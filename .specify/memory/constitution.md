@@ -94,7 +94,7 @@ rusty-brain is a Rust-based memory system designed to be consumed by AI coding a
 All implementation-ready work MUST pass these gates before merge:
 
 - `cargo test` — all tests green
-- `cargo clippy -- -D warnings` — no lint violations
+- `cargo clippy --workspace -- -D warnings` — no lint violations
 - `cargo fmt --check` — formatting compliant
 - Agent integration smoke test — CLI commands produce valid structured output
 
