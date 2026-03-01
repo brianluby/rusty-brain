@@ -83,6 +83,12 @@ impl Observation {
         content: String,
         metadata: Option<ObservationMetadata>,
     ) -> Result<Self, AgentBrainError> {
+        if tool_name.trim().is_empty() {
+            return Err(AgentBrainError::InvalidInput {
+                code: error_codes::E_INPUT_EMPTY_FIELD,
+                message: "tool_name must not be empty or whitespace-only".to_string(),
+            });
+        }
         if summary.trim().is_empty() {
             return Err(AgentBrainError::InvalidInput {
                 code: error_codes::E_INPUT_EMPTY_FIELD,
@@ -112,7 +118,7 @@ impl Observation {
 /// All fields default to their zero/empty values via `#[serde(default)]`.
 /// The `extra` map is flattened into the parent JSON object, allowing
 /// arbitrary key-value pairs alongside the named fields.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ObservationMetadata {
     /// File paths relevant to this observation.
@@ -131,6 +137,11 @@ pub struct ObservationMetadata {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_id: Option<String>,
     /// Arbitrary additional key-value pairs, flattened into the JSON object.
+    ///
+    /// **Important**: Do not insert keys that collide with the camelCase names of
+    /// named fields (`"files"`, `"platform"`, `"projectKey"`, `"compressed"`,
+    /// `"sessionId"`). Doing so produces duplicate JSON keys with undefined
+    /// round-trip behavior.
     #[serde(flatten)]
     pub extra: HashMap<String, serde_json::Value>,
 }
@@ -559,6 +570,40 @@ mod tests {
         assert!(result.is_err());
         let err = result.unwrap_err();
         assert!(matches!(err, AgentBrainError::InvalidInput { .. }));
+    }
+
+    // -------------------------------------------------------------------------
+    // T005: Observation::new() — rejects empty tool_name
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn observation_new_empty_tool_name_returns_invalid_input_error() {
+        let result = Observation::new(
+            ObservationType::Discovery,
+            "".to_string(),
+            "Valid summary".to_string(),
+            "Valid content".to_string(),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentBrainError::InvalidInput { .. }));
+        assert_eq!(err.code(), error_codes::E_INPUT_EMPTY_FIELD);
+    }
+
+    #[test]
+    fn observation_new_whitespace_only_tool_name_returns_invalid_input_error() {
+        let result = Observation::new(
+            ObservationType::Discovery,
+            "   \t\n".to_string(),
+            "Valid summary".to_string(),
+            "Valid content".to_string(),
+            None,
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentBrainError::InvalidInput { .. }));
+        assert_eq!(err.code(), error_codes::E_INPUT_EMPTY_FIELD);
     }
 
     // -------------------------------------------------------------------------

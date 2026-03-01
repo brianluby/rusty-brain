@@ -16,7 +16,9 @@ use serde::{Deserialize, Serialize};
 ///
 /// Unknown fields are silently ignored to maintain forward compatibility as the
 /// Claude Code protocol evolves. Do NOT add `#[serde(deny_unknown_fields)]`.
+#[non_exhaustive]
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub struct HookInput {
     // --- Required envelope fields (present in every event) ---
     /// Unique session identifier assigned by Claude Code.

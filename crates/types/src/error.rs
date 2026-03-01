@@ -4,8 +4,6 @@
 //! [`error_codes`] module, enabling downstream consumers (agents, CLIs, tests)
 //! to match on error identity without parsing human-readable messages.
 
-use std::fmt;
-
 /// Stable error code constants used across all rusty-brain crates.
 ///
 /// Each constant is a `&'static str` suitable for machine parsing. Codes are
@@ -57,18 +55,21 @@ pub mod error_codes {
 /// error for `Error::source()` chaining. The enum is `#[non_exhaustive]` so
 /// new variants can be added without a breaking change.
 #[non_exhaustive]
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum AgentBrainError {
     /// Filesystem I/O failure (read, write, path resolution).
+    #[error("[{code}] {message}")]
     FileSystem {
         /// Stable error code (e.g. [`error_codes::E_FS_NOT_FOUND`]).
         code: &'static str,
         /// Human-readable description of the failure.
         message: String,
         /// Optional underlying [`std::io::Error`].
+        #[source]
         source: Option<std::io::Error>,
     },
     /// Configuration loading or validation failure.
+    #[error("[{code}] {message}")]
     Configuration {
         /// Stable error code (e.g. [`error_codes::E_CONFIG_INVALID_VALUE`]).
         code: &'static str,
@@ -76,15 +77,18 @@ pub enum AgentBrainError {
         message: String,
     },
     /// JSON serialization or deserialization failure.
+    #[error("[{code}] {message}")]
     Serialization {
         /// Stable error code (e.g. [`error_codes::E_SER_SERIALIZE_FAILED`]).
         code: &'static str,
         /// Human-readable description of the failure.
         message: String,
         /// Optional underlying [`serde_json::Error`].
+        #[source]
         source: Option<serde_json::Error>,
     },
     /// File or resource lock could not be acquired.
+    #[error("[{code}] {message}")]
     Lock {
         /// Stable error code (e.g. [`error_codes::E_LOCK_TIMEOUT`]).
         code: &'static str,
@@ -92,6 +96,7 @@ pub enum AgentBrainError {
         message: String,
     },
     /// Memory store integrity violation (corrupted index, bad checksum).
+    #[error("[{code}] {message}")]
     MemoryCorruption {
         /// Stable error code (e.g. [`error_codes::E_MEM_CORRUPTED_INDEX`]).
         code: &'static str,
@@ -99,6 +104,7 @@ pub enum AgentBrainError {
         message: String,
     },
     /// Caller-provided input failed validation.
+    #[error("[{code}] {message}")]
     InvalidInput {
         /// Stable error code (e.g. [`error_codes::E_INPUT_EMPTY_FIELD`]).
         code: &'static str,
@@ -118,35 +124,6 @@ impl AgentBrainError {
             | Self::Lock { code, .. }
             | Self::MemoryCorruption { code, .. }
             | Self::InvalidInput { code, .. } => code,
-        }
-    }
-}
-
-impl fmt::Display for AgentBrainError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::FileSystem { code, message, .. }
-            | Self::Configuration { code, message, .. }
-            | Self::Serialization { code, message, .. }
-            | Self::Lock { code, message, .. }
-            | Self::MemoryCorruption { code, message, .. }
-            | Self::InvalidInput { code, message, .. } => {
-                write!(f, "[{code}] {message}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for AgentBrainError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::FileSystem {
-                source: Some(e), ..
-            } => Some(e),
-            Self::Serialization {
-                source: Some(e), ..
-            } => Some(e),
-            _ => None,
         }
     }
 }
@@ -275,102 +252,51 @@ mod tests {
     // T022: Error code constant verification tests
 
     #[test]
-    fn error_code_e_fs_not_found() {
-        assert_eq!(error_codes::E_FS_NOT_FOUND, "E_FS_NOT_FOUND");
-    }
-
-    #[test]
-    fn error_code_e_fs_permission_denied() {
-        assert_eq!(
-            error_codes::E_FS_PERMISSION_DENIED,
-            "E_FS_PERMISSION_DENIED"
-        );
-    }
-
-    #[test]
-    fn error_code_e_fs_io_error() {
-        assert_eq!(error_codes::E_FS_IO_ERROR, "E_FS_IO_ERROR");
-    }
-
-    #[test]
-    fn error_code_e_config_invalid_value() {
-        assert_eq!(
-            error_codes::E_CONFIG_INVALID_VALUE,
-            "E_CONFIG_INVALID_VALUE"
-        );
-    }
-
-    #[test]
-    fn error_code_e_config_missing_field() {
-        assert_eq!(
-            error_codes::E_CONFIG_MISSING_FIELD,
-            "E_CONFIG_MISSING_FIELD"
-        );
-    }
-
-    #[test]
-    fn error_code_e_config_parse_error() {
-        assert_eq!(error_codes::E_CONFIG_PARSE_ERROR, "E_CONFIG_PARSE_ERROR");
-    }
-
-    #[test]
-    fn error_code_e_ser_serialize_failed() {
-        assert_eq!(
-            error_codes::E_SER_SERIALIZE_FAILED,
-            "E_SER_SERIALIZE_FAILED"
-        );
-    }
-
-    #[test]
-    fn error_code_e_ser_deserialize_failed() {
-        assert_eq!(
-            error_codes::E_SER_DESERIALIZE_FAILED,
-            "E_SER_DESERIALIZE_FAILED"
-        );
-    }
-
-    #[test]
-    fn error_code_e_lock_acquisition_failed() {
-        assert_eq!(
-            error_codes::E_LOCK_ACQUISITION_FAILED,
-            "E_LOCK_ACQUISITION_FAILED"
-        );
-    }
-
-    #[test]
-    fn error_code_e_lock_timeout() {
-        assert_eq!(error_codes::E_LOCK_TIMEOUT, "E_LOCK_TIMEOUT");
-    }
-
-    #[test]
-    fn error_code_e_mem_corrupted_index() {
-        assert_eq!(error_codes::E_MEM_CORRUPTED_INDEX, "E_MEM_CORRUPTED_INDEX");
-    }
-
-    #[test]
-    fn error_code_e_mem_invalid_checksum() {
-        assert_eq!(
-            error_codes::E_MEM_INVALID_CHECKSUM,
-            "E_MEM_INVALID_CHECKSUM"
-        );
-    }
-
-    #[test]
-    fn error_code_e_input_empty_field() {
-        assert_eq!(error_codes::E_INPUT_EMPTY_FIELD, "E_INPUT_EMPTY_FIELD");
-    }
-
-    #[test]
-    fn error_code_e_input_out_of_range() {
-        assert_eq!(error_codes::E_INPUT_OUT_OF_RANGE, "E_INPUT_OUT_OF_RANGE");
-    }
-
-    #[test]
-    fn error_code_e_input_invalid_format() {
-        assert_eq!(
-            error_codes::E_INPUT_INVALID_FORMAT,
-            "E_INPUT_INVALID_FORMAT"
-        );
+    fn all_error_codes_match_their_constant_names() {
+        let codes: &[(&str, &str)] = &[
+            (error_codes::E_FS_NOT_FOUND, "E_FS_NOT_FOUND"),
+            (
+                error_codes::E_FS_PERMISSION_DENIED,
+                "E_FS_PERMISSION_DENIED",
+            ),
+            (error_codes::E_FS_IO_ERROR, "E_FS_IO_ERROR"),
+            (
+                error_codes::E_CONFIG_INVALID_VALUE,
+                "E_CONFIG_INVALID_VALUE",
+            ),
+            (
+                error_codes::E_CONFIG_MISSING_FIELD,
+                "E_CONFIG_MISSING_FIELD",
+            ),
+            (error_codes::E_CONFIG_PARSE_ERROR, "E_CONFIG_PARSE_ERROR"),
+            (
+                error_codes::E_SER_SERIALIZE_FAILED,
+                "E_SER_SERIALIZE_FAILED",
+            ),
+            (
+                error_codes::E_SER_DESERIALIZE_FAILED,
+                "E_SER_DESERIALIZE_FAILED",
+            ),
+            (
+                error_codes::E_LOCK_ACQUISITION_FAILED,
+                "E_LOCK_ACQUISITION_FAILED",
+            ),
+            (error_codes::E_LOCK_TIMEOUT, "E_LOCK_TIMEOUT"),
+            (error_codes::E_MEM_CORRUPTED_INDEX, "E_MEM_CORRUPTED_INDEX"),
+            (
+                error_codes::E_MEM_INVALID_CHECKSUM,
+                "E_MEM_INVALID_CHECKSUM",
+            ),
+            (error_codes::E_INPUT_EMPTY_FIELD, "E_INPUT_EMPTY_FIELD"),
+            (error_codes::E_INPUT_OUT_OF_RANGE, "E_INPUT_OUT_OF_RANGE"),
+            (
+                error_codes::E_INPUT_INVALID_FORMAT,
+                "E_INPUT_INVALID_FORMAT",
+            ),
+        ];
+        for (actual, expected) in codes {
+            assert_eq!(*actual, *expected, "error code constant mismatch");
+        }
     }
 
     // T023: Error::source() chaining tests
@@ -409,98 +335,29 @@ mod tests {
         );
     }
 
-    // T024: Deep cause chain traversal
+    // T024: Cause chain traversal
 
     #[test]
-    fn three_level_deep_cause_chain() {
-        // Three-level chain: RootCause -> MiddleError -> AgentBrainError
-        //
-        // std::io::Error::new does not propagate source() for custom errors
-        // (confirmed: io_err.source() returns None even when constructed via
-        // io::Error::new(kind, custom_err)). To build a genuine three-level chain
-        // we use a custom MiddleError that wraps RootCause and exposes it via
-        // source(), then wraps MiddleError in an io::Error via the From<MiddleError>
-        // impl — which also doesn't chain. Instead we make AgentBrainError hold an
-        // io::Error whose source() we can exercise by placing MiddleError (which
-        // implements Error) as the payload of an io::Error, and verifying the chain
-        // through AgentBrainError -> MiddleError -> RootCause using a direct
-        // MiddleError as the io::Error source field.
-        //
-        // Since io::Error does not expose its inner error via source(), we build
-        // the chain using a custom intermediate error type stored directly in
-        // AgentBrainError's source field via a type that IS io::Error compatible:
-        // we construct the io::Error from MiddleError using io::Error::new, but
-        // verify the chain at the AgentBrainError -> io::Error level only, and
-        // separately verify a standalone custom three-level chain to demonstrate
-        // the traversal pattern.
-
-        #[derive(Debug)]
-        struct RootCause;
-        impl fmt::Display for RootCause {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "root cause error")
-            }
-        }
-        impl std::error::Error for RootCause {}
-
-        // MiddleError wraps RootCause and exposes it via source()
-        #[derive(Debug)]
-        struct MiddleError {
-            cause: RootCause,
-        }
-        impl fmt::Display for MiddleError {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                write!(f, "middle error")
-            }
-        }
-        impl std::error::Error for MiddleError {
-            fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-                Some(&self.cause)
-            }
-        }
-
-        // Build the io::Error from MiddleError. std::io::Error::new stores the
-        // inner error but does NOT propagate it through source(). However, the
-        // AgentBrainError -> io::Error link in the chain IS valid (source() Some).
-        // For the full three-level traversal we use MiddleError directly and verify
-        // source().source() on it.
-        let middle = MiddleError { cause: RootCause };
-
-        // Verify the MiddleError -> RootCause link stands alone
-        let root_via_middle = (&middle as &dyn std::error::Error)
-            .source()
-            .expect("MiddleError must expose RootCause via source()");
-        assert!(
-            root_via_middle.downcast_ref::<RootCause>().is_some(),
-            "MiddleError.source() must downcast to RootCause"
-        );
-
-        // Now build the full three-level chain:
-        // AgentBrainError -> io::Error (from MiddleError) -> (io::Error does not chain further)
-        // We verify the AgentBrainError -> io::Error link.
-        let io_err =
-            std::io::Error::new(std::io::ErrorKind::Other, MiddleError { cause: RootCause });
+    fn cause_chain_traversal() {
+        // Verify AgentBrainError -> io::Error link
+        let io_err = std::io::Error::new(std::io::ErrorKind::Other, "underlying failure");
         let agent_err = AgentBrainError::FileSystem {
             code: error_codes::E_FS_IO_ERROR,
             message: "io failed".to_string(),
             source: Some(io_err),
         };
+        let src = agent_err.source().expect("source must be Some");
+        assert!(src.downcast_ref::<std::io::Error>().is_some());
 
-        // Level 1 traversal: AgentBrainError -> io::Error
-        let level2 = agent_err
-            .source()
-            .expect("AgentBrainError must expose io::Error via source()");
-        assert!(
-            level2.downcast_ref::<std::io::Error>().is_some(),
-            "agent_err.source() must downcast to std::io::Error"
-        );
-
-        // The full three-level traversal (AgentBrainError -> MiddleError -> RootCause)
-        // is demonstrated by the standalone chain above. We confirm the pattern:
-        // source() on agent_err is Some (level 2 reached), and source() on a
-        // standalone MiddleError is Some and reaches RootCause (level 3 reached).
-        // This validates that three-level cause chain traversal works correctly
-        // within the AgentBrainError error type ecosystem.
+        // Verify serde error chain
+        let serde_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let agent_err = AgentBrainError::Serialization {
+            code: error_codes::E_SER_DESERIALIZE_FAILED,
+            message: "deser failed".to_string(),
+            source: Some(serde_err),
+        };
+        let src = agent_err.source().expect("source must be Some");
+        assert!(src.downcast_ref::<serde_json::Error>().is_some());
     }
 
     #[test]

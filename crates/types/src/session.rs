@@ -50,14 +50,14 @@ impl SessionSummary {
         modified_files: Vec<String>,
         summary: String,
     ) -> Result<Self, AgentBrainError> {
-        if id.is_empty() {
+        if id.trim().is_empty() {
             return Err(AgentBrainError::InvalidInput {
                 code: error_codes::E_INPUT_EMPTY_FIELD,
                 message: "id must not be empty".to_string(),
             });
         }
 
-        if summary.is_empty() {
+        if summary.trim().is_empty() {
             return Err(AgentBrainError::InvalidInput {
                 code: error_codes::E_INPUT_EMPTY_FIELD,
                 message: "summary must not be empty".to_string(),
@@ -329,6 +329,52 @@ mod tests {
             error_codes::E_INPUT_EMPTY_FIELD,
             "Expected error code E_INPUT_EMPTY_FIELD for empty summary"
         );
+    }
+
+    // ---------------------------------------------------------------------------
+    // Validation — whitespace-only id
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn whitespace_only_id_returns_invalid_input_error() {
+        let start = base_start();
+        let end = start + Duration::minutes(1);
+        let result = SessionSummary::new(
+            "   \t\n".to_string(),
+            start,
+            end,
+            1,
+            vec![],
+            vec![],
+            "Valid summary.".to_string(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentBrainError::InvalidInput { .. }));
+        assert_eq!(err.code(), error_codes::E_INPUT_EMPTY_FIELD);
+    }
+
+    // ---------------------------------------------------------------------------
+    // Validation — whitespace-only summary
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn whitespace_only_summary_returns_invalid_input_error() {
+        let start = base_start();
+        let end = start + Duration::minutes(1);
+        let result = SessionSummary::new(
+            "session-ws".to_string(),
+            start,
+            end,
+            1,
+            vec![],
+            vec![],
+            "   \t\n".to_string(),
+        );
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert!(matches!(err, AgentBrainError::InvalidInput { .. }));
+        assert_eq!(err.code(), error_codes::E_INPUT_EMPTY_FIELD);
     }
 
     // ---------------------------------------------------------------------------

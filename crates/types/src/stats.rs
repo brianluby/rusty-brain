@@ -335,4 +335,35 @@ mod tests {
             "JSON must NOT use key 'typeCounts', got: {json}"
         );
     }
+
+    #[test]
+    fn mind_stats_type_counts_serialize_with_lowercase_enum_keys() {
+        let mut type_counts = HashMap::new();
+        type_counts.insert(ObservationType::Discovery, 1u64);
+        type_counts.insert(ObservationType::Bugfix, 2u64);
+
+        let stats = MindStats {
+            total_observations: 3,
+            total_sessions: 1,
+            oldest_memory: None,
+            newest_memory: None,
+            file_size_bytes: 256,
+            type_counts,
+        };
+
+        let json = serde_json::to_string(&stats).expect("serialization must succeed");
+
+        assert!(
+            json.contains("\"discovery\""),
+            "ObservationType::Discovery must serialize as lowercase key 'discovery', got: {json}"
+        );
+        assert!(
+            json.contains("\"bugfix\""),
+            "ObservationType::Bugfix must serialize as lowercase key 'bugfix', got: {json}"
+        );
+        assert!(
+            !json.contains("\"Discovery\""),
+            "must NOT contain PascalCase 'Discovery', got: {json}"
+        );
+    }
 }

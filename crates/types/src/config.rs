@@ -61,7 +61,7 @@ impl MindConfig {
     /// Returns [`AgentBrainError::Configuration`] with code
     /// [`error_codes::E_CONFIG_INVALID_VALUE`] if any invariant is violated.
     pub fn validate(&self) -> Result<(), AgentBrainError> {
-        if self.min_confidence < 0.0 || self.min_confidence > 1.0 {
+        if !(0.0..=1.0).contains(&self.min_confidence) {
             return Err(AgentBrainError::Configuration {
                 code: error_codes::E_CONFIG_INVALID_VALUE,
                 message: format!(
@@ -102,6 +102,13 @@ impl MindConfig {
     /// Returns [`AgentBrainError::Configuration`] with code
     /// [`error_codes::E_CONFIG_INVALID_VALUE`] if `MEMVID_MIND_DEBUG` is set to an unrecognised
     /// non-empty value, or if the resulting configuration fails [`MindConfig::validate`].
+    ///
+    /// # Thread Safety
+    ///
+    /// This function reads process-global environment variables via [`std::env::var`].
+    /// It must not be called concurrently with code that mutates environment variables
+    /// (e.g. [`std::env::set_var`]). In tests, use [`temp_env::with_vars`] or an
+    /// equivalent serializing guard.
     pub fn from_env() -> Result<Self, AgentBrainError> {
         let mut cfg = Self::default();
 
@@ -260,6 +267,16 @@ mod tests {
     fn min_confidence_above_one_is_rejected() {
         let cfg = MindConfig {
             min_confidence: 1.1,
+            ..MindConfig::default()
+        };
+        let err = cfg.validate().unwrap_err();
+        assert!(matches!(err, AgentBrainError::Configuration { .. }));
+    }
+
+    #[test]
+    fn min_confidence_nan_is_rejected() {
+        let cfg = MindConfig {
+            min_confidence: f64::NAN,
             ..MindConfig::default()
         };
         let err = cfg.validate().unwrap_err();
