@@ -1,0 +1,36 @@
+# CI Pipeline Contract
+# This defines the expected structure of the GitHub Actions workflow.
+# Implementation must match this contract.
+
+name: CI
+
+on:
+  push:
+    branches: ["**"]   # All branches (FR-009)
+  pull_request:        # All PRs (FR-009)
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # Gate 1: Format check
+      - name: Check formatting
+        run: cargo fmt --check
+
+      # Gate 2: Lint check (warnings denied)
+      - name: Clippy lint
+        run: cargo clippy --workspace -- -D warnings
+
+      # Gate 3: Test suite
+      - name: Run tests
+        run: cargo test --workspace
+
+      # Gate 4: Release build
+      - name: Release build
+        run: cargo build --workspace --release

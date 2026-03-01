@@ -1,0 +1,15 @@
+[package]
+name = "hooks"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+description = "Claude Code hook binaries for rusty-brain"
+
+[dependencies]
+clap = { workspace = true }
+
+[lints]
+workspace = true
