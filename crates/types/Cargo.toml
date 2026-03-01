@@ -10,6 +10,16 @@ description = "Shared types and errors for rusty-brain"
 
 [dependencies]
 serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+
+[dev-dependencies]
+serde_json = { workspace = true }
+chrono = { workspace = true }
+uuid = { workspace = true }
+temp-env = "0.3"
 
 [lints]
 workspace = true
