@@ -48,7 +48,7 @@ pub fn validate_contract(version_str: &str) -> ContractValidationResult;
 /// Priority (FR-010):
 /// 1. platform_project_id (if present and non-empty) → source: PlatformProjectId
 /// 2. canonical_path (if present and non-empty) → use as-is → source: CanonicalPath
-/// 3. cwd (if present and non-empty) → use as-is → source: CanonicalPath
+/// 3. cwd (if present and non-empty) → use as-is → source: Cwd
 /// 4. None of the above → key: None, source: Unresolved
 ///
 /// No filesystem I/O — path strings are used as provided by the caller.

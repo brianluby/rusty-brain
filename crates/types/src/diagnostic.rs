@@ -14,7 +14,7 @@ use uuid::Uuid;
 /// Maximum number of unique field names retained in a diagnostic record.
 pub const MAX_DIAGNOSTIC_FIELDS: usize = 20;
 /// Default retention period for diagnostic records, in days.
-pub const DIAGNOSTIC_RETENTION_DAYS: i64 = 30;
+pub const DIAGNOSTIC_RETENTION_DAYS: u32 = 30;
 
 /// Severity level for diagnostic records.
 ///
@@ -88,7 +88,7 @@ impl DiagnosticRecord {
             .filter(|f| seen.insert(f.clone()))
             .take(MAX_DIAGNOSTIC_FIELDS)
             .collect();
-        let expires = now + TimeDelta::days(DIAGNOSTIC_RETENTION_DAYS);
+        let expires = now + TimeDelta::days(i64::from(DIAGNOSTIC_RETENTION_DAYS));
         Self {
             id: Uuid::new_v4(),
             timestamp: now,
@@ -242,7 +242,8 @@ mod tests {
             DiagnosticSeverity::Error,
         );
 
-        let expected_expires = record.timestamp + TimeDelta::days(DIAGNOSTIC_RETENTION_DAYS);
+        let expected_expires =
+            record.timestamp + TimeDelta::days(i64::from(DIAGNOSTIC_RETENTION_DAYS));
         // Allow 1-second tolerance for clock drift between timestamp and expires_at
         let diff = (record.expires_at - expected_expires).abs();
         assert!(

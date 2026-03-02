@@ -45,7 +45,7 @@ pub fn resolve_project_identity(context: &ProjectContext) -> ProjectIdentity {
         if !cwd.is_empty() {
             return ProjectIdentity {
                 key: Some(cwd.clone()),
-                source: IdentitySource::CanonicalPath,
+                source: IdentitySource::Cwd,
             };
         }
     }
@@ -107,7 +107,7 @@ mod tests {
         let identity = resolve_project_identity(&ctx);
 
         assert_eq!(identity.key, Some("/home/user/project".to_string()));
-        assert_eq!(identity.source, IdentitySource::CanonicalPath);
+        assert_eq!(identity.source, IdentitySource::Cwd);
     }
 
     // 4. All fields None → key=None, source=Unresolved
@@ -193,6 +193,6 @@ mod tests {
         let identity = resolve_project_identity(&ctx);
 
         assert_eq!(identity.key, Some("/nonexistent/path/abc123".to_string()));
-        assert_eq!(identity.source, IdentitySource::CanonicalPath);
+        assert_eq!(identity.source, IdentitySource::Cwd);
     }
 }

@@ -107,6 +107,7 @@ pub struct ProjectIdentity {
 pub enum IdentitySource {
     PlatformProjectId,
     CanonicalPath,
+    Cwd,
     Unresolved,
 }
 ```

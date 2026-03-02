@@ -70,6 +70,7 @@ println!("Project key: {:?} (source: {:?})", identity.key, identity.source);
 
 ```rust
 use platforms::adapter::PlatformAdapter;
+use platforms::AdapterRegistry;
 use types::hooks::HookInput;
 use types::platform_event::PlatformEvent;
 

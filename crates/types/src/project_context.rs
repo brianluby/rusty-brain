@@ -56,6 +56,8 @@ pub enum IdentitySource {
     PlatformProjectId,
     /// Identity was derived from the canonical filesystem path.
     CanonicalPath,
+    /// Identity was derived from the current working directory.
+    Cwd,
     /// No identity could be resolved.
     Unresolved,
 }
@@ -211,15 +213,19 @@ mod tests {
     fn identity_source_all_variants_constructable() {
         let platform = IdentitySource::PlatformProjectId;
         let canonical = IdentitySource::CanonicalPath;
+        let cwd = IdentitySource::Cwd;
         let unresolved = IdentitySource::Unresolved;
 
         // Verify each variant is distinct.
         assert_ne!(platform, canonical);
+        assert_ne!(platform, cwd);
         assert_ne!(platform, unresolved);
+        assert_ne!(canonical, cwd);
         assert_ne!(canonical, unresolved);
+        assert_ne!(cwd, unresolved);
 
         // Verify serde round-trip for each variant independently.
-        for variant in [&platform, &canonical, &unresolved] {
+        for variant in [&platform, &canonical, &cwd, &unresolved] {
             let json = serde_json::to_string(variant).expect("serialization must succeed");
             let deserialized: IdentitySource =
                 serde_json::from_str(&json).expect("deserialization must succeed");

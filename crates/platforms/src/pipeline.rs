@@ -36,6 +36,7 @@ pub struct PipelineResult {
 /// Stateless processor: call [`EventPipeline::process`] for each incoming event.
 /// The pipeline validates the contract version, resolves project identity, and
 /// returns a [`PipelineResult`] indicating the outcome. Never panics on any input.
+#[derive(Default)]
 pub struct EventPipeline;
 
 impl EventPipeline {
@@ -104,12 +105,6 @@ impl EventPipeline {
             identity: Some(identity),
             diagnostic: None,
         }
-    }
-}
-
-impl Default for EventPipeline {
-    fn default() -> Self {
-        Self::new()
     }
 }
 

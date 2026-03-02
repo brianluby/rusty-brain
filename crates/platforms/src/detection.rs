@@ -29,9 +29,11 @@ pub fn detect_platform(input: &HookInput) -> String {
         }
     }
 
-    // Check OPENCODE indicator
-    if std::env::var("OPENCODE").is_ok() {
-        return "opencode".to_string();
+    // Check OPENCODE indicator (value must be "1" per FR-006)
+    if let Ok(val) = std::env::var("OPENCODE") {
+        if val == "1" {
+            return "opencode".to_string();
+        }
     }
 
     // Default
@@ -147,6 +149,36 @@ mod tests {
             || {
                 let input = make_input(None);
                 assert_eq!(detect_platform(&input), "claude");
+            },
+        );
+    }
+
+    #[test]
+    fn opencode_non_one_value_treated_as_absent() {
+        temp_env::with_vars(
+            [("MEMVID_PLATFORM", None::<&str>), ("OPENCODE", Some("0"))],
+            || {
+                let input = make_input(None);
+                assert_eq!(
+                    detect_platform(&input),
+                    "claude",
+                    "OPENCODE=0 must not trigger opencode detection"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn opencode_empty_value_treated_as_absent() {
+        temp_env::with_vars(
+            [("MEMVID_PLATFORM", None::<&str>), ("OPENCODE", Some(""))],
+            || {
+                let input = make_input(None);
+                assert_eq!(
+                    detect_platform(&input),
+                    "claude",
+                    "OPENCODE='' must not trigger opencode detection"
+                );
             },
         );
     }
