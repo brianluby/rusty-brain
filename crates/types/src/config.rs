@@ -142,9 +142,13 @@ impl MindConfig {
             .unwrap_or(false);
 
         if opt_in && explicit_path.is_none() {
-            let platform: Option<String> = if let Ok(p) = std::env::var("MEMVID_PLATFORM") {
-                let p = p.trim().to_lowercase();
-                if p.is_empty() { None } else { Some(p) }
+            let memvid_platform = std::env::var("MEMVID_PLATFORM")
+                .ok()
+                .map(|p| p.trim().to_lowercase())
+                .filter(|p| !p.is_empty());
+
+            let platform: Option<String> = if let Some(p) = memvid_platform {
+                Some(p)
             } else if std::env::var("CLAUDE_PROJECT_DIR").is_ok() {
                 Some("claude".to_string())
             } else if std::env::var("OPENCODE_PROJECT_DIR").is_ok() {
@@ -584,6 +588,28 @@ mod tests {
                 assert!(
                     path.contains("mind-claude.mv2"),
                     "expected mind-claude.mv2 in path, got: {path}"
+                );
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_blank_memvid_platform_falls_through_to_claude_project_dir() {
+        with_env(
+            &[
+                ("MEMVID_PLATFORM", Some("  ")),
+                ("CLAUDE_PROJECT_DIR", Some("/some/dir")),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", Some("1")),
+                ("MEMVID_PLATFORM_MEMORY_PATH", None),
+                ("MEMVID_MIND_DEBUG", None),
+                ("OPENCODE_PROJECT_DIR", None),
+            ],
+            || {
+                let cfg = MindConfig::from_env().expect("from_env must succeed");
+                let path = cfg.memory_path.to_string_lossy();
+                assert!(
+                    path.contains("mind-claude.mv2"),
+                    "blank MEMVID_PLATFORM should fall through to CLAUDE_PROJECT_DIR, got: {path}"
                 );
             },
         );
