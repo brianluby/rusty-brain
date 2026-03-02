@@ -1,7 +1,7 @@
 # Tasks: Type System & Configuration
 
 **Input**: Design documents from `specs/002-type-system-config/`
-**Prerequisites**: plan.md (required), spec.md (required), prd.md, data-model.md, contracts/types-api.rs, research.md, quickstart.md
+**Prerequisites**: plan.md (required), spec.md (required), prd.md, ar.md, sec.md, data-model.md, contracts/types-api.rs, research.md, quickstart.md
 
 **Tests**: Included per constitution V (Test-First Development is non-negotiable). Each module follows RED-GREEN-REFACTOR: write tests first, verify they fail, then implement.
 
@@ -45,7 +45,7 @@
 
 - [x] T004 Implement AgentBrainError enum (#[non_exhaustive], thiserror derive), error_codes module (15 string constants: E_FS_*, E_CONFIG_*, E_SER_*, E_LOCK_*, E_MEM_*, E_INPUT_*), and code() method in crates/types/src/error.rs
 
-**Checkpoint**: `cargo test -p types` passes for error module. All 6 variants constructable with stable codes.
+**Checkpoint**: `cargo test -p types` passes for error module. All 6 variants constructible with stable codes.
 
 ---
 
@@ -61,7 +61,7 @@
 
 > **NOTE: Write these tests FIRST, ensure they FAIL before implementation**
 
-- [x] T005 [P] [US1] Write unit tests for ObservationType (all 10 variants constructable, Copy+Clone+Eq+Hash), Observation (construction with all fields, reject empty/whitespace-only summary, reject empty/whitespace-only content with AgentBrainError::InvalidInput), and ObservationMetadata (construction with defaults, flattened extra map accepts arbitrary keys) in crates/types/src/observation.rs
+- [x] T005 [P] [US1] Write unit tests for ObservationType (all 10 variants constructible, Copy+Clone+Eq+Hash), Observation (construction with all fields, reject empty/whitespace-only summary, reject empty/whitespace-only content with AgentBrainError::InvalidInput), and ObservationMetadata (construction with defaults, flattened extra map accepts arbitrary keys) in crates/types/src/observation.rs
 - [x] T006 [P] [US1] Write unit tests for SessionSummary (construction with all 7 fields, reject end_time < start_time, reject empty summary, reject empty id) in crates/types/src/session.rs
 - [x] T007 [P] [US1] Write unit tests for InjectedContext (construction, all Vec fields default to empty, token_count defaults to 0) in crates/types/src/context.rs
 - [x] T008 [P] [US1] Write unit tests for MindConfig Default (memory_path=".agent-brain/mind.mv2", max_context_observations=20, max_context_tokens=2000, auto_compress=true, min_confidence=0.6, debug=false) and validate() boundary cases (reject min_confidence < 0.0 or > 1.0, reject max_context_observations = 0, reject max_context_tokens = 0) in crates/types/src/config.rs
@@ -76,7 +76,7 @@
 - [x] T014 [P] [US1] Implement MindStats struct (serde rename_all="camelCase", file_size_bytes renamed to "fileSize", type_counts renamed to "topTypes", optional timestamps with skip_serializing_if) in crates/types/src/stats.rs
 - [x] T015 [US1] Update crates/types/src/lib.rs with public re-exports: pub use error, observation, session, context, config, stats modules and all public types
 
-**Checkpoint**: `cargo test -p types` passes for all modules. `cargo build -p types` succeeds. All 8 entity types (excluding HookInput/HookOutput) constructable from downstream code.
+**Checkpoint**: `cargo test -p types` passes for all modules. `cargo build -p types` succeeds. All 8 entity types (excluding HookInput/HookOutput) constructible from downstream code.
 
 ---
 

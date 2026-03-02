@@ -88,8 +88,8 @@ impl MindConfig {
     /// Build a [`MindConfig`] from environment variables, falling back to defaults.
     ///
     /// Resolution order (highest precedence first):
-    /// 1. `MEMVID_MIND_DEBUG` — accepts `"1"` or `"true"` (case-insensitive); empty string is
-    ///    ignored; any other non-empty value is an error.
+    /// 1. `MEMVID_MIND_DEBUG` — accepts `"1"`/`"true"` to enable or `"0"`/`"false"` to disable
+    ///    (case-insensitive); empty string is ignored; any other non-empty value is an error.
     /// 2. `MEMVID_PLATFORM_MEMORY_PATH` — overrides `memory_path` directly.
     /// 3. If `MEMVID_PLATFORM_PATH_OPT_IN=1` and `MEMVID_PLATFORM_MEMORY_PATH` is not set,
     ///    auto-detect platform via `MEMVID_PLATFORM`, then `CLAUDE_PROJECT_DIR` presence
@@ -117,11 +117,12 @@ impl MindConfig {
             if !raw.is_empty() {
                 match raw.trim().to_lowercase().as_str() {
                     "1" | "true" => cfg.debug = true,
+                    "0" | "false" => cfg.debug = false,
                     _ => {
                         return Err(AgentBrainError::Configuration {
                             code: error_codes::E_CONFIG_INVALID_VALUE,
                             message: format!(
-                                "MEMVID_MIND_DEBUG must be '1' or 'true' (case-insensitive), got '{raw}'"
+                                "MEMVID_MIND_DEBUG must be '1', 'true', '0', or 'false' (case-insensitive), got '{raw}'"
                             ),
                         });
                     }
@@ -508,6 +509,60 @@ mod tests {
             || {
                 let cfg = MindConfig::from_env().expect("from_env must succeed");
                 assert!(cfg.debug);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_debug_disabled_with_zero() {
+        with_env(
+            &[
+                ("MEMVID_MIND_DEBUG", Some("0")),
+                ("MEMVID_PLATFORM_MEMORY_PATH", None),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", None),
+                ("MEMVID_PLATFORM", None),
+                ("CLAUDE_PROJECT_DIR", None),
+                ("OPENCODE_PROJECT_DIR", None),
+            ],
+            || {
+                let cfg = MindConfig::from_env().expect("from_env must succeed");
+                assert!(!cfg.debug);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_debug_disabled_with_false() {
+        with_env(
+            &[
+                ("MEMVID_MIND_DEBUG", Some("false")),
+                ("MEMVID_PLATFORM_MEMORY_PATH", None),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", None),
+                ("MEMVID_PLATFORM", None),
+                ("CLAUDE_PROJECT_DIR", None),
+                ("OPENCODE_PROJECT_DIR", None),
+            ],
+            || {
+                let cfg = MindConfig::from_env().expect("from_env must succeed");
+                assert!(!cfg.debug);
+            },
+        );
+    }
+
+    #[test]
+    fn from_env_debug_disabled_with_false_uppercase() {
+        with_env(
+            &[
+                ("MEMVID_MIND_DEBUG", Some("FALSE")),
+                ("MEMVID_PLATFORM_MEMORY_PATH", None),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", None),
+                ("MEMVID_PLATFORM", None),
+                ("CLAUDE_PROJECT_DIR", None),
+                ("OPENCODE_PROJECT_DIR", None),
+            ],
+            || {
+                let cfg = MindConfig::from_env().expect("from_env must succeed");
+                assert!(!cfg.debug);
             },
         );
     }

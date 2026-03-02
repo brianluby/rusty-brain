@@ -49,6 +49,8 @@ Define all shared data structures, error types, and configuration for the rusty-
 specs/002-type-system-config/
 ├── spec.md              # Feature specification
 ├── prd.md               # Product requirements document
+├── ar.md                # Architecture review
+├── sec.md               # Security review
 ├── plan.md              # This file
 ├── research.md          # Phase 0 research findings
 ├── data-model.md        # Phase 1 entity definitions
@@ -86,7 +88,7 @@ No constitution violations to justify. All implementation uses standard Rust pat
 
 ### Module Dependency Order
 
-```
+```text
 error.rs           (no internal deps)
     ↓
 observation.rs     (uses error.rs for validation)

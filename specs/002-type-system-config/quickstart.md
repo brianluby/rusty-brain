@@ -11,7 +11,7 @@
 
 All types live in `crates/types/`. The recommended module structure:
 
-```
+```text
 crates/types/src/
 ├── lib.rs              # Re-exports all public types
 ├── observation.rs      # Observation, ObservationType, ObservationMetadata
