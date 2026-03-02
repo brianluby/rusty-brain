@@ -521,7 +521,7 @@ pub(crate) struct BackendStats {
 
 **Pattern: Pre-Open Validation Pipeline (FileGuard)**
 
-```
+```text
 validate_and_open(path):
 1. If path does not exist → return OpenAction::Create
 2. Get file metadata
@@ -537,7 +537,7 @@ backup_and_prune(path, max_backups=3):
 
 **Pattern: Token-Budgeted Context Assembly (ContextBuilder)**
 
-```
+```text
 build(backend, config, query):
 1. budget_remaining = config.max_context_tokens
 2. recent = backend.timeline(config.max_context_observations, reverse=true)
@@ -554,7 +554,7 @@ build(backend, config, query):
 
 **Pattern: Stats Caching**
 
-```
+```text
 stats():
 1. If cached_stats exists AND cached_frame_count == backend.stats().frame_count:
    return cached_stats

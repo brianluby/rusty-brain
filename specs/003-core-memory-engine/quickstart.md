@@ -19,7 +19,7 @@ edition.workspace = true
 
 [dependencies]
 memvid-core = { workspace = true }
-rusty-brain-types = { path = "../types" }
+types = { path = "../types" }
 ulid = { version = "1", features = ["serde"] }
 fs2 = "0.4"
 serde = { workspace = true }
@@ -51,7 +51,7 @@ memvid-core = { git = "https://github.com/brianluby/memvid/", rev = "fbddef4bff6
 
 ```rust
 use rusty_brain_core::{Mind, estimate_tokens};
-use rusty_brain_types::{MindConfig, ObservationType, ObservationMetadata};
+use types::{MindConfig, ObservationType, ObservationMetadata};
 
 // 1. Open (or create) a memory file
 let config = MindConfig::new("/path/to/project/.agent-brain/mind.mv2");
@@ -123,7 +123,7 @@ reset_mind();
 ## Error Handling
 
 ```rust
-use rusty_brain_types::{RustyBrainError, error_codes};
+use types::{RustyBrainError, error_codes};
 
 match mind.remember(ObservationType::Discovery, "Read", "", None, None) {
     Ok(id) => println!("Stored: {id}"),
@@ -164,7 +164,7 @@ cargo fmt -p rusty-brain-core -- --check
 
 ## Module Structure
 
-```
+```text
 crates/core/src/
 ├── lib.rs              # pub: Mind, MemorySearchResult, estimate_tokens, get_mind, reset_mind
 ├── mind.rs             # Mind struct implementation

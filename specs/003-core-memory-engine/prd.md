@@ -618,6 +618,7 @@ Additional considerations per constitution IX:
 - [x] No open questions blocking implementation
 
 ### Sign-off
+
 | Role | Name | Date | Decision |
 |------|------|------|----------|
 | Product Owner | | YYYY-MM-DD | [Ready / Not Ready] |

@@ -54,7 +54,8 @@ specs/003-core-memory-engine/
 ├── ar.md                # Architecture Review
 ├── sec.md               # Security Review
 ├── prd.md               # Product Requirements Document
-└── spec.md              # Feature specification
+├── spec.md              # Feature specification
+└── tasks.md             # Implementation tasks
 ```
 
 ### Source Code (repository root)

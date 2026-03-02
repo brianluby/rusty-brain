@@ -222,7 +222,7 @@ fn observation_new_valid_with_metadata_succeeds() {
 }
 
 #[test]
-fn observation_new_auto_generates_uuid() {
+fn observation_new_auto_generates_ulid() {
     let obs1 = Observation::new(
         ObservationType::Success,
         "test".to_string(),
@@ -239,7 +239,7 @@ fn observation_new_auto_generates_uuid() {
         None,
     )
     .unwrap();
-    // Each call generates a distinct UUID
+    // Each call generates a distinct ULID
     assert_ne!(obs1.id, obs2.id);
 }
 

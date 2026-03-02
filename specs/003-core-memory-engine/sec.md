@@ -210,7 +210,7 @@ flowchart TD
 
 ### Data Handling Checklist 🟢 `@llm-autonomous`
 
-- [x] **No Restricted data stored unless absolutely required** — Engine does not intentionally store secrets; however, tool output may inadvertently contain them (see R2 below)
+- [x] **No restricted data stored unless strictly necessary** — Engine does not intentionally store secrets; tool outputs may still inadvertently contain secrets (see R2 below)
 - [ ] **Confidential data encrypted at rest** — `.mv2` files are NOT encrypted at rest; relies on OS file permissions *(flagged as finding F1)*
 - [x] **All data encrypted in transit (TLS 1.2+)** — N/A: no network transit; all data stays on local filesystem
 - [ ] **PII has defined retention policy** — Observations are retained indefinitely; no automatic pruning *(flagged as finding F2)*

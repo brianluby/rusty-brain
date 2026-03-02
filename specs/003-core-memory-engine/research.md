@@ -96,7 +96,7 @@
 **Rationale**: memvid's `put_bytes` accepts raw bytes. The observation's human-readable content (summary + content) is the primary payload. Structured metadata (type, ID, timestamp, tool_name, files, platform, etc.) is stored in `PutOptions` metadata field as a JSON value.
 
 **Mapping**:
-```
+```text
 memvid put_bytes payload:  observation.summary + "\n\n" + observation.content (UTF-8 bytes)
 PutOptions.labels:         [observation.obs_type as string]
 PutOptions.tags:           [observation.tool_name, observation.metadata.session_id, ...]

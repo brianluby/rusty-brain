@@ -21,7 +21,7 @@
 
 - [x] T001 Add `ulid`, `fs2`, and `tempfile` workspace dependencies to `Cargo.toml` (root)
 - [x] T002 Enable `lex` feature on `memvid-core` workspace dependency in `Cargo.toml` (root)
-- [x] T003 Update `crates/core/Cargo.toml` with all dependencies per quickstart.md: `rusty-brain-types`, `ulid`, `fs2`, `serde`, `serde_json`, `chrono`, `tracing` (deps) and `tempfile`, `tokio` (dev-deps)
+- [x] T003 Update `crates/core/Cargo.toml` with all dependencies per quickstart.md: `types`, `ulid`, `fs2`, `serde`, `serde_json`, `chrono`, `tracing` (deps) and `tempfile`, `tokio` (dev-deps)
 - [x] T004 Create module files for project structure in `crates/core/src/`: `mind.rs`, `backend.rs`, `memvid_store.rs`, `file_guard.rs`, `context_builder.rs`, `token.rs` — each as empty modules with doc comments
 - [x] T005 Update `crates/core/src/lib.rs` with module declarations and public re-exports per contracts/mind-api.rs: `Mind`, `MemorySearchResult`, `estimate_tokens`, `get_mind`, `reset_mind`
 

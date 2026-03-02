@@ -157,7 +157,7 @@ A compressed record of one coding session, stored as a tagged observation.
 | Field | Type | Default | Description |
 |-------|------|---------|-------------|
 | `memory_path` | `PathBuf` | Platform-dependent | Path to `.mv2` file |
-| `max_context_tokens` | `u32` | `16000` | Token budget for context assembly |
+| `max_context_tokens` | `u32` | `2000` | Token budget for context assembly |
 | `max_context_observations` | `u32` | `20` | Max recent observations in context |
 | `max_relevant_memories` | `u32` | `10` | Max relevant memories from `find` |
 | `max_session_summaries` | `u32` | `5` | Max session summaries in context |
@@ -178,9 +178,9 @@ A compressed record of one coding session, stored as a tagged observation.
 | Field | Type | Description |
 |-------|------|-------------|
 | `recent_observations` | `Vec<Observation>` | Most recent observations, newest first |
-| `relevant_memories` | `Vec<MemorySearchResult>` | Query-relevant hits from `find` |
+| `relevant_memories` | `Vec<Observation>` | Query-relevant hits from `find` |
 | `session_summaries` | `Vec<SessionSummary>` | Recent session summaries |
-| `token_count` | `u32` | Estimated token count of payload |
+| `token_count` | `u64` | Estimated token count of payload |
 
 ### MemorySearchResult
 

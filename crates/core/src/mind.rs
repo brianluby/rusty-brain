@@ -247,6 +247,8 @@ impl Mind {
     ) -> Result<String, RustyBrainError> {
         let now = Utc::now();
 
+        // observation_count is 0: the summary captures decisions and files, not
+        // individual observation counts which are tracked separately by stats().
         let session_summary = SessionSummary::new(
             self.session_id.clone(),
             now,

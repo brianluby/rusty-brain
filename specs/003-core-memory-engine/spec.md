@@ -167,11 +167,11 @@ Multiple agent processes may attempt to access the same memory file simultaneous
 - **SC-003**: Corrupted file recovery (detect, backup, recreate) completes without user intervention and the new store is immediately usable.
 - **SC-004**: Concurrent access from 2+ processes results in zero data corruption across 100 sequential write operations.
 - **SC-005**: Statistics computation for a memory store with 10,000 observations completes in under 2 seconds.
+- **SC-006**: All engine operations produce structured errors with stable error codes — no panics or unstructured error messages escape to callers.
+- **SC-007**: The observation serialization schema is defined exclusively by the Rust types crate. No cross-implementation compatibility with the TypeScript agent-brain is required.
 - **SC-008**: Store operation completes in under 500ms for a memory file with 10,000 observations.
 - **SC-009**: Search operation completes in under 500ms for a memory file with 10,000 observations.
 - **SC-010**: Context assembly completes in under 2 seconds for a memory file with 10,000 observations.
-- **SC-006**: All engine operations produce structured errors with stable error codes — no panics or unstructured error messages escape to callers.
-- **SC-007**: The observation serialization schema is defined exclusively by the Rust types crate. No cross-implementation compatibility with the TypeScript agent-brain is required.
 
 ## Assumptions
 

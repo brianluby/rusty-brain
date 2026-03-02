@@ -8,8 +8,6 @@ use crate::backend::MockBackend;
 fn test_mind() -> (tempfile::TempDir, Mind) {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("test.mv2");
-    // Touch the file so the mock backend "opens" it.
-    std::fs::write(&path, b"").unwrap();
     let config = MindConfig {
         memory_path: path,
         ..MindConfig::default()
@@ -248,7 +246,6 @@ fn mind_session_id_is_valid_ulid() {
 fn mind_memory_path_matches_config() {
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("specific.mv2");
-    std::fs::write(&path, b"").unwrap();
     let config = MindConfig {
         memory_path: path.clone(),
         ..MindConfig::default()

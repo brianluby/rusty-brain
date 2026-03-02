@@ -38,7 +38,7 @@ fn setup_mind(n: usize) -> (tempfile::TempDir, Mind) {
 fn bench_stats(c: &mut Criterion) {
     let (_dir, mind) = setup_mind(100);
 
-    c.bench_function("Mind::stats (100 observations, cold)", |b| {
+    c.bench_function("Mind::remember+stats (100 base, cache-invalidated)", |b| {
         b.iter(|| {
             // Invalidate cache by adding an observation before each stats call.
             mind.remember(ObservationType::Discovery, "bench", "extra", None, None)

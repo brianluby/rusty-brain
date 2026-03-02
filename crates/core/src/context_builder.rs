@@ -80,7 +80,7 @@ pub(crate) fn build(
                 }
                 let obs_tokens = estimate_item_tokens(&obs);
                 if tokens_used + obs_tokens > budget {
-                    break;
+                    continue;
                 }
                 tokens_used += obs_tokens;
                 relevant_memories.push(obs);
@@ -103,7 +103,7 @@ pub(crate) fn build(
         if let Some(summary) = parse_session_summary_from_metadata(&hit.metadata) {
             let summary_tokens = estimate_summary_tokens(&summary);
             if tokens_used + summary_tokens > budget {
-                break;
+                continue;
             }
             tokens_used += summary_tokens;
             session_summaries.push(summary);
@@ -129,21 +129,18 @@ fn parse_observation_from_metadata(meta: &serde_json::Value) -> Option<Observati
         .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
         .map(|dt| dt.with_timezone(&Utc))?;
 
-    let obs_type_str = meta
-        .get("obs_type")
-        .and_then(|v| v.as_str())
-        .unwrap_or("discovery");
-    let obs_type: ObservationType = obs_type_str.parse().unwrap_or(ObservationType::Discovery);
+    let obs_type_str = meta.get("obs_type").and_then(|v| v.as_str())?;
+    let obs_type: ObservationType = obs_type_str.parse().ok()?;
 
     let tool_name = meta
         .get("tool_name")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
+        .filter(|s| !s.is_empty())?
         .to_string();
     let summary = meta
         .get("summary")
         .and_then(|v| v.as_str())
-        .unwrap_or("")
+        .filter(|s| !s.is_empty())?
         .to_string();
     let content = meta
         .get("content")

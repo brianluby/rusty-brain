@@ -73,7 +73,7 @@ pub(crate) fn validate_and_open(path: &Path) -> Result<OpenAction, RustyBrainErr
 /// Renames `path` to `{path}.backup-{YYYYMMDD-HHMMSS}`. Sets backup file
 /// permissions to 0600. Deletes oldest backups beyond `max_backups`.
 pub(crate) fn backup_and_prune(path: &Path, max_backups: usize) -> Result<(), RustyBrainError> {
-    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S");
+    let timestamp = chrono::Utc::now().format("%Y%m%d-%H%M%S%f");
     let backup_name = format!("{}.backup-{timestamp}", path.display());
     let backup_path = Path::new(&backup_name);
 
@@ -88,7 +88,11 @@ pub(crate) fn backup_and_prune(path: &Path, max_backups: usize) -> Result<(), Ru
     {
         use std::os::unix::fs::PermissionsExt;
         let perms = std::fs::Permissions::from_mode(0o600);
-        let _ = std::fs::set_permissions(backup_path, perms);
+        std::fs::set_permissions(backup_path, perms).map_err(|e| RustyBrainError::FileSystem {
+            code: error_codes::E_FS_IO_ERROR,
+            message: format!("failed to set backup permissions: {backup_name}"),
+            source: Some(e),
+        })?;
     }
 
     // Prune old backups
