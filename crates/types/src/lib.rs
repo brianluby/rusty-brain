@@ -35,7 +35,7 @@ pub mod stats;
 
 pub use config::MindConfig;
 pub use context::InjectedContext;
-pub use error::{AgentBrainError, error_codes};
+pub use error::{AgentBrainError, RustyBrainError, StorageSource, error_codes};
 pub use hooks::{HookInput, HookOutput};
 pub use observation::{Observation, ObservationMetadata, ObservationType};
 pub use session::SessionSummary;

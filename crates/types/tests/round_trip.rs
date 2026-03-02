@@ -41,7 +41,7 @@ fn make_full_observation(obs_type: ObservationType, summary: &str, content: &str
         obs_type,
         "integration_test_tool".to_string(),
         summary.to_string(),
-        content.to_string(),
+        Some(content.to_string()),
         Some(metadata),
     )
     .expect("valid observation must construct without error")

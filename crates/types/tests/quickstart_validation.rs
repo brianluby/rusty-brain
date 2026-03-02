@@ -5,17 +5,17 @@ use types::{
     AgentBrainError, HookInput, MindConfig, Observation, ObservationMetadata, ObservationType,
     error_codes,
 };
-use uuid::Uuid;
+use ulid::Ulid;
 
 #[test]
 fn quickstart_creating_an_observation() {
     let obs = Observation {
-        id: Uuid::new_v4(),
+        id: Ulid::new(),
         timestamp: Utc::now(),
         obs_type: ObservationType::Discovery,
         tool_name: "Read".to_string(),
         summary: "Found config pattern in main.rs".to_string(),
-        content: "The main.rs file uses a builder pattern for config...".to_string(),
+        content: Some("The main.rs file uses a builder pattern for config...".to_string()),
         metadata: Some(ObservationMetadata {
             files: vec!["src/main.rs".to_string()],
             platform: "claude".to_string(),
@@ -63,12 +63,12 @@ fn quickstart_configuration_with_defaults() {
 #[test]
 fn quickstart_json_round_trip() {
     let obs = Observation {
-        id: Uuid::new_v4(),
+        id: Ulid::new(),
         timestamp: Utc::now(),
         obs_type: ObservationType::Discovery,
         tool_name: "Read".to_string(),
         summary: "Found config pattern in main.rs".to_string(),
-        content: "The main.rs file uses a builder pattern for config...".to_string(),
+        content: Some("The main.rs file uses a builder pattern for config...".to_string()),
         metadata: Some(ObservationMetadata {
             files: vec!["src/main.rs".to_string()],
             platform: "claude".to_string(),
