@@ -9,7 +9,7 @@
 //! well-formed [`PipelineResult`] with `skipped = true` and a diagnostic record.
 
 use serde::{Deserialize, Serialize};
-use types::{DiagnosticRecord, DiagnosticSeverity, IdentitySource, PlatformEvent, ProjectIdentity};
+use types::{DiagnosticRecord, DiagnosticSeverity, PlatformEvent, ProjectIdentity};
 
 use crate::contract::validate_contract;
 use crate::identity::resolve_project_identity;
@@ -78,7 +78,7 @@ impl EventPipeline {
 
         // Step 2: Identity resolution.
         let identity = resolve_project_identity(&event.project_context);
-        if identity.source == IdentitySource::Unresolved {
+        if identity.key.is_none() {
             let reason = "missing_project_identity".to_string();
             let diagnostic = DiagnosticRecord::new(
                 event.platform.clone(),
@@ -112,7 +112,7 @@ impl EventPipeline {
 mod tests {
     use super::*;
     use chrono::Utc;
-    use types::{EventKind, ProjectContext};
+    use types::{EventKind, IdentitySource, ProjectContext};
     use uuid::Uuid;
 
     // -------------------------------------------------------------------------

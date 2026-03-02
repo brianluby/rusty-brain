@@ -40,8 +40,11 @@ let platform_name = detect_platform(&input);
 
 // 3. Resolve adapter from registry
 let registry = AdapterRegistry::with_builtins();
-let adapter = registry.resolve(&platform_name)
-    .expect("built-in adapter must exist for detected platform");
+let Some(adapter) = registry.resolve(&platform_name) else {
+    // No adapter registered for this platform.
+    // Fail-open: skip silently
+    return Ok(());
+};
 
 // 4. Normalize into a typed event
 let event = adapter.normalize(&input, &input.hook_event_name);

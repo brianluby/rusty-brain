@@ -84,4 +84,4 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O. (005-platform-adapter-system)
 
 ## Recent Changes
-- 005-platform-adapter-system: Added Rust 1.85.0 (stable, edition 2024) + serde/serde_json (serialization), uuid (event IDs), chrono (timestamps), semver (contract version parsing), thiserror (errors). All already in workspace `Cargo.toml`.
+- 005-platform-adapter-system: Wired the `platforms` crate to use `types`, serde/serde_json (serialization), uuid (event IDs), chrono (timestamps), semver (contract version parsing), and thiserror (errors) already present in the workspace `Cargo.toml`, and added `temp-env` as a dev-dependency.
