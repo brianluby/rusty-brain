@@ -89,11 +89,13 @@ pub(crate) fn build(
     }
 
     // 3. Session summaries (lowest priority).
+    // Use a larger intermediate limit to account for non-tagged false positives,
+    // then take only the first MAX_SESSION_SUMMARIES tagged hits.
     let mut session_summaries = Vec::new();
-    let summary_hits = backend.find("session_summary", MAX_SESSION_SUMMARIES)?;
+    let summary_hits = backend.find("session_summary", MAX_SESSION_SUMMARIES * 3)?;
 
     for hit in &summary_hits {
-        if tokens_used >= budget {
+        if session_summaries.len() >= MAX_SESSION_SUMMARIES || tokens_used >= budget {
             break;
         }
         // Only include hits actually tagged as session summaries.

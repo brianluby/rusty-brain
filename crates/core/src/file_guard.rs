@@ -54,6 +54,14 @@ pub(crate) fn validate_and_open(path: &Path) -> Result<OpenAction, RustyBrainErr
         source: Some(e),
     })?;
 
+    if !metadata.is_file() {
+        return Err(RustyBrainError::FileSystem {
+            code: error_codes::E_FS_IO_ERROR,
+            message: format!("path is not a regular file: {path_str}"),
+            source: None,
+        });
+    }
+
     if metadata.len() > MAX_FILE_SIZE {
         return Err(RustyBrainError::FileTooLarge {
             code: error_codes::E_STORAGE_FILE_TOO_LARGE,

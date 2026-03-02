@@ -238,11 +238,11 @@ impl Mind {
     ///
     /// Returns `RustyBrainError::InvalidInput` if `summary` is empty.
     /// Returns `RustyBrainError::Storage` if the backend write fails.
-    #[tracing::instrument(skip(self, decisions, files_modified))]
+    #[tracing::instrument(skip(self, decisions, modified_files))]
     pub fn save_session_summary(
         &self,
         decisions: Vec<String>,
-        files_modified: Vec<String>,
+        modified_files: Vec<String>,
         summary: &str,
     ) -> Result<String, RustyBrainError> {
         let now = Utc::now();
@@ -255,7 +255,7 @@ impl Mind {
             now,
             0,
             decisions,
-            files_modified,
+            modified_files,
             summary.to_string(),
         )?;
 
