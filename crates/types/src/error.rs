@@ -60,7 +60,29 @@ pub mod error_codes {
     pub const E_PLATFORM_PATH_TRAVERSAL: &str = "E_PLATFORM_PATH_TRAVERSAL";
     /// No adapter registered for the requested platform name.
     pub const E_PLATFORM_ADAPTER_NOT_FOUND: &str = "E_PLATFORM_ADAPTER_NOT_FOUND";
+
+    /// Memvid storage backend error (wraps memvid-core errors).
+    pub const E_STORAGE_BACKEND: &str = "E_STORAGE_BACKEND";
+    /// Memory file is corrupted and cannot be opened.
+    pub const E_STORAGE_CORRUPTED_FILE: &str = "E_STORAGE_CORRUPTED_FILE";
+    /// Memory file exceeds the maximum allowed size.
+    pub const E_STORAGE_FILE_TOO_LARGE: &str = "E_STORAGE_FILE_TOO_LARGE";
 }
+
+/// Opaque wrapper for storage backend error messages.
+///
+/// Used as the `#[source]` in [`RustyBrainError::Storage`] to preserve the
+/// `Error::source()` chain when the original error type is not `Send + Sync`.
+#[derive(Debug)]
+pub struct StorageSource(pub String);
+
+impl std::fmt::Display for StorageSource {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for StorageSource {}
 
 /// Unified error type for all rusty-brain operations.
 ///
@@ -70,7 +92,7 @@ pub mod error_codes {
 /// new variants can be added without a breaking change.
 #[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
-pub enum AgentBrainError {
+pub enum RustyBrainError {
     /// Filesystem I/O failure (read, write, path resolution).
     #[error("[{code}] {message}")]
     FileSystem {
@@ -133,9 +155,48 @@ pub enum AgentBrainError {
         /// Human-readable description of the failure.
         message: String,
     },
+    /// Memvid storage backend error (wraps memvid-core errors).
+    #[error("[{code}] {message}")]
+    Storage {
+        /// Stable error code ([`error_codes::E_STORAGE_BACKEND`]).
+        code: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+        /// Underlying error source (memvid errors are converted to strings
+        /// because the original types may not be `Send + Sync`).
+        #[source]
+        source: Option<StorageSource>,
+    },
+    /// Memory file is corrupted and cannot be opened.
+    #[error("[{code}] {message}")]
+    CorruptedFile {
+        /// Stable error code ([`error_codes::E_STORAGE_CORRUPTED_FILE`]).
+        code: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+    },
+    /// Memory file exceeds the maximum allowed size.
+    #[error("[{code}] {message}")]
+    FileTooLarge {
+        /// Stable error code ([`error_codes::E_STORAGE_FILE_TOO_LARGE`]).
+        code: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+    },
+    /// Lock acquisition timed out after retry attempts.
+    #[error("[{code}] {message}")]
+    LockTimeout {
+        /// Stable error code ([`error_codes::E_LOCK_TIMEOUT`]).
+        code: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+    },
 }
 
-impl AgentBrainError {
+/// Backwards-compatible alias for [`RustyBrainError`].
+pub type AgentBrainError = RustyBrainError;
+
+impl RustyBrainError {
     /// Returns the stable error code string for this error.
     #[must_use]
     pub fn code(&self) -> &'static str {
@@ -146,7 +207,11 @@ impl AgentBrainError {
             | Self::Lock { code, .. }
             | Self::MemoryCorruption { code, .. }
             | Self::InvalidInput { code, .. }
-            | Self::Platform { code, .. } => code,
+            | Self::Platform { code, .. }
+            | Self::Storage { code, .. }
+            | Self::CorruptedFile { code, .. }
+            | Self::FileTooLarge { code, .. }
+            | Self::LockTimeout { code, .. } => code,
         }
     }
 }
@@ -160,7 +225,7 @@ mod tests {
 
     #[test]
     fn filesystem_variant_has_correct_code() {
-        let err = AgentBrainError::FileSystem {
+        let err = RustyBrainError::FileSystem {
             code: error_codes::E_FS_NOT_FOUND,
             message: "file not found".to_string(),
             source: None,
@@ -171,7 +236,7 @@ mod tests {
 
     #[test]
     fn configuration_variant_has_correct_code() {
-        let err = AgentBrainError::Configuration {
+        let err = RustyBrainError::Configuration {
             code: error_codes::E_CONFIG_INVALID_VALUE,
             message: "bad config".to_string(),
         };
@@ -181,7 +246,7 @@ mod tests {
 
     #[test]
     fn serialization_variant_has_correct_code() {
-        let err = AgentBrainError::Serialization {
+        let err = RustyBrainError::Serialization {
             code: error_codes::E_SER_SERIALIZE_FAILED,
             message: "serialize failed".to_string(),
             source: None,
@@ -195,7 +260,7 @@ mod tests {
 
     #[test]
     fn lock_variant_has_correct_code() {
-        let err = AgentBrainError::Lock {
+        let err = RustyBrainError::Lock {
             code: error_codes::E_LOCK_ACQUISITION_FAILED,
             message: "lock failed".to_string(),
         };
@@ -205,7 +270,7 @@ mod tests {
 
     #[test]
     fn memory_corruption_variant_has_correct_code() {
-        let err = AgentBrainError::MemoryCorruption {
+        let err = RustyBrainError::MemoryCorruption {
             code: error_codes::E_MEM_CORRUPTED_INDEX,
             message: "index corrupt".to_string(),
         };
@@ -215,7 +280,7 @@ mod tests {
 
     #[test]
     fn invalid_input_variant_has_correct_code() {
-        let err = AgentBrainError::InvalidInput {
+        let err = RustyBrainError::InvalidInput {
             code: error_codes::E_INPUT_EMPTY_FIELD,
             message: "field empty".to_string(),
         };
@@ -239,7 +304,7 @@ mod tests {
     #[test]
     fn filesystem_source_returns_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
-        let err = AgentBrainError::FileSystem {
+        let err = RustyBrainError::FileSystem {
             code: error_codes::E_FS_NOT_FOUND,
             message: "file not found".to_string(),
             source: Some(io_err),
@@ -250,7 +315,7 @@ mod tests {
     #[test]
     fn serialization_source_returns_serde_error() {
         let serde_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
-        let err = AgentBrainError::Serialization {
+        let err = RustyBrainError::Serialization {
             code: error_codes::E_SER_DESERIALIZE_FAILED,
             message: "deser failed".to_string(),
             source: Some(serde_err),
@@ -259,26 +324,52 @@ mod tests {
     }
 
     #[test]
+    fn storage_source_returns_storage_source_error() {
+        let err = RustyBrainError::Storage {
+            code: error_codes::E_STORAGE_BACKEND,
+            message: "backend failed".to_string(),
+            source: Some(super::StorageSource("memvid error".to_string())),
+        };
+        let src = err
+            .source()
+            .expect("source must be Some for Storage with StorageSource");
+        assert!(
+            src.downcast_ref::<super::StorageSource>().is_some(),
+            "source must downcast to StorageSource"
+        );
+    }
+
+    #[test]
+    fn storage_without_source_returns_none() {
+        let err = RustyBrainError::Storage {
+            code: error_codes::E_STORAGE_BACKEND,
+            message: "backend failed".to_string(),
+            source: None,
+        };
+        assert!(err.source().is_none());
+    }
+
+    #[test]
     fn variants_without_source_return_none() {
-        let err = AgentBrainError::Configuration {
+        let err = RustyBrainError::Configuration {
             code: error_codes::E_CONFIG_INVALID_VALUE,
             message: "bad".to_string(),
         };
         assert!(err.source().is_none());
 
-        let err = AgentBrainError::Lock {
+        let err = RustyBrainError::Lock {
             code: error_codes::E_LOCK_TIMEOUT,
             message: "timeout".to_string(),
         };
         assert!(err.source().is_none());
 
-        let err = AgentBrainError::MemoryCorruption {
+        let err = RustyBrainError::MemoryCorruption {
             code: error_codes::E_MEM_INVALID_CHECKSUM,
             message: "bad checksum".to_string(),
         };
         assert!(err.source().is_none());
 
-        let err = AgentBrainError::InvalidInput {
+        let err = RustyBrainError::InvalidInput {
             code: error_codes::E_INPUT_OUT_OF_RANGE,
             message: "out of range".to_string(),
         };
@@ -359,6 +450,15 @@ mod tests {
                 error_codes::E_PLATFORM_ADAPTER_NOT_FOUND,
                 "E_PLATFORM_ADAPTER_NOT_FOUND",
             ),
+            (error_codes::E_STORAGE_BACKEND, "E_STORAGE_BACKEND"),
+            (
+                error_codes::E_STORAGE_CORRUPTED_FILE,
+                "E_STORAGE_CORRUPTED_FILE",
+            ),
+            (
+                error_codes::E_STORAGE_FILE_TOO_LARGE,
+                "E_STORAGE_FILE_TOO_LARGE",
+            ),
         ];
         for (actual, expected) in codes {
             assert_eq!(*actual, *expected, "error code constant mismatch");
@@ -370,7 +470,7 @@ mod tests {
     #[test]
     fn filesystem_wraps_io_error_with_source() {
         let io_err = std::io::Error::new(std::io::ErrorKind::PermissionDenied, "access denied");
-        let err = AgentBrainError::FileSystem {
+        let err = RustyBrainError::FileSystem {
             code: error_codes::E_FS_PERMISSION_DENIED,
             message: "permission denied".to_string(),
             source: Some(io_err),
@@ -387,7 +487,7 @@ mod tests {
     #[test]
     fn serialization_wraps_serde_error_with_source() {
         let serde_err = serde_json::from_str::<serde_json::Value>("not json").unwrap_err();
-        let err = AgentBrainError::Serialization {
+        let err = RustyBrainError::Serialization {
             code: error_codes::E_SER_DESERIALIZE_FAILED,
             message: "deserialize failed".to_string(),
             source: Some(serde_err),
@@ -407,7 +507,7 @@ mod tests {
     fn cause_chain_traversal() {
         // Verify AgentBrainError -> io::Error link
         let io_err = std::io::Error::new(std::io::ErrorKind::Other, "underlying failure");
-        let agent_err = AgentBrainError::FileSystem {
+        let agent_err = RustyBrainError::FileSystem {
             code: error_codes::E_FS_IO_ERROR,
             message: "io failed".to_string(),
             source: Some(io_err),
@@ -417,7 +517,7 @@ mod tests {
 
         // Verify serde error chain
         let serde_err = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
-        let agent_err = AgentBrainError::Serialization {
+        let agent_err = RustyBrainError::Serialization {
             code: error_codes::E_SER_DESERIALIZE_FAILED,
             message: "deser failed".to_string(),
             source: Some(serde_err),
@@ -431,7 +531,7 @@ mod tests {
         let cases: &[(&str, AgentBrainError)] = &[
             (
                 "[E_FS_NOT_FOUND] file missing",
-                AgentBrainError::FileSystem {
+                RustyBrainError::FileSystem {
                     code: error_codes::E_FS_NOT_FOUND,
                     message: "file missing".to_string(),
                     source: None,
@@ -439,14 +539,14 @@ mod tests {
             ),
             (
                 "[E_CONFIG_INVALID_VALUE] bad value",
-                AgentBrainError::Configuration {
+                RustyBrainError::Configuration {
                     code: error_codes::E_CONFIG_INVALID_VALUE,
                     message: "bad value".to_string(),
                 },
             ),
             (
                 "[E_SER_SERIALIZE_FAILED] encode error",
-                AgentBrainError::Serialization {
+                RustyBrainError::Serialization {
                     code: error_codes::E_SER_SERIALIZE_FAILED,
                     message: "encode error".to_string(),
                     source: None,
@@ -454,21 +554,21 @@ mod tests {
             ),
             (
                 "[E_LOCK_TIMEOUT] timed out",
-                AgentBrainError::Lock {
+                RustyBrainError::Lock {
                     code: error_codes::E_LOCK_TIMEOUT,
                     message: "timed out".to_string(),
                 },
             ),
             (
                 "[E_MEM_CORRUPTED_INDEX] index bad",
-                AgentBrainError::MemoryCorruption {
+                RustyBrainError::MemoryCorruption {
                     code: error_codes::E_MEM_CORRUPTED_INDEX,
                     message: "index bad".to_string(),
                 },
             ),
             (
                 "[E_INPUT_INVALID_FORMAT] bad format",
-                AgentBrainError::InvalidInput {
+                RustyBrainError::InvalidInput {
                     code: error_codes::E_INPUT_INVALID_FORMAT,
                     message: "bad format".to_string(),
                 },
@@ -478,6 +578,35 @@ mod tests {
                 AgentBrainError::Platform {
                     code: error_codes::E_PLATFORM_ADAPTER_NOT_FOUND,
                     message: "no adapter".to_string(),
+                },
+            ),
+            (
+                "[E_STORAGE_BACKEND] backend failed",
+                RustyBrainError::Storage {
+                    code: error_codes::E_STORAGE_BACKEND,
+                    message: "backend failed".to_string(),
+                    source: None,
+                },
+            ),
+            (
+                "[E_STORAGE_CORRUPTED_FILE] file corrupt",
+                RustyBrainError::CorruptedFile {
+                    code: error_codes::E_STORAGE_CORRUPTED_FILE,
+                    message: "file corrupt".to_string(),
+                },
+            ),
+            (
+                "[E_STORAGE_FILE_TOO_LARGE] too big",
+                RustyBrainError::FileTooLarge {
+                    code: error_codes::E_STORAGE_FILE_TOO_LARGE,
+                    message: "too big".to_string(),
+                },
+            ),
+            (
+                "[E_LOCK_TIMEOUT] lock timed out",
+                RustyBrainError::LockTimeout {
+                    code: error_codes::E_LOCK_TIMEOUT,
+                    message: "lock timed out".to_string(),
                 },
             ),
         ];

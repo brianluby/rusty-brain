@@ -74,14 +74,13 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - No logging of memory contents at INFO or above without explicit opt-in
 
 ## Active Technologies
-- Rust: 1.85.0 (stable, edition 2024)
-- Serialization: serde, serde_json
-- Identifiers: uuid (event IDs)
-- Time: chrono (timestamps)
-- Versioning: semver (contract version parsing)
-- Errors: thiserror
+- Rust (stable), edition 2024, MSRV 1.85.0
+- memvid-core (pinned git rev `fbddef4`), ulid, fs2 (003-core-memory-engine)
+- memvid `.mv2` files on local filesystem (003-core-memory-engine)
+- serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
 
-All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O. (005-platform-adapter-system)
+All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
 ## Recent Changes
-- 005-platform-adapter-system: Wired the `platforms` crate to use `types`, serde/serde_json (serialization), uuid (event IDs), chrono (timestamps), semver (contract version parsing), and thiserror (errors) already present in the workspace `Cargo.toml`, and added `temp-env` as a dev-dependency.
+- 003-core-memory-engine: Added memvid-core (pinned git rev `fbddef4`), ulid, fs2
+- 005-platform-adapter-system: Wired the `platforms` crate to use `types`, serde/serde_json, uuid, chrono, semver, and thiserror already present in the workspace `Cargo.toml`, and added `temp-env` as a dev-dependency.

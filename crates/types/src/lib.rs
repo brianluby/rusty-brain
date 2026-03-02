@@ -45,7 +45,7 @@ pub use config::MindConfig;
 pub use context::InjectedContext;
 pub use contract_version::ContractValidationResult;
 pub use diagnostic::{DiagnosticRecord, DiagnosticSeverity};
-pub use error::{AgentBrainError, error_codes};
+pub use error::{AgentBrainError, RustyBrainError, StorageSource, error_codes};
 pub use hooks::{HookInput, HookOutput};
 pub use observation::{Observation, ObservationMetadata, ObservationType};
 pub use platform_event::{EventKind, PlatformEvent};
