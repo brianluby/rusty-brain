@@ -72,3 +72,10 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - Isolate memvid behind clean Rust abstractions (traits/wrappers) so upstream changes don't ripple
 - No network by default — any remote capability must be opt-in
 - No logging of memory contents at INFO or above without explicit opt-in
+
+## Active Technologies
+- Rust (stable), edition 2024, MSRV 1.85.0 + memvid-core (pinned git rev `fbddef4`), ulid, fs2 (003-core-memory-engine)
+- memvid `.mv2` files on local filesystem (003-core-memory-engine)
+
+## Recent Changes
+- 003-core-memory-engine: Added Rust (stable), edition 2024, MSRV 1.85.0 + memvid-core (pinned git rev `fbddef4`), ulid, fs2

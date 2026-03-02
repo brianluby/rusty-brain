@@ -10,6 +10,49 @@ description = "Memory engine (Mind) for rusty-brain"
 
 [dependencies]
 memvid-core = { workspace = true }
+types = { path = "../types" }
+ulid = { workspace = true }
+fs2 = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+criterion = { workspace = true }
+
+[[test]]
+name = "mind_roundtrip"
+path = "tests/integration/mind_roundtrip.rs"
+
+[[test]]
+name = "mind_context"
+path = "tests/integration/mind_context.rs"
+
+[[test]]
+name = "mind_recovery"
+path = "tests/integration/mind_recovery.rs"
+
+[[test]]
+name = "mind_concurrent"
+path = "tests/integration/mind_concurrent.rs"
+
+[[bench]]
+name = "store"
+harness = false
+
+[[bench]]
+name = "search"
+harness = false
+
+[[bench]]
+name = "context"
+harness = false
+
+[[bench]]
+name = "stats"
+harness = false
 
 [lints]
 workspace = true

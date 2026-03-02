@@ -53,7 +53,7 @@ mod tests {
             ObservationType::Discovery,
             "test_tool".to_string(),
             "test summary".to_string(),
-            "test content".to_string(),
+            Some("test content".to_string()),
             None,
         )
         .expect("valid observation should construct without error")
