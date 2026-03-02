@@ -117,7 +117,7 @@
 
 ### Tests for User Story 4
 
-- [x] T019 [US4] Write failing tests for `resolve_project_identity()` in `crates/platforms/src/identity.rs` — test cases: (1) platform_project_id present → key=id, source=PlatformProjectId, (2) no project_id but canonical_path → key=path, source=CanonicalPath, (3) no project_id but cwd → key=cwd, source=CanonicalPath, (4) nothing present → key=None, source=Unresolved, (5) platform_project_id takes priority over canonical_path, (6) canonical_path takes priority over cwd, (7) empty string project_id treated as absent, (8) whitespace-only project_id treated as absent, (9) cwd pointing to non-existent directory still used as-is (no filesystem I/O — string value is used directly)
+- [x] T019 [US4] Write failing tests for `resolve_project_identity()` in `crates/platforms/src/identity.rs` — test cases: (1) platform_project_id present → key=id, source=PlatformProjectId, (2) no project_id but canonical_path → key=path, source=CanonicalPath, (3) no project_id but cwd → key=cwd, source=Cwd, (4) nothing present → key=None, source=Unresolved, (5) platform_project_id takes priority over canonical_path, (6) canonical_path takes priority over cwd, (7) empty string project_id treated as absent, (8) whitespace-only project_id treated as absent, (9) cwd pointing to non-existent directory still used as-is (no filesystem I/O — string value is used directly)
 
 ### Implementation for User Story 4
 
@@ -173,7 +173,7 @@
 
 ### Tests for User Story 6
 
-- [x] T025 [US6] Write failing tests for `resolve_memory_path()` in `crates/platforms/src/path_policy.rs` — test cases: (1) no opt-in → legacy path `.agent-brain/mind.mv2`, mode LegacyFirst, (2) platform opt-in → platform-namespaced path e.g. `.claude/mind-claude.mv2`, mode PlatformOptIn, (3) path traversal attempt `../../etc/secrets` → error E_PLATFORM_PATH_TRAVERSAL, (4) platform name with special chars sanitized (e.g., "my.platform" → "my-platform"), (5) path stays within project directory, (6) define `ResolvedMemoryPath` and `PathMode` structs
+- [x] T025 [US6] Write failing tests for `resolve_memory_path()` in `crates/platforms/src/path_policy.rs` — test cases: (1) no opt-in → legacy path `.agent-brain/mind.mv2`, mode LegacyFirst, (2) platform opt-in → platform-namespaced path e.g. `.claude/mind-claude.mv2`, mode PlatformOptIn, (3) path traversal attempt `../../etc/secrets` → sanitized to safe path (dots/slashes replaced with hyphens), stays within project dir, (4) platform name with special chars sanitized (e.g., "my.platform" → "my-platform"), (5) path stays within project directory, (6) define `ResolvedMemoryPath` and `PathMode` structs
 
 ### Implementation for User Story 6
 
