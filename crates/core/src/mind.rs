@@ -66,14 +66,14 @@ impl Mind {
         match action {
             OpenAction::Create => {
                 backend.create(&memory_path)?;
-                set_file_permissions_0600(&memory_path);
+                set_file_permissions_0600(&memory_path)?;
             }
             OpenAction::Open => {
                 if let Err(e) = backend.open(&memory_path) {
                     tracing::info!(error = %e, path = %memory_path.display(), "corrupted memory file detected, recovering");
                     file_guard::backup_and_prune(&memory_path, 3)?;
                     backend.create(&memory_path)?;
-                    set_file_permissions_0600(&memory_path);
+                    set_file_permissions_0600(&memory_path)?;
                 }
             }
         }
@@ -318,9 +318,9 @@ impl Mind {
 
             // Parse obs_type from metadata.
             if let Some(obs_type_str) = frame.metadata.get("obs_type").and_then(|v| v.as_str()) {
-                let obs_type: ObservationType =
-                    obs_type_str.parse().unwrap_or(ObservationType::Discovery);
-                *type_counts.entry(obs_type).or_insert(0) += 1;
+                if let Ok(obs_type) = obs_type_str.parse::<ObservationType>() {
+                    *type_counts.entry(obs_type).or_insert(0) += 1;
+                }
             }
 
             // Count session summaries by tag.
@@ -473,15 +473,25 @@ impl Mind {
 }
 
 /// Set file permissions to 0600 (owner read/write only) per SEC-1.
+///
+/// # Errors
+///
+/// Returns `RustyBrainError::FileSystem` if the permission change fails.
 #[cfg(unix)]
-fn set_file_permissions_0600(path: &Path) {
+fn set_file_permissions_0600(path: &Path) -> Result<(), RustyBrainError> {
     use std::os::unix::fs::PermissionsExt;
     let perms = std::fs::Permissions::from_mode(0o600);
-    let _ = std::fs::set_permissions(path, perms);
+    std::fs::set_permissions(path, perms).map_err(|e| RustyBrainError::FileSystem {
+        code: error_codes::E_FS_IO_ERROR,
+        message: format!("failed to set file permissions: {}", path.display()),
+        source: Some(e),
+    })
 }
 
 #[cfg(not(unix))]
-fn set_file_permissions_0600(_path: &Path) {}
+fn set_file_permissions_0600(_path: &Path) -> Result<(), RustyBrainError> {
+    Ok(())
+}
 
 /// Parse a backend `SearchHit` into a `MemorySearchResult`.
 fn parse_search_hit(hit: &crate::backend::SearchHit) -> MemorySearchResult {

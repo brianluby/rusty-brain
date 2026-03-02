@@ -54,8 +54,9 @@ erDiagram
         PathBuf memory_path
         u32 max_context_tokens
         u32 max_context_observations
-        u32 max_relevant_memories
-        u32 max_session_summaries
+        bool auto_compress
+        f64 min_confidence
+        bool debug
     }
 
     MIND_STATS {
@@ -106,7 +107,7 @@ A single memory entry recorded by an agent. Immutable once created.
 | `content` | `Option<String>` | No | Detailed content body | Optional; empty string treated as `None` |
 | `metadata` | `Option<ObservationMetadata>` | No | Extensible metadata | Optional |
 
-**Serialization format**: JSON with camelCase keys. `obs_type` serialized as `"type"`. Schema owned exclusively by Rust types crate (SC-007).
+**Serialization format**: JSON with camelCase keys via serde (`obs_type` → `"type"`, `tool_name` → `"toolName"`). The memvid metadata JSON uses the Rust field name `"obs_type"` as the storage key for filtering and reconstruction. Schema owned exclusively by Rust types crate (SC-007).
 
 ### ObservationType (Classification Enum)
 
@@ -159,8 +160,16 @@ A compressed record of one coding session, stored as a tagged observation.
 | `memory_path` | `PathBuf` | Platform-dependent | Path to `.mv2` file |
 | `max_context_tokens` | `u32` | `2000` | Token budget for context assembly |
 | `max_context_observations` | `u32` | `20` | Max recent observations in context |
-| `max_relevant_memories` | `u32` | `10` | Max relevant memories from `find` |
-| `max_session_summaries` | `u32` | `5` | Max session summaries in context |
+| `auto_compress` | `bool` | `true` | Auto-compress observations before storage |
+| `min_confidence` | `f64` | `0.6` | Minimum confidence threshold for retrieval |
+| `debug` | `bool` | `false` | Enable debug logging |
+
+**Internal constants** (not configurable via `MindConfig`):
+
+| Constant | Value | Location | Description |
+|----------|-------|----------|-------------|
+| `MAX_RELEVANT_MEMORIES` | `10` | `context_builder.rs` | Max relevant memories from `find` |
+| `MAX_SESSION_SUMMARIES` | `5` | `context_builder.rs` | Max session summaries in context |
 
 ### MindStats
 

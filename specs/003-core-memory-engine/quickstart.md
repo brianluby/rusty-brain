@@ -107,7 +107,7 @@ assert_eq!(tokens, 2); // 11 chars / 4 = 2 (truncated)
 
 ```rust
 use rusty_brain_core::{get_mind, reset_mind};
-use rusty_brain_types::MindConfig;
+use types::MindConfig;
 
 // First call creates the instance
 let mind = get_mind(MindConfig::new("/path/to/mind.mv2"))?;
