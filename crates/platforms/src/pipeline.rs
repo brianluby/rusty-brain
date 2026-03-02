@@ -11,7 +11,7 @@
 use serde::{Deserialize, Serialize};
 use types::{DiagnosticRecord, DiagnosticSeverity, PlatformEvent, ProjectIdentity};
 
-use crate::contract::validate_contract;
+use crate::contract::{REASON_UNKNOWN_CONTRACT_ERROR, validate_contract};
 use crate::identity::resolve_project_identity;
 
 /// Result of processing an event through the pipeline.
@@ -61,7 +61,7 @@ impl EventPipeline {
         if !contract_result.compatible {
             let reason = contract_result
                 .reason
-                .unwrap_or_else(|| "unknown_contract_error".to_string());
+                .unwrap_or_else(|| REASON_UNKNOWN_CONTRACT_ERROR.to_string());
             let diagnostic = DiagnosticRecord::new(
                 event.platform.clone(),
                 reason.clone(),

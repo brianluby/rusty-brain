@@ -9,6 +9,8 @@ pub const SUPPORTED_CONTRACT_MAJOR: u64 = 1;
 pub const REASON_INCOMPATIBLE_CONTRACT_MAJOR: &str = "incompatible_contract_major";
 /// Reason string for malformed version strings.
 pub const REASON_INVALID_CONTRACT_VERSION: &str = "invalid_contract_version";
+/// Fallback reason when contract validation fails without a specific reason.
+pub const REASON_UNKNOWN_CONTRACT_ERROR: &str = "unknown_contract_error";
 
 /// Validate a contract version string against the supported major version.
 ///
