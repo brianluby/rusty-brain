@@ -72,3 +72,10 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - Isolate memvid behind clean Rust abstractions (traits/wrappers) so upstream changes don't ripple
 - No network by default — any remote capability must be opt-in
 - No logging of memory contents at INFO or above without explicit opt-in
+
+## Active Technologies
+- Rust 1.85.0 (stable, edition 2024) + serde/serde_json (serialization), uuid (event IDs), chrono (timestamps), semver (contract version parsing), thiserror (errors). All already in workspace `Cargo.toml`. (005-platform-adapter-system)
+- N/A — diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O (005-platform-adapter-system)
+
+## Recent Changes
+- 005-platform-adapter-system: Added Rust 1.85.0 (stable, edition 2024) + serde/serde_json (serialization), uuid (event IDs), chrono (timestamps), semver (contract version parsing), thiserror (errors). All already in workspace `Cargo.toml`.

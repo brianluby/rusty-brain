@@ -9,7 +9,8 @@
 /// Each constant is a `&'static str` suitable for machine parsing. Codes are
 /// grouped by subsystem prefix: `E_FS_*` (filesystem), `E_CONFIG_*`
 /// (configuration), `E_SER_*` (serialization), `E_LOCK_*` (locking),
-/// `E_MEM_*` (memory integrity), and `E_INPUT_*` (input validation).
+/// `E_MEM_*` (memory integrity), `E_INPUT_*` (input validation), and
+/// `E_PLATFORM_*` (platform adapter).
 pub mod error_codes {
     /// File or directory not found.
     pub const E_FS_NOT_FOUND: &str = "E_FS_NOT_FOUND";
@@ -46,6 +47,19 @@ pub mod error_codes {
     pub const E_INPUT_OUT_OF_RANGE: &str = "E_INPUT_OUT_OF_RANGE";
     /// Input string does not match the expected format.
     pub const E_INPUT_INVALID_FORMAT: &str = "E_INPUT_INVALID_FORMAT";
+
+    /// Event contract version is incompatible (major version mismatch).
+    pub const E_PLATFORM_INCOMPATIBLE_CONTRACT: &str = "E_PLATFORM_INCOMPATIBLE_CONTRACT";
+    /// Event contract version string could not be parsed.
+    pub const E_PLATFORM_INVALID_CONTRACT_VERSION: &str = "E_PLATFORM_INVALID_CONTRACT_VERSION";
+    /// Hook input lacks a required session ID.
+    pub const E_PLATFORM_MISSING_SESSION_ID: &str = "E_PLATFORM_MISSING_SESSION_ID";
+    /// Project identity could not be resolved from context.
+    pub const E_PLATFORM_MISSING_PROJECT_IDENTITY: &str = "E_PLATFORM_MISSING_PROJECT_IDENTITY";
+    /// Resolved memory path escapes the project directory.
+    pub const E_PLATFORM_PATH_TRAVERSAL: &str = "E_PLATFORM_PATH_TRAVERSAL";
+    /// No adapter registered for the requested platform name.
+    pub const E_PLATFORM_ADAPTER_NOT_FOUND: &str = "E_PLATFORM_ADAPTER_NOT_FOUND";
 }
 
 /// Unified error type for all rusty-brain operations.
@@ -111,6 +125,14 @@ pub enum AgentBrainError {
         /// Human-readable description of the failure.
         message: String,
     },
+    /// Platform adapter system failure.
+    #[error("[{code}] {message}")]
+    Platform {
+        /// Stable error code (e.g. [`error_codes::E_PLATFORM_PATH_TRAVERSAL`]).
+        code: &'static str,
+        /// Human-readable description of the failure.
+        message: String,
+    },
 }
 
 impl AgentBrainError {
@@ -123,7 +145,8 @@ impl AgentBrainError {
             | Self::Serialization { code, .. }
             | Self::Lock { code, .. }
             | Self::MemoryCorruption { code, .. }
-            | Self::InvalidInput { code, .. } => code,
+            | Self::InvalidInput { code, .. }
+            | Self::Platform { code, .. } => code,
         }
     }
 }
@@ -201,6 +224,19 @@ mod tests {
     }
 
     #[test]
+    fn platform_variant_has_correct_code() {
+        let err = AgentBrainError::Platform {
+            code: error_codes::E_PLATFORM_PATH_TRAVERSAL,
+            message: "path traversal detected".to_string(),
+        };
+        assert_eq!(err.code(), "E_PLATFORM_PATH_TRAVERSAL");
+        assert_eq!(
+            format!("{err}"),
+            "[E_PLATFORM_PATH_TRAVERSAL] path traversal detected"
+        );
+    }
+
+    #[test]
     fn filesystem_source_returns_io_error() {
         let io_err = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
         let err = AgentBrainError::FileSystem {
@@ -245,6 +281,12 @@ mod tests {
         let err = AgentBrainError::InvalidInput {
             code: error_codes::E_INPUT_OUT_OF_RANGE,
             message: "out of range".to_string(),
+        };
+        assert!(err.source().is_none());
+
+        let err = AgentBrainError::Platform {
+            code: error_codes::E_PLATFORM_MISSING_SESSION_ID,
+            message: "no session id".to_string(),
         };
         assert!(err.source().is_none());
     }
@@ -292,6 +334,30 @@ mod tests {
             (
                 error_codes::E_INPUT_INVALID_FORMAT,
                 "E_INPUT_INVALID_FORMAT",
+            ),
+            (
+                error_codes::E_PLATFORM_INCOMPATIBLE_CONTRACT,
+                "E_PLATFORM_INCOMPATIBLE_CONTRACT",
+            ),
+            (
+                error_codes::E_PLATFORM_INVALID_CONTRACT_VERSION,
+                "E_PLATFORM_INVALID_CONTRACT_VERSION",
+            ),
+            (
+                error_codes::E_PLATFORM_MISSING_SESSION_ID,
+                "E_PLATFORM_MISSING_SESSION_ID",
+            ),
+            (
+                error_codes::E_PLATFORM_MISSING_PROJECT_IDENTITY,
+                "E_PLATFORM_MISSING_PROJECT_IDENTITY",
+            ),
+            (
+                error_codes::E_PLATFORM_PATH_TRAVERSAL,
+                "E_PLATFORM_PATH_TRAVERSAL",
+            ),
+            (
+                error_codes::E_PLATFORM_ADAPTER_NOT_FOUND,
+                "E_PLATFORM_ADAPTER_NOT_FOUND",
             ),
         ];
         for (actual, expected) in codes {
@@ -405,6 +471,13 @@ mod tests {
                 AgentBrainError::InvalidInput {
                     code: error_codes::E_INPUT_INVALID_FORMAT,
                     message: "bad format".to_string(),
+                },
+            ),
+            (
+                "[E_PLATFORM_ADAPTER_NOT_FOUND] no adapter",
+                AgentBrainError::Platform {
+                    code: error_codes::E_PLATFORM_ADAPTER_NOT_FOUND,
+                    message: "no adapter".to_string(),
                 },
             ),
         ];

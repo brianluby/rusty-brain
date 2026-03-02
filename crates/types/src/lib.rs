@@ -22,12 +22,20 @@
 pub mod config;
 /// Context payload injected into an agent's system prompt.
 pub mod context;
+/// Contract version validation result for platform adapter events.
+pub mod contract_version;
+/// Diagnostic types for structured, redacted error and warning records.
+pub mod diagnostic;
 /// Unified error type and stable error code constants.
 pub mod error;
 /// Claude Code hook protocol request and response types.
 pub mod hooks;
 /// Observation types representing individual memory entries.
 pub mod observation;
+/// Platform event types for normalized agent session events.
+pub mod platform_event;
+/// Project context and identity types for platform adapters.
+pub mod project_context;
 /// Session summary representing an aggregated coding session.
 pub mod session;
 /// Read-only statistics snapshot of the memory store.
@@ -35,8 +43,12 @@ pub mod stats;
 
 pub use config::MindConfig;
 pub use context::InjectedContext;
+pub use contract_version::ContractValidationResult;
+pub use diagnostic::{DiagnosticRecord, DiagnosticSeverity};
 pub use error::{AgentBrainError, error_codes};
 pub use hooks::{HookInput, HookOutput};
 pub use observation::{Observation, ObservationMetadata, ObservationType};
+pub use platform_event::{EventKind, PlatformEvent};
+pub use project_context::{IdentitySource, ProjectContext, ProjectIdentity};
 pub use session::SessionSummary;
 pub use stats::MindStats;
