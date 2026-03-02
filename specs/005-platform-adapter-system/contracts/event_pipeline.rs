@@ -68,7 +68,7 @@ pub fn resolve_project_identity(context: &ProjectContext) -> ProjectIdentity;
 /// - Resolved path MUST stay within project_dir (FR-014)
 /// - Returns Err with E_PLATFORM_PATH_TRAVERSAL if path escapes project dir
 ///
-/// Does NOT perform filesystem I/O. Returns a PathBuf.
+/// Does NOT perform filesystem I/O. Returns a `Result<ResolvedMemoryPath, AgentBrainError>`.
 pub fn resolve_memory_path(
     project_dir: &Path,
     platform_name: &str,

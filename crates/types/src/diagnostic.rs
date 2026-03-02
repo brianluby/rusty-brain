@@ -97,7 +97,7 @@ impl DiagnosticRecord {
             affected_fields: deduped,
             severity,
             redacted: true,
-            retention_days: 30,
+            retention_days: DIAGNOSTIC_RETENTION_DAYS,
             expires_at: expires,
         }
     }

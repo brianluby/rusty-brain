@@ -57,8 +57,13 @@ specs/005-platform-adapter-system/
 │   ├── platform_adapter.rs    # PlatformAdapter trait definition
 │   ├── adapter_registry.rs    # AdapterRegistry trait/API
 │   └── event_pipeline.rs      # EventPipeline API contract
-└── tasks.md             # Phase 2 output (/speckit.tasks)
+├── tasks.md             # Phase 2 output (/speckit.tasks)
+├── quickstart.md        # Usage examples and API walkthrough
+└── checklists/          # Quality checklists
+    └── requirements.md  # FR/SC coverage checklist
 ```
+
+**Note**: prd.md, ar.md, and sec.md were omitted for this feature. The spec.md serves as the combined requirements/architecture document, and security considerations (path traversal prevention, diagnostic redaction) are covered directly in spec.md sections and the constitution check above.
 
 ### Source Code (repository root)
 

@@ -28,7 +28,7 @@
 
 **Decision**: Use the `semver` crate (already in workspace) to parse contract versions. Extract only the major version for comparison. Pre-release and build metadata are parsed but ignored for compatibility checking.
 
-**Rationale**: The `semver` crate is already a workspace dependency (version 1). It handles all parsing edge cases (pre-release, build metadata, malformed strings) and returns `None` for unparseable versions — exactly what FR-008 needs.
+**Rationale**: The `semver` crate is already a workspace dependency (version 1). It handles all parsing edge cases (pre-release, build metadata, malformed strings). `semver::Version::parse(&str)` returns a `Result<Version, semver::Error>`, yielding `Err` on malformed input — exactly what FR-008 needs for detecting unparseable versions.
 
 **Alternatives considered**:
 - Manual parsing with `split('.')`: Fragile, doesn't handle pre-release/build metadata correctly.

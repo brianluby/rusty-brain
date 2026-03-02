@@ -20,7 +20,7 @@ detect_platform() ──→ AdapterRegistry::resolve() ──→ Option<&dyn Pla
 PlatformEvent ────→ EventPipeline::process() ────→ PipelineResult
                         │                              │
                         ├─ validate_contract()          ├─ skipped: bool
-                        └─ resolve_identity()           ├─ reason: Option<String>
+                        └─ resolve_project_identity()   ├─ reason: Option<String>
                                                         ├─ identity: Option<ProjectIdentity>
                                                         └─ diagnostic: Option<DiagnosticRecord>
 ```
@@ -228,11 +228,13 @@ pub const E_PLATFORM_ADAPTER_NOT_FOUND: &str = "E_PLATFORM_ADAPTER_NOT_FOUND";
 ## Constants
 
 ```rust
-// In platforms crate
-pub const SUPPORTED_CONTRACT_MAJOR: u64 = 1;
-pub const ADAPTER_CONTRACT_VERSION: &str = "1.0.0";
+// In types crate (crates/types/src/diagnostic.rs)
 pub const DIAGNOSTIC_RETENTION_DAYS: u32 = 30;
 pub const MAX_DIAGNOSTIC_FIELDS: usize = 20;
+
+// In platforms crate (crates/platforms/src/)
+pub const SUPPORTED_CONTRACT_MAJOR: u64 = 1;
+pub const ADAPTER_CONTRACT_VERSION: &str = "1.0.0";
 pub const DEFAULT_LEGACY_PATH: &str = ".agent-brain/mind.mv2";
 pub const DEFAULT_PLATFORM: &str = "claude";
 ```

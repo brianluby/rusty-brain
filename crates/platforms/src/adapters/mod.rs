@@ -4,6 +4,8 @@
 pub mod claude;
 /// OpenCode platform adapter.
 pub mod opencode;
+#[cfg(test)]
+pub(crate) mod test_helpers;
 
 pub use claude::claude_adapter;
 pub use opencode::opencode_adapter;

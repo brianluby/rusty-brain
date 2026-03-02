@@ -5,6 +5,11 @@ use types::ContractValidationResult;
 /// The major version currently supported by the adapter system.
 pub const SUPPORTED_CONTRACT_MAJOR: u64 = 1;
 
+/// Reason string for major version mismatch.
+pub const REASON_INCOMPATIBLE_CONTRACT_MAJOR: &str = "incompatible_contract_major";
+/// Reason string for malformed version strings.
+pub const REASON_INVALID_CONTRACT_VERSION: &str = "invalid_contract_version";
+
 /// Validate a contract version string against the supported major version.
 ///
 /// Uses semver parsing. Pre-release and build metadata are ignored.
@@ -22,13 +27,13 @@ pub fn validate_contract(version_str: &str) -> ContractValidationResult {
             } else {
                 ContractValidationResult {
                     compatible: false,
-                    reason: Some("incompatible_contract_major".to_string()),
+                    reason: Some(REASON_INCOMPATIBLE_CONTRACT_MAJOR.to_string()),
                 }
             }
         }
         Err(_) => ContractValidationResult {
             compatible: false,
-            reason: Some("invalid_contract_version".to_string()),
+            reason: Some(REASON_INVALID_CONTRACT_VERSION.to_string()),
         },
     }
 }

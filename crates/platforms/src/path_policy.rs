@@ -147,7 +147,7 @@ mod tests {
     }
 
     #[test]
-    fn path_traversal_rejected() {
+    fn path_traversal_sanitized() {
         // Sanitization replaces dots and slashes with hyphens, so "../../etc"
         // becomes "--..--..-etc" -- inherently preventing traversal. Verify
         // the crafted name stays within the project directory.

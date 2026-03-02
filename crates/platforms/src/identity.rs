@@ -12,8 +12,8 @@ use types::{IdentitySource, ProjectContext, ProjectIdentity};
 ///
 /// Priority (FR-010):
 /// 1. `platform_project_id` (if present, non-empty, non-whitespace)
-/// 2. `canonical_path` (if present, non-empty)
-/// 3. `cwd` (if present, non-empty)
+/// 2. `canonical_path` (if present, non-empty, non-whitespace)
+/// 3. `cwd` (if present, non-empty, non-whitespace)
 /// 4. Unresolved (`key=None`)
 ///
 /// No filesystem I/O — path strings are used as provided.
@@ -30,21 +30,23 @@ pub fn resolve_project_identity(context: &ProjectContext) -> ProjectIdentity {
         }
     }
 
-    // 2. Check canonical_path.
+    // 2. Check canonical_path (trimmed; empty/whitespace-only treated as absent).
     if let Some(ref path) = context.canonical_path {
-        if !path.is_empty() {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
             return ProjectIdentity {
-                key: Some(path.clone()),
+                key: Some(trimmed.to_string()),
                 source: IdentitySource::CanonicalPath,
             };
         }
     }
 
-    // 3. Check cwd.
+    // 3. Check cwd (trimmed; empty/whitespace-only treated as absent).
     if let Some(ref cwd) = context.cwd {
-        if !cwd.is_empty() {
+        let trimmed = cwd.trim();
+        if !trimmed.is_empty() {
             return ProjectIdentity {
-                key: Some(cwd.clone()),
+                key: Some(trimmed.to_string()),
                 source: IdentitySource::Cwd,
             };
         }
@@ -181,7 +183,37 @@ mod tests {
         assert_eq!(identity.source, IdentitySource::CanonicalPath);
     }
 
-    // 9. Nonexistent cwd used as-is (no filesystem I/O)
+    // 9. Whitespace-only canonical_path treated as absent
+    #[test]
+    fn whitespace_only_canonical_path_treated_as_absent() {
+        let ctx = ProjectContext {
+            platform_project_id: None,
+            canonical_path: Some("   ".to_string()),
+            cwd: Some("/tmp/fallback".to_string()),
+        };
+
+        let identity = resolve_project_identity(&ctx);
+
+        assert_eq!(identity.key, Some("/tmp/fallback".to_string()));
+        assert_eq!(identity.source, IdentitySource::Cwd);
+    }
+
+    // 10. Whitespace-only cwd treated as absent
+    #[test]
+    fn whitespace_only_cwd_treated_as_absent() {
+        let ctx = ProjectContext {
+            platform_project_id: None,
+            canonical_path: None,
+            cwd: Some("   ".to_string()),
+        };
+
+        let identity = resolve_project_identity(&ctx);
+
+        assert_eq!(identity.key, None);
+        assert_eq!(identity.source, IdentitySource::Unresolved);
+    }
+
+    // 11. Nonexistent cwd used as-is (no filesystem I/O)
     #[test]
     fn nonexistent_cwd_used_as_is() {
         let ctx = ProjectContext {

@@ -59,11 +59,14 @@ impl PlatformAdapter for BuiltinAdapter {
             "sessionstart" | "session_start" => EventKind::SessionStart,
             "posttooluse" | "pretooluse" | "tool_observation" => {
                 // Tool name required for tool observations (FR-005).
-                let tool_name = input.tool_name.as_ref()?.clone();
-                if tool_name.is_empty() {
+                let tool_name = input.tool_name.as_ref()?;
+                let trimmed = tool_name.trim();
+                if trimmed.is_empty() {
                     return None;
                 }
-                EventKind::ToolObservation { tool_name }
+                EventKind::ToolObservation {
+                    tool_name: trimmed.to_string(),
+                }
             }
             "stop" | "sessionstop" | "session_stop" => EventKind::SessionStop,
             _ => return None,
@@ -121,6 +124,25 @@ mod tests {
             adapter.contract_version(),
             "1.0.0",
             "factory must create adapter with contract version 1.0.0"
+        );
+    }
+
+    #[test]
+    fn whitespace_only_tool_name_returns_none() {
+        let adapter = create_builtin_adapter("claude");
+        let json = r#"{
+            "session_id": "test-session",
+            "transcript_path": "/tmp/t.jsonl",
+            "cwd": "/tmp",
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "   "
+        }"#;
+        let input: types::HookInput = serde_json::from_str(json).expect("valid HookInput JSON");
+        let result = adapter.normalize(&input, "PostToolUse");
+        assert!(
+            result.is_none(),
+            "whitespace-only tool_name must return None"
         );
     }
 

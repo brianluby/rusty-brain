@@ -56,14 +56,22 @@ let pipeline = EventPipeline::new();
 let result = pipeline.process(&event);
 
 if result.skipped {
-    // Event was skipped — diagnostic available in result.diagnostic
-    eprintln!("Skipped: {:?}", result.reason);
+    // Event was skipped — emit structured JSON diagnostic
+    let output = serde_json::json!({
+        "status": "skipped",
+        "reason": result.reason,
+    });
+    println!("{}", serde_json::to_string(&output)?);
     return Ok(());
 }
 
 // 6. Use the resolved identity for memory isolation
 let identity = result.identity.unwrap();
-println!("Project key: {:?} (source: {:?})", identity.key, identity.source);
+let output = serde_json::json!({
+    "status": "ok",
+    "identity": { "key": identity.key, "source": identity.source },
+});
+println!("{}", serde_json::to_string(&output)?);
 ```
 
 ## Adding a Custom Platform Adapter

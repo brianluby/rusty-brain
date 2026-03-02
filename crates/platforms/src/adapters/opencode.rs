@@ -15,32 +15,8 @@ pub fn opencode_adapter() -> Box<dyn crate::adapter::PlatformAdapter> {
 mod tests {
     use super::*;
     use crate::adapters::claude::claude_adapter;
+    use crate::adapters::test_helpers::make_input;
     use types::{EventKind, HookInput};
-
-    // -------------------------------------------------------------------------
-    // Helper: build a HookInput for OpenCode testing via JSON deserialization
-    // (HookInput is #[non_exhaustive], so struct literal syntax is unavailable
-    // from external crates).
-    // -------------------------------------------------------------------------
-
-    fn make_input(hook_event_name: &str, tool_name: Option<&str>) -> HookInput {
-        let tool_name_json = match tool_name {
-            Some(name) => format!(r#""tool_name": "{name}","#),
-            None => String::new(),
-        };
-        let json = format!(
-            r#"{{
-                "session_id": "test-session-123",
-                "transcript_path": "/tmp/transcript.jsonl",
-                "cwd": "/home/user/project",
-                "permission_mode": "default",
-                "hook_event_name": "{hook_event_name}",
-                {tool_name_json}
-                "platform": "opencode"
-            }}"#
-        );
-        serde_json::from_str(&json).expect("test HookInput JSON must parse")
-    }
 
     // -------------------------------------------------------------------------
     // T013: OpenCode adapter normalization tests
@@ -49,7 +25,7 @@ mod tests {
     #[test]
     fn session_start_event() {
         let adapter = opencode_adapter();
-        let input = make_input("SessionStart", None);
+        let input = make_input("SessionStart", None, "opencode");
         let event = adapter
             .normalize(&input, "SessionStart")
             .expect("SessionStart must produce Some");
@@ -59,7 +35,7 @@ mod tests {
     #[test]
     fn platform_is_opencode() {
         let adapter = opencode_adapter();
-        let input = make_input("SessionStart", None);
+        let input = make_input("SessionStart", None, "opencode");
         let event = adapter
             .normalize(&input, "SessionStart")
             .expect("must produce event");
@@ -71,7 +47,7 @@ mod tests {
         let oc_adapter = opencode_adapter();
         let cl_adapter = claude_adapter();
 
-        let oc_input = make_input("SessionStart", None);
+        let oc_input = make_input("SessionStart", None, "opencode");
         // Build a Claude input with the same fields but platform="claude".
         let cl_json = r#"{
             "session_id": "test-session-123",

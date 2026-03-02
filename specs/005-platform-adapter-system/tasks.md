@@ -200,7 +200,7 @@
 **Purpose**: Final quality pass, public API cleanup, workspace-level validation
 
 - [x] T028 Update `crates/platforms/src/lib.rs` with complete public re-exports — export all public types, traits, functions: `PlatformAdapter`, `AdapterRegistry`, `EventPipeline`, `PipelineResult`, `ResolvedMemoryPath`, `PathMode`, `detect_platform`, `validate_contract`, `resolve_project_identity`, `resolve_memory_path`, `create_builtin_adapter`, constants
-- [x] T029 Run full quality gate — `cargo test` (all green), `cargo clippy -- -D warnings` (zero warnings), `cargo fmt --check` (formatted). Fix any issues.
+- [x] T029 Run full quality gate — `cargo build` (compiles), `cargo test` (all green), `cargo clippy -- -D warnings` (zero warnings), `cargo fmt --check` (formatted). Fix any issues. Note: agent integration smoke test is N/A for this feature (library crate with no CLI commands; see plan.md quality gate note).
 - [x] T030 Verify quickstart.md code examples compile against actual public API — check that the usage flow and custom adapter examples in `specs/005-platform-adapter-system/quickstart.md` match the implemented API signatures
 
 ---
