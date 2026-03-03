@@ -16,6 +16,22 @@ use types::{
     SessionSummary, error_codes,
 };
 
+/// A single timeline entry representing a stored observation.
+///
+/// Returned by [`Mind::timeline()`]. Contains parsed metadata from the
+/// underlying backend frame.
+#[derive(Debug, Clone)]
+pub struct TimelineEntry {
+    /// The observation type (discovery, decision, etc.)
+    pub obs_type: ObservationType,
+    /// Human-readable summary of the observation
+    pub summary: String,
+    /// When the observation was recorded
+    pub timestamp: DateTime<Utc>,
+    /// The tool that generated this observation
+    pub tool_name: String,
+}
+
 /// Search result from [`Mind::search`].
 #[derive(Debug, Clone)]
 pub struct MemorySearchResult {
@@ -366,6 +382,63 @@ impl Mind {
         );
 
         Ok(stats)
+    }
+
+    /// Query timeline entries.
+    ///
+    /// Returns observations parsed from backend frames. When `reverse` is
+    /// `true`, entries are ordered most-recent-first (default CLI behavior).
+    /// When `false`, entries are ordered oldest-first.
+    ///
+    /// The `limit` parameter controls the maximum number of entries returned.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RustyBrainError::Storage`] if the backend timeline or
+    /// frame lookup fails.
+    #[tracing::instrument(skip(self))]
+    pub fn timeline(
+        &self,
+        limit: usize,
+        reverse: bool,
+    ) -> Result<Vec<TimelineEntry>, RustyBrainError> {
+        let entries = self.backend.timeline(limit, reverse)?;
+        let mut result = Vec::with_capacity(entries.len());
+        for entry in &entries {
+            let frame = self.backend.frame_by_id(entry.frame_id)?;
+            let obs_type = frame
+                .metadata
+                .get("obs_type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<ObservationType>().ok())
+                .unwrap_or(ObservationType::Discovery);
+            let summary = frame
+                .metadata
+                .get("summary")
+                .and_then(|v| v.as_str())
+                .unwrap_or(&entry.preview)
+                .to_string();
+            let timestamp = frame
+                .metadata
+                .get("timestamp")
+                .and_then(|v| v.as_str())
+                .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
+                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+            let tool_name = frame
+                .metadata
+                .get("tool_name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            result.push(TimelineEntry {
+                obs_type,
+                summary,
+                timestamp,
+                tool_name,
+            });
+        }
+        tracing::debug!(entry_count = result.len(), "timeline query complete");
+        Ok(result)
     }
 
     /// Assemble session context for agent startup.

@@ -36,6 +36,10 @@ fs2 = "0.4"
 
 # CLI
 clap = { version = "4", features = ["derive"] }
+comfy-table = "7"
+
+# Tracing subscriber (for CLI log initialization)
+tracing-subscriber = { version = "0.3", features = ["fmt", "env-filter"] }
 
 # Versioning
 semver = "1"

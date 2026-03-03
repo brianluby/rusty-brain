@@ -261,7 +261,149 @@ fn mind_is_initialized_returns_true_after_open() {
 }
 
 // =========================================================================
-// T040: Mind::get_context
+// Mind::timeline
+// =========================================================================
+
+#[test]
+fn mind_timeline_empty_returns_empty_vec() {
+    let (_dir, mind) = test_mind();
+    let entries = mind.timeline(10, true).unwrap();
+    assert!(entries.is_empty());
+}
+
+#[test]
+fn mind_timeline_reverse_order_most_recent_first() {
+    let (_dir, mind) = test_mind();
+    mind.remember(ObservationType::Discovery, "Read", "first obs", None, None)
+        .unwrap();
+    mind.remember(ObservationType::Decision, "Write", "second obs", None, None)
+        .unwrap();
+    mind.remember(ObservationType::Bugfix, "Bash", "third obs", None, None)
+        .unwrap();
+
+    let entries = mind.timeline(10, true).unwrap();
+    assert_eq!(entries.len(), 3);
+    // Most recent first (reverse=true)
+    assert_eq!(entries[0].summary, "third obs");
+    assert_eq!(entries[0].obs_type, ObservationType::Bugfix);
+    assert_eq!(entries[2].summary, "first obs");
+    assert_eq!(entries[2].obs_type, ObservationType::Discovery);
+}
+
+#[test]
+fn mind_timeline_chronological_order_oldest_first() {
+    let (_dir, mind) = test_mind();
+    mind.remember(ObservationType::Discovery, "Read", "first obs", None, None)
+        .unwrap();
+    mind.remember(ObservationType::Decision, "Write", "second obs", None, None)
+        .unwrap();
+
+    let entries = mind.timeline(10, false).unwrap();
+    assert_eq!(entries.len(), 2);
+    // Oldest first (reverse=false)
+    assert_eq!(entries[0].summary, "first obs");
+    assert_eq!(entries[1].summary, "second obs");
+}
+
+#[test]
+fn mind_timeline_limit_respected() {
+    let (_dir, mind) = test_mind();
+    for i in 0..20 {
+        mind.remember(
+            ObservationType::Discovery,
+            "Read",
+            &format!("observation {i}"),
+            None,
+            None,
+        )
+        .unwrap();
+    }
+
+    let entries = mind.timeline(5, true).unwrap();
+    assert_eq!(entries.len(), 5);
+}
+
+#[test]
+fn mind_timeline_metadata_parsing() {
+    let (_dir, mind) = test_mind();
+    let _id = mind
+        .remember(
+            ObservationType::Solution,
+            "Bash",
+            "Fixed the caching issue",
+            Some("Applied LRU eviction policy"),
+            None,
+        )
+        .unwrap();
+
+    let entries = mind.timeline(10, true).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.obs_type, ObservationType::Solution);
+    assert_eq!(entry.summary, "Fixed the caching issue");
+    assert_eq!(entry.tool_name, "Bash");
+    assert!(entry.timestamp <= Utc::now());
+}
+
+#[test]
+fn mind_timeline_malformed_metadata_uses_fallbacks() {
+    use crate::backend::MockBackend;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("test.mv2");
+    let config = MindConfig {
+        memory_path: path.clone(),
+        ..MindConfig::default()
+    };
+    let backend = MockBackend::new();
+
+    // Store a frame with no metadata fields (malformed)
+    backend.create(&path).unwrap();
+    backend
+        .put(
+            b"some preview text for fallback",
+            &[],
+            &[],
+            &serde_json::json!({}),
+        )
+        .unwrap();
+
+    let mind = Mind::open_with_backend(config, Box::new(backend)).unwrap();
+    let entries = mind.timeline(10, true).unwrap();
+    assert_eq!(entries.len(), 1);
+
+    let entry = &entries[0];
+    // Fallback values per contract
+    assert_eq!(entry.obs_type, ObservationType::Discovery);
+    assert_eq!(entry.tool_name, "unknown");
+    // Summary falls back to preview text
+    assert!(entry.summary.contains("some preview text"));
+    // Timestamp falls back to now (approximately)
+    assert!(entry.timestamp <= Utc::now());
+}
+
+#[test]
+fn mind_timeline_remember_round_trip() {
+    let (_dir, mind) = test_mind();
+    mind.remember(
+        ObservationType::Pattern,
+        "read_file",
+        "Repository pattern detected",
+        Some("Found in service layer"),
+        None,
+    )
+    .unwrap();
+
+    let entries = mind.timeline(10, true).unwrap();
+    assert_eq!(entries.len(), 1);
+    let entry = &entries[0];
+    assert_eq!(entry.obs_type, ObservationType::Pattern);
+    assert_eq!(entry.summary, "Repository pattern detected");
+    assert_eq!(entry.tool_name, "read_file");
+}
+
+// =========================================================================
+// Mind::get_context
 // =========================================================================
 
 #[test]
