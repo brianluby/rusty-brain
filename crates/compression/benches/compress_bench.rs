@@ -8,9 +8,12 @@ fn make_js_content(chars: usize) -> String {
     let mut content = String::from("import React from 'react';\n");
     content.push_str("import { useState, useEffect } from 'react';\n");
     content.push_str("export default function App() {\n");
+    let mut char_count = content.chars().count();
     let mut i = 0;
-    while content.len() < chars {
-        content.push_str(&format!("  const value{i} = computeValue({i});\n"));
+    while char_count < chars {
+        let line = format!("  const value{i} = computeValue({i});\n");
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);
@@ -19,13 +22,16 @@ fn make_js_content(chars: usize) -> String {
 
 fn make_bash_content(chars: usize) -> String {
     let mut content = String::new();
+    let mut char_count = 0;
     let mut i = 0;
-    while content.len() < chars {
-        match i % 3 {
-            0 => content.push_str(&format!("error: build failed at step {i}\n")),
-            1 => content.push_str(&format!("warning: deprecated usage in line {i}\n")),
-            _ => content.push_str(&format!("ok: test {i} passed\n")),
-        }
+    while char_count < chars {
+        let line = match i % 3 {
+            0 => format!("error: build failed at step {i}\n"),
+            1 => format!("warning: deprecated usage in line {i}\n"),
+            _ => format!("ok: test {i} passed\n"),
+        };
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);
@@ -34,13 +40,16 @@ fn make_bash_content(chars: usize) -> String {
 
 fn make_grep_content(chars: usize) -> String {
     let mut content = String::new();
+    let mut char_count = 0;
     let mut i = 0;
-    while content.len() < chars {
-        content.push_str(&format!(
+    while char_count < chars {
+        let line = format!(
             "src/module{}/handler.rs:{}:    let result = process(input);\n",
             i % 20,
             i * 10
-        ));
+        );
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);
@@ -49,9 +58,12 @@ fn make_grep_content(chars: usize) -> String {
 
 fn make_glob_content(chars: usize) -> String {
     let mut content = String::new();
+    let mut char_count = 0;
     let mut i = 0;
-    while content.len() < chars {
-        content.push_str(&format!("src/module{}/file{}.rs\n", i % 30, i));
+    while char_count < chars {
+        let line = format!("src/module{}/file{}.rs\n", i % 30, i);
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);
@@ -60,9 +72,12 @@ fn make_glob_content(chars: usize) -> String {
 
 fn make_edit_content(chars: usize) -> String {
     let mut content = String::new();
+    let mut char_count = 0;
     let mut i = 0;
-    while content.len() < chars {
-        content.push_str(&format!("-old line {i}\n+new line {i}\n"));
+    while char_count < chars {
+        let line = format!("-old line {i}\n+new line {i}\n");
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);
@@ -71,9 +86,12 @@ fn make_edit_content(chars: usize) -> String {
 
 fn make_generic_content(chars: usize) -> String {
     let mut content = String::new();
+    let mut char_count = 0;
     let mut i = 0;
-    while content.len() < chars {
-        content.push_str(&format!("output line {i}: some generic tool data\n"));
+    while char_count < chars {
+        let line = format!("output line {i}: some generic tool data\n");
+        char_count += line.chars().count();
+        content.push_str(&line);
         i += 1;
     }
     truncate_to_char_boundary(&mut content, chars);

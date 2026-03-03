@@ -70,7 +70,10 @@ pub struct CompressedResult {
 }
 
 /// Diagnostic data about a compression operation.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// `PartialEq` uses epsilon comparison (1e-9) for `f64` fields (`ratio`, `percentage_saved`)
+/// to avoid exact floating-point equality pitfalls. `chars_saved` is compared exactly.
+#[derive(Debug, Clone)]
 pub struct CompressionStatistics {
     /// Compression ratio: original_size / compressed_size.
     /// Always >= 1.0 when present.
@@ -84,6 +87,16 @@ pub struct CompressionStatistics {
     pub percentage_saved: f64,
 }
 
+const EPS: f64 = 1e-9;
+
+impl PartialEq for CompressionStatistics {
+    fn eq(&self, other: &Self) -> bool {
+        self.chars_saved == other.chars_saved
+            && (self.ratio - other.ratio).abs() <= EPS
+            && (self.percentage_saved - other.percentage_saved).abs() <= EPS
+    }
+}
+
 // ============================================================
 // lib.rs — Public API entry point
 // ============================================================
@@ -91,7 +104,9 @@ pub struct CompressionStatistics {
 /// Compress a tool output according to its tool type.
 ///
 /// This is the primary entry point for the compression pipeline.
-/// It is infallible: it never panics and never returns an error.
+/// It is infallible for valid configs: it never returns an error, and in
+/// release builds it never panics. In debug builds, a `debug_assert!`
+/// panics if `config` fails validation (see `CompressionConfig::validate()`).
 ///
 /// # Behavior
 ///

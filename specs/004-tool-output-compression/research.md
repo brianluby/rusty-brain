@@ -57,7 +57,7 @@
 - Rust `regex` uses `(?m)` for multiline mode (same as JS `m` flag)
 - No lookbehind in Rust `regex` — rewrite patterns that used JS `(?<=...)` as capturing groups
 - Named groups: `(?P<name>...)` in Rust vs. `(?<name>...)` in JS
-- Rust regex has no `\d` shorthand for Unicode digits by default — use `[0-9]` for ASCII-only digit matching
+- Rust `regex` crate: `\d` is Unicode-aware by default (matches all Unicode decimal digits, not just ASCII 0–9). Use `[0-9]` or enable the ASCII flag (`(?-u)\d`) when ASCII-only digit matching is desired
 
 **Languages and key patterns**:
 

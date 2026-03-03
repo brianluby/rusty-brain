@@ -93,6 +93,6 @@ mod tests {
     fn budget_of_zero() {
         let text = "some text";
         let result = enforce_budget(text, 0);
-        assert!(result.chars().count() <= 0);
+        assert!(result.is_empty());
     }
 }

@@ -11,7 +11,7 @@ fn large_js_source(target_chars: usize) -> String {
     s.push_str("import { useState, useEffect } from 'react';\n");
     s.push_str("import axios from 'axios';\n\n");
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         s.push_str(&format!(
             "function handler{i}(request, response) {{\n  const data = request.body;\n  \
              console.log('Processing request', data);\n  response.json({{ ok: true }});\n}}\n\n"
@@ -26,7 +26,7 @@ fn large_bash_log(target_chars: usize) -> String {
     let mut s = String::with_capacity(target_chars + 200);
     s.push_str("$ npm run build\n");
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         if i % 200 == 50 {
             s.push_str(&format!("error: compilation failed at module {i}\n"));
         } else if i % 200 == 100 {
@@ -46,7 +46,7 @@ fn large_bash_log(target_chars: usize) -> String {
 fn large_grep_output(target_chars: usize) -> String {
     let mut s = String::with_capacity(target_chars + 200);
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         let file_num = i % 50;
         s.push_str(&format!(
             "src/modules/mod{file_num}/handler.rs:{i}: let result = process_data(input);\n"
@@ -60,7 +60,7 @@ fn large_grep_output(target_chars: usize) -> String {
 fn large_glob_output(target_chars: usize) -> String {
     let mut s = String::with_capacity(target_chars + 200);
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         let dir_num = i % 30;
         s.push_str(&format!(
             "src/components/feature{dir_num}/component_{i}.tsx\n"
@@ -76,7 +76,7 @@ fn large_edit_output(target_chars: usize) -> String {
     s.push_str("File: src/main.rs\n");
     s.push_str("--- a/src/main.rs\n+++ b/src/main.rs\n");
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         s.push_str(&format!(
             "-    let old_value_{i} = compute_old({i});\n\
              +    let new_value_{i} = compute_new({i});\n"
@@ -90,7 +90,7 @@ fn large_edit_output(target_chars: usize) -> String {
 fn large_generic_text(target_chars: usize) -> String {
     let mut s = String::with_capacity(target_chars + 200);
     let mut i = 0;
-    while s.chars().count() < target_chars {
+    while s.len() < target_chars {
         s.push_str(&format!(
             "Line {i}: Lorem ipsum dolor sit amet, consectetur adipiscing elit.\n"
         ));
@@ -238,7 +238,7 @@ fn js_source_with_known_constructs() -> (String, Vec<&'static str>) {
     }
 
     // Pad to ensure we exceed the threshold
-    while source.chars().count() < 5_000 {
+    while source.len() < 5_000 {
         source.push_str("  // filler line to reach threshold\n");
     }
 
@@ -323,7 +323,7 @@ fn sc003_read_preserves_80_percent_constructs_python() {
             source.push_str(&format!("    temp_{i}_{j} = compute_value({i}, {j})\n"));
         }
     }
-    while source.chars().count() < 5_000 {
+    while source.len() < 5_000 {
         source.push_str("    # filler\n");
     }
 
@@ -407,7 +407,7 @@ fn sc003_read_preserves_80_percent_constructs_rust() {
             ));
         }
     }
-    while source.chars().count() < 5_000 {
+    while source.len() < 5_000 {
         source.push_str("    // filler\n");
     }
 

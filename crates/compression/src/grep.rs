@@ -25,10 +25,7 @@ pub fn compress(config: &CompressionConfig, output: &str, input_context: Option<
         // Try to parse file:line:content or file:line format
         if let Some((file_part, _rest)) = trimmed.split_once(':') {
             // Heuristic: file paths contain / or have a dotted extension, and never contain spaces
-            if !file_part.contains(' ')
-                && (file_part.contains('/') || file_part.contains('.'))
-                && !file_part.starts_with(' ')
-            {
+            if !file_part.contains(' ') && (file_part.contains('/') || file_part.contains('.')) {
                 file_matches.entry(file_part).or_default().push(trimmed);
             } else {
                 ungrouped.push(trimmed);

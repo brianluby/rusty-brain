@@ -75,6 +75,12 @@ pub fn compress(config: &CompressionConfig, output: &str, input_context: Option<
 }
 
 /// Parse paths from output — try JSON array first (via `serde_json`), then line-delimited.
+///
+/// When the input looks like a JSON array (`[...]`), parsing is attempted with `serde_json`
+/// first for correctness (handles commas in paths, escapes, etc.). If `serde_json` fails
+/// (e.g. malformed or non-standard input), a simplistic comma-split fallback is used —
+/// note that this fallback does **not** handle commas embedded in path strings. Callers
+/// should prefer well-formed JSON arrays for correct results.
 fn parse_paths(output: &str) -> Vec<String> {
     let trimmed = output.trim();
 
@@ -83,7 +89,8 @@ fn parse_paths(output: &str) -> Vec<String> {
         if let Ok(paths) = serde_json::from_str::<Vec<String>>(trimmed) {
             return paths;
         }
-        // Fallback: manual split for non-standard JSON-like arrays
+        // Best-effort fallback for non-standard JSON-like arrays.
+        // Does NOT handle commas embedded in path strings.
         let inner = &trimmed[1..trimmed.len() - 1];
         return inner
             .split(',')

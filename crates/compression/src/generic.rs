@@ -75,19 +75,28 @@ mod tests {
         let config = CompressionConfig::default();
         let input = make_lines(100);
         let result = compress(&config, &input, None);
+        let lines: Vec<&str> = result.lines().collect();
 
-        // First 15 lines preserved
+        // First 15 lines preserved exactly
         for i in 1..=15 {
-            assert!(
-                result.contains(&format!("line {i}")),
-                "missing head line {i}"
+            let expected = format!("line {i}");
+            assert_eq!(
+                lines[i - 1],
+                expected,
+                "head line {i} mismatch: got {:?}",
+                lines[i - 1]
             );
         }
-        // Last 10 lines preserved
-        for i in 91..=100 {
-            assert!(
-                result.contains(&format!("line {i}")),
-                "missing tail line {i}"
+        // Last 10 lines before the summary preserved exactly
+        // Output format: 15 head lines, 1 omission marker, 10 tail lines, 1 total marker
+        let tail_start = lines.len() - 11; // 10 tail lines + 1 "[N lines total]"
+        for (j, i) in (91..=100).enumerate() {
+            let expected = format!("line {i}");
+            assert_eq!(
+                lines[tail_start + j],
+                expected,
+                "tail line {i} mismatch: got {:?}",
+                lines[tail_start + j]
             );
         }
     }
@@ -98,7 +107,7 @@ mod tests {
         let input = make_lines(100);
         let result = compress(&config, &input, None);
         assert!(
-            result.contains("lines omitted"),
+            result.contains("[...75 lines omitted...]"),
             "missing omission indicator in: {result}"
         );
     }
@@ -109,8 +118,8 @@ mod tests {
         let input = make_lines(100);
         let result = compress(&config, &input, None);
         assert!(
-            result.contains("100"),
-            "missing total line count in: {result}"
+            result.contains("[100 lines total]"),
+            "missing total line count marker in: {result}"
         );
     }
 

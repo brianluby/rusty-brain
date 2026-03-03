@@ -148,7 +148,7 @@ mod tests {
     }
 
     #[test]
-    fn tool_type_unknown_preserves_unknown_name() {
+    fn tool_type_unknown_normalizes_to_lowercase() {
         assert_eq!(
             ToolType::from("WebFetch"),
             ToolType::Other("webfetch".to_string())

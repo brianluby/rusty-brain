@@ -478,7 +478,7 @@ pub fn compress(
 ### Key Algorithms/Patterns 🟡 `@human-review`
 
 **Pattern: Infallible Dispatch with Fallback**
-```
+```text
 1. If output is empty or whitespace-only → return unchanged
 2. If output.chars().count() ≤ config.compression_threshold → return unchanged
 3. Match tool_name.to_ascii_lowercase():
@@ -505,7 +505,7 @@ static IMPORT_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
 Regexes are compiled once on first use and reused for all subsequent calls. This amortizes compilation cost to near-zero per invocation.
 
 **Pattern: Read Compressor Construct Extraction**
-```
+```text
 1. Detect language from input_context file extension (or heuristics)
 2. Apply language-specific regex patterns to extract:
    - Import/use/require statements
@@ -679,7 +679,7 @@ graph TD
 
 ### Error Handling Strategy 🟢 `@llm-autonomous`
 
-```
+```text
 Error Category → Handling Approach
 ├── Empty/whitespace input → Return unchanged (compression_applied: false)
 ├── Below-threshold input → Return unchanged (compression_applied: false)

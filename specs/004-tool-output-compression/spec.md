@@ -185,7 +185,7 @@ For tool types without specialized compressors (e.g., WebFetch, WebSearch, Task,
 - The 3,000-character compression threshold and 2,000-character target budget are configurable via `CompressionConfig` with these values as defaults, derived from production usage in the TypeScript implementation
 - Language construct extraction uses pattern matching; 100% accuracy is not required — false negatives (missed constructs) are acceptable, but false positives (incorrectly identified constructs) should be minimized
 - The compression crate operates synchronously and does not require async runtime
-- Unicode characters are counted by char count, not byte count, consistent with the TypeScript implementation
+- Unicode characters are counted using Rust's `char` count (Unicode scalar values), not byte count. Note: this differs from TypeScript's `string.length`, which counts UTF-16 code units (astral-plane characters like emoji count as 2 in TypeScript but 1 in Rust `char` counting)
 
 ## Success Criteria *(mandatory)*
 

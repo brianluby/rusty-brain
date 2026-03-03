@@ -78,10 +78,19 @@ mod tests {
     fn validate_rejects_zero_threshold() {
         let config = CompressionConfig {
             compression_threshold: 0,
-            target_budget: 0,
-            ..CompressionConfig::default()
+            target_budget: 1,
         };
-        // Should fail on target_budget == 0 first
+        let err = config.validate().unwrap_err();
+        assert!(err.contains("compression_threshold"));
+    }
+
+    #[test]
+    fn validate_checks_budget_before_threshold() {
+        let config = CompressionConfig {
+            compression_threshold: 0,
+            target_budget: 0,
+        };
+        // target_budget is validated first
         let err = config.validate().unwrap_err();
         assert!(err.contains("target_budget"));
     }

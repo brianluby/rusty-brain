@@ -91,10 +91,9 @@ mod tests {
         let config = CompressionConfig::default();
         let output = "diff content\n".repeat(500);
         let result = dispatch(&config, "Edit", &output, Some("src/file.rs"));
-        if result.compression_applied {
-            assert!(result.text.chars().count() <= config.target_budget);
-            assert!(result.text.contains("Changes applied"));
-        }
+        assert!(result.compression_applied);
+        assert!(result.text.chars().count() <= config.target_budget);
+        assert!(result.text.contains("Changes applied"));
     }
 
     #[test]
@@ -102,10 +101,9 @@ mod tests {
         let config = CompressionConfig::default();
         let output = "new content\n".repeat(500);
         let result = dispatch(&config, "Write", &output, Some("src/new.rs"));
-        if result.compression_applied {
-            assert!(result.text.chars().count() <= config.target_budget);
-            assert!(result.text.contains("File created"));
-        }
+        assert!(result.compression_applied);
+        assert!(result.text.chars().count() <= config.target_budget);
+        assert!(result.text.contains("File created"));
     }
 
     #[test]
