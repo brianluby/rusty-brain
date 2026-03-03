@@ -107,6 +107,16 @@ impl From<&MindStats> for StatsOutput {
 }
 
 // ---------------------------------------------------------------------------
+// Structured error output (agent-friendly)
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct ErrorOutput {
+    pub code: &'static str,
+    pub message: String,
+}
+
+// ---------------------------------------------------------------------------
 // JSON output helper
 // ---------------------------------------------------------------------------
 
@@ -115,6 +125,17 @@ pub fn print_json<T: Serialize>(data: &T) -> Result<(), CliError> {
         serde_json::to_string_pretty(data).map_err(|e| CliError::Io(std::io::Error::other(e)))?;
     let mut stdout = std::io::stdout().lock();
     writeln!(stdout, "{json}").map_err(CliError::Io)
+}
+
+/// Print a structured JSON error to stderr for agent consumption.
+pub fn print_error_json(error: &CliError) {
+    let output = ErrorOutput {
+        code: error.code(),
+        message: error.to_string(),
+    };
+    if let Ok(json) = serde_json::to_string_pretty(&output) {
+        let _ = writeln!(std::io::stderr().lock(), "{json}");
+    }
 }
 
 // ---------------------------------------------------------------------------

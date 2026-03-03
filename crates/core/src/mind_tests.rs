@@ -196,19 +196,20 @@ fn mind_ask_returns_relevant_content() {
     .unwrap();
 
     let answer = mind.ask("caching").unwrap();
+    let text = answer.expect("ask should return Some for matching content");
     assert!(
-        answer.contains("caching") || answer.contains("LRU"),
-        "ask should return relevant content, got: {answer}"
+        text.contains("caching") || text.contains("LRU"),
+        "ask should return relevant content, got: {text}"
     );
 }
 
 #[test]
-fn mind_ask_returns_fallback_when_no_matches() {
+fn mind_ask_returns_none_when_no_matches() {
     let (_dir, mind) = test_mind();
     let answer = mind
         .ask("something that definitely does not exist")
         .unwrap();
-    assert_eq!(answer, "No relevant memories found.");
+    assert!(answer.is_none(), "ask should return None for no matches");
 }
 
 // =========================================================================
@@ -573,7 +574,7 @@ fn mind_with_lock_executes_closure() {
 fn mind_with_lock_returns_closure_result() {
     let (_dir, mind) = test_mind();
     let answer = mind.with_lock(|m| m.ask("nonexistent")).unwrap();
-    assert_eq!(answer, "No relevant memories found.");
+    assert!(answer.is_none(), "ask should return None for no matches");
 }
 
 #[cfg(unix)]

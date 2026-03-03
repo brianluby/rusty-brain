@@ -166,16 +166,25 @@ fn test_corrupted_memory_file_error() {
     // Write garbage bytes that are not a valid .mv2 file
     std::fs::write(&path, b"THIS IS NOT A VALID MV2 FILE - GARBAGE DATA").unwrap();
 
-    let (status, stdout, stderr) = run_cli(&path, &["stats"]);
-    // Mind::open recovers from corruption (creates backup + fresh file),
-    // so this should succeed after recovery.
+    let (status, _stdout, stderr) = run_cli(&path, &["stats"]);
+    // CLI uses Mind::open_read_only which does not perform destructive
+    // recovery. Corrupted files should return a user-friendly error.
     assert!(
-        status.success(),
-        "corrupted file should be recovered, stdout: {stdout}, stderr: {stderr}"
+        !status.success(),
+        "corrupted file should fail in read-only mode"
+    );
+    assert!(
+        stderr.contains("corrupted") || stderr.contains("cannot be opened"),
+        "error should mention corruption, got: {stderr}"
     );
     // Verify no panics in output
     assert!(
         !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
         "error should be user-friendly, not a panic: {stderr}"
+    );
+    // Verify the original file is untouched (no backup created)
+    assert!(
+        path.exists(),
+        "corrupted file should not be renamed/deleted in read-only mode"
     );
 }

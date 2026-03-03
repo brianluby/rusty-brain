@@ -34,6 +34,20 @@ impl CliError {
             | Self::Io(_) => 1,
         }
     }
+
+    /// Stable, machine-parseable error code for this error.
+    ///
+    /// Core errors delegate to [`RustyBrainError::code()`]. CLI-specific
+    /// variants use `E_CLI_*` prefixed codes.
+    fn code(&self) -> &'static str {
+        match self {
+            Self::Core(e) => e.code(),
+            Self::MemoryFileNotFound { .. } => "E_CLI_MEMORY_FILE_NOT_FOUND",
+            Self::NotAFile { .. } => "E_CLI_NOT_A_FILE",
+            Self::EmptyPattern => "E_CLI_EMPTY_PATTERN",
+            Self::Io(_) => "E_CLI_IO",
+        }
+    }
 }
 
 impl fmt::Display for CliError {
@@ -84,13 +98,12 @@ impl From<RustyBrainError> for CliError {
     }
 }
 
-fn run() -> Result<(), CliError> {
+/// Returns `Ok(())` on success, or `Err((error, json_mode))` so `main()`
+/// can choose between human and structured JSON error output.
+fn run() -> Result<(), (CliError, bool)> {
     let cli = match Cli::try_parse() {
         Ok(cli) => cli,
-        Err(e)
-            if e.kind()
-                == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
-        {
+        Err(e) if e.kind() == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand => {
             let _ = e.print();
             return Ok(());
         }
@@ -106,8 +119,10 @@ fn run() -> Result<(), CliError> {
             .init();
     }
 
+    let json = cli.command.json();
+
     // Resolve memory path: --memory-path overrides auto-detection.
-    let mut config = MindConfig::from_env()?;
+    let mut config = MindConfig::from_env().map_err(|e| (CliError::from(e), json))?;
     if let Some(path) = cli.memory_path {
         config.memory_path = path;
     }
@@ -115,13 +130,13 @@ fn run() -> Result<(), CliError> {
     // Pre-validate file existence (read-only CLI should not create files).
     let path = &config.memory_path;
     if !path.exists() {
-        return Err(CliError::MemoryFileNotFound { path: path.clone() });
+        return Err((CliError::MemoryFileNotFound { path: path.clone() }, json));
     }
     if !path.is_file() {
-        return Err(CliError::NotAFile { path: path.clone() });
+        return Err((CliError::NotAFile { path: path.clone() }, json));
     }
 
-    let mind = Mind::open(config)?;
+    let mind = Mind::open_read_only(config).map_err(|e| (CliError::from(e), json))?;
     let command = cli.command;
 
     // Dispatch subcommand under file lock for safe concurrent access.
@@ -144,13 +159,21 @@ fn run() -> Result<(), CliError> {
             } => commands::run_timeline(mind, limit, r#type, oldest_first, json),
         };
         Ok(())
-    })?;
-    cmd_result
+    })
+    .map_err(|e| (CliError::from(e), json))?;
+    cmd_result.map_err(|e| (e, json))
 }
 
 fn main() {
-    if let Err(e) = run() {
-        eprintln!("error: {e}");
-        std::process::exit(e.exit_code());
+    match run() {
+        Ok(()) => {}
+        Err((e, json)) => {
+            if json {
+                output::print_error_json(&e);
+            } else {
+                eprintln!("error: {e}");
+            }
+            std::process::exit(e.exit_code());
+        }
     }
 }

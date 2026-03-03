@@ -74,6 +74,18 @@ pub enum Command {
     },
 }
 
+impl Command {
+    /// Whether `--json` output was requested for this subcommand.
+    pub fn json(&self) -> bool {
+        match self {
+            Self::Find { json, .. }
+            | Self::Ask { json, .. }
+            | Self::Stats { json, .. }
+            | Self::Timeline { json, .. } => *json,
+        }
+    }
+}
+
 /// Parse and validate search pattern (must be non-empty after trimming).
 fn parse_pattern(s: &str) -> Result<String, String> {
     let trimmed = s.trim();

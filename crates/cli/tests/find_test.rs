@@ -91,7 +91,10 @@ fn test_find_json_output_valid() {
     assert!(json["count"].is_number());
 
     let results = json["results"].as_array().unwrap();
-    assert!(!results.is_empty(), "find should return at least one result");
+    assert!(
+        !results.is_empty(),
+        "find should return at least one result"
+    );
     let result = &results[0];
     assert!(result["obs_type"].is_string());
     assert!(result["summary"].is_string());

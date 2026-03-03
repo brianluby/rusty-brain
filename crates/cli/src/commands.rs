@@ -41,21 +41,18 @@ pub fn run_find(
     }
 }
 
-/// Sentinel returned by `Mind::ask()` when no relevant memories are found.
-/// Coupled to the implementation in `rusty_brain_core::mind::Mind::ask()`.
-const NO_RESULTS_SENTINEL: &str = "No relevant memories found.";
-
 pub fn run_ask(mind: &Mind, question: &str, json: bool) -> Result<(), CliError> {
     let answer = mind.ask(question)?;
-    let has_results = !answer.is_empty() && answer != NO_RESULTS_SENTINEL;
 
-    let ask_output = AskOutput {
-        answer: if has_results {
-            answer
-        } else {
-            "No relevant memories found for your question.".to_string()
+    let ask_output = match answer {
+        Some(text) => AskOutput {
+            answer: text,
+            has_results: true,
         },
-        has_results,
+        None => AskOutput {
+            answer: "No relevant memories found for your question.".to_string(),
+            has_results: false,
+        },
     };
 
     if json {

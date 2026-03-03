@@ -108,6 +108,67 @@ impl Mind {
         })
     }
 
+    /// Open an existing memory file in read-only mode (no recovery).
+    ///
+    /// Unlike [`Mind::open`], this method never creates files, never backs up
+    /// corrupted files, and never performs destructive recovery. If the file
+    /// cannot be opened (e.g. corrupted), the backend error is returned
+    /// directly. Intended for read-only CLI access.
+    ///
+    /// The caller is expected to pre-validate that the file exists and is a
+    /// regular file before calling this method.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RustyBrainError::CorruptedFile` if the backend cannot open
+    /// the existing file. Returns other `RustyBrainError` variants for
+    /// config validation or file guard failures.
+    #[tracing::instrument(skip(config), fields(path = %config.memory_path.display()))]
+    pub fn open_read_only(config: MindConfig) -> Result<Mind, RustyBrainError> {
+        config.validate()?;
+        let memory_path = config.memory_path.clone();
+        let action = file_guard::validate_and_open(&memory_path)?;
+
+        let backend = Box::new(MemvidStore::new());
+        match action {
+            OpenAction::Create => {
+                return Err(RustyBrainError::FileSystem {
+                    code: error_codes::E_FS_NOT_FOUND,
+                    message: format!(
+                        "memory file does not exist (read-only mode): {}",
+                        memory_path.display()
+                    ),
+                    source: None,
+                });
+            }
+            OpenAction::Open => {
+                backend.open(&memory_path).map_err(|e| {
+                    tracing::warn!(error = %e, path = %memory_path.display(), "corrupted memory file (read-only, no recovery)");
+                    RustyBrainError::CorruptedFile {
+                        code: error_codes::E_STORAGE_CORRUPTED_FILE,
+                        message: format!(
+                            "memory file cannot be opened (read-only, no recovery): {}",
+                            memory_path.display()
+                        ),
+                    }
+                })?;
+            }
+        }
+
+        let session_id = ulid::Ulid::new().to_string().to_lowercase();
+
+        tracing::info!(session_id = %session_id, "mind opened (read-only)");
+
+        Ok(Mind {
+            backend,
+            config,
+            session_id,
+            memory_path,
+            initialized: true,
+            cached_stats: Mutex::new(None),
+        })
+    }
+
     /// Open with a custom backend (for testing with `MockBackend`).
     #[cfg(test)]
     pub(crate) fn open_with_backend(
@@ -229,18 +290,20 @@ impl Mind {
 
     /// Ask a question against stored observations.
     ///
-    /// Returns synthesized answer or "No relevant memories found."
+    /// Returns `Some(answer)` when relevant memories are found, or `None`
+    /// when the backend returns no results. Callers decide how to present
+    /// the "no results" case instead of comparing against a sentinel string.
     ///
     /// # Errors
     ///
     /// Returns `RustyBrainError::Storage` if the backend ask fails.
     #[tracing::instrument(skip(self), fields(question_len = question.len()))]
-    pub fn ask(&self, question: &str) -> Result<String, RustyBrainError> {
+    pub fn ask(&self, question: &str) -> Result<Option<String>, RustyBrainError> {
         let answer = self.backend.ask(question, 10)?;
         if answer.trim().is_empty() {
-            Ok("No relevant memories found.".to_string())
+            Ok(None)
         } else {
-            Ok(answer)
+            Ok(Some(answer))
         }
     }
 

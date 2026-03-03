@@ -114,7 +114,10 @@ fn test_timeline_json_output_valid() {
     assert!(json["count"].is_number());
 
     let entries = json["entries"].as_array().unwrap();
-    assert!(!entries.is_empty(), "timeline should have at least one entry");
+    assert!(
+        !entries.is_empty(),
+        "timeline should have at least one entry"
+    );
     let entry = &entries[0];
     assert!(entry["obs_type"].is_string());
     assert!(entry["summary"].is_string());
