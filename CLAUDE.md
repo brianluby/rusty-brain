@@ -80,9 +80,11 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - ulid, fs2 (003-core-memory-engine)
 - serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
 - clap 4 (derive), tracing 0.1 (007-cli-scripts)
+- `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
 ## Recent Changes
 - 003-core-memory-engine: Added memvid-core (pinned git rev `fbddef4`), ulid, fs2
 - 005-platform-adapter-system: Wired the `platforms` crate to use `types`, serde/serde_json, uuid, chrono, semver, and thiserror already present in the workspace `Cargo.toml`, and added `temp-env` as a dev-dependency.
+- 004-tool-output-compression: Added `regex` crate, workspace `tracing` for WARN-level fallback logging
