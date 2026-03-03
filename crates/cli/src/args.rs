@@ -45,6 +45,7 @@ pub enum Command {
     /// Ask a question about your memory
     Ask {
         /// Natural language question
+        #[arg(value_parser = parse_question)]
         question: String,
         /// Output as JSON
         #[arg(long)]
@@ -73,12 +74,22 @@ pub enum Command {
     },
 }
 
-/// Parse and validate the search pattern (must be non-empty).
+/// Parse and validate search pattern (must be non-empty after trimming).
 fn parse_pattern(s: &str) -> Result<String, String> {
-    if s.is_empty() {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
         return Err("pattern must not be empty".to_string());
     }
-    Ok(s.to_string())
+    Ok(trimmed.to_string())
+}
+
+/// Parse and validate question (must be non-empty after trimming).
+fn parse_question(s: &str) -> Result<String, String> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err("question must not be empty".to_string());
+    }
+    Ok(trimmed.to_string())
 }
 
 /// Parse limit as a positive integer (>= 1).

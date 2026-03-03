@@ -20,7 +20,7 @@ A developer wants to find specific memories from past sessions — for example, 
 1. **Given** a memory file with 50+ observations spanning multiple types and sessions, **When** the developer runs `rusty-brain find "authentication"`, **Then** matching observations are displayed with observation type, timestamp, summary, and a content excerpt, ordered by relevance.
 2. **Given** a search pattern that matches no observations, **When** the developer runs `rusty-brain find "xyznonexistent"`, **Then** a clear "no results found" message is displayed.
 3. **Given** the developer wants to limit results, **When** they run `rusty-brain find "error" --limit 5`, **Then** at most 5 results are returned.
-4. **Given** the developer wants machine-readable output, **When** they run `rusty-brain find "auth" --json`, **Then** results are output as a JSON array suitable for piping to other tools.
+4. **Given** the developer wants machine-readable output, **When** they run `rusty-brain find "auth" --json`, **Then** results are output as a JSON object envelope containing a `results` array and a `count` field, suitable for piping to other tools.
 5. **Given** the developer wants only decisions, **When** they run `rusty-brain find "auth" --type decision`, **Then** only observations with type `decision` are returned.
 
 ---
@@ -70,7 +70,7 @@ A developer wants to see a chronological view of recent memory entries — a tim
 1. **Given** a memory file with observations from 3 sessions, **When** the developer runs `rusty-brain timeline`, **Then** observations are displayed in reverse chronological order (most recent first) with timestamp, observation type, and summary.
 2. **Given** the developer wants to see more or fewer entries, **When** they run `rusty-brain timeline --limit 50`, **Then** at most 50 entries are displayed.
 3. **Given** the developer wants the oldest entries first, **When** they run `rusty-brain timeline --oldest-first`, **Then** entries are displayed in chronological order (oldest first).
-4. **Given** the developer wants machine-readable output, **When** they run `rusty-brain timeline --json`, **Then** entries are output as a JSON array.
+4. **Given** the developer wants machine-readable output, **When** they run `rusty-brain timeline --json`, **Then** entries are output as a JSON object envelope containing an `entries` array and a `count` field.
 5. **Given** the developer wants only discoveries, **When** they run `rusty-brain timeline --type discovery`, **Then** only observations with type `discovery` are displayed.
 
 ---

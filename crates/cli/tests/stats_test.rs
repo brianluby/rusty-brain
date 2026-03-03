@@ -55,6 +55,10 @@ fn test_stats_empty_memory_file() {
         json.get("oldest_memory").is_none() || json["oldest_memory"].is_null(),
         "oldest_memory should be absent for empty store"
     );
+    assert!(
+        json.get("newest_memory").is_none() || json["newest_memory"].is_null(),
+        "newest_memory should be absent for empty store"
+    );
 }
 
 #[test]

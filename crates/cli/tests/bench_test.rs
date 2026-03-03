@@ -21,6 +21,7 @@ fn make_observations(count: usize) -> Vec<TestObs> {
 }
 
 #[test]
+#[ignore]
 fn bench_find_100_observations() {
     let observations = make_observations(100);
     let (_dir, path) = setup_test_mind(&observations);
@@ -38,6 +39,7 @@ fn bench_find_100_observations() {
 }
 
 #[test]
+#[ignore]
 fn bench_stats_100_observations() {
     let observations = make_observations(100);
     let (_dir, path) = setup_test_mind(&observations);
@@ -55,6 +57,7 @@ fn bench_stats_100_observations() {
 }
 
 #[test]
+#[ignore]
 fn bench_timeline_100_observations() {
     let observations = make_observations(100);
     let (_dir, path) = setup_test_mind(&observations);

@@ -113,14 +113,15 @@ fn test_timeline_json_output_valid() {
     assert!(json["entries"].is_array());
     assert!(json["count"].is_number());
 
-    if let Some(entry) = json["entries"].as_array().and_then(|a| a.first()) {
-        assert!(entry["obs_type"].is_string());
-        assert!(entry["summary"].is_string());
-        assert!(entry["timestamp"].is_string());
-        // Timeline entries should NOT have score or tool_name (per contract)
-        assert!(entry.get("score").is_none());
-        assert!(entry.get("tool_name").is_none());
-    }
+    let entries = json["entries"].as_array().unwrap();
+    assert!(!entries.is_empty(), "timeline should have at least one entry");
+    let entry = &entries[0];
+    assert!(entry["obs_type"].is_string());
+    assert!(entry["summary"].is_string());
+    assert!(entry["timestamp"].is_string());
+    // Timeline entries should NOT have score or tool_name (per contract)
+    assert!(entry.get("score").is_none());
+    assert!(entry.get("tool_name").is_none());
 }
 
 #[test]
@@ -176,5 +177,5 @@ fn test_timeline_default_limit_is_10() {
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let count = json["count"].as_u64().unwrap();
-    assert!(count <= 10, "default limit should be 10, got {count}");
+    assert_eq!(count, 10, "default limit should be 10, got {count}");
 }

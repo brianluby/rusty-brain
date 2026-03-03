@@ -85,7 +85,17 @@ impl From<RustyBrainError> for CliError {
 }
 
 fn run() -> Result<(), CliError> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(e)
+            if e.kind()
+                == clap::error::ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand =>
+        {
+            let _ = e.print();
+            return Ok(());
+        }
+        Err(e) => e.exit(),
+    };
 
     // Initialize tracing subscriber if verbose mode is requested.
     if cli.verbose {

@@ -9,8 +9,13 @@ use types::ObservationType;
 fn test_no_args_shows_help() {
     let output = cli_cmd().output().expect("failed to execute CLI");
 
-    // clap shows help and exits 2 when no subcommand provided
-    // (arg_required_else_help = true)
+    // No-args shows help and exits 0 (helpful, not an error)
+    assert!(
+        output.status.success(),
+        "no-args help should exit 0, got: {:?}",
+        output.status.code()
+    );
+
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     let combined = format!("{stdout}{stderr}");
@@ -161,15 +166,16 @@ fn test_corrupted_memory_file_error() {
     // Write garbage bytes that are not a valid .mv2 file
     std::fs::write(&path, b"THIS IS NOT A VALID MV2 FILE - GARBAGE DATA").unwrap();
 
-    let (status, _stdout, stderr) = run_cli(&path, &["stats"]);
-    // The CLI should either handle the corrupted file gracefully or show an error.
-    // Mind::open recovers from corruption (creates backup + fresh file), so this
-    // should actually succeed after recovery.
-    if !status.success() {
-        // If it fails, the error should be user-friendly (no stack traces)
-        assert!(
-            !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
-            "error should be user-friendly, not a panic: {stderr}"
-        );
-    }
+    let (status, stdout, stderr) = run_cli(&path, &["stats"]);
+    // Mind::open recovers from corruption (creates backup + fresh file),
+    // so this should succeed after recovery.
+    assert!(
+        status.success(),
+        "corrupted file should be recovered, stdout: {stdout}, stderr: {stderr}"
+    );
+    // Verify no panics in output
+    assert!(
+        !stderr.contains("panicked") && !stderr.contains("RUST_BACKTRACE"),
+        "error should be user-friendly, not a panic: {stderr}"
+    );
 }

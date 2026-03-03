@@ -96,15 +96,14 @@ All `obs_type` values are lowercase strings matching `ObservationType::Display`.
 |-------|------|----------|-------------|
 | `total_observations` | integer | No | Total number of stored observations |
 | `total_sessions` | integer | No | Number of distinct agent sessions |
-| `oldest_memory` | string | Yes | RFC 3339 timestamp of oldest observation, null if empty |
-| `newest_memory` | string | Yes | RFC 3339 timestamp of newest observation, null if empty |
+| `oldest_memory` | string | Yes | RFC 3339 timestamp of oldest observation; key omitted when no observations |
+| `newest_memory` | string | Yes | RFC 3339 timestamp of newest observation; key omitted when no observations |
 | `file_size_bytes` | integer | No | Size of .mv2 file in bytes |
 | `type_counts` | object | No | Map of observation type (lowercase) to count |
 
 ### Edge cases
 
-- Empty memory file: `{ "total_observations": 0, "total_sessions": 0, "file_size_bytes": 0, "type_counts": {} }`
-  - `oldest_memory` and `newest_memory` omitted when null
+- Empty memory file: `{ "total_observations": 0, "total_sessions": 0, "file_size_bytes": 0, "type_counts": {} }` — `oldest_memory` and `newest_memory` keys are omitted (not present as null)
 
 ---
 

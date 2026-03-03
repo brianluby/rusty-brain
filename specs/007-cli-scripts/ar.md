@@ -52,7 +52,7 @@
 ## Summary
 
 ### Decision 🔴 `@human-required`
-> Build the CLI as a thin orchestration layer in the existing `crates/cli` crate, using `clap` derive macros for argument parsing, delegating all data operations to the `Mind` public API (with a small API extension for timeline queries), and formatting output through a strategy trait that switches between human-readable table output and JSON serialization.
+> Build the CLI as a thin orchestration layer in the existing `crates/cli` crate, using `clap` derive macros for argument parsing, delegating all data operations to the `Mind` public API (with a small API extension for timeline queries), and formatting output through function-based dispatch that switches between human-readable table output and JSON serialization.
 
 ### TL;DR for Agents 🟡 `@human-review`
 > The CLI crate (`crates/cli`) is a binary with a `main.rs` entry point and three internal modules: `args` (clap definitions), `commands` (one function per subcommand), and `output` (formatting strategy). All memory operations delegate to `Mind` from `crates/core` — no direct backend access. A public `Mind::timeline()` method must be added to `crates/core` (currently `pub(crate)` only). Path resolution uses `platforms::resolve_memory_path`. The `--type` filter is applied as a post-query filter in the CLI layer. Do NOT duplicate any core engine logic.

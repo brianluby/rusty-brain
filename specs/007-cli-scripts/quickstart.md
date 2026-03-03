@@ -13,7 +13,7 @@
 # Build the CLI binary
 cargo build -p cli
 
-# Build in release mode (stripped, optimized)
+# Build in release mode (optimized, not stripped by default)
 cargo build -p cli --release
 ```
 

@@ -75,7 +75,7 @@ impl Mind {
 | `limit = 10, reverse = false` | Returns up to 10 entries, oldest first |
 | `limit = 0` | Returns empty vec (caller validates limit > 0) |
 | Empty memory file | Returns empty vec, no error |
-| Corrupted frame metadata | Skips frame with best-effort defaults (obs_type = Discovery, summary = preview text, timestamp = now) |
+| Corrupted frame metadata | Returns frame with best-effort defaults: obs_type = Discovery, summary = preview text, tool_name = "unknown", timestamp = now |
 
 ### Error cases
 

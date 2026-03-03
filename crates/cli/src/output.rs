@@ -1,6 +1,6 @@
 //! Output formatting: JSON serialization and human-readable tables.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::io::{IsTerminal, Write};
 
 use chrono::{DateTime, Utc};
@@ -46,7 +46,7 @@ pub struct StatsOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub newest_memory: Option<String>,
     pub file_size_bytes: u64,
-    pub type_counts: HashMap<String, u64>,
+    pub type_counts: BTreeMap<String, u64>,
 }
 
 #[derive(Debug, Serialize)]

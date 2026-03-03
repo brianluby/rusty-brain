@@ -9,7 +9,7 @@ Crate: `crates/cli` (binary target)
 
 ## Global Options
 
-```
+```text
 rusty-brain [OPTIONS] <SUBCOMMAND>
 
 OPTIONS:
@@ -23,7 +23,7 @@ OPTIONS:
 
 ### find
 
-```
+```text
 rusty-brain find [OPTIONS] <PATTERN>
 
 ARGS:
@@ -38,7 +38,7 @@ OPTIONS:
 
 ### ask
 
-```
+```text
 rusty-brain ask [OPTIONS] <QUESTION>
 
 ARGS:
@@ -51,7 +51,7 @@ OPTIONS:
 
 ### stats
 
-```
+```text
 rusty-brain stats [OPTIONS]
 
 OPTIONS:
@@ -61,7 +61,7 @@ OPTIONS:
 
 ### timeline
 
-```
+```text
 rusty-brain timeline [OPTIONS]
 
 OPTIONS:
@@ -118,6 +118,7 @@ pub enum Command {
     /// Ask a question about your memory
     Ask {
         /// Natural language question
+        #[arg(value_parser = parse_question)]
         question: String,
         /// Output as JSON
         #[arg(long)]
@@ -163,7 +164,7 @@ fn parse_obs_type(s: &str) -> Result<ObservationType, String> {
 
 | Code | Meaning | Trigger |
 |------|---------|---------|
-| 0 | Success | All subcommands on success |
+| 0 | Success | All subcommands on success; no-args help display |
 | 1 | General error | Invalid arguments, missing file, corrupted memory, API error |
 | 2 | Lock timeout | Memory file locked after 5 retries with exponential backoff |
 
@@ -171,8 +172,8 @@ fn parse_obs_type(s: &str) -> Result<ObservationType, String> {
 
 | Input | Constraint | Enforced by |
 |-------|-----------|-------------|
-| `<PATTERN>` | Non-empty string | clap required positional arg |
-| `<QUESTION>` | Non-empty string | clap required positional arg |
+| `<PATTERN>` | Non-empty after trimming | `parse_pattern()` value_parser |
+| `<QUESTION>` | Non-empty after trimming | `parse_question()` value_parser |
 | `--limit` | Positive integer (>=1) | `value_parser!(usize).range(1..)` |
 | `--type` | Valid ObservationType variant | `parse_obs_type()` |
 | `--memory-path` | Existing file (not directory) | Pre-Mind::open() validation in main.rs |

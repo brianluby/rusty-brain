@@ -32,20 +32,21 @@ fn test_lock_file_permissions_0600() {
     lock_path.push(".lock");
     let lock_path = std::path::PathBuf::from(lock_path);
 
-    if lock_path.exists() {
-        let perms = std::fs::metadata(&lock_path).unwrap().permissions();
-        let mode = perms.mode() & 0o777;
-        assert_eq!(
-            mode, 0o600,
-            "lock file should have 0600 permissions, got {mode:o}"
-        );
-    }
-    // Lock file may not exist if Mind::open doesn't create one for read-only ops
+    assert!(
+        lock_path.exists(),
+        "lock file should be created after CLI command"
+    );
+    let perms = std::fs::metadata(&lock_path).unwrap().permissions();
+    let mode = perms.mode() & 0o777;
+    assert_eq!(
+        mode, 0o600,
+        "lock file should have 0600 permissions, got {mode:o}"
+    );
 }
 
 #[cfg(unix)]
 #[test]
-fn test_signal_cleanup_releases_lock() {
+fn test_consecutive_runs_do_not_block() {
     let (_dir, path) = setup_test_mind(&[TestObs {
         obs_type: ObservationType::Discovery,
         tool_name: "Read".into(),

@@ -238,7 +238,7 @@ flowchart TD
     F --> H{Open Mind with lock}
     G --> H
     H -->|File not found| I[Error: no memory file, exit 1]
-    H -->|Lock timeout| J[Error: file in use, exit 1]
+    H -->|Lock timeout| J[Error: file in use, exit 2]
     H -->|Corrupted| K[Error: suggest recovery, exit 1]
     H -->|Success| L{Execute subcommand}
     L -->|find| M[Mind::search with query, limit, type filter]
@@ -313,7 +313,7 @@ The CLI consumes existing data structures from `crates/core` and `crates/types`.
 
 **Consumed Types:**
 
-```
+```text
 MemorySearchResult (from crates/core::mind)
 ├── obs_type: ObservationType
 ├── summary: String
@@ -333,7 +333,7 @@ MindStats (from crates/types)
 
 **New Output Types (CLI-local, for JSON serialization):**
 
-```
+```text
 FindOutput
 ├── results: Vec<SearchResultJson>
 └── count: usize
@@ -355,7 +355,7 @@ TimelineOutput
 
 **CLI Argument Structure:**
 
-```
+```text
 rusty-brain [--memory-path <PATH>] [--verbose|-v] <SUBCOMMAND>
 
 SUBCOMMANDS:

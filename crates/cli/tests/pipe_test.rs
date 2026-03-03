@@ -23,6 +23,12 @@ fn test_json_output_has_no_ansi_escape_codes() {
         .output()
         .expect("failed to execute CLI");
 
+    assert!(
+        output.status.success(),
+        "CLI should succeed, stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     // ANSI escape codes start with \x1b[ (ESC[)
     assert!(

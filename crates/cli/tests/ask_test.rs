@@ -57,5 +57,5 @@ fn test_ask_json_output_valid() {
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
     assert!(json["answer"].is_string());
-    assert!(json["has_results"].is_boolean());
+    assert_eq!(json["has_results"].as_bool(), Some(true));
 }
