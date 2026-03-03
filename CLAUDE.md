@@ -72,3 +72,10 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - Isolate memvid behind clean Rust abstractions (traits/wrappers) so upstream changes don't ripple
 - No network by default — any remote capability must be opt-in
 - No logging of memory contents at INFO or above without explicit opt-in
+
+## Active Technologies
+- Rust (stable, edition 2024, rust-version 1.85.0) + `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
+- N/A — pure text transformation library, no persistence (004-tool-output-compression)
+
+## Recent Changes
+- 004-tool-output-compression: Added Rust (stable, edition 2024, rust-version 1.85.0) + `regex` crate (new), workspace `tracing` (for WARN-level fallback logging)
