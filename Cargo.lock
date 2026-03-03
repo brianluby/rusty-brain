@@ -1571,6 +1571,16 @@ checksum = "7edddbd0b52d732b21ad9a5fab5c704c14cd949e5e9a1ec5929a24fded1b904c"
 [[package]]
 name = "platforms"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "semver",
+ "serde",
+ "serde_json",
+ "temp-env",
+ "thiserror 2.0.18",
+ "types",
+ "uuid",
+]
 
 [[package]]
 name = "plotters"
@@ -1887,7 +1897,16 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rusty-brain-core"
 version = "0.1.0"
 dependencies = [
+ "chrono",
+ "criterion",
+ "fs2",
  "memvid-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "types",
+ "ulid",
 ]
 
 [[package]]
@@ -2404,7 +2423,19 @@ dependencies = [
  "serde_json",
  "temp-env",
  "thiserror 2.0.18",
+ "ulid",
  "uuid",
+]
+
+[[package]]
+name = "ulid"
+version = "1.2.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "470dbf6591da1b39d43c14523b2b469c86879a53e8b758c8e090a470fe7b1fbe"
+dependencies = [
+ "rand 0.9.2",
+ "serde",
+ "web-time",
 ]
 
 [[package]]
@@ -2606,6 +2637,16 @@ name = "web-sys"
 version = "0.3.91"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "854ba17bb104abfb26ba36da9729addc7ce7f06f5c0f90f3c391f8461cca21f9"
+dependencies = [
+ "js-sys",
+ "wasm-bindgen",
+]
+
+[[package]]
+name = "web-time"
+version = "1.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5a6580f308b1fad9207618087a65c04e7a10bc77e02c8e84e9b00dd4b12fa0bb"
 dependencies = [
  "js-sys",
  "wasm-bindgen",
@@ -2947,9 +2988,9 @@ dependencies = [
 
 [[package]]
 name = "zlib-rs"
-version = "0.6.2"
+version = "0.6.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c745c48e1007337ed136dc99df34128b9faa6ed542d80a1c673cf55a6d7236c8"
+checksum = "3be3d40e40a133f9c916ee3f9f4fa2d9d63435b5fbe1bfc6d9dae0aa0ada1513"
 
 [[package]]
 name = "zmij"

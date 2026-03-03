@@ -74,8 +74,15 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - No logging of memory contents at INFO or above without explicit opt-in
 
 ## Active Technologies
-- Rust (stable, edition 2024, rust-version 1.85.0) + `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
-- N/A — pure text transformation library, no persistence (004-tool-output-compression)
+- Rust (stable), edition 2024, MSRV 1.85.0
+- memvid-core (pinned git rev `fbddef4`), ulid, fs2 (003-core-memory-engine)
+- memvid `.mv2` files on local filesystem (003-core-memory-engine)
+- serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
+- `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
+
+All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
 ## Recent Changes
-- 004-tool-output-compression: Added Rust (stable, edition 2024, rust-version 1.85.0) + `regex` crate (new), workspace `tracing` (for WARN-level fallback logging)
+- 003-core-memory-engine: Added memvid-core (pinned git rev `fbddef4`), ulid, fs2
+- 005-platform-adapter-system: Wired the `platforms` crate to use `types`, serde/serde_json, uuid, chrono, semver, and thiserror already present in the workspace `Cargo.toml`, and added `temp-env` as a dev-dependency.
+- 004-tool-output-compression: Added `regex` crate, workspace `tracing` for WARN-level fallback logging
