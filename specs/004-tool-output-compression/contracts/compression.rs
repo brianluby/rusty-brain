@@ -187,11 +187,13 @@ pub enum Language {
 }
 
 /// Detect the programming language from a file path or content heuristics.
-pub fn detect_language(file_path: Option<&str>, content: &str) -> Language;
+/// Crate-internal: used only by the `read` compressor.
+pub(crate) fn detect_language(file_path: Option<&str>, content: &str) -> Language;
 
 /// Extract language-specific constructs from source code.
 ///
 /// Returns a vector of extracted lines (imports, exports, function signatures,
 /// class/struct declarations, error markers). Order matches source order.
 /// If no constructs found, returns an empty vector.
-pub fn extract_constructs(content: &str, language: Language) -> Vec<String>;
+/// Crate-internal: used only by the `read` compressor.
+pub(crate) fn extract_constructs(content: &str, language: Language) -> Vec<String>;

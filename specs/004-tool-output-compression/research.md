@@ -43,7 +43,7 @@
 
 **Decision**: Use `.chars().count()` consistently for all budget comparisons
 
-**Rationale**: PRD assumption A-6 and spec clarification explicitly require Unicode `char` count, not byte count. This matches the TypeScript implementation's `string.length` behavior. While `.chars().count()` is O(n), it's called at most twice per compression (threshold check + budget enforcement), well within the 5ms budget.
+**Rationale**: PRD assumption A-6 and spec clarification explicitly require Unicode `char` count, not byte count. Rust's `.chars().count()` counts Unicode scalar values (code points), which differs from TypeScript's `string.length` that counts UTF-16 code units — astral-plane characters (emoji, CJK extensions) count as 1 in Rust but 2 in TypeScript. This difference is acceptable since the budget is approximate and tool output is overwhelmingly ASCII. While `.chars().count()` is O(n), it's called at most twice per compression (threshold check + budget enforcement), well within the 5ms budget.
 
 **Alternatives considered**:
 - `.len()` (byte count) — faster (O(1)) but would break budget guarantees for multi-byte content; violates PRD

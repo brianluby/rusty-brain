@@ -7,6 +7,15 @@ use crate::config::CompressionConfig;
 
 const TOP_MATCHES: usize = 10;
 
+/// Detect a Windows drive-letter prefix (e.g. `C:\` or `D:/`).
+fn is_windows_drive_prefix(s: &str) -> bool {
+    let bytes = s.as_bytes();
+    bytes.len() >= 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && (bytes[2] == b'\\' || bytes[2] == b'/')
+}
+
 /// Compress grep output by grouping matches by file.
 ///
 /// Parses `file:line:content` format, groups by file path, and shows
@@ -22,10 +31,20 @@ pub fn compress(config: &CompressionConfig, output: &str, input_context: Option<
         if trimmed.is_empty() {
             continue;
         }
-        // Try to parse file:line:content or file:line format
-        if let Some((file_part, _rest)) = trimmed.split_once(':') {
-            // Heuristic: file paths contain / or have a dotted extension, and never contain spaces
-            if !file_part.contains(' ') && (file_part.contains('/') || file_part.contains('.')) {
+        // Try to parse file:line:content or file:line format.
+        // Windows drive-letter paths (e.g. C:\foo\bar.rs:10:match) have a colon
+        // right after the drive letter — skip past it to find the real separator.
+        let colon_pos = if is_windows_drive_prefix(trimmed) {
+            trimmed[2..].find(':').map(|p| p + 2)
+        } else {
+            trimmed.find(':')
+        };
+        if let Some(pos) = colon_pos {
+            let file_part = &trimmed[..pos];
+            // Heuristic: file paths contain / or \ or have a dotted extension, and never contain spaces
+            if !file_part.contains(' ')
+                && (file_part.contains('/') || file_part.contains('\\') || file_part.contains('.'))
+            {
                 file_matches.entry(file_part).or_default().push(trimmed);
             } else {
                 ungrouped.push(trimmed);
@@ -148,6 +167,18 @@ mod tests {
         let result1 = compress(&config, &output, Some("compute"));
         let result2 = compress(&config, &output, Some("compute"));
         assert_eq!(result1, result2);
+    }
+
+    #[test]
+    fn windows_drive_letter_paths_grouped() {
+        let config = CompressionConfig::default();
+        let input = "C:\\Users\\dev\\src\\main.rs:10:fn main() {}\nC:\\Users\\dev\\src\\main.rs:20:let x = 1;\n";
+        let result = compress(&config, input, Some("main"));
+        assert!(
+            result.contains("C:\\Users\\dev\\src\\main.rs"),
+            "Windows path should be grouped: {result}"
+        );
+        assert!(result.contains("2 matches"));
     }
 
     #[test]

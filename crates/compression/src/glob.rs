@@ -25,7 +25,7 @@ pub fn compress(config: &CompressionConfig, output: &str, input_context: Option<
     for path in paths {
         let dir = path
             .rsplit_once('/')
-            .map_or(".", |(dir, _)| if dir.is_empty() { "/" } else { dir })
+            .map_or(".", |(dir, _)| if dir.is_empty() { "" } else { dir })
             .to_string();
         dir_files.entry(dir).or_default().push(path);
     }
@@ -182,6 +182,14 @@ mod tests {
         let config = CompressionConfig::default();
         let result = compress(&config, "", None);
         assert_eq!(result, "");
+    }
+
+    #[test]
+    fn root_dir_paths_no_double_slash() {
+        let config = CompressionConfig::default();
+        let result = compress(&config, "/etc/hosts\n/etc/passwd\n", None);
+        // Root-dir group should render as "/ (2 files):" not "// (2 files):"
+        assert!(!result.contains("//"), "double-slash in output: {result}");
     }
 
     #[test]

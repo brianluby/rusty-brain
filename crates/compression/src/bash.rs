@@ -6,18 +6,27 @@ use std::sync::LazyLock;
 use regex::Regex;
 
 use crate::config::CompressionConfig;
+use crate::regex_util;
 
 static ERROR_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:error[:\[]|ERR!|FAILED|panic(?:ked)?|fatal|cannot find|not found|undefined|segfault|abort|exit(?:ed)?\s+(?:with\s+)?(?:status|code)\s+[1-9])").expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"(?i)(?:error[:\[]|ERR!|FAILED|panic(?:ked)?|fatal|cannot find|not found|undefined|segfault|abort|exit(?:ed)?\s+(?:with\s+)?(?:status|code)\s+[1-9])",
+        "bash::ERROR_PATTERN",
+    )
 });
 
 static WARNING_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:warn(?:ing)?[:\[]|WARN|deprecated)").expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"(?i)(?:warn(?:ing)?[:\[]|WARN|deprecated)",
+        "bash::WARNING_PATTERN",
+    )
 });
 
 static SUCCESS_PATTERN: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)(?:success|passed|✓|✔|ok\b|complet(?:e|ed)|done\b|\bbuilt\b|finished|all\s+\d+\s+tests?\s+passed)")
-        .expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"(?i)(?:success|passed|✓|✔|ok\b|complet(?:e|ed)|done\b|\bbuilt\b|finished|all\s+\d+\s+tests?\s+passed)",
+        "bash::SUCCESS_PATTERN",
+    )
 });
 
 /// Compress bash command output by preserving important lines.

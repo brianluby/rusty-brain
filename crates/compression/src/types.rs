@@ -90,8 +90,8 @@ const F64_EPSILON: f64 = 1e-9;
 impl PartialEq for CompressionStatistics {
     fn eq(&self, other: &Self) -> bool {
         self.chars_saved == other.chars_saved
-            && (self.ratio - other.ratio).abs() < F64_EPSILON
-            && (self.percentage_saved - other.percentage_saved).abs() < F64_EPSILON
+            && (self.ratio - other.ratio).abs() <= F64_EPSILON
+            && (self.percentage_saved - other.percentage_saved).abs() <= F64_EPSILON
     }
 }
 

@@ -11,6 +11,7 @@ mod glob;
 mod grep;
 mod lang;
 mod read;
+mod regex_util;
 mod truncate;
 mod types;
 
@@ -115,25 +116,17 @@ fn dispatch_with_fallback(
         return generic::compress(config, output, input_context);
     }
 
-    let config_clone = config.clone();
-    let output_owned = output.to_string();
-    let context_owned = input_context.map(String::from);
-    let tool_type_clone = tool_type.clone();
-
-    let result = panic::catch_unwind(move || {
-        let ctx = context_owned.as_deref();
-        match tool_type_clone {
-            Read => read::compress(&config_clone, &output_owned, ctx),
-            Bash => bash::compress(&config_clone, &output_owned, ctx),
-            Grep => grep::compress(&config_clone, &output_owned, ctx),
-            Glob => glob::compress(&config_clone, &output_owned, ctx),
-            Edit => edit::compress(&config_clone, &output_owned, ctx, false),
-            Write => edit::compress(&config_clone, &output_owned, ctx, true),
-            #[cfg(test)]
-            Other(name) if name == "panic_test" => panic!("simulated compressor panic"),
-            Other(_) => unreachable!(),
-        }
-    });
+    let result = panic::catch_unwind(panic::AssertUnwindSafe(|| match tool_type {
+        Read => read::compress(config, output, input_context),
+        Bash => bash::compress(config, output, input_context),
+        Grep => grep::compress(config, output, input_context),
+        Glob => glob::compress(config, output, input_context),
+        Edit => edit::compress(config, output, input_context, false),
+        Write => edit::compress(config, output, input_context, true),
+        #[cfg(test)]
+        Other(name) if name == "panic_test" => panic!("simulated compressor panic"),
+        Other(_) => unreachable!(),
+    }));
 
     result.unwrap_or_else(|_| {
         tracing::warn!(

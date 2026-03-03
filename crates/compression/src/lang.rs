@@ -4,6 +4,8 @@ use std::sync::LazyLock;
 
 use regex::Regex;
 
+use crate::regex_util;
+
 /// Supported programming languages for construct extraction.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) enum Language {
@@ -58,43 +60,53 @@ pub(crate) fn detect_language(file_path: Option<&str>, content: &str) -> Languag
 // --- Regex patterns ---
 
 static JS_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:import\s+|const\s+\w+\s*=\s*require\()").expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"^(?:import\s+|const\s+\w+\s*=\s*require\()",
+        "lang::JS_IMPORT",
+    )
 });
 static JS_EXPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:export\s+(?:default\s+)?(?:function|class|const|let|var|interface|type|enum|async\s+function)|export\s*\{|module\.exports)").expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"^(?:export\s+(?:default\s+)?(?:function|class|const|let|var|interface|type|enum|async\s+function)|export\s*\{|module\.exports)",
+        "lang::JS_EXPORT",
+    )
 });
 static JS_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:(?:async\s+)?function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?\()")
-        .expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"^(?:(?:async\s+)?function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:async\s+)?\()",
+        "lang::JS_FUNCTION",
+    )
 });
-static JS_CLASS: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:class|interface)\s+\w+").expect("BUG: invalid regex literal")
-});
+static JS_CLASS: LazyLock<Regex> =
+    LazyLock::new(|| regex_util::compile(r"^(?:class|interface)\s+\w+", "lang::JS_CLASS"));
 
 static PY_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:import\s+|from\s+\S+\s+import\s+)").expect("BUG: invalid regex literal")
+    regex_util::compile(r"^(?:import\s+|from\s+\S+\s+import\s+)", "lang::PY_IMPORT")
 });
 static PY_FUNCTION: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^(?:async\s+)?def\s+\w+").expect("BUG: invalid regex literal"));
+    LazyLock::new(|| regex_util::compile(r"^(?:async\s+)?def\s+\w+", "lang::PY_FUNCTION"));
 static PY_CLASS: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^class\s+\w+").expect("BUG: invalid regex literal"));
+    LazyLock::new(|| regex_util::compile(r"^class\s+\w+", "lang::PY_CLASS"));
 
-static RS_IMPORT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:pub\s+)?(?:use|mod)\s+").expect("BUG: invalid regex literal")
-});
+static RS_IMPORT: LazyLock<Regex> =
+    LazyLock::new(|| regex_util::compile(r"^(?:pub\s+)?(?:use|mod)\s+", "lang::RS_IMPORT"));
 static RS_FUNCTION: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+\w+")
-        .expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"^(?:pub(?:\(crate\))?\s+)?(?:async\s+)?fn\s+\w+",
+        "lang::RS_FUNCTION",
+    )
 });
 static RS_STRUCT: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"^(?:pub(?:\(crate\))?\s+)?(?:struct|enum|trait)\s+\w+")
-        .expect("BUG: invalid regex literal")
+    regex_util::compile(
+        r"^(?:pub(?:\(crate\))?\s+)?(?:struct|enum|trait)\s+\w+",
+        "lang::RS_STRUCT",
+    )
 });
 static RS_IMPL: LazyLock<Regex> =
-    LazyLock::new(|| Regex::new(r"^impl(?:<[^>]*>)?\s+").expect("BUG: invalid regex literal"));
+    LazyLock::new(|| regex_util::compile(r"^impl(?:<[^>]*>)?\s+", "lang::RS_IMPL"));
 
 static ERROR_MARKER: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"(?i)\b(?:TODO|FIXME|HACK|XXX|BUG)\b").expect("BUG: invalid regex literal")
+    regex_util::compile(r"(?i)\b(?:TODO|FIXME|HACK|XXX|BUG)\b", "lang::ERROR_MARKER")
 });
 
 /// Extract language-specific constructs from source code.
