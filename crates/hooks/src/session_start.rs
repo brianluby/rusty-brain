@@ -23,7 +23,7 @@ pub fn handle_session_start(input: &HookInput) -> Result<HookOutput, HookError> 
     }
 
     let memory_path = bootstrap::resolve_memory_path(input, cwd)?;
-    let mind = bootstrap::open_mind(input, cwd)?;
+    let mind = bootstrap::open_mind_with_path(memory_path.clone())?;
 
     // Get context and stats
     let ctx = mind.get_context(None)?;

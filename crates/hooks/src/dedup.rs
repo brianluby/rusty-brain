@@ -55,9 +55,28 @@ impl DedupCache {
                 message: format!("Failed to open cache lock file: {e}"),
             })?;
 
-        lock_file.lock_exclusive().map_err(|e| HookError::Dedup {
-            message: format!("Failed to acquire cache lock: {e}"),
-        })?;
+        // Non-blocking lock with bounded retries (fail-open on timeout).
+        // Prevents indefinite stalls from stuck lock holders.
+        let max_retries: u32 = 3;
+        let mut acquired = false;
+        for attempt in 0..=max_retries {
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => {
+                    acquired = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < max_retries => {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt + 1)));
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !acquired {
+            return Err(HookError::Dedup {
+                message: "Failed to acquire cache lock (timeout)".to_string(),
+            });
+        }
 
         let result = f();
         drop(lock_file); // Releases the exclusive lock by closing the fd

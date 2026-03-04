@@ -54,15 +54,46 @@ pub fn resolve_memory_path(input: &HookInput, cwd: &Path) -> Result<std::path::P
 
 /// Open a read-write `Mind` instance for the detected platform.
 ///
+/// Uses `MindConfig::from_env()` to honour env-driven config (e.g.
+/// `MEMVID_MIND_DEBUG`). Only overrides `memory_path` when
+/// `MEMVID_PLATFORM_MEMORY_PATH` is not explicitly set, preserving the
+/// documented precedence: explicit env override > platform policy > default.
+///
 /// # Errors
 ///
 /// Returns `HookError::Platform` if path resolution fails, or a `HookError`
 /// wrapping the underlying `Mind::open` error on storage failure.
 pub fn open_mind(input: &HookInput, cwd: &Path) -> Result<Mind, HookError> {
     let memory_path = resolve_memory_path(input, cwd)?;
-    let config = MindConfig {
-        memory_path,
-        ..MindConfig::default()
-    };
+    open_mind_with_path(memory_path)
+}
+
+/// Open a read-write `Mind` instance with a pre-resolved memory path.
+///
+/// Uses `MindConfig::from_env()` to honour env-driven config (e.g.
+/// `MEMVID_MIND_DEBUG`). Only overrides `memory_path` when
+/// `MEMVID_PLATFORM_MEMORY_PATH` is not explicitly set, preserving the
+/// documented precedence: explicit env override > platform policy > default.
+///
+/// Use this when the caller has already resolved the path (e.g. `session_start`
+/// needs the path for legacy-path warnings before opening) to avoid double
+/// resolution.
+///
+/// # Errors
+///
+/// Returns `HookError::Platform` on config failure, or a `HookError`
+/// wrapping the underlying `Mind::open` error on storage failure.
+pub fn open_mind_with_path(memory_path: std::path::PathBuf) -> Result<Mind, HookError> {
+    let mut config = MindConfig::from_env().map_err(|e| HookError::Platform {
+        message: format!("Failed to load config from env: {e}"),
+    })?;
+    // Only override with caller-provided path when no explicit env override
+    if std::env::var("MEMVID_PLATFORM_MEMORY_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        config.memory_path = memory_path;
+    }
     Ok(Mind::open(config)?)
 }

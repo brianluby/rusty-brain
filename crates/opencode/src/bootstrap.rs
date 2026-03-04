@@ -46,13 +46,24 @@ pub fn resolve_memory_path(cwd: &Path) -> Result<std::path::PathBuf, RustyBrainE
 
 /// Build a `MindConfig` with the resolved memory path for the opencode platform.
 ///
+/// Uses `MindConfig::from_env()` to honour env-driven config. Only overrides
+/// `memory_path` when `MEMVID_PLATFORM_MEMORY_PATH` is not explicitly set,
+/// preserving the documented precedence: explicit env override > platform
+/// policy > default.
+///
 /// # Errors
 ///
 /// Returns `RustyBrainError` if path resolution or env-based config loading fails.
 pub fn mind_config(cwd: &Path) -> Result<MindConfig, RustyBrainError> {
-    let memory_path = resolve_memory_path(cwd)?;
     let mut config = MindConfig::from_env()?;
-    config.memory_path = memory_path;
+    // Only override with platform-resolved path when no explicit env override
+    if std::env::var("MEMVID_PLATFORM_MEMORY_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .is_none()
+    {
+        config.memory_path = resolve_memory_path(cwd)?;
+    }
     Ok(config)
 }
 
