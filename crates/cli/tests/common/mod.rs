@@ -25,21 +25,24 @@ pub fn setup_test_mind(observations: &[TestObs]) -> (TempDir, PathBuf) {
     let dir = tempfile::tempdir().expect("failed to create temp dir");
     let path = dir.path().join("test.mv2");
 
-    let config = MindConfig {
-        memory_path: path.clone(),
-        ..MindConfig::default()
-    };
-    let mind = Mind::open(config).expect("failed to open mind");
+    {
+        let config = MindConfig {
+            memory_path: path.clone(),
+            ..MindConfig::default()
+        };
+        let mind = Mind::open(config).expect("failed to open mind");
 
-    for obs in observations {
-        mind.remember(
-            obs.obs_type,
-            &obs.tool_name,
-            &obs.summary,
-            obs.content.as_deref(),
-            None,
-        )
-        .expect("failed to remember observation");
+        for obs in observations {
+            mind.remember(
+                obs.obs_type,
+                &obs.tool_name,
+                &obs.summary,
+                obs.content.as_deref(),
+                None,
+            )
+            .expect("failed to remember observation");
+        }
+        // mind is dropped here, releasing any file locks before the CLI runs
     }
 
     (dir, path)
