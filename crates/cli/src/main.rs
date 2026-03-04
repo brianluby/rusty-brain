@@ -2,6 +2,7 @@
 
 mod args;
 mod commands;
+mod opencode_cmd;
 mod output;
 
 use std::fmt;
@@ -21,6 +22,7 @@ pub enum CliError {
     NotAFile { path: PathBuf },
     EmptyPattern,
     Io(std::io::Error),
+    InvalidJson(serde_json::Error),
 }
 
 impl CliError {
@@ -31,7 +33,8 @@ impl CliError {
             | Self::MemoryFileNotFound { .. }
             | Self::NotAFile { .. }
             | Self::EmptyPattern
-            | Self::Io(_) => 1,
+            | Self::Io(_)
+            | Self::InvalidJson(_) => 1,
         }
     }
 
@@ -46,6 +49,7 @@ impl CliError {
             Self::NotAFile { .. } => "E_CLI_NOT_A_FILE",
             Self::EmptyPattern => "E_CLI_EMPTY_PATTERN",
             Self::Io(_) => "E_CLI_IO",
+            Self::InvalidJson(_) => "E_CLI_INVALID_JSON",
         }
     }
 }
@@ -88,6 +92,7 @@ impl fmt::Display for CliError {
                 write!(f, "Search pattern must not be empty.")
             }
             Self::Io(e) => write!(f, "{e}"),
+            Self::InvalidJson(e) => write!(f, "invalid JSON input: {e}"),
         }
     }
 }
@@ -120,6 +125,11 @@ fn run() -> Result<(), (CliError, bool)> {
     }
 
     let json = cli.command.json();
+
+    // OpenCode subcommands handle their own I/O — dispatch directly.
+    if let Command::Opencode(ref subcmd) = cli.command {
+        return opencode_cmd::dispatch(subcmd).map_err(|e| (e, json));
+    }
 
     // Resolve memory path: --memory-path overrides auto-detection.
     let mut config = MindConfig::from_env().map_err(|e| (CliError::from(e), json))?;
@@ -157,6 +167,8 @@ fn run() -> Result<(), (CliError, bool)> {
                 oldest_first,
                 json,
             } => commands::run_timeline(mind, limit, r#type, oldest_first, json),
+            // Already handled above — unreachable
+            Command::Opencode(_) => Ok(()),
         };
         Ok(())
     })

@@ -72,6 +72,24 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// `OpenCode` editor adapter subcommands
+    #[command(subcommand)]
+    Opencode(OpenCodeCommand),
+}
+
+/// `OpenCode`-specific subcommands for editor integration.
+#[derive(Subcommand)]
+pub enum OpenCodeCommand {
+    /// Process a chat hook event (reads `HookInput` JSON from stdin)
+    ChatHook,
+    /// Process a tool hook event (reads `HookInput` JSON from stdin)
+    ToolHook,
+    /// Process a mind tool invocation (reads `MindToolInput` JSON from stdin)
+    Mind,
+    /// Process a session cleanup event (reads `HookInput` JSON from stdin)
+    SessionCleanup,
+    /// Process a session start event with orphan cleanup (reads `HookInput` JSON from stdin)
+    SessionStart,
 }
 
 impl Command {
@@ -82,6 +100,8 @@ impl Command {
             | Self::Ask { json, .. }
             | Self::Stats { json, .. }
             | Self::Timeline { json, .. } => *json,
+            // OpenCode subcommands always output JSON
+            Self::Opencode(_) => true,
         }
     }
 }

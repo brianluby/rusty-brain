@@ -81,6 +81,8 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
 - clap 4 (derive), tracing 0.1 (007-cli-scripts)
 - `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
+- Rust stable, edition 2024, MSRV 1.85.0 + Workspace crates (`core`, `platforms`, `compression`, `types`), `serde`, `serde_json`, `tracing`, `chrono`, `tempfile` (regular dep for atomic sidecar writes) (008-opencode-plugin)
+- `.agent-brain/mind.mv2` (via `crates/core` Mind API), `.opencode/session-<id>.json` (sidecar files on local filesystem) (008-opencode-plugin)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
