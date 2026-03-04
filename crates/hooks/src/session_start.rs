@@ -1,9 +1,21 @@
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::bootstrap;
 use crate::context::format_system_message;
 use crate::error::HookError;
 use types::hooks::{HookInput, HookOutput};
+
+/// Determine the effective memory path that `open_mind_with_path` will use.
+///
+/// When `MEMVID_PLATFORM_MEMORY_PATH` is set and non-empty, that value takes
+/// precedence over the platform-resolved path. This mirrors the precedence
+/// logic inside `bootstrap::open_mind_with_path`.
+fn effective_memory_path(resolved: PathBuf) -> PathBuf {
+    std::env::var("MEMVID_PLATFORM_MEMORY_PATH")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .map_or(resolved, PathBuf::from)
+}
 
 /// Handle the session-start hook event.
 ///
@@ -22,8 +34,9 @@ pub fn handle_session_start(input: &HookInput) -> Result<HookOutput, HookError> 
         return Ok(HookOutput::default());
     }
 
-    let memory_path = bootstrap::resolve_memory_path(input, cwd)?;
-    let mind = bootstrap::open_mind_with_path(memory_path.clone())?;
+    let resolved_path = bootstrap::resolve_memory_path(input, cwd)?;
+    let mind = bootstrap::open_mind_with_path(resolved_path.clone())?;
+    let memory_path = effective_memory_path(resolved_path);
 
     // Get context and stats
     let ctx = mind.get_context(None)?;
