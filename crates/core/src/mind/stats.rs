@@ -45,12 +45,15 @@ impl Mind {
         for entry in &timeline {
             let frame = self.backend.frame_by_id(entry.frame_id)?;
 
-            // Parse obs_type from metadata.
-            if let Some(obs_type_str) = frame.metadata.get("obs_type").and_then(|v| v.as_str()) {
-                if let Ok(obs_type) = obs_type_str.parse::<ObservationType>() {
-                    *type_counts.entry(obs_type).or_insert(0) += 1;
-                }
-            }
+            // Parse obs_type from metadata, falling back to Discovery
+            // (same fallback as Mind::timeline) to avoid undercounts.
+            let obs_type = frame
+                .metadata
+                .get("obs_type")
+                .and_then(|v| v.as_str())
+                .and_then(|s| s.parse::<ObservationType>().ok())
+                .unwrap_or(ObservationType::Discovery);
+            *type_counts.entry(obs_type).or_insert(0) += 1;
 
             // Count session summaries by tag.
             if frame.tags.iter().any(|t| t == "session_summary") {

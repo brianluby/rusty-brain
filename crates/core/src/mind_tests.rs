@@ -69,7 +69,15 @@ fn mind_open_read_only_missing_file_does_not_create_parent_dirs() {
     };
 
     let result = Mind::open_read_only(config);
-    assert!(result.is_err(), "missing read-only file should fail");
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("missing read-only file should fail"),
+    };
+    assert_eq!(
+        err.code(),
+        error_codes::E_FS_NOT_FOUND,
+        "should return E_FS_NOT_FOUND for missing file, got: {err}"
+    );
     assert!(
         !parent.exists(),
         "open_read_only must not create parent directories"

@@ -114,7 +114,7 @@
 **Status:** Proposed
 
 ### Context
-- Several production files are very large due to extensive inline tests.
+- Several production files are large enough to hinder reviewability due to extensive inline tests.
 
 ### Decision
 - Move broad scenario/contract tests to `tests/` where possible.

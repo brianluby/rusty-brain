@@ -39,18 +39,18 @@ fn wrap_memvid_error(err: memvid_core::MemvidError) -> RustyBrainError {
 fn classify_open_error(err: &memvid_core::MemvidError, path: &Path) -> RustyBrainError {
     let msg = err.to_string();
     let lower = msg.to_lowercase();
+    // High-confidence corruption indicators only. Generic tokens like "invalid",
+    // "decode", "deserialize", "header" are excluded to avoid mislabelling
+    // non-corruption errors (e.g. enable_lex failures) as CorruptedFile, which
+    // would trigger destructive backup-and-recreate recovery.
     let corruption_markers = [
         "corrupt",
-        "invalid",
         "malformed",
         "checksum",
         "truncated",
         "unexpected eof",
         "bad magic",
-        "decode",
-        "deserialize",
         "not a memvid",
-        "header",
     ];
 
     if corruption_markers
@@ -94,7 +94,10 @@ impl MemvidBackend for MemvidStore {
     fn open(&self, path: &Path) -> Result<(), RustyBrainError> {
         let mut mv = memvid_core::Memvid::open(path).map_err(|e| classify_open_error(&e, path))?;
         // Ensure lexical indexing is enabled for search/ask support.
-        mv.enable_lex().map_err(|e| classify_open_error(&e, path))?;
+        // Uses wrap_memvid_error (not classify_open_error) because enable_lex
+        // failures on an already-open handle are not corruption and must not
+        // trigger destructive recovery via CorruptedFile.
+        mv.enable_lex().map_err(wrap_memvid_error)?;
         let mut guard = lock_inner(&self.inner)?;
         *guard = Some(mv);
         Ok(())

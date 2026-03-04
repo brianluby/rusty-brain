@@ -10,7 +10,7 @@
 
 ---
 
-### Task 1: RB-ARCH-006 — Cap Over-Fetch in Filtered CLI Queries
+## Task 1: RB-ARCH-006 — Cap Over-Fetch in Filtered CLI Queries
 
 **Files:**
 - Modify: `crates/cli/src/commands.rs:22-26` (run_find)
@@ -79,7 +79,7 @@ git commit -m "perf: cap over-fetch at limit*10 for type-filtered CLI queries (R
 
 ---
 
-### Task 2: RB-ARCH-007 — Create mind/ directory and mod.rs
+## Task 2: RB-ARCH-007 — Create mind/ directory and mod.rs
 
 **Files:**
 - Create: `crates/core/src/mind/mod.rs`
@@ -195,7 +195,7 @@ Note: This won't compile yet — the submodule files don't exist. That's OK, we 
 
 ---
 
-### Task 3: RB-ARCH-007 — Create mind/lifecycle.rs
+## Task 3: RB-ARCH-007 — Create mind/lifecycle.rs
 
 **Files:**
 - Create: `crates/core/src/mind/lifecycle.rs`
@@ -369,7 +369,7 @@ fn set_file_permissions_0600(_path: &Path) -> Result<(), RustyBrainError> {
 
 ---
 
-### Task 4: RB-ARCH-007 — Create mind/locking.rs
+## Task 4: RB-ARCH-007 — Create mind/locking.rs
 
 **Files:**
 - Create: `crates/core/src/mind/locking.rs`
@@ -506,7 +506,7 @@ impl Drop for ReentrantLockGuard {
 
 ---
 
-### Task 5: RB-ARCH-007 — Create mind/read.rs
+## Task 5: RB-ARCH-007 — Create mind/read.rs
 
 **Files:**
 - Create: `crates/core/src/mind/read.rs`
@@ -694,7 +694,7 @@ fn parse_search_hit(hit: &SearchHit) -> MemorySearchResult {
 
 ---
 
-### Task 6: RB-ARCH-007 — Create mind/write.rs
+## Task 6: RB-ARCH-007 — Create mind/write.rs
 
 **Files:**
 - Create: `crates/core/src/mind/write.rs`
@@ -862,7 +862,7 @@ impl Mind {
 
 ---
 
-### Task 7: RB-ARCH-007 — Create mind/stats.rs
+## Task 7: RB-ARCH-007 — Create mind/stats.rs
 
 **Files:**
 - Create: `crates/core/src/mind/stats.rs`
@@ -975,7 +975,7 @@ impl Mind {
 
 ---
 
-### Task 8: RB-ARCH-007 — Delete old mind.rs and verify
+## Task 8: RB-ARCH-007 — Delete old mind.rs and verify
 
 **Files:**
 - Delete: `crates/core/src/mind.rs`
@@ -1025,7 +1025,7 @@ Public API surface unchanged. All tests pass."
 
 ---
 
-### Task 9: RB-ARCH-008 — Remove get_mind/reset_mind Singleton
+## Task 9: RB-ARCH-008 — Remove get_mind/reset_mind Singleton
 
 **Files:**
 - Modify: `crates/core/src/lib.rs`
@@ -1095,7 +1095,7 @@ per invocation. Removes global Mutex state and simplifies lib.rs."
 
 ---
 
-### Task 10: Final Quality Gates
+## Task 10: Final Quality Gates
 
 **Step 1: Run all quality gates**
 

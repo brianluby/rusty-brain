@@ -62,7 +62,10 @@ pub(crate) fn validate_existing(path: &Path) -> Result<(), RustyBrainError> {
 }
 
 fn reject_forbidden_prefixes(path: &Path) -> Result<(), RustyBrainError> {
-    let path_str = path.to_string_lossy();
+    // Normalize the path by removing `.` and `..` components to prevent
+    // traversal bypasses like `/tmp/../dev/shm/x.mv2`.
+    let normalized = normalize_path(path);
+    let path_str = normalized.to_string_lossy();
     for prefix in FORBIDDEN_PREFIXES {
         if path_str.starts_with(prefix) {
             return Err(RustyBrainError::FileSystem {
@@ -73,6 +76,28 @@ fn reject_forbidden_prefixes(path: &Path) -> Result<(), RustyBrainError> {
         }
     }
     Ok(())
+}
+
+/// Normalize a path by resolving `.` and `..` components lexically
+/// (without touching the filesystem).
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut components = Vec::new();
+    for component in path.components() {
+        match component {
+            Component::ParentDir => {
+                // Only pop if we have a normal component to pop
+                if matches!(components.last(), Some(Component::Normal(_))) {
+                    components.pop();
+                } else if !matches!(components.last(), Some(Component::RootDir)) {
+                    components.push(component);
+                }
+            }
+            Component::CurDir => {} // skip `.`
+            _ => components.push(component),
+        }
+    }
+    components.iter().collect()
 }
 
 fn validate_existing_file(path: &Path) -> Result<(), RustyBrainError> {
@@ -211,6 +236,24 @@ mod tests {
         let path = Path::new("/sys/test.mv2");
         let result = validate_and_open(path);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_traversal_to_dev_rejected() {
+        let path = Path::new("/tmp/../dev/shm/x.mv2");
+        let result = validate_and_open(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), error_codes::E_FS_PERMISSION_DENIED);
+    }
+
+    #[test]
+    fn validate_traversal_to_proc_rejected() {
+        let path = Path::new("/home/../proc/self/test.mv2");
+        let result = validate_and_open(path);
+        assert!(result.is_err());
+        let err = result.unwrap_err();
+        assert_eq!(err.code(), error_codes::E_FS_PERMISSION_DENIED);
     }
 
     #[test]

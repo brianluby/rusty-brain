@@ -267,7 +267,8 @@ mod tests {
 
     #[test]
     fn resolve_cli_memory_path_prefers_cli_override() {
-        let explicit = PathBuf::from("/tmp/explicit.mv2");
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.mv2");
         let actual = resolve_cli_memory_path(Some(explicit.clone()))
             .expect("explicit --memory-path must be accepted");
         assert_eq!(actual, explicit);
@@ -275,9 +276,12 @@ mod tests {
 
     #[test]
     fn resolve_cli_memory_path_prefers_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("env-override.mv2");
+        let env_str = env_path.to_str().unwrap();
         temp_env::with_vars(
             [
-                ("MEMVID_PLATFORM_MEMORY_PATH", Some("/tmp/env-override.mv2")),
+                ("MEMVID_PLATFORM_MEMORY_PATH", Some(env_str)),
                 ("MEMVID_PLATFORM_PATH_OPT_IN", Some("1")),
                 ("MEMVID_PLATFORM", Some("opencode")),
                 ("OPENCODE", Some("1")),
@@ -285,7 +289,7 @@ mod tests {
             || {
                 let actual =
                     resolve_cli_memory_path(None).expect("env override path should be accepted");
-                assert_eq!(actual, PathBuf::from("/tmp/env-override.mv2"));
+                assert_eq!(actual, env_path);
             },
         );
     }
