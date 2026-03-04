@@ -79,6 +79,8 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - memvid `.mv2` files on local filesystem (read-only access via `Mind` API in CLI)
 - ulid, fs2 (003-core-memory-engine)
 - serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
+- Rust stable, edition 2024, MSRV 1.85.0 + clap 4 (subcommand dispatch), serde/serde_json (JSON protocol), tracing (diagnostics), existing workspace crates (core, types, platforms) (006-claude-code-hooks)
+- `.agent-brain/mind.mv2` (memvid-encrypted observations), `.agent-brain/.dedup-cache.json` (hash-based dedup), `.install-version` (version marker) (006-claude-code-hooks)
 - clap 4 (derive), tracing 0.1 (007-cli-scripts)
 - `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
 
