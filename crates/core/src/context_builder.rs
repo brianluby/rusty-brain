@@ -74,6 +74,10 @@ pub(crate) fn build(
             if tokens_used >= budget {
                 break;
             }
+            let score = hit.score;
+            if score < config.min_confidence {
+                continue;
+            }
             if let Some(obs) = parse_observation_from_metadata(&hit.metadata) {
                 if recent_ids.contains(&obs.id) {
                     continue;

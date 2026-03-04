@@ -58,6 +58,32 @@ fn mind_open_existing_file_succeeds() {
     assert!(mind.is_initialized());
 }
 
+#[test]
+fn mind_open_read_only_missing_file_does_not_create_parent_dirs() {
+    let dir = tempfile::tempdir().unwrap();
+    let parent = dir.path().join("nested").join("deep");
+    let path = parent.join("readonly.mv2");
+    let config = MindConfig {
+        memory_path: path,
+        ..MindConfig::default()
+    };
+
+    let result = Mind::open_read_only(config);
+    let err = match result {
+        Err(e) => e,
+        Ok(_) => panic!("missing read-only file should fail"),
+    };
+    assert_eq!(
+        err.code(),
+        error_codes::E_FS_NOT_FOUND,
+        "should return E_FS_NOT_FOUND for missing file, got: {err}"
+    );
+    assert!(
+        !parent.exists(),
+        "open_read_only must not create parent directories"
+    );
+}
+
 // =========================================================================
 // T022: Mind::remember
 // =========================================================================

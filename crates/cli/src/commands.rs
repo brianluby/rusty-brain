@@ -19,7 +19,13 @@ pub fn run_find(
         return Err(CliError::EmptyPattern);
     }
 
-    let results = mind.search(pattern, Some(limit))?;
+    let fetch_limit = if type_filter.is_some() {
+        limit.saturating_mul(10)
+    } else {
+        limit
+    };
+
+    let results = mind.search(pattern, Some(fetch_limit))?;
 
     // Apply post-query type filter.
     let filtered: Vec<_> = match type_filter {
@@ -27,7 +33,8 @@ pub fn run_find(
         None => results.iter().collect(),
     };
 
-    let output_results: Vec<SearchResultJson> = filtered.iter().map(|r| (*r).into()).collect();
+    let output_results: Vec<SearchResultJson> =
+        filtered.iter().take(limit).map(|r| (*r).into()).collect();
     let find_output = FindOutput {
         count: output_results.len(),
         results: output_results,
@@ -83,7 +90,13 @@ pub fn run_timeline(
     json: bool,
 ) -> Result<(), CliError> {
     // reverse=true for default newest-first; reverse=false for oldest-first
-    let entries = mind.timeline(limit, !oldest_first)?;
+    let fetch_limit = if type_filter.is_some() {
+        limit.saturating_mul(10)
+    } else {
+        limit
+    };
+
+    let entries = mind.timeline(fetch_limit, !oldest_first)?;
 
     // Apply post-query type filter.
     let filtered: Vec<_> = match type_filter {
@@ -91,7 +104,8 @@ pub fn run_timeline(
         None => entries.iter().collect(),
     };
 
-    let output_entries: Vec<TimelineEntryJson> = filtered.iter().map(|e| (*e).into()).collect();
+    let output_entries: Vec<TimelineEntryJson> =
+        filtered.iter().take(limit).map(|e| (*e).into()).collect();
     let timeline_output = TimelineOutput {
         count: output_entries.len(),
         entries: output_entries,

@@ -36,6 +36,40 @@ fn wrap_memvid_error(err: memvid_core::MemvidError) -> RustyBrainError {
     }
 }
 
+fn classify_open_error(err: &memvid_core::MemvidError, path: &Path) -> RustyBrainError {
+    let msg = err.to_string();
+    let lower = msg.to_lowercase();
+    // High-confidence corruption indicators only. Generic tokens like "invalid",
+    // "decode", "deserialize", "header" are excluded to avoid mislabelling
+    // non-corruption errors (e.g. enable_lex failures) as CorruptedFile, which
+    // would trigger destructive backup-and-recreate recovery.
+    let corruption_markers = [
+        "corrupt",
+        "malformed",
+        "checksum",
+        "truncated",
+        "unexpected eof",
+        "bad magic",
+        "not a memvid",
+    ];
+
+    if corruption_markers
+        .iter()
+        .any(|marker| lower.contains(marker))
+    {
+        RustyBrainError::CorruptedFile {
+            code: error_codes::E_STORAGE_CORRUPTED_FILE,
+            message: format!("memory file appears corrupted: {} ({msg})", path.display()),
+        }
+    } else {
+        RustyBrainError::Storage {
+            code: error_codes::E_STORAGE_BACKEND,
+            message: format!("failed to open memory file {}: {msg}", path.display()),
+            source: Some(types::StorageSource(msg)),
+        }
+    }
+}
+
 /// Acquire the mutex guard, returning a storage error on poison.
 fn lock_inner(
     inner: &Mutex<Option<memvid_core::Memvid>>,
@@ -58,8 +92,11 @@ impl MemvidBackend for MemvidStore {
     }
 
     fn open(&self, path: &Path) -> Result<(), RustyBrainError> {
-        let mut mv = memvid_core::Memvid::open(path).map_err(wrap_memvid_error)?;
+        let mut mv = memvid_core::Memvid::open(path).map_err(|e| classify_open_error(&e, path))?;
         // Ensure lexical indexing is enabled for search/ask support.
+        // Uses wrap_memvid_error (not classify_open_error) because enable_lex
+        // failures on an already-open handle are not corruption and must not
+        // trigger destructive recovery via CorruptedFile.
         mv.enable_lex().map_err(wrap_memvid_error)?;
         let mut guard = lock_inner(&self.inner)?;
         *guard = Some(mv);

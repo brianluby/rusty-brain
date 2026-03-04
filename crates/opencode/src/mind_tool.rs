@@ -6,8 +6,9 @@
 use std::path::Path;
 
 use rusty_brain_core::mind::Mind;
-use types::{MindConfig, ObservationType, RustyBrainError, error_codes};
+use types::{ObservationType, RustyBrainError, error_codes};
 
+use crate::bootstrap;
 use crate::types::{MindToolInput, MindToolOutput, VALID_MODES};
 
 /// Process a mind tool invocation from `OpenCode`.
@@ -45,35 +46,19 @@ pub fn handle_mind_tool(
     }
 }
 
-fn open_mind_read_only(cwd: &Path) -> Result<Mind, RustyBrainError> {
-    let resolved = platforms::resolve_memory_path(cwd, "opencode", false)?;
-    let path = resolved.path;
-
-    let config = {
-        let mut c = MindConfig::from_env()?;
-        c.memory_path.clone_from(&path);
-        c
-    };
-
-    // Try read-only first; only create on explicit NOT_FOUND
-    Mind::open_read_only(config).or_else(|e| match &e {
-        RustyBrainError::FileSystem {
+fn open_mind_read_only(cwd: &Path) -> Result<Option<Mind>, RustyBrainError> {
+    match bootstrap::open_mind_read_only(cwd) {
+        Ok(mind) => Ok(Some(mind)),
+        Err(RustyBrainError::FileSystem {
             code: error_codes::E_FS_NOT_FOUND,
             ..
-        } => {
-            let mut config2 = MindConfig::from_env()?;
-            config2.memory_path = path;
-            Mind::open(config2)
-        }
-        _ => Err(e),
-    })
+        }) => Ok(None),
+        Err(e) => Err(e),
+    }
 }
 
 fn open_mind_read_write(cwd: &Path) -> Result<Mind, RustyBrainError> {
-    let resolved = platforms::resolve_memory_path(cwd, "opencode", false)?;
-    let mut config = MindConfig::from_env()?;
-    config.memory_path = resolved.path;
-    Mind::open(config)
+    bootstrap::open_mind_read_write(cwd)
 }
 
 fn handle_search(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError> {
@@ -88,7 +73,9 @@ fn handle_search(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Ru
     };
 
     let limit = input.limit.unwrap_or(10);
-    let mind = open_mind_read_only(cwd)?;
+    let Some(mind) = open_mind_read_only(cwd)? else {
+        return Ok(MindToolOutput::success(serde_json::json!([])));
+    };
     let results = mind.with_lock(|m: &Mind| m.search(query, Some(limit)))?;
 
     let data: Vec<serde_json::Value> = results
@@ -119,7 +106,11 @@ fn handle_ask(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Rusty
         }
     };
 
-    let mind = open_mind_read_only(cwd)?;
+    let Some(mind) = open_mind_read_only(cwd)? else {
+        return Ok(MindToolOutput::success(serde_json::json!({
+            "answer": serde_json::Value::Null,
+        })));
+    };
     let answer = mind.with_lock(|m: &Mind| m.ask(question))?;
 
     Ok(MindToolOutput::success(serde_json::json!({
@@ -129,7 +120,9 @@ fn handle_ask(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Rusty
 
 fn handle_recent(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError> {
     let limit = input.limit.unwrap_or(10);
-    let mind = open_mind_read_only(cwd)?;
+    let Some(mind) = open_mind_read_only(cwd)? else {
+        return Ok(MindToolOutput::success(serde_json::json!([])));
+    };
     let entries = mind.with_lock(|m: &Mind| m.timeline(limit, true))?;
 
     let data: Vec<serde_json::Value> = entries
@@ -148,7 +141,18 @@ fn handle_recent(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Ru
 }
 
 fn handle_stats(cwd: &Path) -> Result<MindToolOutput, RustyBrainError> {
-    let mind = open_mind_read_only(cwd)?;
+    let Some(mind) = open_mind_read_only(cwd)? else {
+        return Ok(MindToolOutput::success(serde_json::json!({
+            "total_observations": 0,
+            "total_sessions": 0,
+            "date_range": {
+                "oldest": serde_json::Value::Null,
+                "newest": serde_json::Value::Null,
+            },
+            "file_size_bytes": 0,
+            "type_breakdown": {},
+        })));
+    };
     let stats = mind.with_lock(|m: &Mind| m.stats())?;
 
     let type_breakdown: serde_json::Value = stats

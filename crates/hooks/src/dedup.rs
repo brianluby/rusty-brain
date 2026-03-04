@@ -1,6 +1,9 @@
 use std::collections::HashMap;
+use std::fs::OpenOptions;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
+
+use fs2::FileExt;
 
 use crate::error::HookError;
 
@@ -29,22 +32,74 @@ impl DedupCache {
         }
     }
 
+    fn lock_path(&self) -> PathBuf {
+        let mut lock_os = self.cache_path.as_os_str().to_os_string();
+        lock_os.push(".lock");
+        PathBuf::from(lock_os)
+    }
+
+    fn with_lock<T>(&self, f: impl FnOnce() -> Result<T, HookError>) -> Result<T, HookError> {
+        let lock_path = self.lock_path();
+        if let Some(parent) = lock_path.parent() {
+            std::fs::create_dir_all(parent).map_err(|e| HookError::Dedup {
+                message: format!("Failed to create cache directory: {e}"),
+            })?;
+        }
+
+        let lock_file = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(&lock_path)
+            .map_err(|e| HookError::Dedup {
+                message: format!("Failed to open cache lock file: {e}"),
+            })?;
+
+        // Non-blocking lock with bounded retries (fail-open on timeout).
+        // Prevents indefinite stalls from stuck lock holders.
+        let max_retries: u32 = 3;
+        let mut acquired = false;
+        for attempt in 0..=max_retries {
+            match lock_file.try_lock_exclusive() {
+                Ok(()) => {
+                    acquired = true;
+                    break;
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < max_retries => {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt + 1)));
+                }
+                Err(_) => break,
+            }
+        }
+
+        if !acquired {
+            return Err(HookError::Dedup {
+                message: "Failed to acquire cache lock (timeout)".to_string(),
+            });
+        }
+
+        let result = f();
+        drop(lock_file); // Releases the exclusive lock by closing the fd
+        result
+    }
+
     /// Check if the given tool+summary combination was recorded within the last 60 seconds.
     ///
     /// Returns `true` if duplicate (should skip storage).
     /// On any error: returns `false` (fail-open).
     #[must_use]
     pub fn is_duplicate(&self, tool_name: &str, summary: &str) -> bool {
-        let Ok(data) = self.read_cache() else {
-            return false;
-        };
+        self.with_lock(|| {
+            let data = self.read_cache().unwrap_or_default();
+            let key = Self::hash_key(tool_name, summary);
+            let now = chrono::Utc::now().timestamp();
 
-        let key = Self::hash_key(tool_name, summary);
-        let now = chrono::Utc::now().timestamp();
-
-        data.entries
-            .get(&key)
-            .is_some_and(|&ts| (now - ts) < TTL_SECONDS)
+            Ok(data
+                .entries
+                .get(&key)
+                .is_some_and(|&ts| (now - ts) < TTL_SECONDS))
+        })
+        .unwrap_or(false)
     }
 
     /// Record a new tool+summary entry with the current timestamp.
@@ -55,17 +110,19 @@ impl DedupCache {
     ///
     /// Returns `HookError::Dedup` on I/O or serialization failure.
     pub fn record(&self, tool_name: &str, summary: &str) -> Result<(), HookError> {
-        let mut data = self.read_cache().unwrap_or_default();
-        let now = chrono::Utc::now().timestamp();
+        self.with_lock(|| {
+            let mut data = self.read_cache().unwrap_or_default();
+            let now = chrono::Utc::now().timestamp();
 
-        // Prune expired entries
-        data.entries.retain(|_, ts| (now - *ts) < TTL_SECONDS);
+            // Prune expired entries
+            data.entries.retain(|_, ts| (now - *ts) < TTL_SECONDS);
 
-        // Record new entry
-        let key = Self::hash_key(tool_name, summary);
-        data.entries.insert(key, now);
+            // Record new entry
+            let key = Self::hash_key(tool_name, summary);
+            data.entries.insert(key, now);
 
-        self.write_cache(&data)
+            self.write_cache(&data)
+        })
     }
 
     fn hash_key(tool_name: &str, summary: &str) -> String {

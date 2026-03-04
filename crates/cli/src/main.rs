@@ -22,7 +22,6 @@ pub enum CliError {
     NotAFile { path: PathBuf },
     EmptyPattern,
     Io(std::io::Error),
-    InvalidJson(serde_json::Error),
 }
 
 impl CliError {
@@ -33,8 +32,7 @@ impl CliError {
             | Self::MemoryFileNotFound { .. }
             | Self::NotAFile { .. }
             | Self::EmptyPattern
-            | Self::Io(_)
-            | Self::InvalidJson(_) => 1,
+            | Self::Io(_) => 1,
         }
     }
 
@@ -49,7 +47,6 @@ impl CliError {
             Self::NotAFile { .. } => "E_CLI_NOT_A_FILE",
             Self::EmptyPattern => "E_CLI_EMPTY_PATTERN",
             Self::Io(_) => "E_CLI_IO",
-            Self::InvalidJson(_) => "E_CLI_INVALID_JSON",
         }
     }
 }
@@ -92,7 +89,6 @@ impl fmt::Display for CliError {
                 write!(f, "Search pattern must not be empty.")
             }
             Self::Io(e) => write!(f, "{e}"),
-            Self::InvalidJson(e) => write!(f, "invalid JSON input: {e}"),
         }
     }
 }
@@ -101,6 +97,41 @@ impl From<RustyBrainError> for CliError {
     fn from(e: RustyBrainError) -> Self {
         Self::Core(e)
     }
+}
+
+fn detect_cli_platform() -> String {
+    if let Ok(value) = std::env::var("MEMVID_PLATFORM") {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_lowercase();
+        }
+    }
+
+    if std::env::var("OPENCODE").is_ok_and(|v| v == "1") {
+        return "opencode".to_string();
+    }
+
+    "claude".to_string()
+}
+
+fn resolve_cli_memory_path(cli_memory_path: Option<PathBuf>) -> Result<PathBuf, CliError> {
+    if let Some(path) = cli_memory_path {
+        return Ok(path);
+    }
+
+    if let Ok(path) = std::env::var("MEMVID_PLATFORM_MEMORY_PATH") {
+        let trimmed = path.trim();
+        if !trimmed.is_empty() {
+            return Ok(PathBuf::from(trimmed));
+        }
+    }
+
+    let project_dir = std::env::current_dir().map_err(CliError::Io)?;
+    let platform_opt_in = std::env::var("MEMVID_PLATFORM_PATH_OPT_IN").is_ok_and(|v| v == "1");
+    let platform = detect_cli_platform();
+    let resolved = platforms::resolve_memory_path(&project_dir, &platform, platform_opt_in)
+        .map_err(CliError::from)?;
+    Ok(resolved.path)
 }
 
 /// Returns `Ok(())` on success, or `Err((error, json_mode))` so `main()`
@@ -131,11 +162,9 @@ fn run() -> Result<(), (CliError, bool)> {
         return opencode_cmd::dispatch(subcmd).map_err(|e| (e, json));
     }
 
-    // Resolve memory path: --memory-path overrides auto-detection.
+    // Resolve runtime config and memory path.
     let mut config = MindConfig::from_env().map_err(|e| (CliError::from(e), json))?;
-    if let Some(path) = cli.memory_path {
-        config.memory_path = path;
-    }
+    config.memory_path = resolve_cli_memory_path(cli.memory_path.clone()).map_err(|e| (e, json))?;
 
     // Pre-validate file existence (read-only CLI should not create files).
     let path = &config.memory_path;
@@ -187,5 +216,81 @@ fn main() {
             }
             std::process::exit(e.exit_code());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_cli_memory_path_matches_platform_policy_default_opt_in() {
+        temp_env::with_vars(
+            [
+                ("MEMVID_PLATFORM_MEMORY_PATH", None::<&str>),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", Some("1")),
+                ("MEMVID_PLATFORM", None::<&str>),
+                ("OPENCODE", None::<&str>),
+            ],
+            || {
+                let cwd = std::env::current_dir().expect("current dir");
+                let expected = platforms::resolve_memory_path(&cwd, "claude", true)
+                    .expect("resolve default platform")
+                    .path;
+                let actual =
+                    resolve_cli_memory_path(None).expect("resolve_cli_memory_path must succeed");
+                assert_eq!(actual, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_cli_memory_path_matches_platform_policy_opencode() {
+        temp_env::with_vars(
+            [
+                ("MEMVID_PLATFORM_MEMORY_PATH", None::<&str>),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", Some("1")),
+                ("MEMVID_PLATFORM", None::<&str>),
+                ("OPENCODE", Some("1")),
+            ],
+            || {
+                let cwd = std::env::current_dir().expect("current dir");
+                let expected = platforms::resolve_memory_path(&cwd, "opencode", true)
+                    .expect("resolve opencode platform")
+                    .path;
+                let actual =
+                    resolve_cli_memory_path(None).expect("resolve_cli_memory_path must succeed");
+                assert_eq!(actual, expected);
+            },
+        );
+    }
+
+    #[test]
+    fn resolve_cli_memory_path_prefers_cli_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let explicit = dir.path().join("explicit.mv2");
+        let actual = resolve_cli_memory_path(Some(explicit.clone()))
+            .expect("explicit --memory-path must be accepted");
+        assert_eq!(actual, explicit);
+    }
+
+    #[test]
+    fn resolve_cli_memory_path_prefers_env_override() {
+        let dir = tempfile::tempdir().unwrap();
+        let env_path = dir.path().join("env-override.mv2");
+        let env_str = env_path.to_str().unwrap();
+        temp_env::with_vars(
+            [
+                ("MEMVID_PLATFORM_MEMORY_PATH", Some(env_str)),
+                ("MEMVID_PLATFORM_PATH_OPT_IN", Some("1")),
+                ("MEMVID_PLATFORM", Some("opencode")),
+                ("OPENCODE", Some("1")),
+            ],
+            || {
+                let actual =
+                    resolve_cli_memory_path(None).expect("env override path should be accepted");
+                assert_eq!(actual, env_path);
+            },
+        );
     }
 }

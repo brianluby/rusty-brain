@@ -182,3 +182,34 @@ fn test_timeline_default_limit_is_10() {
     let count = json["count"].as_u64().unwrap();
     assert_eq!(count, 10, "default limit should be 10, got {count}");
 }
+
+#[test]
+fn test_timeline_type_filter_applies_before_final_limit() {
+    let (_dir, path) = setup_test_mind(&[
+        TestObs {
+            obs_type: ObservationType::Discovery,
+            tool_name: "Read".into(),
+            summary: "older discovery entry".into(),
+            content: None,
+        },
+        TestObs {
+            obs_type: ObservationType::Decision,
+            tool_name: "Write".into(),
+            summary: "newest decision entry".into(),
+            content: None,
+        },
+    ]);
+
+    // With --limit=1 and --type=discovery, the CLI must still return the
+    // matching discovery entry instead of filtering after a 1-entry backend fetch.
+    let (status, stdout, _stderr) = run_cli(
+        &path,
+        &["timeline", "--limit", "1", "--type", "discovery", "--json"],
+    );
+    assert!(status.success());
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let entries = json["entries"].as_array().unwrap();
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0]["obs_type"].as_str().unwrap(), "discovery");
+}

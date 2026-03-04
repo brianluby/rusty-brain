@@ -1,3 +1,4 @@
+pub mod bootstrap;
 pub mod context;
 pub mod dedup;
 pub mod dispatch;
