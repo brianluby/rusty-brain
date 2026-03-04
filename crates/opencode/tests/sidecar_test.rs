@@ -1,5 +1,6 @@
 //! Sidecar module unit tests (T004, T017).
 
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::Duration;
@@ -8,6 +9,7 @@ use opencode::sidecar;
 use opencode::types::{MAX_DEDUP_ENTRIES, SidecarState};
 
 /// Backdate a file's mtime by `seconds_ago` using `touch -t`.
+#[cfg(unix)]
 fn backdate_file(path: &Path, seconds_ago: u64) {
     use chrono::{Duration as ChronoDuration, Utc};
     let past = Utc::now() - ChronoDuration::seconds(seconds_ago as i64);
@@ -134,6 +136,7 @@ fn with_hash_lru_refresh() {
     assert_eq!(state.dedup_hashes, vec!["bbb", "ccc", "aaa"]);
 }
 
+#[cfg(unix)]
 #[test]
 fn file_permissions_0600() {
     let dir = tempfile::tempdir().unwrap();
@@ -154,6 +157,7 @@ fn file_permissions_0600() {
 // T017: Orphan cleanup tests
 // ---------------------------------------------------------------------------
 
+#[cfg(unix)]
 #[test]
 fn cleanup_stale_deletes_old_files() {
     let dir = tempfile::tempdir().unwrap();
@@ -174,6 +178,7 @@ fn cleanup_stale_deletes_old_files() {
     assert!(fresh_path.exists(), "fresh file should be preserved");
 }
 
+#[cfg(unix)]
 #[test]
 fn cleanup_only_matches_session_pattern() {
     let dir = tempfile::tempdir().unwrap();

@@ -51,14 +51,17 @@ pub fn sidecar_path(cwd: &Path, session_id: &str) -> std::path::PathBuf;
 /// Returns `true` if the hash is already present (duplicate observation).
 pub fn is_duplicate(state: &SidecarState, hash: &str) -> bool;
 
-/// Add a dedup hash to the sidecar state with LRU eviction.
+/// Return a new sidecar state with the given dedup hash added (LRU eviction).
 ///
-/// - If hash already exists: moves it to the end (refreshes LRU position)
-/// - If cache is at capacity (1024): evicts oldest entry (front of Vec)
-/// - Appends new hash to the end
+/// Takes `&SidecarState` and returns a new `SidecarState` (immutable API).
 ///
-/// Also increments `observation_count` and updates `last_updated`.
-pub fn add_hash(state: &mut SidecarState, hash: String);
+/// - If hash already exists: moves it to the end (refreshes LRU position),
+///   does NOT increment `observation_count`
+/// - If hash is new and cache is at capacity (1024): evicts oldest entry (front of Vec)
+/// - Appends hash to the end
+/// - Increments `observation_count` only for newly added hashes
+/// - Always updates `last_updated`
+pub fn with_hash(state: &SidecarState, hash: String) -> SidecarState;
 
 /// Compute a dedup hash from tool name and summary.
 ///

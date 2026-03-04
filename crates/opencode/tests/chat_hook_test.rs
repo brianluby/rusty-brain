@@ -1,7 +1,5 @@
 //! Chat hook unit tests (T008).
 
-use std::path::Path;
-
 use opencode::chat_hook::handle_chat_hook;
 use types::HookInput;
 
@@ -104,7 +102,13 @@ fn topic_query_passes_to_get_context() {
     assert!(result.is_ok(), "chat hook with query should succeed");
 
     let output = result.unwrap();
-    assert!(output.system_message.is_some());
+    let msg = output
+        .system_message
+        .expect("system_message should be present for topic query");
+    assert!(
+        msg.contains("authentication"),
+        "system_message should contain topic-specific content from seeded observation, got: {msg}"
+    );
 }
 
 /// AC-18: Memory path resolved via resolve_memory_path(cwd, "opencode", false).
@@ -129,10 +133,15 @@ fn memory_path_uses_legacy_first() {
 /// AC-3, M-5: Error path returns Err (caller wraps in fail-open).
 #[test]
 fn invalid_cwd_returns_error() {
-    let input = make_hook_input("/nonexistent/path");
-    let cwd = Path::new("/nonexistent/path/that/does/not/exist");
+    // Create a file where a directory would need to be, making mkdir fail
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    // cwd is a child of a file — creating .agent-brain/ under it is impossible
+    let cwd = blocker.join("fake_project");
+    let input = make_hook_input(&cwd.to_string_lossy());
 
-    let result = handle_chat_hook(&input, cwd);
+    let result = handle_chat_hook(&input, &cwd);
     // The handler returns Err; the fail-open wrapper in lib.rs handles conversion
     assert!(
         result.is_err(),

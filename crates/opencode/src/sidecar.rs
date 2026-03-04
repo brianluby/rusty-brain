@@ -155,18 +155,23 @@ pub fn is_duplicate(state: &SidecarState, hash: &str) -> bool {
 
 /// Return a new sidecar state with the given dedup hash added (LRU eviction).
 ///
-/// - If hash already exists: moves it to the end (refreshes LRU position)
-/// - If cache is at capacity (1024): evicts oldest entry (front of Vec)
-/// - Appends new hash to the end
-/// - Increments `observation_count` and updates `last_updated`.
+/// - If hash already exists: moves it to the end (refreshes LRU position),
+///   does NOT increment `observation_count`
+/// - If hash is new and cache is at capacity (1024): evicts oldest entry (front of Vec)
+/// - Appends hash to the end
+/// - Increments `observation_count` only for newly added hashes
+/// - Always updates `last_updated`.
 #[must_use]
 pub fn with_hash(state: &SidecarState, hash: String) -> SidecarState {
     let mut new_state = state.clone();
 
     // If already present, remove it (will re-add at end for LRU refresh)
-    if let Some(pos) = new_state.dedup_hashes.iter().position(|h| *h == hash) {
+    let existed = if let Some(pos) = new_state.dedup_hashes.iter().position(|h| *h == hash) {
         new_state.dedup_hashes.remove(pos);
-    }
+        true
+    } else {
+        false
+    };
 
     // Evict oldest if at capacity
     if new_state.dedup_hashes.len() >= MAX_DEDUP_ENTRIES {
@@ -174,7 +179,9 @@ pub fn with_hash(state: &SidecarState, hash: String) -> SidecarState {
     }
 
     new_state.dedup_hashes.push(hash);
-    new_state.observation_count += 1;
+    if !existed {
+        new_state.observation_count += 1;
+    }
     new_state.last_updated = Utc::now();
     new_state
 }

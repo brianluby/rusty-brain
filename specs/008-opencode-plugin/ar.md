@@ -359,11 +359,11 @@ graph TD
 
 | Component | Responsibility | Interface | Dependencies |
 |-----------|---------------|-----------|--------------|
-| chat_hook module | Read `HookInput` from stdin, resolve memory path, call `Mind::get_context`, return `HookOutput` with injected context | `fn handle_chat_hook(input: &HookInput, cwd: &Path) -> HookOutput` | `core::Mind`, `platforms::resolve_memory_path` |
-| tool_hook module | Read `HookInput`, check sidecar for dedup, compress tool output, call `Mind::remember`, update sidecar | `fn handle_tool_hook(input: &HookInput, cwd: &Path) -> HookOutput` | `core::Mind`, `compression::compress`, `sidecar` |
-| mind_tool module | Read `MindToolInput`, dispatch by mode to Mind APIs, return `MindToolOutput` | `fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> MindToolOutput` | `core::Mind` |
+| chat_hook module | Read `HookInput` from stdin, resolve memory path, call `Mind::get_context`, return `HookOutput` with injected context | `fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `platforms::resolve_memory_path` |
+| tool_hook module | Read `HookInput`, check sidecar for dedup, compress tool output, call `Mind::remember`, update sidecar | `fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `compression::compress`, `sidecar` |
+| mind_tool module | Read `MindToolInput`, dispatch by mode to Mind APIs, return `MindToolOutput` | `fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError>` | `core::Mind` |
 | sidecar module | Load/save session state, LRU dedup cache, hash computation, stale file cleanup | `fn load(path) -> SidecarState`, `fn save(path, state)`, `fn is_duplicate(state, hash) -> bool`, `fn cleanup_stale(dir, max_age)` | `serde_json`, `std::fs` |
-| session_cleanup module | Read sidecar for observation metadata, generate summary, call `Mind::save_session_summary`, delete sidecar | `fn handle_session_cleanup(session_id: &str, cwd: &Path) -> HookOutput` | `core::Mind`, `sidecar` |
+| session_cleanup module | Read sidecar for observation metadata, generate summary, call `Mind::save_session_summary`, delete sidecar | `fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `sidecar` |
 | CLI opencode subcommands | Parse subcommands, read stdin, call library handlers, write stdout, catch errors for fail-open | clap-derive `Opencode` subcommand enum | `crates/opencode` library |
 
 ### Data Flow :green_circle: `@llm-autonomous`

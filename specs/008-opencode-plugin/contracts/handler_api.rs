@@ -6,8 +6,10 @@
 // The CLI (crates/cli) calls these functions; they accept parsed input and
 // return output structs — no stdin/stdout I/O in the library.
 //
-// All handlers fail-open: errors and panics are caught by the fail-open
-// wrapper and converted to valid default output.
+// Handlers return Result<..., RustyBrainError> and may propagate errors.
+// Fail-open behavior is provided by wrapper functions (handle_with_failopen,
+// mind_tool_with_failopen) that catch errors and panics, converting them
+// to valid default output.
 
 use std::path::Path;
 use std::time::Duration;
@@ -31,7 +33,7 @@ use crate::types::{MindToolInput, MindToolOutput};
 /// The handler then returns a welcome message indicating the memory system
 /// is active.
 ///
-/// On error: returns `HookOutput::default()` (fail-open).
+/// On error: returns `Err(RustyBrainError)`; fail-open wrapper converts to `HookOutput::default()`.
 ///
 /// Performance target: <200ms p95 (SC-001).
 pub fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
@@ -48,7 +50,8 @@ pub fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
 /// 4. If duplicate: skips storage, returns success
 /// 5. If new: calls `Mind::remember()`, updates sidecar with new hash
 ///
-/// On error: returns `HookOutput { continue_execution: Some(true), .. }` (fail-open).
+/// On error: returns `Err(RustyBrainError)`; fail-open wrapper converts to
+/// `HookOutput { continue_execution: Some(true), .. }`.
 ///
 /// Performance target: <100ms p95 including sidecar I/O (SC-002).
 pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
@@ -68,7 +71,8 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
 ///
 /// Invalid mode: returns MindToolOutput with error listing valid modes (SEC-8).
 ///
-/// On error: returns MindToolOutput { success: false, error: Some(msg) }.
+/// On error: returns `Err(RustyBrainError)`; fail-open wrapper converts to
+/// `MindToolOutput { success: false, error: Some(msg) }`.
 pub fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError>;
 
 // ---------------------------------------------------------------------------
@@ -82,7 +86,7 @@ pub fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> Result<MindToolOut
 /// 3. Calls `Mind::save_session_summary(decisions, files, summary)`
 /// 4. Deletes the sidecar file
 ///
-/// On error: returns `HookOutput::default()` (fail-open).
+/// On error: returns `Err(RustyBrainError)`; fail-open wrapper converts to `HookOutput::default()`.
 pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
 
 // ---------------------------------------------------------------------------
@@ -97,7 +101,7 @@ pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput
 ///
 /// On any individual file error: logs WARN and continues scanning.
 /// Never panics.
-pub fn cleanup_stale_sidecars(sidecar_dir: &Path, max_age: Duration);
+pub fn cleanup_stale(sidecar_dir: &Path, max_age: Duration);
 
 // ---------------------------------------------------------------------------
 // Fail-Open Wrapper (M-5)

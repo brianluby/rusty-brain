@@ -274,10 +274,14 @@ fn invalid_mode_error_includes_error_code() {
     let input = make_input("bogus");
     let result = handle_mind_tool(&input, dir.path()).unwrap();
 
-    let err = result.error.unwrap();
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("E_INPUT_INVALID_FORMAT"),
+        "invalid mode error should have structured error_code"
+    );
     assert!(
-        err.contains("E_INPUT_INVALID_FORMAT"),
-        "invalid mode error should include error code: {err}"
+        result.error.unwrap().contains("invalid mode"),
+        "error message should describe the problem"
     );
 }
 
@@ -287,11 +291,12 @@ fn missing_query_error_includes_error_code() {
     let input = make_input("search");
     let result = handle_mind_tool(&input, dir.path()).unwrap();
 
-    let err = result.error.unwrap();
-    assert!(
-        err.contains("E_INPUT_EMPTY_FIELD"),
-        "missing query error should include error code: {err}"
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("E_INPUT_EMPTY_FIELD"),
+        "missing query error should have structured error_code"
     );
+    assert!(result.error.unwrap().contains("query is required"));
 }
 
 #[test]
@@ -300,11 +305,12 @@ fn missing_content_error_includes_error_code() {
     let input = make_input("remember");
     let result = handle_mind_tool(&input, dir.path()).unwrap();
 
-    let err = result.error.unwrap();
-    assert!(
-        err.contains("E_INPUT_EMPTY_FIELD"),
-        "missing content error should include error code: {err}"
+    assert_eq!(
+        result.error_code.as_deref(),
+        Some("E_INPUT_EMPTY_FIELD"),
+        "missing content error should have structured error_code"
     );
+    assert!(result.error.unwrap().contains("content is required"));
 }
 
 // ---------------------------------------------------------------------------

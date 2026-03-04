@@ -25,12 +25,14 @@ pub fn handle_mind_tool(
 ) -> Result<MindToolOutput, RustyBrainError> {
     // SEC-8: Validate mode against whitelist
     if !VALID_MODES.contains(&input.mode.as_str()) {
-        return Ok(MindToolOutput::error(format!(
-            "[{}] invalid mode '{}'; valid modes: {}",
+        return Ok(MindToolOutput::error_with_code(
             types::error_codes::E_INPUT_INVALID_FORMAT,
-            input.mode,
-            VALID_MODES.join(", ")
-        )));
+            format!(
+                "invalid mode '{}'; valid modes: {}",
+                input.mode,
+                VALID_MODES.join(", ")
+            ),
+        ));
     }
 
     match input.mode.as_str() {
@@ -54,10 +56,14 @@ fn open_mind_read_only(cwd: &Path) -> Result<Mind, RustyBrainError> {
     };
 
     // Try read-only first; if file doesn't exist, open read-write to auto-create
-    Mind::open_read_only(config).or_else(|_| {
-        let mut config2 = MindConfig::from_env()?;
-        config2.memory_path = path;
-        Mind::open(config2)
+    Mind::open_read_only(config).or_else(|e| {
+        if path.exists() {
+            Err(e)
+        } else {
+            let mut config2 = MindConfig::from_env()?;
+            config2.memory_path = path;
+            Mind::open(config2)
+        }
     })
 }
 
@@ -72,10 +78,10 @@ fn handle_search(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Ru
     let query = match &input.query {
         Some(q) if !q.trim().is_empty() => q,
         _ => {
-            return Ok(MindToolOutput::error(format!(
-                "[{}] query is required for search mode",
-                types::error_codes::E_INPUT_EMPTY_FIELD
-            )));
+            return Ok(MindToolOutput::error_with_code(
+                types::error_codes::E_INPUT_EMPTY_FIELD,
+                "query is required for search mode",
+            ));
         }
     };
 
@@ -104,10 +110,10 @@ fn handle_ask(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, Rusty
     let question = match &input.query {
         Some(q) if !q.trim().is_empty() => q,
         _ => {
-            return Ok(MindToolOutput::error(format!(
-                "[{}] query is required for ask mode",
-                types::error_codes::E_INPUT_EMPTY_FIELD
-            )));
+            return Ok(MindToolOutput::error_with_code(
+                types::error_codes::E_INPUT_EMPTY_FIELD,
+                "query is required for ask mode",
+            ));
         }
     };
 
@@ -168,10 +174,10 @@ fn handle_remember(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, 
     let content = match &input.content {
         Some(c) if !c.trim().is_empty() => c,
         _ => {
-            return Ok(MindToolOutput::error(format!(
-                "[{}] content is required for remember mode",
-                types::error_codes::E_INPUT_EMPTY_FIELD
-            )));
+            return Ok(MindToolOutput::error_with_code(
+                types::error_codes::E_INPUT_EMPTY_FIELD,
+                "content is required for remember mode",
+            ));
         }
     };
 

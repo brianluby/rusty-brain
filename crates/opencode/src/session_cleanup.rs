@@ -36,9 +36,19 @@ pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput
     let sidecar_path = sidecar::sidecar_path(cwd, session_id);
 
     // Load sidecar state for observation metadata (if available)
-    let observation_count = sidecar::load(&sidecar_path)
-        .map(|state| state.observation_count)
-        .unwrap_or(0);
+    let observation_count = match sidecar::load(&sidecar_path) {
+        Ok(state) => state.observation_count,
+        Err(e) => {
+            if sidecar_path.exists() {
+                tracing::warn!(
+                    error = %e,
+                    path = %sidecar_path.display(),
+                    "failed to load sidecar file during cleanup, defaulting to 0 observations"
+                );
+            }
+            0
+        }
+    };
 
     let summary = format!("Session completed with {observation_count} observation(s) captured.",);
 

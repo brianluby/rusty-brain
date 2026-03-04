@@ -85,8 +85,12 @@ fn empty_session_stores_minimal_summary() {
 /// M-5: Error path returns Err (caller wraps in fail-open).
 #[test]
 fn invalid_cwd_returns_error() {
-    let cwd = Path::new("/nonexistent/path/that/does/not/exist");
-    let result = handle_session_cleanup("test-session", cwd);
+    // Create a file where a directory would need to be, making mkdir fail
+    let dir = tempfile::tempdir().unwrap();
+    let blocker = dir.path().join("blocker");
+    std::fs::write(&blocker, "not a directory").unwrap();
+    let cwd = blocker.join("fake_project");
+    let result = handle_session_cleanup("test-session", &cwd);
     assert!(result.is_err(), "cleanup should error for invalid cwd");
 }
 

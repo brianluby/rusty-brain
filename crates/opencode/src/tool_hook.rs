@@ -50,18 +50,25 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
     let session_id = &input.session_id;
     let sidecar_file = sidecar::sidecar_path(cwd, session_id);
 
-    let state = if let Ok(s) = sidecar::load(&sidecar_file) {
-        s
-    } else {
-        // First invocation or corrupt file — create fresh state
-        if sidecar_file.exists() {
-            tracing::warn!(
-                path = %sidecar_file.display(),
-                "corrupt sidecar file, recreating"
-            );
-            let _ = std::fs::remove_file(&sidecar_file);
+    let state = match sidecar::load(&sidecar_file) {
+        Ok(s) => s,
+        Err(e) => {
+            if !sidecar_file.exists() {
+                // First invocation — no sidecar yet
+                crate::types::SidecarState::new(session_id.clone())
+            } else if matches!(e, RustyBrainError::Serialization { .. }) {
+                // Corrupt file — recreate
+                tracing::warn!(
+                    path = %sidecar_file.display(),
+                    "corrupt sidecar file, recreating"
+                );
+                let _ = std::fs::remove_file(&sidecar_file);
+                crate::types::SidecarState::new(session_id.clone())
+            } else {
+                // I/O or permission error — propagate
+                return Err(e);
+            }
         }
-        crate::types::SidecarState::new(session_id.clone())
     };
 
     // Compute dedup hash

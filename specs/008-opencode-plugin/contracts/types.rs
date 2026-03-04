@@ -55,7 +55,13 @@ pub struct MindToolOutput {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
 
-    /// Machine-readable error message. Present when success=false.
+    /// Stable machine-parseable error code (e.g. `"E_INPUT_INVALID_FORMAT"`).
+    /// Present when `success=false`. Callers should branch on this field
+    /// rather than parsing the free-text `error` message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+
+    /// Human-readable error message. Present when success=false.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -66,15 +72,27 @@ impl MindToolOutput {
         Self {
             success: true,
             data: Some(data),
+            error_code: None,
             error: None,
         }
     }
 
-    /// Create a failed output with error message.
+    /// Create a failed output with error message and stable error code.
+    pub fn error_with_code(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            data: None,
+            error_code: Some(code.to_string()),
+            error: Some(message.into()),
+        }
+    }
+
+    /// Create a failed output with error message (no structured code).
     pub fn error(message: impl Into<String>) -> Self {
         Self {
             success: false,
             data: None,
+            error_code: None,
             error: Some(message.into()),
         }
     }

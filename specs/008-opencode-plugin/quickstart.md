@@ -105,7 +105,7 @@ echo '{"session_id":"new-session","transcript_path":"","cwd":"/path/to/project",
 
 ## Project Structure
 
-```
+```text
 crates/opencode/src/
 ├── lib.rs                 # Public API, fail-open wrapper
 ├── types.rs               # MindToolInput, MindToolOutput
@@ -143,9 +143,10 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 chrono = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
-tempfile = { workspace = true }
+tracing-subscriber = { workspace = true }
 ```
 
 In `crates/cli/Cargo.toml`:

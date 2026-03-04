@@ -57,7 +57,7 @@ Session-scoped state persisted as a JSON sidecar file (`.opencode/session-<id>.j
 
 **Lifecycle**:
 - Created on first tool hook invocation in a session
-- Updated on each tool hook invocation (observation stored or dedup checked)
+- Updated on each tool hook invocation (observation stored or dedup check performed)
 - Deleted on session cleanup (S-1)
 - Orphaned files cleaned up after 24 hours (S-2)
 
