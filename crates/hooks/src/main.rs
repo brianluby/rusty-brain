@@ -17,9 +17,16 @@ fn main() {
         let cli = match Cli::try_parse() {
             Ok(cli) => cli,
             Err(e) => {
-                // Unknown subcommand or --help: write empty JSON and exit 0
+                // Unknown subcommand or --help: write fail-open JSON and exit 0
                 tracing::warn!("CLI parse error: {e}");
-                let _ = write_output(&HookOutput::default());
+                let fail_open_output = HookOutput {
+                    continue_execution: Some(true),
+                    ..Default::default()
+                };
+                if write_output(&fail_open_output).is_err() {
+                    print!("{{\"continue\":true}}");
+                    let _ = std::io::Write::flush(&mut std::io::stdout());
+                }
                 return;
             }
         };
@@ -34,15 +41,15 @@ fn main() {
         };
 
         if write_output(&output).is_err() {
-            // Last resort: write raw JSON to stdout
-            print!("{{}}");
+            // Last resort: write raw fail-open JSON to stdout
+            print!("{{\"continue\":true}}");
             let _ = std::io::Write::flush(&mut std::io::stdout());
         }
     });
 
     if result.is_err() {
         // Panic caught — write fail-open response
-        print!("{{}}");
+        print!("{{\"continue\":true}}");
         let _ = std::io::Write::flush(&mut std::io::stdout());
     }
 }

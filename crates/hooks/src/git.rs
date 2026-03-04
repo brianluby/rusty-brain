@@ -24,6 +24,19 @@ pub fn detect_modified_files(cwd: &Path) -> Vec<String> {
         return Vec::new();
     };
 
+    // Read stdout in a separate thread to avoid pipe buffer deadlock.
+    // If git produces more output than the OS pipe buffer, it blocks on write
+    // and never exits — reading concurrently prevents this.
+    let stdout_handle = child.stdout.take();
+    let reader_thread = std::thread::spawn(move || {
+        let Some(mut stdout) = stdout_handle else {
+            return String::new();
+        };
+        let mut buf = String::new();
+        let _ = stdout.read_to_string(&mut buf);
+        buf
+    });
+
     // Poll for completion with timeout
     let start = Instant::now();
     let status = loop {
@@ -45,14 +58,9 @@ pub fn detect_modified_files(cwd: &Path) -> Vec<String> {
         return Vec::new();
     }
 
-    let Some(mut stdout) = child.stdout.take() else {
+    let Ok(output) = reader_thread.join() else {
         return Vec::new();
     };
-
-    let mut output = String::new();
-    if stdout.read_to_string(&mut output).is_err() {
-        return Vec::new();
-    }
 
     output
         .lines()

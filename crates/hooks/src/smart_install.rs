@@ -24,8 +24,8 @@ pub fn handle_smart_install(input: &HookInput) -> Result<HookOutput, HookError> 
     };
 
     if needs_write {
-        // Atomic write: temp file + rename
-        let tmp_path = version_path.with_extension("tmp");
+        // Atomic write: temp file + rename (unique name avoids collisions)
+        let tmp_path = version_path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp_path, current_version)?;
         if let Err(e) = std::fs::rename(&tmp_path, &version_path) {
             let _ = std::fs::remove_file(&tmp_path); // Best-effort cleanup

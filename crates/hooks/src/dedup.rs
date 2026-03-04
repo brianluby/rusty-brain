@@ -9,7 +9,7 @@ const CACHE_FILENAME: &str = ".dedup-cache.json";
 
 /// File-based deduplication cache for post-tool-use observations.
 ///
-/// Entries expire after 60 seconds and are pruned on every read.
+/// Entries expire after 60 seconds and are pruned on every write (in `record`).
 /// Stores only hashes (not content) for security (SEC-2).
 pub struct DedupCache {
     cache_path: PathBuf,
@@ -92,8 +92,10 @@ impl DedupCache {
             })?;
         }
 
-        // Atomic write: write to temp file then rename
-        let tmp_path = self.cache_path.with_extension("tmp");
+        // Atomic write: write to temp file then rename (unique name avoids collisions)
+        let tmp_path = self
+            .cache_path
+            .with_extension(format!("tmp.{}", std::process::id()));
         let json = serde_json::to_string(data).map_err(|e| HookError::Dedup {
             message: format!("Failed to serialize cache: {e}"),
         })?;

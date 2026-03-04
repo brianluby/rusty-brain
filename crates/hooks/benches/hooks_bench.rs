@@ -40,12 +40,17 @@ fn bench_session_start(c: &mut Criterion) {
 }
 
 fn bench_post_tool_use(c: &mut Criterion) {
-    let dir = tempfile::tempdir().unwrap();
-    let cwd = dir.path().to_str().unwrap().to_string();
-    let input = make_post_tool_use_input(&cwd);
-
+    let mut counter: u64 = 0;
     c.bench_function("post_tool_use", |b| {
         b.iter(|| {
+            // Fresh temp dir per iteration so dedup cache doesn't short-circuit
+            let dir = tempfile::tempdir().unwrap();
+            let cwd = dir.path().to_str().unwrap().to_string();
+            counter += 1;
+            let mut input = make_post_tool_use_input(&cwd);
+            // Mutate tool_input to ensure unique summary each iteration
+            input.tool_input =
+                Some(serde_json::json!({"file_path": format!("/tmp/bench_{counter}.rs")}));
             let _ = hooks::post_tool_use::handle_post_tool_use(&input);
         });
     });

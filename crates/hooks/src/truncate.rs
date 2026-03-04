@@ -11,7 +11,7 @@ pub fn head_tail_truncate(content: &str, max_tokens: usize) -> String {
         return String::new();
     }
 
-    let max_chars = max_tokens * 4;
+    let max_chars = max_tokens.saturating_mul(4);
     let char_count = content.chars().count();
     if char_count <= max_chars {
         return content.to_string();
@@ -19,7 +19,7 @@ pub fn head_tail_truncate(content: &str, max_tokens: usize) -> String {
 
     let marker_len = TRUNCATION_MARKER.chars().count();
     let budget = max_chars.saturating_sub(marker_len);
-    let head_chars = (budget * 60) / 100;
+    let head_chars = budget.saturating_mul(60) / 100;
     let tail_chars = budget - head_chars;
 
     // Use char_indices to find safe UTF-8 byte boundaries

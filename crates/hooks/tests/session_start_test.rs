@@ -35,16 +35,19 @@ fn returns_system_message_with_commands() {
 }
 
 #[test]
-fn error_during_init_returns_fail_open() {
-    // Use a path where we can't create a memory directory
-    let input = common::session_start_input_with_cwd("/dev/null/nonexistent");
+fn error_during_init_returns_err() {
+    // Use a regular file as cwd — cannot create memory dir under a file (cross-platform)
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, "blocker").unwrap();
+    let input = common::session_start_input_with_cwd(file_path.to_str().unwrap());
 
     let result = handle_session_start(&input);
-    // Either Ok with continue:true or Err that will be fail-opened by the I/O layer
-    match result {
-        Ok(output) => assert_eq!(output.continue_execution, Some(true)),
-        Err(_) => {} // Expected — the I/O layer will fail-open this
-    }
+    // Handler returns Err; fail-open conversion happens at the I/O boundary in main.rs
+    assert!(
+        result.is_err(),
+        "handle_session_start should return Err for invalid cwd"
+    );
 }
 
 #[test]

@@ -12,7 +12,8 @@ use types::{MindConfig, ObservationType};
 ///
 /// # Errors
 ///
-/// Returns `HookError::Mind` or `HookError::Git` on failure.
+/// Returns `HookError::Platform` (memory-path resolution) or `HookError::Mind` on failure.
+/// Git detection is fail-open and does not produce errors.
 pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 
@@ -34,16 +35,18 @@ pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
 
     let mind = rusty_brain_core::mind::Mind::open(config)?;
 
-    // Store each modified file as a separate Feature observation
+    // Store each modified file as a separate Feature observation (best-effort)
     for file in &modified_files {
         let summary = format!("Modified file: {file}");
-        let _ = mind.remember(
+        if let Err(e) = mind.remember(
             ObservationType::Feature,
             "session_stop",
             &summary,
             None,
             None,
-        );
+        ) {
+            tracing::warn!("Failed to store file observation for '{file}': {e}");
+        }
     }
 
     // Build session summary text

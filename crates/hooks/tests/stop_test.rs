@@ -86,8 +86,12 @@ fn each_modified_file_stored_as_separate_observation() {
     assert!(output.system_message.is_some());
     let msg = output.system_message.unwrap();
     assert!(
-        msg.contains("a.rs") || msg.contains("b.rs") || msg.contains("2"),
-        "summary should reference modified files: {msg}"
+        msg.contains("Modified 2 file(s)"),
+        "summary should reference file count: {msg}"
+    );
+    assert!(
+        msg.contains("a.rs") && msg.contains("b.rs"),
+        "summary should list modified files: {msg}"
     );
 }
 
@@ -128,7 +132,7 @@ fn session_with_no_changes_stores_summary_noting_no_modifications() {
     assert!(output.system_message.is_some());
     let msg = output.system_message.unwrap();
     assert!(
-        msg.contains("no") || msg.contains("No") || msg.contains("0"),
+        msg.contains("no file modifications"),
         "should note no modifications: {msg}"
     );
 }

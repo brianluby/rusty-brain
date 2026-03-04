@@ -63,12 +63,15 @@ fn session_start_valid_input_produces_valid_json() {
     let dir = tempfile::tempdir().unwrap();
     let json_input = valid_session_start_json(dir.path().to_str().unwrap());
 
-    rusty_brain_cmd()
+    let output = rusty_brain_cmd()
         .arg("session-start")
         .write_stdin(json_input)
         .assert()
-        .success()
-        .stdout(predicates::str::contains("{"));
+        .success();
+
+    let stdout = String::from_utf8(output.get_output().stdout.clone()).unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert!(parsed.is_object(), "output must be a JSON object");
 }
 
 #[test]

@@ -62,13 +62,15 @@ fn mismatched_version_updates_file() {
 
 #[test]
 fn error_during_io_fails_open() {
-    // Use a path that doesn't exist and can't be created (e.g., under /dev/null)
-    let input = common::smart_install_input("/dev/null/nonexistent");
-    // The handler should not panic
+    // Use a regular file as cwd — cannot create children under a file (cross-platform)
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, "blocker").unwrap();
+    let input = common::smart_install_input(file_path.to_str().unwrap());
+    // The handler should return Err; fail-open conversion happens at the I/O boundary
     let result = handle_smart_install(&input);
-    // Either Ok with continue:true or Err that will be fail-opened by the I/O layer
-    match result {
-        Ok(output) => assert_eq!(output.continue_execution, Some(true)),
-        Err(_) => {} // Expected — the I/O layer will fail-open this
-    }
+    assert!(
+        result.is_err(),
+        "handle_smart_install should return Err for invalid cwd"
+    );
 }

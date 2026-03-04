@@ -19,8 +19,9 @@ pub fn read_input() -> Result<HookInput, HookError> {
 /// Returns `HookError` on I/O or serialization failure.
 pub fn write_output(output: &HookOutput) -> Result<(), HookError> {
     let stdout = std::io::stdout();
-    serde_json::to_writer(stdout.lock(), output)?;
-    println!();
+    let mut handle = stdout.lock();
+    serde_json::to_writer(&mut handle, output)?;
+    std::io::Write::write_all(&mut handle, b"\n")?;
     Ok(())
 }
 

@@ -101,20 +101,24 @@ fn tool_output_over_2000_chars_is_truncated() {
 }
 
 #[test]
-fn error_during_storage_returns_fail_open() {
-    // Use an invalid cwd that prevents Mind::open
+fn error_during_storage_returns_err() {
+    // Use a regular file as cwd — cannot resolve memory path under a file (cross-platform)
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, "blocker").unwrap();
     let input = common::post_tool_use_input_with_cwd(
-        "/dev/null/nonexistent",
+        file_path.to_str().unwrap(),
         "Read",
         serde_json::json!({"file_path": "/tmp/test.rs"}),
         serde_json::json!("content"),
     );
 
     let result = handle_post_tool_use(&input);
-    match result {
-        Ok(output) => assert_eq!(output.continue_execution, Some(true)),
-        Err(_) => {} // Expected — the I/O layer will fail-open this
-    }
+    // Handler returns Err; fail-open conversion happens at the I/O boundary in main.rs
+    assert!(
+        result.is_err(),
+        "handle_post_tool_use should return Err for invalid cwd"
+    );
 }
 
 #[test]
