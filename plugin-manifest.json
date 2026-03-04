@@ -1,0 +1,11 @@
+{
+  "name": "rusty-brain",
+  "version": "0.1.0",
+  "description": "Memory system for AI coding agents — provides persistent, searchable memory via memvid-encoded storage.",
+  "binary_path": "target/release/rusty-brain",
+  "capabilities": [
+    "chat_hook",
+    "tool_hook",
+    "mind_tool"
+  ]
+}

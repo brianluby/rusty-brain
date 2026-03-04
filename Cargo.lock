@@ -1622,6 +1622,18 @@ checksum = "d6790f58c7ff633d8771f42965289203411a5e5c68388703c06e14f24770b41e"
 [[package]]
 name = "opencode"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "compression",
+ "platforms",
+ "rusty-brain-core",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tracing",
+ "tracing-subscriber",
+ "types",
+]
 
 [[package]]
 name = "ownedbytes"
@@ -2057,6 +2069,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "fs2",
+ "opencode",
  "rusty-brain-core",
  "serde",
  "serde_json",

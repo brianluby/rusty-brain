@@ -83,6 +83,8 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - `.agent-brain/mind.mv2` (memvid-encrypted observations), `.agent-brain/.dedup-cache.json` (hash-based dedup), `.install-version` (version marker) (006-claude-code-hooks)
 - clap 4 (derive), tracing 0.1 (007-cli-scripts)
 - `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
+- Workspace crates (`core`, `platforms`, `compression`, `types`), `serde`, `serde_json`, `tracing`, `chrono`, `tempfile` (regular dep for atomic sidecar writes) (008-opencode-plugin)
+- `.agent-brain/mind.mv2` (via `crates/core` Mind API), `.opencode/session-<id>.json` (sidecar files on local filesystem) (008-opencode-plugin)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
