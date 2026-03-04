@@ -1,9 +1,10 @@
 use std::path::Path;
 
+use crate::bootstrap;
 use crate::error::HookError;
 use crate::git::detect_modified_files;
+use types::ObservationType;
 use types::hooks::{HookInput, HookOutput};
-use types::{MindConfig, ObservationType};
 
 /// Handle the stop hook event.
 ///
@@ -17,37 +18,14 @@ use types::{MindConfig, ObservationType};
 pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 
+    if !bootstrap::should_process(input, "stop") {
+        return Ok(HookOutput::default());
+    }
+
     // Detect modified files (returns empty Vec on any error)
     let modified_files = detect_modified_files(cwd);
 
-    // Resolve memory path and open Mind
-    let platform_name = platforms::detect_platform(input);
-    let resolved = platforms::resolve_memory_path(cwd, &platform_name, false).map_err(|e| {
-        HookError::Platform {
-            message: format!("Failed to resolve memory path: {e}"),
-        }
-    })?;
-
-    let config = MindConfig {
-        memory_path: resolved.path.clone(),
-        ..MindConfig::default()
-    };
-
-    let mind = rusty_brain_core::mind::Mind::open(config)?;
-
-    // Store each modified file as a separate Feature observation (best-effort)
-    for file in &modified_files {
-        let summary = format!("Modified file: {file}");
-        if let Err(e) = mind.remember(
-            ObservationType::Feature,
-            "session_stop",
-            &summary,
-            None,
-            None,
-        ) {
-            tracing::warn!("Failed to store file observation for '{file}': {e}");
-        }
-    }
+    let mind = bootstrap::open_mind(input, cwd)?;
 
     // Build session summary text
     let summary_text = if modified_files.is_empty() {
@@ -63,8 +41,24 @@ pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
     // Decisions are empty for MVP (decision extraction deferred)
     let decisions: Vec<String> = Vec::new();
 
-    // Save session summary
-    mind.save_session_summary(decisions, modified_files, &summary_text)?;
+    // Store observations and summary under one lock
+    mind.with_lock(|m| {
+        for file in &modified_files {
+            let summary = format!("Modified file: {file}");
+            if let Err(e) = m.remember(
+                ObservationType::Feature,
+                "session_stop",
+                &summary,
+                None,
+                None,
+            ) {
+                tracing::warn!("Failed to store file observation for '{file}': {e}");
+            }
+        }
+
+        m.save_session_summary(decisions, modified_files.clone(), &summary_text)?;
+        Ok(())
+    })?;
 
     Ok(HookOutput {
         system_message: Some(summary_text),

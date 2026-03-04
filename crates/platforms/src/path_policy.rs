@@ -10,9 +10,34 @@ use std::path::{Path, PathBuf};
 
 use types::AgentBrainError;
 use types::error::error_codes;
+use types::sanitize_platform_name;
 
 /// Default legacy memory file path relative to project root.
 const DEFAULT_LEGACY_PATH: &str = ".agent-brain/mind.mv2";
+
+/// Pre-canonical memory path used by early Claude Code integrations.
+///
+/// This path (`".claude/mind.mv2"`) predates the current canonical policy
+/// (`".agent-brain/mind.mv2"` or platform-scoped). When this file exists
+/// alongside the canonical path, a migration warning should be shown.
+pub const LEGACY_CLAUDE_MEMORY_PATH: &str = ".claude/mind.mv2";
+
+/// Format the migration warning shown when a legacy memory file is detected.
+///
+/// Returns a human-readable note suitable for appending to system messages.
+/// The `canonical_path` argument is the display form of the current session's
+/// resolved memory path.
+///
+/// Does NOT perform filesystem I/O — the caller is responsible for checking
+/// whether the legacy file exists before calling this function.
+#[must_use]
+pub fn format_legacy_path_warning(canonical_path: &std::path::Path) -> String {
+    format!(
+        "\n**Note:** Legacy memory file detected at `{LEGACY_CLAUDE_MEMORY_PATH}`. \
+         Current canonical path for this session is `{}`.\n",
+        canonical_path.display()
+    )
+}
 
 /// The mode used to resolve a memory file path.
 #[non_exhaustive]
@@ -31,22 +56,6 @@ pub struct ResolvedMemoryPath {
     pub path: PathBuf,
     /// The path resolution mode that was applied.
     pub mode: PathMode,
-}
-
-/// Sanitize a platform name for use in file paths.
-///
-/// Replaces non-alphanumeric characters (except hyphens and underscores)
-/// with hyphens (FR-016).
-fn sanitize_platform_name(name: &str) -> String {
-    name.chars()
-        .map(|c| {
-            if c.is_alphanumeric() || c == '-' || c == '_' {
-                c
-            } else {
-                '-'
-            }
-        })
-        .collect()
 }
 
 /// Resolve the memory file path based on path policy.
@@ -249,5 +258,40 @@ mod tests {
         assert_eq!(r1.path, r2.path);
         assert_eq!(r1.mode, PathMode::LegacyFirst);
         assert_eq!(r2.mode, PathMode::LegacyFirst);
+    }
+
+    // -------------------------------------------------------------------------
+    // Legacy path warning (RB-ARCH-010)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn legacy_claude_memory_path_constant_value() {
+        assert_eq!(LEGACY_CLAUDE_MEMORY_PATH, ".claude/mind.mv2");
+    }
+
+    #[test]
+    fn format_legacy_path_warning_contains_both_paths() {
+        let canonical = Path::new("/project/.agent-brain/mind.mv2");
+        let warning = format_legacy_path_warning(canonical);
+
+        assert!(
+            warning.contains(LEGACY_CLAUDE_MEMORY_PATH),
+            "warning must mention the legacy path"
+        );
+        assert!(
+            warning.contains("/project/.agent-brain/mind.mv2"),
+            "warning must mention the canonical path"
+        );
+    }
+
+    #[test]
+    fn format_legacy_path_warning_with_platform_opt_in_path() {
+        let canonical = Path::new("/project/.claude/mind-claude.mv2");
+        let warning = format_legacy_path_warning(canonical);
+
+        assert!(
+            warning.contains(".claude/mind-claude.mv2"),
+            "warning must mention the platform-scoped canonical path"
+        );
     }
 }

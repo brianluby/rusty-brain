@@ -29,10 +29,10 @@ fn each_entry_has_type_command_with_correct_command_string() {
     let hooks = parsed.get("hooks").unwrap();
 
     let expected = [
-        ("SessionStart", "\"rusty-brain\" session-start"),
-        ("PostToolUse", "\"rusty-brain\" post-tool-use"),
-        ("Stop", "\"rusty-brain\" stop"),
-        ("Notification", "\"rusty-brain\" smart-install"),
+        ("SessionStart", "'rusty-brain' session-start"),
+        ("PostToolUse", "'rusty-brain' post-tool-use"),
+        ("Stop", "'rusty-brain' stop"),
+        ("Notification", "'rusty-brain' smart-install"),
     ];
 
     for (event, cmd) in &expected {
@@ -60,7 +60,7 @@ fn binary_name_is_configurable() {
     let session_start = hooks.get("SessionStart").unwrap().as_array().unwrap();
     let cmd = session_start[0].get("command").unwrap().as_str().unwrap();
     assert!(
-        cmd.starts_with("\"my-custom-binary\""),
+        cmd.starts_with("'my-custom-binary'"),
         "should use quoted custom binary name: {cmd}"
     );
 }
@@ -74,21 +74,21 @@ fn binary_path_with_spaces_is_shell_quoted() {
     let session_start = hooks.get("SessionStart").unwrap().as_array().unwrap();
     let cmd = session_start[0].get("command").unwrap().as_str().unwrap();
     assert_eq!(
-        cmd, "\"/path/with spaces/rusty-brain\" session-start",
+        cmd, "'/path/with spaces/rusty-brain' session-start",
         "paths with spaces must be shell-quoted"
     );
 }
 
 #[test]
-fn binary_path_with_quotes_is_escaped() {
-    let manifest = generate_manifest("path\"with\"quotes");
+fn binary_path_with_single_quote_is_escaped() {
+    let manifest = generate_manifest("path'with'quote");
     let parsed: serde_json::Value = serde_json::from_str(&manifest).unwrap();
     let hooks = parsed.get("hooks").unwrap();
 
     let session_start = hooks.get("SessionStart").unwrap().as_array().unwrap();
     let cmd = session_start[0].get("command").unwrap().as_str().unwrap();
     assert_eq!(
-        cmd, "\"path\\\"with\\\"quotes\" session-start",
-        "embedded quotes must be escaped"
+        cmd, "'path'\"'\"'with'\"'\"'quote' session-start",
+        "embedded single quotes must be escaped"
     );
 }

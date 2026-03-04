@@ -1,13 +1,13 @@
 /// Shell-quote a path so it remains a single token when parsed by the shell.
-/// Wraps in double quotes and escapes embedded double quotes.
+/// Uses single-quote escaping to avoid shell expansion.
 fn shell_quote(path: &str) -> String {
-    format!("\"{}\"", path.replace('"', "\\\""))
+    format!("'{}'", path.replace('\'', "'\"'\"'"))
 }
 
 /// Generate the hooks.json manifest content for Claude Code hook registration.
 ///
 /// Produces a JSON string mapping hook event types to `{binary_name} <subcommand>` commands.
-/// Binary paths are shell-quoted to handle spaces in paths.
+/// Binary paths are shell-quoted to handle spaces and shell metacharacters.
 #[must_use]
 pub fn generate_manifest(binary_name: &str) -> String {
     let bin = shell_quote(binary_name);

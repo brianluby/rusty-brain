@@ -18,7 +18,7 @@ semver = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
-temp-env = "0.3"
+temp-env = { workspace = true }
 
 [lints]
 workspace = true

@@ -4,6 +4,8 @@
 //! All handlers are fail-open: errors and panics produce valid default output.
 //! No stdin/stdout I/O — the CLI layer handles all I/O.
 
+pub mod bootstrap;
+
 pub mod chat_hook;
 pub mod mind_tool;
 pub mod session_cleanup;

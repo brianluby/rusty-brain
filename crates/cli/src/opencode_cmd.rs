@@ -9,6 +9,7 @@ use std::time::Duration;
 
 use crate::CliError;
 use crate::args::OpenCodeCommand;
+use types::{RustyBrainError, error_codes};
 
 /// Dispatch an `OpenCode` subcommand.
 ///
@@ -24,13 +25,27 @@ pub fn dispatch(subcmd: &OpenCodeCommand) -> Result<(), CliError> {
     }
 }
 
+fn io_to_rusty(err: std::io::Error) -> RustyBrainError {
+    RustyBrainError::FileSystem {
+        code: error_codes::E_FS_IO_ERROR,
+        message: "failed to read OpenCode command input".to_string(),
+        source: Some(err),
+    }
+}
+
+fn json_to_rusty(err: serde_json::Error) -> RustyBrainError {
+    RustyBrainError::Serialization {
+        code: error_codes::E_SER_DESERIALIZE_FAILED,
+        message: "invalid OpenCode JSON input".to_string(),
+        source: Some(err),
+    }
+}
+
 /// Read stdin into a string.
-fn read_stdin() -> Result<String, CliError> {
+fn read_stdin() -> Result<String, std::io::Error> {
     use std::io::Read;
     let mut buf = String::new();
-    std::io::stdin()
-        .read_to_string(&mut buf)
-        .map_err(CliError::Io)?;
+    std::io::stdin().read_to_string(&mut buf)?;
     Ok(buf)
 }
 
@@ -42,46 +57,49 @@ fn write_json_stdout(value: &impl serde::Serialize) -> Result<(), CliError> {
 }
 
 fn run_chat_hook() -> Result<(), CliError> {
-    let raw = read_stdin()?;
-    let input: types::HookInput = serde_json::from_str(&raw).map_err(CliError::InvalidJson)?;
+    let output = opencode::handle_with_failopen(|| {
+        let raw = read_stdin().map_err(io_to_rusty)?;
+        let input: types::HookInput = serde_json::from_str(&raw).map_err(json_to_rusty)?;
 
-    let cwd = Path::new(&input.cwd);
-    let output =
-        opencode::handle_with_failopen(|| opencode::chat_hook::handle_chat_hook(&input, cwd));
+        let cwd = Path::new(&input.cwd);
+        opencode::chat_hook::handle_chat_hook(&input, cwd)
+    });
 
     write_json_stdout(&output)
 }
 
 fn run_tool_hook() -> Result<(), CliError> {
-    let raw = read_stdin()?;
-    let input: types::HookInput = serde_json::from_str(&raw).map_err(CliError::InvalidJson)?;
+    let output = opencode::handle_with_failopen(|| {
+        let raw = read_stdin().map_err(io_to_rusty)?;
+        let input: types::HookInput = serde_json::from_str(&raw).map_err(json_to_rusty)?;
 
-    let cwd = Path::new(&input.cwd);
-    let output =
-        opencode::handle_with_failopen(|| opencode::tool_hook::handle_tool_hook(&input, cwd));
+        let cwd = Path::new(&input.cwd);
+        opencode::tool_hook::handle_tool_hook(&input, cwd)
+    });
 
     write_json_stdout(&output)
 }
 
 fn run_mind() -> Result<(), CliError> {
-    let raw = read_stdin()?;
-    let input: opencode::types::MindToolInput =
-        serde_json::from_str(&raw).map_err(CliError::InvalidJson)?;
+    let output = opencode::mind_tool_with_failopen(|| {
+        let raw = read_stdin().map_err(io_to_rusty)?;
+        let input: opencode::types::MindToolInput =
+            serde_json::from_str(&raw).map_err(json_to_rusty)?;
 
-    // MindToolInput doesn't carry cwd; use the process working directory
-    let cwd = std::env::current_dir().map_err(CliError::Io)?;
-    let output =
-        opencode::mind_tool_with_failopen(|| opencode::mind_tool::handle_mind_tool(&input, &cwd));
+        // MindToolInput doesn't carry cwd; use the process working directory
+        let cwd = std::env::current_dir().map_err(io_to_rusty)?;
+        opencode::mind_tool::handle_mind_tool(&input, &cwd)
+    });
 
     write_json_stdout(&output)
 }
 
 fn run_session_cleanup() -> Result<(), CliError> {
-    let raw = read_stdin()?;
-    let input: types::HookInput = serde_json::from_str(&raw).map_err(CliError::InvalidJson)?;
-
-    let cwd = Path::new(&input.cwd);
     let output = opencode::handle_with_failopen(|| {
+        let raw = read_stdin().map_err(io_to_rusty)?;
+        let input: types::HookInput = serde_json::from_str(&raw).map_err(json_to_rusty)?;
+
+        let cwd = Path::new(&input.cwd);
         opencode::session_cleanup::handle_session_cleanup(&input.session_id, cwd)
     });
 
@@ -89,15 +107,18 @@ fn run_session_cleanup() -> Result<(), CliError> {
 }
 
 fn run_session_start() -> Result<(), CliError> {
-    let raw = read_stdin()?;
-    let input: types::HookInput = serde_json::from_str(&raw).map_err(CliError::InvalidJson)?;
+    let output = opencode::handle_with_failopen(|| {
+        let raw = read_stdin().map_err(io_to_rusty)?;
+        let input: types::HookInput = serde_json::from_str(&raw).map_err(json_to_rusty)?;
 
-    let cwd = Path::new(&input.cwd);
-    let sidecar_dir = cwd.join(".opencode");
+        let cwd = Path::new(&input.cwd);
+        let sidecar_dir = cwd.join(".opencode");
 
-    // Cleanup stale sidecar files (>24h old)
-    opencode::sidecar::cleanup_stale(&sidecar_dir, Duration::from_secs(24 * 3600));
+        // Cleanup stale sidecar files (>24h old)
+        opencode::sidecar::cleanup_stale(&sidecar_dir, Duration::from_secs(24 * 3600));
 
-    // Return default HookOutput (success)
-    write_json_stdout(&types::HookOutput::default())
+        Ok(types::HookOutput::default())
+    });
+
+    write_json_stdout(&output)
 }

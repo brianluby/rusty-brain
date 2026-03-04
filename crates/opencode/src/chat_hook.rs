@@ -9,11 +9,13 @@ use std::fmt::Write as _;
 use std::path::Path;
 
 use rusty_brain_core::mind::Mind;
-use types::{HookInput, HookOutput, InjectedContext, MindConfig, RustyBrainError};
+use types::{HookInput, HookOutput, InjectedContext, RustyBrainError};
+
+use crate::bootstrap;
 
 /// Process a chat message event from `OpenCode`.
 ///
-/// Resolves the memory path (`LegacyFirst`), opens the Mind, retrieves context
+/// Resolves the memory path, opens the Mind, retrieves context
 /// via `Mind::get_context(query)`, and returns a `HookOutput` with:
 /// - `system_message`: formatted memory context (human-readable)
 /// - `hook_specific_output`: structured `InjectedContext` JSON
@@ -26,12 +28,11 @@ use types::{HookInput, HookOutput, InjectedContext, MindConfig, RustyBrainError}
 /// Returns `RustyBrainError` if memory path resolution, Mind opening,
 /// or context retrieval fails.
 pub fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError> {
-    let resolved = platforms::resolve_memory_path(cwd, "opencode", false)?;
+    if !bootstrap::should_process(input, "session_start") {
+        return Ok(HookOutput::default());
+    }
 
-    let mut config = MindConfig::from_env()?;
-    config.memory_path = resolved.path;
-
-    let mind = Mind::open(config)?;
+    let mind = bootstrap::open_mind_read_write(cwd)?;
     let query = input.prompt.as_deref();
 
     let ctx = mind.with_lock(|m: &Mind| m.get_context(query))?;

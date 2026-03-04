@@ -167,6 +167,38 @@ fn recovered_mv2_file_has_0600_permissions() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn existing_mv2_file_permissions_hardened_to_0600_on_open() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("existing-perms.mv2");
+
+    {
+        let config = MindConfig {
+            memory_path: path.clone(),
+            ..MindConfig::default()
+        };
+        let _mind = Mind::open(config).unwrap();
+    }
+
+    std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let config = MindConfig {
+        memory_path: path.clone(),
+        ..MindConfig::default()
+    };
+    let _mind = Mind::open(config).unwrap();
+
+    let perms = std::fs::metadata(&path).unwrap().permissions();
+    assert_eq!(
+        perms.mode() & 0o777,
+        0o600,
+        "existing store permissions should be hardened to 0600"
+    );
+}
+
 // =========================================================================
 // T071: Read-only filesystem (EC-2)
 // =========================================================================

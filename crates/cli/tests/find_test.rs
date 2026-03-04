@@ -168,3 +168,35 @@ fn test_find_empty_pattern_error() {
         "error should mention empty pattern, got: {stderr}"
     );
 }
+
+#[test]
+fn test_find_type_filter_applies_before_final_limit() {
+    let (_dir, path) = setup_test_mind(&[
+        TestObs {
+            obs_type: ObservationType::Discovery,
+            tool_name: "Read".into(),
+            summary: "token token token token token token token token token token".into(),
+            content: None,
+        },
+        TestObs {
+            obs_type: ObservationType::Decision,
+            tool_name: "Write".into(),
+            summary: "token".into(),
+            content: None,
+        },
+    ]);
+
+    // Even with --limit=1, the type-filtered result should not be dropped.
+    let (status, stdout, _stderr) = run_cli(
+        &path,
+        &[
+            "find", "token", "--limit", "1", "--type", "decision", "--json",
+        ],
+    );
+    assert!(status.success());
+
+    let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
+    let results = json["results"].as_array().unwrap();
+    assert_eq!(results.len(), 1);
+    assert_eq!(results[0]["obs_type"].as_str().unwrap(), "decision");
+}

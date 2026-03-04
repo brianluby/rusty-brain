@@ -16,6 +16,7 @@ path = "src/main.rs"
 rusty-brain-core = { path = "../core" }
 types = { path = "../types" }
 opencode = { path = "../opencode" }
+platforms = { path = "../platforms" }
 clap = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -27,6 +28,7 @@ comfy-table = { workspace = true }
 [dev-dependencies]
 tempfile = { workspace = true }
 fs2 = { workspace = true }
+temp-env = { workspace = true }
 
 [lints]
 workspace = true

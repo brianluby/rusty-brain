@@ -41,7 +41,7 @@ pub mod session;
 /// Read-only statistics snapshot of the memory store.
 pub mod stats;
 
-pub use config::MindConfig;
+pub use config::{MindConfig, sanitize_platform_name};
 pub use context::InjectedContext;
 pub use contract_version::ContractValidationResult;
 pub use diagnostic::{DiagnosticRecord, DiagnosticSeverity};

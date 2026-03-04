@@ -71,7 +71,8 @@ fn empty_session_stores_minimal_summary() {
     let resolved = platforms::resolve_memory_path(cwd, "opencode", false).unwrap();
     let mut config = types::MindConfig::from_env().unwrap();
     config.memory_path = resolved.path;
-    let _mind = rusty_brain_core::mind::Mind::open(config).unwrap();
+    let mind = rusty_brain_core::mind::Mind::open(config).unwrap();
+    drop(mind);
 
     // Create empty sidecar
     let sidecar_path = sidecar::sidecar_path(cwd, "empty-session");
@@ -104,7 +105,8 @@ fn missing_sidecar_handled_gracefully() {
     let resolved = platforms::resolve_memory_path(cwd, "opencode", false).unwrap();
     let mut config = types::MindConfig::from_env().unwrap();
     config.memory_path = resolved.path;
-    let _mind = rusty_brain_core::mind::Mind::open(config).unwrap();
+    let mind = rusty_brain_core::mind::Mind::open(config).unwrap();
+    drop(mind);
 
     let result = handle_session_cleanup("no-sidecar-session", cwd);
     assert!(

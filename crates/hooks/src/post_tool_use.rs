@@ -1,10 +1,11 @@
 use std::path::Path;
 
+use crate::bootstrap;
 use crate::dedup::DedupCache;
 use crate::error::HookError;
 use crate::truncate::head_tail_truncate;
+use types::ObservationType;
 use types::hooks::{HookInput, HookOutput};
-use types::{MindConfig, ObservationType};
 
 const MAX_TOKENS: usize = 500;
 
@@ -20,11 +21,18 @@ const MAX_TOKENS: usize = 500;
 pub fn handle_post_tool_use(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 
+    if !bootstrap::should_process(input, "PostToolUse") {
+        return Ok(HookOutput {
+            continue_execution: Some(true),
+            ..Default::default()
+        });
+    }
+
     let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
     let tool_input = input.tool_input.as_ref();
     let tool_response = input.tool_response.as_ref();
 
-    // Classify tool → ObservationType
+    // Classify tool -> ObservationType
     let obs_type = classify_tool(tool_name);
 
     // Generate summary from tool input
@@ -45,23 +53,13 @@ pub fn handle_post_tool_use(input: &HookInput) -> Result<HookOutput, HookError> 
         .filter(|s| !s.is_empty())
         .map(|s| head_tail_truncate(&s, MAX_TOKENS));
 
-    // Resolve memory path and open Mind
-    let platform_name = platforms::detect_platform(input);
-    let resolved = platforms::resolve_memory_path(cwd, &platform_name, false).map_err(|e| {
-        HookError::Platform {
-            message: format!("Failed to resolve memory path: {e}"),
-        }
+    let mind = bootstrap::open_mind(input, cwd)?;
+
+    // Store observation under cross-process lock
+    mind.with_lock(|m| {
+        m.remember(obs_type, tool_name, &summary, content.as_deref(), None)?;
+        Ok(())
     })?;
-
-    let config = MindConfig {
-        memory_path: resolved.path.clone(),
-        ..MindConfig::default()
-    };
-
-    let mind = rusty_brain_core::mind::Mind::open(config)?;
-
-    // Store observation
-    mind.remember(obs_type, tool_name, &summary, content.as_deref(), None)?;
 
     // Record in dedup cache (best-effort)
     let _ = dedup.record(tool_name, &summary);

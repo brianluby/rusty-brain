@@ -25,6 +25,21 @@ All of the following must pass before merge:
 3. `cargo test --workspace` — all tests green
 4. `cargo build --workspace --release` — release build succeeds
 
+## Memory Path Policy
+
+Canonical runtime memory-path resolution is owned by `platforms::resolve_memory_path(...)`.
+
+- Default mode (`MEMVID_PLATFORM_PATH_OPT_IN` unset): `.agent-brain/mind.mv2`
+- Platform opt-in mode (`MEMVID_PLATFORM_PATH_OPT_IN=1`): `.{platform}/mind-{platform}.mv2`
+- Explicit override (`MEMVID_PLATFORM_MEMORY_PATH`) takes precedence over policy resolution
+- CLI override (`--memory-path`) takes precedence over all environment-based resolution
+
+### Migration Notes
+
+- Older builds could resolve platform paths differently across entrypoints; current behavior is unified across CLI, hooks, and OpenCode.
+- Legacy Claude path `.claude/mind.mv2` is still detected and surfaced in startup messaging so existing data can be migrated intentionally.
+- If you previously stored memories in legacy or pre-unification locations, copy/merge into the currently resolved canonical path shown by startup output (or set `MEMVID_PLATFORM_MEMORY_PATH` during transition).
+
 ## Crate Layout
 
 | Crate | Type | Description |

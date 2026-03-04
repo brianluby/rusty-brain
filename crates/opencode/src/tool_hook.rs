@@ -7,8 +7,9 @@ use std::path::Path;
 
 use compression::CompressionConfig;
 use rusty_brain_core::mind::Mind;
-use types::{HookInput, HookOutput, MindConfig, ObservationType, RustyBrainError};
+use types::{HookInput, HookOutput, ObservationType, RustyBrainError, error_codes};
 
+use crate::bootstrap;
 use crate::sidecar;
 
 /// Process a tool execution event from `OpenCode`.
@@ -26,6 +27,10 @@ use crate::sidecar;
 /// Returns `RustyBrainError` if memory path resolution, Mind opening,
 /// observation storage, or sidecar persistence fails.
 pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError> {
+    if !bootstrap::should_process(input, "PostToolUse") {
+        return Ok(HookOutput::default());
+    }
+
     let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
     let tool_response = input
         .tool_response
@@ -63,11 +68,17 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
     let state = match sidecar::load(&sidecar_file) {
         Ok(s) => s,
         Err(e) => {
-            if !sidecar_file.exists() {
-                // First invocation — no sidecar yet
+            if matches!(
+                e,
+                RustyBrainError::FileSystem {
+                    code: error_codes::E_FS_NOT_FOUND,
+                    ..
+                }
+            ) {
+                // First invocation - no sidecar yet
                 crate::types::SidecarState::new(session_id.clone())
             } else if matches!(e, RustyBrainError::Serialization { .. }) {
-                // Corrupt file — recreate
+                // Corrupt file - recreate
                 tracing::warn!(
                     path = %sidecar_file.display(),
                     "corrupt sidecar file, recreating"
@@ -75,7 +86,7 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
                 let _ = std::fs::remove_file(&sidecar_file);
                 crate::types::SidecarState::new(session_id.clone())
             } else {
-                // I/O or permission error — propagate
+                // I/O or permission error - propagate
                 return Err(e);
             }
         }
@@ -90,11 +101,7 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
     }
 
     // Store new observation
-    let resolved = platforms::resolve_memory_path(cwd, "opencode", false)?;
-    let mut mind_config = MindConfig::from_env()?;
-    mind_config.memory_path = resolved.path;
-
-    let mind = Mind::open(mind_config)?;
+    let mind = bootstrap::open_mind_read_write(cwd)?;
     mind.with_lock(|m: &Mind| {
         m.remember(
             ObservationType::Discovery,
@@ -105,7 +112,7 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
         )
     })?;
 
-    // Update sidecar with new hash (immutable — returns new state)
+    // Update sidecar with new hash (immutable - returns new state)
     let state = sidecar::with_hash(&state, hash);
     sidecar::save(&sidecar_file, &state)?;
 

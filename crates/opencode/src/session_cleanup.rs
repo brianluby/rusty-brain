@@ -7,8 +7,9 @@
 use std::path::Path;
 
 use rusty_brain_core::mind::Mind;
-use types::{HookOutput, MindConfig, RustyBrainError};
+use types::{HookOutput, RustyBrainError};
 
+use crate::bootstrap;
 use crate::sidecar;
 
 /// Process a session deletion event from `OpenCode`.
@@ -26,12 +27,7 @@ use crate::sidecar;
 /// Returns `RustyBrainError` if memory path resolution, Mind opening,
 /// or summary storage fails.
 pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput, RustyBrainError> {
-    let resolved = platforms::resolve_memory_path(cwd, "opencode", false)?;
-
-    let mut config = MindConfig::from_env()?;
-    config.memory_path = resolved.path;
-
-    let mind = Mind::open(config)?;
+    let mind = bootstrap::open_mind_read_write(cwd)?;
 
     let sidecar_path = sidecar::sidecar_path(cwd, session_id);
 
@@ -54,7 +50,7 @@ pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput
 
     mind.with_lock(|m: &Mind| m.save_session_summary(Vec::new(), Vec::new(), &summary))?;
 
-    // Delete sidecar file (best-effort — already saved summary)
+    // Delete sidecar file (best-effort - already saved summary)
     if sidecar_path.exists() {
         if let Err(e) = std::fs::remove_file(&sidecar_path) {
             tracing::warn!(
