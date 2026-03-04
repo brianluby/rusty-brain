@@ -74,8 +74,7 @@ fn binary_path_with_spaces_is_shell_quoted() {
     let session_start = hooks.get("SessionStart").unwrap().as_array().unwrap();
     let cmd = session_start[0].get("command").unwrap().as_str().unwrap();
     assert_eq!(
-        cmd,
-        "\"/path/with spaces/rusty-brain\" session-start",
+        cmd, "\"/path/with spaces/rusty-brain\" session-start",
         "paths with spaces must be shell-quoted"
     );
 }
@@ -89,8 +88,7 @@ fn binary_path_with_quotes_is_escaped() {
     let session_start = hooks.get("SessionStart").unwrap().as_array().unwrap();
     let cmd = session_start[0].get("command").unwrap().as_str().unwrap();
     assert_eq!(
-        cmd,
-        "\"path\\\"with\\\"quotes\" session-start",
+        cmd, "\"path\\\"with\\\"quotes\" session-start",
         "embedded quotes must be escaped"
     );
 }

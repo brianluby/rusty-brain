@@ -9,7 +9,7 @@ authors.workspace = true
 description = "Claude Code hook binaries for rusty-brain"
 
 [[bin]]
-name = "rusty-brain"
+name = "rusty-brain-hooks"
 path = "src/main.rs"
 
 [dependencies]

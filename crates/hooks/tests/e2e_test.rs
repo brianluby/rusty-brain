@@ -1,7 +1,7 @@
 use assert_cmd::Command;
 
 fn rusty_brain_cmd() -> Command {
-    assert_cmd::cargo::cargo_bin_cmd!("rusty-brain")
+    assert_cmd::cargo::cargo_bin_cmd!("rusty-brain-hooks")
 }
 
 fn valid_session_start_json(cwd: &str) -> String {

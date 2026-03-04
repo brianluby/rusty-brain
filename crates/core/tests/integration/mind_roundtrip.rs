@@ -76,9 +76,10 @@ fn ask_returns_relevant_content_with_real_backend() {
     .unwrap();
 
     let answer = mind.ask("caching").unwrap();
+    let text = answer.expect("ask should return Some for matching content");
     assert!(
-        answer.contains("caching") || answer.contains("LRU"),
-        "ask should return relevant content, got: {answer}"
+        text.contains("caching") || text.contains("LRU"),
+        "ask should return relevant content, got: {text}"
     );
 }
 

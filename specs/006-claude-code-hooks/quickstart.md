@@ -15,7 +15,7 @@
 cargo build -p hooks
 
 # Verify binary exists
-./target/debug/rusty-brain --help
+./target/debug/rusty-brain-hooks --help
 ```
 
 ## Test Individual Hooks
@@ -23,7 +23,7 @@ cargo build -p hooks
 ### Session Start
 
 ```bash
-echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"SessionStart"}' | ./target/debug/rusty-brain session-start
+echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"SessionStart"}' | ./target/debug/rusty-brain-hooks session-start
 ```
 
 Expected: JSON with `systemMessage` containing memory context (or welcome message if no `.mv2` file exists).
@@ -31,7 +31,7 @@ Expected: JSON with `systemMessage` containing memory context (or welcome messag
 ### Post Tool Use
 
 ```bash
-echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"src/main.rs"},"tool_response":{"content":"fn main() {}"}}' | ./target/debug/rusty-brain post-tool-use
+echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"PostToolUse","tool_name":"Read","tool_input":{"file_path":"src/main.rs"},"tool_response":{"content":"fn main() {}"}}' | ./target/debug/rusty-brain-hooks post-tool-use
 ```
 
 Expected: JSON with `continue: true`.
@@ -39,7 +39,7 @@ Expected: JSON with `continue: true`.
 ### Stop
 
 ```bash
-echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"Stop"}' | ./target/debug/rusty-brain stop
+echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"Stop"}' | ./target/debug/rusty-brain-hooks stop
 ```
 
 Expected: JSON with session summary in `systemMessage`.
@@ -47,7 +47,7 @@ Expected: JSON with session summary in `systemMessage`.
 ### Smart Install
 
 ```bash
-echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"Notification"}' | ./target/debug/rusty-brain smart-install
+echo '{"session_id":"test-123","transcript_path":"/tmp/t","cwd":".","permission_mode":"default","hook_event_name":"Notification"}' | ./target/debug/rusty-brain-hooks smart-install
 ```
 
 Expected: JSON with `continue: true`. Creates `.install-version` file.
@@ -55,7 +55,7 @@ Expected: JSON with `continue: true`. Creates `.install-version` file.
 ## Enable Debug Logging
 
 ```bash
-echo '...' | RUSTY_BRAIN_LOG=debug ./target/debug/rusty-brain session-start
+echo '...' | RUSTY_BRAIN_LOG=debug ./target/debug/rusty-brain-hooks session-start
 ```
 
 Diagnostic output goes to stderr; JSON output remains clean on stdout.
@@ -90,16 +90,16 @@ in `crates/hooks/src/manifest.rs` produces the correct format. For now, manually
 cat > ~/.claude/hooks.json << 'EOF'
 {
   "hooks": {
-    "SessionStart": [{ "type": "command", "command": "rusty-brain session-start" }],
-    "PostToolUse": [{ "type": "command", "command": "rusty-brain post-tool-use" }],
-    "Stop": [{ "type": "command", "command": "rusty-brain stop" }],
-    "Notification": [{ "type": "command", "command": "rusty-brain smart-install", "matcher": "smart-install" }]
+    "SessionStart": [{ "type": "command", "command": "rusty-brain-hooks session-start" }],
+    "PostToolUse": [{ "type": "command", "command": "rusty-brain-hooks post-tool-use" }],
+    "Stop": [{ "type": "command", "command": "rusty-brain-hooks stop" }],
+    "Notification": [{ "type": "command", "command": "rusty-brain-hooks smart-install", "matcher": "smart-install" }]
   }
 }
 EOF
 ```
 
-Replace `rusty-brain` with the full path to the binary if it's not in your `$PATH`.
+Replace `rusty-brain-hooks` with the full path to the binary if it's not in your `$PATH`.
 
 ## File Layout After Installation
 
