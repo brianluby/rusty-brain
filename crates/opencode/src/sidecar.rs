@@ -105,8 +105,12 @@ pub fn save(path: &Path, state: &SidecarState) -> Result<(), ::types::RustyBrain
     // Set 0600 permissions before rename (SEC-2, unix only)
     #[cfg(unix)]
     std::fs::set_permissions(temp.path(), std::fs::Permissions::from_mode(0o600)).map_err(|e| {
+        let code = match e.kind() {
+            std::io::ErrorKind::PermissionDenied => ::types::error_codes::E_FS_PERMISSION_DENIED,
+            _ => ::types::error_codes::E_FS_IO_ERROR,
+        };
         ::types::RustyBrainError::FileSystem {
-            code: ::types::error_codes::E_FS_PERMISSION_DENIED,
+            code,
             message: "failed to set sidecar file permissions".to_string(),
             source: Some(e),
         }

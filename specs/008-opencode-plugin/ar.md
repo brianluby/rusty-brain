@@ -362,7 +362,7 @@ graph TD
 | chat_hook module | Read `HookInput` from stdin, resolve memory path, call `Mind::get_context`, return `HookOutput` with injected context | `fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `platforms::resolve_memory_path` |
 | tool_hook module | Read `HookInput`, check sidecar for dedup, compress tool output, call `Mind::remember`, update sidecar | `fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `compression::compress`, `sidecar` |
 | mind_tool module | Read `MindToolInput`, dispatch by mode to Mind APIs, return `MindToolOutput` | `fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError>` | `core::Mind` |
-| sidecar module | Load/save session state, LRU dedup cache, hash computation, stale file cleanup | `fn load(path) -> SidecarState`, `fn save(path, state)`, `fn is_duplicate(state, hash) -> bool`, `fn cleanup_stale(dir, max_age)` | `serde_json`, `std::fs` |
+| sidecar module | Load/save session state, LRU dedup cache, hash computation, stale file cleanup | `fn load(path) -> Result<SidecarState, RustyBrainError>`, `fn save(path, state) -> Result<(), RustyBrainError>`, `fn is_duplicate(state, hash) -> bool` (infallible: pure `Vec` lookup), `fn cleanup_stale(dir, max_age)` (best-effort fail-open per M-5; logs warnings, never propagates errors) | `serde_json`, `std::fs` |
 | session_cleanup module | Read sidecar for observation metadata, generate summary, call `Mind::save_session_summary`, delete sidecar | `fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput, RustyBrainError>` | `core::Mind`, `sidecar` |
 | CLI opencode subcommands | Parse subcommands, read stdin, call library handlers, write stdout, catch errors for fail-open | clap-derive `Opencode` subcommand enum | `crates/opencode` library |
 
@@ -775,14 +775,14 @@ N/A — greenfield implementation. No existing OpenCode integration to migrate f
 |------------|-----------------|-----------------|-----------|---------------|
 | M-1 | Testability, Performance | :white_check_mark: Good | chat_hook module | `handle_chat_hook` calls `Mind::get_context`, returns `HookOutput` with injected context |
 | M-2 | Testability, Performance | :white_check_mark: Good | tool_hook module | `handle_tool_hook` calls `compress` + `Mind::remember`, updates sidecar |
-| M-3 | Testability | :white_check_mark: Good | mind_tool module | `handle_mind_tool` dispatches by mode to `Mind` search/ask/timeline/stats/remember |
+| M-3 | Testability | :white_check_mark: Good | mind_tool module | `handle_mind_tool` dispatches by mode to `Mind` search/ask/recent/stats/remember |
 | M-4 | Simplicity | :white_check_mark: Good | sidecar module | Vec-based LRU with 1024-entry bound, loaded/saved per invocation |
 | M-5 | Fail-open reliability | :white_check_mark: Good | fail-open wrapper | `handle_with_failopen` catches errors + panics, emits WARN trace |
 | M-6 | Simplicity | :white_check_mark: Good | chat_hook, tool_hook | `resolve_memory_path(cwd, "opencode", false)` returns `.agent-brain/mind.mv2` |
 | M-7 | Simplicity | :white_check_mark: Good | types | No `deny_unknown_fields` on `MindToolInput` or `HookInput` deserialization |
 | M-8 | Simplicity | :white_check_mark: Good | manifest file | Static JSON file generated during build/install |
 | S-1 | Testability | :white_check_mark: Good | session_cleanup module | `handle_session_cleanup` calls `Mind::save_session_summary`, deletes sidecar |
-| S-2 | Simplicity | :white_check_mark: Good | sidecar module | `cleanup_stale_sidecars` scans directory, deletes files >24h old |
+| S-2 | Simplicity | :white_check_mark: Good | sidecar module | `cleanup_stale` scans directory, deletes files >24h old |
 | S-3 | Testability | :white_check_mark: Good | chat_hook module | Passes user query to `Mind::get_context(Some(query))` |
 
 ---
