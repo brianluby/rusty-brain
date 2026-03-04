@@ -64,7 +64,7 @@ pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
     let decisions: Vec<String> = Vec::new();
 
     // Save session summary
-    mind.save_session_summary(decisions, modified_files.clone(), &summary_text)?;
+    mind.save_session_summary(decisions, modified_files, &summary_text)?;
 
     Ok(HookOutput {
         system_message: Some(summary_text),

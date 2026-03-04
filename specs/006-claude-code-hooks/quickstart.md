@@ -55,7 +55,7 @@ Expected: JSON with `continue: true`. Creates `.install-version` file.
 ## Enable Debug Logging
 
 ```bash
-RUSTY_BRAIN_LOG=debug echo '...' | ./target/debug/rusty-brain session-start
+echo '...' | RUSTY_BRAIN_LOG=debug ./target/debug/rusty-brain session-start
 ```
 
 Diagnostic output goes to stderr; JSON output remains clean on stdout.
@@ -83,13 +83,23 @@ cargo fmt --check                         # Formatting compliant
 
 ## Hook Registration
 
-Copy the generated `hooks.json` to your Claude Code settings directory:
+Create a `hooks.json` in your Claude Code settings directory. The `generate_manifest()` function
+in `crates/hooks/src/manifest.rs` produces the correct format. For now, manually create the file:
 
 ```bash
-# Generate manifest (after binary is built)
-# The manifest points to the rusty-brain binary location
-cp hooks.json ~/.claude/hooks.json
+cat > ~/.claude/hooks.json << 'EOF'
+{
+  "hooks": {
+    "SessionStart": [{ "type": "command", "command": "rusty-brain session-start" }],
+    "PostToolUse": [{ "type": "command", "command": "rusty-brain post-tool-use" }],
+    "Stop": [{ "type": "command", "command": "rusty-brain stop" }],
+    "Notification": [{ "type": "command", "command": "rusty-brain smart-install", "matcher": "smart-install" }]
+  }
+}
+EOF
 ```
+
+Replace `rusty-brain` with the full path to the binary if it's not in your `$PATH`.
 
 ## File Layout After Installation
 

@@ -153,7 +153,11 @@ fn git_not_available_returns_empty_file_list_and_stores_summary() {
 
 #[test]
 fn error_during_summary_generation_fails_open() {
-    let input = common::stop_input("/dev/null/nonexistent");
+    // Use a regular file as cwd — cannot resolve memory path under a file (cross-platform)
+    let dir = tempfile::tempdir().unwrap();
+    let file_path = dir.path().join("not-a-dir");
+    std::fs::write(&file_path, "blocker").unwrap();
+    let input = common::stop_input(file_path.to_str().unwrap());
 
     let result = handle_stop(&input);
     // Handler should return Err for invalid paths;

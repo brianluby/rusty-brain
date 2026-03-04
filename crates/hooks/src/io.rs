@@ -22,6 +22,7 @@ pub fn write_output(output: &HookOutput) -> Result<(), HookError> {
     let mut handle = stdout.lock();
     serde_json::to_writer(&mut handle, output)?;
     std::io::Write::write_all(&mut handle, b"\n")?;
+    std::io::Write::flush(&mut handle)?;
     Ok(())
 }
 
