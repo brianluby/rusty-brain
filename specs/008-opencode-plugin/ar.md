@@ -486,7 +486,7 @@ pub struct SidecarState {
 ### Key Algorithms/Patterns :yellow_circle: `@human-review`
 
 **Pattern: Fail-Open Handler Wrapper**
-```
+```rust
 fn handle_with_failopen<F>(handler: F) -> HookOutput
 where F: FnOnce() -> Result<HookOutput, RustyBrainError>
 {
@@ -505,8 +505,8 @@ where F: FnOnce() -> Result<HookOutput, RustyBrainError>
 ```
 
 **Pattern: Sidecar LRU Eviction**
-```
-fn add_hash(state: &mut SidecarState, hash: String) {
+```rust
+fn with_hash(state: &SidecarState, hash: String) -> SidecarState {
     if state.dedup_hashes.contains(&hash) {
         // Move to end (most recently used)
         state.dedup_hashes.retain(|h| h != &hash);
@@ -521,7 +521,7 @@ fn add_hash(state: &mut SidecarState, hash: String) {
 ```
 
 **Pattern: Dedup Hash Computation**
-```
+```rust
 fn compute_dedup_hash(tool_name: &str, summary: &str) -> String {
     use std::hash::{Hash, Hasher};
     use std::collections::hash_map::DefaultHasher;
@@ -624,7 +624,7 @@ graph TD
 
 | Risk | Likelihood | Impact | Mitigation |
 |------|------------|--------|------------|
-| Sidecar file corruption on concurrent write (OpenCode sends parallel hook events) | Low | Med | Atomic writes (temp + rename); file-level locking via advisory lock |
+| Sidecar file corruption on concurrent write (OpenCode sends parallel hook events) | Low | Med | Atomic writes (temp + rename); best-effort dedup without file locks |
 | OpenCode manifest format incompatible with CLI subcommand invocation | Med | Med | Manifest is a static file; can be adapted to call binary with any arguments |
 | Vec-based LRU performance degrades with future cache size increases | Low | Low | 1024 entries is well within O(n) performance; can switch to `lru` crate if needed |
 | CLI binary startup time increases with opencode dependencies | Low | Low | Only loads opencode code paths when subcommand is invoked (clap lazy dispatch) |
@@ -703,7 +703,7 @@ Full details in specs/008-opencode-plugin/sec.md (pending).
 
 ### Error Handling Strategy :green_circle: `@llm-autonomous`
 
-```
+```text
 Error Category → Handling Approach
 ├── Input parsing errors → Return structured error JSON (MindToolOutput.error)
 ├── Memory file not found → Chat hook: create new file; others: fail-open

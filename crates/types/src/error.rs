@@ -67,6 +67,9 @@ pub mod error_codes {
     pub const E_STORAGE_CORRUPTED_FILE: &str = "E_STORAGE_CORRUPTED_FILE";
     /// Memory file exceeds the maximum allowed size.
     pub const E_STORAGE_FILE_TOO_LARGE: &str = "E_STORAGE_FILE_TOO_LARGE";
+
+    /// Unknown or unclassified internal error.
+    pub const E_UNKNOWN: &str = "E_UNKNOWN";
 }
 
 /// Opaque wrapper for storage backend error messages.

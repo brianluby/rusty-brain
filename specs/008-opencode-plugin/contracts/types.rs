@@ -87,14 +87,9 @@ impl MindToolOutput {
         }
     }
 
-    /// Create a failed output with error message (no structured code).
+    /// Create a failed output with error message and default `E_UNKNOWN` code.
     pub fn error(message: impl Into<String>) -> Self {
-        Self {
-            success: false,
-            data: None,
-            error_code: None,
-            error: Some(message.into()),
-        }
+        Self::error_with_code("E_UNKNOWN", message)
     }
 }
 

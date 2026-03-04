@@ -6,7 +6,7 @@
 use std::path::Path;
 
 use rusty_brain_core::mind::Mind;
-use types::{MindConfig, ObservationType, RustyBrainError};
+use types::{MindConfig, ObservationType, RustyBrainError, error_codes};
 
 use crate::types::{MindToolInput, MindToolOutput, VALID_MODES};
 
@@ -55,15 +55,17 @@ fn open_mind_read_only(cwd: &Path) -> Result<Mind, RustyBrainError> {
         c
     };
 
-    // Try read-only first; if file doesn't exist, open read-write to auto-create
-    Mind::open_read_only(config).or_else(|e| {
-        if path.exists() {
-            Err(e)
-        } else {
+    // Try read-only first; only create on explicit NOT_FOUND
+    Mind::open_read_only(config).or_else(|e| match &e {
+        RustyBrainError::FileSystem {
+            code: error_codes::E_FS_NOT_FOUND,
+            ..
+        } => {
             let mut config2 = MindConfig::from_env()?;
             config2.memory_path = path;
             Mind::open(config2)
         }
+        _ => Err(e),
     })
 }
 

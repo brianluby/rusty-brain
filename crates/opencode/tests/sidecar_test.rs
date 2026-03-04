@@ -69,11 +69,14 @@ fn hash_computation_determinism() {
 
 #[test]
 fn sidecar_path_sanitization() {
-    let cwd = Path::new("/tmp/project");
+    let dir = tempfile::tempdir().unwrap();
+    let cwd = dir.path();
 
     // Normal session ID
     let p = sidecar::sidecar_path(cwd, "abc-123");
-    assert_eq!(p, Path::new("/tmp/project/.opencode/session-abc-123.json"));
+    assert_eq!(p.file_name().unwrap(), "session-abc-123.json");
+    assert_eq!(p.parent().unwrap().file_name().unwrap(), ".opencode");
+    assert!(p.starts_with(cwd));
 
     // Path traversal attempt
     let p = sidecar::sidecar_path(cwd, "../../../etc/passwd");
@@ -225,7 +228,9 @@ fn cleanup_empty_directory_handled() {
 
 #[test]
 fn cleanup_nonexistent_directory_handled() {
-    let path = Path::new("/tmp/nonexistent-sidecar-cleanup-test");
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("nonexistent-subdir");
+    let path = path.as_path();
     // Should not panic on nonexistent directory
     sidecar::cleanup_stale(path, Duration::from_secs(24 * 3600));
 }

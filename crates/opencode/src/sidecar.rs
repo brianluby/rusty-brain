@@ -150,7 +150,7 @@ pub fn sidecar_path(cwd: &Path, session_id: &str) -> PathBuf {
 /// Check if a dedup hash already exists in the sidecar state.
 #[must_use]
 pub fn is_duplicate(state: &SidecarState, hash: &str) -> bool {
-    state.dedup_hashes.contains(&hash.to_string())
+    state.dedup_hashes.iter().any(|h| h == hash)
 }
 
 /// Return a new sidecar state with the given dedup hash added (LRU eviction).

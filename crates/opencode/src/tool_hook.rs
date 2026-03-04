@@ -30,7 +30,17 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
     let tool_response = input
         .tool_response
         .as_ref()
-        .map(std::string::ToString::to_string)
+        .map(|value| {
+            // Prefer a nested "content" string if present, then a direct string value;
+            // fall back to JSON stringification only when needed.
+            if let Some(content) = value.get("content").and_then(|v| v.as_str()) {
+                content.to_owned()
+            } else if let Some(s) = value.as_str() {
+                s.to_owned()
+            } else {
+                value.to_string()
+            }
+        })
         .unwrap_or_default();
 
     if tool_response.is_empty() {
@@ -90,7 +100,7 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
             ObservationType::Discovery,
             tool_name,
             summary,
-            Some(&tool_response),
+            Some(summary),
             None,
         )
     })?;

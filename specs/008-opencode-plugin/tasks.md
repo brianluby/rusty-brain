@@ -241,7 +241,7 @@
 
 ### Foundational Phase (Phase 2)
 
-```
+```text
 # T003 first (types must compile before tests can reference them):
 Task T003: Types in crates/opencode/src/types.rs
 
@@ -252,7 +252,7 @@ Task T005: Fail-open tests in crates/opencode/tests/failopen_test.rs
 
 ### P1 User Stories (Phases 3–5) — After Foundational
 
-```
+```text
 # These three story test tasks can run in parallel:
 Task T008: [US1] Chat hook tests in crates/opencode/tests/chat_hook_test.rs
 Task T010: [US2] Tool hook tests in crates/opencode/tests/tool_hook_test.rs
