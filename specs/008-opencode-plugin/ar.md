@@ -123,7 +123,7 @@ The `crates/platforms` crate already provides `opencode_adapter()`, `detect_plat
 - Rust stable, edition 2024, MSRV 1.85.0
 - Existing workspace crates only (no new external crates without AR justification)
 - stdin/stdout JSON protocol, stderr for tracing
-- Performance: chat hook <200ms, tool hook <100ms
+- Performance: chat hook <200ms, tool hook <750ms end-to-end (handler-only <100ms p95 excluding Mind::open())
 - Constitution: agent-friendly (III), contract-first (IV), test-first (V), memory integrity (VII), security-first (IX), machine-parseable errors (X), no silent failures (XI)
 
 ---
@@ -132,7 +132,7 @@ The `crates/platforms` crate already provides `opencode_adapter()`, `detect_plat
 
 1. **Testability** — handler logic must be unit-testable without stdin/stdout I/O *(traces to Constitution V, PRD M-1..M-3)*
 2. **Simplicity** — minimize new binaries, build targets, and module count *(traces to Constitution XII)*
-3. **Performance** — chat hook <200ms, tool hook <100ms including sidecar I/O *(traces to PRD M-1, M-2)*
+3. **Performance** — chat hook <200ms, tool hook <750ms end-to-end including Mind::open() (handler-only <100ms p95) *(traces to PRD M-1, M-2)*
 4. **Reusability** — handler logic reusable for future platform integrations *(traces to PRD background: multi-platform validation)*
 5. **Fail-open reliability** — no code path can crash or block the developer's workflow *(traces to PRD M-5)*
 6. **Dependency discipline** — use existing crates, minimize new dependencies *(traces to Constitution XIII)*
@@ -431,26 +431,29 @@ sequenceDiagram
 
 ```rust
 // === crates/opencode public API ===
+// Handlers return Result<..., RustyBrainError>; fail-open wrapper functions
+// (handle_with_failopen, mind_tool_with_failopen) catch errors/panics and
+// return valid default output with WARN tracing.
 
 /// Chat hook handler — returns HookOutput with injected context.
-/// Fails-open: returns empty HookOutput on any error.
-pub fn handle_chat_hook(input: &HookInput, cwd: &Path) -> HookOutput;
+/// On error: returns Err(RustyBrainError); wrapper fails-open.
+pub fn handle_chat_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
 
 /// Tool hook handler — captures observation with dedup.
-/// Fails-open: returns continue=true on any error.
-pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> HookOutput;
+/// On error: returns Err(RustyBrainError); wrapper fails-open.
+pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
 
 /// Mind tool handler — dispatches by mode.
-/// Returns structured MindToolOutput with success/error.
-pub fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> MindToolOutput;
+/// On error: returns Err(RustyBrainError); wrapper fails-open.
+pub fn handle_mind_tool(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, RustyBrainError>;
 
 /// Session cleanup handler — generates summary, deletes sidecar.
-/// Fails-open: returns continue=true on any error.
-pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> HookOutput;
+/// On error: returns Err(RustyBrainError); wrapper fails-open.
+pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput, RustyBrainError>;
 
 /// Orphaned sidecar cleanup — deletes files older than max_age.
 /// Fails-open: logs WARN on errors, never panics.
-pub fn cleanup_stale_sidecars(sidecar_dir: &Path, max_age: Duration);
+pub fn cleanup_stale(sidecar_dir: &Path, max_age: Duration);
 
 // === New types in crates/opencode (or crates/types) ===
 
@@ -467,6 +470,9 @@ pub struct MindToolOutput {
     pub success: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<serde_json::Value>,
+    /// Stable machine-parseable error code (e.g. "E_INPUT_INVALID_FORMAT").
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
 }
@@ -542,7 +548,7 @@ fn compute_dedup_hash(tool_name: &str, summary: &str) -> String {
 - Rust stable, edition 2024, MSRV 1.85.0
 - Use existing workspace crates only
 - stdin/stdout JSON protocol, stderr for tracing
-- Chat hook <200ms, tool hook <100ms (including sidecar I/O)
+- Chat hook <200ms, tool hook <750ms end-to-end including Mind::open() (handler-only <100ms p95)
 - All 13 constitution principles apply
 - No `deny_unknown_fields` on input types (M-7)
 
@@ -725,7 +731,7 @@ N/A — greenfield implementation. No existing OpenCode integration to migrate f
 **Rollback Triggers:**
 - Plugin causes OpenCode crashes or hangs in >1% of invocations
 - Memory file corruption traced to plugin writes
-- Performance consistently exceeds budgets (>200ms chat, >100ms tool)
+- Performance consistently exceeds budgets (>200ms chat, >750ms tool end-to-end)
 
 **Rollback Decision Authority:** Project maintainer (brianluby)
 

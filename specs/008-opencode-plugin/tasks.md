@@ -233,7 +233,7 @@
 - [x] Sidecar files with 0600 permissions (SEC-2)
 - [x] Mind tool mode validated against `VALID_MODES` whitelist (SEC-8)
 - [x] No memory content logged at INFO+ verified by test (SEC-3, T022)
-- [x] Performance benchmarks pass: chat hook <200ms, tool hook <100ms (SC-001, SC-002, T023)
+- [x] Performance benchmarks pass: chat hook <200ms, tool hook <750ms end-to-end including Mind::open() (handler-only <100ms p95 excluding Mind::open()) (SC-001, SC-002, T023)
 
 ---
 

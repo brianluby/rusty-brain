@@ -462,6 +462,7 @@ mod tests {
                 error_codes::E_STORAGE_FILE_TOO_LARGE,
                 "E_STORAGE_FILE_TOO_LARGE",
             ),
+            (error_codes::E_UNKNOWN, "E_UNKNOWN"),
         ];
         for (actual, expected) in codes {
             assert_eq!(*actual, *expected, "error code constant mismatch");

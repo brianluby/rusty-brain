@@ -29,12 +29,18 @@ use crate::types::{MAX_DEDUP_ENTRIES, SidecarState};
 /// Returns `RustyBrainError::FileSystem` if the file cannot be read.
 /// Returns `RustyBrainError::Serialization` if deserialization fails.
 pub fn load(path: &Path) -> Result<SidecarState, ::types::RustyBrainError> {
-    let content =
-        std::fs::read_to_string(path).map_err(|e| ::types::RustyBrainError::FileSystem {
-            code: ::types::error_codes::E_FS_IO_ERROR,
+    let content = std::fs::read_to_string(path).map_err(|e| {
+        let code = if e.kind() == std::io::ErrorKind::NotFound {
+            ::types::error_codes::E_FS_NOT_FOUND
+        } else {
+            ::types::error_codes::E_FS_IO_ERROR
+        };
+        ::types::RustyBrainError::FileSystem {
+            code,
             message: format!("failed to read sidecar file: {path}", path = path.display()),
             source: Some(e),
-        })?;
+        }
+    })?;
 
     serde_json::from_str(&content).map_err(|e| ::types::RustyBrainError::Serialization {
         code: ::types::error_codes::E_SER_DESERIALIZE_FAILED,
