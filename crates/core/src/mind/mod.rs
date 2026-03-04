@@ -81,11 +81,6 @@ impl Mind {
     pub fn is_initialized(&self) -> bool {
         self.initialized
     }
-
-    /// Effective runtime config used by this mind instance.
-    pub(crate) fn config(&self) -> &MindConfig {
-        &self.config
-    }
 }
 
 #[cfg(test)]
