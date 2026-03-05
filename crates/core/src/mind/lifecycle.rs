@@ -132,10 +132,20 @@ impl Mind {
 }
 
 fn should_recover_from_open_error(err: &RustyBrainError) -> bool {
-    matches!(
-        err,
-        RustyBrainError::CorruptedFile { .. } | RustyBrainError::MemoryCorruption { .. }
-    )
+    match err {
+        RustyBrainError::CorruptedFile { .. } | RustyBrainError::MemoryCorruption { .. } => true,
+        // Storage backend errors from memvid-core that indicate the file is
+        // unreadable (not a valid .mv2) should trigger recovery. We distinguish
+        // from permission errors by checking the error message — permission
+        // denials should NOT trigger recovery/backup.
+        RustyBrainError::Storage { message, .. } => {
+            let msg = message.to_lowercase();
+            !msg.contains("permission denied")
+                && !msg.contains("operation not permitted")
+                && !msg.contains("access denied")
+        }
+        _ => false,
+    }
 }
 
 /// Set file permissions to 0600 (owner read/write only) per SEC-1.

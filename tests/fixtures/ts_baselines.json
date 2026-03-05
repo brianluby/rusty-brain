@@ -1,0 +1,25 @@
+{
+  "baselines": [
+    {
+      "hardware": "Apple M-series",
+      "metric": "query_latency_ms",
+      "ts_version": "1.0.0",
+      "value": 45.0,
+      "workload": "100 observations, single search query"
+    },
+    {
+      "hardware": "Apple M-series",
+      "metric": "compression_throughput_mb_s",
+      "ts_version": "1.0.0",
+      "value": 5.0,
+      "workload": "10KB tool output, default compression"
+    },
+    {
+      "hardware": "Apple M-series",
+      "metric": "startup_time_ms",
+      "ts_version": "1.0.0",
+      "value": 200.0,
+      "workload": "Cold start to first command ready"
+    }
+  ]
+}

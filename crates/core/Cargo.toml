@@ -38,6 +38,14 @@ path = "tests/integration/mind_recovery.rs"
 name = "mind_concurrent"
 path = "tests/integration/mind_concurrent.rs"
 
+[[test]]
+name = "compatibility_smoke"
+path = "tests/compatibility_smoke.rs"
+
+[[test]]
+name = "generate_fixtures"
+path = "tests/generate_fixtures.rs"
+
 [[bench]]
 name = "store"
 harness = false
