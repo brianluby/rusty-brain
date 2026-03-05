@@ -157,3 +157,183 @@ fn extract_text(value: &serde_json::Value) -> String {
         _ => serde_json::to_string(value).unwrap_or_default(),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_input(cwd: &str) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": cwd,
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Read",
+            "tool_input": {"file_path": "/src/main.rs"},
+            "tool_response": "file contents here",
+            "tool_use_id": "toolu_01"
+        }))
+        .expect("valid HookInput JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // classify_tool
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn classify_tool_edit_returns_feature() {
+        assert_eq!(classify_tool("Edit"), ObservationType::Feature);
+    }
+
+    #[test]
+    fn classify_tool_write_returns_feature() {
+        assert_eq!(classify_tool("Write"), ObservationType::Feature);
+    }
+
+    #[test]
+    fn classify_tool_notebook_edit_returns_feature() {
+        assert_eq!(classify_tool("NotebookEdit"), ObservationType::Feature);
+    }
+
+    #[test]
+    fn classify_tool_read_returns_discovery() {
+        assert_eq!(classify_tool("Read"), ObservationType::Discovery);
+    }
+
+    #[test]
+    fn classify_tool_bash_returns_discovery() {
+        assert_eq!(classify_tool("Bash"), ObservationType::Discovery);
+    }
+
+    #[test]
+    fn classify_tool_grep_returns_discovery() {
+        assert_eq!(classify_tool("Grep"), ObservationType::Discovery);
+    }
+
+    #[test]
+    fn classify_tool_unknown_returns_discovery() {
+        assert_eq!(classify_tool("SomeFutureTool"), ObservationType::Discovery);
+    }
+
+    // -----------------------------------------------------------------------
+    // generate_summary
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn generate_summary_read_extracts_file_path() {
+        let input = serde_json::json!({"file_path": "/src/lib.rs"});
+        let summary = generate_summary("Read", Some(&input));
+        assert_eq!(summary, "Read /src/lib.rs");
+    }
+
+    #[test]
+    fn generate_summary_edit_extracts_file_path() {
+        let input = serde_json::json!({"file_path": "/src/main.rs"});
+        let summary = generate_summary("Edit", Some(&input));
+        assert_eq!(summary, "Edited /src/main.rs");
+    }
+
+    #[test]
+    fn generate_summary_write_extracts_file_path() {
+        let input = serde_json::json!({"file_path": "/tmp/output.txt"});
+        let summary = generate_summary("Write", Some(&input));
+        assert_eq!(summary, "Wrote /tmp/output.txt");
+    }
+
+    #[test]
+    fn generate_summary_bash_extracts_command() {
+        let input = serde_json::json!({"command": "cargo test"});
+        let summary = generate_summary("Bash", Some(&input));
+        assert_eq!(summary, "Ran command: cargo test");
+    }
+
+    #[test]
+    fn generate_summary_bash_truncates_long_command() {
+        let long_cmd = "a".repeat(200);
+        let input = serde_json::json!({"command": long_cmd});
+        let summary = generate_summary("Bash", Some(&input));
+        assert!(summary.len() < 200, "summary should truncate long commands");
+        assert!(summary.starts_with("Ran command: "));
+    }
+
+    #[test]
+    fn generate_summary_grep_extracts_pattern() {
+        let input = serde_json::json!({"pattern": "fn main"});
+        let summary = generate_summary("Grep", Some(&input));
+        assert_eq!(summary, "Searched for fn main");
+    }
+
+    #[test]
+    fn generate_summary_glob_extracts_pattern() {
+        let input = serde_json::json!({"pattern": "**/*.rs"});
+        let summary = generate_summary("Glob", Some(&input));
+        assert_eq!(summary, "Searched files: **/*.rs");
+    }
+
+    #[test]
+    fn generate_summary_web_fetch_extracts_url() {
+        let input = serde_json::json!({"url": "https://example.com"});
+        let summary = generate_summary("WebFetch", Some(&input));
+        assert_eq!(summary, "Fetched https://example.com");
+    }
+
+    #[test]
+    fn generate_summary_web_search_extracts_query() {
+        let input = serde_json::json!({"query": "rust async"});
+        let summary = generate_summary("WebSearch", Some(&input));
+        assert_eq!(summary, "Searched web: rust async");
+    }
+
+    #[test]
+    fn generate_summary_unknown_tool_uses_tool_name() {
+        let summary = generate_summary("CustomTool", None);
+        assert_eq!(summary, "Used CustomTool");
+    }
+
+    #[test]
+    fn generate_summary_with_none_input_uses_unknown() {
+        let summary = generate_summary("Read", None);
+        assert_eq!(summary, "Read unknown");
+    }
+
+    // -----------------------------------------------------------------------
+    // extract_text
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn extract_text_returns_string_value_directly() {
+        let value = serde_json::json!("hello world");
+        assert_eq!(extract_text(&value), "hello world");
+    }
+
+    #[test]
+    fn extract_text_serializes_non_string_values() {
+        let value = serde_json::json!({"key": "value"});
+        let text = extract_text(&value);
+        assert!(text.contains("key"));
+        assert!(text.contains("value"));
+    }
+
+    #[test]
+    fn extract_text_handles_null() {
+        let value = serde_json::Value::Null;
+        let text = extract_text(&value);
+        assert_eq!(text, "null");
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_post_tool_use — requires Mind, so #[ignore]
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires memvid runtime (Mind::open needs valid .mv2 file)"]
+    fn handle_post_tool_use_returns_continue_true() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let input = make_input(tmp.path().to_str().unwrap());
+        let result = handle_post_tool_use(&input);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert_eq!(output.continue_execution, Some(true));
+    }
+}

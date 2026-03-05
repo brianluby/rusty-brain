@@ -196,3 +196,117 @@ fn handle_remember(input: &MindToolInput, cwd: &Path) -> Result<MindToolOutput, 
         "observation_id": id,
     })))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_input(mode: &str) -> MindToolInput {
+        MindToolInput {
+            mode: mode.to_string(),
+            query: None,
+            content: None,
+            limit: None,
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Mode validation (SEC-8)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_mind_tool_rejects_invalid_mode() {
+        let input = make_input("delete_everything");
+        let cwd = Path::new("/tmp");
+        let result = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!result.success);
+        assert_eq!(
+            result.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_INVALID_FORMAT)
+        );
+        assert!(result.error.as_deref().unwrap().contains("invalid mode"));
+    }
+
+    #[test]
+    fn handle_mind_tool_rejects_empty_mode() {
+        let input = make_input("");
+        let cwd = Path::new("/tmp");
+        let result = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!result.success);
+    }
+
+    // -----------------------------------------------------------------------
+    // Search mode — missing query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn search_mode_requires_query() {
+        let input = make_input("search");
+        let cwd = Path::new("/tmp");
+        // Input validation happens before Mind open, so this always returns Ok
+        let output = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_EMPTY_FIELD)
+        );
+    }
+
+    #[test]
+    fn search_mode_rejects_whitespace_only_query() {
+        let mut input = make_input("search");
+        input.query = Some("   ".to_string());
+        let cwd = Path::new("/tmp");
+        let output = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_EMPTY_FIELD)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Ask mode — missing query
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn ask_mode_requires_query() {
+        let input = make_input("ask");
+        let cwd = Path::new("/tmp");
+        let output = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_EMPTY_FIELD)
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Remember mode — missing content
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn remember_mode_requires_content() {
+        let input = make_input("remember");
+        let cwd = Path::new("/tmp");
+        let output = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_EMPTY_FIELD)
+        );
+    }
+
+    #[test]
+    fn remember_mode_rejects_empty_content() {
+        let mut input = make_input("remember");
+        input.content = Some(String::new());
+        let cwd = Path::new("/tmp");
+        let output = handle_mind_tool(&input, cwd).unwrap();
+        assert!(!output.success);
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_INPUT_EMPTY_FIELD)
+        );
+    }
+}

@@ -68,3 +68,91 @@ pub fn detect_modified_files(cwd: &Path) -> Vec<String> {
         .map(String::from)
         .collect()
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // detect_modified_files — in a real git repo
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_modified_files_returns_vec_for_git_repo() {
+        // Use the project root itself (known git repo)
+        let project_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(|p| p.parent())
+            .expect("should find workspace root");
+
+        let files = detect_modified_files(project_root);
+        // We can't assert specific files, but the function should not panic
+        // and should return a Vec<String>
+        let _: Vec<String> = files;
+    }
+
+    #[test]
+    fn detect_modified_files_returns_empty_for_nonexistent_dir() {
+        let files = detect_modified_files(Path::new("/nonexistent/path/that/does/not/exist"));
+        assert!(
+            files.is_empty(),
+            "should return empty vec for nonexistent directory"
+        );
+    }
+
+    #[test]
+    fn detect_modified_files_returns_empty_for_non_git_dir() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let files = detect_modified_files(tmp.path());
+        assert!(
+            files.is_empty(),
+            "should return empty vec for non-git directory"
+        );
+    }
+
+    #[test]
+    fn detect_modified_files_detects_new_file_in_git_repo() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+        // Initialize a git repo, create a commit, then modify a file
+        let init = std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(tmp.path())
+            .output();
+
+        if init.is_err() || !init.unwrap().status.success() {
+            // git not available, skip
+            return;
+        }
+
+        // Configure git user for commit
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.email", "test@test.com"])
+            .current_dir(tmp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["config", "user.name", "Test"])
+            .current_dir(tmp.path())
+            .output();
+
+        // Create initial file and commit
+        std::fs::write(tmp.path().join("file.txt"), "initial").expect("write file");
+        let _ = std::process::Command::new("git")
+            .args(["add", "."])
+            .current_dir(tmp.path())
+            .output();
+        let _ = std::process::Command::new("git")
+            .args(["commit", "-m", "initial"])
+            .current_dir(tmp.path())
+            .output();
+
+        // Modify the file
+        std::fs::write(tmp.path().join("file.txt"), "modified").expect("write modified file");
+
+        let files = detect_modified_files(tmp.path());
+        assert!(
+            files.contains(&"file.txt".to_string()),
+            "should detect modified file, got: {files:?}"
+        );
+    }
+}

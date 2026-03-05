@@ -65,3 +65,48 @@ pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
         ..Default::default()
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_input(cwd: &str) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": cwd,
+            "permission_mode": "default",
+            "hook_event_name": "Stop",
+            "stop_hook_active": true,
+            "last_assistant_message": "Done."
+        }))
+        .expect("valid HookInput JSON")
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_stop — requires Mind, so #[ignore] for the full flow
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires memvid runtime (Mind::open needs valid .mv2 file)"]
+    fn handle_stop_returns_system_message() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let input = make_input(tmp.path().to_str().unwrap());
+        let result = handle_stop(&input);
+        assert!(result.is_ok());
+        let output = result.unwrap();
+        assert!(output.system_message.is_some());
+    }
+
+    #[test]
+    fn handle_stop_errors_when_mind_cannot_open() {
+        // Use a nonexistent path so Mind::open fails
+        let input = make_input("/nonexistent/path/that/does/not/exist");
+        let result = handle_stop(&input);
+        // Should error because Mind::open will fail on a nonexistent directory
+        assert!(
+            result.is_err(),
+            "handle_stop should error when Mind cannot open"
+        );
+    }
+}

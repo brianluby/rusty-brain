@@ -19,6 +19,21 @@ thiserror = { workspace = true }
 
 [dev-dependencies]
 temp-env = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+
+[[test]]
+name = "pipeline_test"
+path = "tests/pipeline_test.rs"
+
+[[test]]
+name = "pipeline_integration_test"
+path = "tests/pipeline_integration_test.rs"
+
+[[test]]
+name = "cross_platform_test"
+path = "tests/cross_platform_test.rs"
 
 [lints]
 workspace = true

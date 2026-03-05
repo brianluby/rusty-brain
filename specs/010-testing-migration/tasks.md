@@ -61,48 +61,48 @@
 
 ### hooks crate unit tests (currently 0 unit tests, 18 pub fns)
 
-- [ ] T010 [US1] Add unit tests for `should_process()` in `crates/hooks/src/bootstrap.rs` — test with valid/invalid platform configs, missing env vars
-- [ ] T011 [US1] Add unit tests for `resolve_memory_path()` in `crates/hooks/src/bootstrap.rs` — test default path, custom path via env var, missing directory
-- [ ] T012 [US1] Add unit tests for `open_mind()` and `open_mind_with_path()` in `crates/hooks/src/bootstrap.rs` — test successful open, missing file, corrupted file
-- [ ] T013 [P] [US1] Add unit tests for `format_system_message()` in `crates/hooks/src/context.rs` — test message formatting with various observation counts and platform types
-- [ ] T014 [P] [US1] Add unit tests for `handle_session_start()` in `crates/hooks/src/session_start.rs` — test successful start, dedup check, error paths
-- [ ] T015 [P] [US1] Add unit tests for `handle_post_tool_use()` in `crates/hooks/src/post_tool_use.rs` — test with various tool types, compression integration
-- [ ] T016 [P] [US1] Add unit tests for `handle_stop()` in `crates/hooks/src/stop.rs` — test graceful shutdown, observation persistence
-- [ ] T017 [P] [US1] Add unit tests for dedup functions (`check_duplicate()`, `record_hash()`, `load_cache()`) in `crates/hooks/src/dedup.rs`
-- [ ] T018 [P] [US1] Add unit tests for `handle_smart_install()` in `crates/hooks/src/smart_install.rs` — test install detection, version checking
-- [ ] T019 [P] [US1] Add unit tests for IO functions (`read_input()`, `write_output()`) in `crates/hooks/src/io.rs` — test JSON serialization/deserialization
-- [ ] T020 [P] [US1] Add unit tests for `read_manifest()` in `crates/hooks/src/manifest.rs` — test valid manifest, missing file, malformed JSON
-- [ ] T021 [P] [US1] Add unit tests for `detect_git_context()` in `crates/hooks/src/git.rs` — test inside/outside git repo, branch detection
+- [x] T010 [US1] Add unit tests for `should_process()` in `crates/hooks/src/bootstrap.rs` — test with valid/invalid platform configs, missing env vars
+- [x] T011 [US1] Add unit tests for `resolve_memory_path()` in `crates/hooks/src/bootstrap.rs` — test default path, custom path via env var, missing directory
+- [x] T012 [US1] Add unit tests for `open_mind()` and `open_mind_with_path()` in `crates/hooks/src/bootstrap.rs` — test successful open, missing file, corrupted file
+- [x] T013 [P] [US1] Add unit tests for `format_system_message()` in `crates/hooks/src/context.rs` — test message formatting with various observation counts and platform types
+- [x] T014 [P] [US1] Add unit tests for `handle_session_start()` in `crates/hooks/src/session_start.rs` — test successful start, dedup check, error paths
+- [x] T015 [P] [US1] Add unit tests for `handle_post_tool_use()` in `crates/hooks/src/post_tool_use.rs` — test with various tool types, compression integration
+- [x] T016 [P] [US1] Add unit tests for `handle_stop()` in `crates/hooks/src/stop.rs` — test graceful shutdown, observation persistence
+- [x] T017 [P] [US1] Add unit tests for dedup functions (`check_duplicate()`, `record_hash()`, `load_cache()`) in `crates/hooks/src/dedup.rs`
+- [x] T018 [P] [US1] Add unit tests for `handle_smart_install()` in `crates/hooks/src/smart_install.rs` — test install detection, version checking
+- [x] T019 [P] [US1] Add unit tests for IO functions (`read_input()`, `write_output()`) in `crates/hooks/src/io.rs` — test JSON serialization/deserialization
+- [x] T020 [P] [US1] Add unit tests for `read_manifest()` in `crates/hooks/src/manifest.rs` — test valid manifest, missing file, malformed JSON
+- [x] T021 [P] [US1] Add unit tests for `detect_git_context()` in `crates/hooks/src/git.rs` — test inside/outside git repo, branch detection
 
 ### opencode crate unit tests (currently 0 unit tests, 22 pub fns)
 
-- [ ] T022 [P] [US1] Add unit tests for `handle_with_failopen()` in `crates/opencode/src/lib.rs` — test success path, error recovery, fail-open behavior
-- [ ] T023 [P] [US1] Add unit tests for `mind_tool_with_failopen()` in `crates/opencode/src/mind_tool.rs` — test search, remember, stats operations with failopen
-- [ ] T024 [P] [US1] Add unit tests for sidecar functions (`load()`, `save()`, `sidecar_path()`, `ensure_dir()`) in `crates/opencode/src/sidecar.rs`
-- [ ] T025 [P] [US1] Add unit tests for `handle_chat_hook()` in `crates/opencode/src/chat_hook.rs` — test observation extraction from chat messages
-- [ ] T026 [P] [US1] Add unit tests for `handle_tool_hook()` in `crates/opencode/src/tool_hook.rs` — test tool output processing, compression integration
-- [ ] T027 [P] [US1] Add unit tests for bootstrap functions in `crates/opencode/src/bootstrap.rs` — test initialization, config resolution, platform detection
-- [ ] T028 [P] [US1] Add unit tests for `cleanup_sessions()` in `crates/opencode/src/session_cleanup.rs` — test stale session cleanup, active session preservation
-- [ ] T029 [P] [US1] Add unit tests for type constructors and serialization in `crates/opencode/src/types.rs`
+- [x] T022 [P] [US1] Add unit tests for `handle_with_failopen()` in `crates/opencode/src/lib.rs` — test success path, error recovery, fail-open behavior
+- [x] T023 [P] [US1] Add unit tests for `mind_tool_with_failopen()` in `crates/opencode/src/mind_tool.rs` — test search, remember, stats operations with failopen
+- [x] T024 [P] [US1] Add unit tests for sidecar functions (`load()`, `save()`, `sidecar_path()`, `ensure_dir()`) in `crates/opencode/src/sidecar.rs`
+- [x] T025 [P] [US1] Add unit tests for `handle_chat_hook()` in `crates/opencode/src/chat_hook.rs` — test observation extraction from chat messages
+- [x] T026 [P] [US1] Add unit tests for `handle_tool_hook()` in `crates/opencode/src/tool_hook.rs` — test tool output processing, compression integration
+- [x] T027 [P] [US1] Add unit tests for bootstrap functions in `crates/opencode/src/bootstrap.rs` — test initialization, config resolution, platform detection
+- [x] T028 [P] [US1] Add unit tests for `cleanup_sessions()` in `crates/opencode/src/session_cleanup.rs` — test stale session cleanup, active session preservation
+- [x] T029 [P] [US1] Add unit tests for type constructors and serialization in `crates/opencode/src/types.rs`
 
 ### cli crate — expand unit test coverage (currently 4 unit tests, 12 pub fns)
 
-- [ ] T030 [P] [US1] Add unit tests for CLI argument parsing and command dispatch functions in `crates/cli/src/args.rs` and `crates/cli/src/commands.rs` — test subcommand routing, flag validation, output format selection
-- [ ] T031 [P] [US1] Add unit tests for output formatting functions in `crates/cli/src/output.rs` — test JSON and table output rendering with various input data
+- [x] T030 [P] [US1] Add unit tests for CLI argument parsing and command dispatch functions in `crates/cli/src/args.rs` and `crates/cli/src/commands.rs` — test subcommand routing, flag validation, output format selection
+- [x] T031 [P] [US1] Add unit tests for output formatting functions in `crates/cli/src/output.rs` — test JSON and table output rendering with various input data
 
 ### compression crate — enhance compress() coverage
 
-- [ ] T032 [P] [US1] Add unit tests for `compress()` entry point in `crates/compression/src/lib.rs` — test all tool types (Read, Write, Bash, Glob, Grep, LS), various input sizes, config combinations beyond existing panic recovery tests
+- [x] T032 [P] [US1] Add unit tests for `compress()` entry point in `crates/compression/src/lib.rs` — test all tool types (Read, Write, Bash, Glob, Grep, LS), various input sizes, config combinations beyond existing panic recovery tests
 
 ### platforms crate — expand integration tests
 
-- [ ] T033 [P] [US1] Add integration test for EventPipeline composite API in `crates/platforms/tests/pipeline_integration_test.rs` — test full event normalization flow for Claude platform
-- [ ] T034 [P] [US1] Add integration test for cross-platform round-trips in `crates/platforms/tests/cross_platform_test.rs` — test Claude → normalize → verify and OpenCode → normalize → verify
+- [x] T033 [P] [US1] Add integration test for EventPipeline composite API in `crates/platforms/tests/pipeline_integration_test.rs` — test full event normalization flow for Claude platform
+- [x] T034 [P] [US1] Add integration test for cross-platform round-trips in `crates/platforms/tests/cross_platform_test.rs` — test Claude → normalize → verify and OpenCode → normalize → verify
 
 ### cross-crate integration
 
-- [ ] T035 [US1] Add or verify integration test for full remember → search → getContext cycle in `crates/core/tests/integration/mind_roundtrip.rs` — ensure the cross-crate workflow per FR-002 is exercised end-to-end
-- [ ] T036 [US1] Run `cargo test --workspace` and verify all public APIs across 7 crates have ≥1 test; document final test count (target: ≥400 total tests, SC-001 parity ≥48)
+- [x] T035 [US1] Add or verify integration test for full remember → search → getContext cycle in `crates/core/tests/integration/mind_roundtrip.rs` — ensure the cross-crate workflow per FR-002 is exercised end-to-end
+- [x] T036 [US1] Run `cargo test --workspace` and verify all public APIs across 7 crates have ≥1 test; document final test count (target: ≥400 total tests, SC-001 parity ≥48)
 
 **Checkpoint**: US1 complete — `cargo test --workspace` green, every pub fn has ≥1 test, cross-crate workflow validated
 

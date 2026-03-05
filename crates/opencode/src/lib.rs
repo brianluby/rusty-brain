@@ -55,3 +55,77 @@ where
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // handle_with_failopen
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_with_failopen_returns_ok_output_on_success() {
+        let output = handle_with_failopen(|| {
+            Ok(::types::HookOutput {
+                system_message: Some("hello".to_string()),
+                ..Default::default()
+            })
+        });
+        assert_eq!(output.system_message, Some("hello".to_string()));
+    }
+
+    #[test]
+    fn handle_with_failopen_returns_default_on_error() {
+        let output = handle_with_failopen(|| {
+            Err(::types::RustyBrainError::FileSystem {
+                code: ::types::error_codes::E_FS_NOT_FOUND,
+                message: "test error".to_string(),
+                source: None,
+            })
+        });
+        assert_eq!(output, ::types::HookOutput::default());
+    }
+
+    #[test]
+    fn handle_with_failopen_returns_default_on_panic() {
+        let output = handle_with_failopen(|| {
+            panic!("intentional test panic");
+        });
+        assert_eq!(output, ::types::HookOutput::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // mind_tool_with_failopen
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mind_tool_with_failopen_returns_ok_output_on_success() {
+        let data = serde_json::json!({"result": "ok"});
+        let output = mind_tool_with_failopen(|| Ok(MindToolOutput::success(data.clone())));
+        assert!(output.success);
+        assert_eq!(output.data, Some(data));
+    }
+
+    #[test]
+    fn mind_tool_with_failopen_returns_error_output_on_error() {
+        let output = mind_tool_with_failopen(|| {
+            Err(::types::RustyBrainError::FileSystem {
+                code: ::types::error_codes::E_FS_IO_ERROR,
+                message: "disk full".to_string(),
+                source: None,
+            })
+        });
+        assert!(!output.success);
+        assert_eq!(output.error.as_deref(), Some("internal error"));
+    }
+
+    #[test]
+    fn mind_tool_with_failopen_returns_error_output_on_panic() {
+        let output = mind_tool_with_failopen(|| {
+            panic!("intentional test panic");
+        });
+        assert!(!output.success);
+        assert_eq!(output.error.as_deref(), Some("internal error"));
+    }
+}

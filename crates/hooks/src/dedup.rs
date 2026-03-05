@@ -66,7 +66,9 @@ impl DedupCache {
                     break;
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock && attempt < max_retries => {
-                    std::thread::sleep(std::time::Duration::from_millis(50 * u64::from(attempt + 1)));
+                    std::thread::sleep(std::time::Duration::from_millis(
+                        50 * u64::from(attempt + 1),
+                    ));
                 }
                 Err(_) => break,
             }
@@ -167,5 +169,150 @@ impl DedupCache {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // DedupCache::new
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn new_sets_cache_path_under_agent_brain_dir() {
+        let cache = DedupCache::new(Path::new("/tmp/project"));
+        assert_eq!(
+            cache.cache_path,
+            PathBuf::from("/tmp/project/.agent-brain/.dedup-cache.json")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // hash_key — deterministic
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn hash_key_is_deterministic() {
+        let key1 = DedupCache::hash_key("Read", "Read /src/main.rs");
+        let key2 = DedupCache::hash_key("Read", "Read /src/main.rs");
+        assert_eq!(key1, key2, "same inputs should produce same hash");
+    }
+
+    #[test]
+    fn hash_key_differs_for_different_tools() {
+        let key1 = DedupCache::hash_key("Read", "same summary");
+        let key2 = DedupCache::hash_key("Write", "same summary");
+        assert_ne!(
+            key1, key2,
+            "different tools should produce different hashes"
+        );
+    }
+
+    #[test]
+    fn hash_key_differs_for_different_summaries() {
+        let key1 = DedupCache::hash_key("Read", "summary A");
+        let key2 = DedupCache::hash_key("Read", "summary B");
+        assert_ne!(
+            key1, key2,
+            "different summaries should produce different hashes"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_duplicate — fresh cache
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_duplicate_returns_false_for_fresh_cache() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache = DedupCache::new(tmp.path());
+        assert!(
+            !cache.is_duplicate("Read", "Read /src/main.rs"),
+            "fresh cache should not report duplicates"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // record + is_duplicate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn record_and_is_duplicate_detects_recent_entry() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache = DedupCache::new(tmp.path());
+
+        cache
+            .record("Read", "Read /src/main.rs")
+            .expect("record should succeed");
+        assert!(
+            cache.is_duplicate("Read", "Read /src/main.rs"),
+            "recently recorded entry should be duplicate"
+        );
+    }
+
+    #[test]
+    fn record_does_not_mark_different_entry_as_duplicate() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache = DedupCache::new(tmp.path());
+
+        cache
+            .record("Read", "Read /src/main.rs")
+            .expect("record should succeed");
+        assert!(
+            !cache.is_duplicate("Write", "Wrote /src/main.rs"),
+            "different entry should not be duplicate"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // write_cache / read_cache round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn write_and_read_cache_round_trips() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache = DedupCache::new(tmp.path());
+
+        let mut data = CacheData::default();
+        let now = chrono::Utc::now().timestamp();
+        data.entries.insert("test_key".to_string(), now);
+
+        cache
+            .write_cache(&data)
+            .expect("write_cache should succeed");
+        let read_back = cache.read_cache().expect("read_cache should succeed");
+        assert_eq!(read_back.entries.get("test_key"), Some(&now));
+    }
+
+    // -----------------------------------------------------------------------
+    // read_cache — missing file
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn read_cache_returns_error_for_missing_file() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let cache = DedupCache::new(tmp.path());
+        let result = cache.read_cache();
+        assert!(
+            result.is_err(),
+            "read_cache should error when file is missing"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // lock_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn lock_path_appends_lock_extension() {
+        let cache = DedupCache::new(Path::new("/tmp/project"));
+        let lock = cache.lock_path();
+        assert_eq!(
+            lock.extension().and_then(|e| e.to_str()),
+            Some("lock"),
+            "lock path should have .lock extension"
+        );
     }
 }

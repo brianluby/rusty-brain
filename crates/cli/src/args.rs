@@ -145,3 +145,300 @@ fn parse_obs_type(s: &str) -> Result<ObservationType, String> {
         )
     })
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    // -------------------------------------------------------------------------
+    // T030: Subcommand routing and flag validation
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_find_subcommand_basic() {
+        let cli = Cli::try_parse_from(["rusty-brain", "find", "hello"]).unwrap();
+        match cli.command {
+            Command::Find {
+                pattern,
+                limit,
+                r#type,
+                json,
+            } => {
+                assert_eq!(pattern, "hello");
+                assert_eq!(limit, 10, "default limit must be 10");
+                assert!(r#type.is_none());
+                assert!(!json);
+            }
+            _ => panic!("expected Find command"),
+        }
+    }
+
+    #[test]
+    fn parse_find_with_limit_and_json() {
+        let cli =
+            Cli::try_parse_from(["rusty-brain", "find", "test", "--limit", "5", "--json"]).unwrap();
+        match cli.command {
+            Command::Find {
+                pattern,
+                limit,
+                json,
+                ..
+            } => {
+                assert_eq!(pattern, "test");
+                assert_eq!(limit, 5);
+                assert!(json);
+            }
+            _ => panic!("expected Find command"),
+        }
+    }
+
+    #[test]
+    fn parse_find_with_type_filter() {
+        let cli =
+            Cli::try_parse_from(["rusty-brain", "find", "test", "--type", "discovery"]).unwrap();
+        match cli.command {
+            Command::Find { r#type, .. } => {
+                assert_eq!(r#type, Some(ObservationType::Discovery));
+            }
+            _ => panic!("expected Find command"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_subcommand() {
+        let cli = Cli::try_parse_from(["rusty-brain", "ask", "What happened?"]).unwrap();
+        match cli.command {
+            Command::Ask { question, json } => {
+                assert_eq!(question, "What happened?");
+                assert!(!json);
+            }
+            _ => panic!("expected Ask command"),
+        }
+    }
+
+    #[test]
+    fn parse_ask_with_json() {
+        let cli = Cli::try_parse_from(["rusty-brain", "ask", "question", "--json"]).unwrap();
+        match cli.command {
+            Command::Ask { json, .. } => assert!(json),
+            _ => panic!("expected Ask command"),
+        }
+    }
+
+    #[test]
+    fn parse_stats_subcommand() {
+        let cli = Cli::try_parse_from(["rusty-brain", "stats"]).unwrap();
+        match cli.command {
+            Command::Stats { json } => assert!(!json),
+            _ => panic!("expected Stats command"),
+        }
+    }
+
+    #[test]
+    fn parse_stats_with_json() {
+        let cli = Cli::try_parse_from(["rusty-brain", "stats", "--json"]).unwrap();
+        match cli.command {
+            Command::Stats { json } => assert!(json),
+            _ => panic!("expected Stats command"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_defaults() {
+        let cli = Cli::try_parse_from(["rusty-brain", "timeline"]).unwrap();
+        match cli.command {
+            Command::Timeline {
+                limit,
+                r#type,
+                oldest_first,
+                json,
+            } => {
+                assert_eq!(limit, 10);
+                assert!(r#type.is_none());
+                assert!(!oldest_first);
+                assert!(!json);
+            }
+            _ => panic!("expected Timeline command"),
+        }
+    }
+
+    #[test]
+    fn parse_timeline_with_all_flags() {
+        let cli = Cli::try_parse_from([
+            "rusty-brain",
+            "timeline",
+            "--limit",
+            "20",
+            "--type",
+            "bugfix",
+            "--oldest-first",
+            "--json",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Timeline {
+                limit,
+                r#type,
+                oldest_first,
+                json,
+            } => {
+                assert_eq!(limit, 20);
+                assert_eq!(r#type, Some(ObservationType::Bugfix));
+                assert!(oldest_first);
+                assert!(json);
+            }
+            _ => panic!("expected Timeline command"),
+        }
+    }
+
+    #[test]
+    fn parse_global_verbose_flag() {
+        let cli = Cli::try_parse_from(["rusty-brain", "--verbose", "stats"]).unwrap();
+        assert!(cli.verbose);
+    }
+
+    #[test]
+    fn parse_global_memory_path_flag() {
+        let cli = Cli::try_parse_from(["rusty-brain", "--memory-path", "/tmp/test.mv2", "stats"])
+            .unwrap();
+        assert_eq!(cli.memory_path, Some(PathBuf::from("/tmp/test.mv2")));
+    }
+
+    #[test]
+    fn parse_opencode_chat_hook() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "chat-hook"]).unwrap();
+        match cli.command {
+            Command::Opencode(OpenCodeCommand::ChatHook) => {}
+            _ => panic!("expected Opencode ChatHook"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_tool_hook() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "tool-hook"]).unwrap();
+        match cli.command {
+            Command::Opencode(OpenCodeCommand::ToolHook) => {}
+            _ => panic!("expected Opencode ToolHook"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_mind() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "mind"]).unwrap();
+        match cli.command {
+            Command::Opencode(OpenCodeCommand::Mind) => {}
+            _ => panic!("expected Opencode Mind"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_session_cleanup() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "session-cleanup"]).unwrap();
+        match cli.command {
+            Command::Opencode(OpenCodeCommand::SessionCleanup) => {}
+            _ => panic!("expected Opencode SessionCleanup"),
+        }
+    }
+
+    #[test]
+    fn parse_opencode_session_start() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "session-start"]).unwrap();
+        match cli.command {
+            Command::Opencode(OpenCodeCommand::SessionStart) => {}
+            _ => panic!("expected Opencode SessionStart"),
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Validation tests (parse_pattern, parse_question, parse_limit, parse_obs_type)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn empty_pattern_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "find", ""]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn whitespace_only_pattern_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "find", "   "]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pattern_is_trimmed() {
+        let cli = Cli::try_parse_from(["rusty-brain", "find", "  hello  "]).unwrap();
+        match cli.command {
+            Command::Find { pattern, .. } => assert_eq!(pattern, "hello"),
+            _ => panic!("expected Find"),
+        }
+    }
+
+    #[test]
+    fn empty_question_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "ask", ""]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn whitespace_only_question_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "ask", "   "]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn limit_zero_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "find", "test", "--limit", "0"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn limit_non_integer_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "find", "test", "--limit", "abc"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn limit_one_accepted() {
+        let cli = Cli::try_parse_from(["rusty-brain", "find", "test", "--limit", "1"]).unwrap();
+        match cli.command {
+            Command::Find { limit, .. } => assert_eq!(limit, 1),
+            _ => panic!("expected Find"),
+        }
+    }
+
+    #[test]
+    fn invalid_obs_type_rejected() {
+        let result = Cli::try_parse_from(["rusty-brain", "find", "test", "--type", "invalid"]);
+        assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // Command::json() helper
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn json_method_find_default_false() {
+        let cli = Cli::try_parse_from(["rusty-brain", "find", "test"]).unwrap();
+        assert!(!cli.command.json());
+    }
+
+    #[test]
+    fn json_method_find_with_flag_true() {
+        let cli = Cli::try_parse_from(["rusty-brain", "find", "test", "--json"]).unwrap();
+        assert!(cli.command.json());
+    }
+
+    #[test]
+    fn json_method_opencode_always_true() {
+        let cli = Cli::try_parse_from(["rusty-brain", "opencode", "chat-hook"]).unwrap();
+        assert!(cli.command.json());
+    }
+
+    #[test]
+    fn no_subcommand_shows_help() {
+        let result = Cli::try_parse_from(["rusty-brain"]);
+        assert!(result.is_err());
+    }
+}
