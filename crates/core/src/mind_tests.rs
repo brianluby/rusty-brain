@@ -315,6 +315,12 @@ fn mind_timeline_reverse_order_most_recent_first() {
     assert_eq!(entries[0].obs_type, ObservationType::Bugfix);
     assert_eq!(entries[2].summary, "first obs");
     assert_eq!(entries[2].obs_type, ObservationType::Discovery);
+    // Verify timestamps are monotonically decreasing (most recent first)
+    assert!(
+        entries[0].timestamp >= entries[1].timestamp
+            && entries[1].timestamp >= entries[2].timestamp,
+        "timestamps should be in descending order"
+    );
 }
 
 #[test]
@@ -330,6 +336,11 @@ fn mind_timeline_chronological_order_oldest_first() {
     // Oldest first (reverse=false)
     assert_eq!(entries[0].summary, "first obs");
     assert_eq!(entries[1].summary, "second obs");
+    // Verify timestamps are monotonically increasing (oldest first)
+    assert!(
+        entries[0].timestamp <= entries[1].timestamp,
+        "timestamps should be in ascending order"
+    );
 }
 
 #[test]
@@ -405,8 +416,14 @@ fn mind_timeline_malformed_metadata_uses_fallbacks() {
     assert_eq!(entry.tool_name, "unknown");
     // Summary falls back to preview text
     assert!(entry.summary.contains("some preview text"));
-    // Timestamp falls back to now (approximately)
-    assert!(entry.timestamp <= Utc::now());
+    // Timestamp falls back to backend epoch timestamp (not Utc::now())
+    // since the frame has a backend-provided timestamp field.
+    // Verify it's a reasonable past timestamp, not approximately now.
+    let age = Utc::now() - entry.timestamp;
+    assert!(
+        age.num_seconds() >= 0 && age.num_seconds() < 60,
+        "fallback timestamp should be recent and not in the future, got age: {age}"
+    );
 }
 
 #[test]

@@ -36,9 +36,6 @@ shellcheck install.sh
 
 # Run unit tests (requires bats-core)
 bats tests/install_script_test.bats
-
-# Dry run (downloads but doesn't install)
-RUSTY_BRAIN_VERSION=v0.1.0 sh install.sh --dry-run
 ```
 
 ### 3. Create a Release

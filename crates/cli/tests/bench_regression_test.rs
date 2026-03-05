@@ -78,18 +78,27 @@ fn report_variance(label: &str, durations_ms: &[f64]) {
     }
 }
 
+/// In CI (BENCH_REGRESSION_REQUIRED=1), missing fixtures/binary cause test failure.
+/// Locally, they cause a skip for developer convenience.
+fn require_or_skip(msg: &str) {
+    if std::env::var("BENCH_REGRESSION_REQUIRED").as_deref() == Ok("1") {
+        panic!("{msg} — set BENCH_REGRESSION_REQUIRED=0 or provide the missing resource");
+    }
+    eprintln!("{msg}, skipping");
+}
+
 #[test]
 fn startup_time_at_least_2x_faster() {
     let Some(baselines) = load_baselines() else {
-        eprintln!("ts_baselines.json not found, skipping regression test");
+        require_or_skip("ts_baselines.json not found");
         return;
     };
     let Some(ts_ms) = get_baseline_value(&baselines, "startup_time_ms") else {
-        eprintln!("startup_time_ms baseline not found, skipping");
+        require_or_skip("startup_time_ms baseline not found");
         return;
     };
     let Some(binary) = find_binary() else {
-        eprintln!("rusty-brain binary not found, skipping startup regression test");
+        require_or_skip("rusty-brain binary not found");
         return;
     };
 
@@ -133,11 +142,11 @@ fn startup_time_at_least_2x_faster() {
 #[test]
 fn query_latency_at_least_2x_faster() {
     let Some(baselines) = load_baselines() else {
-        eprintln!("ts_baselines.json not found, skipping regression test");
+        require_or_skip("ts_baselines.json not found");
         return;
     };
     let Some(ts_ms) = get_baseline_value(&baselines, "query_latency_ms") else {
-        eprintln!("query_latency_ms baseline not found, skipping");
+        require_or_skip("query_latency_ms baseline not found");
         return;
     };
 
@@ -188,11 +197,11 @@ fn query_latency_at_least_2x_faster() {
 #[test]
 fn compression_throughput_at_least_2x_faster() {
     let Some(baselines) = load_baselines() else {
-        eprintln!("ts_baselines.json not found, skipping regression test");
+        require_or_skip("ts_baselines.json not found");
         return;
     };
     let Some(ts_mb_s) = get_baseline_value(&baselines, "compression_throughput_mb_s") else {
-        eprintln!("compression_throughput_mb_s baseline not found, skipping");
+        require_or_skip("compression_throughput_mb_s baseline not found");
         return;
     };
 

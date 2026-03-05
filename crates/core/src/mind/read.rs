@@ -94,7 +94,15 @@ impl Mind {
                 .get("timestamp")
                 .and_then(|v| v.as_str())
                 .and_then(|s| DateTime::parse_from_rfc3339(s).ok())
-                .map_or_else(Utc::now, |dt| dt.with_timezone(&Utc));
+                .map(|dt| dt.with_timezone(&Utc))
+                .or_else(|| {
+                    // Fall back to backend-provided epoch timestamp before Utc::now().
+                    frame
+                        .timestamp
+                        .and_then(|epoch| DateTime::from_timestamp(epoch, 0))
+                        .map(|dt| dt.with_timezone(&Utc))
+                })
+                .unwrap_or_else(Utc::now);
             let tool_name = frame
                 .metadata
                 .get("tool_name")

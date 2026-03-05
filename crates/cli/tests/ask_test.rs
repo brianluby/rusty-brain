@@ -25,6 +25,11 @@ fn test_ask_returns_answer() {
     let (status, stdout, _stderr) = run_cli(&path, &["ask", "How is caching implemented?"]);
     assert!(status.success(), "ask should succeed");
     assert!(!stdout.trim().is_empty(), "should return non-empty answer");
+    let lower = stdout.to_lowercase();
+    assert!(
+        lower.contains("cach") || lower.contains("lru"),
+        "answer should be semantically relevant (contain 'cach' or 'lru'), got: {stdout}"
+    );
 }
 
 #[test]
