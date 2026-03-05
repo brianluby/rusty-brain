@@ -45,6 +45,33 @@ fn find_binary() -> Option<std::path::PathBuf> {
 /// Required speedup factor: Rust must be at least this many times faster.
 const REQUIRED_SPEEDUP: f64 = 2.0;
 
+/// Maximum acceptable coefficient of variation (stddev/mean) before flagging
+/// the run as unreliable (e.g., system under heavy load).
+const MAX_CV: f64 = 0.5;
+
+/// Compute mean, stddev, and coefficient of variation for a set of durations.
+/// Prints a warning if CV exceeds the threshold.
+fn report_variance(label: &str, durations_ms: &[f64]) {
+    if durations_ms.len() < 2 {
+        return;
+    }
+    let n = durations_ms.len() as f64;
+    let mean = durations_ms.iter().sum::<f64>() / n;
+    let variance = durations_ms.iter().map(|d| (d - mean).powi(2)).sum::<f64>() / (n - 1.0);
+    let stddev = variance.sqrt();
+    let cv = if mean > 0.0 { stddev / mean } else { 0.0 };
+
+    eprintln!(
+        "  {label} variance: mean={mean:.3}ms, stddev={stddev:.3}ms, CV={cv:.2} (max={MAX_CV})"
+    );
+    if cv > MAX_CV {
+        eprintln!(
+            "  WARNING: {label} has high variance (CV={cv:.2} > {MAX_CV}), \
+             system may be under heavy load — results may be unreliable"
+        );
+    }
+}
+
 #[test]
 fn startup_time_at_least_2x_faster() {
     let Some(baselines) = load_baselines() else {
@@ -120,15 +147,17 @@ fn query_latency_at_least_2x_faster() {
     let _ = mind.search("caching pattern", Some(10));
 
     let iterations: u32 = 50;
-    let start = std::time::Instant::now();
+    let mut durations = Vec::with_capacity(iterations as usize);
     for _ in 0..iterations {
+        let t = std::time::Instant::now();
         mind.search("caching pattern", Some(10)).expect("search");
+        durations.push(t.elapsed().as_secs_f64() * 1000.0);
     }
-    let elapsed = start.elapsed();
-    let avg_ms = elapsed.as_secs_f64() * 1000.0 / f64::from(iterations);
+    let avg_ms = durations.iter().sum::<f64>() / durations.len() as f64;
     let speedup = ts_ms / avg_ms;
 
     eprintln!("Query: Rust={avg_ms:.2}ms, TS={ts_ms:.1}ms, speedup={speedup:.1}x");
+    report_variance("query_latency", &durations);
 
     assert!(
         speedup >= REQUIRED_SPEEDUP,

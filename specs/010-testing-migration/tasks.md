@@ -227,13 +227,13 @@
 
 **Purpose**: CI enhancement, final validation, cross-cutting improvements
 
-- [ ] T073 Update `.github/workflows/ci.yml` to add benchmark regression gate step — run `cargo bench` and fail if any metric is <2× vs ts_baselines.json (use custom comparison script parsing criterion JSON output)
-- [ ] T074 [P] Update `.github/workflows/ci.yml` to add fuzz smoke test step — install cargo-fuzz, run each harness for 60 seconds, fail on any panic
-- [ ] T075 [P] Add variance/deviation metrics to benchmark output — flag unreliable runs when system is under heavy load (edge case from spec)
-- [ ] T076 Run agent integration smoke test — verify CLI commands (`rusty-brain search`, `rusty-brain stats`, `rusty-brain timeline`) produce valid structured JSON output per constitution Quality Gates
-- [ ] T077 Run full quality gate validation: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace && cargo bench --workspace`
-- [ ] T078 Run quickstart.md validation — execute all commands from quickstart.md and verify they work as documented
-- [ ] T079 Final test count audit — verify total test count ≥400, every pub fn has ≥1 test, all SC-001 through SC-009 success criteria met
+- [x] T073 Update `.github/workflows/ci.yml` to add benchmark regression gate step — run `cargo bench` and fail if any metric is <2× vs ts_baselines.json (use custom comparison script parsing criterion JSON output)
+- [x] T074 [P] Update `.github/workflows/ci.yml` to add fuzz smoke test step — install cargo-fuzz, run each harness for 60 seconds, fail on any panic
+- [x] T075 [P] Add variance/deviation metrics to benchmark output — flag unreliable runs when system is under heavy load (edge case from spec)
+- [x] T076 Run agent integration smoke test — verify CLI commands (`rusty-brain search`, `rusty-brain stats`, `rusty-brain timeline`) produce valid structured JSON output per constitution Quality Gates
+- [x] T077 Run full quality gate validation: `cargo fmt --check && cargo clippy --workspace -- -D warnings && cargo test --workspace && cargo bench --workspace`
+- [x] T078 Run quickstart.md validation — execute all commands from quickstart.md and verify they work as documented
+- [x] T079 Final test count audit — verify total test count ≥400, every pub fn has ≥1 test, all SC-001 through SC-009 success criteria met
 
 ---
 
