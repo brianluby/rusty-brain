@@ -516,7 +516,10 @@ main() {
   # Verify SHA-256 checksum (mandatory)
   verify_sha256 "$_archive_path" "$_checksum_path"
 
-  # Extract with path traversal protection (SEC-12)
+  # Extract into fresh empty directory (SEC-12)
+  # Note: GNU tar rejects '../' paths by default; --strip-components is for
+  # directory prefix convenience, not security. The actual protections are:
+  # (1) extraction into a clean temp directory, (2) tar's default path sanitization.
   _extract_dir="${tmpdir}/extract"
   mkdir -p "$_extract_dir"
   tar xzf "$_archive_path" -C "$_extract_dir" --strip-components=1

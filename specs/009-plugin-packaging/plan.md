@@ -76,10 +76,10 @@ packaging/
 │   │   └── memory/
 │   │       └── SKILL.md             # memory skill definition
 │   ├── commands/
-│   │   ├── ask.md                   # /ask slash command
-│   │   ├── search.md                # /search slash command
-│   │   ├── recent.md                # /recent slash command
-│   │   └── stats.md                 # /stats slash command
+│   │   ├── ask.md                   # /mind:ask slash command
+│   │   ├── search.md                # /mind:search slash command
+│   │   ├── recent.md                # /mind:recent slash command
+│   │   └── stats.md                 # /mind:stats slash command
 │   ├── marketplace.json             # Marketplace registry
 │   └── README.md                    # Plugin README (optional)
 └── opencode/

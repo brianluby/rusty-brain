@@ -499,6 +499,6 @@ Before marking as Approved:
 - [x] Trust boundaries are identified
 - [x] Security requirements have verification methods specified
 - [x] Security requirements trace to PRD ACs where applicable
-- [x] No Critical/High findings remain Open — F2 (High) is Open; requires human decision
+- [ ] No Critical/High findings remain Open — F2 (High) is Open; requires human decision
 - [x] Compliance N/A items have justification
-- [x] Risk acceptance has named approver and review date — Partially complete; R2 not yet accepted
+- [ ] Risk acceptance has named approver and review date — Partially complete; R2 not yet accepted

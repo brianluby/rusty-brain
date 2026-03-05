@@ -707,5 +707,5 @@ Before marking as Accepted:
 - [x] Component names are consistent across all diagrams and tables
 - [x] Implementation guardrails reference specific PRD constraints
 - [x] Rollback triggers and authority are defined
-- [ ] Security review is linked (pending — `/speckit.security` next)
+- [x] Security review is linked (`sec.md`)
 - [x] No blocking open questions (Q1 is non-blocking preference)

@@ -79,7 +79,7 @@ Open Claude Code in any project. The `mind` and `memory` skills should appear in
 
 ## File Layout Summary
 
-```
+```text
 repo-root/
 ├── .github/workflows/
 │   ├── ci.yml                 # Existing CI (unchanged)
@@ -104,7 +104,7 @@ repo-root/
 
 - **No Rust code changes**: This feature only adds scripts, workflows, and manifests
 - **Plugin manifests are embedded**: The install script writes manifests directly (no separate download)
-- **`${CLAUDE_PLUGIN_ROOT}`**: Use this env var in hooks.json and SKILL.md for plugin-relative paths
+- **`${CLAUDE_PLUGIN_ROOT}`**: Use this env var in hooks.json for plugin-relative binary paths (skills use direct `rusty-brain` commands via PATH)
 - **Version source of truth**: `Cargo.toml` workspace version; git tag must match
 - **Binary install path**: `~/.local/bin/` (macOS/Linux), `$env:LOCALAPPDATA\rusty-brain\bin\` (Windows)
 - **Plugin install path**: `~/.claude/plugins/rusty-brain/`
