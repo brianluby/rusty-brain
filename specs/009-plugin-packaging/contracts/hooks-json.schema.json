@@ -1,0 +1,80 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Claude Code Hooks Configuration",
+  "description": "Schema for hooks/hooks.json used by Claude Code hook system",
+  "type": "object",
+  "properties": {
+    "description": {
+      "type": "string"
+    },
+    "hooks": {
+      "type": "object",
+      "properties": {
+        "SessionStart": {
+          "$ref": "#/$defs/hookEventArray"
+        },
+        "PostToolUse": {
+          "$ref": "#/$defs/hookEventArrayWithMatcher"
+        },
+        "Stop": {
+          "$ref": "#/$defs/hookEventArray"
+        }
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/hookEventArray"
+      }
+    }
+  },
+  "required": ["hooks"],
+  "$defs": {
+    "hookEntry": {
+      "type": "object",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": ["command"]
+        },
+        "command": {
+          "type": "string",
+          "description": "Shell command to execute. Use ${CLAUDE_PLUGIN_ROOT} for plugin-relative paths."
+        },
+        "timeout": {
+          "type": "integer",
+          "minimum": 1,
+          "description": "Timeout in seconds"
+        }
+      },
+      "required": ["type", "command"]
+    },
+    "hookEventArray": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "hooks": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/hookEntry" }
+          }
+        },
+        "required": ["hooks"]
+      }
+    },
+    "hookEventArrayWithMatcher": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "properties": {
+          "matcher": {
+            "type": "string",
+            "description": "Glob pattern for tool name matching"
+          },
+          "hooks": {
+            "type": "array",
+            "items": { "$ref": "#/$defs/hookEntry" }
+          }
+        },
+        "required": ["hooks"]
+      }
+    }
+  }
+}
