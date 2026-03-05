@@ -14,7 +14,6 @@ use types::ObservationType;
 
 /// Helper: spawn N writers that each write `writes_per_thread` observations,
 /// synchronised by a barrier so all threads start at the same time.
-/// Returns total expected observations.
 fn run_concurrent_writers(num_threads: usize, writes_per_thread: usize) {
     let (_dir, config) = common::temp_mind_config();
     let mind = Arc::new(Mind::open(config).unwrap());
