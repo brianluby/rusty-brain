@@ -154,12 +154,12 @@
 
 **Covers**: FR-004, SC-003
 
-- [ ] T048 [US3] Add 4-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — spawn 4 threads with Arc<Barrier>, each writes unique observation, verify all 4 retrievable after completion
-- [ ] T049 [US3] Add 8-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — same pattern with 8 writers, verify no data loss
-- [ ] T050 [US3] Add 16-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — stress test with 16 writers, verify no corruption
-- [ ] T051 [US3] Add stale lock recovery test in `crates/core/tests/integration/mind_concurrent.rs` — create stale lock file (simulating crashed process), start new Mind instance, verify recovery completes within 5 seconds per clarification
-- [ ] T052 [US3] Add reader-during-write test in `crates/core/tests/integration/mind_concurrent.rs` — one writer holds lock, concurrent reader must either wait or get clean error, never read partial data
-- [ ] T053 [US3] Add data integrity verification in `crates/core/tests/integration/mind_concurrent.rs` — after all concurrent writes complete, open Mind and verify SHA-256 checksums of all stored observations match originals
+- [x] T048 [US3] Add 4-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — spawn 4 threads with Arc<Barrier>, each writes unique observation, verify all 4 retrievable after completion
+- [x] T049 [US3] Add 8-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — same pattern with 8 writers, verify no data loss
+- [x] T050 [US3] Add 16-writer concurrent test in `crates/core/tests/integration/mind_concurrent.rs` — stress test with 16 writers, verify no corruption
+- [x] T051 [US3] Add stale lock recovery test in `crates/core/tests/integration/mind_concurrent.rs` — create stale lock file (simulating crashed process), start new Mind instance, verify recovery completes within 5 seconds per clarification
+- [x] T052 [US3] Add reader-during-write test in `crates/core/tests/integration/mind_concurrent.rs` — one writer holds lock, concurrent reader must either wait or get clean error, never read partial data
+- [x] T053 [US3] Add data integrity verification in `crates/core/tests/integration/mind_concurrent.rs` — after all concurrent writes complete, open Mind and verify SHA-256 checksums of all stored observations match originals
 
 **Checkpoint**: US3 complete — 4, 8, 16 writer tests pass 100%, stale lock recovery ≤5s, no partial reads
 
