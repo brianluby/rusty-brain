@@ -28,6 +28,7 @@ fn effective_memory_path(resolved: PathBuf) -> PathBuf {
 /// # Errors
 ///
 /// Returns `HookError::Mind` or `HookError::Platform` on failure.
+#[tracing::instrument(skip(input))]
 pub fn handle_session_start(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 

@@ -35,7 +35,10 @@ pub fn fail_open(result: Result<HookOutput, HookError>) -> HookOutput {
     match result {
         Ok(output) => output,
         Err(e) => {
-            tracing::warn!("Hook error (fail-open): {e}");
+            tracing::warn!(
+                error = &e as &dyn std::error::Error,
+                "Hook error (fail-open)"
+            );
             HookOutput {
                 continue_execution: Some(true),
                 ..Default::default()

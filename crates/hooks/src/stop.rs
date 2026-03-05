@@ -15,6 +15,7 @@ use types::hooks::{HookInput, HookOutput};
 ///
 /// Returns `HookError::Platform` (memory-path resolution) or `HookError::Mind` on failure.
 /// Git detection is fail-open and does not produce errors.
+#[tracing::instrument(skip(input))]
 pub fn handle_stop(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 

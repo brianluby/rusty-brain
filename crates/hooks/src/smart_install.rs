@@ -13,6 +13,7 @@ const VERSION_FILENAME: &str = ".install-version";
 /// # Errors
 ///
 /// Returns `HookError::Io` on file I/O failure.
+#[tracing::instrument(skip(input))]
 pub fn handle_smart_install(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
     let version_path = cwd.join(VERSION_FILENAME);

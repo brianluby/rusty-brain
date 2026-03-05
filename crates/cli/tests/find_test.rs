@@ -110,20 +110,30 @@ fn test_find_type_filter() {
         TestObs {
             obs_type: ObservationType::Discovery,
             tool_name: "Read".into(),
-            summary: "authentication middleware validates bearer credentials in the request pipeline".into(),
+            summary:
+                "authentication middleware validates bearer credentials in the request pipeline"
+                    .into(),
             content: None,
         },
         TestObs {
             obs_type: ObservationType::Decision,
             tool_name: "Write".into(),
-            summary: "authentication middleware decision for bearer credentials validation approach".into(),
+            summary:
+                "authentication middleware decision for bearer credentials validation approach"
+                    .into(),
             content: None,
         },
     ]);
 
     let (status, stdout, _stderr) = run_cli(
         &path,
-        &["find", "authentication middleware bearer credentials", "--type", "decision", "--json"],
+        &[
+            "find",
+            "authentication middleware bearer credentials",
+            "--type",
+            "decision",
+            "--json",
+        ],
     );
     assert!(status.success());
 

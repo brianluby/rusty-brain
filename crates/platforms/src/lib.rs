@@ -33,3 +33,4 @@ pub use path_policy::{
 };
 pub use pipeline::{EventPipeline, PipelineResult};
 pub use registry::AdapterRegistry;
+pub mod bootstrap;

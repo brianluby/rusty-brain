@@ -18,6 +18,7 @@ const MAX_TOKENS: usize = 500;
 ///
 /// Returns `HookError::Platform` (memory-path resolution), `HookError::Mind`,
 /// or `HookError::Dedup` on failure.
+#[tracing::instrument(skip(input))]
 pub fn handle_post_tool_use(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
 
