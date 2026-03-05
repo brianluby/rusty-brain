@@ -161,10 +161,10 @@ fn resolve_memory_path_with_valid_dir() {
                 "resolve_memory_path with valid dir should succeed: {result:?}"
             );
             let path = result.unwrap();
-            // Without opt-in, should use legacy path
+            // Without opt-in, should use canonical path
             assert!(
                 path.to_string_lossy().contains(".agent-brain/mind.mv2"),
-                "without opt-in, should use legacy path: {}",
+                "without opt-in, should use canonical path: {}",
                 path.display()
             );
         },
@@ -236,7 +236,7 @@ fn mind_config_uses_legacy_path_without_opt_in() {
                 cfg.memory_path
                     .to_string_lossy()
                     .contains(".agent-brain/mind.mv2"),
-                "without opt-in, config should use legacy path: {}",
+                "without opt-in, config should use canonical path: {}",
                 cfg.memory_path.display()
             );
         },

@@ -69,44 +69,52 @@ fn get_baseline_value(baselines: &serde_json::Value, metric: &str) -> Option<f64
 }
 
 fn bench_remember_vs_baseline(c: &mut Criterion) {
-    let (_dir, mind) = setup_mind(100);
-
     let payload = "payload content for benchmark throughput measurement";
     let payload_bytes = payload.len();
-    let start = std::time::Instant::now();
-    let iterations: u32 = 100;
-    for i in 0..iterations {
-        mind.remember(
-            ObservationType::Discovery,
-            "bench",
-            &format!("throughput observation {i}"),
-            Some(payload),
-            None,
-        )
-        .expect("remember failed");
-    }
-    let elapsed = start.elapsed();
-    let total_bytes = payload_bytes * usize::try_from(iterations).expect("fits in usize");
-    #[expect(clippy::cast_precision_loss, reason = "byte count fits in f64")]
-    let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
-    let avg_ms = elapsed.as_secs_f64() * 1000.0 / f64::from(iterations);
 
-    // Compare against query_latency_ms as a rough write-vs-read reference
-    if let Some(baselines) = load_baselines() {
-        if let Some(ts_ms) = get_baseline_value(&baselines, "query_latency_ms") {
-            let speedup = ts_ms / avg_ms;
-            println!();
-            println!("=== TypeScript Baseline Comparison (Store) ===");
-            println!("  Rust write latency:       {avg_ms:.3} ms");
-            println!("  Rust write throughput:     {throughput_mb_s:.3} MB/s");
-            println!("  TypeScript query baseline: {ts_ms:.1} ms");
-            println!("  Speedup factor (vs read):  {speedup:.1}x");
-            println!("===============================================");
+    // Manual throughput measurement on a separate Mind instance so the
+    // Criterion benchmark below starts with exactly 100 observations.
+    {
+        let (_throughput_dir, throughput_mind) = setup_mind(100);
+        let start = std::time::Instant::now();
+        let iterations: u32 = 100;
+        for i in 0..iterations {
+            throughput_mind
+                .remember(
+                    ObservationType::Discovery,
+                    "bench",
+                    &format!("throughput observation {i}"),
+                    Some(payload),
+                    None,
+                )
+                .expect("remember failed");
         }
-    } else {
-        println!("(ts_baselines.json not found, skipping comparison)");
+        let elapsed = start.elapsed();
+        let elapsed_secs = elapsed.as_secs_f64().max(1e-9);
+        let total_bytes = payload_bytes * usize::try_from(iterations).expect("fits in usize");
+        #[expect(clippy::cast_precision_loss, reason = "byte count fits in f64")]
+        let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs;
+        let avg_ms = elapsed_secs * 1000.0 / f64::from(iterations);
+
+        // Compare against query_latency_ms as a rough write-vs-read reference
+        if let Some(baselines) = load_baselines() {
+            if let Some(ts_ms) = get_baseline_value(&baselines, "query_latency_ms") {
+                let speedup = ts_ms / avg_ms;
+                println!();
+                println!("=== TypeScript Baseline Comparison (Store) ===");
+                println!("  Rust write latency:       {avg_ms:.3} ms");
+                println!("  Rust write throughput:     {throughput_mb_s:.3} MB/s");
+                println!("  TypeScript query baseline: {ts_ms:.1} ms");
+                println!("  Speedup factor (vs read):  {speedup:.1}x");
+                println!("===============================================");
+            }
+        } else {
+            println!("(ts_baselines.json not found, skipping comparison)");
+        }
     }
 
+    // Criterion benchmark on a fresh Mind with exactly 100 observations.
+    let (_dir, mind) = setup_mind(100);
     let mut j = 1000u64;
     c.bench_function("Mind::remember throughput (100 existing)", |b| {
         b.iter(|| {
