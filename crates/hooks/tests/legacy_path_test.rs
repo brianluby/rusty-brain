@@ -24,7 +24,7 @@ fn legacy_only_returns_migration_warning() {
         diag.message
     );
     assert!(
-        diag.message.contains("igrat"),
+        diag.message.to_lowercase().contains("migrate"),
         "diagnostic should suggest migration: {}",
         diag.message
     );

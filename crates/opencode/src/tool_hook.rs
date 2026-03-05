@@ -169,19 +169,33 @@ mod tests {
     }
 
     #[test]
-    fn handle_tool_hook_returns_default_for_empty_tool_response() {
+    fn handle_tool_hook_returns_default_for_absent_tool_response() {
         let input = make_tool_hook_input("Read", None);
-        let cwd = std::path::Path::new("/tmp/project");
-        // Either returns default (no tool_response) or errors (platform issue).
-        let _result = handle_tool_hook(&input, cwd);
+        let cwd = std::path::Path::new("/tmp/nonexistent-project");
+        let result = handle_tool_hook(&input, cwd);
+        // No tool_response → early return with default output (no Mind needed)
+        assert!(result.is_ok(), "absent tool_response should return Ok");
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            HookOutput::default(),
+            "absent tool_response should return default output"
+        );
     }
 
     #[test]
     fn handle_tool_hook_returns_default_for_empty_string_response() {
         let input = make_tool_hook_input("Read", Some(serde_json::json!("")));
-        let cwd = std::path::Path::new("/tmp/project");
-        // Either returns default (empty response) or errors (platform issue).
-        let _result = handle_tool_hook(&input, cwd);
+        let cwd = std::path::Path::new("/tmp/nonexistent-project");
+        let result = handle_tool_hook(&input, cwd);
+        // Empty string tool_response → early return with default output
+        assert!(result.is_ok(), "empty tool_response should return Ok");
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            HookOutput::default(),
+            "empty tool_response should return default output"
+        );
     }
 
     // -----------------------------------------------------------------------

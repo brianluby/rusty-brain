@@ -31,7 +31,7 @@ jobs:
         run: cargo build --workspace --release
 
       - name: Benchmark regression gate
-        run: cargo test -p rusty-brain-cli --test bench_regression_test -- --nocapture
+        run: cargo test --release -p rusty-brain-cli --test bench_regression_test -- --nocapture
 
   # Fuzz smoke test (runs on nightly, separate job to avoid blocking main CI)
   fuzz:

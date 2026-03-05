@@ -527,9 +527,9 @@ mod tests {
         let old_file = tmp.path().join("session-old.json");
         std::fs::write(&old_file, "{}").unwrap();
 
-        // Set modification time to the past by using filetime crate isn't available,
-        // so we use a max_age of 0 seconds to treat all files as stale.
-        cleanup_stale(tmp.path(), Duration::from_secs(0));
+        // Ensure file age exceeds max_age (age > max_age gates deletion).
+        std::thread::sleep(Duration::from_millis(2));
+        cleanup_stale(tmp.path(), Duration::from_millis(1));
 
         assert!(!old_file.exists());
     }

@@ -300,7 +300,7 @@ mod tests {
             diag.message
         );
         assert!(
-            diag.message.contains("igrat"),
+            diag.message.to_lowercase().contains("migrate"),
             "message should suggest migration, got: {}",
             diag.message
         );

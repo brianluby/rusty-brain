@@ -82,20 +82,28 @@ mod tests {
 
     #[test]
     fn effective_memory_path_returns_resolved_when_env_not_set() {
-        // Ensure MEMVID_PLATFORM_MEMORY_PATH is not set for this test
         let resolved = PathBuf::from("/tmp/resolved/mind.mv2");
-        // If the env var is unset, effective_memory_path returns the resolved path
-        // We can't guarantee env state in parallel tests, but the logic is straightforward
-        let result = effective_memory_path(resolved.clone());
-        // Either returns resolved or env override — both are valid
-        assert!(
-            result == resolved
-                || std::env::var("MEMVID_PLATFORM_MEMORY_PATH")
-                    .ok()
-                    .filter(|v| !v.is_empty())
-                    .is_some(),
-            "should return resolved path when env is not set"
-        );
+        temp_env::with_var("MEMVID_PLATFORM_MEMORY_PATH", None::<&str>, || {
+            let result = effective_memory_path(resolved.clone());
+            assert_eq!(
+                result, resolved,
+                "should return resolved path when env is not set"
+            );
+        });
+    }
+
+    #[test]
+    fn effective_memory_path_returns_env_override_when_set() {
+        let resolved = PathBuf::from("/tmp/resolved/mind.mv2");
+        let override_path = "/custom/override/mind.mv2";
+        temp_env::with_var("MEMVID_PLATFORM_MEMORY_PATH", Some(override_path), || {
+            let result = effective_memory_path(resolved);
+            assert_eq!(
+                result,
+                PathBuf::from(override_path),
+                "should return env override path when set"
+            );
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -114,14 +122,13 @@ mod tests {
     }
 
     #[test]
-    fn handle_session_start_returns_default_output_for_non_processable() {
-        // Create an input that the pipeline might skip.
-        // Since should_process is fail-open and returns true for most inputs,
-        // this test verifies the function signature and return type.
+    fn handle_session_start_errors_for_nonexistent_path() {
         let input = make_input("/nonexistent/path");
         let result = handle_session_start(&input);
-        // Either error (because Mind can't open) or success — both are valid
-        // The key thing is the function compiles and returns the right type
-        assert!(result.is_ok() || result.is_err());
+        // Mind::open fails for nonexistent paths, so expect an error
+        assert!(
+            result.is_err(),
+            "should error for nonexistent cwd: {result:?}"
+        );
     }
 }

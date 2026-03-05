@@ -125,26 +125,28 @@ mod tests {
             return;
         }
 
+        let run_git = |args: &[&str]| {
+            let out = std::process::Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .output()
+                .expect("git command failed to execute");
+            assert!(
+                out.status.success(),
+                "git {:?} failed: {}",
+                args,
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+
         // Configure git user for commit
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.email", "test@test.com"])
-            .current_dir(tmp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["config", "user.name", "Test"])
-            .current_dir(tmp.path())
-            .output();
+        run_git(&["config", "user.email", "test@test.com"]);
+        run_git(&["config", "user.name", "Test"]);
 
         // Create initial file and commit
         std::fs::write(tmp.path().join("file.txt"), "initial").expect("write file");
-        let _ = std::process::Command::new("git")
-            .args(["add", "."])
-            .current_dir(tmp.path())
-            .output();
-        let _ = std::process::Command::new("git")
-            .args(["commit", "-m", "initial"])
-            .current_dir(tmp.path())
-            .output();
+        run_git(&["add", "."]);
+        run_git(&["commit", "-m", "initial"]);
 
         // Modify the file
         std::fs::write(tmp.path().join("file.txt"), "modified").expect("write modified file");

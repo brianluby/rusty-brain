@@ -14,8 +14,15 @@ fn load_baselines() -> Option<serde_json::Value> {
         .join("tests")
         .join("fixtures")
         .join("ts_baselines.json");
-    let content = std::fs::read_to_string(&fixtures).ok()?;
-    serde_json::from_str(&content).ok()
+    if !fixtures.exists() {
+        return None;
+    }
+    let content = std::fs::read_to_string(&fixtures)
+        .unwrap_or_else(|e| panic!("failed to read ts_baselines.json: {e}"));
+    Some(
+        serde_json::from_str(&content)
+            .unwrap_or_else(|e| panic!("malformed ts_baselines.json: {e}")),
+    )
 }
 
 fn get_baseline_value(baselines: &serde_json::Value, metric: &str) -> Option<f64> {
@@ -29,12 +36,11 @@ fn get_baseline_value(baselines: &serde_json::Value, metric: &str) -> Option<f64
 fn find_binary() -> Option<std::path::PathBuf> {
     let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
     let workspace_root = manifest_dir.parent()?.parent()?;
+    let bin_name = format!("rusty-brain{}", std::env::consts::EXE_SUFFIX);
 
+    // Prefer release for accurate benchmark results, fall back to debug.
     for profile in &["release", "debug"] {
-        let bin = workspace_root
-            .join("target")
-            .join(profile)
-            .join("rusty-brain");
+        let bin = workspace_root.join("target").join(profile).join(&bin_name);
         if bin.exists() {
             return Some(bin);
         }

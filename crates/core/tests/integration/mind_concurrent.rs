@@ -210,11 +210,14 @@ fn concurrent_16_writers_no_data_loss() {
 #[test]
 fn stale_lock_recovery_within_5_seconds() {
     let (_dir, config) = common::temp_mind_config();
-    let mind = Mind::open(config.clone()).unwrap();
+
+    // Open and close an initial Mind to create the .mv2 file.
     let lock_path = {
-        let mut p = mind.memory_path().as_os_str().to_os_string();
+        let initial = Mind::open(config.clone()).unwrap();
+        let mut p = initial.memory_path().as_os_str().to_os_string();
         p.push(".lock");
         std::path::PathBuf::from(p)
+        // `initial` is dropped here, releasing any locks.
     };
 
     // Create a stale lock file (just the file, not actually locked).
@@ -228,8 +231,10 @@ fn stale_lock_recovery_within_5_seconds() {
         .open(&lock_path)
         .unwrap();
 
-    // Verify the mind can still operate (stale lock file doesn't block).
+    // Reopen Mind after the stale lock file exists — this exercises the
+    // startup/open path recovery.
     let start = std::time::Instant::now();
+    let mind = Mind::open(config).unwrap();
     mind.remember(
         ObservationType::Discovery,
         "Read",
@@ -434,26 +439,19 @@ fn concurrent_writes_data_integrity_verified() {
         "all 12 observations should be stored"
     );
 
-    // Verify each writer's observations are searchable and have correct content.
-    let mut found: std::collections::HashMap<String, bool> = std::collections::HashMap::new();
-    for i in 0..4 {
-        let query = format!("integrity writer {i} observation");
-        let results = mind.search(&query, Some(10)).unwrap();
-        for r in &results {
-            if r.summary.contains(&format!("integrity writer {i}")) {
-                found.insert(r.summary.clone(), true);
-            }
-        }
-    }
-
-    // We should find all 12 observations across the searches.
-    assert!(
-        found.len() >= 8,
-        "should find most observations via search, found {}/12",
-        found.len()
-    );
-
-    // Verify timeline has all entries.
+    // Verify all 12 observations via timeline (deterministic, not search-dependent).
     let timeline = mind.timeline(20, false).unwrap();
     assert_eq!(timeline.len(), 12, "timeline should have 12 entries");
+
+    // Verify every writer's observations are present by checking summaries.
+    let summaries: Vec<&str> = timeline.iter().map(|e| e.summary.as_str()).collect();
+    for i in 0..4 {
+        for j in 0..3 {
+            let expected = format!("integrity writer {i} observation {j}");
+            assert!(
+                summaries.contains(&expected.as_str()),
+                "missing observation: {expected}\n  found: {summaries:?}"
+            );
+        }
+    }
 }

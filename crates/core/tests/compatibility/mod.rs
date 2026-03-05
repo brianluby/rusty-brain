@@ -65,6 +65,12 @@ pub fn assert_compatible_search(fixture_path: &Path, query: &str, expected: &[Ex
 
         // Check content match (summary should contain or match the expected content)
         assert!(
+            !actual.summary.trim().is_empty(),
+            "rank {}: empty summary for query {:?}",
+            expected_hit.rank,
+            query
+        );
+        assert!(
             actual.summary.contains(&expected_hit.content)
                 || expected_hit.content.contains(&actual.summary),
             "rank {}: content mismatch for query {:?}\n  expected to contain: {:?}\n  actual summary: {:?}",
@@ -95,6 +101,11 @@ pub fn assert_compatible_search(fixture_path: &Path, query: &str, expected: &[Ex
 /// Assert that stats from a fixture match expected values.
 #[allow(dead_code)]
 pub fn assert_compatible_stats(fixture_path: &Path, expected_observation_count: u64) {
+    assert!(
+        fixture_path.exists(),
+        "fixture file not found: {}",
+        fixture_path.display()
+    );
     let config = MindConfig {
         memory_path: fixture_path.to_path_buf(),
         ..MindConfig::default()
@@ -113,6 +124,11 @@ pub fn assert_compatible_stats(fixture_path: &Path, expected_observation_count: 
 /// Assert that timeline entries from a fixture match expected count.
 #[allow(dead_code)]
 pub fn assert_compatible_timeline(fixture_path: &Path, expected_count: usize) {
+    assert!(
+        fixture_path.exists(),
+        "fixture file not found: {}",
+        fixture_path.display()
+    );
     let config = MindConfig {
         memory_path: fixture_path.to_path_buf(),
         ..MindConfig::default()
