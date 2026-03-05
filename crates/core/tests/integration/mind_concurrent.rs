@@ -454,4 +454,21 @@ fn concurrent_writes_data_integrity_verified() {
             );
         }
     }
+
+    // Spot-check content round-trip via search for a subset of writers.
+    // (Timeline entries don't carry content, so we use search to verify
+    // the stored content payload matches what was originally written.)
+    for i in 0..2 {
+        let query = format!("unique content from writer {i}");
+        let results = mind.search(&query, Some(10)).unwrap();
+        let has_content_match = results.iter().any(|r| {
+            r.content_excerpt
+                .as_deref()
+                .is_some_and(|c| c.contains(&format!("writer {i}")))
+        });
+        assert!(
+            has_content_match,
+            "content round-trip failed for writer {i}: no matching content_excerpt in results"
+        );
+    }
 }

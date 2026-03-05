@@ -94,15 +94,28 @@ fn startup_time_at_least_2x_faster() {
     };
 
     // Warm up
-    let _ = Command::new(&binary).arg("--version").output();
+    let warmup = Command::new(&binary)
+        .arg("--version")
+        .output()
+        .expect("warmup failed");
+    assert!(
+        warmup.status.success(),
+        "warmup --version failed: {:?}",
+        warmup
+    );
 
     let iterations: u32 = 20;
     let start = std::time::Instant::now();
     for _ in 0..iterations {
-        Command::new(&binary)
+        let out = Command::new(&binary)
             .arg("--version")
             .output()
             .expect("failed to run binary");
+        assert!(
+            out.status.success(),
+            "--version returned non-zero: {:?}",
+            out.status
+        );
     }
     let elapsed = start.elapsed();
     let avg_ms = elapsed.as_secs_f64() * 1000.0 / f64::from(iterations);
