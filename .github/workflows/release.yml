@@ -1,0 +1,175 @@
+# Release workflow: builds cross-platform binaries and publishes a GitHub Release.
+# Triggered by pushing a semver tag (e.g. v0.1.0).
+
+name: Release
+
+on:
+  push:
+    tags: ['v*.*.*']
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1. Create a draft GitHub Release and extract the version string.
+  # ---------------------------------------------------------------------------
+  create-release:
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Extract and validate version
+        id: meta
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          TAG_VERSION="${TAG_REF#v}"
+          echo "version=${TAG_VERSION}" >> "$GITHUB_OUTPUT"
+
+          CARGO_VERSION=$(grep 'version = "' crates/cli/Cargo.toml | head -1 | sed 's/.*"\(.*\)".*/\1/')
+          if [ "${TAG_VERSION}" != "${CARGO_VERSION}" ]; then
+            echo "::error::Tag version (${TAG_VERSION}) does not match crates/cli/Cargo.toml version (${CARGO_VERSION})"
+            exit 1
+          fi
+          echo "Validated: tag ${TAG_VERSION} matches Cargo.toml ${CARGO_VERSION}"
+
+      - name: Create draft release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG_REF}" \
+            --draft \
+            --title "rusty-brain ${TAG_REF}" \
+            --generate-notes
+
+  # ---------------------------------------------------------------------------
+  # 2. Build release binaries for every supported target.
+  # ---------------------------------------------------------------------------
+  build-release:
+    needs: create-release
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: aarch64-unknown-linux-musl
+            runner: ubuntu-24.04
+          - target: x86_64-apple-darwin
+            runner: macos-15-intel
+          - target: aarch64-apple-darwin
+            runner: macos-14
+          - target: x86_64-pc-windows-msvc
+            runner: windows-latest
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.create-release.outputs.version }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Build with cross
+        uses: houseabsolute/actions-rust-cross@9a1618ffb70e8374ab5f48fcccea3ebeacf57971 # v1.0.5
+        with:
+          command: build
+          target: ${{ matrix.target }}
+          args: "--release -p rusty-brain -p rusty-brain-hooks"
+        env:
+          MACOSX_DEPLOYMENT_TARGET: ${{ contains(matrix.target, 'apple') && '11.0' || '' }}
+
+      # -- Unix archive & checksum ------------------------------------------------
+      - name: Package archive (Unix)
+        if: runner.os != 'Windows'
+        run: |
+          STAGING_DIR="rusty-brain-v${VERSION}-${{ matrix.target }}"
+          mkdir -p "${STAGING_DIR}"
+
+          cp "target/${{ matrix.target }}/release/rusty-brain"       "${STAGING_DIR}/"
+          cp "target/${{ matrix.target }}/release/rusty-brain-hooks" "${STAGING_DIR}/"
+          cp LICENSE   "${STAGING_DIR}/" 2>/dev/null || true
+          cp README.md "${STAGING_DIR}/" 2>/dev/null || true
+
+          tar czf "${STAGING_DIR}.tar.gz" "${STAGING_DIR}/"
+
+          if command -v shasum >/dev/null 2>&1; then
+            shasum -a 256 "${STAGING_DIR}.tar.gz" > "${STAGING_DIR}.tar.gz.sha256"
+          else
+            sha256sum "${STAGING_DIR}.tar.gz" > "${STAGING_DIR}.tar.gz.sha256"
+          fi
+
+          echo "Archive contents:"
+          tar tzf "${STAGING_DIR}.tar.gz"
+          echo "SHA-256:"
+          cat "${STAGING_DIR}.tar.gz.sha256"
+
+      - name: Upload assets (Unix)
+        if: runner.os != 'Windows'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          STAGING_DIR="rusty-brain-v${VERSION}-${{ matrix.target }}"
+          gh release upload "${TAG_REF}" \
+            "${STAGING_DIR}.tar.gz" \
+            "${STAGING_DIR}.tar.gz.sha256" \
+            --clobber
+
+      # -- Windows archive & checksum ---------------------------------------------
+      - name: Package archive (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $STAGING_DIR = "rusty-brain-v${{ env.VERSION }}-${{ matrix.target }}"
+          New-Item -ItemType Directory -Force -Path $STAGING_DIR | Out-Null
+
+          Copy-Item "target/${{ matrix.target }}/release/rusty-brain.exe"       "$STAGING_DIR/"
+          Copy-Item "target/${{ matrix.target }}/release/rusty-brain-hooks.exe" "$STAGING_DIR/"
+          if (Test-Path "LICENSE")   { Copy-Item "LICENSE"   "$STAGING_DIR/" }
+          if (Test-Path "README.md") { Copy-Item "README.md" "$STAGING_DIR/" }
+
+          tar czf "$STAGING_DIR.tar.gz" "$STAGING_DIR/"
+
+          $hash = (Get-FileHash -Algorithm SHA256 "$STAGING_DIR.tar.gz").Hash.ToLower()
+          "$hash  $STAGING_DIR.tar.gz" | Out-File -Encoding ascii "$STAGING_DIR.tar.gz.sha256"
+
+          Write-Host "SHA-256:"
+          Get-Content "$STAGING_DIR.tar.gz.sha256"
+
+      - name: Upload assets (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          $STAGING_DIR = "rusty-brain-v${{ env.VERSION }}-${{ matrix.target }}"
+          gh release upload $env:TAG_REF `
+            "$STAGING_DIR.tar.gz" `
+            "$STAGING_DIR.tar.gz.sha256" `
+            --clobber
+
+  # ---------------------------------------------------------------------------
+  # 3. Publish (undraft) the release once all builds succeed.
+  # ---------------------------------------------------------------------------
+  publish-release:
+    needs: [create-release, build-release]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4
+
+      - name: Publish release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_REF: ${{ github.ref_name }}
+        run: |
+          gh release edit "${TAG_REF}" --draft=false

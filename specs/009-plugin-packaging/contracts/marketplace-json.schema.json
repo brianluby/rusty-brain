@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Claude Code Marketplace Manifest",
+  "description": "Schema for marketplace.json used by Claude Code plugin marketplace",
+  "type": "object",
+  "required": ["name", "plugins"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Marketplace/publisher name"
+    },
+    "description": {
+      "type": "string"
+    },
+    "owner": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "url": { "type": "string", "format": "uri" }
+      },
+      "required": ["name"]
+    },
+    "plugins": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["name", "version", "source"],
+        "properties": {
+          "name": { "type": "string" },
+          "description": { "type": "string" },
+          "version": {
+            "type": "string",
+            "pattern": "^\\d+\\.\\d+\\.\\d+$"
+          },
+          "source": {
+            "type": "string",
+            "description": "Relative path to plugin root (e.g., './')"
+          }
+        }
+      }
+    }
+  }
+}

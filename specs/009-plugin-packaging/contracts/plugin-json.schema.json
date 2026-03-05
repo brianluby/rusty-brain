@@ -1,0 +1,63 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Claude Code Plugin Manifest",
+  "description": "Schema for .claude-plugin/plugin.json used by Claude Code plugin discovery",
+  "type": "object",
+  "required": ["name"],
+  "properties": {
+    "name": {
+      "type": "string",
+      "description": "Plugin identifier",
+      "const": "rusty-brain"
+    },
+    "version": {
+      "type": "string",
+      "description": "Semantic version of the plugin",
+      "pattern": "^\\d+\\.\\d+\\.\\d+$"
+    },
+    "description": {
+      "type": "string",
+      "description": "Human-readable plugin description"
+    },
+    "author": {
+      "type": "object",
+      "properties": {
+        "name": { "type": "string" },
+        "url": { "type": "string", "format": "uri" }
+      },
+      "required": ["name"]
+    },
+    "repository": {
+      "type": "string",
+      "format": "uri",
+      "description": "GitHub repository URL"
+    },
+    "homepage": {
+      "type": "string",
+      "format": "uri"
+    },
+    "license": {
+      "type": "string",
+      "description": "SPDX license identifier"
+    },
+    "keywords": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "skills": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Relative paths to skill directories (e.g., './skills/')"
+    },
+    "hooks": {
+      "type": "string",
+      "description": "Relative path to hooks.json (e.g., './hooks/hooks.json')"
+    },
+    "commands": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Relative paths to command markdown files"
+    }
+  },
+  "additionalProperties": true
+}
