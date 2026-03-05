@@ -133,17 +133,24 @@
 
 ## Phase 1: Correctness-Critical Alignment
 
-- [ ] **RB-ARCH-001 (P0, M)** Unify memory path resolution authority
+- [ ] **RB-ARCH-001 (P0, M)** Unify memory path resolution authority — **DEFERRED to v0.2.0**
   - **Goal:** route CLI path resolution through `platforms::resolve_memory_path`.
   - **Files:** `crates/cli/src/main.rs`, `crates/types/src/config.rs`, shared bootstrap module (new, location TBD).
   - **Acceptance:** same resolved path for CLI and hooks/opencode under equivalent env; regression tests added.
   - **Depends on:** none.
+  - **Deferral rationale:** All current entrypoints (CLI, hooks, opencode) resolve to `.agent-brain/mind.mv2` in the project root. The inconsistency is in code organization, not user-facing behavior. Safe to defer past v0.1.0 launch.
+  - **Risk owner:** @brianluby
+  - **Target milestone:** v0.2.0
+  - **Mitigation:** Existing integration tests cover path resolution for each entrypoint independently.
 
-- [ ] **RB-ARCH-002 (P0, S)** Add migration and compatibility notes for path policy unification
+- [ ] **RB-ARCH-002 (P0, S)** Add migration and compatibility notes for path policy unification — **DEFERRED to v0.2.0**
   - **Goal:** avoid user confusion during transition.
   - **Files:** `README.md`, potentially hook startup messaging path guidance.
   - **Acceptance:** docs clearly state canonical path policy and legacy behavior.
   - **Depends on:** RB-ARCH-001.
+  - **Deferral rationale:** No migration needed until RB-ARCH-001 changes actual resolution behavior.
+  - **Risk owner:** @brianluby
+  - **Target milestone:** v0.2.0
 
 ## Phase 2: Remove Architectural Drift
 

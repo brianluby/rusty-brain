@@ -39,8 +39,9 @@ detect_platform() {
       ;;
   esac
 
-  # On Darwin, prefer /usr/bin/uname -m for accurate Rosetta detection
-  if [ "$os" = "Darwin" ] && [ -x /usr/bin/uname ]; then
+  # On Darwin, prefer /usr/bin/uname -m for accurate Rosetta detection.
+  # In test mode, always use the (potentially mocked) uname for testability.
+  if [ "$os" = "Darwin" ] && [ "${INSTALL_SH_TESTING:-0}" != "1" ] && [ -x /usr/bin/uname ]; then
     arch="$(/usr/bin/uname -m)"
   else
     arch="$(uname -m)"

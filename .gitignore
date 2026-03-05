@@ -20,5 +20,8 @@ Thumbs.db
 .env*
 !.env.example
 
+# Runtime memory/state (never commit mutable artifacts)
+.agent-brain/
+
 # Logs
 *.log
