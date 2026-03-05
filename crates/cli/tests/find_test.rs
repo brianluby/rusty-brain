@@ -110,23 +110,29 @@ fn test_find_type_filter() {
         TestObs {
             obs_type: ObservationType::Discovery,
             tool_name: "Read".into(),
-            summary: "Found pattern in codebase".into(),
+            summary: "authentication middleware validates bearer credentials in the request pipeline".into(),
             content: None,
         },
         TestObs {
             obs_type: ObservationType::Decision,
             tool_name: "Write".into(),
-            summary: "Decided on pattern approach".into(),
+            summary: "authentication middleware decision for bearer credentials validation approach".into(),
             content: None,
         },
     ]);
 
-    let (status, stdout, _stderr) =
-        run_cli(&path, &["find", "pattern", "--type", "decision", "--json"]);
+    let (status, stdout, _stderr) = run_cli(
+        &path,
+        &["find", "authentication middleware bearer credentials", "--type", "decision", "--json"],
+    );
     assert!(status.success());
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("valid JSON");
     let results = json["results"].as_array().unwrap();
+    assert!(
+        !results.is_empty(),
+        "type-filtered search should return at least one result"
+    );
     for r in results {
         assert_eq!(r["obs_type"].as_str().unwrap(), "decision");
     }
