@@ -94,10 +94,7 @@ pub fn assert_compatible_search(fixture_path: &Path, query: &str, expected: &[Ex
 
 /// Assert that stats from a fixture match expected values.
 #[allow(dead_code)]
-pub fn assert_compatible_stats(
-    fixture_path: &Path,
-    expected_observation_count: u64,
-) {
+pub fn assert_compatible_stats(fixture_path: &Path, expected_observation_count: u64) {
     let config = MindConfig {
         memory_path: fixture_path.to_path_buf(),
         ..MindConfig::default()
@@ -115,10 +112,7 @@ pub fn assert_compatible_stats(
 
 /// Assert that timeline entries from a fixture match expected count.
 #[allow(dead_code)]
-pub fn assert_compatible_timeline(
-    fixture_path: &Path,
-    expected_count: usize,
-) {
+pub fn assert_compatible_timeline(fixture_path: &Path, expected_count: usize) {
     let config = MindConfig {
         memory_path: fixture_path.to_path_buf(),
         ..MindConfig::default()

@@ -113,7 +113,11 @@ mod tests {
     #[test]
     fn fixtures_dir_exists() {
         let dir = fixtures_dir();
-        assert!(dir.exists(), "tests/fixtures/ directory should exist at {}", dir.display());
+        assert!(
+            dir.exists(),
+            "tests/fixtures/ directory should exist at {}",
+            dir.display()
+        );
     }
 
     #[test]

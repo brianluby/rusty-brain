@@ -46,6 +46,26 @@ path = "tests/compatibility_smoke.rs"
 name = "generate_fixtures"
 path = "tests/generate_fixtures.rs"
 
+[[test]]
+name = "search_compat_test"
+path = "tests/search_compat_test.rs"
+
+[[test]]
+name = "timeline_compat_test"
+path = "tests/timeline_compat_test.rs"
+
+[[test]]
+name = "stats_compat_test"
+path = "tests/stats_compat_test.rs"
+
+[[test]]
+name = "format_compat_test"
+path = "tests/format_compat_test.rs"
+
+[[test]]
+name = "unknown_fields_test"
+path = "tests/unknown_fields_test.rs"
+
 [[bench]]
 name = "store"
 harness = false

@@ -42,16 +42,80 @@ fn generate_small_fixture(dir: &Path) {
     let mind = create_mind(&path);
 
     let observations = [
-        (ObservationType::Discovery, "Read", "Found caching pattern in user service layer", Some("The UserService uses LRU cache with 5-minute TTL for user lookups to reduce database load")),
-        (ObservationType::Decision, "Write", "Chose PostgreSQL for persistent user data storage", Some("Evaluated SQLite, PostgreSQL, and MySQL. PostgreSQL selected for JSONB support and concurrent write handling")),
-        (ObservationType::Success, "Bash", "Completed database migration to version three successfully", None),
-        (ObservationType::Problem, "Read", "Race condition found in session cleanup background task", Some("Multiple agents writing to the same session file without proper file locking causes data corruption")),
-        (ObservationType::Discovery, "Glob", "Authentication middleware validates JWT bearer tokens", Some("Middleware extracts JWT from Authorization header and validates against RSA public key")),
-        (ObservationType::Decision, "Write", "Selected async runtime for all background processing tasks", Some("Using tokio spawn for background database writes to avoid blocking the main thread")),
-        (ObservationType::Success, "Bash", "All integration tests passing after database refactoring work", None),
-        (ObservationType::Problem, "Read", "Memory leak detected in connection pool management code", Some("Connection pool grows unbounded when connections fail to return due to timeout handling bug")),
-        (ObservationType::Discovery, "Read", "Error handling uses structured error codes throughout codebase", Some("All errors implement thiserror with machine-parseable error codes following E-XXXX format")),
-        (ObservationType::Decision, "Write", "Implemented retry logic with exponential backoff strategy", Some("Three retries with 100ms, 200ms, 400ms delays for transient network failures")),
+        (
+            ObservationType::Discovery,
+            "Read",
+            "Found caching pattern in user service layer",
+            Some(
+                "The UserService uses LRU cache with 5-minute TTL for user lookups to reduce database load",
+            ),
+        ),
+        (
+            ObservationType::Decision,
+            "Write",
+            "Chose PostgreSQL for persistent user data storage",
+            Some(
+                "Evaluated SQLite, PostgreSQL, and MySQL. PostgreSQL selected for JSONB support and concurrent write handling",
+            ),
+        ),
+        (
+            ObservationType::Success,
+            "Bash",
+            "Completed database migration to version three successfully",
+            None,
+        ),
+        (
+            ObservationType::Problem,
+            "Read",
+            "Race condition found in session cleanup background task",
+            Some(
+                "Multiple agents writing to the same session file without proper file locking causes data corruption",
+            ),
+        ),
+        (
+            ObservationType::Discovery,
+            "Glob",
+            "Authentication middleware validates JWT bearer tokens",
+            Some(
+                "Middleware extracts JWT from Authorization header and validates against RSA public key",
+            ),
+        ),
+        (
+            ObservationType::Decision,
+            "Write",
+            "Selected async runtime for all background processing tasks",
+            Some(
+                "Using tokio spawn for background database writes to avoid blocking the main thread",
+            ),
+        ),
+        (
+            ObservationType::Success,
+            "Bash",
+            "All integration tests passing after database refactoring work",
+            None,
+        ),
+        (
+            ObservationType::Problem,
+            "Read",
+            "Memory leak detected in connection pool management code",
+            Some(
+                "Connection pool grows unbounded when connections fail to return due to timeout handling bug",
+            ),
+        ),
+        (
+            ObservationType::Discovery,
+            "Read",
+            "Error handling uses structured error codes throughout codebase",
+            Some(
+                "All errors implement thiserror with machine-parseable error codes following E-XXXX format",
+            ),
+        ),
+        (
+            ObservationType::Decision,
+            "Write",
+            "Implemented retry logic with exponential backoff strategy",
+            Some("Three retries with 100ms, 200ms, 400ms delays for transient network failures"),
+        ),
     ];
 
     for (obs_type, tool, summary, content) in &observations {
@@ -135,12 +199,29 @@ fn generate_edge_cases_fixture(dir: &Path) {
 
     let long_summary = "A".repeat(5000);
     let cases: Vec<(&str, Option<&str>)> = vec![
-        ("Unicode: emoji and CJK characters in observation summary content", Some("Content with emoji: \u{1f600}\u{1f680}\u{2764}\u{fe0f} and CJK: \u{4f60}\u{597d}\u{4e16}\u{754c}")),
+        (
+            "Unicode: emoji and CJK characters in observation summary content",
+            Some(
+                "Content with emoji: \u{1f600}\u{1f680}\u{2764}\u{fe0f} and CJK: \u{4f60}\u{597d}\u{4e16}\u{754c}",
+            ),
+        ),
         ("Empty summary edge case placeholder", None),
-        (&long_summary, Some("Very long summary observation for stress testing the search indexing")),
-        ("Special chars: <script>alert('xss')</script> & \"quotes\" 'apos'", Some("Content with <html> tags and &amp; entities")),
-        ("Newlines in summary\nshould be handled\ngracefully", Some("Content\nwith\nmultiple\nnewlines")),
-        ("   Leading and trailing whitespace   ", Some("   Whitespace content   ")),
+        (
+            &long_summary,
+            Some("Very long summary observation for stress testing the search indexing"),
+        ),
+        (
+            "Special chars: <script>alert('xss')</script> & \"quotes\" 'apos'",
+            Some("Content with <html> tags and &amp; entities"),
+        ),
+        (
+            "Newlines in summary\nshould be handled\ngracefully",
+            Some("Content\nwith\nmultiple\nnewlines"),
+        ),
+        (
+            "   Leading and trailing whitespace   ",
+            Some("   Whitespace content   "),
+        ),
     ];
 
     for (summary, content) in &cases {
@@ -174,7 +255,11 @@ fn generate_expected_results(dir: &Path) {
     let mind = Mind::open(config).expect("failed to open fixture");
 
     // Run reference queries and capture results
-    let queries = ["caching pattern user service", "authentication JWT bearer token", "database migration"];
+    let queries = [
+        "caching pattern user service",
+        "authentication JWT bearer token",
+        "database migration",
+    ];
     let mut results_json = Vec::new();
 
     for query in &queries {

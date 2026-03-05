@@ -118,29 +118,29 @@
 
 ### Compatibility tests
 
-- [ ] T037 [P] [US2] Create search compatibility test in `crates/core/tests/compatibility/search_compat_test.rs` — load each fixture (small, medium, edge_cases), run queries from expected_results.json, assert same result set and ordering with ±0.01 score tolerance per FR-013
-- [ ] T038 [P] [US2] Create timeline compatibility test in `crates/core/tests/compatibility/timeline_compat_test.rs` — load fixtures, verify timeline output matches TypeScript reference
-- [ ] T039 [P] [US2] Create stats compatibility test in `crates/core/tests/compatibility/stats_compat_test.rs` — load fixtures, verify stats (observation count, memory size, etc.) match TypeScript reference
-- [ ] T040 [P] [US2] Create `.mv2` format read/write round-trip test in `crates/core/tests/compatibility/format_compat_test.rs` — write observations with Rust, read with Rust, verify identical to TypeScript-written data per FR-009
+- [x] T037 [P] [US2] Create search compatibility test in `crates/core/tests/compatibility/search_compat_test.rs` — load each fixture (small, medium, edge_cases), run queries from expected_results.json, assert same result set and ordering with ±0.01 score tolerance per FR-013
+- [x] T038 [P] [US2] Create timeline compatibility test in `crates/core/tests/compatibility/timeline_compat_test.rs` — load fixtures, verify timeline output matches TypeScript reference
+- [x] T039 [P] [US2] Create stats compatibility test in `crates/core/tests/compatibility/stats_compat_test.rs` — load fixtures, verify stats (observation count, memory size, etc.) match TypeScript reference
+- [x] T040 [P] [US2] Create `.mv2` format read/write round-trip test in `crates/core/tests/compatibility/format_compat_test.rs` — write observations with Rust, read with Rust, verify identical to TypeScript-written data per FR-009
 
 ### Environment variable tests
 
-- [ ] T041 [P] [US2] Create env var compatibility tests in `crates/hooks/tests/env_compat_test.rs` — test all 6 env vars (MEMVID_PLATFORM, MEMVID_MIND_DEBUG, MEMVID_PLATFORM_MEMORY_PATH, MEMVID_PLATFORM_PATH_OPT_IN, CLAUDE_PROJECT_DIR, OPENCODE_PROJECT_DIR) with valid, invalid, and unset values per Contract 6
-- [ ] T042 [P] [US2] Create env var compatibility tests for opencode in `crates/opencode/tests/env_compat_test.rs` — test OPENCODE_PROJECT_DIR and MEMVID_PLATFORM with opencode-specific behavior
+- [x] T041 [P] [US2] Create env var compatibility tests in `crates/hooks/tests/env_compat_test.rs` — test all 6 env vars (MEMVID_PLATFORM, MEMVID_MIND_DEBUG, MEMVID_PLATFORM_MEMORY_PATH, MEMVID_PLATFORM_PATH_OPT_IN, CLAUDE_PROJECT_DIR, OPENCODE_PROJECT_DIR) with valid, invalid, and unset values per Contract 6
+- [x] T042 [P] [US2] Create env var compatibility tests for opencode in `crates/opencode/tests/env_compat_test.rs` — test OPENCODE_PROJECT_DIR and MEMVID_PLATFORM with opencode-specific behavior
 
 ### Directory layout test
 
-- [ ] T043 [US2] Create directory layout assertion test in `crates/hooks/tests/layout_compat_test.rs` — verify `.agent-brain/` structure matches TypeScript: `mind.mv2`, `.dedup-cache.json`, `.install-version` per FR-011
+- [x] T043 [US2] Create directory layout assertion test in `crates/hooks/tests/layout_compat_test.rs` — verify `.agent-brain/` structure matches TypeScript: `mind.mv2`, `.dedup-cache.json`, `.install-version` per FR-011
 
 ### Edge case tests
 
-- [ ] T044 [P] [US2] Create unknown fields resilience test in `crates/core/tests/compatibility/unknown_fields_test.rs` — test reading `.mv2` with extra unknown fields (simulating newer TS version), verify known fields read correctly and unknowns ignored gracefully
-- [ ] T045 [P] [US2] Create invalid env var test in `crates/hooks/tests/invalid_env_test.rs` — test `MEMVID_PLATFORM=nonexistent` returns clear structured error
-- [ ] T046 [P] [US2] Create permissions error test in `crates/hooks/tests/permissions_test.rs` — test `.agent-brain/` with restricted permissions returns meaningful error
+- [x] T044 [P] [US2] Create unknown fields resilience test in `crates/core/tests/compatibility/unknown_fields_test.rs` — test reading `.mv2` with extra unknown fields (simulating newer TS version), verify known fields read correctly and unknowns ignored gracefully
+- [x] T045 [P] [US2] Create invalid env var test in `crates/hooks/tests/invalid_env_test.rs` — test `MEMVID_PLATFORM=nonexistent` returns clear structured error
+- [x] T046 [P] [US2] Create permissions error test in `crates/hooks/tests/permissions_test.rs` — test `.agent-brain/` with restricted permissions returns meaningful error
 
 ### Plugin.json update
 
-- [ ] T047 [US2] Update `plugin.json` hook paths from `dist/hooks/*.js` to Rust binary paths per FR-014; verify structure in a test
+- [x] T047 [US2] Update `plugin.json` hook paths from `dist/hooks/*.js` to Rust binary paths per FR-014; verify structure in a test
 
 **Checkpoint**: US2 complete — TypeScript `.mv2` fixtures produce identical results, all env vars honored, directory layout matches, plugin.json updated
 

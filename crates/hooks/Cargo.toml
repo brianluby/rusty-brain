@@ -30,6 +30,7 @@ tempfile = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 criterion = { workspace = true }
+temp-env = { workspace = true }
 
 [[bench]]
 name = "hooks_bench"

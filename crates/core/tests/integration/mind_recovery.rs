@@ -43,7 +43,9 @@ fn corrupted_file_is_backed_up_and_recovered() {
         None,
     )
     .unwrap();
-    let results = mind.search("corruption recovery validates data integrity", None).unwrap();
+    let results = mind
+        .search("corruption recovery validates data integrity", None)
+        .unwrap();
     assert!(!results.is_empty(), "search should work after recovery");
 }
 
