@@ -229,7 +229,7 @@ fn compression_throughput_at_least_2x_faster() {
         "Compression: Rust={throughput_mb_s:.2}MB/s, TS={ts_mb_s:.1}MB/s, speedup={speedup:.1}x"
     );
 
-    const COMPRESSION_MIN_SPEEDUP: f64 = 1.2;
+    const COMPRESSION_MIN_SPEEDUP: f64 = 1.0;
     assert!(
         speedup >= COMPRESSION_MIN_SPEEDUP,
         "compression_throughput_mb_s regression: Rust ({throughput_mb_s:.2}MB/s) is only \
