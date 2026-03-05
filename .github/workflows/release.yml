@@ -160,7 +160,7 @@ jobs:
           if (Test-Path "LICENSE")   { Copy-Item "LICENSE"   "$STAGING_DIR/" }
           if (Test-Path "README.md") { Copy-Item "README.md" "$STAGING_DIR/" }
 
-          tar czf "$STAGING_DIR.tar.gz" "$STAGING_DIR/"
+          tar czf "$STAGING_DIR.tar.gz" "$STAGING_DIR"
 
           $hash = (Get-FileHash -Algorithm SHA256 "$STAGING_DIR.tar.gz").Hash.ToLower()
           "$hash  $STAGING_DIR.tar.gz" | Out-File -Encoding ascii "$STAGING_DIR.tar.gz.sha256"
