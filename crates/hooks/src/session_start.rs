@@ -1,3 +1,4 @@
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::bootstrap;
@@ -45,10 +46,13 @@ pub fn handle_session_start(input: &HookInput) -> Result<HookOutput, HookError> 
     // Format system message
     let mut message = format_system_message(&ctx, &stats, &memory_path);
 
-    // Check for legacy memory path (constant and message owned by path_policy)
-    let legacy_path = cwd.join(platforms::LEGACY_CLAUDE_MEMORY_PATH);
-    if legacy_path.exists() {
-        message.push_str(&platforms::format_legacy_path_warning(&memory_path));
+    // Check for legacy memory path and emit diagnostic
+    if let Some(diag) = bootstrap::detect_legacy_path(cwd) {
+        let label = match diag.level {
+            bootstrap::DiagnosticLevel::Warning => "Warning",
+            bootstrap::DiagnosticLevel::Info => "Info",
+        };
+        let _ = write!(message, "\n**{label}:** {}\n", diag.message);
     }
 
     Ok(HookOutput {

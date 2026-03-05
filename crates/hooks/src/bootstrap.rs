@@ -6,6 +6,74 @@ use types::hooks::HookInput;
 
 use crate::error::HookError;
 
+/// Severity level for lightweight hook diagnostics.
+///
+/// This is distinct from `types::DiagnosticSeverity` / `types::DiagnosticRecord`
+/// which are heavier, persisted records with retention and redaction. This enum
+/// is for transient, in-memory diagnostics returned by helper functions like
+/// `detect_legacy_path`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DiagnosticLevel {
+    /// Warning diagnostic — action may be needed.
+    Warning,
+    /// Informational diagnostic — no action required.
+    Info,
+}
+
+/// A lightweight, transient diagnostic message.
+///
+/// Used for in-memory hook diagnostics (e.g. legacy path warnings) that are
+/// surfaced in structured output but not persisted to storage.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    /// The severity level of this diagnostic.
+    pub level: DiagnosticLevel,
+    /// A human-readable message describing the diagnostic.
+    pub message: String,
+}
+
+/// Detect legacy `.claude/mind.mv2` path and return a diagnostic if applicable.
+///
+/// # Behavior
+///
+/// - If `.claude/mind.mv2` exists AND `.agent-brain/mind.mv2` does **not** exist:
+///   returns `Some(Diagnostic::Warning)` with a migration suggestion.
+/// - If **both** paths exist: returns `Some(Diagnostic::Warning)` noting the
+///   duplicate; the caller should use `.agent-brain/mind.mv2`.
+/// - If only `.agent-brain/mind.mv2` exists (or neither): returns `None`.
+///
+/// Does NOT perform any writes — purely diagnostic.
+#[must_use]
+pub fn detect_legacy_path(project_root: &Path) -> Option<Diagnostic> {
+    let legacy = project_root.join(platforms::LEGACY_CLAUDE_MEMORY_PATH);
+    let canonical = project_root.join(".agent-brain/mind.mv2");
+
+    let legacy_exists = legacy.exists();
+    let canonical_exists = canonical.exists();
+
+    match (legacy_exists, canonical_exists) {
+        (true, false) => Some(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "Legacy memory file found at `{}`. Migrate to `{}` for the current Rust engine.",
+                platforms::LEGACY_CLAUDE_MEMORY_PATH,
+                ".agent-brain/mind.mv2"
+            ),
+        }),
+        (true, true) => Some(Diagnostic {
+            level: DiagnosticLevel::Warning,
+            message: format!(
+                "Duplicate memory files detected: both `{}` and `{}` exist. \
+                 Using `{}`. Consider removing the legacy file.",
+                platforms::LEGACY_CLAUDE_MEMORY_PATH,
+                ".agent-brain/mind.mv2",
+                ".agent-brain/mind.mv2"
+            ),
+        }),
+        _ => None,
+    }
+}
+
 fn platform_opt_in() -> bool {
     std::env::var("MEMVID_PLATFORM_PATH_OPT_IN").is_ok_and(|v| v == "1")
 }
@@ -203,5 +271,101 @@ mod tests {
         // `platform_opt_in` reads `MEMVID_PLATFORM_PATH_OPT_IN` env var.
         // We simply verify it returns without panicking.
         let _result: bool = platform_opt_in();
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_legacy_path (Contract 4, T067-T069)
+    // -----------------------------------------------------------------------
+
+    /// T067: Legacy-only scenario — `.claude/mind.mv2` exists,
+    /// `.agent-brain/mind.mv2` does not → Warning with migration suggestion.
+    #[test]
+    fn detect_legacy_path_legacy_only_returns_warning() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let legacy_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("mind.mv2"), b"fake mv2").unwrap();
+
+        let result = detect_legacy_path(tmp.path());
+
+        assert!(
+            result.is_some(),
+            "should return a diagnostic for legacy-only"
+        );
+        let diag = result.unwrap();
+        assert_eq!(diag.level, DiagnosticLevel::Warning);
+        assert!(
+            diag.message.contains(".claude/mind.mv2"),
+            "message should mention legacy path, got: {}",
+            diag.message
+        );
+        assert!(
+            diag.message.contains("igrat"),
+            "message should suggest migration, got: {}",
+            diag.message
+        );
+    }
+
+    /// T068: Both-exist scenario — both `.claude/mind.mv2` and
+    /// `.agent-brain/mind.mv2` exist → Warning about duplicate.
+    #[test]
+    fn detect_legacy_path_both_exist_returns_duplicate_warning() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        // Create legacy path
+        let legacy_dir = tmp.path().join(".claude");
+        std::fs::create_dir_all(&legacy_dir).unwrap();
+        std::fs::write(legacy_dir.join("mind.mv2"), b"fake mv2").unwrap();
+        // Create canonical path
+        let canonical_dir = tmp.path().join(".agent-brain");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(canonical_dir.join("mind.mv2"), b"fake mv2").unwrap();
+
+        let result = detect_legacy_path(tmp.path());
+
+        assert!(
+            result.is_some(),
+            "should return a diagnostic when both exist"
+        );
+        let diag = result.unwrap();
+        assert_eq!(diag.level, DiagnosticLevel::Warning);
+        assert!(
+            diag.message.contains("uplicate") || diag.message.contains("both"),
+            "message should mention duplicate/both, got: {}",
+            diag.message
+        );
+        assert!(
+            diag.message.contains(".agent-brain/mind.mv2"),
+            "message should mention canonical path, got: {}",
+            diag.message
+        );
+    }
+
+    /// T069: Normal scenario — only `.agent-brain/mind.mv2` exists → None.
+    #[test]
+    fn detect_legacy_path_canonical_only_returns_none() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+        let canonical_dir = tmp.path().join(".agent-brain");
+        std::fs::create_dir_all(&canonical_dir).unwrap();
+        std::fs::write(canonical_dir.join("mind.mv2"), b"fake mv2").unwrap();
+
+        let result = detect_legacy_path(tmp.path());
+
+        assert!(
+            result.is_none(),
+            "should return None when only canonical path exists"
+        );
+    }
+
+    /// Additional: Neither path exists → None.
+    #[test]
+    fn detect_legacy_path_neither_exists_returns_none() {
+        let tmp = tempfile::tempdir().expect("failed to create temp dir");
+
+        let result = detect_legacy_path(tmp.path());
+
+        assert!(
+            result.is_none(),
+            "should return None when neither path exists"
+        );
     }
 }

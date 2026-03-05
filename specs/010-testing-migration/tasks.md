@@ -173,12 +173,12 @@
 
 **Covers**: FR-005, FR-008, SC-004
 
-- [ ] T054 [P] [US4] Enhance query latency benchmark in `crates/core/benches/search.rs` — add baseline comparison logic that loads ts_baselines.json and asserts Rust latency ≤ TypeScript / 2.0
-- [ ] T055 [P] [US4] Enhance compression throughput benchmark in `crates/compression/benches/compress_bench.rs` — add baseline comparison logic that asserts Rust throughput ≥ TypeScript × 2.0
-- [ ] T056 [P] [US4] Create startup time benchmark in `crates/cli/benches/startup_bench.rs` — measure cold start to first command ready, compare against ts_baselines.json startup_time_ms
-- [ ] T057 [P] [US4] Enhance store benchmark in `crates/core/benches/store.rs` — add write throughput baseline comparison
-- [ ] T058 [P] [US4] Enhance context assembly benchmark in `crates/core/benches/context.rs` — add context build time baseline comparison
-- [ ] T059 [US4] Create benchmark summary report script or test that loads all criterion results and ts_baselines.json, outputs pass/fail for each metric with actual speedup factors, in `crates/cli/tests/bench_regression_test.rs`
+- [x] T054 [P] [US4] Enhance query latency benchmark in `crates/core/benches/search.rs` — add baseline comparison logic that loads ts_baselines.json and asserts Rust latency ≤ TypeScript / 2.0
+- [x] T055 [P] [US4] Enhance compression throughput benchmark in `crates/compression/benches/compress_bench.rs` — add baseline comparison logic that asserts Rust throughput ≥ TypeScript × 2.0
+- [x] T056 [P] [US4] Create startup time benchmark in `crates/cli/benches/startup_bench.rs` — measure cold start to first command ready, compare against ts_baselines.json startup_time_ms
+- [x] T057 [P] [US4] Enhance store benchmark in `crates/core/benches/store.rs` — add write throughput baseline comparison
+- [x] T058 [P] [US4] Enhance context assembly benchmark in `crates/core/benches/context.rs` — add context build time baseline comparison
+- [x] T059 [US4] Create benchmark summary report script or test that loads all criterion results and ts_baselines.json, outputs pass/fail for each metric with actual speedup factors, in `crates/cli/tests/bench_regression_test.rs`
 
 **Checkpoint**: US4 complete — all benchmarks show ≥2× speedup, regression gate logic in place
 
@@ -192,13 +192,13 @@
 
 **Covers**: FR-007, SC-006
 
-- [ ] T060 [P] [US5] Initialize cargo-fuzz for compression crate and create compression fuzz harness in `crates/compression/fuzz/fuzz_targets/compression_fuzz.rs` — feeds arbitrary bytes to `compress()`, verifies Ok or structured Err, never panic per Contract 3
-- [ ] T061 [P] [US5] Create seed corpus for compression fuzzer in `crates/compression/fuzz/corpus/compression_fuzz/` — include valid tool output samples (Read, Bash, Glob results), empty input, very large input, binary data
-- [ ] T062 [P] [US5] Initialize cargo-fuzz for hooks crate and create hook JSON fuzz harness in `crates/hooks/fuzz/fuzz_targets/hook_json_fuzz.rs` — feeds arbitrary bytes to hook JSON parser, verifies no panic
-- [ ] T063 [P] [US5] Create seed corpus for hook JSON fuzzer in `crates/hooks/fuzz/corpus/hook_json_fuzz/` — include valid hook JSON payloads (session_start, post_tool_use, stop), malformed JSON, truncated input
-- [ ] T064 [P] [US5] Initialize cargo-fuzz for core crate and create search query fuzz harness in `crates/core/fuzz/fuzz_targets/search_query_fuzz.rs` — feeds arbitrary bytes as search query strings, verifies empty results or structured error, never crash
-- [ ] T065 [P] [US5] Create seed corpus for search query fuzzer in `crates/core/fuzz/corpus/search_query_fuzz/` — include valid queries, unicode, SQL injection patterns, very long strings, null bytes
-- [ ] T066 [US5] Run all 3 fuzz harnesses for 60 seconds each and verify 0 panics; document any crash artifacts in `crates/<name>/fuzz/artifacts/` and add as regression tests
+- [x] T060 [P] [US5] Initialize cargo-fuzz for compression crate and create compression fuzz harness in `crates/compression/fuzz/fuzz_targets/compression_fuzz.rs` — feeds arbitrary bytes to `compress()`, verifies Ok or structured Err, never panic per Contract 3
+- [x] T061 [P] [US5] Create seed corpus for compression fuzzer in `crates/compression/fuzz/corpus/compression_fuzz/` — include valid tool output samples (Read, Bash, Glob results), empty input, very large input, binary data
+- [x] T062 [P] [US5] Initialize cargo-fuzz for hooks crate and create hook JSON fuzz harness in `crates/hooks/fuzz/fuzz_targets/hook_json_fuzz.rs` — feeds arbitrary bytes to hook JSON parser, verifies no panic
+- [x] T063 [P] [US5] Create seed corpus for hook JSON fuzzer in `crates/hooks/fuzz/corpus/hook_json_fuzz/` — include valid hook JSON payloads (session_start, post_tool_use, stop), malformed JSON, truncated input
+- [x] T064 [P] [US5] Initialize cargo-fuzz for core crate and create search query fuzz harness in `crates/core/fuzz/fuzz_targets/search_query_fuzz.rs` — feeds arbitrary bytes as search query strings, verifies empty results or structured error, never crash
+- [x] T065 [P] [US5] Create seed corpus for search query fuzzer in `crates/core/fuzz/corpus/search_query_fuzz/` — include valid queries, unicode, SQL injection patterns, very long strings, null bytes
+- [ ] T066 [US5] Run all 3 fuzz harnesses for 60 seconds each and verify 0 panics; document any crash artifacts in `crates/<name>/fuzz/artifacts/` and add as regression tests (DEFERRED: requires nightly Rust)
 
 **Checkpoint**: US5 complete — 3 harnesses run 60s each with no panics, seed corpora committed
 
@@ -212,12 +212,12 @@
 
 **Covers**: FR-012, SC-009
 
-- [ ] T067 [US6] Add unit test for legacy-only scenario in `crates/hooks/src/bootstrap.rs` — `.claude/mind.mv2` exists, `.agent-brain/mind.mv2` does not → returns Diagnostic::Warning with migration suggestion (test-first: write failing test)
-- [ ] T068 [US6] Add unit test for both-exist scenario in `crates/hooks/src/bootstrap.rs` — both paths exist → uses `.agent-brain/mind.mv2`, returns Diagnostic::Warning about duplicate (test-first)
-- [ ] T069 [US6] Add unit test for normal scenario in `crates/hooks/src/bootstrap.rs` — only `.agent-brain/mind.mv2` exists → returns None (no diagnostic) (test-first)
-- [ ] T070 [US6] Implement `detect_legacy_path()` function in `crates/hooks/src/bootstrap.rs` — check for `.claude/mind.mv2` relative to project root, return `Option<Diagnostic>` per Contract 4 (make T067-T069 pass)
-- [ ] T071 [US6] Wire `detect_legacy_path()` into hook startup paths (session_start, post_tool_use) so diagnostic is emitted at startup in `crates/hooks/src/session_start.rs` and `crates/hooks/src/post_tool_use.rs`
-- [ ] T072 [US6] Add integration test for legacy detection in `crates/hooks/tests/legacy_path_test.rs` — create temp directory with `.claude/mind.mv2`, run hook entry point, verify structured diagnostic in output
+- [x] T067 [US6] Add unit test for legacy-only scenario in `crates/hooks/src/bootstrap.rs` — `.claude/mind.mv2` exists, `.agent-brain/mind.mv2` does not → returns Diagnostic::Warning with migration suggestion (test-first: write failing test)
+- [x] T068 [US6] Add unit test for both-exist scenario in `crates/hooks/src/bootstrap.rs` — both paths exist → uses `.agent-brain/mind.mv2`, returns Diagnostic::Warning about duplicate (test-first)
+- [x] T069 [US6] Add unit test for normal scenario in `crates/hooks/src/bootstrap.rs` — only `.agent-brain/mind.mv2` exists → returns None (no diagnostic) (test-first)
+- [x] T070 [US6] Implement `detect_legacy_path()` function in `crates/hooks/src/bootstrap.rs` — check for `.claude/mind.mv2` relative to project root, return `Option<Diagnostic>` per Contract 4 (make T067-T069 pass)
+- [x] T071 [US6] Wire `detect_legacy_path()` into hook startup paths (session_start, post_tool_use) so diagnostic is emitted at startup in `crates/hooks/src/session_start.rs` and `crates/hooks/src/post_tool_use.rs`
+- [x] T072 [US6] Add integration test for legacy detection in `crates/hooks/tests/legacy_path_test.rs` — create temp directory with `.claude/mind.mv2`, run hook entry point, verify structured diagnostic in output
 
 **Checkpoint**: US6 complete — legacy path detected, structured diagnostic emitted, all 3 scenarios tested
 

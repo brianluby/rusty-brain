@@ -1,0 +1,9 @@
+{
+  "session_id": "sess_abc123def456",
+  "transcript_path": "/tmp/claude/transcript.jsonl",
+  "cwd": "/home/user/project",
+  "permission_mode": "default",
+  "hook_event_name": "Stop",
+  "stop_hook_active": true,
+  "last_assistant_message": "I've completed the refactoring of the authentication module. The changes include:\n1. Extracted JWT validation into a separate module\n2. Added refresh token support\n3. Updated all tests to pass"
+}

@@ -1,0 +1,22 @@
+$ cargo test --lib
+   Compiling types v0.1.0 (/workspace/crates/types)
+   Compiling compression v0.1.0 (/workspace/crates/compression)
+   Compiling rusty-brain-core v0.1.0 (/workspace/crates/core)
+    Finished test [unoptimized + debuginfo] target(s) in 4.32s
+     Running unittests src/lib.rs (target/debug/deps/compression-abc123)
+
+running 24 tests
+test bash::tests::compress_cargo_build ... ok
+test bash::tests::compress_empty_output ... ok
+test bash::tests::compress_git_status ... ok
+test config::tests::default_config ... ok
+test config::tests::validate_threshold ... ok
+test edit::tests::compress_diff ... ok
+test generic::tests::compress_large ... ok
+test glob::tests::compress_file_list ... ok
+test grep::tests::compress_search_results ... ok
+test read::tests::compress_source_file ... ok
+test truncate::tests::enforce_budget_basic ... ok
+test truncate::tests::enforce_budget_empty ... ok
+
+test result: ok. 24 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.02s

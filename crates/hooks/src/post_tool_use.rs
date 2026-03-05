@@ -28,6 +28,18 @@ pub fn handle_post_tool_use(input: &HookInput) -> Result<HookOutput, HookError> 
         });
     }
 
+    // Emit legacy path diagnostic (best-effort, non-blocking)
+    if let Some(diag) = bootstrap::detect_legacy_path(cwd) {
+        match diag.level {
+            bootstrap::DiagnosticLevel::Warning => {
+                tracing::warn!(diagnostic = %diag.message, "legacy path detected");
+            }
+            bootstrap::DiagnosticLevel::Info => {
+                tracing::info!(diagnostic = %diag.message, "legacy path info");
+            }
+        }
+    }
+
     let tool_name = input.tool_name.as_deref().unwrap_or("unknown");
     let tool_input = input.tool_input.as_ref();
     let tool_response = input.tool_response.as_ref();

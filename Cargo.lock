@@ -2071,6 +2071,8 @@ dependencies = [
  "chrono",
  "clap",
  "comfy-table",
+ "compression",
+ "criterion",
  "fs2",
  "opencode",
  "platforms",

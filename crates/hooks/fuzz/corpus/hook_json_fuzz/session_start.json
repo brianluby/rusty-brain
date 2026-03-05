@@ -1,0 +1,10 @@
+{
+  "session_id": "sess_abc123def456",
+  "transcript_path": "/tmp/claude/transcript.jsonl",
+  "cwd": "/home/user/project",
+  "permission_mode": "default",
+  "hook_event_name": "SessionStart",
+  "source": "startup",
+  "model": "claude-sonnet-4-20250514",
+  "prompt": "Help me refactor the authentication module"
+}

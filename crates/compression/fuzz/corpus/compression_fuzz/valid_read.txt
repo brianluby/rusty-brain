@@ -1,0 +1,24 @@
+     1	use std::collections::HashMap;
+     2	use serde::{Deserialize, Serialize};
+     3
+     4	#[derive(Debug, Clone, Serialize, Deserialize)]
+     5	pub struct Config {
+     6	    pub name: String,
+     7	    pub version: String,
+     8	    pub settings: HashMap<String, String>,
+     9	}
+    10
+    11	impl Config {
+    12	    pub fn new(name: &str) -> Self {
+    13	        Self {
+    14	            name: name.to_string(),
+    15	            version: "1.0.0".to_string(),
+    16	            settings: HashMap::new(),
+    17	        }
+    18	    }
+    19
+    20	    pub fn with_setting(mut self, key: &str, value: &str) -> Self {
+    21	        self.settings.insert(key.to_string(), value.to_string());
+    22	        self
+    23	    }
+    24	}
