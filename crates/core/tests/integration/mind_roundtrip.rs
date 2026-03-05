@@ -233,3 +233,58 @@ fn open_read_only_dir_returns_error() {
 // T070 (file-deleted-between-operations) is deferred — it requires
 // Mind to detect and recreate the .mv2 file, which is not yet implemented.
 // The current Mind design doesn't re-validate the file on each operation.
+
+// =========================================================================
+// FR-002: Cross-crate remember → search → getContext cycle
+// =========================================================================
+
+#[test]
+fn full_remember_search_get_context_cycle() {
+    let (_dir, config) = common::temp_mind_config();
+    let mind = Mind::open(config).unwrap();
+
+    // Step 1: Remember diverse observations
+    mind.remember(
+        ObservationType::Discovery,
+        "Read",
+        "Found authentication middleware pattern using JWT bearer tokens",
+        Some("The middleware validates JWTs from the Authorization header"),
+        None,
+    )
+    .unwrap();
+    mind.remember(
+        ObservationType::Decision,
+        "Write",
+        "Selected PostgreSQL database for persistent storage of user profiles",
+        Some("Evaluated SQLite and PostgreSQL; chose PG for JSONB and concurrency"),
+        None,
+    )
+    .unwrap();
+
+    // Step 2: Search should find relevant results
+    let results = mind
+        .search("authentication middleware JWT bearer", None)
+        .unwrap();
+    assert!(
+        !results.is_empty(),
+        "search should find authentication observation"
+    );
+    assert_eq!(results[0].obs_type, ObservationType::Discovery);
+    assert!(results[0].summary.contains("authentication"));
+
+    // Step 3: getContext should include recent observations
+    let ctx = mind.get_context(Some("authentication middleware")).unwrap();
+    assert!(ctx.token_count > 0, "context should have non-zero tokens");
+    assert!(
+        !ctx.recent_observations.is_empty(),
+        "context should include recent observations"
+    );
+
+    // Step 4: Stats should reflect stored observations
+    let stats = mind.stats().unwrap();
+    assert_eq!(stats.total_observations, 2);
+
+    // Step 5: Timeline should show both entries
+    let timeline = mind.timeline(10, false).unwrap();
+    assert_eq!(timeline.len(), 2, "timeline should have 2 entries");
+}

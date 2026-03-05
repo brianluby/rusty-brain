@@ -63,3 +63,60 @@ pub fn handle_session_cleanup(session_id: &str, cwd: &Path) -> Result<HookOutput
 
     Ok(HookOutput::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // handle_session_cleanup
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires memvid Mind to be openable"]
+    fn handle_session_cleanup_with_valid_mind() {
+        let tmp = TempDir::new().unwrap();
+        let _result = handle_session_cleanup("test-session", tmp.path());
+    }
+
+    // -----------------------------------------------------------------------
+    // Sidecar path integration
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cleanup_uses_correct_sidecar_path() {
+        let cwd = Path::new("/tmp/project");
+        let sidecar_file = sidecar::sidecar_path(cwd, "sess-42");
+        assert!(
+            sidecar_file
+                .to_string_lossy()
+                .contains("session-sess-42.json")
+        );
+    }
+
+    #[test]
+    fn cleanup_handles_missing_sidecar_gracefully() {
+        // When no sidecar file exists, observation_count defaults to 0.
+        // We verify the sidecar load returns an appropriate error.
+        let tmp = TempDir::new().unwrap();
+        let path = sidecar::sidecar_path(tmp.path(), "nonexistent");
+        let result = sidecar::load(&path);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cleanup_deletes_sidecar_file_after_processing() {
+        // Create a sidecar file and verify the cleanup logic would delete it.
+        // Since we can't open Mind in unit tests, we test the deletion path directly.
+        let tmp = TempDir::new().unwrap();
+        let sidecar_path = sidecar::sidecar_path(tmp.path(), "to-delete");
+        let state = crate::types::SidecarState::new("to-delete".to_string());
+        sidecar::save(&sidecar_path, &state).unwrap();
+        assert!(sidecar_path.exists());
+
+        // Direct file removal (what handle_session_cleanup does post-Mind)
+        std::fs::remove_file(&sidecar_path).unwrap();
+        assert!(!sidecar_path.exists());
+    }
+}

@@ -183,5 +183,74 @@ fn bench_compress(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_compress);
+fn load_baselines() -> Option<serde_json::Value> {
+    let manifest_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let fixtures = manifest_dir
+        .parent()?
+        .parent()?
+        .join("tests")
+        .join("fixtures")
+        .join("ts_baselines.json");
+    let content = std::fs::read_to_string(&fixtures).ok()?;
+    serde_json::from_str(&content).ok()
+}
+
+fn get_baseline_value(baselines: &serde_json::Value, metric: &str) -> Option<f64> {
+    baselines["baselines"]
+        .as_array()?
+        .iter()
+        .find(|b| b["metric"].as_str() == Some(metric))
+        .and_then(|b| b["value"].as_f64())
+}
+
+fn bench_compress_vs_baseline(c: &mut Criterion) {
+    let config = CompressionConfig::default();
+    // Use 10KB input to match the TypeScript baseline workload
+    let input_bytes = 10 * 1024;
+    let content = make_bash_content(input_bytes);
+    let content_len = content.len();
+
+    // Pre-measure throughput for comparison print
+    let start = std::time::Instant::now();
+    let iterations: u32 = 1000;
+    for _ in 0..iterations {
+        let _ = compress(
+            black_box(&config),
+            "Bash",
+            black_box(&content),
+            Some("npm test"),
+        );
+    }
+    let elapsed = start.elapsed();
+    let total_bytes = content_len * usize::try_from(iterations).expect("fits in usize");
+    #[expect(clippy::cast_precision_loss, reason = "byte count fits in f64")]
+    let throughput_mb_s = (total_bytes as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+
+    if let Some(baselines) = load_baselines() {
+        if let Some(ts_mb_s) = get_baseline_value(&baselines, "compression_throughput_mb_s") {
+            let speedup = throughput_mb_s / ts_mb_s;
+            println!();
+            println!("=== TypeScript Baseline Comparison (Compression) ===");
+            println!("  Rust throughput:       {throughput_mb_s:.2} MB/s");
+            println!("  TypeScript baseline:   {ts_mb_s:.1} MB/s");
+            println!("  Speedup factor:        {speedup:.1}x");
+            println!("=====================================================");
+        }
+    } else {
+        println!("(ts_baselines.json not found, skipping comparison)");
+    }
+
+    c.bench_function("compress/bash_10kb_throughput", |b| {
+        b.iter(|| {
+            compress(
+                black_box(&config),
+                "Bash",
+                black_box(&content),
+                Some("npm test"),
+            )
+        });
+    });
+}
+
+criterion_group!(benches, bench_compress, bench_compress_vs_baseline);
 criterion_main!(benches);

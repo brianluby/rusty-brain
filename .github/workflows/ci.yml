@@ -29,3 +29,34 @@ jobs:
 
       - name: Release build
         run: cargo build --workspace --release
+
+      - name: Benchmark regression gate
+        run: cargo test --release -p rusty-brain-cli --test bench_regression_test -- --nocapture
+
+  # Fuzz smoke test (runs on nightly, separate job to avoid blocking main CI)
+  fuzz:
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - uses: dtolnay/rust-toolchain@efa25f7f19611383d5b0ccf2d1c8914531636bf9 # master
+        with:
+          toolchain: nightly
+
+      - uses: Swatinem/rust-cache@779680da715d629ac1d338a641029a2f4372abb5 # v2
+
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Fuzz compression (60s)
+        run: cd crates/compression && cargo +nightly fuzz run compression_fuzz -- -max_total_time=60
+        continue-on-error: true
+
+      - name: Fuzz hook JSON (60s)
+        run: cd crates/hooks && cargo +nightly fuzz run hook_json_fuzz -- -max_total_time=60
+        continue-on-error: true
+
+      - name: Fuzz search query (60s)
+        run: cd crates/core && cargo +nightly fuzz run search_query_fuzz -- -max_total_time=60
+        continue-on-error: true

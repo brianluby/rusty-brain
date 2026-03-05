@@ -132,10 +132,22 @@ impl Mind {
 }
 
 fn should_recover_from_open_error(err: &RustyBrainError) -> bool {
-    matches!(
-        err,
-        RustyBrainError::CorruptedFile { .. } | RustyBrainError::MemoryCorruption { .. }
-    )
+    match err {
+        RustyBrainError::CorruptedFile { .. } | RustyBrainError::MemoryCorruption { .. } => true,
+        // Storage backend errors from memvid-core: only recover for explicit
+        // corruption indicators. Non-corruption conditions (version mismatch,
+        // transient I/O, permission errors) should NOT trigger destructive
+        // backup-and-recreate recovery.
+        RustyBrainError::Storage { message, .. } => {
+            let msg = message.to_lowercase();
+            msg.contains("corrupt")
+                || msg.contains("invalid")
+                || msg.contains("malformed")
+                || msg.contains("cannot be opened")
+                || msg.contains("failed to fill whole buffer")
+        }
+        _ => false,
+    }
 }
 
 /// Set file permissions to 0600 (owner read/write only) per SEC-1.

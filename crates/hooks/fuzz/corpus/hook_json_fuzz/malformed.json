@@ -1,0 +1,8 @@
+{
+  "session_id": 12345,
+  "transcript_path": null,
+  "cwd": "",
+  "extra_field": "should be ignored",
+  "nested": {"deeply": {"nested": {"value": true}}},
+  "array_field": [1, "two", null, false]
+}

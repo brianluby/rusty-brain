@@ -141,3 +141,129 @@ impl SidecarState {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // -----------------------------------------------------------------------
+    // MindToolInput
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mind_tool_input_deserializes_search_mode() {
+        let json = r#"{"mode":"search","query":"test query","limit":5}"#;
+        let input: MindToolInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.mode, "search");
+        assert_eq!(input.query, Some("test query".to_string()));
+        assert_eq!(input.limit, Some(5));
+        assert!(input.content.is_none());
+    }
+
+    #[test]
+    fn mind_tool_input_deserializes_remember_mode() {
+        let json = r#"{"mode":"remember","content":"important finding"}"#;
+        let input: MindToolInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.mode, "remember");
+        assert_eq!(input.content, Some("important finding".to_string()));
+        assert!(input.query.is_none());
+        assert!(input.limit.is_none());
+    }
+
+    #[test]
+    fn mind_tool_input_ignores_unknown_fields() {
+        let json = r#"{"mode":"stats","future_field":"ignored"}"#;
+        let input: MindToolInput = serde_json::from_str(json).unwrap();
+        assert_eq!(input.mode, "stats");
+    }
+
+    #[test]
+    fn valid_modes_contains_all_five() {
+        assert_eq!(VALID_MODES.len(), 5);
+        assert!(VALID_MODES.contains(&"search"));
+        assert!(VALID_MODES.contains(&"ask"));
+        assert!(VALID_MODES.contains(&"recent"));
+        assert!(VALID_MODES.contains(&"stats"));
+        assert!(VALID_MODES.contains(&"remember"));
+    }
+
+    // -----------------------------------------------------------------------
+    // MindToolOutput
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mind_tool_output_success_sets_fields_correctly() {
+        let data = serde_json::json!({"key": "value"});
+        let output = MindToolOutput::success(data.clone());
+        assert!(output.success);
+        assert_eq!(output.data, Some(data));
+        assert!(output.error_code.is_none());
+        assert!(output.error.is_none());
+    }
+
+    #[test]
+    fn mind_tool_output_error_sets_default_code() {
+        let output = MindToolOutput::error("something broke");
+        assert!(!output.success);
+        assert!(output.data.is_none());
+        assert_eq!(
+            output.error_code.as_deref(),
+            Some(types::error_codes::E_UNKNOWN)
+        );
+        assert_eq!(output.error.as_deref(), Some("something broke"));
+    }
+
+    #[test]
+    fn mind_tool_output_error_with_code_sets_custom_code() {
+        let output = MindToolOutput::error_with_code("E_CUSTOM", "custom error");
+        assert!(!output.success);
+        assert_eq!(output.error_code.as_deref(), Some("E_CUSTOM"));
+        assert_eq!(output.error.as_deref(), Some("custom error"));
+    }
+
+    #[test]
+    fn mind_tool_output_success_serializes_without_error_fields() {
+        let output = MindToolOutput::success(serde_json::json!(42));
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"success\":true"));
+        assert!(json.contains("\"data\":42"));
+        assert!(!json.contains("error_code"));
+        assert!(!json.contains("\"error\""));
+    }
+
+    #[test]
+    fn mind_tool_output_error_serializes_without_data_field() {
+        let output = MindToolOutput::error("fail");
+        let json = serde_json::to_string(&output).unwrap();
+        assert!(json.contains("\"success\":false"));
+        assert!(!json.contains("\"data\""));
+        assert!(json.contains("\"error\":\"fail\""));
+    }
+
+    // -----------------------------------------------------------------------
+    // SidecarState
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sidecar_state_new_initializes_correctly() {
+        let state = SidecarState::new("sess-001".to_string());
+        assert_eq!(state.session_id, "sess-001");
+        assert_eq!(state.observation_count, 0);
+        assert!(state.dedup_hashes.is_empty());
+        assert!(state.created_at <= Utc::now());
+        assert_eq!(state.created_at, state.last_updated);
+    }
+
+    #[test]
+    fn sidecar_state_json_round_trip() {
+        let state = SidecarState::new("sess-round-trip".to_string());
+        let json = serde_json::to_string(&state).unwrap();
+        let deserialized: SidecarState = serde_json::from_str(&json).unwrap();
+        assert_eq!(state, deserialized);
+    }
+
+    #[test]
+    fn max_dedup_entries_is_1024() {
+        assert_eq!(MAX_DEDUP_ENTRIES, 1024);
+    }
+}

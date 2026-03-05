@@ -301,3 +301,267 @@ pub fn cleanup_stale(sidecar_dir: &Path, max_age: Duration) {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::types::SidecarState;
+    use tempfile::TempDir;
+
+    // -----------------------------------------------------------------------
+    // sidecar_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn sidecar_path_produces_expected_format() {
+        let cwd = Path::new("/tmp/project");
+        let path = sidecar_path(cwd, "abc-123");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/project/.opencode/session-abc-123.json")
+        );
+    }
+
+    #[test]
+    fn sidecar_path_sanitizes_special_characters() {
+        let cwd = Path::new("/tmp/project");
+        let path = sidecar_path(cwd, "../../etc/passwd");
+        let filename = path.file_name().unwrap().to_string_lossy();
+        assert!(!filename.contains(".."));
+        assert!(!filename.contains('/'));
+        assert!(filename.starts_with("session-"));
+        assert!(filename.ends_with(".json"));
+    }
+
+    #[test]
+    fn sidecar_path_allows_hyphens_and_underscores() {
+        let cwd = Path::new("/tmp/project");
+        let path = sidecar_path(cwd, "my_session-01");
+        assert_eq!(
+            path,
+            PathBuf::from("/tmp/project/.opencode/session-my_session-01.json")
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // save and load round-trip
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn save_and_load_round_trip() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session-test.json");
+        let state = SidecarState::new("test-session".to_string());
+
+        save(&path, &state).unwrap();
+        let loaded = load(&path).unwrap();
+
+        assert_eq!(loaded.session_id, "test-session");
+        assert_eq!(loaded.observation_count, 0);
+    }
+
+    #[test]
+    fn save_creates_parent_directories() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp
+            .path()
+            .join("nested")
+            .join("dir")
+            .join("session-test.json");
+        let state = SidecarState::new("nested-test".to_string());
+
+        save(&path, &state).unwrap();
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn load_returns_error_for_missing_file() {
+        let path = Path::new("/tmp/nonexistent-sidecar-file-12345.json");
+        let result = load(path);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            ::types::RustyBrainError::FileSystem { code, .. } => {
+                assert_eq!(code, ::types::error_codes::E_FS_NOT_FOUND);
+            }
+            other => panic!("expected FileSystem error, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_returns_error_for_invalid_json() {
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session-bad.json");
+        std::fs::write(&path, "not valid json").unwrap();
+
+        let result = load(&path);
+        assert!(result.is_err());
+        assert!(matches!(
+            result.unwrap_err(),
+            ::types::RustyBrainError::Serialization { .. }
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_sets_0600_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().unwrap();
+        let path = tmp.path().join("session-perms.json");
+        let state = SidecarState::new("perms-test".to_string());
+
+        save(&path, &state).unwrap();
+
+        let metadata = std::fs::metadata(&path).unwrap();
+        let mode = metadata.permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    // -----------------------------------------------------------------------
+    // compute_dedup_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn compute_dedup_hash_is_deterministic() {
+        let h1 = compute_dedup_hash("Write", "created file test.txt");
+        let h2 = compute_dedup_hash("Write", "created file test.txt");
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn compute_dedup_hash_differs_for_different_inputs() {
+        let h1 = compute_dedup_hash("Write", "file a");
+        let h2 = compute_dedup_hash("Write", "file b");
+        assert_ne!(h1, h2);
+    }
+
+    #[test]
+    fn compute_dedup_hash_is_16_chars_hex() {
+        let hash = compute_dedup_hash("Read", "content");
+        assert_eq!(hash.len(), 16);
+        assert!(hash.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    // -----------------------------------------------------------------------
+    // is_duplicate
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn is_duplicate_returns_false_for_empty_state() {
+        let state = SidecarState::new("s1".to_string());
+        assert!(!is_duplicate(&state, "abc123"));
+    }
+
+    #[test]
+    fn is_duplicate_returns_true_for_existing_hash() {
+        let mut state = SidecarState::new("s1".to_string());
+        state.dedup_hashes.push("abc123".to_string());
+        assert!(is_duplicate(&state, "abc123"));
+    }
+
+    // -----------------------------------------------------------------------
+    // with_hash
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn with_hash_adds_new_hash_and_increments_count() {
+        let state = SidecarState::new("s1".to_string());
+        let updated = with_hash(&state, "hash1".to_string());
+
+        assert_eq!(updated.dedup_hashes.len(), 1);
+        assert_eq!(updated.observation_count, 1);
+        assert!(updated.dedup_hashes.contains(&"hash1".to_string()));
+    }
+
+    #[test]
+    fn with_hash_does_not_increment_count_for_existing_hash() {
+        let state = SidecarState::new("s1".to_string());
+        let state = with_hash(&state, "hash1".to_string());
+        assert_eq!(state.observation_count, 1);
+
+        let state = with_hash(&state, "hash1".to_string());
+        assert_eq!(state.observation_count, 1);
+        assert_eq!(state.dedup_hashes.len(), 1);
+    }
+
+    #[test]
+    fn with_hash_refreshes_lru_position_for_existing_hash() {
+        let state = SidecarState::new("s1".to_string());
+        let state = with_hash(&state, "a".to_string());
+        let state = with_hash(&state, "b".to_string());
+        let state = with_hash(&state, "a".to_string()); // refresh "a"
+
+        assert_eq!(state.dedup_hashes, vec!["b", "a"]);
+    }
+
+    #[test]
+    fn with_hash_evicts_oldest_when_at_capacity() {
+        let mut state = SidecarState::new("s1".to_string());
+        for i in 0..MAX_DEDUP_ENTRIES {
+            state.dedup_hashes.push(format!("{i:016x}"));
+        }
+        state.observation_count = u32::try_from(MAX_DEDUP_ENTRIES).unwrap();
+        assert_eq!(state.dedup_hashes.len(), MAX_DEDUP_ENTRIES);
+
+        let updated = with_hash(&state, "new_hash".to_string());
+        assert_eq!(updated.dedup_hashes.len(), MAX_DEDUP_ENTRIES);
+        assert!(!updated.dedup_hashes.contains(&format!("{:016x}", 0)));
+        assert!(updated.dedup_hashes.last().unwrap() == "new_hash");
+    }
+
+    #[test]
+    fn with_hash_returns_new_state_without_mutating_original() {
+        let original = SidecarState::new("s1".to_string());
+        let _updated = with_hash(&original, "hash1".to_string());
+        assert!(original.dedup_hashes.is_empty());
+        assert_eq!(original.observation_count, 0);
+    }
+
+    // -----------------------------------------------------------------------
+    // cleanup_stale
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn cleanup_stale_removes_old_sidecar_files() {
+        let tmp = TempDir::new().unwrap();
+        let old_file = tmp.path().join("session-old.json");
+        std::fs::write(&old_file, "{}").unwrap();
+
+        // Ensure file age exceeds max_age (age > max_age gates deletion).
+        std::thread::sleep(Duration::from_millis(2));
+        cleanup_stale(tmp.path(), Duration::from_millis(1));
+
+        assert!(!old_file.exists());
+    }
+
+    #[test]
+    fn cleanup_stale_skips_non_session_files() {
+        let tmp = TempDir::new().unwrap();
+        let keep = tmp.path().join("config.json");
+        std::fs::write(&keep, "{}").unwrap();
+
+        cleanup_stale(tmp.path(), Duration::from_secs(0));
+
+        assert!(keep.exists());
+    }
+
+    #[test]
+    fn cleanup_stale_does_not_panic_on_missing_dir() {
+        cleanup_stale(
+            Path::new("/tmp/nonexistent-cleanup-dir-12345"),
+            Duration::from_secs(0),
+        );
+    }
+
+    #[test]
+    fn cleanup_stale_preserves_recent_files() {
+        let tmp = TempDir::new().unwrap();
+        let recent = tmp.path().join("session-recent.json");
+        std::fs::write(&recent, "{}").unwrap();
+
+        // Max age of 1 hour -- the just-created file should survive
+        cleanup_stale(tmp.path(), Duration::from_secs(3600));
+
+        assert!(recent.exists());
+    }
+}

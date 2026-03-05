@@ -38,12 +38,14 @@ fn corrupted_file_is_backed_up_and_recovered() {
     mind.remember(
         ObservationType::Discovery,
         "Read",
-        "test after recovery",
-        None,
+        "successful corruption recovery validates data integrity",
+        Some("The mind store was restored after detecting corrupted mv2 file data"),
         None,
     )
     .unwrap();
-    let results = mind.search("recovery", None).unwrap();
+    let results = mind
+        .search("corruption recovery validates data integrity", None)
+        .unwrap();
     assert!(!results.is_empty(), "search should work after recovery");
 }
 

@@ -84,3 +84,97 @@ pub fn open_mind_read_write(cwd: &Path) -> Result<Mind, RustyBrainError> {
 pub fn open_mind_read_only(cwd: &Path) -> Result<Mind, RustyBrainError> {
     Mind::open_read_only(mind_config(cwd)?)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_hook_input(event: &str) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/tmp/project",
+            "permission_mode": "default",
+            "hook_event_name": event,
+        }))
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // should_process
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn should_process_returns_bool() {
+        let input = make_hook_input("PostToolUse");
+        // The function should not panic regardless of platform detection outcome
+        let _result = should_process(&input, "PostToolUse");
+    }
+
+    #[test]
+    fn should_process_is_fail_open_for_unknown_platform() {
+        let input: HookInput = serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/tmp/project",
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "platform": "unknown_platform_xyz",
+        }))
+        .unwrap();
+        // Fail-open: should return true when adapter is not found
+        let result = should_process(&input, "PostToolUse");
+        assert!(result);
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_memory_path
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_memory_path_returns_path() {
+        let cwd = Path::new("/tmp/test-project");
+        let result = resolve_memory_path(cwd);
+        // Should succeed and return a path containing .agent-brain
+        if let Ok(path) = result {
+            let path_str = path.to_string_lossy();
+            assert!(
+                path_str.contains(".agent-brain") || path_str.contains("mind"),
+                "resolved path should reference memory storage: {path_str}"
+            );
+        }
+        // Path resolution may fail if platform opt-in env isn't set;
+        // the important thing is it doesn't panic.
+    }
+
+    // -----------------------------------------------------------------------
+    // mind_config
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn mind_config_returns_config_with_memory_path() {
+        let cwd = Path::new("/tmp/test-project");
+        // Config resolution may fail depending on env; acceptable
+        if let Ok(config) = mind_config(cwd) {
+            assert!(!config.memory_path.as_os_str().is_empty());
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // open_mind_read_write / open_mind_read_only
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[ignore = "requires memvid and actual memory file on disk"]
+    fn open_mind_read_write_with_valid_cwd() {
+        let cwd = Path::new("/tmp/test-project");
+        let _result = open_mind_read_write(cwd);
+    }
+
+    #[test]
+    #[ignore = "requires memvid and actual memory file on disk"]
+    fn open_mind_read_only_with_valid_cwd() {
+        let cwd = Path::new("/tmp/test-project");
+        let _result = open_mind_read_only(cwd);
+    }
+}

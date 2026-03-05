@@ -97,3 +97,87 @@ fn format_system_message(ctx: &InjectedContext, cwd: &Path) -> String {
 
     msg
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::path::Path;
+
+    fn make_hook_input(event: &str) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/tmp/project",
+            "permission_mode": "default",
+            "hook_event_name": event,
+        }))
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // handle_chat_hook — event filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_chat_hook_with_non_session_start_event() {
+        let input = make_hook_input("PostToolUse");
+        let cwd = Path::new("/tmp/project");
+        // Either returns default (event filtered) or errors (no Mind file).
+        // Both are acceptable — the key is no panic.
+        let _result = handle_chat_hook(&input, cwd);
+    }
+
+    // -----------------------------------------------------------------------
+    // format_system_message
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_system_message_includes_project_name() {
+        let ctx = InjectedContext {
+            recent_observations: vec![],
+            relevant_memories: vec![],
+            session_summaries: vec![],
+            token_count: 0,
+        };
+        let msg = format_system_message(&ctx, Path::new("/home/user/my-project"));
+        assert!(msg.contains("**my-project**"));
+    }
+
+    #[test]
+    fn format_system_message_uses_unknown_for_root_path() {
+        let ctx = InjectedContext {
+            recent_observations: vec![],
+            relevant_memories: vec![],
+            session_summaries: vec![],
+            token_count: 0,
+        };
+        let msg = format_system_message(&ctx, Path::new("/"));
+        assert!(msg.contains("Project:"));
+    }
+
+    #[test]
+    fn format_system_message_starts_with_memory_context_header() {
+        let ctx = InjectedContext {
+            recent_observations: vec![],
+            relevant_memories: vec![],
+            session_summaries: vec![],
+            token_count: 0,
+        };
+        let msg = format_system_message(&ctx, Path::new("/tmp/test"));
+        assert!(msg.starts_with("# Memory Context\n"));
+    }
+
+    #[test]
+    fn format_system_message_omits_sections_when_empty() {
+        let ctx = InjectedContext {
+            recent_observations: vec![],
+            relevant_memories: vec![],
+            session_summaries: vec![],
+            token_count: 0,
+        };
+        let msg = format_system_message(&ctx, Path::new("/tmp/test"));
+        assert!(!msg.contains("## Recent Observations"));
+        assert!(!msg.contains("## Relevant Memories"));
+        assert!(!msg.contains("## Session Summaries"));
+    }
+}

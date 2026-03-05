@@ -79,11 +79,12 @@ fn test_find_json_output_valid() {
     let (_dir, path) = setup_test_mind(&[TestObs {
         obs_type: ObservationType::Decision,
         tool_name: "Write".into(),
-        summary: "Chose async approach".into(),
-        content: Some("After evaluating options".into()),
+        summary: "Chose asynchronous runtime approach for request handling".into(),
+        content: Some("After evaluating synchronous versus asynchronous options we selected the asynchronous runtime".into()),
     }]);
 
-    let (status, stdout, _stderr) = run_cli(&path, &["find", "async", "--json"]);
+    let (status, stdout, _stderr) =
+        run_cli(&path, &["find", "asynchronous runtime approach", "--json"]);
     assert!(status.success());
 
     let json: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
@@ -175,13 +176,14 @@ fn test_find_type_filter_applies_before_final_limit() {
         TestObs {
             obs_type: ObservationType::Discovery,
             tool_name: "Read".into(),
-            summary: "token token token token token token token token token token".into(),
+            summary: "authentication middleware validates bearer credentials in request pipeline"
+                .into(),
             content: None,
         },
         TestObs {
             obs_type: ObservationType::Decision,
             tool_name: "Write".into(),
-            summary: "token".into(),
+            summary: "authentication middleware decision for bearer credentials validation".into(),
             content: None,
         },
     ]);
@@ -190,7 +192,13 @@ fn test_find_type_filter_applies_before_final_limit() {
     let (status, stdout, _stderr) = run_cli(
         &path,
         &[
-            "find", "token", "--limit", "1", "--type", "decision", "--json",
+            "find",
+            "authentication middleware bearer credentials",
+            "--limit",
+            "1",
+            "--type",
+            "decision",
+            "--json",
         ],
     );
     assert!(status.success());

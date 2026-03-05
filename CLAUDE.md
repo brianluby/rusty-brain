@@ -87,6 +87,8 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - `.agent-brain/mind.mv2` (via `crates/core` Mind API), `.opencode/session-<id>.json` (sidecar files on local filesystem) (008-opencode-plugin)
 - Rust stable, edition 2024, MSRV 1.85.0 (binary already built by workspace). Shell scripts: POSIX sh + PowerShell 5.1+. + cross-rs (CI only, for Linux musl cross-compilation), `houseabsolute/actions-rust-cross` GitHub Action. No new Rust crate dependencies. (009-plugin-packaging)
 - N/A (no new storage; existing `.mv2` files are preserved, never touched). (009-plugin-packaging)
+- Rust stable, edition 2024, MSRV 1.85.0 + memvid-core (pinned rev `fbddef4`), criterion 0.5 (benchmarks), cargo-fuzz/libFuzzer (fuzz testing), serde/serde_json (fixture parsing), tempfile (test isolation), assert_cmd/predicates (CLI tests) (010-testing-migration)
+- `.mv2` files via memvid-core (read/write compatibility), `tests/fixtures/` (committed test data) (010-testing-migration)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 

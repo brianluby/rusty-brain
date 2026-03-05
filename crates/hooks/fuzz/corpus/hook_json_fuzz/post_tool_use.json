@@ -1,0 +1,11 @@
+{
+  "session_id": "sess_abc123def456",
+  "transcript_path": "/tmp/claude/transcript.jsonl",
+  "cwd": "/home/user/project",
+  "permission_mode": "default",
+  "hook_event_name": "PostToolUse",
+  "tool_name": "Read",
+  "tool_input": {"file_path": "/home/user/project/src/main.rs"},
+  "tool_response": {"content": "fn main() {\n    println!(\"Hello, world!\");\n}"},
+  "tool_use_id": "tool_use_xyz789"
+}

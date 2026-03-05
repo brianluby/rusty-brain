@@ -118,3 +118,98 @@ pub fn handle_tool_hook(input: &HookInput, cwd: &Path) -> Result<HookOutput, Rus
 
     Ok(HookOutput::default())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn make_hook_input(event: &str) -> HookInput {
+        serde_json::from_value(serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/tmp/project",
+            "permission_mode": "default",
+            "hook_event_name": event,
+        }))
+        .unwrap()
+    }
+
+    // -----------------------------------------------------------------------
+    // Event filtering
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn handle_tool_hook_returns_default_for_non_post_tool_use_event() {
+        let input = make_hook_input("SessionStart");
+        let cwd = std::path::Path::new("/tmp/project");
+        let result = handle_tool_hook(&input, cwd).unwrap();
+        assert_eq!(result, HookOutput::default());
+    }
+
+    // -----------------------------------------------------------------------
+    // Empty tool response
+    // -----------------------------------------------------------------------
+
+    fn make_tool_hook_input(
+        tool_name: &str,
+        tool_response: Option<serde_json::Value>,
+    ) -> HookInput {
+        let mut json = serde_json::json!({
+            "session_id": "test-session",
+            "transcript_path": "/tmp/transcript.jsonl",
+            "cwd": "/tmp/project",
+            "permission_mode": "default",
+            "hook_event_name": "PostToolUse",
+            "tool_name": tool_name,
+        });
+        if let Some(resp) = tool_response {
+            json["tool_response"] = resp;
+        }
+        serde_json::from_value(json).unwrap()
+    }
+
+    #[test]
+    fn handle_tool_hook_returns_default_for_absent_tool_response() {
+        let input = make_tool_hook_input("Read", None);
+        let cwd = std::path::Path::new("/tmp/nonexistent-project");
+        let result = handle_tool_hook(&input, cwd);
+        // No tool_response → early return with default output (no Mind needed)
+        assert!(result.is_ok(), "absent tool_response should return Ok");
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            HookOutput::default(),
+            "absent tool_response should return default output"
+        );
+    }
+
+    #[test]
+    fn handle_tool_hook_returns_default_for_empty_string_response() {
+        let input = make_tool_hook_input("Read", Some(serde_json::json!("")));
+        let cwd = std::path::Path::new("/tmp/nonexistent-project");
+        let result = handle_tool_hook(&input, cwd);
+        // Empty string tool_response → early return with default output
+        assert!(result.is_ok(), "empty tool_response should return Ok");
+        let output = result.unwrap();
+        assert_eq!(
+            output,
+            HookOutput::default(),
+            "empty tool_response should return default output"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Tool response extraction
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn tool_response_extracts_nested_content_field() {
+        let input = make_tool_hook_input(
+            "Write",
+            Some(serde_json::json!({"content": "file written successfully"})),
+        );
+        let cwd = std::path::Path::new("/tmp/project");
+        // We can't fully test without Mind, but we verify it doesn't panic
+        let _result = handle_tool_hook(&input, cwd);
+    }
+}

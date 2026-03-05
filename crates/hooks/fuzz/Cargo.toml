@@ -1,0 +1,23 @@
+[package]
+name = "hooks-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+serde_json = "1.0"
+
+[dependencies.hooks]
+path = ".."
+
+[dependencies.types]
+path = "../../types"
+
+[[bin]]
+name = "hook_json_fuzz"
+path = "fuzz_targets/hook_json_fuzz.rs"
+doc = false

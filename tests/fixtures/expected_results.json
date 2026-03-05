@@ -1,0 +1,43 @@
+[
+  {
+    "fixture": "small_10obs",
+    "queries": [
+      {
+        "query": "caching pattern user service",
+        "results": [
+          {
+            "content": "Found caching pattern in user service layer",
+            "rank": 1,
+            "score_max": 11.124367485046387,
+            "score_min": 11.104367485046387
+          }
+        ],
+        "total_count": 1
+      },
+      {
+        "query": "authentication JWT bearer token",
+        "results": [
+          {
+            "content": "Authentication middleware validates JWT bearer tokens",
+            "rank": 1,
+            "score_max": 11.67164207458496,
+            "score_min": 11.651642074584961
+          }
+        ],
+        "total_count": 1
+      },
+      {
+        "query": "database migration",
+        "results": [
+          {
+            "content": "Completed database migration to version three successfully",
+            "rank": 1,
+            "score_max": 4.383617172241211,
+            "score_min": 4.363617172241211
+          }
+        ],
+        "total_count": 1
+      }
+    ]
+  }
+]
