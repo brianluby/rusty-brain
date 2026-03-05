@@ -166,7 +166,7 @@ For Rust developers, rusty-brain is optionally available as a crate on crates.io
 
 - GitHub Releases is the primary hosting mechanism for release binaries.
 - The install script downloads from GitHub Releases API endpoints.
-- Claude Code plugin is installed globally at `~/.claude/plugins/rusty-brain/` with `plugin.json` at the root of that directory.
+- Claude Code plugin is installed globally at `~/.claude/plugins/rusty-brain/` with `plugin.json` at `.claude-plugin/plugin.json` within that directory.
 - OpenCode command discovery follows the `commands/` directory convention currently used by the Node.js version.
 - The npm wrapper package (if implemented) follows the pattern used by projects like `esbuild` and `turbo` — a thin JS shim that downloads the native binary on first run.
 - Static linking with musl is used for Linux targets to avoid glibc version dependencies.

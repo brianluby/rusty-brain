@@ -124,7 +124,7 @@ After installation, rusty-brain appears as a registered Claude Code plugin with 
 **Independent Test**: Install the plugin and verify Claude Code recognizes skills and can invoke each one.
 
 **Acceptance Scenarios**:
-1. **Given** rusty-brain is installed, **When** the user opens Claude Code in any project, **Then** the plugin is discovered via `~/.claude/plugins/rusty-brain/plugin.json` and skills appear in the available skills list.
+1. **Given** rusty-brain is installed, **When** the user opens Claude Code in any project, **Then** the plugin is discovered via `~/.claude/plugins/rusty-brain/.claude-plugin/plugin.json` and skills appear in the available skills list.
 2. **Given** the plugin is registered, **When** the agent invokes `mind:search`, **Then** rusty-brain processes the search and returns results in the expected format.
 3. **Given** the plugin is registered, **When** the agent invokes `mind:memory`, **Then** memories are captured and stored using the Rust binary (not the Node.js original).
 
@@ -317,8 +317,8 @@ erDiagram
         string download_url "GitHub Release URL"
     }
     PLUGIN_MANIFEST {
-        string plugin_json "~/.claude/plugins/rusty-brain/plugin.json"
-        string marketplace_json "~/.claude/plugins/rusty-brain/marketplace.json"
+        string plugin_json "~/.claude/plugins/rusty-brain/.claude-plugin/plugin.json"
+        string marketplace_json "~/.claude/plugins/rusty-brain/.claude-plugin/marketplace.json"
         string binary_path "~/.local/bin/rusty-brain"
         string version "semver"
     }
@@ -389,7 +389,7 @@ erDiagram
 
 | AC ID | Requirement | User Story | Given | When | Then |
 |-------|-------------|------------|-------|------|------|
-| AC-1 | M-1 | US-2 | rusty-brain is installed | User opens Claude Code | Plugin is discovered via `~/.claude/plugins/rusty-brain/plugin.json` |
+| AC-1 | M-1 | US-2 | rusty-brain is installed | User opens Claude Code | Plugin is discovered via `~/.claude/plugins/rusty-brain/.claude-plugin/plugin.json` |
 | AC-2 | M-2 | US-2 | Plugin is registered | Agent invokes `mind:search` | Search results returned in expected format |
 | AC-3 | M-3 | US-3 | Release tag is pushed | GitHub Actions completes | 5 platform binaries published as release assets |
 | AC-4 | M-4 | US-3 | Release assets published | User downloads `.sha256` file | Checksum matches corresponding archive |

@@ -215,6 +215,7 @@ try {
         $version = $env:RUSTY_BRAIN_VERSION
     } else {
         $version = Get-LatestVersion
+        Test-Version -Version $version
     }
 
     # Normalise version tag (ensure v prefix for download URL)
@@ -493,6 +494,8 @@ rusty-brain stats
     $hooksSrc = Join-Path $extractDir "rusty-brain-hooks.exe"
     if (Test-Path $hooksSrc) {
         Copy-Item -Path $hooksSrc -Destination (Join-Path $pluginDir "rusty-brain-hooks.exe") -Force
+    } else {
+        throw "Installation failed: required hooks binary 'rusty-brain-hooks.exe' was not found at '$hooksSrc'. The hooks configuration references this binary, so the archive is incomplete."
     }
 
     # Check PATH and print result

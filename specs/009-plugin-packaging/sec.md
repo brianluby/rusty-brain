@@ -79,7 +79,7 @@ This is a **lightweight security review** intended to catch obvious security con
 | Install Script Download | `curl -sSf https://raw.githubusercontent.com/.../install.sh \| sh` | No | No | Script fetched over HTTPS but executed without verification |
 | Binary Download | GitHub Releases API + asset download | No | No | SHA-256 checksum verified after download |
 | GitHub API Query | `GET /repos/.../releases/latest` (unauthenticated) | No | No | Public API; rate limited at 60 req/hr |
-| Plugin Manifest | `~/.claude/plugins/rusty-brain/plugin.json` references binary path | N/A | N/A | If manifest is tampered, wrong binary could be invoked |
+| Plugin Manifest | `~/.claude/plugins/rusty-brain/.claude-plugin/plugin.json` references binary path | N/A | N/A | If manifest is tampered, wrong binary could be invoked |
 | Binary Execution | `~/.local/bin/rusty-brain` invoked by coding agents | N/A | User-level | Runs with user's full privileges; reads `.mv2` files |
 
 ### Attack Surface Diagram `@llm-autonomous`
@@ -140,7 +140,7 @@ flowchart LR
 | Release binary | Release Binary | Internal | GitHub Actions build | `~/.local/bin/rusty-brain` | Indefinite (until upgrade) | No | Yes (HTTPS) | User machine |
 | SHA-256 checksum | Release Binary.sha256_checksum | Public | GitHub Actions build | Temp file (deleted after verify) | Transient | No | Yes (HTTPS) | User machine |
 | Binary archive | Release Binary.archive_name | Internal | GitHub Release asset | Temp file (deleted after extract) | Transient | No | Yes (HTTPS) | User machine |
-| Plugin manifest | Plugin Manifest | Internal | Install script (heredoc/embedded) | `~/.claude/plugins/rusty-brain/plugin.json` | Indefinite | No | N/A (local write) | User machine |
+| Plugin manifest | Plugin Manifest | Internal | Install script (heredoc/embedded) | `~/.claude/plugins/rusty-brain/.claude-plugin/plugin.json` | Indefinite | No | N/A (local write) | User machine |
 | Skill definitions | Skill Definition | Public | Install script (embedded) | `~/.claude/plugins/rusty-brain/skills/` | Indefinite | No | N/A (local write) | User machine |
 | Command definitions | Command Definition | Public | Install script (embedded) | OpenCode commands dir | Indefinite | No | N/A (local write) | User machine |
 | Memory files (.mv2) | — (pre-existing) | Confidential | User's prior sessions | `~/.agent-brain/mind.mv2` | User-controlled | No (memvid encoding) | N/A (local only) | User machine |

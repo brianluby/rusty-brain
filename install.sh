@@ -166,9 +166,9 @@ parse_release_json() {
     return 1
   fi
 
-  _pattern="rusty-brain-.*-${_triple}\\.tar\\.gz"
+  _pattern="rusty-brain-.*-${_triple}\\.tar\\.gz\""
   _url="$(printf '%s' "$_json" \
-    | grep -o "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${_pattern}\"" \
+    | grep -o "\"browser_download_url\"[[:space:]]*:[[:space:]]*\"[^\"]*${_pattern}" \
     | head -n 1 \
     | sed 's/.*"browser_download_url"[[:space:]]*:[[:space:]]*"//;s/"$//')"
 
@@ -423,10 +423,13 @@ rusty-brain stats
 ```
 STATS_EOF
 
-  # Copy hooks binary from extracted archive
+  # Copy hooks binary from extracted archive (required for hooks.json)
   if [ -f "$_extract_dir/rusty-brain-hooks" ]; then
     cp "$_extract_dir/rusty-brain-hooks" "$_plugin_dir/rusty-brain-hooks"
     chmod +x "$_plugin_dir/rusty-brain-hooks"
+  else
+    err "rusty-brain-hooks binary missing from release archive (expected at $_extract_dir/rusty-brain-hooks). Aborting plugin installation."
+    return 1
   fi
 }
 
