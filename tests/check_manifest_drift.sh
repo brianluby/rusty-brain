@@ -62,13 +62,17 @@ for cmd in ask search recent stats; do
   compare_file "$CANONICAL/commands/${cmd}.md" "$PLUGIN_DIR/commands/${cmd}.md" "commands/${cmd}.md"
 done
 
-# plugin.json — compare structure (version field will differ since canonical has real version)
-# Replace the generated version back to match canonical's version for comparison
-sed "s/0\.1\.0/0.1.0/" "$PLUGIN_DIR/.claude-plugin/plugin.json" > "$TMPDIR_DRIFT/plugin_normalized.json"
+# plugin.json — normalize version field before comparison so differing versions don't cause false drift
+# The canonical file has a real version; the generated file has the install-time version.
+# Replace any semver "version": "X.Y.Z" with the canonical version from packaging/.
+_canonical_version="$(sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\)".*/\1/p' "$CANONICAL/.claude-plugin/plugin.json" | head -n 1)"
+sed "s/\"version\"[[:space:]]*:[[:space:]]*\"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\"/\"version\": \"${_canonical_version}\"/" \
+  "$PLUGIN_DIR/.claude-plugin/plugin.json" > "$TMPDIR_DRIFT/plugin_normalized.json"
 compare_file "$CANONICAL/.claude-plugin/plugin.json" "$TMPDIR_DRIFT/plugin_normalized.json" ".claude-plugin/plugin.json"
 
 # marketplace.json
-sed "s/0\.1\.0/0.1.0/" "$PLUGIN_DIR/marketplace.json" > "$TMPDIR_DRIFT/marketplace_normalized.json"
+sed "s/\"version\"[[:space:]]*:[[:space:]]*\"[0-9][0-9]*\.[0-9][0-9]*\.[0-9][0-9]*\"/\"version\": \"${_canonical_version}\"/" \
+  "$PLUGIN_DIR/marketplace.json" > "$TMPDIR_DRIFT/marketplace_normalized.json"
 compare_file "$CANONICAL/marketplace.json" "$TMPDIR_DRIFT/marketplace_normalized.json" "marketplace.json"
 
 if [ "$DRIFT" -ne 0 ]; then

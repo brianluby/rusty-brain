@@ -421,8 +421,8 @@ fn mind_timeline_malformed_metadata_uses_fallbacks() {
     // Verify it's a reasonable past timestamp, not approximately now.
     let age = Utc::now() - entry.timestamp;
     assert!(
-        age.num_seconds() < 60,
-        "fallback timestamp should come from backend epoch (recent), got age: {age}"
+        age.num_seconds() >= 0 && age.num_seconds() < 60,
+        "fallback timestamp should be recent and not in the future, got age: {age}"
     );
 }
 
