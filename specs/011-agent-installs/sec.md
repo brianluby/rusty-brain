@@ -35,8 +35,8 @@
 
 | Document | ID | Relationship |
 |----------|-----|--------------|
-| Parent PRD | 011-prd-agent-installs.md | Feature being reviewed |
-| Architecture Review | 011-ar-agent-installs.md | Technical implementation |
+| Parent PRD | prd.md | Feature being reviewed |
+| Architecture Review | ar.md | Technical implementation |
 
 ---
 

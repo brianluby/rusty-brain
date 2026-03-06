@@ -305,7 +305,7 @@ stateDiagram-v2
 - [ ] **M-7:** The system shall produce structured JSON output when invoked with `--json` or when stdin is not a TTY.
 - [ ] **M-8:** The system shall support upgrading agent configurations without data loss when re-run on an already-configured system.
 - [ ] **M-9:** The system shall validate that the target agent is installed before attempting configuration, providing a clear error if not found.
-- [ ] **M-10:** The system shall provide machine-parseable error messages with stable error codes for all failure modes.
+- [ ] **M-10:** The system shall provide machine-parseable error messages with stable error codes for install, runtime, and domain-level failure modes. (Note: CLI argument-parsing errors are handled by clap and emitted as human-readable text on stderr.)
 - [ ] **M-11:** The system shall not require interactive prompts during installation when in non-TTY mode.
 - [ ] **M-12:** The system shall create necessary directory structures if they do not exist.
 - [ ] **M-13:** The system shall require explicit scope selection via `--project` or `--global` and refuse to run without one.
@@ -402,7 +402,9 @@ erDiagram
   "scope": "project"
 }
 
-// JSON Output (error)
+// JSON Output (domain-level error — M-10 scope)
+// Note: CLI argument-parsing errors (e.g., missing --project/--global) are
+// handled by clap and emitted as human-readable text on stderr, not as JSON.
 {
   "status": "error",
   "error_code": "AGENT_NOT_FOUND",
