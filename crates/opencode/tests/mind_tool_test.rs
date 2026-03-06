@@ -319,9 +319,9 @@ fn missing_content_error_includes_error_code() {
 
 #[test]
 fn plugin_manifest_has_required_fields() {
-    let manifest_json = include_str!("../../../plugin-manifest.json");
+    let manifest_json = include_str!("../../../.claude-plugin/plugin.json");
     let manifest: serde_json::Value =
-        serde_json::from_str(manifest_json).expect("plugin-manifest.json should be valid JSON");
+        serde_json::from_str(manifest_json).expect("plugin.json should be valid JSON");
 
     assert!(
         manifest.get("name").and_then(|v| v.as_str()).is_some(),
@@ -333,19 +333,9 @@ fn plugin_manifest_has_required_fields() {
     );
     assert!(
         manifest
-            .get("binary_path")
+            .get("description")
             .and_then(|v| v.as_str())
             .is_some(),
-        "manifest must have 'binary_path' field"
+        "manifest must have 'description' field"
     );
-    let capabilities = manifest
-        .get("capabilities")
-        .and_then(|v| v.as_array())
-        .expect("manifest must have 'capabilities' array");
-    assert!(!capabilities.is_empty(), "capabilities must not be empty");
-
-    let cap_strings: Vec<&str> = capabilities.iter().filter_map(|v| v.as_str()).collect();
-    assert!(cap_strings.contains(&"chat_hook"), "must declare chat_hook");
-    assert!(cap_strings.contains(&"tool_hook"), "must declare tool_hook");
-    assert!(cap_strings.contains(&"mind_tool"), "must declare mind_tool");
 }

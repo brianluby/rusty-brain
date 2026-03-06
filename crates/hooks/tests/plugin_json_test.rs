@@ -18,14 +18,14 @@ fn workspace_root() -> PathBuf {
 }
 
 fn read_plugin_json() -> serde_json::Value {
-    let path = workspace_root().join("packaging/claude-code/.claude-plugin/plugin.json");
+    let path = workspace_root().join(".claude-plugin/plugin.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read plugin.json at {}: {e}", path.display()));
     serde_json::from_str(&content).expect("plugin.json must be valid JSON")
 }
 
 fn read_hooks_json() -> serde_json::Value {
-    let path = workspace_root().join("packaging/claude-code/hooks/hooks.json");
+    let path = workspace_root().join("hooks/hooks.json");
     let content = std::fs::read_to_string(&path)
         .unwrap_or_else(|e| panic!("failed to read hooks.json at {}: {e}", path.display()));
     serde_json::from_str(&content).expect("hooks.json must be valid JSON")
@@ -50,34 +50,6 @@ fn plugin_json_has_required_top_level_fields() {
     assert!(
         plugin.get("description").is_some(),
         "plugin.json must have 'description' field"
-    );
-    assert!(
-        plugin.get("hooks").is_some(),
-        "plugin.json must have 'hooks' field"
-    );
-}
-
-#[test]
-fn plugin_json_hooks_field_references_hooks_json() {
-    let plugin = read_plugin_json();
-    let hooks_ref = plugin
-        .get("hooks")
-        .and_then(|v| v.as_str())
-        .expect("hooks field must be a string path");
-
-    assert!(
-        hooks_ref.contains("hooks.json"),
-        "hooks field should reference hooks.json, got: {hooks_ref}"
-    );
-    assert!(
-        !hooks_ref.contains("dist/"),
-        "hooks field must NOT reference dist/ directory (JS paths): {hooks_ref}"
-    );
-    assert!(
-        Path::new(hooks_ref)
-            .extension()
-            .is_none_or(|ext| ext != "js"),
-        "hooks field must NOT reference .js files: {hooks_ref}"
     );
 }
 
@@ -328,7 +300,7 @@ fn generated_manifest_hook_types_match_static_hooks_json() {
 }
 
 #[test]
-fn hooks_json_commands_use_plugin_root_variable() {
+fn hooks_json_commands_use_path_based_binary_lookup() {
     let hooks = read_hooks_json();
     let hook_map = hooks["hooks"].as_object().expect("hooks object");
 
@@ -354,9 +326,14 @@ fn hooks_json_commands_use_plugin_root_variable() {
                     .unwrap_or_else(|| panic!("{event_type} entry must have 'command' field"));
 
                 assert!(
-                    command.contains("${CLAUDE_PLUGIN_ROOT}"),
-                    "{event_type} command should use ${{CLAUDE_PLUGIN_ROOT}} variable \
-                     for portable plugin paths: {command}"
+                    !command.contains("${CLAUDE_PLUGIN_ROOT}"),
+                    "{event_type} command must NOT use ${{CLAUDE_PLUGIN_ROOT}} variable \
+                     (uses PATH-based lookup instead): {command}"
+                );
+                assert!(
+                    command.starts_with("rusty-brain-hooks"),
+                    "{event_type} command should start with plain 'rusty-brain-hooks' \
+                     binary name (PATH-based lookup): {command}"
                 );
             }
         }
