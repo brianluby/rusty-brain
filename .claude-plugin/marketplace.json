@@ -1,0 +1,23 @@
+{
+  "name": "rusty-brain",
+  "owner": {
+    "name": "Brian Luby"
+  },
+  "metadata": {
+    "description": "Persistent AI memory system using memvid video-encoded storage"
+  },
+  "plugins": [
+    {
+      "name": "rusty-brain",
+      "description": "Persistent AI memory system using memvid video-encoded storage",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "Brian Luby"
+      },
+      "repository": "https://github.com/brianluby/rusty-brain",
+      "license": "Apache-2.0",
+      "keywords": ["memory", "ai", "memvid", "persistent-memory"]
+    }
+  ]
+}

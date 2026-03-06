@@ -8,13 +8,5 @@
   },
   "repository": "https://github.com/brianluby/rusty-brain",
   "license": "Apache-2.0",
-  "keywords": ["memory", "ai", "memvid", "persistent-memory"],
-  "skills": ["./skills/mind/", "./skills/memory/"],
-  "hooks": "./hooks/hooks.json",
-  "commands": [
-    "./commands/ask.md",
-    "./commands/search.md",
-    "./commands/recent.md",
-    "./commands/stats.md"
-  ]
+  "keywords": ["memory", "ai", "memvid", "persistent-memory"]
 }
