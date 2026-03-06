@@ -2,6 +2,7 @@
 
 mod args;
 mod commands;
+mod install_cmd;
 mod opencode_cmd;
 mod output;
 
@@ -22,6 +23,7 @@ pub enum CliError {
     NotAFile { path: PathBuf },
     EmptyPattern,
     Io(std::io::Error),
+    Install(types::InstallError),
 }
 
 impl CliError {
@@ -32,7 +34,8 @@ impl CliError {
             | Self::MemoryFileNotFound { .. }
             | Self::NotAFile { .. }
             | Self::EmptyPattern
-            | Self::Io(_) => 1,
+            | Self::Io(_)
+            | Self::Install(_) => 1,
         }
     }
 
@@ -47,6 +50,7 @@ impl CliError {
             Self::NotAFile { .. } => "E_CLI_NOT_A_FILE",
             Self::EmptyPattern => "E_CLI_EMPTY_PATTERN",
             Self::Io(_) => "E_CLI_IO",
+            Self::Install(_) => "E_CLI_INSTALL",
         }
     }
 }
@@ -89,6 +93,7 @@ impl fmt::Display for CliError {
                 write!(f, "Search pattern must not be empty.")
             }
             Self::Io(e) => write!(f, "{e}"),
+            Self::Install(e) => write!(f, "{e}"),
         }
     }
 }
@@ -162,6 +167,19 @@ fn run() -> Result<(), (CliError, bool)> {
         return opencode_cmd::dispatch(subcmd).map_err(|e| (e, json));
     }
 
+    // Install subcommand handles its own I/O — dispatch directly.
+    if let Command::Install {
+        ref agents,
+        project,
+        global,
+        json: json_flag,
+        reconfigure,
+    } = cli.command
+    {
+        return install_cmd::run_install(agents.clone(), project, global, json_flag, reconfigure)
+            .map_err(|e| (e, json));
+    }
+
     // Resolve runtime config and memory path.
     let mut config = MindConfig::from_env().map_err(|e| (CliError::from(e), json))?;
     config.memory_path = resolve_cli_memory_path(cli.memory_path.clone()).map_err(|e| (e, json))?;
@@ -197,7 +215,7 @@ fn run() -> Result<(), (CliError, bool)> {
                 json,
             } => commands::run_timeline(mind, limit, r#type, oldest_first, json),
             // Already handled above — unreachable
-            Command::Opencode(_) => Ok(()),
+            Command::Opencode(_) | Command::Install { .. } => Ok(()),
         };
         Ok(())
     })
