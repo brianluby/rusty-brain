@@ -1718,7 +1718,9 @@ dependencies = [
  "serde",
  "serde_json",
  "temp-env",
+ "tempfile",
  "thiserror 2.0.18",
+ "tracing",
  "types",
  "uuid",
 ]
@@ -2068,6 +2070,7 @@ checksum = "b39cdef0fa800fc44525c84ccb54a029961a8215f9619753635a9c0d2538d46d"
 name = "rusty-brain-cli"
 version = "0.1.0"
 dependencies = [
+ "assert_cmd",
  "chrono",
  "clap",
  "comfy-table",

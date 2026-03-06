@@ -75,6 +75,24 @@ pub enum Command {
     /// `OpenCode` editor adapter subcommands
     #[command(subcommand)]
     Opencode(OpenCodeCommand),
+    /// Configure rusty-brain for external AI agents
+    Install {
+        /// Comma-separated list of agents to configure (e.g., opencode,copilot)
+        #[arg(long, value_delimiter = ',')]
+        agents: Option<Vec<String>>,
+        /// Install config relative to current working directory
+        #[arg(long, group = "scope")]
+        project: bool,
+        /// Install config in user-level directories
+        #[arg(long, group = "scope")]
+        global: bool,
+        /// Force JSON output
+        #[arg(long)]
+        json: bool,
+        /// Regenerate config files (backup existing)
+        #[arg(long)]
+        reconfigure: bool,
+    },
 }
 
 /// `OpenCode`-specific subcommands for editor integration.
@@ -99,7 +117,8 @@ impl Command {
             Self::Find { json, .. }
             | Self::Ask { json, .. }
             | Self::Stats { json, .. }
-            | Self::Timeline { json, .. } => *json,
+            | Self::Timeline { json, .. }
+            | Self::Install { json, .. } => *json,
             // OpenCode subcommands always output JSON
             Self::Opencode(_) => true,
         }
@@ -440,5 +459,111 @@ mod tests {
     fn no_subcommand_shows_help() {
         let result = Cli::try_parse_from(["rusty-brain"]);
         assert!(result.is_err());
+    }
+
+    // -------------------------------------------------------------------------
+    // T027: Install subcommand arg parsing tests
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn parse_install_project_scope() {
+        let cli = Cli::try_parse_from(["rusty-brain", "install", "--project"]).unwrap();
+        match cli.command {
+            Command::Install {
+                project, global, ..
+            } => {
+                assert!(project);
+                assert!(!global);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_global_scope() {
+        let cli = Cli::try_parse_from(["rusty-brain", "install", "--global"]).unwrap();
+        match cli.command {
+            Command::Install {
+                project, global, ..
+            } => {
+                assert!(!project);
+                assert!(global);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_project_and_global_mutually_exclusive() {
+        let result = Cli::try_parse_from(["rusty-brain", "install", "--project", "--global"]);
+        assert!(
+            result.is_err(),
+            "--project and --global should be mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn parse_install_agents_comma_delimited() {
+        let cli = Cli::try_parse_from([
+            "rusty-brain",
+            "install",
+            "--agents",
+            "opencode,copilot",
+            "--project",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Install { agents, .. } => {
+                let agents = agents.unwrap();
+                assert_eq!(agents, vec!["opencode", "copilot"]);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_json_flag() {
+        let cli = Cli::try_parse_from(["rusty-brain", "install", "--project", "--json"]).unwrap();
+        match cli.command {
+            Command::Install { json, .. } => assert!(json),
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_reconfigure_flag() {
+        let cli =
+            Cli::try_parse_from(["rusty-brain", "install", "--project", "--reconfigure"]).unwrap();
+        match cli.command {
+            Command::Install { reconfigure, .. } => assert!(reconfigure),
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn parse_install_no_scope_allowed() {
+        // Neither --project nor --global should be accepted (scope required at runtime)
+        let cli = Cli::try_parse_from(["rusty-brain", "install"]).unwrap();
+        match cli.command {
+            Command::Install {
+                project, global, ..
+            } => {
+                assert!(!project);
+                assert!(!global);
+            }
+            _ => panic!("expected Install command"),
+        }
+    }
+
+    #[test]
+    fn json_method_install_default_false() {
+        let cli = Cli::try_parse_from(["rusty-brain", "install", "--project"]).unwrap();
+        assert!(!cli.command.json());
+    }
+
+    #[test]
+    fn json_method_install_with_flag_true() {
+        let cli = Cli::try_parse_from(["rusty-brain", "install", "--project", "--json"]).unwrap();
+        assert!(cli.command.json());
     }
 }

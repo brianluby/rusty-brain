@@ -31,6 +31,7 @@ fs2 = { workspace = true }
 temp-env = { workspace = true }
 criterion = { workspace = true }
 compression = { path = "../compression" }
+assert_cmd = { workspace = true }
 
 [[bench]]
 name = "startup_bench"

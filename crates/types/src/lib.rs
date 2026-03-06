@@ -30,6 +30,8 @@ pub mod diagnostic;
 pub mod error;
 /// Claude Code hook protocol request and response types.
 pub mod hooks;
+/// Types for the agent install subsystem.
+pub mod install;
 /// Observation types representing individual memory entries.
 pub mod observation;
 /// Platform event types for normalized agent session events.
@@ -47,6 +49,10 @@ pub use contract_version::ContractValidationResult;
 pub use diagnostic::{DiagnosticRecord, DiagnosticSeverity};
 pub use error::{AgentBrainError, RustyBrainError, StorageSource, error_codes};
 pub use hooks::{HookInput, HookOutput};
+pub use install::{
+    AgentInfo, AgentInstallResult, ConfigFile, InstallConfig, InstallError, InstallReport,
+    InstallScope, InstallStatus,
+};
 pub use observation::{Observation, ObservationMetadata, ObservationType};
 pub use platform_event::{EventKind, PlatformEvent};
 pub use project_context::{IdentitySource, ProjectContext, ProjectIdentity};

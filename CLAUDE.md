@@ -89,6 +89,8 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - N/A (no new storage; existing `.mv2` files are preserved, never touched). (009-plugin-packaging)
 - Rust stable, edition 2024, MSRV 1.85.0 + memvid-core (pinned rev `fbddef4`), criterion 0.5 (benchmarks), cargo-fuzz/libFuzzer (fuzz testing), serde/serde_json (fixture parsing), tempfile (test isolation), assert_cmd/predicates (CLI tests) (010-testing-migration)
 - `.mv2` files via memvid-core (read/write compatibility), `tests/fixtures/` (committed test data) (010-testing-migration)
+- Rust stable, edition 2024, MSRV 1.85.0 + clap 4 (derive), serde/serde_json, tracing, tempfile (promote from dev-dep to regular dep) (011-agent-installs)
+- Local filesystem only — config files written to agent directories, no database (011-agent-installs)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 
