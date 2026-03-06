@@ -2,6 +2,25 @@
 
 Rust rewrite of [agent-brain](https://github.com/brianluby/agent-brain/) — a memory system for AI coding agents (Claude Code, OpenCode, etc.). Uses [memvid](https://github.com/brianluby/memvid) for video-encoded memory storage and retrieval.
 
+## Installation
+
+### Binary
+
+```bash
+# macOS / Linux
+curl -sSf https://raw.githubusercontent.com/brianluby/rusty-brain/main/install.sh | sh
+
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/brianluby/rusty-brain/main/install.ps1 | iex
+```
+
+### Claude Code Plugin
+
+```
+/plugin marketplace add brianluby/rusty-brain
+/plugin install rusty-brain@rusty-brain
+```
+
 ## Prerequisites
 
 - Rust 1.85.0 or later (`rustup update stable`)
