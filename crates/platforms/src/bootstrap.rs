@@ -43,7 +43,7 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
             level: DiagnosticLevel::Info,
             message: format!(
                 "Using legacy memory file at `{}`. Migrate to `{canonical}`: \
-                 `mkdir -p {} && mv .agent-brain/mind.mv2 {canonical}`",
+                 `mkdir -p {} && mv .agent-brain/{MIND_FILENAME} {canonical}`",
                 crate::LEGACY_AGENT_BRAIN_PATH,
                 crate::DEFAULT_MEMORY_DIR
             ),
@@ -62,8 +62,8 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Warning,
             message: format!(
-                "Legacy memory file at `.claude/mind.mv2`. Migrate to `{canonical}`: \
-                 `mkdir -p {} && mv .claude/mind.mv2 {canonical}`",
+                "Legacy memory file at `.claude/{MIND_FILENAME}`. Migrate to `{canonical}`: \
+                 `mkdir -p {} && mv .claude/{MIND_FILENAME} {canonical}`",
                 crate::DEFAULT_MEMORY_DIR
             ),
         });
@@ -81,7 +81,9 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
 /// 3. `.rusty-brain/mind.mv2` — returned as default for new installations
 #[must_use]
 pub fn resolve_effective_path(project_root: &Path) -> std::path::PathBuf {
-    let rusty_brain = project_root.join(crate::DEFAULT_MEMORY_DIR).join(MIND_FILENAME);
+    let rusty_brain = project_root
+        .join(crate::DEFAULT_MEMORY_DIR)
+        .join(MIND_FILENAME);
     if rusty_brain.exists() {
         return rusty_brain;
     }
@@ -176,7 +178,11 @@ mod tests {
         let result = detect_legacy_paths(dir.path());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].level, DiagnosticLevel::Info);
-        assert!(result[0].message.contains("mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2"));
+        assert!(
+            result[0].message.contains(
+                "mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2"
+            )
+        );
     }
 
     #[test]
