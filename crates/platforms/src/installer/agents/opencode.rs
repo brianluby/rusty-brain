@@ -189,4 +189,10 @@ mod tests {
         assert_eq!(parse_version_string(""), None);
         assert_eq!(parse_version_string("   "), None);
     }
+
+    #[test]
+    fn parse_version_no_semver_returns_none() {
+        assert_eq!(parse_version_string("no version here"), None);
+        assert_eq!(parse_version_string("License: MIT"), None);
+    }
 }

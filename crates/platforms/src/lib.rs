@@ -36,7 +36,7 @@ pub use registry::AdapterRegistry;
 pub mod bootstrap;
 /// Agent installer subsystem for configuring external AI agents.
 pub mod installer;
+pub use installer::AgentInstaller;
 pub use installer::orchestrator::InstallOrchestrator;
 pub use installer::registry::InstallerRegistry;
 pub use installer::writer::ConfigWriter;
-pub use installer::{AgentInstaller, SUPPORTED_AGENTS, find_binary_on_path, is_valid_agent};

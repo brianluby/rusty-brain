@@ -35,8 +35,8 @@ pub fn run_install(
         return Err(CliError::Install(InstallError::ScopeRequired));
     };
 
-    // Auto-enable JSON when stdin is not a TTY (M-7, AC-12).
-    let json = json || !std::io::stdin().is_terminal();
+    // Auto-enable JSON when stdout is not a TTY (M-7, AC-12).
+    let json = json || !std::io::stdout().is_terminal();
 
     let config = InstallConfig {
         agents,

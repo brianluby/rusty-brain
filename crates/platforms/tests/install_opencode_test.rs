@@ -162,11 +162,7 @@ fn upgrade_creates_backup_of_existing_config() {
     assert_eq!(report1.results[0].status, InstallStatus::Configured);
 
     // Second install (should be upgrade with backup).
-    let mut registry2 = InstallerRegistry::new();
-    registry2.register(Box::new(FakeOpenCodeInstaller));
-    let orch2 = InstallOrchestrator::new(registry2);
-
-    let report2 = orch2.run(&config).unwrap();
+    let report2 = orch.run(&config).unwrap();
     assert_eq!(report2.results[0].status, InstallStatus::Upgraded);
 
     // Verify backup exists.
