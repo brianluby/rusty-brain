@@ -46,12 +46,6 @@ rusty-brain install --agents opencode --project --json
 rusty-brain install --agents opencode --project --reconfigure
 ```
 
-### Override config directory
-
-```bash
-rusty-brain install --agents opencode --project --config-dir /custom/path
-```
-
 ## Expected Output (JSON mode)
 
 ```json

@@ -225,10 +225,19 @@ pub fn resolve_global_config_dir(agent_name: &str) -> Result<PathBuf, InstallErr
     #[cfg(target_os = "linux")]
     {
         // Respect XDG_CONFIG_HOME if set, otherwise fall back to ~/.config
-        let config_dir = std::env::var("XDG_CONFIG_HOME").unwrap_or_else(|_| {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            format!("{home}/.config")
-        });
+        let config_dir = match std::env::var("XDG_CONFIG_HOME") {
+            Ok(xdg) => xdg,
+            Err(_) => {
+                let home = std::env::var("HOME").map_err(|_| InstallError::IoError {
+                    path: PathBuf::from("~"),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "HOME environment variable not set",
+                    ),
+                })?;
+                format!("{home}/.config")
+            }
+        };
         Ok(PathBuf::from(config_dir).join(agent_name))
     }
 

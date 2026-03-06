@@ -51,8 +51,6 @@ pub struct InstallConfig {
     pub json: bool,
     /// Regenerate config files (backup existing)
     pub reconfigure: bool,
-    /// Override config directory for the agent
-    pub config_dir: Option<PathBuf>,
 }
 
 /// Per-agent installation result.
@@ -76,10 +74,20 @@ pub struct AgentInstallResult {
 /// Overall installation report.
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct InstallReport {
-    pub status: String,
+    /// Overall status. Uses `ReportStatus` enum (serialized as snake_case).
+    pub status: ReportStatus,
     pub results: Vec<AgentInstallResult>,
     pub memory_store: PathBuf,
     pub scope: String,
+}
+
+/// Overall report status.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReportStatus {
+    Success,
+    Partial,
+    Failed,
 }
 
 /// Installation outcome for a single agent.
@@ -137,7 +145,7 @@ pub enum InstallError {
 /// All filesystem operations go through `ConfigWriter`.
 pub trait AgentInstaller: Send + Sync {
     /// Canonical lowercase agent name: "opencode", "copilot", "codex", "gemini"
-    fn agent_name(&self) -> &str;
+    fn agent_name(&self) -> &'static str;
 
     /// Detect if this agent is installed on the system.
     ///
@@ -235,7 +243,4 @@ pub trait InstallOrchestratorContract {
 //     #[arg(long)]
 //     reconfigure: bool,
 //
-//     /// Override config directory for the agent
-//     #[arg(long)]
-//     config_dir: Option<PathBuf>,
 // }

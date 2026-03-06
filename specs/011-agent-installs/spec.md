@@ -118,7 +118,7 @@ An AI coding agent is working in a project and discovers rusty-brain is availabl
 - What happens when an agent is detected but its version cannot be determined?
   - Proceed with install using the latest known config format and emit a warning that version could not be confirmed.
 - What happens when the user has a custom agent config directory (non-default location)?
-  - The install supports a `--config-dir` override per agent.
+  - Deferred (S-4): A `--config-dir` override was planned but deferred from this PR. Agents use platform-standard config directories.
 
 ## Requirements *(mandatory)*
 

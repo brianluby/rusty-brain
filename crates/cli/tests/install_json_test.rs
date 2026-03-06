@@ -20,6 +20,8 @@ fn install_json_output_is_valid_json() {
         .output()
         .expect("failed to execute CLI");
 
+    assert!(output.status.success(), "install should succeed");
+
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value =
         serde_json::from_str(&stdout).expect("output should be valid JSON");
@@ -44,6 +46,8 @@ fn install_json_results_have_expected_fields() {
         .current_dir(dir.path())
         .output()
         .expect("failed to execute CLI");
+
+    assert!(output.status.success(), "install should succeed");
 
     let stdout = String::from_utf8_lossy(&output.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).unwrap();

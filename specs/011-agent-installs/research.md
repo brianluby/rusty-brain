@@ -74,7 +74,7 @@
 
 ### R5: Subprocess Timeout for Agent Version Detection
 
-**Decision**: Use `std::process::Command` with `std::thread::spawn` + `std::sync::mpsc::channel` for timeout, or `tokio::process::Command` if async is available. Since the CLI is sync, use the thread-based approach with a 2-second timeout.
+**Decision**: Use `std::process::Command::spawn()` with a reader thread (`std::thread::spawn` + `std::sync::mpsc::channel`) for timeout. On timeout, explicitly call `child.kill()` + `child.wait()` to prevent process and thread leaks (SEC-6). 2-second timeout.
 
 **Rationale**: Agent `--version` commands should return instantly, but a hung process could block the install command indefinitely. A 2-second timeout balances reliability with user experience.
 

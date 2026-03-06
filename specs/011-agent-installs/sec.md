@@ -24,10 +24,10 @@
 
 | Level | Label | Definition |
 |-------|-------|------------|
-| **Critical** | Immediate exploitation risk; data breach or system compromise likely |
-| **High** | Significant risk; exploitation possible with moderate effort |
-| **Medium** | Notable risk; exploitation requires specific conditions |
-| **Low** | Minor risk; limited impact or unlikely exploitation |
+| **Critical** | Critical | Immediate exploitation risk; data breach or system compromise likely |
+| **High** | High | Significant risk; exploitation possible with moderate effort |
+| **Medium** | Medium | Notable risk; exploitation requires specific conditions |
+| **Low** | Low | Minor risk; limited impact or unlikely exploitation |
 
 ---
 
@@ -76,7 +76,7 @@ This is a **lightweight security review** intended to catch obvious security con
 
 | Exposure Type | Details | Authentication | Authorization | Notes |
 |---------------|---------|----------------|---------------|-------|
-| CLI argument input | `--agents`, `--config-dir`, `--project`, `--global` flags | -- | -- | Input validation required for `--config-dir` path |
+| CLI argument input | `--agents`, `--project`, `--global` flags | -- | -- | Agent names validated against allowlist |
 | Subprocess execution | Agent version detection via `<agent> --version` | -- | -- | Binary path from PATH; no user-supplied command strings |
 | Filesystem writes | Config files written to agent directories | -- | OS filesystem permissions | Atomic writes via temp+rename |
 
@@ -350,7 +350,7 @@ Based on this review, the implementation MUST satisfy:
 
 | Req ID | Requirement | PRD AC | Verification Method |
 |--------|-------------|--------|---------------------|
-| SEC-1 | Config files shall be written with user-only read/write permissions (0o644 on Unix, default ACL on Windows) | AC-1, AC-2, AC-3, AC-4 | Unit test: verify file permissions after write |
+| SEC-1 | Config files shall be written with owner read/write and group/other read-only permissions (0o644 on Unix, default ACL on Windows). Note: 0o644 is used instead of 0o600 because agent processes need read access to the config files. | AC-1, AC-2, AC-3, AC-4 | Unit test: verify file permissions after write |
 | SEC-2 | Memory contents shall never be logged at any level during install operations | -- | Code review: grep for memory content access in install modules |
 | SEC-3 | Install manifest shall not contain any data from the memory store (only paths) | AC-8 | Unit test: verify manifest content |
 
