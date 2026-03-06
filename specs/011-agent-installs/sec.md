@@ -92,7 +92,7 @@ flowchart LR
     end
 
     subgraph Trust Boundary: CLI Input
-        ARGS[--config-dir<br>--agents] --> VALIDATE[Input Validation<br>path traversal check]
+        ARGS[--agents<br>--project/--global] --> VALIDATE[Input Validation<br>allowlist + path check]
         VALIDATE --> INSTALL
     end
 
@@ -231,14 +231,14 @@ No confidential or restricted data is handled. Config files contain only paths a
 
 | Asset at Risk | Modification Scenario | Impact | Likelihood |
 |---------------|----------------------|--------|------------|
-| Agent config files | Path traversal via `--config-dir` writes config to unintended location | Medium | Low |
+| Agent config files | Path traversal in internally-resolved config paths writes to unintended location | Medium | Low |
 | Agent config files | Malicious binary path injected into config template | Medium | Low |
 | Existing config files | Overwritten without backup due to bug in ConfigWriter | Medium | Low |
 | .bak backup files | Backup overwritten on repeated `--reconfigure` runs | Low | Medium |
 
 **Integrity Risk Level:** Medium
 
-The primary integrity concern is **path traversal via `--config-dir`**: if a user (or agent acting autonomously) passes a crafted path like `--config-dir ../../../etc/`, the install command could write files outside expected directories. This is mitigated by path validation (SEC-1 below).
+The primary integrity concern is **path traversal in config paths**: although config directories are now resolved internally (no user-supplied `--config-dir`), the resolved paths are still validated against `..` traversal sequences (SEC-4). Risk is lower than originally assessed since paths are not user-supplied.
 
 A secondary concern is that config files reference the rusty-brain binary path. If an attacker could influence path resolution (e.g., placing a malicious binary earlier on PATH), the config would point to the wrong binary. This is standard PATH-based risk, not specific to this feature.
 
@@ -261,10 +261,10 @@ The install command is a one-time operation, not a service. Disruption to the in
 | Dimension | Risk Level | Primary Concern | Mitigation Priority |
 |-----------|------------|-----------------|---------------------|
 | **Confidentiality** | Low | Config files contain only paths (Public/Internal data) | Low |
-| **Integrity** | Medium | Path traversal via `--config-dir`; binary path injection | Medium |
+| **Integrity** | Medium | Path traversal in config paths; binary path injection | Medium |
 | **Availability** | Low | Subprocess timeout; disk-full during write | Low |
 
-**Overall CIA Risk:** Low — *Offline CLI tool writing non-sensitive config files to local disk with no network exposure. Primary concern is input validation on `--config-dir` to prevent path traversal.*
+**Overall CIA Risk:** Low — *Offline CLI tool writing non-sensitive config files to local disk with no network exposure. Config directories are resolved internally (not user-supplied), further reducing path traversal risk.*
 
 ---
 
@@ -273,7 +273,7 @@ The install command is a one-time operation, not a service. Disruption to the in
 ```mermaid
 flowchart TD
     subgraph Untrusted
-        CLI_ARGS[CLI Arguments<br>--config-dir, --agents]
+        CLI_ARGS[CLI Arguments<br>--agents, --project/--global]
         AGENT_BIN[Agent Binary Output<br>--version response]
     end
 
@@ -306,12 +306,12 @@ flowchart TD
 
 **Trust boundaries identified:**
 
-1. **CLI argument input -> application logic**: User-supplied `--config-dir` path must be validated to prevent path traversal. Agent names must be validated against an allowlist.
+1. **CLI argument input -> application logic**: Agent names must be validated against an allowlist. Config directories are resolved internally per scope (project root or platform-standard global dir).
 2. **Agent subprocess output -> application logic**: Output from `<agent> --version` is untrusted text parsed for version info. Must handle malformed output gracefully without injection risk.
 
 ### Trust Boundary Checklist `@llm-autonomous`
 
-- [x] **All input from untrusted sources is validated** — `--config-dir` validated for traversal; `--agents` validated against allowlist
+- [x] **All input from untrusted sources is validated** — `--agents` validated against allowlist; config paths resolved internally and validated for traversal
 - [x] **External API responses are validated** — N/A (no external APIs); subprocess output parsed defensively
 - [x] **Authorization checked at data access, not just entry point** — N/A (local filesystem, user's own permissions)
 - [x] **Service-to-service calls are authenticated** — N/A (no service calls)
@@ -322,7 +322,7 @@ flowchart TD
 
 | ID | Risk Description | Severity | Mitigation | Status | Owner |
 |----|------------------|----------|------------|--------|-------|
-| R1 | Path traversal via `--config-dir` could write files outside expected directories | Medium | Validate and canonicalize path; reject paths containing `..` or absolute paths outside user home/project | Open | Implementer |
+| R1 | Path traversal in resolved config paths could write files outside expected directories | Low | Config dirs are resolved internally (not user-supplied); `validate_config_path()` rejects `..` components | Mitigated | Implementer |
 | R2 | Agent binary on PATH could be a malicious impersonator | Low | Verify binary identity via `--version` output pattern matching; warn if unrecognizable. Standard PATH risk, not unique to this feature | Open | Implementer |
 | R3 | Config files written with overly permissive permissions (e.g., world-writable) | Low | Write files with user-only permissions (0o644 on Unix); inherit directory permissions | Open | Implementer |
 | R4 | `.bak` backup chain lost on repeated `--reconfigure` (only most recent backup kept) | Low | Document that only one `.bak` is kept per config file. Not a security issue per se, but data loss risk | Open | Implementer |
@@ -358,7 +358,7 @@ Based on this review, the implementation MUST satisfy:
 
 | Req ID | Requirement | PRD AC | Verification Method |
 |--------|-------------|--------|---------------------|
-| SEC-4 | `--config-dir` path shall be canonicalized and validated to reject paths containing `..` traversal sequences or symlinks pointing outside expected boundaries | AC-1 | Unit test: test with `../../etc/passwd`, symlink paths, etc. |
+| SEC-4 | Config paths shall be validated to reject paths containing `..` traversal sequences. Note: `--config-dir` was deferred (S-4); paths are resolved internally, reducing traversal risk | AC-1 | Unit test: test with `../../etc/passwd` path components |
 | SEC-5 | `--agents` values shall be validated against a hardcoded allowlist (`opencode`, `copilot`, `codex`, `gemini`) | AC-6, AC-10 | Unit test: reject unknown agent names |
 | SEC-6 | Agent `--version` subprocess shall have a 2-second timeout to prevent hanging | -- | Unit test: mock slow subprocess |
 | SEC-7 | Agent detection shall use `std::process::Command::new()` with explicit binary name, never shell execution (no `sh -c` or `cmd /c`) | -- | Code review: verify no shell invocations |
@@ -392,7 +392,7 @@ Based on this review, the implementation MUST satisfy:
 
 | ID | Finding | Severity | Category | Recommendation | Status |
 |----|---------|----------|----------|----------------|--------|
-| F1 | `--config-dir` accepts arbitrary paths without validation | Medium | Input Validation | Implement path canonicalization and traversal rejection (SEC-4) | Open |
+| F1 | *(Resolved)* `--config-dir` was removed (S-4 deferred). Config paths are resolved internally and validated via `validate_config_path()` | Low | Input Validation | Path validation implemented (SEC-4) | Mitigated |
 | F2 | No specification for config file permissions after write | Low | Data Protection | Explicitly set file permissions in ConfigWriter (SEC-1) | Open |
 | F3 | Agent subprocess timeout not specified in AR interface | Low | Availability | Add 2-second timeout to agent detection subprocess (SEC-6) | Open |
 
@@ -409,7 +409,7 @@ Based on this review, the implementation MUST satisfy:
 
 ## Open Questions `@human-review`
 
-- [ ] **Q1:** Should `--config-dir` be restricted to directories under `$HOME` or project root, or just reject `..` traversal? Stricter is safer but may block legitimate use cases.
+- [x] **Q1:** *(Resolved)* `--config-dir` was deferred (S-4). Config directories are resolved internally per scope, eliminating user-supplied path traversal risk. `validate_config_path()` rejects `..` components as defense-in-depth.
 - [ ] **Q2:** Should `.bak` files be created with more restrictive permissions than the original (e.g., read-only) to prevent accidental modification?
 
 ---

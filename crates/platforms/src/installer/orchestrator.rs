@@ -115,7 +115,12 @@ impl InstallOrchestrator {
                 status: InstallStatus::NotFound,
                 config_path: None,
                 version_detected: None,
-                error: Some(format!("No installer registered for '{agent_name}'")),
+                error: Some(
+                    InstallError::AgentNotFound {
+                        agent: agent_name.to_string(),
+                    }
+                    .to_string(),
+                ),
             };
         };
 
@@ -193,36 +198,35 @@ mod tests {
     use types::install::{AgentInfo, ConfigFile, InstallScope};
 
     struct FakeInstaller {
-        name: String,
+        name: &'static str,
         detected: bool,
     }
 
     impl FakeInstaller {
-        fn detected(name: &str) -> Box<dyn AgentInstaller> {
+        fn detected(name: &'static str) -> Box<dyn AgentInstaller> {
             Box::new(Self {
-                name: name.to_string(),
+                name,
                 detected: true,
             })
         }
 
-        fn not_detected(name: &str) -> Box<dyn AgentInstaller> {
+        fn not_detected(name: &'static str) -> Box<dyn AgentInstaller> {
             Box::new(Self {
-                name: name.to_string(),
+                name,
                 detected: false,
             })
         }
     }
 
     impl AgentInstaller for FakeInstaller {
-        #[allow(clippy::unnecessary_literal_bound)]
         fn agent_name(&self) -> &'static str {
-            Box::leak(self.name.clone().into_boxed_str())
+            self.name
         }
 
         fn detect(&self) -> Option<AgentInfo> {
             if self.detected {
                 Some(AgentInfo {
-                    name: self.name.clone(),
+                    name: self.name.to_string(),
                     binary_path: PathBuf::from(format!("/usr/bin/{}", self.name)),
                     version: Some("1.0.0".to_string()),
                 })
@@ -240,10 +244,11 @@ mod tests {
                 InstallScope::Project { root } => root.clone(),
                 InstallScope::Global => PathBuf::from("/tmp/global"),
             };
+            let name = self.name;
             Ok(vec![ConfigFile {
-                target_path: dir.join(format!(".{}/config.json", self.name)),
-                content: format!(r#"{{"agent": "{}"}}"#, self.name),
-                description: format!("{} config", self.name),
+                target_path: dir.join(format!(".{name}/config.json")),
+                content: format!(r#"{{"agent": "{name}"}}"#),
+                description: format!("{name} config"),
             }])
         }
 

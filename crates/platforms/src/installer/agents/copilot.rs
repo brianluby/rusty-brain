@@ -5,6 +5,7 @@
 //! a placeholder config until the extension format is confirmed.
 
 use std::path::Path;
+use std::process::{Command, Stdio};
 
 use types::install::{AgentInfo, ConfigFile, InstallError, InstallScope};
 
@@ -24,6 +25,16 @@ impl AgentInstaller for CopilotInstaller {
     fn detect(&self) -> Option<AgentInfo> {
         // Copilot CLI is accessed via `gh copilot` — detect `gh` binary.
         let binary_path = find_binary_on_path("gh")?;
+
+        // Verify `gh copilot` subcommand is available (gh may exist without copilot).
+        let copilot_check = Command::new(&binary_path)
+            .args(["help", "copilot"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+        if !copilot_check.is_ok_and(|s| s.success()) {
+            return None;
+        }
 
         let version = detect_binary_version(&binary_path);
 

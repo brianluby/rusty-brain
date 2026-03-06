@@ -12,7 +12,7 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::mpsc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use types::install::{AgentInfo, ConfigFile, InstallError, InstallScope};
 
@@ -90,6 +90,10 @@ pub fn find_binary_on_path(name: &str) -> Option<PathBuf> {
             if with_cmd.is_file() {
                 return Some(with_cmd);
             }
+            let with_bat = dir.join(format!("{name}.bat"));
+            if with_bat.is_file() {
+                return Some(with_bat);
+            }
         }
     }
     None
@@ -119,7 +123,18 @@ pub fn detect_binary_version(binary_path: &Path) -> Option<String> {
         let _ = tx.send(buf);
     });
 
+    let deadline = Instant::now() + Duration::from_secs(2);
     if let Ok(stdout) = rx.recv_timeout(Duration::from_secs(2)) {
+        // Enforce timeout on child lifetime too — a process that closes stdout
+        // but hangs in cleanup would block child.wait() indefinitely.
+        while Instant::now() < deadline {
+            match child.try_wait() {
+                Ok(Some(_)) => return parse_version_string(&stdout),
+                Ok(None) => std::thread::sleep(Duration::from_millis(10)),
+                Err(_) => return None,
+            }
+        }
+        let _ = child.kill();
         let _ = child.wait();
         parse_version_string(&stdout)
     } else {

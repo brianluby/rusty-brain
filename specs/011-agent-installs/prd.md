@@ -9,7 +9,7 @@
 **Feature Branch**: `011-agent-installs`
 **Created**: 2026-03-05
 **Status**: Draft
-**Input**: User description: "Agentic agent installs for opencode, github copilot-cli, codex and gemini."
+**Input**: User description: "Agentic agent installs for opencode, GitHub Copilot CLI, codex and gemini."
 
 ---
 
@@ -210,7 +210,7 @@ An AI coding agent is working in a project and discovers rusty-brain is availabl
 - **EC-4:** Binary installed but agent config becomes stale after agent upgrade — `--reconfigure` regenerates agent config files.
 - **EC-5:** Install run in CI/CD with no agents installed — install skips agent configuration, exits with a warning.
 - **EC-6:** Agent detected but version cannot be determined — proceed with latest known config format, emit a warning.
-- **EC-7:** User has custom agent config directory (non-default location) — `--config-dir` override per agent.
+- **EC-7:** User has custom agent config directory (non-default location) — *(deferred: S-4 `--config-dir` not implemented in this PR; agents use platform-standard config directories)*.
 
 ---
 
@@ -313,7 +313,7 @@ stateDiagram-v2
 - [ ] **S-1:** The system shall support a `--reconfigure` flag that regenerates agent configuration files without replacing the binary, creating `.bak` copies of existing files before overwriting. Only the most recent `.bak` is kept per config file (repeated runs overwrite previous `.bak`).
 - [ ] **S-2:** The system shall log installation actions and results via the standard `RUSTY_BRAIN_LOG` environment variable.
 - [ ] **S-3:** The system shall detect the installed version of each agent and generate version-compatible configuration.
-- [ ] **S-4:** The system shall support a `--config-dir` override for non-default configuration locations. When multiple agents are being configured, the override applies to all agents (each agent's config files are written into the specified directory).
+- [ ] **S-4:** *(Deferred)* The system shall support a `--config-dir` override for non-default configuration locations. When multiple agents are being configured, the override applies to all agents (each agent's config files are written into the specified directory).
 
 ### Could Have (C) — Nice to have, if time permits `@human-review`
 - [ ] **C-1:** The system could provide a `--dry-run` flag that shows what would be installed without making changes.
@@ -384,7 +384,7 @@ erDiagram
 //   --global              Install config in user-level directories (~/.config/)
 //   --json                Force JSON output (auto-enabled in non-TTY mode)
 //   --reconfigure         Regenerate config files, backup existing
-//   --config-dir <PATH>   Override config directory (applies to all agents in a multi-agent install; when used with --agents specifying multiple agents, the same override directory is used for each)
+//   (--config-dir deferred: S-4 not implemented in this PR)
 
 // JSON Output (success)
 {
@@ -497,11 +497,11 @@ graph LR
 | Internet Exposure | No | Install is fully offline, no network calls |
 | Sensitive Data | No | Config files contain paths and command definitions, no secrets |
 | Authentication Required | No | Local filesystem operations only |
-| Security Review Required | Yes | Review file permissions on generated configs; ensure no path traversal in `--config-dir` |
+| Security Review Required | Yes | Review file permissions on generated configs; validate path components against traversal |
 
 Additional considerations:
 - Generated config files should have appropriate permissions (not world-writable)
-- `--config-dir` input must be validated to prevent path traversal attacks
+- Config paths must be validated to prevent path traversal attacks
 - Binary path references in config files must point to the actual rusty-brain binary, not be injectable
 - `.bak` files should inherit the permissions of the originals
 
