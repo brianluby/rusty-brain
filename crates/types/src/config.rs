@@ -38,7 +38,7 @@ pub fn sanitize_platform_name(name: &str) -> String {
 #[serde(rename_all = "camelCase")]
 #[serde(default)]
 pub struct MindConfig {
-    /// Path to the memvid memory database file. Default: `.agent-brain/mind.mv2`.
+    /// Path to the memvid memory database file. Default: `.rusty-brain/mind.mv2`.
     pub memory_path: PathBuf,
     /// Maximum number of observations included in injected context. Default: 20.
     pub max_context_observations: u32,
@@ -60,7 +60,7 @@ pub struct MindConfig {
 impl Default for MindConfig {
     fn default() -> Self {
         Self {
-            memory_path: PathBuf::from(".agent-brain/mind.mv2"),
+            memory_path: PathBuf::from(".rusty-brain/mind.mv2"),
             max_context_observations: 20,
             max_context_tokens: 2000,
             auto_compress: true,

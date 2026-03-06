@@ -1,5 +1,5 @@
 pub use platforms::bootstrap::{
-    Diagnostic, DiagnosticLevel, detect_legacy_path, platform_opt_in, should_process,
+    Diagnostic, DiagnosticLevel, detect_legacy_paths, platform_opt_in, should_process,
 };
 
 use std::path::Path;

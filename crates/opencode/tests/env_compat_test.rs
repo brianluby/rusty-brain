@@ -163,7 +163,7 @@ fn resolve_memory_path_with_valid_dir() {
             let path = result.unwrap();
             // Without opt-in, should use canonical path
             assert!(
-                path.to_string_lossy().contains(".agent-brain/mind.mv2"),
+                path.to_string_lossy().contains(".rusty-brain/mind.mv2"),
                 "without opt-in, should use canonical path: {}",
                 path.display()
             );
@@ -235,7 +235,7 @@ fn mind_config_uses_legacy_path_without_opt_in() {
             assert!(
                 cfg.memory_path
                     .to_string_lossy()
-                    .contains(".agent-brain/mind.mv2"),
+                    .contains(".rusty-brain/mind.mv2"),
                 "without opt-in, config should use canonical path: {}",
                 cfg.memory_path.display()
             );
@@ -284,7 +284,7 @@ fn mind_config_empty_memory_path_env_falls_back_to_platform_resolution() {
             assert!(
                 cfg.memory_path
                     .to_string_lossy()
-                    .contains(".agent-brain/mind.mv2"),
+                    .contains(".rusty-brain/mind.mv2"),
                 "empty MEMVID_PLATFORM_MEMORY_PATH should fall back to platform resolution: {}",
                 cfg.memory_path.display()
             );

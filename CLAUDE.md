@@ -47,7 +47,7 @@ Feature artifacts live in `specs/<NNN>-<feature-name>/` with: `spec.md`, `prd.md
 - `.specify/` — Workflow engine: config, bash scripts, markdown templates, constitution
 - `.specify/memory/constitution.md` — 13 core principles governing all development (non-negotiable)
 - `.claude/commands/` — Speckit slash commands for Claude Code
-- `.agent-brain/mind.mv2` — Memvid-encoded persistent memory database
+- `.rusty-brain/mind.mv2` — Memvid-encoded persistent memory database
 
 ### Git Mode
 
@@ -80,15 +80,17 @@ The constitution (`.specify/memory/constitution.md` v2.0.0) governs all implemen
 - ulid, fs2 (003-core-memory-engine)
 - serde, serde_json, uuid, chrono, semver, thiserror (005-platform-adapter-system)
 - Rust stable, edition 2024, MSRV 1.85.0 + clap 4 (subcommand dispatch), serde/serde_json (JSON protocol), tracing (diagnostics), existing workspace crates (core, types, platforms) (006-claude-code-hooks)
-- `.agent-brain/mind.mv2` (memvid-encrypted observations), `.agent-brain/.dedup-cache.json` (hash-based dedup), `.install-version` (version marker) (006-claude-code-hooks)
+- `.rusty-brain/mind.mv2` (memvid-encrypted observations), `.rusty-brain/.dedup-cache.json` (hash-based dedup), `.rusty-brain/.install-version` (version marker) (006-claude-code-hooks)
 - clap 4 (derive), tracing 0.1 (007-cli-scripts)
 - `regex` crate (new), workspace `tracing` (for WARN-level fallback logging) (004-tool-output-compression)
 - Workspace crates (`core`, `platforms`, `compression`, `types`), `serde`, `serde_json`, `tracing`, `chrono`, `tempfile` (regular dep for atomic sidecar writes) (008-opencode-plugin)
-- `.agent-brain/mind.mv2` (via `crates/core` Mind API), `.opencode/session-<id>.json` (sidecar files on local filesystem) (008-opencode-plugin)
+- `.rusty-brain/mind.mv2` (via `crates/core` Mind API), `.opencode/session-<id>.json` (sidecar files on local filesystem) (008-opencode-plugin)
 - Rust stable, edition 2024, MSRV 1.85.0 (binary already built by workspace). Shell scripts: POSIX sh + PowerShell 5.1+. + cross-rs (CI only, for Linux musl cross-compilation), `houseabsolute/actions-rust-cross` GitHub Action. No new Rust crate dependencies. (009-plugin-packaging)
 - N/A (no new storage; existing `.mv2` files are preserved, never touched). (009-plugin-packaging)
 - Rust stable, edition 2024, MSRV 1.85.0 + memvid-core (pinned rev `fbddef4`), criterion 0.5 (benchmarks), cargo-fuzz/libFuzzer (fuzz testing), serde/serde_json (fixture parsing), tempfile (test isolation), assert_cmd/predicates (CLI tests) (010-testing-migration)
 - `.mv2` files via memvid-core (read/write compatibility), `tests/fixtures/` (committed test data) (010-testing-migration)
+- Rust stable, edition 2024, MSRV 1.85.0 + serde, serde_json, fs2, chrono (all existing workspace deps) (012-default-memory-path)
+- `.mv2` files on local filesystem, `.dedup-cache.json`, `.install-version` (012-default-memory-path)
 
 All crates already present in workspace `Cargo.toml`. Diagnostics are in-memory only; memory path resolution produces paths but does not perform I/O.
 

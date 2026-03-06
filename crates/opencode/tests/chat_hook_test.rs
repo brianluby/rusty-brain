@@ -122,7 +122,7 @@ fn memory_path_uses_legacy_first() {
     assert!(result.is_ok());
 
     // Verify the legacy path was created
-    let legacy_path = cwd.join(".agent-brain").join("mind.mv2");
+    let legacy_path = cwd.join(".rusty-brain").join("mind.mv2");
     assert!(
         legacy_path.exists(),
         "legacy memory path should be created: {}",
@@ -137,7 +137,7 @@ fn invalid_cwd_returns_error() {
     let dir = tempfile::tempdir().unwrap();
     let blocker = dir.path().join("blocker");
     std::fs::write(&blocker, "not a directory").unwrap();
-    // cwd is a child of a file — creating .agent-brain/ under it is impossible
+    // cwd is a child of a file — creating .rusty-brain/ under it is impossible
     let cwd = blocker.join("fake_project");
     let input = make_hook_input(&cwd.to_string_lossy());
 

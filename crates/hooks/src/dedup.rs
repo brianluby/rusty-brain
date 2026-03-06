@@ -28,7 +28,7 @@ impl DedupCache {
     #[must_use]
     pub fn new(project_dir: &Path) -> Self {
         Self {
-            cache_path: project_dir.join(".agent-brain").join(CACHE_FILENAME),
+            cache_path: project_dir.join(".rusty-brain").join(CACHE_FILENAME),
         }
     }
 
@@ -181,11 +181,11 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn new_sets_cache_path_under_agent_brain_dir() {
+    fn new_sets_cache_path_under_rusty_brain_dir() {
         let cache = DedupCache::new(Path::new("/tmp/project"));
         assert_eq!(
             cache.cache_path,
-            PathBuf::from("/tmp/project/.agent-brain/.dedup-cache.json")
+            PathBuf::from("/tmp/project/.rusty-brain/.dedup-cache.json")
         );
     }
 

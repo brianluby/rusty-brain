@@ -70,28 +70,28 @@ fn smart_install_error_is_hookioerror_variant() {
 
 #[cfg(unix)]
 #[test]
-fn readonly_agent_brain_dir_prevents_mv2_creation() {
+fn readonly_rusty_brain_dir_prevents_mv2_creation() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain = tmp.path().join(".agent-brain");
-    std::fs::create_dir_all(&agent_brain).expect("create .agent-brain");
+    let rusty_brain = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain).expect("create .rusty-brain");
 
-    // Make .agent-brain read-only
-    std::fs::set_permissions(&agent_brain, std::fs::Permissions::from_mode(0o444))
+    // Make .rusty-brain read-only
+    std::fs::set_permissions(&rusty_brain, std::fs::Permissions::from_mode(0o444))
         .expect("set permissions");
 
     // Attempt to write a file inside the read-only directory
-    let test_file = agent_brain.join("test-write.tmp");
+    let test_file = rusty_brain.join("test-write.tmp");
     let write_result = std::fs::write(&test_file, "test");
 
     // Restore permissions before assertions
-    std::fs::set_permissions(&agent_brain, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(&rusty_brain, std::fs::Permissions::from_mode(0o755))
         .expect("restore permissions");
 
     assert!(
         write_result.is_err(),
-        "writing to read-only .agent-brain/ should fail"
+        "writing to read-only .rusty-brain/ should fail"
     );
 
     let err = write_result.unwrap_err();
@@ -108,11 +108,11 @@ fn dedup_cache_unwritable_produces_error() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain = tmp.path().join(".agent-brain");
-    std::fs::create_dir_all(&agent_brain).expect("create .agent-brain");
+    let rusty_brain = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain).expect("create .rusty-brain");
 
     // Create the dedup cache file as read-only
-    let dedup_path = agent_brain.join(".dedup-cache.json");
+    let dedup_path = rusty_brain.join(".dedup-cache.json");
     std::fs::write(&dedup_path, "{}").expect("write initial cache");
     std::fs::set_permissions(&dedup_path, std::fs::Permissions::from_mode(0o444))
         .expect("set read-only");
@@ -136,9 +136,11 @@ fn install_version_unwritable_produces_error() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
+    let rusty_brain_dir = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain_dir).expect("create .rusty-brain dir");
 
     // Create .install-version as read-only
-    let version_path = tmp.path().join(".install-version");
+    let version_path = rusty_brain_dir.join(".install-version");
     std::fs::write(&version_path, "0.0.0-old").expect("write old version");
     std::fs::set_permissions(&version_path, std::fs::Permissions::from_mode(0o444))
         .expect("set read-only");

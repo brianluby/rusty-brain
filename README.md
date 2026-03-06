@@ -48,7 +48,7 @@ All of the following must pass before merge:
 
 Canonical runtime memory-path resolution is owned by `platforms::resolve_memory_path(...)`.
 
-- Default mode (`MEMVID_PLATFORM_PATH_OPT_IN` unset): `.agent-brain/mind.mv2`
+- Default mode (`MEMVID_PLATFORM_PATH_OPT_IN` unset): `.rusty-brain/mind.mv2`
 - Platform opt-in mode (`MEMVID_PLATFORM_PATH_OPT_IN=1`): `.{platform}/mind-{platform}.mv2`
 - Explicit override (`MEMVID_PLATFORM_MEMORY_PATH`) takes precedence over policy resolution
 - CLI override (`--memory-path`) takes precedence over all environment-based resolution
