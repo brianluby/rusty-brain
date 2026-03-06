@@ -1,12 +1,11 @@
 {
-  "description": "rusty-brain hook registrations for Claude Code lifecycle events",
   "hooks": {
     "SessionStart": [
       {
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks session-start",
+            "command": "rusty-brain-hooks session-start",
             "timeout": 30
           }
         ]
@@ -18,7 +17,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks post-tool-use",
+            "command": "rusty-brain-hooks post-tool-use",
             "timeout": 30
           }
         ]
@@ -29,7 +28,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks stop",
+            "command": "rusty-brain-hooks stop",
             "timeout": 30
           }
         ]

@@ -181,259 +181,6 @@ parse_release_json() {
   printf '%s\n' "$_url"
 }
 
-# ---------- install_plugin_files ---------------------------------------------
-
-install_plugin_files() {
-  _version="${1:-}"
-  _plugin_dir="${2:-}"
-  _extract_dir="${3:-}"
-
-  # Strip v prefix for semver in manifests
-  _semver="$(printf '%s' "$_version" | sed 's/^v//')"
-
-  printf 'Installing plugin to %s\n' "$_plugin_dir"
-
-  mkdir -p "$_plugin_dir/.claude-plugin"
-  mkdir -p "$_plugin_dir/hooks"
-  mkdir -p "$_plugin_dir/skills/mind"
-  mkdir -p "$_plugin_dir/skills/memory"
-  mkdir -p "$_plugin_dir/commands"
-
-  # plugin.json
-  cat > "$_plugin_dir/.claude-plugin/plugin.json" <<'PLUGIN_EOF'
-{
-  "name": "rusty-brain",
-  "version": "VERSION_PLACEHOLDER",
-  "description": "Persistent AI memory system using memvid video-encoded storage",
-  "author": {
-    "name": "Brian Luby",
-    "url": "https://github.com/brianluby"
-  },
-  "repository": "https://github.com/brianluby/rusty-brain",
-  "license": "Apache-2.0",
-  "keywords": ["memory", "ai", "memvid", "persistent-memory"],
-  "skills": ["./skills/mind/", "./skills/memory/"],
-  "hooks": "./hooks/hooks.json",
-  "commands": [
-    "./commands/ask.md",
-    "./commands/search.md",
-    "./commands/recent.md",
-    "./commands/stats.md"
-  ]
-}
-PLUGIN_EOF
-  sed -i.bak "s/VERSION_PLACEHOLDER/$_semver/" "$_plugin_dir/.claude-plugin/plugin.json"
-  rm -f "$_plugin_dir/.claude-plugin/plugin.json.bak"
-
-  # marketplace.json
-  cat > "$_plugin_dir/marketplace.json" <<'MARKET_EOF'
-{
-  "name": "rusty-brain-marketplace",
-  "description": "rusty-brain plugin marketplace manifest",
-  "owner": {
-    "name": "Brian Luby",
-    "url": "https://github.com/brianluby"
-  },
-  "plugins": [
-    {
-      "name": "rusty-brain",
-      "description": "Persistent AI memory system using memvid video-encoded storage",
-      "version": "VERSION_PLACEHOLDER",
-      "source": "./"
-    }
-  ]
-}
-MARKET_EOF
-  sed -i.bak "s/VERSION_PLACEHOLDER/$_semver/" "$_plugin_dir/marketplace.json"
-  rm -f "$_plugin_dir/marketplace.json.bak"
-
-  # hooks.json
-  cat > "$_plugin_dir/hooks/hooks.json" <<'HOOKS_EOF'
-{
-  "description": "rusty-brain hook registrations for Claude Code lifecycle events",
-  "hooks": {
-    "SessionStart": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks session-start",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "PostToolUse": [
-      {
-        "matcher": "*",
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks post-tool-use",
-            "timeout": 30
-          }
-        ]
-      }
-    ],
-    "Stop": [
-      {
-        "hooks": [
-          {
-            "type": "command",
-            "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks stop",
-            "timeout": 30
-          }
-        ]
-      }
-    ]
-  }
-}
-HOOKS_EOF
-
-  # skills/mind/SKILL.md
-  cat > "$_plugin_dir/skills/mind/SKILL.md" <<'MIND_EOF'
----
-name: mind
-description: Search and manage Claude's persistent memory stored in a single portable .mv2 file
----
-
-# Claude Mind
-
-Search and manage Claude's persistent memory.
-
-## Commands
-
-- `/mind:search <query>` - Search memories for specific content or patterns
-- `/mind:ask <question>` - Ask questions about memories and get context-aware answers
-- `/mind:recent` - Show recent memories and activity timeline
-- `/mind:stats` - Show memory statistics and storage information
-
-## Usage
-
-All memory operations use the `rusty-brain` CLI binary. Memories are stored in `.agent-brain/mind.mv2` and persist across conversations.
-
-### Search memories
-```bash
-rusty-brain find "<query>"
-```
-
-### Ask a question
-```bash
-rusty-brain ask "<question>"
-```
-
-### View recent activity
-```bash
-rusty-brain timeline
-```
-
-### View statistics
-```bash
-rusty-brain stats
-```
-
-_Memories are captured automatically from your tool use via hooks._
-MIND_EOF
-
-  # skills/memory/SKILL.md
-  cat > "$_plugin_dir/skills/memory/SKILL.md" <<'MEMORY_EOF'
----
-name: memory
-description: Claude Mind - Search and manage Claude's persistent memory stored in a single portable .mv2 file
----
-
-# Claude Memory
-
-Capture and store memories for persistent context across conversations.
-
-## How It Works
-
-Memory capture happens automatically through Claude Code hooks:
-- **SessionStart**: Loads existing memory context
-- **PostToolUse**: Captures relevant observations from tool interactions
-- **Stop**: Persists captured memories to the `.mv2` file
-
-## Storage
-
-Memories are stored in `.agent-brain/mind.mv2` using memvid video-encoded format. This file is portable and persists across sessions.
-
-## Manual Memory Operations
-
-Use the `mind` skill for manual memory operations:
-- `/mind:search <query>` - Search existing memories
-- `/mind:ask <question>` - Ask questions about stored context
-- `/mind:recent` - View recent activity
-- `/mind:stats` - View storage statistics
-MEMORY_EOF
-
-  # commands/ask.md
-  cat > "$_plugin_dir/commands/ask.md" <<'ASK_EOF'
----
-description: Ask questions about memories and get context-aware answers
-argument-hint: "<question>"
-allowed-tools: ["Bash"]
----
-
-Ask a question about stored memories:
-
-```bash
-rusty-brain ask "$ARGUMENTS"
-```
-ASK_EOF
-
-  # commands/search.md
-  cat > "$_plugin_dir/commands/search.md" <<'SEARCH_EOF'
----
-description: Search memories for specific content or patterns
-argument-hint: "<query>"
-allowed-tools: ["Bash"]
----
-
-Search memories for matching content:
-
-```bash
-rusty-brain find "$ARGUMENTS"
-```
-SEARCH_EOF
-
-  # commands/recent.md
-  cat > "$_plugin_dir/commands/recent.md" <<'RECENT_EOF'
----
-description: Show recent memories and activity timeline
-allowed-tools: ["Bash"]
----
-
-Show recent memory activity:
-
-```bash
-rusty-brain timeline
-```
-RECENT_EOF
-
-  # commands/stats.md
-  cat > "$_plugin_dir/commands/stats.md" <<'STATS_EOF'
----
-description: Show memory statistics and storage information
-allowed-tools: ["Bash"]
----
-
-Show memory statistics:
-
-```bash
-rusty-brain stats
-```
-STATS_EOF
-
-  # Copy hooks binary from extracted archive (required for hooks.json)
-  if [ -f "$_extract_dir/rusty-brain-hooks" ]; then
-    cp "$_extract_dir/rusty-brain-hooks" "$_plugin_dir/rusty-brain-hooks"
-    chmod +x "$_plugin_dir/rusty-brain-hooks"
-  else
-    err "rusty-brain-hooks binary missing from release archive (expected at $_extract_dir/rusty-brain-hooks). Aborting plugin installation."
-    return 1
-  fi
-}
-
 # ---------- main -------------------------------------------------------------
 
 main() {
@@ -441,7 +188,6 @@ main() {
   printf 'Detected platform: %s\n' "$target"
 
   install_dir="${RUSTY_BRAIN_INSTALL_DIR:-$HOME/.local/bin}"
-  plugin_dir="$HOME/.claude/plugins/rusty-brain"
 
   # Validate version if provided
   version="${RUSTY_BRAIN_VERSION:-}"
@@ -546,11 +292,11 @@ main() {
   cp "$_extract_dir/rusty-brain" "${install_dir}/rusty-brain"
   chmod +x "${install_dir}/rusty-brain"
 
-  # Install plugin files — NEVER touch ~/.agent-brain/ (SEC-1)
-  if [ -n "$_existing_version" ]; then
-    printf 'Updating plugin at %s\n' "$plugin_dir"
+  # Install hooks binary to PATH (used by plugin hooks.json)
+  if [ -f "$_extract_dir/rusty-brain-hooks" ]; then
+    cp "$_extract_dir/rusty-brain-hooks" "${install_dir}/rusty-brain-hooks"
+    chmod +x "${install_dir}/rusty-brain-hooks"
   fi
-  install_plugin_files "$version" "$plugin_dir" "$_extract_dir"
 
   # Check if install dir is in PATH (informational only, never modify shell config M-11)
   case ":${PATH}:" in
@@ -570,6 +316,11 @@ main() {
   else
     printf 'rusty-brain %s installed successfully!\n' "$version"
   fi
+
+  printf '\nTo install the Claude Code plugin:\n'
+  printf '  1. Start Claude Code\n'
+  printf '  2. Run: /plugin marketplace add brianluby/rusty-brain\n'
+  printf '  3. Run: /plugin install rusty-brain@rusty-brain\n'
 }
 
 # ---------- entry point ------------------------------------------------------

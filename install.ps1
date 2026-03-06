@@ -281,221 +281,10 @@ try {
 
     Copy-Item -Path (Join-Path $extractDir "rusty-brain.exe") -Destination $binaryPath -Force
 
-    # Create plugin directory structure
-    $pluginDir = Join-Path $env:APPDATA ".claude\plugins\rusty-brain"
-    $action2 = if ($existingVersion) { "Updating plugin at" } else { "Installing plugin to" }
-    Write-Host "$action2 $pluginDir\"
-
-    $dirs = @(
-        (Join-Path $pluginDir ".claude-plugin")
-        (Join-Path $pluginDir "hooks")
-        (Join-Path $pluginDir "skills\mind")
-        (Join-Path $pluginDir "skills\memory")
-        (Join-Path $pluginDir "commands")
-    )
-
-    foreach ($d in $dirs) {
-        if (-not (Test-Path $d)) {
-            New-Item -ItemType Directory -Path $d -Force | Out-Null
-        }
-    }
-
-    # Write plugin.json
-    @"
-{
-  "name": "rusty-brain",
-  "version": "$versionBare",
-  "description": "Persistent AI memory system using memvid video-encoded storage",
-  "author": {
-    "name": "Brian Luby",
-    "url": "https://github.com/brianluby"
-  },
-  "repository": "https://github.com/brianluby/rusty-brain",
-  "license": "Apache-2.0",
-  "keywords": ["memory", "ai", "memvid", "persistent-memory"],
-  "skills": ["./skills/mind/", "./skills/memory/"],
-  "hooks": "./hooks/hooks.json",
-  "commands": [
-    "./commands/ask.md",
-    "./commands/search.md",
-    "./commands/recent.md",
-    "./commands/stats.md"
-  ]
-}
-"@ | Set-Content -Path (Join-Path $pluginDir ".claude-plugin\plugin.json") -Encoding UTF8
-
-    # Write marketplace.json
-    @"
-{
-  "name": "rusty-brain-marketplace",
-  "description": "rusty-brain plugin marketplace manifest",
-  "owner": {
-    "name": "Brian Luby",
-    "url": "https://github.com/brianluby"
-  },
-  "plugins": [
-    {
-      "name": "rusty-brain",
-      "description": "Persistent AI memory system using memvid video-encoded storage",
-      "version": "$versionBare",
-      "source": "./"
-    }
-  ]
-}
-"@ | Set-Content -Path (Join-Path $pluginDir "marketplace.json") -Encoding UTF8
-
-    # Write hooks.json
-    @'
-{
-  "description": "rusty-brain hook registrations for Claude Code lifecycle events",
-  "hooks": {
-    "SessionStart": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks session-start", "timeout": 30}]}],
-    "PostToolUse": [{"matcher": "*", "hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks post-tool-use", "timeout": 30}]}],
-    "Stop": [{"hooks": [{"type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/rusty-brain-hooks stop", "timeout": 30}]}]
-  }
-}
-'@ | Set-Content -Path (Join-Path $pluginDir "hooks\hooks.json") -Encoding UTF8
-
-    # Write skills/mind/SKILL.md
-    @'
----
-name: mind
-description: Search and manage Claude's persistent memory stored in a single portable .mv2 file
----
-
-# Claude Mind
-
-Search and manage Claude's persistent memory.
-
-## Commands
-
-- `/mind:search <query>` - Search memories for specific content or patterns
-- `/mind:ask <question>` - Ask questions about memories and get context-aware answers
-- `/mind:recent` - Show recent memories and activity timeline
-- `/mind:stats` - Show memory statistics and storage information
-
-## Usage
-
-All memory operations use the `rusty-brain` CLI binary. Memories are stored in `.agent-brain/mind.mv2` and persist across conversations.
-
-### Search memories
-```bash
-rusty-brain find "<query>"
-```
-
-### Ask a question
-```bash
-rusty-brain ask "<question>"
-```
-
-### View recent activity
-```bash
-rusty-brain timeline
-```
-
-### View statistics
-```bash
-rusty-brain stats
-```
-
-_Memories are captured automatically from your tool use via hooks._
-'@ | Set-Content -Path (Join-Path $pluginDir "skills\mind\SKILL.md") -Encoding UTF8
-
-    # Write skills/memory/SKILL.md
-    @'
----
-name: memory
-description: Claude Mind - Search and manage Claude's persistent memory stored in a single portable .mv2 file
----
-
-# Claude Memory
-
-Capture and store memories for persistent context across conversations.
-
-## How It Works
-
-Memory capture happens automatically through Claude Code hooks:
-- **SessionStart**: Loads existing memory context
-- **PostToolUse**: Captures relevant observations from tool interactions
-- **Stop**: Persists captured memories to the `.mv2` file
-
-## Storage
-
-Memories are stored in `.agent-brain/mind.mv2` using memvid video-encoded format. This file is portable and persists across sessions.
-
-## Manual Memory Operations
-
-Use the `mind` skill for manual memory operations:
-- `/mind:search <query>` - Search existing memories
-- `/mind:ask <question>` - Ask questions about stored context
-- `/mind:recent` - View recent activity
-- `/mind:stats` - View storage statistics
-'@ | Set-Content -Path (Join-Path $pluginDir "skills\memory\SKILL.md") -Encoding UTF8
-
-    # Write commands/ask.md
-    @'
----
-description: Ask questions about memories and get context-aware answers
-argument-hint: "<question>"
-allowed-tools: ["Bash"]
----
-
-Ask a question about stored memories:
-
-```bash
-rusty-brain ask "$ARGUMENTS"
-```
-'@ | Set-Content -Path (Join-Path $pluginDir "commands\ask.md") -Encoding UTF8
-
-    # Write commands/search.md
-    @'
----
-description: Search memories for specific content or patterns
-argument-hint: "<query>"
-allowed-tools: ["Bash"]
----
-
-Search memories for matching content:
-
-```bash
-rusty-brain find "$ARGUMENTS"
-```
-'@ | Set-Content -Path (Join-Path $pluginDir "commands\search.md") -Encoding UTF8
-
-    # Write commands/recent.md
-    @'
----
-description: Show recent memories and activity timeline
-allowed-tools: ["Bash"]
----
-
-Show recent memory activity:
-
-```bash
-rusty-brain timeline
-```
-'@ | Set-Content -Path (Join-Path $pluginDir "commands\recent.md") -Encoding UTF8
-
-    # Write commands/stats.md
-    @'
----
-description: Show memory statistics and storage information
-allowed-tools: ["Bash"]
----
-
-Show memory statistics:
-
-```bash
-rusty-brain stats
-```
-'@ | Set-Content -Path (Join-Path $pluginDir "commands\stats.md") -Encoding UTF8
-
-    # Copy hooks binary to plugin directory
-    $hooksSrc = Join-Path $extractDir "rusty-brain-hooks.exe"
-    if (Test-Path $hooksSrc) {
-        Copy-Item -Path $hooksSrc -Destination (Join-Path $pluginDir "rusty-brain-hooks.exe") -Force
-    } else {
-        throw "Installation failed: required hooks binary 'rusty-brain-hooks.exe' was not found at '$hooksSrc'. The hooks configuration references this binary, so the archive is incomplete."
+    # Install hooks binary to PATH
+    $hooksBin = Join-Path $extractDir "rusty-brain-hooks.exe"
+    if (Test-Path $hooksBin) {
+        Copy-Item -Path $hooksBin -Destination (Join-Path $installDir "rusty-brain-hooks.exe") -Force
     }
 
     # Check PATH and print result
@@ -514,6 +303,12 @@ rusty-brain stats
     } else {
         Write-Host "rusty-brain $versionTag installed successfully!"
     }
+
+    Write-Host ""
+    Write-Host "To install the Claude Code plugin:"
+    Write-Host "  1. Start Claude Code"
+    Write-Host "  2. Run: /plugin marketplace add brianluby/rusty-brain"
+    Write-Host "  3. Run: /plugin install rusty-brain@rusty-brain"
 
 } finally {
     # Clean up temp directory (SEC-10)
