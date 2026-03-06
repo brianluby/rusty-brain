@@ -48,8 +48,14 @@ impl AgentInstaller for CopilotInstaller {
                 }
                 Ok(None) => {
                     if start.elapsed() >= timeout {
-                        let _ = child.kill();
-                        let _ = child.wait();
+                        match child.kill() {
+                            Ok(()) => {
+                                let _ = child.wait();
+                            }
+                            Err(_) => {
+                                // If we cannot kill the child, avoid blocking indefinitely on wait.
+                            }
+                        }
                         return None;
                     }
                     std::thread::sleep(Duration::from_millis(10));
