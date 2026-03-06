@@ -9,7 +9,7 @@
 
 The `.rusty-brain/` directory is the self-contained data directory for rusty-brain at the repository root.
 
-```
+```text
 .rusty-brain/
 ├── mind.mv2              # memvid-encoded memory database
 ├── .dedup-cache.json     # hash-based dedup cache (post-tool-use)
@@ -45,7 +45,7 @@ The `.rusty-brain/` directory is the self-contained data directory for rusty-bra
 | Constant | Old Value | New Value | Location |
 |----------|-----------|-----------|----------|
 | `DEFAULT_MEMORY_DIR` (new) | N/A | `.rusty-brain` | `crates/platforms/src/path_policy.rs` |
-| `DEFAULT_LEGACY_PATH` | `.agent-brain/mind.mv2` | `.rusty-brain/mind.mv2` | `crates/platforms/src/path_policy.rs` |
+| `DEFAULT_MEMORY_PATH` | `.agent-brain/mind.mv2` | `.rusty-brain/mind.mv2` | `crates/platforms/src/path_policy.rs` |
 | `LEGACY_AGENT_BRAIN_PATH` (new) | N/A | `.agent-brain/mind.mv2` | `crates/platforms/src/path_policy.rs` |
 | `LEGACY_CLAUDE_MEMORY_PATH` | `.claude/mind.mv2` | `.claude/mind.mv2` (unchanged) | `crates/platforms/src/path_policy.rs` |
 | `MindConfig::default().memory_path` | `.agent-brain/mind.mv2` | `.rusty-brain/mind.mv2` | `crates/types/src/config.rs` |
@@ -54,13 +54,13 @@ The `.rusty-brain/` directory is the self-contained data directory for rusty-bra
 
 | Scenario | Level | Message Template |
 |----------|-------|-----------------|
-| `.agent-brain/` only (no `.rusty-brain/`) | Info | "Using legacy memory file at `.agent-brain/mind.mv2`. Migrate to `.rusty-brain/mind.mv2`: `mv .agent-brain .rusty-brain`" |
+| `.agent-brain/` only (no `.rusty-brain/`) | Info | "Using legacy memory file at `.agent-brain/mind.mv2`. Migrate to `.rusty-brain/mind.mv2`: `mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2`" |
 | `.agent-brain/` + `.rusty-brain/` both exist | Warning | "Duplicate memory files: using `.rusty-brain/mind.mv2`. Consider removing `.agent-brain/`." |
 | `.claude/` exists (any combo) | Warning | "Legacy memory file at `.claude/mind.mv2`. Migrate to `.rusty-brain/mind.mv2`." |
 
 ## State Transitions
 
-```
+```text
 [No data directory] --first write--> [.rusty-brain/ created]
 [.agent-brain/ only] --user runs `mv`--> [.rusty-brain/ only]
 [.agent-brain/ + .rusty-brain/] --user removes old--> [.rusty-brain/ only]

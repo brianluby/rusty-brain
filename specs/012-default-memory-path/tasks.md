@@ -197,7 +197,7 @@
 
 ## Parallel Example: After Phase 2 Completion
 
-```
+```text
 # Agent 1: US1 (new installation path)
 Task: T012–T014 in crates/types/tests/config_test.rs
 

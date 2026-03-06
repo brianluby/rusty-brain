@@ -66,8 +66,8 @@ crates/
 │   ├── src/config.rs          # MindConfig::default() path constant
 │   └── tests/config_test.rs   # Default path assertions
 ├── platforms/
-│   ├── src/path_policy.rs     # DEFAULT_LEGACY_PATH, LEGACY_CLAUDE_MEMORY_PATH, resolve_memory_path()
-│   └── src/bootstrap.rs       # detect_legacy_path(), build_mind_config()
+│   ├── src/path_policy.rs     # DEFAULT_MEMORY_PATH, LEGACY_CLAUDE_MEMORY_PATH, resolve_memory_path()
+│   └── src/bootstrap.rs       # detect_legacy_paths(), build_mind_config()
 ├── hooks/
 │   ├── src/dedup.rs           # DedupCache::new() hardcoded path
 │   ├── src/smart_install.rs   # VERSION_FILENAME location

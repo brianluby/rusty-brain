@@ -70,23 +70,23 @@ fn smart_install_error_is_hookioerror_variant() {
 
 #[cfg(unix)]
 #[test]
-fn readonly_agent_brain_dir_prevents_mv2_creation() {
+fn readonly_rusty_brain_dir_prevents_mv2_creation() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain = tmp.path().join(".rusty-brain");
-    std::fs::create_dir_all(&agent_brain).expect("create .rusty-brain");
+    let rusty_brain = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain).expect("create .rusty-brain");
 
     // Make .rusty-brain read-only
-    std::fs::set_permissions(&agent_brain, std::fs::Permissions::from_mode(0o444))
+    std::fs::set_permissions(&rusty_brain, std::fs::Permissions::from_mode(0o444))
         .expect("set permissions");
 
     // Attempt to write a file inside the read-only directory
-    let test_file = agent_brain.join("test-write.tmp");
+    let test_file = rusty_brain.join("test-write.tmp");
     let write_result = std::fs::write(&test_file, "test");
 
     // Restore permissions before assertions
-    std::fs::set_permissions(&agent_brain, std::fs::Permissions::from_mode(0o755))
+    std::fs::set_permissions(&rusty_brain, std::fs::Permissions::from_mode(0o755))
         .expect("restore permissions");
 
     assert!(
@@ -108,11 +108,11 @@ fn dedup_cache_unwritable_produces_error() {
     use std::os::unix::fs::PermissionsExt;
 
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain = tmp.path().join(".rusty-brain");
-    std::fs::create_dir_all(&agent_brain).expect("create .rusty-brain");
+    let rusty_brain = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain).expect("create .rusty-brain");
 
     // Create the dedup cache file as read-only
-    let dedup_path = agent_brain.join(".dedup-cache.json");
+    let dedup_path = rusty_brain.join(".dedup-cache.json");
     std::fs::write(&dedup_path, "{}").expect("write initial cache");
     std::fs::set_permissions(&dedup_path, std::fs::Permissions::from_mode(0o444))
         .expect("set read-only");

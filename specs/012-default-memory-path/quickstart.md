@@ -14,10 +14,17 @@ If you have an existing `.agent-brain/` directory:
 
 ```bash
 # Move the entire directory (preserves all data files)
+# If .rusty-brain/ doesn't exist yet:
 mv .agent-brain .rusty-brain
 
-# Update .gitignore
+# Or if .rusty-brain/ already exists (e.g. from supporting files):
+mkdir -p .rusty-brain
+mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2
+# Then remove old directory: rm -rf .agent-brain
+
+# Update .gitignore (macOS)
 sed -i '' 's/\.agent-brain/\.rusty-brain/' .gitignore
+# On Linux: sed -i 's/\.agent-brain/\.rusty-brain/' .gitignore
 ```
 
 If you have the oldest `.claude/mind.mv2` legacy path:

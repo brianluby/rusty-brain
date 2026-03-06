@@ -25,7 +25,8 @@ pub struct Diagnostic {
 pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let rusty_brain = project_root.join(".rusty-brain/mind.mv2");
+    let canonical = format!("{}/mind.mv2", crate::DEFAULT_MEMORY_DIR);
+    let rusty_brain = project_root.join(&canonical);
     let agent_brain = project_root.join(crate::LEGACY_AGENT_BRAIN_PATH);
     let claude_legacy = project_root.join(crate::LEGACY_CLAUDE_MEMORY_PATH);
 
@@ -38,14 +39,18 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Info,
             message: format!(
-                "Using legacy memory file at `{}`. Migrate to `.rusty-brain/mind.mv2`: `mv .agent-brain .rusty-brain`",
-                crate::LEGACY_AGENT_BRAIN_PATH
+                "Using legacy memory file at `{}`. Migrate to `{canonical}`: \
+                 `mkdir -p {} && mv .agent-brain/mind.mv2 {canonical}`",
+                crate::LEGACY_AGENT_BRAIN_PATH,
+                crate::DEFAULT_MEMORY_DIR
             ),
         });
     } else if agent_exists && rusty_exists {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Warning,
-            message: "Duplicate memory files: using `.rusty-brain/mind.mv2`. Consider removing `.agent-brain/`.".to_string(),
+            message: format!(
+                "Duplicate memory files: using `{canonical}`. Consider removing `.agent-brain/`."
+            ),
         });
     }
 
@@ -53,7 +58,11 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
     if claude_exists {
         diagnostics.push(Diagnostic {
             level: DiagnosticLevel::Warning,
-            message: "Legacy memory file at `.claude/mind.mv2`. Migrate to `.rusty-brain/mind.mv2`: `mv .claude .rusty-brain`".to_string(),
+            message: format!(
+                "Legacy memory file at `.claude/mind.mv2`. Migrate to `{canonical}`: \
+                 `mkdir -p {} && mv .claude/mind.mv2 {canonical}`",
+                crate::DEFAULT_MEMORY_DIR
+            ),
         });
     }
 
@@ -61,16 +70,16 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
 }
 
 /// Resolve the effective memory path, falling back to `.agent-brain/` if
-/// `.rusty-brain/` doesn't exist yet.
+/// `.rusty-brain/mind.mv2` doesn't exist yet.
 ///
 /// Resolution order:
-/// 1. `.rusty-brain/mind.mv2` — used if the file or directory exists
-/// 2. `.agent-brain/mind.mv2` — used if exists and `.rusty-brain/` doesn't
+/// 1. `.rusty-brain/mind.mv2` — used if the file exists
+/// 2. `.agent-brain/mind.mv2` — used if file exists and `.rusty-brain/mind.mv2` doesn't
 /// 3. `.rusty-brain/mind.mv2` — returned as default for new installations
 #[must_use]
 pub fn resolve_effective_path(project_root: &Path) -> std::path::PathBuf {
-    let rusty_brain = project_root.join(".rusty-brain/mind.mv2");
-    if rusty_brain.exists() || project_root.join(".rusty-brain").exists() {
+    let rusty_brain = project_root.join(crate::DEFAULT_MEMORY_DIR).join("mind.mv2");
+    if rusty_brain.exists() {
         return rusty_brain;
     }
 
@@ -164,7 +173,7 @@ mod tests {
         let result = detect_legacy_paths(dir.path());
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].level, DiagnosticLevel::Info);
-        assert!(result[0].message.contains("mv .agent-brain .rusty-brain"));
+        assert!(result[0].message.contains("mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2"));
     }
 
     #[test]
@@ -252,6 +261,26 @@ mod tests {
 
         let result = resolve_effective_path(dir.path());
         assert_eq!(result, dir.path().join(".agent-brain/mind.mv2"));
+    }
+
+    #[test]
+    fn resolve_effective_path_ignores_rusty_brain_dir_without_mv2() {
+        let dir = tempfile::tempdir().unwrap();
+        // .rusty-brain/ exists with only metadata (e.g. from smart_install)
+        let rusty_dir = dir.path().join(".rusty-brain");
+        std::fs::create_dir_all(&rusty_dir).unwrap();
+        std::fs::write(rusty_dir.join(".install-version"), b"0.1.0").unwrap();
+        // .agent-brain/mind.mv2 exists with actual memory data
+        let agent_dir = dir.path().join(".agent-brain");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("mind.mv2"), b"data").unwrap();
+
+        let result = resolve_effective_path(dir.path());
+        assert_eq!(
+            result,
+            dir.path().join(".agent-brain/mind.mv2"),
+            "should fall back to .agent-brain when .rusty-brain has no mind.mv2"
+        );
     }
 
     #[test]

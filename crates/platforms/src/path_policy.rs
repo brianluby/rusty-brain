@@ -37,7 +37,7 @@ pub fn format_legacy_path_warning(canonical_path: &std::path::Path) -> String {
     format!(
         "\n**Note:** Legacy memory file detected at `{LEGACY_CLAUDE_MEMORY_PATH}`. \
          Current canonical path for this session is `{}`. \
-         Migrate with: `mv .claude .rusty-brain`\n",
+         Migrate with: `mkdir -p {DEFAULT_MEMORY_DIR} && mv .claude/mind.mv2 {DEFAULT_MEMORY_DIR}/mind.mv2`\n",
         canonical_path.display()
     )
 }
@@ -286,8 +286,8 @@ mod tests {
             "warning must mention the canonical path"
         );
         assert!(
-            warning.contains("mv .claude .rusty-brain"),
-            "warning must contain actionable mv command"
+            warning.contains("mkdir -p .rusty-brain && mv .claude/mind.mv2 .rusty-brain/mind.mv2"),
+            "warning must contain safe file-level mv command"
         );
     }
 

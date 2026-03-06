@@ -65,40 +65,40 @@ fn resolve_memory_path_points_to_rusty_brain_dir() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn agent_brain_dir_expected_files_can_be_constructed() {
+fn rusty_brain_dir_expected_files_can_be_constructed() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain_dir = tmp.path().join(".rusty-brain");
-    std::fs::create_dir_all(&agent_brain_dir).expect("create .rusty-brain dir");
+    let rusty_brain_dir = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain_dir).expect("create .rusty-brain dir");
 
     let expected_files = ["mind.mv2", ".dedup-cache.json", ".install-version"];
 
     for filename in &expected_files {
-        let file_path = agent_brain_dir.join(filename);
+        let file_path = rusty_brain_dir.join(filename);
         std::fs::write(&file_path, "").expect("write placeholder");
         assert!(file_path.exists(), "expected file should exist: {filename}");
     }
 }
 
 #[test]
-fn agent_brain_dir_structure_matches_typescript_layout() {
+fn rusty_brain_dir_structure_matches_expected_layout() {
     let tmp = tempfile::tempdir().expect("tempdir");
-    let agent_brain_dir = tmp.path().join(".rusty-brain");
-    std::fs::create_dir_all(&agent_brain_dir).expect("create .rusty-brain dir");
+    let rusty_brain_dir = tmp.path().join(".rusty-brain");
+    std::fs::create_dir_all(&rusty_brain_dir).expect("create .rusty-brain dir");
 
-    // Simulate the full layout the TypeScript version creates
-    std::fs::write(agent_brain_dir.join("mind.mv2"), b"fake-mv2").expect("write mind.mv2");
-    std::fs::write(agent_brain_dir.join(".dedup-cache.json"), b"{}")
+    // Simulate the full layout
+    std::fs::write(rusty_brain_dir.join("mind.mv2"), b"fake-mv2").expect("write mind.mv2");
+    std::fs::write(rusty_brain_dir.join(".dedup-cache.json"), b"{}")
         .expect("write .dedup-cache.json");
-    std::fs::write(agent_brain_dir.join(".install-version"), b"0.1.0")
+    std::fs::write(rusty_brain_dir.join(".install-version"), b"0.1.0")
         .expect("write .install-version");
 
     // Verify all three files exist
-    assert!(agent_brain_dir.join("mind.mv2").exists());
-    assert!(agent_brain_dir.join(".dedup-cache.json").exists());
-    assert!(agent_brain_dir.join(".install-version").exists());
+    assert!(rusty_brain_dir.join("mind.mv2").exists());
+    assert!(rusty_brain_dir.join(".dedup-cache.json").exists());
+    assert!(rusty_brain_dir.join(".install-version").exists());
 
     // Verify no unexpected subdirectories
-    let entries: Vec<_> = std::fs::read_dir(&agent_brain_dir)
+    let entries: Vec<_> = std::fs::read_dir(&rusty_brain_dir)
         .expect("read dir")
         .filter_map(Result::ok)
         .collect();
@@ -110,7 +110,7 @@ fn agent_brain_dir_structure_matches_typescript_layout() {
 }
 
 #[test]
-fn smart_install_writes_install_version_in_cwd() {
+fn smart_install_writes_install_version_in_rusty_brain() {
     let tmp = tempfile::tempdir().expect("tempdir");
     let input = common::smart_install_input(tmp.path().to_str().unwrap());
 

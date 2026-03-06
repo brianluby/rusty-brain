@@ -42,8 +42,8 @@ fn agent_brain_only_suggests_migration() {
     assert_eq!(result.len(), 1);
     assert_eq!(result[0].level, DiagnosticLevel::Info);
     assert!(
-        result[0].message.contains("mv .agent-brain .rusty-brain"),
-        "diagnostic should contain actionable mv command: {}",
+        result[0].message.contains("mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2"),
+        "diagnostic should contain safe file-level mv command: {}",
         result[0].message
     );
 }
