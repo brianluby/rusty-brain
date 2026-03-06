@@ -29,8 +29,8 @@ pub fn handle_post_tool_use(input: &HookInput) -> Result<HookOutput, HookError> 
         });
     }
 
-    // Emit legacy path diagnostic (best-effort, non-blocking)
-    if let Some(diag) = bootstrap::detect_legacy_path(cwd) {
+    // Emit legacy path diagnostics (best-effort, non-blocking)
+    for diag in bootstrap::detect_legacy_paths(cwd) {
         match diag.level {
             bootstrap::DiagnosticLevel::Warning => {
                 tracing::warn!(diagnostic = %diag.message, "legacy path detected");

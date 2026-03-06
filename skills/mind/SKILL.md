@@ -16,7 +16,7 @@ Search and manage Claude's persistent memory.
 
 ## Usage
 
-All memory operations use the `rusty-brain` CLI binary. Memories are stored in `.agent-brain/mind.mv2` and persist across conversations.
+All memory operations use the `rusty-brain` CLI binary. Memories are stored in `.rusty-brain/mind.mv2` and persist across conversations.
 
 ### Search memories
 ```bash

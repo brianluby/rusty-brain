@@ -16,7 +16,7 @@ Memory capture happens automatically through Claude Code hooks:
 
 ## Storage
 
-Memories are stored in `.agent-brain/mind.mv2` using memvid video-encoded format. This file is portable and persists across sessions.
+Memories are stored in `.rusty-brain/mind.mv2` using memvid video-encoded format. This file is portable and persists across sessions.
 
 ## Manual Memory Operations
 

@@ -114,7 +114,7 @@ Equivalent to: project scaffolding, `tsconfig.json`, `tsup.config.ts`, `package.
 - [ ] `SessionSummary` — struct with session-level aggregation fields (`id`, `start_time`, `end_time`, `observation_count`, `key_decisions`, `files_modified`, `summary`)
 - [ ] `InjectedContext` — struct for context returned at session start (`recent_observations`, `relevant_memories`, `session_summaries`, `token_count`)
 - [ ] `MindConfig` — struct with defaults:
-  - `memory_path`: `.agent-brain/mind.mv2`
+  - `memory_path`: `.rusty-brain/mind.mv2`
   - `max_context_observations`: 20
   - `max_context_tokens`: 2000
   - `auto_compress`: true
@@ -362,8 +362,8 @@ Equivalent to: `src/__tests__/` (48 test files), plus Rust-specific quality impr
 
 - [ ] **Zero-migration `.mv2` files** — Rust version reads/writes the same `.mv2` format natively (no conversion needed)
 - [ ] **Configuration compatibility** — honor all existing env vars (`MEMVID_PLATFORM`, `MEMVID_MIND_DEBUG`, `MEMVID_PLATFORM_MEMORY_PATH`, `MEMVID_PLATFORM_PATH_OPT_IN`, `CLAUDE_PROJECT_DIR`, `OPENCODE_PROJECT_DIR`)
-- [ ] **Directory structure compatibility** — use identical `.agent-brain/` directory layout
-- [ ] **Legacy path migration** — detect `.claude/mind.mv2` and suggest move to `.agent-brain/mind.mv2`
+- [ ] **Directory structure compatibility** — use identical `.rusty-brain/` directory layout
+- [ ] **Legacy path migration** — detect `.claude/mind.mv2` and suggest move to `.rusty-brain/mind.mv2`
 - [ ] **Side-by-side testing** — verify Rust and TS versions produce identical search results for the same `.mv2` file
 - [ ] Document the switch: update `plugin.json` to point hook paths at Rust binaries instead of `dist/hooks/*.js`
 

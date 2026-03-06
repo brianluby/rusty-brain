@@ -25,9 +25,9 @@ where
 // -------------------------------------------------------------------------
 
 #[test]
-fn default_memory_path_is_agent_brain_mind_mv2() {
+fn default_memory_path_is_rusty_brain_mind_mv2() {
     let cfg = MindConfig::default();
-    assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+    assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
 }
 
 #[test]
@@ -198,7 +198,7 @@ fn mind_config_json_round_trip_defaults() {
     );
     assert_eq!(
         deserialized.memory_path,
-        PathBuf::from(".agent-brain/mind.mv2")
+        PathBuf::from(".rusty-brain/mind.mv2")
     );
     assert_eq!(deserialized.max_context_observations, 20);
     assert_eq!(deserialized.max_context_tokens, 2000);
@@ -221,7 +221,7 @@ fn mind_config_partial_json_applies_defaults() {
     // Remaining fields must fall back to Default impl values.
     assert_eq!(
         deserialized.memory_path,
-        PathBuf::from(".agent-brain/mind.mv2"),
+        PathBuf::from(".rusty-brain/mind.mv2"),
         "memory_path must default when absent"
     );
     assert_eq!(
@@ -415,7 +415,7 @@ fn from_env_ignores_platform_detection_for_memory_path() {
         ],
         || {
             let cfg = MindConfig::from_env().expect("from_env must succeed");
-            assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+            assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
         },
     );
 }
@@ -433,7 +433,7 @@ fn from_env_ignores_claude_project_dir_for_memory_path() {
         ],
         || {
             let cfg = MindConfig::from_env().expect("from_env must succeed");
-            assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+            assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
         },
     );
 }
@@ -451,7 +451,7 @@ fn from_env_ignores_claude_project_dir_opt_in() {
         ],
         || {
             let cfg = MindConfig::from_env().expect("from_env must succeed");
-            assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+            assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
         },
     );
 }
@@ -469,7 +469,7 @@ fn from_env_ignores_opencode_project_dir_opt_in() {
         ],
         || {
             let cfg = MindConfig::from_env().expect("from_env must succeed");
-            assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+            assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
         },
     );
 }
@@ -549,7 +549,7 @@ fn from_env_does_not_construct_platform_scoped_path() {
         ],
         || {
             let cfg = MindConfig::from_env().expect("from_env must succeed");
-            assert_eq!(cfg.memory_path, PathBuf::from(".agent-brain/mind.mv2"));
+            assert_eq!(cfg.memory_path, PathBuf::from(".rusty-brain/mind.mv2"));
         },
     );
 }

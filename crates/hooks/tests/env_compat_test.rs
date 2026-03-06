@@ -283,7 +283,7 @@ fn memvid_platform_memory_path_unset_uses_default() {
             let cfg = MindConfig::from_env().expect("should parse");
             assert_eq!(
                 cfg.memory_path,
-                PathBuf::from(".agent-brain/mind.mv2"),
+                PathBuf::from(".rusty-brain/mind.mv2"),
                 "unset path should use default"
             );
         },
@@ -349,7 +349,7 @@ fn memvid_platform_path_opt_in_false_uses_legacy_path() {
             let path =
                 hooks::bootstrap::resolve_memory_path(&input, tmp.path()).expect("should resolve");
             assert!(
-                path.to_str().unwrap().contains(".agent-brain/mind.mv2"),
+                path.to_str().unwrap().contains(".rusty-brain/mind.mv2"),
                 "non-opt-in should use legacy path: {path:?}"
             );
         },
@@ -372,7 +372,7 @@ fn memvid_platform_path_opt_in_unset_uses_legacy_path() {
             let path =
                 hooks::bootstrap::resolve_memory_path(&input, tmp.path()).expect("should resolve");
             assert!(
-                path.to_str().unwrap().contains(".agent-brain/mind.mv2"),
+                path.to_str().unwrap().contains(".rusty-brain/mind.mv2"),
                 "unset opt-in should use legacy path: {path:?}"
             );
         },
