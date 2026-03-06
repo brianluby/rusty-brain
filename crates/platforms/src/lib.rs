@@ -28,8 +28,8 @@ pub use contract::{SUPPORTED_CONTRACT_MAJOR, validate_contract};
 pub use detection::detect_platform;
 pub use identity::resolve_project_identity;
 pub use path_policy::{
-    LEGACY_CLAUDE_MEMORY_PATH, PathMode, ResolvedMemoryPath, format_legacy_path_warning,
-    resolve_memory_path,
+    DEFAULT_MEMORY_DIR, LEGACY_AGENT_BRAIN_PATH, LEGACY_CLAUDE_MEMORY_PATH, PathMode,
+    ResolvedMemoryPath, format_legacy_path_warning, resolve_memory_path,
 };
 pub use pipeline::{EventPipeline, PipelineResult};
 pub use registry::AdapterRegistry;

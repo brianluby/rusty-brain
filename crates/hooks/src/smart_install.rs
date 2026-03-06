@@ -16,7 +16,8 @@ const VERSION_FILENAME: &str = ".install-version";
 #[tracing::instrument(skip(input))]
 pub fn handle_smart_install(input: &HookInput) -> Result<HookOutput, HookError> {
     let cwd = Path::new(&input.cwd);
-    let version_path = cwd.join(VERSION_FILENAME);
+    let rusty_brain_dir = cwd.join(".rusty-brain");
+    let version_path = rusty_brain_dir.join(VERSION_FILENAME);
     let current_version = env!("CARGO_PKG_VERSION");
 
     let needs_write = match std::fs::read_to_string(&version_path) {
@@ -25,6 +26,8 @@ pub fn handle_smart_install(input: &HookInput) -> Result<HookOutput, HookError> 
     };
 
     if needs_write {
+        // Ensure .rusty-brain directory exists
+        std::fs::create_dir_all(&rusty_brain_dir)?;
         // Atomic write: temp file + rename (unique name avoids collisions)
         let tmp_path = version_path.with_extension(format!("tmp.{}", std::process::id()));
         std::fs::write(&tmp_path, current_version)?;
@@ -70,8 +73,11 @@ mod tests {
             "handle_smart_install should succeed: {result:?}"
         );
 
-        let version_path = tmp.path().join(VERSION_FILENAME);
-        assert!(version_path.exists(), ".install-version file should exist");
+        let version_path = tmp.path().join(".rusty-brain").join(VERSION_FILENAME);
+        assert!(
+            version_path.exists(),
+            ".rusty-brain/.install-version file should exist"
+        );
 
         let content = std::fs::read_to_string(&version_path).expect("should read version file");
         assert_eq!(
@@ -93,7 +99,9 @@ mod tests {
     #[test]
     fn handle_smart_install_skips_write_when_version_matches() {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        let version_path = tmp.path().join(VERSION_FILENAME);
+        let rusty_brain_dir = tmp.path().join(".rusty-brain");
+        std::fs::create_dir_all(&rusty_brain_dir).expect("create .rusty-brain dir");
+        let version_path = rusty_brain_dir.join(VERSION_FILENAME);
 
         // Pre-write the current version
         std::fs::write(&version_path, env!("CARGO_PKG_VERSION")).expect("pre-write should succeed");
@@ -106,7 +114,9 @@ mod tests {
     #[test]
     fn handle_smart_install_overwrites_stale_version() {
         let tmp = tempfile::tempdir().expect("failed to create temp dir");
-        let version_path = tmp.path().join(VERSION_FILENAME);
+        let rusty_brain_dir = tmp.path().join(".rusty-brain");
+        std::fs::create_dir_all(&rusty_brain_dir).expect("create .rusty-brain dir");
+        let version_path = rusty_brain_dir.join(VERSION_FILENAME);
 
         // Pre-write an old version
         std::fs::write(&version_path, "0.0.0-old").expect("pre-write should succeed");

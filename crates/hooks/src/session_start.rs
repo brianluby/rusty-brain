@@ -47,8 +47,8 @@ pub fn handle_session_start(input: &HookInput) -> Result<HookOutput, HookError> 
     // Format system message
     let mut message = format_system_message(&ctx, &stats, &memory_path);
 
-    // Check for legacy memory path and emit diagnostic
-    if let Some(diag) = bootstrap::detect_legacy_path(cwd) {
+    // Check for legacy memory paths and emit diagnostics
+    for diag in bootstrap::detect_legacy_paths(cwd) {
         let label = match diag.level {
             bootstrap::DiagnosticLevel::Warning => "Warning",
             bootstrap::DiagnosticLevel::Info => "Info",

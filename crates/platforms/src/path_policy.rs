@@ -1,8 +1,8 @@
 //! Memory file path policy resolution.
 //!
 //! Resolves the memory file path based on platform opt-in policy:
-//! - Default (no opt-in): `.agent-brain/mind.mv2` (FR-015, mode: LegacyFirst)
-//! - Platform opt-in: `.{platform}/mind-{platform}.mv2` (FR-015, mode: PlatformOptIn)
+//! - Default (no opt-in): `.rusty-brain/mind.mv2` (mode: Default)
+//! - Platform opt-in: `.{platform}/mind-{platform}.mv2` (mode: PlatformOptIn)
 //! - Platform name sanitized per FR-016
 //! - Resolved path MUST stay within project_dir (FR-014)
 
@@ -12,21 +12,23 @@ use types::AgentBrainError;
 use types::error::error_codes;
 use types::sanitize_platform_name;
 
-/// Default legacy memory file path relative to project root.
-const DEFAULT_LEGACY_PATH: &str = ".agent-brain/mind.mv2";
+/// New canonical memory directory name.
+pub const DEFAULT_MEMORY_DIR: &str = ".rusty-brain";
 
-/// Pre-canonical memory path used by early Claude Code integrations.
-///
-/// This path (`".claude/mind.mv2"`) predates the current canonical policy
-/// (`".agent-brain/mind.mv2"` or platform-scoped). When this file exists
-/// alongside the canonical path, a migration warning should be shown.
+/// Default memory file path relative to project root (new canonical).
+const DEFAULT_MEMORY_PATH: &str = ".rusty-brain/mind.mv2";
+
+/// Legacy memory file path from the agent-brain era.
+pub const LEGACY_AGENT_BRAIN_PATH: &str = ".agent-brain/mind.mv2";
+
+/// Oldest legacy memory file path from early Claude Code integrations.
 pub const LEGACY_CLAUDE_MEMORY_PATH: &str = ".claude/mind.mv2";
 
 /// Format the migration warning shown when a legacy memory file is detected.
 ///
 /// Returns a human-readable note suitable for appending to system messages.
 /// The `canonical_path` argument is the display form of the current session's
-/// resolved memory path.
+/// resolved memory path. Includes actionable `mv` commands for migration (FR-009).
 ///
 /// Does NOT perform filesystem I/O — the caller is responsible for checking
 /// whether the legacy file exists before calling this function.
@@ -34,7 +36,8 @@ pub const LEGACY_CLAUDE_MEMORY_PATH: &str = ".claude/mind.mv2";
 pub fn format_legacy_path_warning(canonical_path: &std::path::Path) -> String {
     format!(
         "\n**Note:** Legacy memory file detected at `{LEGACY_CLAUDE_MEMORY_PATH}`. \
-         Current canonical path for this session is `{}`.\n",
+         Current canonical path for this session is `{}`. \
+         Migrate with: `mkdir -p {DEFAULT_MEMORY_DIR} && mv .claude/mind.mv2 {DEFAULT_MEMORY_DIR}/mind.mv2`\n",
         canonical_path.display()
     )
 }
@@ -43,8 +46,8 @@ pub fn format_legacy_path_warning(canonical_path: &std::path::Path) -> String {
 #[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PathMode {
-    /// Legacy mode: `.agent-brain/mind.mv2` (no platform opt-in).
-    LegacyFirst,
+    /// Default mode: `.rusty-brain/mind.mv2` (no platform opt-in).
+    Default,
     /// Platform opt-in mode: `.{platform}/mind-{platform}.mv2`.
     PlatformOptIn,
 }
@@ -60,7 +63,7 @@ pub struct ResolvedMemoryPath {
 
 /// Resolve the memory file path based on path policy.
 ///
-/// - Default (no opt-in): `.agent-brain/mind.mv2` (FR-015, mode: `LegacyFirst`)
+/// - Default (no opt-in): `.rusty-brain/mind.mv2` (mode: `Default`)
 /// - Platform opt-in: `.{platform}/mind-{platform}.mv2` (FR-015, mode: `PlatformOptIn`)
 /// - Platform name sanitized per FR-016
 /// - Resolved path MUST stay within `project_dir` (FR-014)
@@ -82,7 +85,7 @@ pub fn resolve_memory_path(
     let relative = if platform_opt_in {
         PathBuf::from(format!(".{sanitized}/mind-{sanitized}.mv2"))
     } else {
-        PathBuf::from(DEFAULT_LEGACY_PATH)
+        PathBuf::from(DEFAULT_MEMORY_PATH)
     };
 
     let resolved = project_dir.join(&relative);
@@ -119,7 +122,7 @@ pub fn resolve_memory_path(
     let mode = if platform_opt_in {
         PathMode::PlatformOptIn
     } else {
-        PathMode::LegacyFirst
+        PathMode::Default
     };
 
     Ok(ResolvedMemoryPath {
@@ -139,8 +142,8 @@ mod tests {
         let result = resolve_memory_path(Path::new("/project"), "claude", false)
             .expect("legacy mode should succeed");
 
-        assert_eq!(result.path, PathBuf::from("/project/.agent-brain/mind.mv2"));
-        assert_eq!(result.mode, PathMode::LegacyFirst);
+        assert_eq!(result.path, PathBuf::from("/project/.rusty-brain/mind.mv2"));
+        assert_eq!(result.mode, PathMode::Default);
     }
 
     #[test]
@@ -256,8 +259,8 @@ mod tests {
         let r1 = resolve_memory_path(Path::new("/proj"), "claude", false).unwrap();
         let r2 = resolve_memory_path(Path::new("/proj"), "opencode", false).unwrap();
         assert_eq!(r1.path, r2.path);
-        assert_eq!(r1.mode, PathMode::LegacyFirst);
-        assert_eq!(r2.mode, PathMode::LegacyFirst);
+        assert_eq!(r1.mode, PathMode::Default);
+        assert_eq!(r2.mode, PathMode::Default);
     }
 
     // -------------------------------------------------------------------------
@@ -271,7 +274,7 @@ mod tests {
 
     #[test]
     fn format_legacy_path_warning_contains_both_paths() {
-        let canonical = Path::new("/project/.agent-brain/mind.mv2");
+        let canonical = Path::new("/project/.rusty-brain/mind.mv2");
         let warning = format_legacy_path_warning(canonical);
 
         assert!(
@@ -279,8 +282,12 @@ mod tests {
             "warning must mention the legacy path"
         );
         assert!(
-            warning.contains("/project/.agent-brain/mind.mv2"),
+            warning.contains("/project/.rusty-brain/mind.mv2"),
             "warning must mention the canonical path"
+        );
+        assert!(
+            warning.contains("mkdir -p .rusty-brain && mv .claude/mind.mv2 .rusty-brain/mind.mv2"),
+            "warning must contain safe file-level mv command"
         );
     }
 

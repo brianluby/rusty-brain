@@ -21,6 +21,7 @@ Thumbs.db
 !.env.example
 
 # Runtime memory/state (never commit mutable artifacts)
+.rusty-brain/
 .agent-brain/
 
 # Logs

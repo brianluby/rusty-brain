@@ -105,11 +105,11 @@ mod tests {
     fn format_system_message_contains_memory_path() {
         let ctx = InjectedContext::default();
         let stats = make_empty_stats();
-        let path = PathBuf::from("/home/user/.agent-brain/mind.mv2");
+        let path = PathBuf::from("/home/user/.rusty-brain/mind.mv2");
 
         let msg = format_system_message(&ctx, &stats, &path);
         assert!(
-            msg.contains("/home/user/.agent-brain/mind.mv2"),
+            msg.contains("/home/user/.rusty-brain/mind.mv2"),
             "message should contain the memory path"
         );
     }
