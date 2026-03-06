@@ -70,7 +70,7 @@
 
 ### Tests for User Story 2
 
-- [X] T015 [US2] Write test `detect_legacy_paths_agent_brain_only_suggests_migration` — `.agent-brain/` exists, no `.rusty-brain/` → returns Info diagnostic with actionable `mv .agent-brain .rusty-brain` command in `crates/platforms/src/bootstrap.rs`
+- [X] T015 [US2] Write test `detect_legacy_paths_agent_brain_only_suggests_migration` — `.agent-brain/` exists, no `.rusty-brain/` → returns Info diagnostic with actionable `mkdir -p .rusty-brain && mv .agent-brain/mind.mv2 .rusty-brain/mind.mv2` command in `crates/platforms/src/bootstrap.rs`
 - [X] T016 [US2] Write test `detect_legacy_paths_both_dirs_warns_duplicate` — both `.agent-brain/` and `.rusty-brain/` exist → returns Warning about duplicate in `crates/platforms/src/bootstrap.rs`
 - [X] T017 [US2] Write test `detect_legacy_paths_rusty_brain_only_returns_empty` — only `.rusty-brain/` exists → returns empty Vec in `crates/platforms/src/bootstrap.rs`
 - [X] T018 [US2] Write test `resolve_effective_path_falls_back_to_agent_brain` — `.agent-brain/mind.mv2` exists, `.rusty-brain/` doesn't → returns `.agent-brain/mind.mv2` in `crates/platforms/src/bootstrap.rs`

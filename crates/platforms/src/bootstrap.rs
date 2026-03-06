@@ -3,6 +3,9 @@ use std::path::Path;
 use crate::{AdapterRegistry, EventPipeline, detect_platform, resolve_memory_path};
 use types::{HookInput, MindConfig, RustyBrainError};
 
+/// Memory database filename, shared across path construction.
+const MIND_FILENAME: &str = "mind.mv2";
+
 /// Diagnostic severity level for legacy path warnings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DiagnosticLevel {
@@ -25,7 +28,7 @@ pub struct Diagnostic {
 pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
 
-    let canonical = format!("{}/mind.mv2", crate::DEFAULT_MEMORY_DIR);
+    let canonical = format!("{}/{MIND_FILENAME}", crate::DEFAULT_MEMORY_DIR);
     let rusty_brain = project_root.join(&canonical);
     let agent_brain = project_root.join(crate::LEGACY_AGENT_BRAIN_PATH);
     let claude_legacy = project_root.join(crate::LEGACY_CLAUDE_MEMORY_PATH);
@@ -78,7 +81,7 @@ pub fn detect_legacy_paths(project_root: &Path) -> Vec<Diagnostic> {
 /// 3. `.rusty-brain/mind.mv2` — returned as default for new installations
 #[must_use]
 pub fn resolve_effective_path(project_root: &Path) -> std::path::PathBuf {
-    let rusty_brain = project_root.join(crate::DEFAULT_MEMORY_DIR).join("mind.mv2");
+    let rusty_brain = project_root.join(crate::DEFAULT_MEMORY_DIR).join(MIND_FILENAME);
     if rusty_brain.exists() {
         return rusty_brain;
     }

@@ -39,7 +39,7 @@ Change the default memory directory from `.agent-brain/` to `.rusty-brain/` acro
 | XII. Simplicity | PASS | Minimal changes to existing patterns; extends existing detection, doesn't introduce new frameworks |
 | XIII. Dependency Policy | PASS | No new dependencies |
 
-**Post-Phase 1 re-check**: All gates still pass. `detect_legacy_path` signature changes from `Option<Diagnostic>` to `Vec<Diagnostic>` but this is a non-breaking internal API change.
+**Post-Phase 1 re-check**: All gates still pass. `detect_legacy_paths` returns `Vec<Diagnostic>` to support multi-path diagnostics; this is a non-breaking internal API change.
 
 ## Project Structure
 
@@ -97,7 +97,7 @@ No constitution violations to justify.
 
 `build_mind_config()` gains a filesystem check: if `.rusty-brain/mind.mv2` doesn't exist but `.agent-brain/mind.mv2` does, use the legacy path. This implements FR-004 (graceful fallback) without auto-migration (FR-008).
 
-### 2. detect_legacy_path → detect_legacy_paths (R-002)
+### 2. detect_legacy_paths (R-002)
 
 Return type changes from `Option<Diagnostic>` to `Vec<Diagnostic>` to handle multiple legacy paths simultaneously. The function now checks both `.agent-brain/` and `.claude/` against the new canonical `.rusty-brain/`.
 
@@ -122,7 +122,7 @@ Return type changes from `Option<Diagnostic>` to `Vec<Diagnostic>` to handle mul
 3. Update all unit tests for new default values
 
 ### Phase B: Legacy Detection & Fallback
-1. Extend `detect_legacy_path` to three-tier chain
+1. Extend `detect_legacy_paths` to three-tier chain
 2. Add `resolve_effective_path` fallback in `bootstrap.rs`
 3. Wire fallback into `build_mind_config`
 4. Update integration tests
