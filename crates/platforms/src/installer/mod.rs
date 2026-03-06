@@ -147,6 +147,7 @@ pub fn detect_binary_version(binary_path: &Path) -> Option<String> {
 /// Parse a version string from command output.
 ///
 /// Handles formats like "opencode 1.2.3" or "v1.2.3" or just "1.2.3".
+/// Returns `None` if no semver-like pattern is found.
 #[must_use]
 pub fn parse_version_string(output: &str) -> Option<String> {
     let trimmed = output.trim();
@@ -161,7 +162,7 @@ pub fn parse_version_string(output: &str) -> Option<String> {
         }
     }
 
-    Some(trimmed.to_string())
+    None
 }
 
 /// Validate that a JSON config file exists and is parseable.

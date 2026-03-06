@@ -6,6 +6,7 @@
 
 use std::path::Path;
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use types::install::{AgentInfo, ConfigFile, InstallError, InstallScope};
 
@@ -27,13 +28,34 @@ impl AgentInstaller for CopilotInstaller {
         let binary_path = find_binary_on_path("gh")?;
 
         // Verify `gh copilot` subcommand is available (gh may exist without copilot).
-        let copilot_check = Command::new(&binary_path)
+        // Use spawn + timeout to avoid blocking indefinitely if gh hangs.
+        let mut child = Command::new(&binary_path)
             .args(["help", "copilot"])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .status();
-        if !copilot_check.is_ok_and(|s| s.success()) {
-            return None;
+            .spawn()
+            .ok()?;
+
+        let start = Instant::now();
+        let timeout = Duration::from_secs(2);
+        loop {
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    if !status.success() {
+                        return None;
+                    }
+                    break;
+                }
+                Ok(None) => {
+                    if start.elapsed() >= timeout {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        return None;
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(_) => return None,
+            }
         }
 
         let version = detect_binary_version(&binary_path);

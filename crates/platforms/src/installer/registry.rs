@@ -72,22 +72,18 @@ mod tests {
     use types::install::{AgentInfo, ConfigFile, InstallError, InstallScope};
 
     struct MockInstaller {
-        name: String,
+        name: &'static str,
     }
 
     impl MockInstaller {
-        fn new(name: &str) -> Box<dyn AgentInstaller> {
-            Box::new(Self {
-                name: name.to_string(),
-            })
+        fn new(name: &'static str) -> Box<dyn AgentInstaller> {
+            Box::new(Self { name })
         }
     }
 
     impl AgentInstaller for MockInstaller {
-        #[allow(clippy::unnecessary_literal_bound)]
         fn agent_name(&self) -> &'static str {
-            // Leak the string for test purposes — the name lives for the test's lifetime.
-            Box::leak(self.name.clone().into_boxed_str())
+            self.name
         }
         fn detect(&self) -> Option<AgentInfo> {
             None
