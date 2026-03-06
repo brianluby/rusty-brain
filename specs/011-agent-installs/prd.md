@@ -224,6 +224,7 @@ An AI coding agent is working in a project and discovers rusty-brain is availabl
 - [A-5] The existing platform adapter system (005) can be extended to support new agent platforms without major refactoring.
 
 ### Risks
+
 | ID | Risk | Likelihood | Impact | Mitigation |
 |----|------|------------|--------|------------|
 | R-1 | Agent extension mechanisms are undocumented or unstable | Medium | High | Research each agent's plugin API before building; stub unsupported agents |
@@ -550,6 +551,7 @@ Additional considerations:
 | Upgrade data preservation | N/A | Zero data loss | Test: re-run install, verify memory intact |
 
 ### Technical Verification `@llm-autonomous`
+
 | Metric | Target | Verification Method |
 |--------|--------|---------------------|
 | Test coverage for Must Have ACs | > 90% | CI pipeline |
@@ -571,6 +573,7 @@ Additional considerations:
 - [ ] Spike tasks for agent extension mechanisms completed (Spike-1 through Spike-4)
 
 ### Sign-off
+
 | Role | Name | Date | Decision |
 |------|------|------|----------|
 | Product Owner | [name] | YYYY-MM-DD | [Ready / Not Ready] |

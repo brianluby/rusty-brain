@@ -324,7 +324,7 @@ flowchart TD
 |----|------------------|----------|------------|--------|-------|
 | R1 | Path traversal in resolved config paths could write files outside expected directories | Low | Config dirs are resolved internally (not user-supplied); `validate_config_path()` rejects `..` components | Mitigated | Implementer |
 | R2 | Agent binary on PATH could be a malicious impersonator | Low | Verify binary identity via `--version` output pattern matching; warn if unrecognizable. Standard PATH risk, not unique to this feature | Open | Implementer |
-| R3 | Config files written with overly permissive permissions (e.g., world-writable) | Low | Write files with user-only permissions (0o644 on Unix); inherit directory permissions | Open | Implementer |
+| R3 | Config files written with overly permissive permissions (e.g., world-writable) | Low | Write files with owner read/write and group/other read-only permissions (0o644 on Unix); inherit directory permissions | Mitigated | Implementer |
 | R4 | `.bak` backup chain lost on repeated `--reconfigure` (only most recent backup kept) | Low | Document that only one `.bak` is kept per config file. Not a security issue per se, but data loss risk | Open | Implementer |
 | R5 | Subprocess execution (`agent --version`) could be abused if agent name is user-controlled | Low | Agent names come from hardcoded allowlist (opencode, copilot, codex, gemini), never from user input directly. Binary lookup uses safe PATH resolution, not shell execution | Mitigated | -- |
 
@@ -393,8 +393,8 @@ Based on this review, the implementation MUST satisfy:
 | ID | Finding | Severity | Category | Recommendation | Status |
 |----|---------|----------|----------|----------------|--------|
 | F1 | *(Resolved)* `--config-dir` was removed (S-4 deferred). Config paths are resolved internally and validated via `validate_config_path()` | Low | Input Validation | Path validation implemented (SEC-4) | Mitigated |
-| F2 | No specification for config file permissions after write | Low | Data Protection | Explicitly set file permissions in ConfigWriter (SEC-1) | Open |
-| F3 | Agent subprocess timeout not specified in AR interface | Low | Availability | Add 2-second timeout to agent detection subprocess (SEC-6) | Open |
+| F2 | Config file permissions specified and documented | Low | Data Protection | SEC-1 defines 0o644 rationale; ConfigWriter sets permissions after write | Mitigated |
+| F3 | Agent subprocess timeout implemented | Low | Availability | SEC-6: 2-second timeout with `try_wait()` deadline enforcement in `detect_binary_version()` | Mitigated |
 
 ### Positive Observations `@llm-autonomous`
 
@@ -431,8 +431,8 @@ Based on this review, the implementation MUST satisfy:
 
 ### Conditions for Approval (if applicable) `@human-required`
 
-- [ ] SEC-4 (path traversal validation) must be implemented before merge
-- [ ] SEC-7 (no shell execution for subprocesses) must be verified in code review
+- [x] SEC-4 (path traversal validation) implemented via `validate_config_path()`
+- [x] SEC-7 (no shell execution for subprocesses) verified — all subprocess calls use `Command::new()` with explicit binary paths
 
 ---
 
