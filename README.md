@@ -63,7 +63,7 @@ rusty-brain install --project
 
 This auto-detects which supported agents are installed on your system and configures all of them in one step.
 
-Use `--global` instead of `--project` to configure agents for all projects rather than just the current one.
+Use `--global` instead of `--project` to install configuration in user-level directories (e.g., `~/.config/`) so rusty-brain is available across all your projects without per-project setup.
 
 ## Using rusty-brain
 

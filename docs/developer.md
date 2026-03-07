@@ -15,10 +15,10 @@ cargo clippy --workspace -- -D warnings  # Lint (must pass with zero warnings)
 
 All of the following must pass before merge:
 
-1. `cargo fmt --check` — formatting compliant
+1. `cargo test --workspace` — all tests green
 2. `cargo clippy --workspace -- -D warnings` — no lint violations
-3. `cargo test --workspace` — all tests green
-4. `cargo build --workspace --release` — release build succeeds
+3. `cargo fmt --check` — formatting compliant
+4. Agent integration smoke test — CLI commands produce valid structured output
 
 ## Crate Layout
 
@@ -80,6 +80,43 @@ Canonical runtime memory-path resolution is owned by `platforms::resolve_memory_
 4. The workspace auto-discovers it via `members = ["crates/*"]`
 5. Run `cargo build --workspace` to verify
 
+## CLI JSON Output Contract
+
+All CLI subcommands (`find`, `ask`, `stats`, `timeline`) accept a `--json` flag that emits machine-parseable output on stdout. When adding a new subcommand:
+
+- Implement a `--json` flag via clap
+- Output a single JSON object or array to stdout; never mix prose and JSON
+- All structured types live in `crates/types/src/`
+- Test JSON output in `crates/cli/src/` using `assert_cmd` + `serde_json`
+
+## Local Development Tips
+
+Run a subset of tests to speed up the feedback loop:
+
+```bash
+cargo test --lib                  # Unit tests only
+cargo test --test '*'             # Integration tests only
+cargo test -p rusty-brain-core    # Single crate
+cargo test <test_name>            # Single test by name
+```
+
+Override the memory path during development without touching your real memory file:
+
+```bash
+MEMVID_PLATFORM_MEMORY_PATH=/tmp/test.mv2 cargo run -p cli -- find "auth"
+```
+
 ## Spec-Driven Development
 
-All features follow a mandatory spec pipeline before code is written. See `specs/` for feature artifacts and `CLAUDE.md` for the full workflow.
+All features follow a mandatory pipeline before code is written:
+
+1. **Specify** — feature spec from natural language description
+2. **PRD** — MoSCoW requirements and prioritized user stories
+3. **Architecture** — options analysis and technical approach
+4. **Security** — attack surface and CIA impact
+5. **Plan** — tech stack, data models, API contracts
+6. **Tasks** — dependency-ordered implementation tasks
+7. **Analyze** — cross-artifact consistency check
+8. **Implement** — test-first execution of tasks
+
+Feature artifacts live in `specs/<NNN>-<feature-name>/`. See `CLAUDE.md` for slash commands that drive each stage.
