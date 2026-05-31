@@ -27,10 +27,10 @@ allow = [
     "Unicode-DFS-2016",
     "Zlib",
     "CC0-1.0",
-    "MPL-2.0",
 ]
 confidence-threshold = 0.9
-# No copyleft-by-default; anything not in `allow` fails the build.
+# Permissive-only allowlist: no copyleft (weak or strong) is accepted.
+# Anything not in `allow` fails the build.
 
 [bans]
 # Surface accidental dependency bloat / duplicate trees.
