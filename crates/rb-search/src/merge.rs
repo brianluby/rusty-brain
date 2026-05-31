@@ -51,18 +51,23 @@ pub fn build_signals(
 
     for (rank_idx, id) in keyword.iter().enumerate() {
         if let Some(i) = slot(id, &mut index, &mut out) {
-            out[i].keyword_rank = Some(rank_idx);
+            out[i].keyword_rank = Some(out[i].keyword_rank.map_or(rank_idx, |r| r.min(rank_idx)));
         }
     }
     for (id, distance) in vector {
         if let Some(i) = slot(id, &mut index, &mut out) {
-            out[i].vector_distance = Some(*distance);
+            out[i].vector_distance = Some(
+                out[i]
+                    .vector_distance
+                    .map_or(*distance, |d| d.min(*distance)),
+            );
         }
     }
     for (hop_idx, id) in graph.iter().enumerate() {
         if let Some(i) = slot(id, &mut index, &mut out) {
             // hop index saturates into u8; graph depth is bounded well below 255.
-            out[i].graph_hops = Some(hop_idx.min(u8::MAX as usize) as u8);
+            let hops = hop_idx.min(u8::MAX as usize) as u8;
+            out[i].graph_hops = Some(out[i].graph_hops.map_or(hops, |h| h.min(hops)));
         }
     }
 
@@ -149,6 +154,55 @@ mod tests {
         assert_eq!(by_id.get(&c).unwrap().graph_hops, Some(0));
         assert_eq!(by_id.get(&b).unwrap().graph_hops, Some(1));
         assert_eq!(by_id.get(&a).unwrap().graph_hops, Some(2));
+    }
+
+    #[test]
+    fn duplicate_keyword_ids_keep_earliest_rank() {
+        let now = Utc::now();
+        let duplicate = MemoryId::new();
+        let earlier = MemoryId::new();
+        let mut meta = HashMap::new();
+        for id in [&duplicate, &earlier] {
+            meta.insert(id.clone(), (5, now));
+        }
+
+        let keyword = vec![duplicate.clone(), earlier, duplicate.clone()];
+        let signals = build_signals(&keyword, &[], &[], &meta);
+        let by_id: HashMap<MemoryId, &Signals> =
+            signals.iter().map(|s| (s.id.clone(), s)).collect();
+
+        assert_eq!(by_id.get(&duplicate).unwrap().keyword_rank, Some(0));
+    }
+
+    #[test]
+    fn duplicate_vector_ids_keep_smallest_distance() {
+        let now = Utc::now();
+        let duplicate = MemoryId::new();
+        let mut meta = HashMap::new();
+        meta.insert(duplicate.clone(), (5, now));
+
+        let vector = vec![(duplicate.clone(), 0.8), (duplicate.clone(), 0.2)];
+        let signals = build_signals(&[], &vector, &[], &meta);
+
+        assert!((signals[0].vector_distance.unwrap() - 0.2).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn duplicate_graph_ids_keep_earliest_hop() {
+        let now = Utc::now();
+        let duplicate = MemoryId::new();
+        let other = MemoryId::new();
+        let mut meta = HashMap::new();
+        for id in [&duplicate, &other] {
+            meta.insert(id.clone(), (5, now));
+        }
+
+        let graph = vec![duplicate.clone(), other, duplicate.clone()];
+        let signals = build_signals(&[], &[], &graph, &meta);
+        let by_id: HashMap<MemoryId, &Signals> =
+            signals.iter().map(|s| (s.id.clone(), s)).collect();
+
+        assert_eq!(by_id.get(&duplicate).unwrap().graph_hops, Some(0));
     }
 
     #[test]

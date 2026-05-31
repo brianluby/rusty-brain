@@ -27,8 +27,9 @@ pub struct Signals {
 fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f32 {
     // Vector similarity: cosine distance in [0, 2] -> similarity in [0, 1].
     let vector_sim = match s.vector_distance {
-        Some(d) => 1.0 - (d / 2.0).clamp(0.0, 1.0),
+        Some(d) if d.is_finite() => 1.0 - (d / 2.0).clamp(0.0, 1.0),
         None => 0.0,
+        Some(_) => 0.0,
     };
     // Keyword: reciprocal rank, 0 = best -> 1.0.
     let keyword = match s.keyword_rank {
@@ -46,11 +47,18 @@ fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f3
     let age_days = ((now - s.created_at).num_seconds() as f32 / 86_400.0).max(0.0);
     let recency = (-age_days / HALF_LIFE).exp();
 
-    w.vector * vector_sim
-        + w.keyword * keyword
-        + w.graph * graph
-        + w.importance * importance
-        + w.recency * recency
+    let finite_weight = |weight: f32| if weight.is_finite() { weight } else { 0.0 };
+    let score = finite_weight(w.vector) * vector_sim
+        + finite_weight(w.keyword) * keyword
+        + finite_weight(w.graph) * graph
+        + finite_weight(w.importance) * importance
+        + finite_weight(w.recency) * recency;
+
+    if score.is_finite() {
+        score.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 /// Rank candidates by weighted, normalized signal score.
@@ -69,10 +77,9 @@ pub fn rank(
         .iter()
         .map(|s| (s.id.clone(), score_one(s, &weights, now)))
         .collect();
-    // Stable sort descending by score; partial_cmp is total here (scores are finite),
-    // and we fall back to Equal so a NaN (which cannot occur with finite inputs) does
-    // not panic, keeping the function panic-free on all paths.
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    // Stable sort descending by score; `total_cmp` keeps ordering deterministic for
+    // every public input shape, including values sanitized from non-finite signals.
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     scored.truncate(limit);
     scored
 }
@@ -261,5 +268,106 @@ mod tests {
                 "scores must be reproducible"
             );
         }
+    }
+
+    #[test]
+    fn non_finite_vector_distances_score_as_worst_vector_match() {
+        let n = now();
+        let finite = MemoryId::new();
+        let nan = MemoryId::new();
+        let infinity = MemoryId::new();
+        let weights = Weights {
+            vector: 1.0,
+            keyword: 0.0,
+            graph: 0.0,
+            importance: 0.0,
+            recency: 0.0,
+        };
+        let signals = vec![
+            Signals {
+                id: nan.clone(),
+                keyword_rank: None,
+                vector_distance: Some(f32::NAN),
+                graph_hops: None,
+                importance: 10,
+                created_at: n,
+            },
+            Signals {
+                id: infinity.clone(),
+                keyword_rank: None,
+                vector_distance: Some(f32::INFINITY),
+                graph_hops: None,
+                importance: 10,
+                created_at: n,
+            },
+            Signals {
+                id: finite.clone(),
+                keyword_rank: None,
+                vector_distance: Some(0.0),
+                graph_hops: None,
+                importance: 0,
+                created_at: n,
+            },
+        ];
+
+        let ranked = rank(signals, weights, n, 10);
+
+        assert_eq!(ranked[0], (finite, 1.0));
+        assert_eq!(ranked[1].0, nan);
+        assert_eq!(ranked[1].1, 0.0);
+        assert_eq!(ranked[2].0, infinity);
+        assert_eq!(ranked[2].1, 0.0);
+        assert!(ranked.iter().all(|(_, score)| score.is_finite()));
+    }
+
+    #[test]
+    fn non_finite_weights_are_ignored_and_custom_scores_are_clamped() {
+        let n = now();
+        let id = MemoryId::new();
+        let weights = Weights {
+            vector: f32::NAN,
+            keyword: f32::INFINITY,
+            graph: f32::NEG_INFINITY,
+            importance: 2.0,
+            recency: -1.0,
+        };
+        let signals = vec![Signals {
+            id: id.clone(),
+            keyword_rank: Some(0),
+            vector_distance: Some(0.0),
+            graph_hops: Some(0),
+            importance: 10,
+            created_at: n,
+        }];
+
+        let ranked = rank(signals, weights, n, 10);
+
+        assert_eq!(ranked, vec![(id, 1.0)]);
+        assert!(ranked[0].1.is_finite());
+    }
+
+    #[test]
+    fn negative_custom_scores_clamp_to_zero() {
+        let n = now();
+        let id = MemoryId::new();
+        let weights = Weights {
+            vector: -1.0,
+            keyword: 0.0,
+            graph: 0.0,
+            importance: 0.0,
+            recency: 0.0,
+        };
+        let signals = vec![Signals {
+            id: id.clone(),
+            keyword_rank: None,
+            vector_distance: Some(0.0),
+            graph_hops: None,
+            importance: 0,
+            created_at: n,
+        }];
+
+        let ranked = rank(signals, weights, n, 10);
+
+        assert_eq!(ranked, vec![(id, 0.0)]);
     }
 }
