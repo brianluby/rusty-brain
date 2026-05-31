@@ -6,5 +6,6 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod backend;
+mod enrich;
 
 pub use backend::MemoryBackend;
