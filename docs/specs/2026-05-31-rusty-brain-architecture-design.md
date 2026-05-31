@@ -19,6 +19,8 @@
 
 `rusty-brain` is the focused rebuild: **a shared memory substrate that many agents read and write concurrently — and nothing more.**
 
+**Prior art:** an earlier prototype (`rusty-brain-old`) was a clean 7-crate workspace (348 deps) that already integrated five agent CLIs, but stored memory as a single memvid-encoded file guarded by advisory `flock`. That model could not support easy concurrent multi-agent sharing — memvid requires `&mut self` and rewrites the whole file under an exclusive lock, so agents serialize with no read concurrency and no change propagation. This rebuild keeps that prototype's good ideas (the multi-agent integration surface, a versioned contract, fail-open capture hooks) and replaces the storage/concurrency core with a single-writer daemon over SQLite WAL.
+
 ## 2. Goals
 
 1. Persistent, project-aware semantic memory for AI agents, accessed primarily via MCP.
@@ -51,7 +53,7 @@
 3. **Embedding dimension is a single configured value, enforced at init, fail-closed.**
 4. **Migrations are file-discovered, checksummed, reproducible-from-git**, with a CI test that builds a fresh DB and exercises every query path.
 5. **Memory is a substrate, not an orchestrator.**
-6. **Security boundaries fail closed**; isolation enforced server-side, never trusted from the client.
+6. **Security boundaries fail closed; capture hooks fail open.** Isolation/auth is enforced server-side, never trusted from the client (denies on doubt). Conversely, any best-effort capture hook wired into an agent session must *never* block or break that session — it degrades silently. The two directions are deliberate: security denies on doubt; convenience capture must stay out of the user's way. (Confirmed by rusty-brain-old's non-negotiable fail-open hook rule.)
 7. **Lean by default**: heavy/optional things live behind features or separate crates. `cargo-deny` + `cargo-audit` in CI from commit one.
 8. **No `unwrap()`/`expect()`/`panic!` on request paths** (clippy-denied workspace-wide; allowed in tests).
 
@@ -223,6 +225,8 @@ pub trait EmbeddingProvider: Send + Sync {
 
 `recall`/`list`/`context` return lean uniform rows (summary + metadata); full bodies are fetched on demand via `get`. All inputs validated against JSON Schema at the boundary.
 
+**Contract versioning:** `rb-types` exposes a `ContractVersion` carried in the daemon handshake and surfaced to MCP/CLI clients (and future hook payloads), so a client can detect protocol drift and degrade or prompt-to-update rather than silently mis-serialize. (Borrowed from rusty-brain-old's `contract_version`.)
+
 **CLI:** mirrors the tools, plus `serve` (run daemon), `status`, and daemon control.
 
 ## 13. Error Handling & Resilience
@@ -259,6 +263,7 @@ CRDT text editor · `ractor`/`iroh` actor cluster & p2p · gRPC server · DSPy/P
 - **P1 — Core engine + daemon:** `rb-engine` (remember/recall/get/list), `rb-embed` (Voyage) + dim contract, `rb-search` hybrid ranking, `rb-daemon` (writer thread + read pool + UDS), `rb-proto`, CLI client.
 - **P2 — Agent surface:** `mcp` adapter + daemon auto-start, namespace detection (git/`CLAUDE.md`), graph links + traversal.
 - **P3 — Deferred (behind existing seams):** `subscribe` change-stream (cross-agent awareness), memory evolution (consolidation / link decay / importance recalibration) as opt-in daemon jobs, `local` embedding feature.
+- **P4 — Broader agent surface (deferred):** capture hooks + an `install` command that configures multiple agent CLIs (Claude Code, OpenCode, Copilot CLI, Codex CLI, Gemini CLI) to read/write the shared store via the daemon — **fail-open**, versioned by `ContractVersion`. Lives in separate `rb-hooks` / `rb-install` crates, never compiled into the core. (Ported in spirit from rusty-brain-old, which already integrated all five.)
 
 ## 18. Open Questions
 
@@ -270,12 +275,15 @@ CRDT text editor · `ractor`/`iroh` actor cluster & p2p · gRPC server · DSPy/P
 - Networked multi-host server (separate crate, real auth) if memory ever needs to span machines.
 - ANN vector index if scale exceeds sqlite-vec brute force.
 - Additional embedding providers via the trait.
+- Broader non-MCP agent integration via the P4 hook/`install` surface (fail-open, `ContractVersion`-gated).
+- Portable export/archive format (e.g. a single shareable memvid `.mv2` snapshot) for moving or committing a memory set — strictly as an *export*, never the live concurrent store.
 
 ## 20. Rejected Alternatives
 
 - **TOON for transport or MCP responses.** TOON (~40% fewer LLM tokens for *uniform arrays*) is wrong for the UDS transport (not LLM-facing; its truncation-blindness is a liability for a wire protocol) and only marginally useful for MCP responses (it compacts metadata, not the freeform `content` that dominates large recalls). Rejected for v1 to avoid unproven dependency/risk; revisit only with empirical token measurements on real payloads.
 - **libsql/Turso, Postgres/pgvector** — heavier or non-local-first; reserved as future options.
 - **Embedded-lib shared-file access** — simpler but suffers write contention and complicates cross-agent notifications; the single-writer daemon is cleaner for concurrent multi-agent use.
+- **Single-file memvid store + `flock` (the rusty-brain-old approach)** — a monolithic video-encoded file guarded by advisory locks. Proven in practice (v0) *not* to support easy concurrent multi-agent sharing: memvid needs `&mut self` and rewrites the file, so agents serialize on a coarse exclusive lock with no read concurrency or change propagation. This experience directly motivates the single-writer daemon + SQLite WAL; memvid is retained only as a possible export format (§19).
 
 ## Appendix A — Lesson → Design Traceability
 
@@ -288,5 +296,6 @@ CRDT text editor · `ractor`/`iroh` actor cluster & p2p · gRPC server · DSPy/P
 | Unauthenticated permissive-CORS HTTP API | No network by default; UDS + 0600 perms (§14) |
 | HMAC keyed on guessable `secret-$USER` | Filesystem-based local trust; server-side isolation (§8, §14) |
 | Self-update runs untrusted build, verifies after | No self-update; package-manager distribution (§14, §16) |
+| rusty-brain-old: single memvid file + `flock` blocked concurrent agents | Single-writer daemon + SQLite WAL — concurrent readers, serialized writes, change events (§8, §20) |
 | Scope creep (editor, actors, gRPC, ML) | Explicit non-goals; memory-substrate-only (§3, §16) |
 | 929 `unwrap()` on crash-exposed paths | Lint-denied outside tests; explicit error types (§5, §13) |
