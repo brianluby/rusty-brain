@@ -81,6 +81,90 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self.backend.write(note, embedding).await?;
         Ok(id)
     }
+
+    /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
+    /// candidates scoped to the engine namespace, rank with `rb_search`, then
+    /// return ranked `SearchResult`s after applying type/tag filters.
+    pub async fn recall(
+        &self,
+        query: &str,
+        limit: usize,
+        type_filter: Option<MemoryType>,
+        tags: &[String],
+    ) -> rb_types::Result<Vec<rb_types::SearchResult>> {
+        use std::collections::HashMap;
+
+        // Over-fetch candidates so post-filtering still has enough to fill `limit`.
+        let candidate_limit = limit.saturating_mul(4).max(limit);
+
+        let mut query_emb = self.embedder.embed(&[query.to_string()]).await?;
+        let embedding = query_emb.pop().unwrap_or_default();
+
+        let keyword = self
+            .backend
+            .keyword(self.namespace.clone(), query.to_string(), candidate_limit)
+            .await?;
+        let vector = self
+            .backend
+            .vector(self.namespace.clone(), embedding, candidate_limit)
+            .await?;
+
+        // Bounded 1-hop graph expansion of the top keyword hit only.
+        let graph = match keyword.first() {
+            Some(top) => self.backend.graph(top.clone(), 1).await?,
+            None => Vec::new(),
+        };
+
+        // Collect the unique candidate id set across all three sources.
+        let mut order: Vec<MemoryId> = Vec::new();
+        let mut seen: std::collections::HashSet<MemoryId> = std::collections::HashSet::new();
+        for id in keyword
+            .iter()
+            .chain(vector.iter().map(|(id, _)| id))
+            .chain(graph.iter())
+        {
+            if seen.insert(id.clone()) {
+                order.push(id.clone());
+            }
+        }
+
+        // Fetch each candidate once; build the note cache + the rank meta map.
+        let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
+        let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        for id in &order {
+            if let Some(note) = self.backend.get(id.clone()).await? {
+                meta.insert(id.clone(), (note.importance, note.created_at));
+                notes.insert(id.clone(), note);
+            }
+        }
+
+        let signals = rb_search::build_signals(&keyword, &vector, &graph, &meta);
+        let ranked = rb_search::rank(signals, self.weights, chrono::Utc::now(), candidate_limit);
+
+        // Assemble results in ranked order, applying filters, truncating to limit.
+        let mut results: Vec<rb_types::SearchResult> = Vec::new();
+        for (id, score) in ranked {
+            let Some(note) = notes.get(&id) else {
+                continue;
+            };
+            if let Some(ty) = type_filter {
+                if note.memory_type != ty {
+                    continue;
+                }
+            }
+            if !tags.iter().all(|t| note.tags.contains(t)) {
+                continue;
+            }
+            results.push(rb_types::SearchResult {
+                memory: note.clone(),
+                score,
+            });
+            if results.len() == limit {
+                break;
+            }
+        }
+        Ok(results)
+    }
 }
 
 #[cfg(test)]
@@ -172,5 +256,103 @@ mod tests {
             eng.backend().embedding_of(&id1),
             eng.backend().embedding_of(&id2)
         ); // deterministic provider => same vector
+    }
+
+    async fn seed(
+        eng: &MemoryEngine<MockBackend, DeterministicProvider>,
+        content: &str,
+        ty: MemoryType,
+        imp: u8,
+        tags: &[&str],
+    ) -> rb_types::MemoryId {
+        let mut inp = input(content, imp);
+        inp.memory_type = ty;
+        inp.tags = tags.iter().map(|t| t.to_string()).collect();
+        eng.remember(inp).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn recall_returns_results_for_seeded_memories() {
+        let eng = engine();
+        seed(
+            &eng,
+            "alpha topic about sqlite",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        seed(&eng, "beta topic about tokio", MemoryType::Insight, 5, &[]).await;
+        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // scores are finite and sorted descending.
+        assert!(results.iter().all(|r| r.score.is_finite()));
+        assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn recall_respects_limit() {
+        let eng = engine();
+        for i in 0..5 {
+            seed(
+                &eng,
+                &format!("doc number {i}"),
+                MemoryType::Insight,
+                5,
+                &[],
+            )
+            .await;
+        }
+        let results = eng.recall("doc", 2, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_type_filter_excludes_other_types() {
+        let eng = engine();
+        seed(&eng, "a bug fix note", MemoryType::BugFix, 5, &[]).await;
+        seed(&eng, "an insight note", MemoryType::Insight, 5, &[]).await;
+        let results = eng
+            .recall("note", 10, Some(MemoryType::BugFix), &[])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].memory.memory_type, MemoryType::BugFix);
+    }
+
+    #[tokio::test]
+    async fn recall_tag_filter_requires_all_tags() {
+        let eng = engine();
+        seed(&eng, "tagged one", MemoryType::Insight, 5, &["x", "y"]).await;
+        seed(&eng, "tagged two", MemoryType::Insight, 5, &["x"]).await;
+        let results = eng
+            .recall("tagged", 10, None, &["x".to_string(), "y".to_string()])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(results[0].memory.tags.contains(&"y".to_string()));
+    }
+
+    #[tokio::test]
+    async fn recall_ranks_all_candidates_with_finite_descending_scores() {
+        // NOTE: importance does NOT decide ordering between near-identical
+        // candidates (keyword-rank position dominates, see RANKING NOTE), so we
+        // assert the honest invariants: every candidate is returned, scores are
+        // finite, and the result is sorted descending. Importance-driven order
+        // is covered by the deterministic `list` test in Task 20.
+        let eng = engine();
+        let _low = seed(&eng, "ranking probe content", MemoryType::Insight, 2, &[]).await;
+        let _high = seed(&eng, "ranking probe content", MemoryType::Insight, 9, &[]).await;
+        let results = eng.recall("ranking probe", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.score.is_finite()));
+        assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn recall_empty_store_returns_empty() {
+        let eng = engine();
+        let results = eng.recall("anything", 10, None, &[]).await.unwrap();
+        assert!(results.is_empty());
     }
 }
