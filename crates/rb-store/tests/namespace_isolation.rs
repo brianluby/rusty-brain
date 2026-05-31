@@ -139,6 +139,43 @@ fn scoped_queries_never_cross_namespaces() {
         kw_b.is_disjoint(&a_ids),
         "keyword_search(b) must never return a-namespace ids"
     );
+
+    // --- vector_search scoped to "a": the query vector is closest to b1
+    // ([0,1,0,0]) GLOBALLY, so an unscoped KNN would surface a b-row first.
+    // Scoping to "a" must still return only a-namespace ids.
+    let query: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
+    let vec_a: HashSet<MemoryId> = store
+        .vector_search(&ns_a, &query, 50)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!vec_a.is_empty(), "vector_search(a) must match a-rows");
+    assert!(
+        vec_a.is_subset(&a_ids),
+        "vector_search(a) must only return a-namespace ids"
+    );
+    assert!(
+        vec_a.is_disjoint(&b_ids),
+        "vector_search(a) must never return b-namespace ids"
+    );
+
+    // --- vector_search scoped to "b" returns only b-rows.
+    let vec_b: HashSet<MemoryId> = store
+        .vector_search(&ns_b, &query, 50)
+        .unwrap()
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+    assert!(!vec_b.is_empty(), "vector_search(b) must match b-rows");
+    assert!(
+        vec_b.is_subset(&b_ids),
+        "vector_search(b) must only return b-namespace ids"
+    );
+    assert!(
+        vec_b.is_disjoint(&a_ids),
+        "vector_search(b) must never return a-namespace ids"
+    );
 }
 
 #[test]

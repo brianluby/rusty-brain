@@ -53,16 +53,22 @@ fn single_writer_many_readers_no_busy_no_lost_writes() {
                 if let Err(e) = reader.list(&ns, None, 50) {
                     if is_busy(&e.to_string()) {
                         busy_seen.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        panic!("unexpected reader error in list: {e}");
                     }
                 }
                 if let Err(e) = reader.keyword_search(&ns, "memory", 50) {
                     if is_busy(&e.to_string()) {
                         busy_seen.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        panic!("unexpected reader error in keyword_search: {e}");
                     }
                 }
                 if let Err(e) = reader.vector_search(&ns, &probe, 5) {
                     if is_busy(&e.to_string()) {
                         busy_seen.fetch_add(1, Ordering::Relaxed);
+                    } else {
+                        panic!("unexpected reader error in vector_search: {e}");
                     }
                 }
             }
