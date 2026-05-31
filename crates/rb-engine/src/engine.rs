@@ -51,6 +51,35 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self.weights
     }
 
+    fn in_namespace(&self, note: &MemoryNote) -> bool {
+        note.namespace == self.namespace
+    }
+
+    fn active_in_namespace(&self, note: &MemoryNote) -> bool {
+        self.in_namespace(note) && note.archived_at.is_none()
+    }
+
+    fn matches_recall_filters(
+        note: &MemoryNote,
+        type_filter: Option<MemoryType>,
+        tags: &[String],
+    ) -> bool {
+        if let Some(ty) = type_filter {
+            if note.memory_type != ty {
+                return false;
+            }
+        }
+        tags.iter().all(|t| note.tags.contains(t))
+    }
+
+    async fn get_scoped(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        Ok(self
+            .backend
+            .get(self.namespace.clone(), id)
+            .await?
+            .filter(|note| self.in_namespace(note)))
+    }
+
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
         let mut note = MemoryNote::new(
@@ -109,9 +138,21 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .vector(self.namespace.clone(), embedding, candidate_limit)
             .await?;
 
-        // Bounded 1-hop graph expansion of the top keyword hit only.
-        let graph = match keyword.first() {
-            Some(top) => self.backend.graph(top.clone(), 1).await?,
+        // Bounded 1-hop graph expansion of the top active in-namespace keyword hit only.
+        let mut graph_seed = None;
+        for id in &keyword {
+            if self
+                .get_scoped(id.clone())
+                .await?
+                .as_ref()
+                .is_some_and(|note| self.active_in_namespace(note))
+            {
+                graph_seed = Some(id.clone());
+                break;
+            }
+        }
+        let graph = match graph_seed {
+            Some(top) => self.backend.graph(self.namespace.clone(), top, 1).await?,
             None => Vec::new(),
         };
 
@@ -132,29 +173,43 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
         for id in &order {
-            if let Some(note) = self.backend.get(id.clone()).await? {
+            if let Some(note) = self.get_scoped(id.clone()).await? {
+                if !self.active_in_namespace(&note)
+                    || !Self::matches_recall_filters(&note, type_filter, tags)
+                {
+                    continue;
+                }
                 meta.insert(id.clone(), (note.importance, note.created_at));
                 notes.insert(id.clone(), note);
             }
         }
 
-        let signals = rb_search::build_signals(&keyword, &vector, &graph, &meta);
+        let filtered_keyword: Vec<MemoryId> = keyword
+            .iter()
+            .filter(|id| notes.contains_key(*id))
+            .cloned()
+            .collect();
+        let filtered_vector: Vec<(MemoryId, f32)> = vector
+            .iter()
+            .filter(|(id, _)| notes.contains_key(id))
+            .cloned()
+            .collect();
+        let filtered_graph: Vec<MemoryId> = graph
+            .iter()
+            .filter(|id| notes.contains_key(*id))
+            .cloned()
+            .collect();
+
+        let signals =
+            rb_search::build_signals(&filtered_keyword, &filtered_vector, &filtered_graph, &meta);
         let ranked = rb_search::rank(signals, self.weights, chrono::Utc::now(), candidate_limit);
 
-        // Assemble results in ranked order, applying filters, truncating to limit.
+        // Assemble results in ranked order, truncating to limit.
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
         for (id, score) in ranked {
             let Some(note) = notes.get(&id) else {
                 continue;
             };
-            if let Some(ty) = type_filter {
-                if note.memory_type != ty {
-                    continue;
-                }
-            }
-            if !tags.iter().all(|t| note.tags.contains(t)) {
-                continue;
-            }
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
@@ -166,9 +221,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         Ok(results)
     }
 
-    /// Fetch a single memory by id (namespace scoping is enforced by the backend).
+    /// Fetch a single memory by id in the engine namespace.
     pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        self.backend.get(id).await
+        self.get_scoped(id).await
     }
 
     /// List memories in the engine namespace, most-recent first, optionally
@@ -185,10 +240,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Expand the graph around `id` to `depth` hops and fetch the connected notes.
     pub async fn graph(&self, id: MemoryId, depth: u8) -> rb_types::Result<Vec<MemoryNote>> {
-        let ids = self.backend.graph(id, depth).await?;
+        let Some(anchor) = self.get_scoped(id.clone()).await? else {
+            return Ok(Vec::new());
+        };
+        if !self.active_in_namespace(&anchor) {
+            return Ok(Vec::new());
+        }
+        let ids = self
+            .backend
+            .graph(self.namespace.clone(), id, depth)
+            .await?;
         let mut notes = Vec::with_capacity(ids.len());
         for nid in ids {
-            if let Some(note) = self.backend.get(nid).await? {
+            if let Some(note) = self.get_scoped(nid).await? {
+                if !self.active_in_namespace(&note) {
+                    continue;
+                }
                 notes.push(note);
             }
         }
@@ -201,12 +268,20 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         id: MemoryId,
         updates: rb_types::MemoryUpdates,
     ) -> rb_types::Result<()> {
-        self.backend.update(id, updates).await
+        if self.get_scoped(id.clone()).await?.is_none() {
+            return Err(rb_types::Error::NotFound(id));
+        }
+        self.backend
+            .update(self.namespace.clone(), id, updates)
+            .await
     }
 
     /// Soft-delete (archive) a memory. Spec §12: delete == soft archive.
     pub async fn delete(&self, id: MemoryId) -> rb_types::Result<()> {
-        self.backend.archive(id).await
+        if self.get_scoped(id.clone()).await?.is_none() {
+            return Err(rb_types::Error::NotFound(id));
+        }
+        self.backend.archive(self.namespace.clone(), id).await
     }
 
     /// Project context payload: recent memories (by recency) plus important ones
@@ -331,6 +406,18 @@ mod tests {
         eng.remember(inp).await.unwrap()
     }
 
+    fn note(
+        namespace: Namespace,
+        content: &str,
+        ty: MemoryType,
+        importance: u8,
+        tags: &[&str],
+    ) -> MemoryNote {
+        let mut note = MemoryNote::new(namespace, content.to_string(), ty, importance);
+        note.tags = tags.iter().map(|t| t.to_string()).collect();
+        note
+    }
+
     #[tokio::test]
     async fn recall_returns_results_for_seeded_memories() {
         let eng = engine();
@@ -394,6 +481,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_filters_before_ranking_so_matching_candidates_fill_limit() {
+        let eng = engine();
+
+        let wrong_ids: Vec<MemoryId> = (0..12)
+            .map(|i| {
+                let ty = if i % 2 == 0 {
+                    MemoryType::Insight
+                } else {
+                    MemoryType::BugFix
+                };
+                let note = note(
+                    Namespace::Project("rb".into()),
+                    &format!("wrong candidate {i}"),
+                    ty,
+                    10,
+                    &["wrong"],
+                );
+                let id = note.id.clone();
+                eng.backend().insert_note(note);
+                id
+            })
+            .collect();
+        let matching_ids: Vec<MemoryId> = (0..3)
+            .map(|i| {
+                let note = note(
+                    Namespace::Project("rb".into()),
+                    &format!("matching candidate {i}"),
+                    MemoryType::BugFix,
+                    1,
+                    &["keep"],
+                );
+                let id = note.id.clone();
+                eng.backend().insert_note(note);
+                id
+            })
+            .collect();
+        eng.backend().set_keyword_results(wrong_ids);
+        eng.backend()
+            .set_vector_results(matching_ids.iter().cloned().map(|id| (id, 2.0)).collect());
+
+        let results = eng
+            .recall(
+                "candidate",
+                3,
+                Some(MemoryType::BugFix),
+                &["keep".to_string()],
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 3);
+        assert!(results.iter().all(|r| matching_ids.contains(&r.memory.id)));
+    }
+
+    #[tokio::test]
     async fn recall_ranks_all_candidates_with_finite_descending_scores() {
         // NOTE: importance does NOT decide ordering between near-identical
         // candidates (keyword-rank position dominates, see RANKING NOTE), so we
@@ -422,6 +564,22 @@ mod tests {
         let id = eng.remember(input("findable", 5)).await.unwrap();
         assert!(eng.get(id.clone()).await.unwrap().is_some());
         assert!(eng.get(rb_types::MemoryId::new()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn get_does_not_return_cross_namespace_note() {
+        let eng = engine();
+        let cross = note(
+            Namespace::Project("other".into()),
+            "foreign note",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let cross_id = cross.id.clone();
+        eng.backend().insert_note(cross);
+
+        assert!(eng.get(cross_id).await.unwrap().is_none());
     }
 
     #[tokio::test]
@@ -454,6 +612,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_does_not_mutate_cross_namespace_note() {
+        let eng = engine();
+        let cross = note(
+            Namespace::Project("other".into()),
+            "foreign body",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let cross_id = cross.id.clone();
+        eng.backend().insert_note(cross);
+
+        let _ = eng
+            .update(
+                cross_id.clone(),
+                rb_types::MemoryUpdates {
+                    content: Some("mutated".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await;
+
+        let note = eng.backend().note_of(&cross_id).unwrap();
+        assert_eq!(note.content, "foreign body");
+    }
+
+    #[tokio::test]
     async fn delete_soft_archives_the_note() {
         let eng = engine();
         let id = eng.remember(input("doomed", 5)).await.unwrap();
@@ -463,13 +648,117 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn delete_does_not_archive_cross_namespace_note() {
+        let eng = engine();
+        let cross = note(
+            Namespace::Project("other".into()),
+            "foreign body",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let cross_id = cross.id.clone();
+        eng.backend().insert_note(cross);
+
+        let _ = eng.delete(cross_id.clone()).await;
+
+        let note = eng.backend().note_of(&cross_id).unwrap();
+        assert!(note.archived_at.is_none());
+    }
+
+    #[tokio::test]
     async fn graph_returns_connected_notes() {
-        // MockBackend.graph returns empty, so graph() yields no neighbors here;
-        // this asserts the pass-through shape and empty handling without a DB.
         let eng = engine();
         let id = eng.remember(input("anchor", 5)).await.unwrap();
+        let active = note(
+            Namespace::Project("rb".into()),
+            "same namespace active",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let cross = note(
+            Namespace::Project("other".into()),
+            "foreign neighbor",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let mut archived = note(
+            Namespace::Project("rb".into()),
+            "archived neighbor",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        archived.archived_at = Some(chrono::Utc::now());
+        let active_id = active.id.clone();
+        let cross_id = cross.id.clone();
+        let archived_id = archived.id.clone();
+        eng.backend().insert_note(active);
+        eng.backend().insert_note(cross);
+        eng.backend().insert_note(archived);
+        eng.backend().set_graph_neighbors(
+            id.clone(),
+            vec![cross_id.clone(), archived_id.clone(), active_id.clone()],
+        );
+
         let neighbors = eng.graph(id, 2).await.unwrap();
-        assert!(neighbors.is_empty());
+        assert_eq!(neighbors.len(), 1);
+        assert_eq!(neighbors[0].id, active_id);
+
+        eng.backend()
+            .set_graph_neighbors(cross_id.clone(), vec![active_id]);
+        let cross_anchor_neighbors = eng.graph(cross_id, 2).await.unwrap();
+        assert!(cross_anchor_neighbors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_does_not_leak_cross_namespace_or_archived_graph_neighbors() {
+        let eng = engine();
+        let anchor = seed(&eng, "anchor topic", MemoryType::Insight, 5, &[]).await;
+        let active = note(
+            Namespace::Project("rb".into()),
+            "same namespace active graph result",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let cross = note(
+            Namespace::Project("other".into()),
+            "foreign graph result",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let mut archived = note(
+            Namespace::Project("rb".into()),
+            "archived graph result",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        archived.archived_at = Some(chrono::Utc::now());
+        let active_id = active.id.clone();
+        let cross_id = cross.id.clone();
+        let archived_id = archived.id.clone();
+        eng.backend().insert_note(active);
+        eng.backend().insert_note(cross);
+        eng.backend().insert_note(archived);
+        eng.backend().set_keyword_results(vec![anchor.clone()]);
+        eng.backend().set_vector_results(Vec::new());
+        eng.backend().set_graph_neighbors(
+            anchor,
+            vec![cross_id.clone(), archived_id.clone(), active_id],
+        );
+
+        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+
+        assert!(results.iter().all(|r| {
+            r.memory.namespace == Namespace::Project("rb".into()) && r.memory.archived_at.is_none()
+        }));
+        assert!(!results.iter().any(|r| r.memory.id == cross_id));
+        assert!(!results.iter().any(|r| r.memory.id == archived_id));
     }
 
     #[tokio::test]

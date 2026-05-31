@@ -14,6 +14,9 @@ use std::sync::Mutex;
 pub(crate) struct MockBackend {
     pub notes: Mutex<HashMap<MemoryId, MemoryNote>>,
     pub embeddings: Mutex<HashMap<MemoryId, Vec<f32>>>,
+    graph: Mutex<HashMap<MemoryId, Vec<MemoryId>>>,
+    keyword_results: Mutex<Option<Vec<MemoryId>>>,
+    vector_results: Mutex<Option<Vec<(MemoryId, f32)>>>,
 }
 
 impl MockBackend {
@@ -28,6 +31,22 @@ impl MockBackend {
     pub fn note_of(&self, id: &MemoryId) -> Option<MemoryNote> {
         self.notes.lock().unwrap().get(id).cloned()
     }
+
+    pub fn insert_note(&self, note: MemoryNote) {
+        self.notes.lock().unwrap().insert(note.id.clone(), note);
+    }
+
+    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<MemoryId>) {
+        self.graph.lock().unwrap().insert(id, neighbors);
+    }
+
+    pub fn set_keyword_results(&self, ids: Vec<MemoryId>) {
+        *self.keyword_results.lock().unwrap() = Some(ids);
+    }
+
+    pub fn set_vector_results(&self, ids: Vec<(MemoryId, f32)>) {
+        *self.vector_results.lock().unwrap() = Some(ids);
+    }
 }
 
 #[async_trait::async_trait]
@@ -40,16 +59,25 @@ impl MemoryBackend for MockBackend {
         Ok(())
     }
 
-    async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        Ok(self.notes.lock().unwrap().get(&id).cloned())
+    async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        Ok(self
+            .notes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|note| note.namespace == ns)
+            .cloned())
     }
 
     async fn keyword(
         &self,
         ns: Namespace,
         _query: String,
-        _limit: usize,
+        limit: usize,
     ) -> rb_types::Result<Vec<MemoryId>> {
+        if let Some(ids) = self.keyword_results.lock().unwrap().clone() {
+            return Ok(ids.into_iter().take(limit).collect());
+        }
         let mut v: Vec<MemoryNote> = self
             .notes
             .lock()
@@ -59,15 +87,18 @@ impl MemoryBackend for MockBackend {
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().map(|n| n.id).collect())
+        Ok(v.into_iter().take(limit).map(|n| n.id).collect())
     }
 
     async fn vector(
         &self,
         ns: Namespace,
         _embedding: Vec<f32>,
-        _limit: usize,
+        limit: usize,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
+        if let Some(ids) = self.vector_results.lock().unwrap().clone() {
+            return Ok(ids.into_iter().take(limit).collect());
+        }
         let mut v: Vec<MemoryNote> = self
             .notes
             .lock()
@@ -77,11 +108,31 @@ impl MemoryBackend for MockBackend {
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().map(|n| (n.id, 0.0)).collect())
+        Ok(v.into_iter().take(limit).map(|n| (n.id, 0.0)).collect())
     }
 
-    async fn graph(&self, _id: MemoryId, _depth: u8) -> rb_types::Result<Vec<MemoryId>> {
-        Ok(Vec::new())
+    async fn graph(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        _depth: u8,
+    ) -> rb_types::Result<Vec<MemoryId>> {
+        let has_anchor = self
+            .notes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|note| note.namespace == ns);
+        if !has_anchor {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .graph
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default())
     }
 
     async fn list(
@@ -104,10 +155,16 @@ impl MemoryBackend for MockBackend {
         Ok(v)
     }
 
-    async fn update(&self, id: MemoryId, updates: MemoryUpdates) -> rb_types::Result<()> {
+    async fn update(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        updates: MemoryUpdates,
+    ) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
         let note = guard
             .get_mut(&id)
+            .filter(|note| note.namespace == ns)
             .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
         if let Some(c) = updates.content {
             note.content = c;
@@ -127,10 +184,11 @@ impl MemoryBackend for MockBackend {
         Ok(())
     }
 
-    async fn archive(&self, id: MemoryId) -> rb_types::Result<()> {
+    async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
         let note = guard
             .get_mut(&id)
+            .filter(|note| note.namespace == ns)
             .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
         note.archived_at = Some(chrono::Utc::now());
         Ok(())

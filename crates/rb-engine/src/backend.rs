@@ -7,7 +7,7 @@ use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
 #[async_trait::async_trait]
 pub trait MemoryBackend: Send + Sync {
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()>;
-    async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
+    async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
     async fn keyword(
         &self,
         ns: Namespace,
@@ -20,15 +20,25 @@ pub trait MemoryBackend: Send + Sync {
         embedding: Vec<f32>,
         limit: usize,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>>;
-    async fn graph(&self, id: MemoryId, depth: u8) -> rb_types::Result<Vec<MemoryId>>;
+    async fn graph(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        depth: u8,
+    ) -> rb_types::Result<Vec<MemoryId>>;
     async fn list(
         &self,
         ns: Namespace,
         min_importance: Option<u8>,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>>;
-    async fn update(&self, id: MemoryId, updates: MemoryUpdates) -> rb_types::Result<()>;
-    async fn archive(&self, id: MemoryId) -> rb_types::Result<()>;
+    async fn update(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        updates: MemoryUpdates,
+    ) -> rb_types::Result<()>;
+    async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()>;
 }
 
 #[cfg(test)]
@@ -60,8 +70,14 @@ mod tests {
             self.notes.lock().unwrap().insert(note.id.clone(), note);
             Ok(())
         }
-        async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-            Ok(self.notes.lock().unwrap().get(&id).cloned())
+        async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+            Ok(self
+                .notes
+                .lock()
+                .unwrap()
+                .get(&id)
+                .filter(|note| note.namespace == ns)
+                .cloned())
         }
         async fn keyword(
             &self,
@@ -97,7 +113,12 @@ mod tests {
             pairs.sort_by_key(|(_, note)| std::cmp::Reverse(note.created_at));
             Ok(pairs.into_iter().map(|(id, _)| (id, 0.0)).collect())
         }
-        async fn graph(&self, _id: MemoryId, _depth: u8) -> rb_types::Result<Vec<MemoryId>> {
+        async fn graph(
+            &self,
+            _ns: Namespace,
+            _id: MemoryId,
+            _depth: u8,
+        ) -> rb_types::Result<Vec<MemoryId>> {
             Ok(Vec::new())
         }
         async fn list(
@@ -118,10 +139,16 @@ mod tests {
             v.truncate(limit);
             Ok(v)
         }
-        async fn update(&self, id: MemoryId, updates: MemoryUpdates) -> rb_types::Result<()> {
+        async fn update(
+            &self,
+            ns: Namespace,
+            id: MemoryId,
+            updates: MemoryUpdates,
+        ) -> rb_types::Result<()> {
             let mut guard = self.notes.lock().unwrap();
             let note = guard
                 .get_mut(&id)
+                .filter(|note| note.namespace == ns)
                 .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
             if let Some(c) = updates.content {
                 note.content = c;
@@ -131,10 +158,11 @@ mod tests {
             }
             Ok(())
         }
-        async fn archive(&self, id: MemoryId) -> rb_types::Result<()> {
+        async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()> {
             let mut guard = self.notes.lock().unwrap();
             let note = guard
                 .get_mut(&id)
+                .filter(|note| note.namespace == ns)
                 .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
             note.archived_at = Some(chrono::Utc::now());
             Ok(())
@@ -155,7 +183,7 @@ mod tests {
             .write(note.clone(), Some(vec![0.1, 0.2, 0.3]))
             .await
             .unwrap();
-        let got = backend.get(id).await.unwrap().unwrap();
+        let got = backend.get(Namespace::Global, id).await.unwrap().unwrap();
         assert_eq!(got.content, "hello world");
     }
 
@@ -165,9 +193,12 @@ mod tests {
         let note = MemoryNote::new(Namespace::Global, "x".to_string(), MemoryType::Reference, 3);
         let id = note.id.clone();
         backend.write(note, None).await.unwrap();
-        backend.archive(id.clone()).await.unwrap();
+        backend
+            .archive(Namespace::Global, id.clone())
+            .await
+            .unwrap();
         assert!(backend
-            .get(id)
+            .get(Namespace::Global, id)
             .await
             .unwrap()
             .unwrap()

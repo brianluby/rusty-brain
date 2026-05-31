@@ -18,8 +18,14 @@ impl MemoryBackend for VecBackend {
         Ok(())
     }
 
-    async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        Ok(self.notes.lock().unwrap().get(&id).cloned())
+    async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        Ok(self
+            .notes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|note| note.namespace == ns)
+            .cloned())
     }
 
     async fn keyword(
@@ -49,7 +55,12 @@ impl MemoryBackend for VecBackend {
         Ok(Vec::new())
     }
 
-    async fn graph(&self, _id: MemoryId, _depth: u8) -> rb_types::Result<Vec<MemoryId>> {
+    async fn graph(
+        &self,
+        _ns: Namespace,
+        _id: MemoryId,
+        _depth: u8,
+    ) -> rb_types::Result<Vec<MemoryId>> {
         Ok(Vec::new())
     }
 
@@ -73,10 +84,16 @@ impl MemoryBackend for VecBackend {
         Ok(v)
     }
 
-    async fn update(&self, id: MemoryId, updates: MemoryUpdates) -> rb_types::Result<()> {
+    async fn update(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        updates: MemoryUpdates,
+    ) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
         let note = guard
             .get_mut(&id)
+            .filter(|note| note.namespace == ns)
             .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
         if let Some(c) = updates.content {
             note.content = c;
@@ -84,10 +101,11 @@ impl MemoryBackend for VecBackend {
         Ok(())
     }
 
-    async fn archive(&self, id: MemoryId) -> rb_types::Result<()> {
+    async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
         let note = guard
             .get_mut(&id)
+            .filter(|note| note.namespace == ns)
             .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
         note.archived_at = Some(chrono::Utc::now());
         Ok(())
