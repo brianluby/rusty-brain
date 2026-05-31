@@ -1,6 +1,12 @@
-//! `rb_embed`: pluggable embedding providers for rusty-brain.
+//! `rb_embed`: embedding providers for rusty-brain.
 //!
-//! The `EmbeddingProvider` trait, a Voyage remote impl, and an offline
-//! deterministic provider for tests and no-API-key fallback. Concrete types
-//! are added in subsequent tasks.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+//! Defines the `EmbeddingProvider` trait, the remote `VoyageProvider`
+//! (added in a later task), and a public offline `DeterministicProvider`
+//! used as a no-API-key fallback and in tests.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod deterministic;
+mod provider;
+
+pub use deterministic::DeterministicProvider;
+pub use provider::EmbeddingProvider;

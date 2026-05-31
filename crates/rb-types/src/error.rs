@@ -21,6 +21,8 @@ pub enum Error {
     DimensionMismatch { expected: usize, got: usize },
     #[error("io error: {0}")]
     Io(String),
+    #[error("embedding error: {0}")]
+    Embedding(String),
 }
 
 /// Convenience alias used throughout rusty-brain.

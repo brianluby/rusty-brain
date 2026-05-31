@@ -29,6 +29,7 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Serialization(_) => "serialization",
         Error::DimensionMismatch { .. } => "dimension_mismatch",
         Error::Io(_) => "io",
+        Error::Embedding(_) => "embedding",
     }
 }
 
@@ -47,6 +48,7 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "invalid_link_type" => Error::InvalidLinkType(message.to_string()),
         "serialization" => Error::Serialization(message.to_string()),
         "io" => Error::Io(message.to_string()),
+        "embedding" => Error::Embedding(message.to_string()),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
@@ -132,6 +134,14 @@ mod tests {
     #[test]
     fn io_round_trips() {
         assert!(matches!(round_trip(Error::Io("eof".into())), Error::Io(_)));
+    }
+
+    #[test]
+    fn embedding_round_trips() {
+        assert!(matches!(
+            round_trip(Error::Embedding("provider failed".into())),
+            Error::Embedding(_)
+        ));
     }
 
     #[test]
