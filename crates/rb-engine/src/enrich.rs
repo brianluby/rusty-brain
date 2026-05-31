@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-
 /// Maximum characters retained in a heuristic summary.
 const SUMMARY_MAX_CHARS: usize = 150;
 /// Maximum number of derived keywords.
