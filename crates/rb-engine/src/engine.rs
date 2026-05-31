@@ -165,6 +165,66 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         }
         Ok(results)
     }
+
+    /// Fetch a single memory by id (namespace scoping is enforced by the backend).
+    pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        self.backend.get(id).await
+    }
+
+    /// List memories in the engine namespace, most-recent first, optionally
+    /// filtered by a minimum importance.
+    pub async fn list(
+        &self,
+        min_importance: Option<u8>,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        self.backend
+            .list(self.namespace.clone(), min_importance, limit)
+            .await
+    }
+
+    /// Expand the graph around `id` to `depth` hops and fetch the connected notes.
+    pub async fn graph(&self, id: MemoryId, depth: u8) -> rb_types::Result<Vec<MemoryNote>> {
+        let ids = self.backend.graph(id, depth).await?;
+        let mut notes = Vec::with_capacity(ids.len());
+        for nid in ids {
+            if let Some(note) = self.backend.get(nid).await? {
+                notes.push(note);
+            }
+        }
+        Ok(notes)
+    }
+
+    /// Apply a partial update to an existing memory.
+    pub async fn update(
+        &self,
+        id: MemoryId,
+        updates: rb_types::MemoryUpdates,
+    ) -> rb_types::Result<()> {
+        self.backend.update(id, updates).await
+    }
+
+    /// Soft-delete (archive) a memory. Spec §12: delete == soft archive.
+    pub async fn delete(&self, id: MemoryId) -> rb_types::Result<()> {
+        self.backend.archive(id).await
+    }
+
+    /// Project context payload: recent memories (by recency) plus important ones
+    /// (importance >= 8), with a total count of the recent window.
+    pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
+        const CONTEXT_LIMIT: usize = 50;
+        const IMPORTANT_FLOOR: u8 = 8;
+        let recent = self
+            .backend
+            .list(self.namespace.clone(), None, CONTEXT_LIMIT)
+            .await?;
+        let important = self
+            .backend
+            .list(self.namespace.clone(), Some(IMPORTANT_FLOOR), CONTEXT_LIMIT)
+            .await?;
+        let total = recent.len();
+        Ok((recent, important, total))
+    }
 }
 
 #[cfg(test)]
@@ -354,5 +414,74 @@ mod tests {
         let eng = engine();
         let results = eng.recall("anything", 10, None, &[]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn get_returns_stored_note_or_none() {
+        let eng = engine();
+        let id = eng.remember(input("findable", 5)).await.unwrap();
+        assert!(eng.get(id.clone()).await.unwrap().is_some());
+        assert!(eng.get(rb_types::MemoryId::new()).await.unwrap().is_none());
+    }
+
+    #[tokio::test]
+    async fn list_orders_by_recency_and_honors_min_importance() {
+        let eng = engine();
+        seed(&eng, "first", MemoryType::Insight, 3, &[]).await;
+        seed(&eng, "second", MemoryType::Insight, 9, &[]).await;
+        let all = eng.list(None, 10).await.unwrap();
+        assert_eq!(all.len(), 2);
+        // most recent first (second was inserted last).
+        assert_eq!(all[0].content, "second");
+        let important = eng.list(Some(8), 10).await.unwrap();
+        assert_eq!(important.len(), 1);
+        assert_eq!(important[0].importance, 9);
+    }
+
+    #[tokio::test]
+    async fn update_mutates_then_get_reflects_change() {
+        let eng = engine();
+        let id = eng.remember(input("old body", 5)).await.unwrap();
+        let updates = rb_types::MemoryUpdates {
+            content: Some("new body".to_string()),
+            importance: Some(9),
+            ..Default::default()
+        };
+        eng.update(id.clone(), updates).await.unwrap();
+        let note = eng.get(id).await.unwrap().unwrap();
+        assert_eq!(note.content, "new body");
+        assert_eq!(note.importance, 9);
+    }
+
+    #[tokio::test]
+    async fn delete_soft_archives_the_note() {
+        let eng = engine();
+        let id = eng.remember(input("doomed", 5)).await.unwrap();
+        eng.delete(id.clone()).await.unwrap();
+        let note = eng.get(id).await.unwrap().unwrap();
+        assert!(note.archived_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn graph_returns_connected_notes() {
+        // MockBackend.graph returns empty, so graph() yields no neighbors here;
+        // this asserts the pass-through shape and empty handling without a DB.
+        let eng = engine();
+        let id = eng.remember(input("anchor", 5)).await.unwrap();
+        let neighbors = eng.graph(id, 2).await.unwrap();
+        assert!(neighbors.is_empty());
+    }
+
+    #[tokio::test]
+    async fn context_splits_recent_and_important() {
+        let eng = engine();
+        seed(&eng, "low importance recent", MemoryType::Insight, 2, &[]).await;
+        seed(&eng, "high importance note", MemoryType::Insight, 9, &[]).await;
+        let (recent, important, total) = eng.context().await.unwrap();
+        // recent includes both; important only the >= 8 one.
+        assert_eq!(recent.len(), 2);
+        assert_eq!(important.len(), 1);
+        assert_eq!(important[0].importance, 9);
+        assert_eq!(total, 2);
     }
 }
