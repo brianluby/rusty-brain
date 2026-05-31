@@ -1,0 +1,29 @@
+[package]
+name = "rb-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Embedding provider trait for rusty-brain plus a Voyage remote impl and an offline deterministic provider."
+
+[lib]
+name = "rb_embed"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+async-trait = { workspace = true }
+reqwest = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+secrecy = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }
+wiremock = { workspace = true }
+
+[lints]
+workspace = true

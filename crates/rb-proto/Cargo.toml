@@ -1,0 +1,25 @@
+[package]
+name = "rb-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain daemon wire protocol: request/response enums, length-delimited JSON framing, and async UDS client."
+
+[lib]
+name = "rb_proto"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+bytes = { workspace = true }
+futures = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

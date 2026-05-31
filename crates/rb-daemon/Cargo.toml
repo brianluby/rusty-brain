@@ -1,0 +1,34 @@
+[package]
+name = "rb-daemon"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain single-writer daemon: dedicated writer thread, read pool, UDS listener, change broadcast, server-side isolation."
+
+[lib]
+name = "rb_daemon"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+rb-store = { path = "../rb-store" }
+rb-engine = { path = "../rb-engine" }
+rb-embed = { path = "../rb-embed" }
+rb-proto = { path = "../rb-proto" }
+rb-search = { path = "../rb-search" }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
+futures = { workspace = true }
+deadpool-sqlite = { workspace = true }
+directories = { workspace = true }
+tracing = { workspace = true }
+thiserror = { workspace = true }
+serde = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
