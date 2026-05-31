@@ -1,0 +1,26 @@
+[package]
+name = "rb-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "SQLite + sqlite-vec storage engine for rusty-brain: schema, migrations, FTS, vector KNN, graph."
+
+[lib]
+name = "rb_store"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+rusqlite = { workspace = true }
+sqlite-vec = { workspace = true }
+deadpool-sqlite = { workspace = true }
+include_dir = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
