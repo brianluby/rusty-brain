@@ -7,5 +7,7 @@
 
 mod error;
 mod migrations;
+mod store;
 
 pub use migrations::run_migrations;
+pub use store::{SqliteStore, Store};
