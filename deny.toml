@@ -1,0 +1,48 @@
+# cargo-deny configuration for rusty-brain.
+# Enforced in CI from commit one (spec sections 5.7 and 15).
+
+[graph]
+all-features = true
+
+[advisories]
+# Fail on any security advisory in the dependency graph.
+# `version = 2` selects the modern schema where unmaintained/yanked
+# default to deny-style behavior via the lint surface below.
+version = 2
+yanked = "deny"
+ignore = []
+
+[licenses]
+version = 2
+# Sane permissive allowlist covering the P0 dependency closure
+# (serde/uuid/chrono/thiserror/rusqlite/sqlite-vec/deadpool/include_dir/sha2/tempfile).
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "Zlib",
+    "CC0-1.0",
+    "MPL-2.0",
+]
+confidence-threshold = 0.9
+# No copyleft-by-default; anything not in `allow` fails the build.
+
+[bans]
+# Surface accidental dependency bloat / duplicate trees.
+multiple-versions = "warn"
+wildcards = "warn"
+highlight = "all"
+deny = []
+skip = []
+skip-tree = []
+
+[sources]
+# Only crates.io is trusted by default.
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
