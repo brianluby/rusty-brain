@@ -264,4 +264,80 @@ mod tests {
             .unwrap();
         assert_eq!(max, 10, "two-digit version recorded");
     }
+
+    #[test]
+    fn embedded_initial_schema_creates_expected_objects() {
+        let c = conn();
+        // Run the real, file-discovered migrations (001_initial_schema.sql).
+        run_migrations(&c).unwrap();
+
+        let exists = |name: &str, kind: &str| -> bool {
+            let n: i64 = c
+                .query_row(
+                    "SELECT count(*) FROM sqlite_master WHERE type=?1 AND name=?2",
+                    rusqlite::params![kind, name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            n == 1
+        };
+
+        assert!(exists("meta", "table"), "meta table");
+        assert!(exists("memories", "table"), "memories table");
+        assert!(exists("memory_links", "table"), "memory_links table");
+        assert!(
+            exists("memories_fts", "table"),
+            "memories_fts virtual table"
+        );
+        assert!(exists("idx_mem_ns", "index"), "idx_mem_ns");
+        assert!(
+            exists("idx_mem_active", "index"),
+            "idx_mem_active partial index"
+        );
+        assert!(exists("mem_ai", "trigger"), "FTS after-insert trigger");
+        assert!(exists("mem_au", "trigger"), "FTS after-update trigger");
+        assert!(exists("mem_ad", "trigger"), "FTS after-delete trigger");
+
+        // memory_vectors is created in code at open(), NOT by the migration file.
+        assert!(
+            !exists("memory_vectors", "table"),
+            "memory_vectors must NOT be created by static migrations"
+        );
+
+        // archived_at column is present in the BASE schema (no ghost migration).
+        let has_archived: i64 = c
+            .query_row(
+                "SELECT count(*) FROM pragma_table_info('memories') WHERE name='archived_at'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            has_archived, 1,
+            "archived_at present in base memories schema"
+        );
+
+        // The memory_type CHECK constraint accepts a valid enum value...
+        c.execute(
+            "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+             summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+             VALUES ('m1','global',0,0,'c','s','[]','[]','insight',5,1.0,'')",
+            [],
+        )
+        .unwrap();
+        // ...and the FTS row was synced by the after-insert trigger.
+        let fts_rows: i64 = c
+            .query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1, "after-insert trigger populated FTS");
+
+        // ...but rejects an invalid memory_type.
+        let bad = c.execute(
+            "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+             summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+             VALUES ('m2','global',0,0,'c','s','[]','[]','not_a_type',5,1.0,'')",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK constraint rejects invalid memory_type");
+    }
 }
