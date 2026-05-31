@@ -7,5 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod change;
+mod store_handle;
 
 pub use change::{ChangeKind, MemoryChanged};
+pub use store_handle::StoreHandle;
