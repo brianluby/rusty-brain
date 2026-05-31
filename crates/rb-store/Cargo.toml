@@ -18,6 +18,8 @@ sqlite-vec = { workspace = true }
 deadpool-sqlite = { workspace = true }
 include_dir = { workspace = true }
 sha2 = { workspace = true }
+serde_json = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

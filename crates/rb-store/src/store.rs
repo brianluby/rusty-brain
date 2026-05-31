@@ -2,7 +2,9 @@
 
 use crate::error::{io_err, storage_err};
 use crate::migrations::run_migrations;
-use rb_types::{Error, MemoryId, MemoryLink, MemoryNote, MemoryUpdates, Namespace, Result};
+use rb_types::{
+    Error, MemoryId, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result,
+};
 use std::path::Path;
 
 /// The synchronous storage trait. The daemon wraps this on blocking threads.
@@ -32,10 +34,11 @@ pub trait Store {
 /// the read pool separately in P1.
 pub struct SqliteStore {
     // rusqlite::Connection doesn't impl Debug, so we derive it manually via a wrapper.
-    // pub(crate) for intra-crate access (CRUD methods in Part D consume it). allow
-    // dead_code because no non-test code uses this until Part D CRUD lands.
-    #[allow(dead_code)]
+    // pub(crate) for intra-crate access (CRUD methods consume it).
     pub(crate) conn: rusqlite::Connection,
+    /// Embedding dimension configured at open; used to fail-close dimension mismatches
+    /// before touching the DB.
+    pub(crate) embedding_dim: usize,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -98,7 +101,10 @@ impl SqliteStore {
 
         seed_or_verify_dim(&conn, embedding_dim)?;
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            embedding_dim,
+        })
     }
 }
 
@@ -174,48 +180,510 @@ fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Resu
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Private codec helpers
+// ---------------------------------------------------------------------------
+
+fn json_array(v: &[String]) -> Result<String> {
+    serde_json::to_string(v).map_err(|e| Error::Serialization(e.to_string()))
+}
+
+fn ts(dt: chrono::DateTime<chrono::Utc>) -> i64 {
+    dt.timestamp()
+}
+
+fn opt_ts(dt: Option<chrono::DateTime<chrono::Utc>>) -> Option<i64> {
+    dt.map(|d| d.timestamp())
+}
+
+fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(embedding.len() * 4);
+    for f in embedding {
+        buf.extend_from_slice(&f.to_le_bytes());
+    }
+    buf
+}
+
+fn parse_json_array(s: &str) -> Result<Vec<String>> {
+    serde_json::from_str(s).map_err(|e| Error::Serialization(e.to_string()))
+}
+
+fn from_ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(|| {
+        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default()
+    })
+}
+
+fn from_opt_ts(secs: Option<i64>) -> Option<chrono::DateTime<chrono::Utc>> {
+    secs.map(from_ts)
+}
+
+fn parse_id(s: &str) -> Result<MemoryId> {
+    s.parse::<MemoryId>()
+}
+
+fn load_links(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<MemoryLink>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT source_id, target_id, link_type, strength, reason, created_at
+             FROM memory_links WHERE source_id = ?1",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+                row.get::<_, f64>(3)?,
+                row.get::<_, String>(4)?,
+                row.get::<_, i64>(5)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let mut links = Vec::new();
+    for r in rows {
+        let (src, tgt, lt, strength, reason, created) =
+            r.map_err(|e| Error::Storage(e.to_string()))?;
+        links.push(MemoryLink {
+            source_id: parse_id(&src)?,
+            target_id: parse_id(&tgt)?,
+            link_type: rb_types::LinkType::parse(&lt)?,
+            strength: strength as f32,
+            reason,
+            created_at: from_ts(created),
+        });
+    }
+    Ok(links)
+}
+
+fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<MemoryNote> {
+    let id = parse_id(
+        &row.get::<_, String>("memory_id")
+            .map_err(|e| Error::Storage(e.to_string()))?,
+    )?;
+    let namespace = Namespace::parse_db_string(
+        &row.get::<_, String>("namespace")
+            .map_err(|e| Error::Storage(e.to_string()))?,
+    )?;
+    let memory_type = MemoryType::parse(
+        &row.get::<_, String>("memory_type")
+            .map_err(|e| Error::Storage(e.to_string()))?,
+    )?;
+    let g = |c: &str| -> Result<String> {
+        row.get::<_, String>(c)
+            .map_err(|e| Error::Storage(e.to_string()))
+    };
+    let gi = |c: &str| -> Result<i64> {
+        row.get::<_, i64>(c)
+            .map_err(|e| Error::Storage(e.to_string()))
+    };
+    let links = load_links(conn, &id)?;
+    Ok(MemoryNote {
+        id,
+        namespace,
+        created_at: from_ts(gi("created_at")?),
+        updated_at: from_ts(gi("updated_at")?),
+        content: g("content")?,
+        summary: g("summary")?,
+        keywords: parse_json_array(&g("keywords")?)?,
+        tags: parse_json_array(&g("tags")?)?,
+        context: g("context")?,
+        memory_type,
+        importance: gi("importance")? as u8,
+        confidence: row
+            .get::<_, f64>("confidence")
+            .map_err(|e| Error::Storage(e.to_string()))? as f32,
+        related_files: parse_json_array(&g("related_files")?)?,
+        access_count: gi("access_count")? as u64,
+        last_accessed_at: from_opt_ts(
+            row.get::<_, Option<i64>>("last_accessed_at")
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        ),
+        archived_at: from_opt_ts(
+            row.get::<_, Option<i64>>("archived_at")
+                .map_err(|e| Error::Storage(e.to_string()))?,
+        ),
+        superseded_by: row
+            .get::<_, Option<String>>("superseded_by")
+            .map_err(|e| Error::Storage(e.to_string()))?
+            .map(|s| parse_id(&s))
+            .transpose()?,
+        embedding_model: g("embedding_model")?,
+        links,
+    })
+}
+
+/// Wrap the user query as a single FTS5 phrase so operators (-, OR, NEAR, *, ")
+/// are treated as literal text. Internal double-quotes are doubled per FTS5 rules.
+fn escape_fts5_query(query: &str) -> String {
+    let escaped = query.replace('"', "\"\"");
+    format!("\"{escaped}\"")
+}
+
+// ---------------------------------------------------------------------------
+// Store impl
+// ---------------------------------------------------------------------------
+
 impl Store for SqliteStore {
-    fn insert_memory(&self, _note: &MemoryNote, _embedding: Option<&[f32]>) -> Result<()> {
-        unimplemented!("next cluster")
+    fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
+        // Defense-in-depth validation before touching the DB. The SQL CHECK
+        // constraints are the backstop; these give a clean early error.
+        if note.importance < 1 || note.importance > 10 {
+            return Err(Error::Storage(format!(
+                "importance {} is out of range 1..=10",
+                note.importance
+            )));
+        }
+        if !(0.0..=1.0).contains(&note.confidence) {
+            return Err(Error::Storage(format!(
+                "confidence {} is out of range 0.0..=1.0",
+                note.confidence
+            )));
+        }
+
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        tx.execute(
+            "INSERT INTO memories (
+                memory_id, namespace, created_at, updated_at, content, summary,
+                keywords, tags, context, memory_type, importance, confidence,
+                related_files, access_count, last_accessed_at, archived_at,
+                superseded_by, embedding_model
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                ?13, ?14, ?15, ?16, ?17, ?18
+             )",
+            rusqlite::params![
+                note.id.to_string(),
+                note.namespace.as_db_string(),
+                ts(note.created_at),
+                ts(note.updated_at),
+                note.content,
+                note.summary,
+                json_array(&note.keywords)?,
+                json_array(&note.tags)?,
+                note.context,
+                note.memory_type.as_str(),
+                note.importance as i64,
+                note.confidence as f64,
+                json_array(&note.related_files)?,
+                note.access_count as i64,
+                opt_ts(note.last_accessed_at),
+                opt_ts(note.archived_at),
+                note.superseded_by.as_ref().map(|id| id.to_string()),
+                note.embedding_model,
+            ],
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+        if let Some(emb) = embedding {
+            tx.execute(
+                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![note.id.to_string(), embedding_bytes(emb)],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        for link in &note.links {
+            tx.execute(
+                "INSERT INTO memory_links
+                    (source_id, target_id, link_type, strength, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    link.source_id.to_string(),
+                    link.target_id.to_string(),
+                    link.link_type.as_str(),
+                    link.strength as f64,
+                    link.reason,
+                    ts(link.created_at),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
-    fn get_memory(&self, _id: &MemoryId) -> Result<Option<MemoryNote>> {
-        unimplemented!("next cluster")
+
+    fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                        keywords, tags, context, memory_type, importance, confidence,
+                        related_files, access_count, last_accessed_at, archived_at,
+                        superseded_by, embedding_model
+                 FROM memories WHERE memory_id = ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![id.to_string()])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        match rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            Some(row) => Ok(Some(row_to_note(&self.conn, row)?)),
+            None => Ok(None),
+        }
     }
-    fn keyword_search(
-        &self,
-        _ns: &Namespace,
-        _query: &str,
-        _limit: usize,
-    ) -> Result<Vec<MemoryId>> {
-        unimplemented!("next cluster")
+
+    fn keyword_search(&self, ns: &Namespace, query: &str, limit: usize) -> Result<Vec<MemoryId>> {
+        let match_expr = escape_fts5_query(query);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT m.memory_id
+                 FROM memories_fts
+                 JOIN memories m ON m.rowid = memories_fts.rowid
+                 WHERE memories_fts MATCH ?1
+                   AND m.namespace = ?2
+                   AND m.archived_at IS NULL
+                 ORDER BY rank
+                 LIMIT ?3",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![match_expr, ns.as_db_string(), limit as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut ids = Vec::new();
+        for r in rows {
+            let s = r.map_err(|e| Error::Storage(e.to_string()))?;
+            ids.push(s.parse::<MemoryId>()?);
+        }
+        Ok(ids)
     }
+
     fn vector_search(
         &self,
-        _ns: &Namespace,
-        _embedding: &[f32],
-        _limit: usize,
+        ns: &Namespace,
+        embedding: &[f32],
+        limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        unimplemented!("next cluster")
+        if embedding.len() != self.embedding_dim {
+            return Err(Error::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: embedding.len(),
+            });
+        }
+
+        // sqlite-vec accepts the query vector as a JSON array string.
+        let query_json =
+            serde_json::to_string(embedding).map_err(|e| Error::Serialization(e.to_string()))?;
+
+        // Over-fetch: we can't filter by namespace inside vec0's KNN query (adding
+        // WHERE on auxiliary columns is not supported in KNN mode). Instead we
+        // over-fetch a candidate pool large enough to still yield `limit` in-scope
+        // neighbors after filtering, then filter by namespace + active in Rust.
+        //
+        // Deviation from the plan: the plan used a CTE with `k = ?` plus an outer
+        // `LIMIT`. That would cause a sqlite-vec error: "Only LIMIT or 'k =?' can be
+        // provided, not both" (the query planner sees both when it pushes the outer
+        // LIMIT into the CTE scan). We instead use a single-level query with LIMIT
+        // only, then filter candidates in Rust.
+        //
+        // vec0 returns min(LIMIT, total_rows) without error.
+        let k_budget = (limit as i64).saturating_mul(10).max(limit as i64);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, distance
+                 FROM memory_vectors
+                 WHERE embedding MATCH ?1
+                 ORDER BY distance
+                 LIMIT ?2",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![query_json, k_budget], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Collect raw candidates, then filter by namespace + active status.
+        let ns_str = ns.as_db_string();
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Check namespace and archived status in one query.
+            let active: bool = self
+                .conn
+                .query_row(
+                    "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
+                    rusqlite::params![id_str, ns_str],
+                    |_| Ok(true),
+                )
+                .unwrap_or(false);
+
+            if active {
+                let id = parse_id(&id_str)?;
+                out.push((id, dist as f32));
+                if out.len() >= limit {
+                    break;
+                }
+            }
+        }
+        Ok(out)
     }
-    fn graph_neighbors(&self, _id: &MemoryId, _depth: u8) -> Result<Vec<MemoryId>> {
-        unimplemented!("next cluster")
+
+    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
+        if depth == 0 {
+            return Ok(Vec::new());
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "WITH RECURSIVE walk(node, d) AS (
+                     SELECT target_id, 1
+                     FROM memory_links
+                     WHERE source_id = ?1
+                     UNION
+                     SELECT l.target_id, w.d + 1
+                     FROM memory_links l
+                     JOIN walk w ON l.source_id = w.node
+                     WHERE w.d < ?2
+                 )
+                 SELECT DISTINCT node
+                 FROM walk
+                 WHERE node <> ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![id.to_string(), depth as i64], |row| {
+                row.get::<_, String>(0)
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut ids = Vec::new();
+        for r in rows {
+            let s = r.map_err(|e| Error::Storage(e.to_string()))?;
+            ids.push(s.parse::<MemoryId>()?);
+        }
+        Ok(ids)
     }
+
     fn list(
         &self,
-        _ns: &Namespace,
-        _min_importance: Option<u8>,
-        _limit: usize,
+        ns: &Namespace,
+        min_importance: Option<u8>,
+        limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        unimplemented!("next cluster")
+        let min = min_importance.unwrap_or(0) as i64;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                        keywords, tags, context, memory_type, importance, confidence,
+                        related_files, access_count, last_accessed_at, archived_at,
+                        superseded_by, embedding_model
+                 FROM memories
+                 WHERE namespace = ?1
+                   AND archived_at IS NULL
+                   AND importance >= ?2
+                 ORDER BY created_at DESC
+                 LIMIT ?3",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![ns.as_db_string(), min, limit as i64])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            out.push(row_to_note(&self.conn, row)?);
+        }
+        Ok(out)
     }
-    fn update_memory(&self, _id: &MemoryId, _updates: &MemoryUpdates) -> Result<()> {
-        unimplemented!("next cluster")
+
+    fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()> {
+        let mut sets: Vec<String> = Vec::new();
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+
+        if let Some(content) = &updates.content {
+            sets.push(format!("content = ?{}", params.len() + 1));
+            params.push(Box::new(content.clone()));
+        }
+        if let Some(summary) = &updates.summary {
+            sets.push(format!("summary = ?{}", params.len() + 1));
+            params.push(Box::new(summary.clone()));
+        }
+        if let Some(importance) = updates.importance {
+            sets.push(format!("importance = ?{}", params.len() + 1));
+            params.push(Box::new(importance as i64));
+        }
+        if let Some(tags) = &updates.tags {
+            sets.push(format!("tags = ?{}", params.len() + 1));
+            params.push(Box::new(json_array(tags)?));
+        }
+        if let Some(context) = &updates.context {
+            sets.push(format!("context = ?{}", params.len() + 1));
+            params.push(Box::new(context.clone()));
+        }
+
+        // Always bump updated_at.
+        sets.push(format!("updated_at = ?{}", params.len() + 1));
+        params.push(Box::new(chrono::Utc::now().timestamp()));
+
+        // WHERE memory_id bind comes last.
+        let id_pos = params.len() + 1;
+        params.push(Box::new(id.to_string()));
+
+        let sql = format!(
+            "UPDATE memories SET {} WHERE memory_id = ?{}",
+            sets.join(", "),
+            id_pos
+        );
+
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        self.conn
+            .execute(&sql, refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
-    fn archive_memory(&self, _id: &MemoryId) -> Result<()> {
-        unimplemented!("next cluster")
+
+    fn archive_memory(&self, id: &MemoryId) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memories
+                 SET archived_at = ?1, updated_at = ?1
+                 WHERE memory_id = ?2 AND archived_at IS NULL",
+                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
-    fn add_link(&self, _link: &MemoryLink) -> Result<()> {
-        unimplemented!("next cluster")
+
+    fn add_link(&self, link: &MemoryLink) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO memory_links
+                    (source_id, target_id, link_type, strength, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                rusqlite::params![
+                    link.source_id.to_string(),
+                    link.target_id.to_string(),
+                    link.link_type.as_str(),
+                    link.strength as f64,
+                    link.reason,
+                    link.created_at.timestamp(),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
     }
 }
 
@@ -335,5 +803,601 @@ mod tests {
             matches!(err, Error::Storage(ref m) if m.contains("embedding_dim must be greater than 0")),
             "zero dim must be rejected with a clear Storage error, got {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod insert_tests {
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    fn vec8(seed: f32) -> Vec<f32> {
+        (0..8).map(|i| seed + i as f32 * 0.1).collect()
+    }
+
+    #[test]
+    fn insert_persists_memory_vector_and_links() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+
+        let mut a = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "alpha content".into(),
+            MemoryType::CodePattern,
+            5,
+        );
+        let mut b = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "beta content".into(),
+            MemoryType::Insight,
+            7,
+        );
+        b.tags = vec!["x".into(), "y".into()];
+
+        // Insert target first so the link FK is satisfiable.
+        store.insert_memory(&b, Some(&vec8(0.5))).unwrap();
+
+        a.keywords = vec!["k1".into()];
+        a.related_files = vec!["src/lib.rs".into()];
+        a.links = vec![MemoryLink {
+            source_id: a.id.clone(),
+            target_id: b.id.clone(),
+            link_type: LinkType::References,
+            strength: 0.8,
+            reason: "see beta".into(),
+            created_at: a.created_at,
+        }];
+        store.insert_memory(&a, Some(&vec8(1.0))).unwrap();
+
+        // memories row count
+        let n: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 2);
+
+        // FTS populated via trigger (external-content; requires INSERT trigger from migration 001)
+        let fts: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts, 2);
+
+        // vector row stored
+        let vn: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vn, 2);
+
+        // link stored
+        let ln: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_links", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ln, 1);
+    }
+
+    #[test]
+    fn insert_without_embedding_skips_vector() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(Namespace::Global, "no vec".into(), MemoryType::Reference, 3);
+        store.insert_memory(&m, None).unwrap();
+        let vn: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vn, 0);
+    }
+
+    #[test]
+    fn insert_rejects_out_of_range_importance() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // importance = 0 is below the valid range 1..=10
+        let mut m = MemoryNote::new(Namespace::Global, "bad".into(), MemoryType::Reference, 5);
+        m.importance = 0;
+        let err = store.insert_memory(&m, None).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref s) if s.contains("importance")),
+            "expected storage error about importance, got {err:?}"
+        );
+
+        // importance = 11 is above the valid range
+        m.importance = 11;
+        let err = store.insert_memory(&m, None).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref s) if s.contains("importance")),
+            "expected storage error about importance, got {err:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod get_tests {
+    use super::*;
+    use rb_types::{LinkType, MemoryId, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn get_round_trips_all_fields_and_links() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+
+        let target = MemoryNote::new(
+            Namespace::Session {
+                project: "rb".into(),
+                session_id: "s1".into(),
+            },
+            "target".into(),
+            MemoryType::Entity,
+            4,
+        );
+        store.insert_memory(&target, None).unwrap();
+
+        let mut m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "full content".into(),
+            MemoryType::BugFix,
+            9,
+        );
+        m.summary = "a summary".into();
+        m.keywords = vec!["alpha".into(), "beta".into()];
+        m.tags = vec!["t1".into()];
+        m.context = "while fixing X".into();
+        m.confidence = 0.75;
+        m.related_files = vec!["a.rs".into(), "b.rs".into()];
+        m.embedding_model = "voyage-3".into();
+        m.links = vec![MemoryLink {
+            source_id: m.id.clone(),
+            target_id: target.id.clone(),
+            link_type: LinkType::Implements,
+            strength: 0.6,
+            reason: "impl".into(),
+            created_at: m.created_at,
+        }];
+        store.insert_memory(&m, None).unwrap();
+
+        let got = store.get_memory(&m.id).unwrap().expect("memory present");
+        assert_eq!(got.id, m.id);
+        assert_eq!(got.namespace, Namespace::Project("rb".into()));
+        assert_eq!(got.content, "full content");
+        assert_eq!(got.summary, "a summary");
+        assert_eq!(got.keywords, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(got.tags, vec!["t1".to_string()]);
+        assert_eq!(got.context, "while fixing X");
+        assert_eq!(got.memory_type, MemoryType::BugFix);
+        assert_eq!(got.importance, 9);
+        assert!((got.confidence - 0.75).abs() < 1e-6);
+        assert_eq!(
+            got.related_files,
+            vec!["a.rs".to_string(), "b.rs".to_string()]
+        );
+        assert_eq!(got.embedding_model, "voyage-3");
+        assert_eq!(got.created_at.timestamp(), m.created_at.timestamp());
+        assert_eq!(got.links.len(), 1);
+        assert_eq!(got.links[0].target_id, target.id);
+        assert_eq!(got.links[0].link_type, LinkType::Implements);
+        assert!((got.links[0].strength - 0.6).abs() < 1e-6);
+    }
+
+    #[test]
+    fn get_missing_returns_none() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        assert!(store.get_memory(&MemoryId::new()).unwrap().is_none());
+    }
+}
+
+#[cfg(test)]
+mod keyword_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert(store: &SqliteStore, ns: Namespace, content: &str) -> rb_types::MemoryId {
+        let m = MemoryNote::new(ns, content.into(), MemoryType::Reference, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, None).unwrap();
+        id
+    }
+
+    #[test]
+    fn finds_matching_and_scopes_to_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "rust async runtime tokio");
+        let _miss_ns = insert(&store, Namespace::Global, "rust async runtime tokio");
+        let _miss_term = insert(&store, proj.clone(), "completely different topic");
+
+        let found = store.keyword_search(&proj, "tokio", 10).unwrap();
+        assert_eq!(found, vec![hit]);
+    }
+
+    #[test]
+    fn escapes_special_query_chars() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "config flag enable-cache value");
+
+        // The '-' would be an FTS5 operator (NOT) if unescaped. After escaping, the
+        // query is treated as the literal phrase "enable cache" (unicode61 splits on
+        // '-'), which matches the adjacent tokens in the document.
+        let found = store.keyword_search(&proj, "enable-cache", 10).unwrap();
+        assert_eq!(found, vec![hit.clone()]);
+
+        // A query that is nothing but FTS5 operators must NOT raise a syntax error;
+        // escaped, it becomes an empty/operator-free phrase that simply matches nothing.
+        let none = store.keyword_search(&proj, "OR AND (", 10).unwrap();
+        assert!(none.is_empty());
+    }
+
+    #[test]
+    fn excludes_archived() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let id = insert(&store, proj.clone(), "archivable widget");
+        store.archive_memory(&id).unwrap();
+        let found = store.keyword_search(&proj, "widget", 10).unwrap();
+        assert!(found.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod vector_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert_vec(
+        store: &SqliteStore,
+        ns: Namespace,
+        content: &str,
+        v: [f32; 8],
+    ) -> rb_types::MemoryId {
+        let m = MemoryNote::new(ns, content.into(), MemoryType::Insight, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, Some(&v)).unwrap();
+        id
+    }
+
+    #[test]
+    fn returns_nearest_first_scoped_to_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+
+        let near = insert_vec(
+            &store,
+            proj.clone(),
+            "near",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let far = insert_vec(
+            &store,
+            proj.clone(),
+            "far",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Different namespace, identical to query: must be excluded by scope.
+        let other = insert_vec(
+            &store,
+            Namespace::Global,
+            "other",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let query = [0.9, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&proj, &query, 10).unwrap();
+
+        let ids: Vec<_> = res.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(ids, vec![near.clone(), far.clone()]);
+        // distances are ascending
+        assert!(res[0].1 <= res[1].1);
+        assert!(!ids.contains(&other));
+    }
+
+    #[test]
+    fn dimension_mismatch_is_rejected() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let err = store.vector_search(&proj, &[0.0, 0.0, 0.0], 5).unwrap_err();
+        assert!(matches!(
+            err,
+            Error::DimensionMismatch {
+                expected: 8,
+                got: 3
+            }
+        ));
+    }
+}
+
+#[cfg(test)]
+mod graph_tests {
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            c.into(),
+            MemoryType::Entity,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        m
+    }
+
+    fn link(store: &SqliteStore, src: &MemoryNote, tgt: &MemoryNote) {
+        store
+            .add_link(&MemoryLink {
+                source_id: src.id.clone(),
+                target_id: tgt.id.clone(),
+                link_type: LinkType::References,
+                strength: 1.0,
+                reason: String::new(),
+                created_at: src.created_at,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn traverses_up_to_depth() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        let c = node(&store, "c");
+        let d = node(&store, "d");
+        link(&store, &a, &b); // a -> b
+        link(&store, &b, &c); // b -> c
+        link(&store, &c, &d); // c -> d
+
+        let mut depth1 = store.graph_neighbors(&a.id, 1).unwrap();
+        depth1.sort_by_key(|id| id.to_string());
+        let mut want1 = vec![b.id.clone()];
+        want1.sort_by_key(|id| id.to_string());
+        assert_eq!(depth1, want1);
+
+        let mut depth2 = store.graph_neighbors(&a.id, 2).unwrap();
+        depth2.sort_by_key(|id| id.to_string());
+        let mut want2 = vec![b.id.clone(), c.id.clone()];
+        want2.sort_by_key(|id| id.to_string());
+        assert_eq!(depth2, want2);
+    }
+
+    #[test]
+    fn no_links_returns_empty() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "lonely");
+        assert!(store.graph_neighbors(&a.id, 3).unwrap().is_empty());
+    }
+}
+
+#[cfg(test)]
+mod list_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert_imp(
+        store: &SqliteStore,
+        ns: Namespace,
+        content: &str,
+        importance: u8,
+    ) -> rb_types::MemoryId {
+        let mut m = MemoryNote::new(ns, content.into(), MemoryType::Reference, importance);
+        // Force distinct created_at ordering by nudging timestamps.
+        m.created_at -= chrono::Duration::seconds(importance as i64);
+        m.updated_at = m.created_at;
+        let id = m.id.clone();
+        store.insert_memory(&m, None).unwrap();
+        id
+    }
+
+    #[test]
+    fn orders_by_created_desc_and_filters_importance_and_ns() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        // importance => created_at offset: lower importance = more recent (smaller subtraction)
+        let high_recent = insert_imp(&store, proj.clone(), "recent high", 2); // -2s, imp 2
+        let mid = insert_imp(&store, proj.clone(), "older mid", 5); // -5s, imp 5
+        let low = insert_imp(&store, proj.clone(), "oldest low", 8); // -8s, imp 8
+        let _other_ns = insert_imp(&store, Namespace::Global, "global", 1);
+
+        // No importance filter: newest first.
+        let all = store.list(&proj, None, 10).unwrap();
+        let ids: Vec<_> = all.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids, vec![high_recent.clone(), mid.clone(), low.clone()]);
+
+        // min_importance = 5 keeps mid(5) and low(8), drops high(2).
+        let filtered = store.list(&proj, Some(5), 10).unwrap();
+        let fids: Vec<_> = filtered.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(fids, vec![mid.clone(), low.clone()]);
+
+        // limit respected.
+        let limited = store.list(&proj, None, 1).unwrap();
+        assert_eq!(limited.len(), 1);
+        assert_eq!(limited[0].id, high_recent);
+    }
+
+    #[test]
+    fn excludes_archived() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let keep = insert_imp(&store, proj.clone(), "keep", 5);
+        let drop_id = insert_imp(&store, proj.clone(), "drop", 5);
+        store.archive_memory(&drop_id).unwrap();
+        let res = store.list(&proj, None, 10).unwrap();
+        let ids: Vec<_> = res.iter().map(|m| m.id.clone()).collect();
+        assert_eq!(ids, vec![keep]);
+    }
+}
+
+#[cfg(test)]
+mod update_tests {
+    use super::*;
+    use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace};
+
+    #[test]
+    fn updates_fields_bumps_timestamp_and_syncs_fts() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj.clone(), "original term".into(), MemoryType::Insight, 3);
+        m.updated_at -= chrono::Duration::seconds(100);
+        store.insert_memory(&m, None).unwrap();
+
+        let updates = MemoryUpdates {
+            content: Some("rewritten unicorn term".into()),
+            summary: Some("new summary".into()),
+            importance: Some(9),
+            tags: Some(vec!["alpha".into(), "beta".into()]),
+            context: Some("new context".into()),
+        };
+        store.update_memory(&m.id, &updates).unwrap();
+
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(got.content, "rewritten unicorn term");
+        assert_eq!(got.summary, "new summary");
+        assert_eq!(got.importance, 9);
+        assert_eq!(got.tags, vec!["alpha".to_string(), "beta".to_string()]);
+        assert_eq!(got.context, "new context");
+        assert!(got.updated_at.timestamp() > m.updated_at.timestamp());
+
+        // FTS reflects new content, not old.
+        let new_hits = store.keyword_search(&proj, "unicorn", 10).unwrap();
+        assert_eq!(new_hits, vec![m.id.clone()]);
+        let old_hits = store.keyword_search(&proj, "original", 10).unwrap();
+        assert!(old_hits.is_empty());
+    }
+
+    #[test]
+    fn partial_update_leaves_unset_fields() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut m = MemoryNote::new(
+            Namespace::Global,
+            "keep me".into(),
+            MemoryType::Reference,
+            4,
+        );
+        m.summary = "keep summary".into();
+        store.insert_memory(&m, None).unwrap();
+
+        let updates = MemoryUpdates {
+            importance: Some(7),
+            ..Default::default()
+        };
+        store.update_memory(&m.id, &updates).unwrap();
+
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(got.importance, 7);
+        assert_eq!(got.content, "keep me");
+        assert_eq!(got.summary, "keep summary");
+    }
+
+    #[test]
+    fn update_missing_is_ok_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let updates = MemoryUpdates {
+            importance: Some(5),
+            ..Default::default()
+        };
+        // No row affected; method must not error.
+        store.update_memory(&MemoryId::new(), &updates).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod archive_tests {
+    use super::*;
+    use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn archive_sets_timestamp_and_excludes_from_searches() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let m = MemoryNote::new(
+            proj.clone(),
+            "searchable banana".into(),
+            MemoryType::Reference,
+            6,
+        );
+        let emb = [0.1f32, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8];
+        store.insert_memory(&m, Some(&emb)).unwrap();
+
+        // Visible before archive.
+        assert_eq!(
+            store.keyword_search(&proj, "banana", 10).unwrap(),
+            vec![m.id.clone()]
+        );
+        assert!(!store.list(&proj, None, 10).unwrap().is_empty());
+
+        store.archive_memory(&m.id).unwrap();
+
+        // get_memory still returns it (with archived_at set) — archive is soft.
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!(got.archived_at.is_some());
+
+        // Excluded from keyword, vector, and list.
+        assert!(store
+            .keyword_search(&proj, "banana", 10)
+            .unwrap()
+            .is_empty());
+        assert!(store.vector_search(&proj, &emb, 10).unwrap().is_empty());
+        assert!(store.list(&proj, None, 10).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_missing_is_ok_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        store.archive_memory(&MemoryId::new()).unwrap();
+    }
+}
+
+#[cfg(test)]
+mod add_link_tests {
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            c.into(),
+            MemoryType::Entity,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        m
+    }
+
+    #[test]
+    fn add_link_persists_and_is_returned_by_get() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+
+        let link = MemoryLink {
+            source_id: a.id.clone(),
+            target_id: b.id.clone(),
+            link_type: LinkType::Supersedes,
+            strength: 0.9,
+            reason: "newer".into(),
+            created_at: a.created_at,
+        };
+        store.add_link(&link).unwrap();
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got.links.len(), 1);
+        assert_eq!(got.links[0].target_id, b.id);
+        assert_eq!(got.links[0].link_type, LinkType::Supersedes);
+        assert!((got.links[0].strength - 0.9).abs() < 1e-6);
+        assert_eq!(got.links[0].reason, "newer");
+    }
+
+    #[test]
+    fn add_link_to_missing_target_fails_fk() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let link = MemoryLink {
+            source_id: a.id.clone(),
+            target_id: rb_types::MemoryId::new(),
+            link_type: LinkType::References,
+            strength: 0.5,
+            reason: String::new(),
+            created_at: a.created_at,
+        };
+        // foreign_keys=ON => FK violation surfaces as a storage error.
+        let err = store.add_link(&link).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)));
     }
 }
