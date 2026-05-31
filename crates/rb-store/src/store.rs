@@ -88,6 +88,12 @@ impl SqliteStore {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(storage_err)?;
 
+        // A busy handler keeps the P1 daemon (multiple connections + WAL
+        // checkpoints) from hitting immediate SQLITE_BUSY: a contended write
+        // waits up to 5s for the lock instead of failing right away.
+        conn.busy_timeout(std::time::Duration::from_secs(5))
+            .map_err(storage_err)?;
+
         run_migrations(&conn)?;
 
         // Dynamic-dimension vector table. vec0 needs the literal dim baked in.
@@ -353,71 +359,90 @@ impl Store for SqliteStore {
             )));
         }
 
-        let tx = self
-            .conn
-            .unchecked_transaction()
+        // Take the write lock at BEGIN (IMMEDIATE) instead of deferring it to the
+        // first write. This avoids a deferred-transaction upgrade racing another
+        // writer mid-transaction; the busy_timeout above makes a contended BEGIN
+        // wait rather than fail immediately. Atomicity is unchanged: all writes
+        // commit together, and any error rolls the whole transaction back.
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        tx.execute(
-            "INSERT INTO memories (
-                memory_id, namespace, created_at, updated_at, content, summary,
-                keywords, tags, context, memory_type, importance, confidence,
-                related_files, access_count, last_accessed_at, archived_at,
-                superseded_by, embedding_model
-             ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                ?13, ?14, ?15, ?16, ?17, ?18
-             )",
-            rusqlite::params![
-                note.id.to_string(),
-                note.namespace.as_db_string(),
-                ts(note.created_at),
-                ts(note.updated_at),
-                note.content,
-                note.summary,
-                json_array(&note.keywords)?,
-                json_array(&note.tags)?,
-                note.context,
-                note.memory_type.as_str(),
-                note.importance as i64,
-                note.confidence as f64,
-                json_array(&note.related_files)?,
-                note.access_count as i64,
-                opt_ts(note.last_accessed_at),
-                opt_ts(note.archived_at),
-                note.superseded_by.as_ref().map(|id| id.to_string()),
-                note.embedding_model,
-            ],
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute(
+                    "INSERT INTO memories (
+                        memory_id, namespace, created_at, updated_at, content, summary,
+                        keywords, tags, context, memory_type, importance, confidence,
+                        related_files, access_count, last_accessed_at, archived_at,
+                        superseded_by, embedding_model
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, ?17, ?18
+                     )",
+                    rusqlite::params![
+                        note.id.to_string(),
+                        note.namespace.as_db_string(),
+                        ts(note.created_at),
+                        ts(note.updated_at),
+                        note.content,
+                        note.summary,
+                        json_array(&note.keywords)?,
+                        json_array(&note.tags)?,
+                        note.context,
+                        note.memory_type.as_str(),
+                        note.importance as i64,
+                        note.confidence as f64,
+                        json_array(&note.related_files)?,
+                        note.access_count as i64,
+                        opt_ts(note.last_accessed_at),
+                        opt_ts(note.archived_at),
+                        note.superseded_by.as_ref().map(|id| id.to_string()),
+                        note.embedding_model,
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        if let Some(emb) = embedding {
-            tx.execute(
-                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                rusqlite::params![note.id.to_string(), embedding_bytes(emb)],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            if let Some(emb) = embedding {
+                self.conn
+                    .execute(
+                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![note.id.to_string(), embedding_bytes(emb)],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+
+            for link in &note.links {
+                self.conn
+                    .execute(
+                        "INSERT INTO memory_links
+                            (source_id, target_id, link_type, strength, reason, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                        rusqlite::params![
+                            link.source_id.to_string(),
+                            link.target_id.to_string(),
+                            link.link_type.as_str(),
+                            link.strength as f64,
+                            link.reason,
+                            ts(link.created_at),
+                        ],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                // Best-effort rollback; surface the original error.
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
         }
-
-        for link in &note.links {
-            tx.execute(
-                "INSERT INTO memory_links
-                    (source_id, target_id, link_type, strength, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-                rusqlite::params![
-                    link.source_id.to_string(),
-                    link.target_id.to_string(),
-                    link.link_type.as_str(),
-                    link.strength as f64,
-                    link.reason,
-                    ts(link.created_at),
-                ],
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        }
-
-        tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
     }
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>> {
@@ -1042,6 +1067,44 @@ mod get_tests {
     fn get_missing_returns_none() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         assert!(store.get_memory(&MemoryId::new()).unwrap().is_none());
+    }
+
+    #[test]
+    fn round_trips_access_count_last_accessed_and_superseded_by() {
+        // These three columns never carry non-default values in the other tests,
+        // so their decode paths were untested. Exercise them explicitly.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+
+        // superseded_by is a FK to memories(memory_id); insert the successor first.
+        let successor = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "successor".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&successor, None).unwrap();
+
+        let accessed = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+            .expect("valid timestamp");
+
+        let mut m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "superseded body".into(),
+            MemoryType::CodePattern,
+            6,
+        );
+        m.access_count = 3;
+        m.last_accessed_at = Some(accessed);
+        m.superseded_by = Some(successor.id.clone());
+        store.insert_memory(&m, None).unwrap();
+
+        let got = store.get_memory(&m.id).unwrap().expect("memory present");
+        assert_eq!(got.access_count, 3);
+        assert_eq!(
+            got.last_accessed_at.map(|t| t.timestamp()),
+            Some(accessed.timestamp())
+        );
+        assert_eq!(got.superseded_by, Some(successor.id));
     }
 }
 
