@@ -4,6 +4,8 @@
 //! handshake, the `Request`/`Response` enums, and an async `Client`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
+mod error;
 mod messages;
 
+pub use error::{error_to_response, response_error_to_error};
 pub use messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
