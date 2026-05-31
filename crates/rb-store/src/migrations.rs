@@ -55,7 +55,33 @@ fn discover() -> Result<Vec<Migration>> {
         migs.push(Migration { version, name, sql });
     }
     migs.sort_by_key(|m| m.version);
+    check_no_duplicate_versions(&migs)?;
     Ok(migs)
+}
+
+/// Reject any two migrations that share the same numeric version, BEFORE
+/// anything is applied. A duplicate version would otherwise surface much later
+/// as a confusing checksum mismatch (the second file's body differs from the
+/// first's recorded checksum). This is the exact mnemosyne duplicate-`003_` bug.
+/// Expects `migs` sorted ascending by version (so duplicates are adjacent).
+fn check_no_duplicate_versions(migs: &[Migration]) -> Result<()> {
+    let mut dups: Vec<String> = Vec::new();
+    for pair in migs.windows(2) {
+        if pair[0].version == pair[1].version {
+            dups.push(format!(
+                "{} (in {} and {})",
+                pair[0].version, pair[0].name, pair[1].name
+            ));
+        }
+    }
+    if dups.is_empty() {
+        Ok(())
+    } else {
+        Err(Error::Migration(format!(
+            "duplicate migration version(s): {}",
+            dups.join(", ")
+        )))
+    }
 }
 
 /// Create the `_migrations` ledger if it does not already exist.
@@ -107,7 +133,7 @@ fn apply_all(conn: &rusqlite::Connection, migs: &[Migration]) -> Result<()> {
                     conn.execute_batch(&m.sql).map_err(migration_err)?;
                     conn.execute(
                         "INSERT INTO _migrations (version, name, checksum, applied_at) \
-                         VALUES (?1, ?2, ?3, strftime('%s','now'))",
+                         VALUES (?1, ?2, ?3, unixepoch())",
                         rusqlite::params![m.version, m.name, sum],
                     )
                     .map_err(migration_err)?;
@@ -145,6 +171,7 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #![allow(clippy::panic)]
     use super::*;
 
     const M1: &str = "CREATE TABLE widgets (id INTEGER PRIMARY KEY, name TEXT NOT NULL);";
@@ -164,6 +191,45 @@ mod tests {
             name: name.to_string(),
             sql: sql.to_string(),
         }
+    }
+
+    #[test]
+    fn duplicate_versions_are_rejected_before_applying() {
+        // Two files sharing version 3 (the mnemosyne duplicate-003 bug). Sorted
+        // ascending so duplicates are adjacent, as discover() guarantees.
+        let migs = [
+            mig(1, "001_a.sql", "CREATE TABLE a (id INTEGER);"),
+            mig(3, "003_b.sql", "CREATE TABLE b (id INTEGER);"),
+            mig(3, "003_c.sql", "CREATE TABLE c (id INTEGER);"),
+        ];
+        let err = check_no_duplicate_versions(&migs).unwrap_err();
+        match err {
+            Error::Migration(msg) => {
+                assert!(
+                    msg.contains("duplicate migration version(s)"),
+                    "message should name the duplicate class, got {msg:?}"
+                );
+                assert!(
+                    msg.contains('3'),
+                    "message should name version 3, got {msg:?}"
+                );
+                assert!(
+                    msg.contains("003_b.sql") && msg.contains("003_c.sql"),
+                    "message should name both files, got {msg:?}"
+                );
+            }
+            other => panic!("expected Error::Migration, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn distinct_versions_pass_duplicate_check() {
+        let migs = [
+            mig(1, "001_a.sql", "CREATE TABLE a (id INTEGER);"),
+            mig(2, "002_b.sql", "CREATE TABLE b (id INTEGER);"),
+            mig(10, "010_c.sql", "CREATE TABLE c (id INTEGER);"),
+        ];
+        assert!(check_no_duplicate_versions(&migs).is_ok());
     }
 
     #[test]

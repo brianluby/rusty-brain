@@ -32,8 +32,8 @@ pub trait Store {
 /// the read pool separately in P1.
 pub struct SqliteStore {
     // rusqlite::Connection doesn't impl Debug, so we derive it manually via a wrapper.
-    // pub(crate) for intra-crate access (CRUD methods in Part D); allow dead_code until
-    // those methods are added — the field is legitimately used in tests right now.
+    // pub(crate) for intra-crate access (CRUD methods in Part D consume it). allow
+    // dead_code because no non-test code uses this until Part D CRUD lands.
     #[allow(dead_code)]
     pub(crate) conn: rusqlite::Connection,
 }
@@ -51,7 +51,7 @@ impl SqliteStore {
     /// creates the dynamic-dim `memory_vectors` table, and enforces the
     /// embedding-dimension invariant fail-closed.
     pub fn open(path: &Path, embedding_dim: usize) -> Result<Self> {
-        register_vec();
+        register_vec()?;
         let conn = rusqlite::Connection::open(path).map_err(|e| {
             io_err(std::io::Error::other(format!(
                 "open {}: {e}",
@@ -63,13 +63,21 @@ impl SqliteStore {
 
     /// Open an ephemeral in-memory store with the given embedding dimension.
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self> {
-        register_vec();
+        register_vec()?;
         let conn = rusqlite::Connection::open_in_memory().map_err(storage_err)?;
         Self::init(conn, embedding_dim)
     }
 
     /// Shared init path: pragmas, migrations, vectors table, dim invariant.
     fn init(conn: rusqlite::Connection, embedding_dim: usize) -> Result<Self> {
+        // A zero-dimension embedding produces a malformed `float[0]` vec0 column.
+        // Reject it up front rather than letting SQLite fail cryptically later.
+        if embedding_dim == 0 {
+            return Err(Error::Storage(
+                "embedding_dim must be greater than 0".to_string(),
+            ));
+        }
+
         // WAL gives concurrent readers + one writer with no SQLITE_BUSY storms.
         // (In-memory DBs ignore WAL and report "memory"; that is fine.)
         conn.pragma_update(None, "journal_mode", "WAL")
@@ -94,24 +102,38 @@ impl SqliteStore {
     }
 }
 
+/// Caches the result of the one-time process-global sqlite-vec registration.
+/// `Ok(())` on success; the error message is cloned on every subsequent call.
+static VEC_REGISTERED: std::sync::OnceLock<std::result::Result<(), String>> =
+    std::sync::OnceLock::new();
+
 /// Register the sqlite-vec extension so `vec0` virtual tables and the KNN
 /// `MATCH` syntax are available on every subsequently opened connection.
-fn register_vec() {
-    // SAFETY: `sqlite_vec::sqlite3_vec_init` is the FFI entry point published by
-    // the sqlite-vec crate. `sqlite3_auto_extension` registers it with SQLite so
-    // it runs on each connection opened AFTER this call. We cast the fn pointer
-    // exactly as the sqlite-vec crate does in its own test (transmute of a
-    // `*const ()`); the target fn-pointer type is inferred from the
-    // `sqlite3_auto_extension` argument slot. The init fn is valid for the
-    // program's lifetime; re-registration on subsequent `open*` calls is
-    // idempotent/benign.
-    #[allow(unsafe_code)]
-    #[allow(clippy::missing_transmute_annotations)]
-    unsafe {
-        rusqlite::ffi::sqlite3_auto_extension(Some(std::mem::transmute(
-            sqlite_vec::sqlite3_vec_init as *const (),
-        )));
-    }
+///
+/// Fails closed: if registration does not return `SQLITE_OK`, this returns an
+/// error so the caller never proceeds with a connection that silently lacks
+/// the `vec0` module. Runs exactly once per process via `VEC_REGISTERED`.
+fn register_vec() -> Result<()> {
+    let outcome = VEC_REGISTERED.get_or_init(|| {
+        // SAFETY: `sqlite_vec::sqlite3_vec_init` is the FFI entry point published
+        // by the sqlite-vec crate. We transmute its address to the
+        // `RawAutoExtension` fn-pointer type rusqlite expects, exactly as the
+        // sqlite-vec crate does in its own test (transmute of a `*const ()`).
+        // The init fn has `'static` validity (it lives in the linked library for
+        // the whole program). `register_auto_extension` registers it as a SQLite
+        // auto-extension and returns `Err` if SQLite rejects it. Process-global
+        // single-execution (and thus idempotency) is guaranteed by the
+        // `OnceLock` guard above — we do NOT rely on SQLite's internal dedup.
+        #[allow(unsafe_code)]
+        #[allow(clippy::missing_transmute_annotations)]
+        let result = unsafe {
+            rusqlite::auto_extension::register_auto_extension(std::mem::transmute(
+                sqlite_vec::sqlite3_vec_init as *const (),
+            ))
+        };
+        result.map_err(|e| format!("failed to register sqlite-vec extension: {e}"))
+    });
+    outcome.clone().map_err(Error::Storage)
 }
 
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
@@ -294,5 +316,24 @@ mod tests {
             .query_row("PRAGMA journal_mode", [], |r| r.get(0))
             .unwrap();
         assert_eq!(mode.to_lowercase(), "wal", "file DB uses WAL");
+    }
+
+    #[test]
+    fn open_with_zero_dim_fails_closed() {
+        // In-memory path.
+        let err = SqliteStore::open_in_memory(0).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref m) if m.contains("embedding_dim must be greater than 0")),
+            "zero dim must be rejected with a clear Storage error, got {err:?}"
+        );
+
+        // File path.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let err = SqliteStore::open(&path, 0).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref m) if m.contains("embedding_dim must be greater than 0")),
+            "zero dim must be rejected with a clear Storage error, got {err:?}"
+        );
     }
 }
