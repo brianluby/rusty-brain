@@ -208,14 +208,16 @@ fn parse_json_array(s: &str) -> Result<Vec<String>> {
     serde_json::from_str(s).map_err(|e| Error::Serialization(e.to_string()))
 }
 
-fn from_ts(secs: i64) -> chrono::DateTime<chrono::Utc> {
-    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0).unwrap_or_else(|| {
-        chrono::DateTime::<chrono::Utc>::from_timestamp(0, 0).unwrap_or_default()
-    })
+/// Decode a stored unix-seconds timestamp, failing closed on out-of-range
+/// values rather than silently fabricating an epoch-0 datetime.
+fn from_ts(secs: i64) -> Result<chrono::DateTime<chrono::Utc>> {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(secs, 0)
+        .ok_or_else(|| Error::Storage(format!("timestamp {secs} out of range")))
 }
 
-fn from_opt_ts(secs: Option<i64>) -> Option<chrono::DateTime<chrono::Utc>> {
-    secs.map(from_ts)
+/// `None` stays `None`; a present-but-out-of-range value propagates the error.
+fn from_opt_ts(secs: Option<i64>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
+    secs.map(from_ts).transpose()
 }
 
 fn parse_id(s: &str) -> Result<MemoryId> {
@@ -250,9 +252,10 @@ fn load_links(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<MemoryLi
             source_id: parse_id(&src)?,
             target_id: parse_id(&tgt)?,
             link_type: rb_types::LinkType::parse(&lt)?,
+            // `strength` is stored as SQLite REAL (f64) and narrowed to f32 here.
             strength: strength as f32,
             reason,
-            created_at: from_ts(created),
+            created_at: from_ts(created)?,
         });
     }
     Ok(links)
@@ -279,12 +282,13 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         row.get::<_, i64>(c)
             .map_err(|e| Error::Storage(e.to_string()))
     };
+    // TODO(P1): batch link loading (avoid N+1 load_links per row in list/get_memory).
     let links = load_links(conn, &id)?;
     Ok(MemoryNote {
         id,
         namespace,
-        created_at: from_ts(gi("created_at")?),
-        updated_at: from_ts(gi("updated_at")?),
+        created_at: from_ts(gi("created_at")?)?,
+        updated_at: from_ts(gi("updated_at")?)?,
         content: g("content")?,
         summary: g("summary")?,
         keywords: parse_json_array(&g("keywords")?)?,
@@ -292,19 +296,25 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         context: g("context")?,
         memory_type,
         importance: gi("importance")? as u8,
+        // `confidence` is stored as SQLite REAL (f64) and narrowed to f32 on load,
+        // so round-trips are only exact for f32-representable values.
         confidence: row
             .get::<_, f64>("confidence")
             .map_err(|e| Error::Storage(e.to_string()))? as f32,
         related_files: parse_json_array(&g("related_files")?)?,
-        access_count: gi("access_count")? as u64,
+        // Checked conversion: a negative DB value must error, not silently wrap
+        // into a huge u64.
+        access_count: gi("access_count")?
+            .try_into()
+            .map_err(|_| Error::Storage("access_count is negative in DB".into()))?,
         last_accessed_at: from_opt_ts(
             row.get::<_, Option<i64>>("last_accessed_at")
                 .map_err(|e| Error::Storage(e.to_string()))?,
-        ),
+        )?,
         archived_at: from_opt_ts(
             row.get::<_, Option<i64>>("archived_at")
                 .map_err(|e| Error::Storage(e.to_string()))?,
-        ),
+        )?,
         superseded_by: row
             .get::<_, Option<String>>("superseded_by")
             .map_err(|e| Error::Storage(e.to_string()))?
@@ -549,6 +559,9 @@ impl Store for SqliteStore {
         Ok(out)
     }
 
+    /// The recursive CTE `UNION` dedups on (node, depth) pairs, so a cycle can
+    /// accumulate O(depth x cycle_length) intermediate rows before the outer
+    /// `SELECT DISTINCT` flattens them — fine at P0's bounded depth.
     fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
         if depth == 0 {
             return Ok(Vec::new());
@@ -621,6 +634,16 @@ impl Store for SqliteStore {
     }
 
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()> {
+        // Defense-in-depth validation, consistent with insert_memory, before
+        // touching the DB. (MemoryUpdates has no confidence field.)
+        if let Some(imp) = updates.importance {
+            if !(1..=10).contains(&imp) {
+                return Err(Error::Storage(format!(
+                    "importance {imp} is out of range 1..=10"
+                )));
+            }
+        }
+
         let mut sets: Vec<String> = Vec::new();
         let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
 
@@ -645,7 +668,13 @@ impl Store for SqliteStore {
             params.push(Box::new(context.clone()));
         }
 
-        // Always bump updated_at.
+        // An all-None update is a true no-op: do not bump updated_at or issue an
+        // UPDATE when nothing changed.
+        if sets.is_empty() {
+            return Ok(());
+        }
+
+        // Bump updated_at only when at least one field is actually changing.
         sets.push(format!("updated_at = ?{}", params.len() + 1));
         params.push(Box::new(chrono::Utc::now().timestamp()));
 
@@ -1378,6 +1407,47 @@ mod update_tests {
         };
         // No row affected; method must not error.
         store.update_memory(&MemoryId::new(), &updates).unwrap();
+    }
+
+    #[test]
+    fn all_none_update_is_true_noop_keeps_updated_at() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut m = MemoryNote::new(Namespace::Global, "stable".into(), MemoryType::Reference, 4);
+        // Pin updated_at well in the past so a spurious bump would be detectable.
+        m.updated_at -= chrono::Duration::seconds(1000);
+        store.insert_memory(&m, None).unwrap();
+        let before = store.get_memory(&m.id).unwrap().unwrap();
+
+        // All-None update must be a true no-op: updated_at unchanged.
+        store
+            .update_memory(&m.id, &MemoryUpdates::default())
+            .unwrap();
+
+        let after = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(
+            after.updated_at.timestamp(),
+            before.updated_at.timestamp(),
+            "all-None update must not bump updated_at"
+        );
+    }
+
+    #[test]
+    fn rejects_out_of_range_importance() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(Namespace::Global, "x".into(), MemoryType::Reference, 5);
+        store.insert_memory(&m, None).unwrap();
+
+        for bad in [0u8, 11u8] {
+            let updates = MemoryUpdates {
+                importance: Some(bad),
+                ..Default::default()
+            };
+            let err = store.update_memory(&m.id, &updates).unwrap_err();
+            assert!(
+                matches!(err, Error::Storage(ref s) if s.contains("importance")),
+                "expected storage error about importance for {bad}, got {err:?}"
+            );
+        }
     }
 }
 
