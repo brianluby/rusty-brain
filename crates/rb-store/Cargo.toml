@@ -15,7 +15,6 @@ path = "src/lib.rs"
 rb-types = { path = "../rb-types" }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
-deadpool-sqlite = { workspace = true }
 include_dir = { workspace = true }
 sha2 = { workspace = true }
 serde_json = { workspace = true }
