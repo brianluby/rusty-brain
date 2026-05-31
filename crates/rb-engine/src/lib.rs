@@ -1,6 +1,10 @@
-//! `rb_engine`: single-request orchestration for rusty-brain.
+//! `rb_engine`: single-request memory orchestration (policy only).
 //!
-//! Generic over a `MemoryBackend` trait and an `EmbeddingProvider`, so the
-//! engine stays pure policy (embed plus rank) and testable without a real
-//! store. Concrete types are added in subsequent tasks.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+//! Generic over a `MemoryBackend` (store access) and an
+//! `rb_embed::EmbeddingProvider`. P1 enrichment is heuristic only; LLM
+//! enrichment and semantic link generation are deferred to P2.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod backend;
+
+pub use backend::MemoryBackend;

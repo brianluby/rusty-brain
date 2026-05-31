@@ -5,7 +5,7 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "rusty-brain request orchestration: embed plus rank policy over an abstract memory backend (no concrete store dependency)."
+description = "Single-request memory orchestration: heuristic enrichment, embed, hybrid recall ranking."
 
 [lib]
 name = "rb_engine"
