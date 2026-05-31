@@ -1,6 +1,15 @@
 [workspace]
 resolver = "2"
-members = ["crates/rb-types", "crates/rb-store"]
+members = [
+    "crates/rb-types",
+    "crates/rb-store",
+    "crates/rb-proto",
+    "crates/rb-embed",
+    "crates/rb-search",
+    "crates/rb-engine",
+    "crates/rb-daemon",
+    "crates/rusty-brain",
+]
 
 [workspace.package]
 version = "0.0.1"
@@ -21,6 +30,21 @@ deadpool-sqlite = "0.9"
 include_dir = "0.7"
 sha2 = "0.10"
 tempfile = "3"
+# --- P1 additions ---
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+tokio-util = { version = "0.7", features = ["codec"] }
+tokio-stream = "0.1"
+async-trait = "0.1"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+futures = "0.3"
+bytes = "1"
+secrecy = "0.10"
+directories = "5"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+clap = { version = "4", features = ["derive", "env"] }
+anyhow = "1"
+wiremock = "0.6"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"
