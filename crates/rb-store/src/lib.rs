@@ -1,7 +1,11 @@
-//! `rb_store`: SQLite + sqlite-vec storage engine for rusty-brain.
+//! `rb-store`: SQLite + sqlite-vec storage engine for rusty-brain.
 //!
-//! Provides the `Store` trait and `SqliteStore` implementation (added in
-//! subsequent tasks): one database, one transaction, file-discovered
-//! checksummed migrations, FTS5 keyword search, sqlite-vec KNN, and a
-//! recursive-CTE graph walk.
+//! One database file holds memories, FTS index, vectors and links so that a
+//! `remember` is a single transaction (no dual-DB desync). The embedding
+//! dimension is a single configured value, enforced fail-closed at `open`.
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod error;
+mod migrations;
+
+pub use migrations::run_migrations;
