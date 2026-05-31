@@ -57,19 +57,33 @@
 
 ## 6. Architecture Overview
 
-```
-   agent A (Claude)        agent B (Claude)        human (terminal)
-        | stdio                 | stdio                 | argv
-   rusty-brain mcp         rusty-brain mcp        rusty-brain recall
-        |                       |                       |
-        +------- Unix domain socket (0600, $XDG_RUNTIME_DIR) -------+
-                                                                    v
-                       +--------------  rb-daemon  --------------+
-   per-conn tokio task |  Readers: deadpool read-pool (WAL)  ----+--> SQLite (WAL)
-   (bounded, framed)   |  Writer:  ONE dedicated thread + mpsc --+--> (single writer)
-                       |  Events:  tokio::broadcast on commit    |
-                       |  Namespace isolation enforced here      |
-                       +-----------------------------------------+
+```mermaid
+flowchart TD
+    A["agent A · Claude"] -->|stdio| MA["rusty-brain mcp"]
+    B["agent B · Claude"] -->|stdio| MB["rusty-brain mcp"]
+    H["human · terminal"] -->|argv| C["rusty-brain recall"]
+
+    MA --> SOCK
+    MB --> SOCK
+    C --> SOCK
+    SOCK{{"Unix domain socket<br/>0600 · $XDG_RUNTIME_DIR"}}
+
+    subgraph Daemon["rb-daemon"]
+        direction TB
+        CONN["per-conn tokio tasks<br/>bounded · framed JSON"]
+        ISO["namespace isolation<br/>enforced server-side"]
+        READ["readers: deadpool pool (WAL)"]
+        WRITE["writer: ONE dedicated thread + mpsc"]
+        EVT["events: tokio::broadcast on commit"]
+        CONN --> ISO
+        ISO --> READ
+        ISO --> WRITE
+        WRITE --> EVT
+    end
+
+    SOCK --> CONN
+    READ -->|concurrent reads| DB[("SQLite · WAL")]
+    WRITE -->|serialized writes| DB
 ```
 
 One binary (`rusty-brain`) with subcommands; the engine is a set of library crates.
