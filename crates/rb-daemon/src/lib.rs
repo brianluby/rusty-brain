@@ -7,11 +7,14 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod change;
+mod error_map;
 mod paths;
+mod server;
 mod shared_embedder;
 mod store_handle;
 
 pub use change::{ChangeKind, MemoryChanged};
 pub use paths::{default_db_path, default_socket_path};
+pub use server::{Daemon, DaemonConfig};
 pub use shared_embedder::SharedEmbedder;
 pub use store_handle::StoreHandle;
