@@ -2,7 +2,7 @@ use crate::provider::EmbeddingProvider;
 use async_trait::async_trait;
 use rb_types::Error;
 use secrecy::{ExposeSecret, SecretString};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use std::time::Duration;
 
 /// Maximum number of inputs per HTTP request (Voyage batch ceiling).
@@ -21,7 +21,18 @@ pub struct VoyageProvider {
     api_key: SecretString,
     model: String,
     dim: usize,
+    output_dimension: Option<usize>,
     base_url: String,
+}
+
+/// Shape of the Voyage `/embeddings` request we send.
+#[derive(Serialize)]
+struct EmbeddingsRequest<'a> {
+    model: &'a str,
+    input: &'a [String],
+    input_type: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    output_dimension: Option<usize>,
 }
 
 /// Shape of the Voyage `/embeddings` response we depend on.
@@ -42,7 +53,7 @@ impl VoyageProvider {
     pub fn from_env() -> rb_types::Result<Self> {
         let key = std::env::var("VOYAGE_API_KEY")
             .map_err(|_| Error::Embedding("VOYAGE_API_KEY is not set".to_string()))?;
-        Self::build(DEFAULT_MODEL, DEFAULT_DIM, key, DEFAULT_BASE_URL)
+        Self::build(DEFAULT_MODEL, DEFAULT_DIM, None, key, DEFAULT_BASE_URL)
     }
 
     /// Build a provider for a specific model + dimension, reading the key from
@@ -50,7 +61,7 @@ impl VoyageProvider {
     pub fn with_model(model: &str, dim: usize) -> rb_types::Result<Self> {
         let key = std::env::var("VOYAGE_API_KEY")
             .map_err(|_| Error::Embedding("VOYAGE_API_KEY is not set".to_string()))?;
-        Self::build(model, dim, key, DEFAULT_BASE_URL)
+        Self::build(model, dim, Some(dim), key, DEFAULT_BASE_URL)
     }
 
     /// Test-only constructor: explicit key + base URL, no environment access.
@@ -65,11 +76,36 @@ impl VoyageProvider {
             api_key: SecretString::from(api_key.to_string()),
             model: model.to_string(),
             dim,
+            output_dimension: Some(dim),
             base_url: base_url.trim_end_matches('/').to_string(),
         }
     }
 
-    fn build(model: &str, dim: usize, api_key: String, base_url: &str) -> rb_types::Result<Self> {
+    /// Test-only constructor for default-model behavior that omits
+    /// `output_dimension`, matching `from_env`.
+    #[cfg(test)]
+    pub(crate) fn for_test_default(api_key: &str, base_url: &str) -> Self {
+        let client = reqwest::Client::builder()
+            .timeout(REQUEST_TIMEOUT)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new());
+        Self {
+            client,
+            api_key: SecretString::from(api_key.to_string()),
+            model: DEFAULT_MODEL.to_string(),
+            dim: DEFAULT_DIM,
+            output_dimension: None,
+            base_url: base_url.trim_end_matches('/').to_string(),
+        }
+    }
+
+    fn build(
+        model: &str,
+        dim: usize,
+        output_dimension: Option<usize>,
+        api_key: String,
+        base_url: &str,
+    ) -> rb_types::Result<Self> {
         let client = reqwest::Client::builder()
             .timeout(REQUEST_TIMEOUT)
             .build()
@@ -79,18 +115,24 @@ impl VoyageProvider {
             api_key: SecretString::from(api_key),
             model: model.to_string(),
             dim,
+            output_dimension,
             base_url: base_url.trim_end_matches('/').to_string(),
         })
+    }
+
+    fn embeddings_request<'a>(&'a self, texts: &'a [String]) -> EmbeddingsRequest<'a> {
+        EmbeddingsRequest {
+            model: &self.model,
+            input: texts,
+            input_type: "document",
+            output_dimension: self.output_dimension,
+        }
     }
 
     /// POST a single chunk of inputs and return their embeddings in order.
     async fn embed_chunk(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.base_url);
-        let body = serde_json::json!({
-            "model": self.model,
-            "input": texts,
-            "input_type": "document",
-        });
+        let body = self.embeddings_request(texts);
 
         let resp = self
             .client
@@ -196,7 +238,8 @@ mod tests {
             .and(body_partial_json(serde_json::json!({
                 "model": "voyage-3-lite",
                 "input": ["first", "second"],
-                "input_type": "document"
+                "input_type": "document",
+                "output_dimension": 4
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(&response))
             .mount(&server)
@@ -212,6 +255,17 @@ mod tests {
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], vec![0.1, 0.2, 0.3, 0.4]);
         assert_eq!(out[1], vec![0.5, 0.6, 0.7, 0.8]);
+    }
+
+    #[test]
+    fn default_model_request_omits_output_dimension() {
+        let p = VoyageProvider::for_test_default("test-key", "http://127.0.0.1:1/v1");
+        let inputs = vec!["first".to_string(), "second".to_string()];
+        let body = serde_json::to_value(p.embeddings_request(&inputs)).unwrap();
+
+        assert_eq!(body["model"], "voyage-3-lite");
+        assert_eq!(body["input_type"], "document");
+        assert!(body.get("output_dimension").is_none());
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -310,6 +364,17 @@ mod tests {
         for v in &out {
             assert_eq!(v, &vec![1.0, 0.0, 0.0, 0.0]);
         }
+
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 2);
+        let batch_sizes: Vec<usize> = requests
+            .iter()
+            .map(|request| {
+                let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+                body["input"].as_array().unwrap().len()
+            })
+            .collect();
+        assert_eq!(batch_sizes, vec![128, 72]);
     }
 
     // Real-API smoke test. Ignored by default; run with:

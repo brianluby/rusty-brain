@@ -1,16 +1,14 @@
 use crate::provider::EmbeddingProvider;
 use async_trait::async_trait;
-use std::collections::hash_map::DefaultHasher;
-use std::hash::{Hash, Hasher};
+use sha2::{Digest, Sha256};
 
 /// Offline, deterministic embedding provider. Hashes each input text into a
 /// reproducible unit-length vector of length `dim`. Same text always yields the
 /// same vector; different texts yield different vectors. Never performs IO and
 /// never errors. Public so it can be used as a no-API-key fallback and in tests.
 ///
-/// Determinism relies on `std::collections::hash_map::DefaultHasher::new()`,
-/// which is seeded with fixed keys (unlike `RandomState`), so the same input
-/// produces the same hash across processes and runs.
+/// Determinism relies on SHA-256 so persisted vectors do not depend on standard
+/// library hash implementation details.
 pub struct DeterministicProvider {
     dim: usize,
 }
@@ -25,10 +23,14 @@ impl DeterministicProvider {
     fn embed_one(&self, text: &str) -> Vec<f32> {
         let mut raw = Vec::with_capacity(self.dim);
         for i in 0..self.dim {
-            let mut hasher = DefaultHasher::new();
-            text.hash(&mut hasher);
-            i.hash(&mut hasher);
-            let h = hasher.finish();
+            let mut hasher = Sha256::new();
+            hasher.update(text.as_bytes());
+            hasher.update([0]);
+            hasher.update((i as u64).to_le_bytes());
+            let digest = hasher.finalize();
+            let mut bytes = [0_u8; 8];
+            bytes.copy_from_slice(&digest[..8]);
+            let h = u64::from_le_bytes(bytes);
             let unit = (h as f64) / (u64::MAX as f64);
             raw.push((unit * 2.0 - 1.0) as f32);
         }
@@ -90,6 +92,28 @@ mod tests {
         let a = p.embed(&["repeatable".to_string()]).await.unwrap();
         let b = p.embed(&["repeatable".to_string()]).await.unwrap();
         assert_eq!(a, b);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn vector_values_are_stable_for_persisted_embeddings() {
+        let p = DeterministicProvider::new(4);
+        let out = p
+            .embed(&["stable persisted vector".to_string()])
+            .await
+            .unwrap();
+        let expected = [
+            -0.19579384_f32,
+            -0.48179987_f32,
+            -0.622556_f32,
+            -0.58477145_f32,
+        ];
+
+        for (actual, expected) in out[0].iter().zip(expected) {
+            assert!(
+                (actual - expected).abs() < 1e-6,
+                "expected {expected}, got {actual}"
+            );
+        }
     }
 
     #[tokio::test(flavor = "multi_thread")]
