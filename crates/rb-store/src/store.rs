@@ -463,6 +463,13 @@ impl Store for SqliteStore {
         Ok(ids)
     }
 
+    /// Scale limitation: vec0 KNN cannot filter on namespace/active inside the
+    /// query, so we over-fetch a candidate pool of `10 * limit` nearest vectors
+    /// and filter by namespace + active state in Rust. If those nearest `10*N`
+    /// vectors are dominated by other namespaces or archived rows, FEWER than
+    /// `limit` results may be returned. This is acceptable at P0's brute-force
+    /// scale; a namespace-aware ANN index (or partitioned vec0 table) is a future
+    /// option if recall at the tail becomes a problem.
     fn vector_search(
         &self,
         ns: &Namespace,
@@ -517,15 +524,19 @@ impl Store for SqliteStore {
         for r in rows {
             let (id_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
 
-            // Check namespace and archived status in one query.
-            let active: bool = self
-                .conn
-                .query_row(
-                    "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
-                    rusqlite::params![id_str, ns_str],
-                    |_| Ok(true),
-                )
-                .unwrap_or(false);
+            // Check namespace and archived status in one query. Fail closed: a
+            // missing row means "not active" (skip), but ANY other DB error must
+            // propagate rather than be silently swallowed (which would drop a
+            // candidate as if it were out of scope).
+            let active: bool = match self.conn.query_row(
+                "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
+                rusqlite::params![id_str, ns_str],
+                |_| Ok(true),
+            ) {
+                Ok(found) => found,
+                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                Err(e) => return Err(Error::Storage(e.to_string())),
+            };
 
             if active {
                 let id = parse_id(&id_str)?;
@@ -909,6 +920,27 @@ mod insert_tests {
             "expected storage error about importance, got {err:?}"
         );
     }
+
+    #[test]
+    fn insert_rejects_out_of_range_confidence() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // confidence = -0.1 is below the valid range 0.0..=1.0
+        let mut m = MemoryNote::new(Namespace::Global, "bad".into(), MemoryType::Reference, 5);
+        m.confidence = -0.1;
+        let err = store.insert_memory(&m, None).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref s) if s.contains("confidence")),
+            "expected storage error about confidence, got {err:?}"
+        );
+
+        // confidence = 1.1 is above the valid range
+        m.confidence = 1.1;
+        let err = store.insert_memory(&m, None).unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(ref s) if s.contains("confidence")),
+            "expected storage error about confidence, got {err:?}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1024,6 +1056,37 @@ mod keyword_tests {
         // escaped, it becomes an empty/operator-free phrase that simply matches nothing.
         let none = store.keyword_search(&proj, "OR AND (", 10).unwrap();
         assert!(none.is_empty());
+
+        // A double-quote is the FTS5 phrase delimiter. Unescaped it would either
+        // break the query or let a user inject phrase syntax. escape_fts5_query
+        // doubles internal quotes, so this runs safely (no error) and matches
+        // nothing here (the document has no literal quote token).
+        let quoted = store
+            .keyword_search(&proj, "value\" OR config", 10)
+            .unwrap();
+        assert!(
+            quoted.is_empty(),
+            "double-quote input must not inject phrase syntax, got {quoted:?}"
+        );
+
+        // A bare double-quote alone must also be safe (no panic, no syntax error).
+        let lone_quote = store.keyword_search(&proj, "\"", 10).unwrap();
+        assert!(lone_quote.is_empty());
+
+        // An asterisk is the FTS5 prefix operator. After escaping (`"enable*"`) the
+        // query is a well-formed phrase-with-prefix that FTS5 accepts safely (no
+        // syntax error, no injection). It may legitimately match `enable` in the
+        // document via prefix; the requirement is only that it runs safely, so we
+        // assert it does not error and does not match unrelated rows.
+        let star = store.keyword_search(&proj, "enable*", 10).unwrap();
+        assert!(
+            star == vec![hit.clone()] || star.is_empty(),
+            "asterisk input must run safely without injection, got {star:?}"
+        );
+
+        // A lone asterisk must also be safe (no panic, no syntax error).
+        let lone_star = store.keyword_search(&proj, "*", 10).unwrap();
+        assert!(lone_star.is_empty());
     }
 
     #[test]
@@ -1162,6 +1225,27 @@ mod graph_tests {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let a = node(&store, "lonely");
         assert!(store.graph_neighbors(&a.id, 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn cycle_terminates_and_dedups() {
+        // a -> b and b -> a form a 2-cycle. A naive UNION ALL recursion would loop
+        // forever; UNION + DISTINCT must terminate and return each node once.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        link(&store, &a, &b); // a -> b
+        link(&store, &b, &a); // b -> a (back-edge forms the cycle)
+
+        // depth >= 2 forces the recursion to revisit `a` via b -> a; it must not
+        // hang and must exclude the start node `a` and dedup `b`.
+        let mut got = store.graph_neighbors(&a.id, 3).unwrap();
+        got.sort_by_key(|id| id.to_string());
+        // Neighbors of `a`: b (depth 1). `a` itself is reachable at depth 2 via the
+        // back-edge but is excluded by `node <> ?1`. Result is exactly [b].
+        let mut want = vec![b.id.clone()];
+        want.sort_by_key(|id| id.to_string());
+        assert_eq!(got, want, "cycle must terminate with a deduplicated set");
     }
 }
 
