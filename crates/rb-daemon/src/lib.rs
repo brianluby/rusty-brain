@@ -1,7 +1,11 @@
-//! `rb_daemon`: the single-writer rusty-brain service.
+//! `rb_daemon`: single-writer service over `rb_store`.
 //!
-//! One dedicated OS thread owns the write connection (rusqlite is `!Sync`);
-//! reads run on a bounded pool via `spawn_blocking`; commits broadcast a
-//! `MemoryChanged` event. A UDS listener dispatches per-connection engines
-//! with server-side namespace isolation. Concrete types are added later.
-#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
+//! One dedicated OS thread owns the write `SqliteStore` (rusqlite is `!Sync`,
+//! so the write connection never crosses threads); a bounded pool of read
+//! stores serves concurrent reads via `spawn_blocking`; a Unix-domain-socket
+//! listener frames `rb_proto` requests to a per-connection `MemoryEngine`.
+#![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod change;
+
+pub use change::{ChangeKind, MemoryChanged};
