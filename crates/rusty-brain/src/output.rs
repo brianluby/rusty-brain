@@ -5,8 +5,10 @@ use rb_types::{MemoryNote, SearchResult};
 /// Render recall hits. JSON: the raw `Vec<SearchResult>`. Human: one line per hit.
 pub fn render_recall(results: &[SearchResult], json: bool) -> String {
     if json {
-        return serde_json::to_string_pretty(results)
-            .unwrap_or_else(|e| format!("[] // json error: {e}"));
+        return serde_json::to_string_pretty(results).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render recall JSON");
+            "[]".to_string()
+        });
     }
     if results.is_empty() {
         return "No memories matched.".to_string();
@@ -32,8 +34,10 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
 /// Render a list of notes (used by `list`, `graph`, and the `context` halves).
 pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
     if json {
-        return serde_json::to_string_pretty(notes)
-            .unwrap_or_else(|e| format!("[] // json error: {e}"));
+        return serde_json::to_string_pretty(notes).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render notes JSON");
+            "[]".to_string()
+        });
     }
     if notes.is_empty() {
         return "No memories.".to_string();
@@ -59,8 +63,10 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
 /// Render a single fetched memory (or a not-found message).
 pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
     if json {
-        return serde_json::to_string_pretty(memory)
-            .unwrap_or_else(|e| format!("null // json error: {e}"));
+        return serde_json::to_string_pretty(memory).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render memory JSON");
+            "null".to_string()
+        });
     }
     match memory {
         Some(n) => format!(
@@ -106,8 +112,10 @@ pub fn render_context(
             "important": important,
             "total": total,
         });
-        return serde_json::to_string_pretty(&value)
-            .unwrap_or_else(|e| format!("{{}} // json error: {e}"));
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render context JSON");
+            "{}".to_string()
+        });
     }
     let mut out = format!("Context ({total} memories total)\n\nRecent:\n");
     out.push_str(&render_notes(recent, false));

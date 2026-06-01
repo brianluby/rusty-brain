@@ -26,7 +26,8 @@ where
 {
     let mut spawn = Some(spawn);
     let mut last_err: Option<Error> = None;
-    for attempt in 0..max_attempts.max(1) {
+    let attempts = max_attempts.max(1);
+    for attempt in 0..attempts {
         match connect().await {
             Ok(v) => return Ok(v),
             Err(e) => {
@@ -39,7 +40,7 @@ where
                         s()?;
                     }
                 }
-                if backoff > Duration::ZERO {
+                if backoff > Duration::ZERO && attempt + 1 < attempts {
                     tokio::time::sleep(backoff).await;
                 }
             }

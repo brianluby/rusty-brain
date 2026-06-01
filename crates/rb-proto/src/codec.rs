@@ -34,9 +34,11 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use crate::frame::{read_frame, write_frame};
+    use crate::frame::read_frame;
     use crate::Request;
+    use futures::SinkExt;
     use tokio::io::duplex;
+    use tokio_stream::StreamExt;
     use tokio_util::codec::Framed;
 
     /// A frame whose length prefix exceeds MAX_FRAME_BYTES must be rejected
@@ -55,7 +57,6 @@ mod tests {
         // MAX_FRAME_BYTES. The content doesn't matter — the codec rejects
         // based on the length prefix before reading the body.
         let oversized_payload = bytes::Bytes::from(vec![b'x'; MAX_FRAME_BYTES + 1]);
-        use futures::SinkExt;
         writer.send(oversized_payload).await.unwrap();
 
         // The bounded reader must reject this frame.
@@ -68,15 +69,17 @@ mod tests {
 
     #[tokio::test]
     async fn frame_at_limit_is_accepted() {
-        // A frame exactly at MAX_FRAME_BYTES must succeed (boundary check).
-        // We use a simple Ping which is tiny, just verifying the codec
-        // accepts normal-sized frames through the bounded constructor.
-        let (a, b) = duplex(64 * 1024);
-        let mut sender = bounded_framed(a);
-        let mut receiver = bounded_framed(b);
+        let (writer_raw, reader_raw) = duplex(2 * 1024 * 1024);
+        let mut writer: Framed<_, LengthDelimitedCodec> =
+            Framed::new(writer_raw, LengthDelimitedCodec::new());
+        let mut reader: Framed<_, LengthDelimitedCodec> = Framed::new(reader_raw, bounded_codec());
 
-        write_frame(&mut sender, &Request::Ping).await.unwrap();
-        let req: Request = read_frame(&mut receiver).await.unwrap();
-        assert!(matches!(req, Request::Ping));
+        writer
+            .send(bytes::Bytes::from(vec![b'x'; MAX_FRAME_BYTES]))
+            .await
+            .unwrap();
+
+        let frame = reader.next().await.unwrap().unwrap();
+        assert_eq!(frame.len(), MAX_FRAME_BYTES);
     }
 }

@@ -137,10 +137,10 @@ impl Daemon {
                         Ok((stream, _addr)) => {
                             let store = store.clone();
                             let embedder = embedder.clone();
-                            // Acquire a connection permit before spawning.
-                            // If all permits are taken, this back-pressures the
-                            // accept loop (the biased select still drains JoinSet
-                            // results on the next iteration, returning permits).
+                            // Acquire a connection permit before spawning. If
+                            // all permits are taken, drop the newly accepted
+                            // stream immediately instead of queueing unbounded
+                            // per-connection tasks.
                             let permit = match conn_sem.clone().try_acquire_owned() {
                                 Ok(p) => p,
                                 Err(_) => {

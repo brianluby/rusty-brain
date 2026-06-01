@@ -32,7 +32,7 @@ impl MemoryBackend for VecBackend {
         &self,
         ns: Namespace,
         _query: String,
-        _limit: usize,
+        limit: usize,
     ) -> rb_types::Result<Vec<MemoryId>> {
         let mut v: Vec<MemoryNote> = self
             .notes
@@ -43,7 +43,7 @@ impl MemoryBackend for VecBackend {
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().map(|n| n.id).collect())
+        Ok(v.into_iter().take(limit).map(|n| n.id).collect())
     }
 
     async fn vector(

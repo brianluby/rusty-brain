@@ -32,6 +32,8 @@ pub trait MemoryBackend: Send + Sync {
         min_importance: Option<u8>,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>>;
+    /// Apply metadata-only updates. `MemoryEngine::update` rejects content edits
+    /// so the vector index cannot drift from stored note content.
     async fn update(
         &self,
         ns: Namespace,

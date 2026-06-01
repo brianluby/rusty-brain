@@ -18,7 +18,7 @@ pub enum ProviderKind {
 /// Pure selection: Voyage iff a non-empty API key is present, else Deterministic.
 pub fn select_provider_kind(api_key: Option<String>) -> ProviderKind {
     match api_key {
-        Some(k) if !k.is_empty() => ProviderKind::Voyage,
+        Some(k) if !k.trim().is_empty() => ProviderKind::Voyage,
         _ => ProviderKind::Deterministic,
     }
 }
@@ -89,6 +89,12 @@ mod tests {
     #[test]
     fn selects_deterministic_when_key_empty() {
         let sel = select_provider_kind(Some(String::new()));
+        assert_eq!(sel, ProviderKind::Deterministic);
+    }
+
+    #[test]
+    fn selects_deterministic_when_key_is_whitespace() {
+        let sel = select_provider_kind(Some("   ".to_string()));
         assert_eq!(sel, ProviderKind::Deterministic);
     }
 }

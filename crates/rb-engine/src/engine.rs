@@ -275,6 +275,19 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         id: MemoryId,
         updates: rb_types::MemoryUpdates,
     ) -> rb_types::Result<()> {
+        if updates.content.is_some() {
+            return Err(rb_types::Error::Storage(
+                "content updates are not supported; create a new memory so embeddings stay consistent"
+                    .to_string(),
+            ));
+        }
+        if let Some(importance) = updates.importance {
+            if !(1..=10).contains(&importance) {
+                return Err(rb_types::Error::Storage(format!(
+                    "importance {importance} is out of range 1..=10"
+                )));
+            }
+        }
         if self.get_scoped(id.clone()).await?.is_none() {
             return Err(rb_types::Error::NotFound(id));
         }
@@ -654,14 +667,53 @@ mod tests {
         let eng = engine();
         let id = eng.remember(input("old body", 5)).await.unwrap();
         let updates = rb_types::MemoryUpdates {
-            content: Some("new body".to_string()),
             importance: Some(9),
+            tags: Some(vec!["updated".to_string()]),
             ..Default::default()
         };
         eng.update(id.clone(), updates).await.unwrap();
         let note = eng.get(id).await.unwrap().unwrap();
-        assert_eq!(note.content, "new body");
+        assert_eq!(note.content, "old body");
         assert_eq!(note.importance, 9);
+        assert_eq!(note.tags, vec!["updated".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_content_edits_to_keep_embeddings_consistent() {
+        let eng = engine();
+        let id = eng.remember(input("old body", 5)).await.unwrap();
+        let err = eng
+            .update(
+                id.clone(),
+                rb_types::MemoryUpdates {
+                    content: Some("new body".to_string()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("content updates"));
+        let note = eng.get(id).await.unwrap().unwrap();
+        assert_eq!(note.content, "old body");
+    }
+
+    #[tokio::test]
+    async fn update_rejects_out_of_range_importance() {
+        let eng = engine();
+        let id = eng.remember(input("valid", 5)).await.unwrap();
+        for bad in [0, 11] {
+            let err = eng
+                .update(
+                    id.clone(),
+                    rb_types::MemoryUpdates {
+                        importance: Some(bad),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(err.to_string().contains("importance"), "got {err}");
+        }
     }
 
     #[tokio::test]
@@ -681,7 +733,7 @@ mod tests {
             .update(
                 cross_id.clone(),
                 rb_types::MemoryUpdates {
-                    content: Some("mutated".to_string()),
+                    importance: Some(9),
                     ..Default::default()
                 },
             )

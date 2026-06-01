@@ -82,9 +82,35 @@ pub fn default_db_path() -> Result<PathBuf> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
 
     #[test]
     fn socket_path_is_under_a_rusty_brain_dir_named_sock() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let p = default_socket_path().unwrap();
         assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("sock"));
         assert!(
@@ -104,13 +130,13 @@ mod tests {
 
     #[test]
     fn xdg_runtime_dir_is_honored_for_socket() {
+        let _lock = ENV_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        std::env::set_var("XDG_RUNTIME_DIR", dir.path());
+        let _guard = EnvGuard::set("XDG_RUNTIME_DIR", dir.path());
         let p = default_socket_path().unwrap();
         assert!(
             p.starts_with(dir.path()),
             "socket must live under XDG_RUNTIME_DIR when set: {p:?}"
         );
-        std::env::remove_var("XDG_RUNTIME_DIR");
     }
 }

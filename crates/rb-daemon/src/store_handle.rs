@@ -227,26 +227,18 @@ impl StoreHandle {
     }
 
     /// Test-only helper: checks that the RAII guard returns the connection even
-    /// when the read closure panics. Returns `Ok(())` if the panic is correctly
-    /// mapped to `Error::Storage`, so the test can `.unwrap()` it.
+    /// when the read closure panics. The panic should surface as
+    /// `Error::Storage`, while the guard's `Drop` still returns the connection.
     ///
     /// This method is `pub` only to be reachable from `tests/`. Do NOT call
     /// it in production code.
     #[doc(hidden)]
     pub async fn with_read_panicking_for_test(&self) -> Result<()> {
         #[allow(clippy::panic)]
-        let result = self
-            .with_read(|_store| -> Result<()> {
-                panic!("deliberate test panic inside read closure");
-            })
-            .await;
-        // The JoinError from the panic is mapped to Error::Storage by with_read.
-        match result {
-            Err(Error::Storage(_)) => Ok(()),
-            other => Err(Error::Storage(format!(
-                "expected Storage error from panic, got {other:?}"
-            ))),
-        }
+        self.with_read(|_store| -> Result<()> {
+            panic!("deliberate test panic inside read closure");
+        })
+        .await
     }
 
     /// Test-only helper: the number of idle connections currently in the read

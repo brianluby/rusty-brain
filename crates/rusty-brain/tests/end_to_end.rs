@@ -22,16 +22,16 @@ impl Drop for Reap {
     }
 }
 
-/// Block until `path` exists or the deadline passes. Returns true if it appeared.
+/// Block until `path` accepts connections or the deadline passes.
 fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     let deadline = Instant::now() + timeout;
     while Instant::now() < deadline {
-        if path.exists() {
+        if std::os::unix::net::UnixStream::connect(path).is_ok() {
             return true;
         }
         std::thread::sleep(Duration::from_millis(50));
     }
-    path.exists()
+    std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
 #[test]

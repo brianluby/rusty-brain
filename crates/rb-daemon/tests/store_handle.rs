@@ -229,7 +229,7 @@ async fn panicking_read_closure_returns_connection_via_raii() {
     for _ in 0..POOL_SIZE {
         let err = handle.with_read_panicking_for_test().await;
         assert!(
-            err.is_ok(),
+            matches!(err, Err(Error::Storage(_))),
             "panicking read closure must surface as Storage error, got {err:?}"
         );
     }

@@ -48,12 +48,19 @@ impl RunningDaemon {
                 .unwrap();
         });
 
+        let mut ready = false;
         for _ in 0..200 {
             if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+                ready = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+        assert!(
+            ready,
+            "daemon socket was not reachable within startup timeout at {}",
+            socket.display()
+        );
 
         RunningDaemon {
             socket,
@@ -117,9 +124,15 @@ async fn full_round_trip_through_client() {
     assert_eq!(listed[0].id, id);
 
     let graph = client.graph(id.clone(), 1).await.unwrap();
+    let unique: std::collections::HashSet<_> = graph.iter().map(|m| m.id.clone()).collect();
+    assert_eq!(
+        unique.len(),
+        graph.len(),
+        "graph results must not contain duplicate memories"
+    );
     assert!(
-        graph.iter().all(|m| m.id != id) || graph.is_empty() || graph.iter().any(|m| m.id == id),
-        "graph returns a (possibly empty) neighborhood without error"
+        graph.iter().all(|m| m.namespace == ns),
+        "graph results must stay inside the handshake namespace"
     );
 
     let updates = MemoryUpdates {

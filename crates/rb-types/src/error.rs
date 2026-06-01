@@ -65,6 +65,10 @@ mod tests {
             "serialization error: json"
         );
         assert_eq!(Error::Io("eof".into()).to_string(), "io error: eof");
+        assert_eq!(
+            Error::Embedding("provider down".into()).to_string(),
+            "embedding error: provider down"
+        );
     }
 
     #[test]
