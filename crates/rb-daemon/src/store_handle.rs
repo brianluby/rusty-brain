@@ -244,6 +244,17 @@ impl StoreHandle {
             ))),
         }
     }
+
+    /// Test-only helper: the number of idle connections currently in the read
+    /// pool. After all reads have returned, this equals the configured pool
+    /// size; a leaked connection would make it permanently smaller.
+    ///
+    /// This method is `pub` only to be reachable from `tests/`. Do NOT call
+    /// it in production code.
+    #[doc(hidden)]
+    pub async fn read_pool_len_for_test(&self) -> usize {
+        self.pool.stores.lock().await.len()
+    }
 }
 
 /// Execute a store operation inside `catch_unwind` so a panic in the rusqlite

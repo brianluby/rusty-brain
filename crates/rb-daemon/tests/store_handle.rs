@@ -200,12 +200,20 @@ async fn namespace_id_methods_fail_closed() {
     handle.shutdown().await;
 }
 
-/// A panicking read closure must not permanently shrink the pool:
-/// the RAII guard returns the connection in Drop so subsequent reads
-/// still succeed, and we can run pool_size + 1 sequential reads afterward.
+/// A panicking read closure must not permanently shrink the pool: the RAII
+/// guard returns the connection in Drop. This test fails on the pre-fix leak
+/// in two independent ways:
+///   1. After draining the whole pool with POOL_SIZE panicking reads, the
+///      idle-connection count must be restored to exactly POOL_SIZE. A leak
+///      would leave it at 0 (or < POOL_SIZE).
+///   2. POOL_SIZE concurrent reads must all complete within a short timeout.
+///      On the pre-fix code a fully-drained pool would block forever waiting
+///      for a connection that never returns, tripping the timeout.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn panicking_read_closure_returns_connection_via_raii() {
-    const POOL_SIZE: usize = 2;
+    use std::time::Duration;
+
+    const POOL_SIZE: usize = 3;
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("rb.db");
     let handle = StoreHandle::start(db, DIM, POOL_SIZE).unwrap();
@@ -215,18 +223,43 @@ async fn panicking_read_closure_returns_connection_via_raii() {
     let n = note(&ns, "raii test memory");
     handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
 
-    // Run a closure that panics inside spawn_blocking; the pool guard must
-    // catch the unwind (via JoinError mapping) and return the connection.
-    let err = handle.with_read_panicking_for_test().await;
-    assert!(
-        err.is_ok(),
-        "panicking read closure must surface as Storage error, got {err:?}"
+    // Drain the ENTIRE pool via panicking reads. If the guard were broken,
+    // every one of these would leak its connection and the pool would end up
+    // empty (size 0), making both checks below fail.
+    for _ in 0..POOL_SIZE {
+        let err = handle.with_read_panicking_for_test().await;
+        assert!(
+            err.is_ok(),
+            "panicking read closure must surface as Storage error, got {err:?}"
+        );
+    }
+
+    // (1) Direct assertion: the pool must be fully restored to POOL_SIZE. This
+    // alone fails on the pre-fix leak (the count would be 0 after POOL_SIZE
+    // panics drained every connection without returning it).
+    let restored = handle.read_pool_len_for_test().await;
+    assert_eq!(
+        restored, POOL_SIZE,
+        "read pool must be fully restored to POOL_SIZE after panicking reads, got {restored}"
     );
 
-    // Now run pool_size + 1 sequential reads — if the connection leaked we
-    // would eventually block or error when the pool is exhausted.
-    for _ in 0..(POOL_SIZE + 1) {
-        let listed = handle.list(ns.clone(), None, 10).await.unwrap();
+    // (2) Black-box assertion: fire POOL_SIZE concurrent reads. On the pre-fix
+    // code a fully-drained pool has no connections to hand out, so these would
+    // block forever and the timeout would fire -> the test fails.
+    let mut tasks = Vec::with_capacity(POOL_SIZE);
+    for _ in 0..POOL_SIZE {
+        let h = handle.clone();
+        let ns = ns.clone();
+        tasks.push(tokio::spawn(async move {
+            h.list(ns, None, 10).await
+        }));
+    }
+    for t in tasks {
+        let listed = tokio::time::timeout(Duration::from_secs(5), t)
+            .await
+            .expect("concurrent read must complete; a leaked pool would hang here")
+            .expect("read task must not panic")
+            .expect("read must succeed");
         assert!(
             !listed.is_empty(),
             "pool must not be permanently shrunk after panic"
