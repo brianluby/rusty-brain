@@ -494,6 +494,14 @@ fn writer_loop(
                 }
             }
             WriteCommand::Shutdown { reply } => {
+                // Fold the WAL back into the main file before the connection is
+                // dropped, so the on-disk DB is a clean single file. Best-effort:
+                // a checkpoint failure is logged but must not block shutdown.
+                if let Some(active) = store.as_ref() {
+                    if let Err(e) = active.checkpoint_truncate() {
+                        tracing::warn!(error = %e, "WAL checkpoint on shutdown failed");
+                    }
+                }
                 let _ = reply.send(());
                 break;
             }
@@ -667,6 +675,33 @@ mod tests {
         assert_eq!(ids, vec![bid, aid]);
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_checkpoints_so_data_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+
+        let ns = Namespace::Project("ckpt-shutdown".to_string());
+        let id;
+        {
+            let handle = StoreHandle::start(db.clone(), DIM, 2).unwrap();
+            let n = note(&ns, "survive the shutdown checkpoint");
+            id = n.id.clone();
+            handle.write(n, Some(vec![0.2f32; DIM])).await.unwrap();
+            // Graceful shutdown runs PRAGMA wal_checkpoint(TRUNCATE) in the writer
+            // Shutdown arm, then joins the writer thread.
+            handle.shutdown().await;
+        }
+
+        // Reopen a brand-new handle on the same file; the row must be present.
+        let reopened = StoreHandle::start(db, DIM, 1).unwrap();
+        let got = reopened.get(ns, id).await.unwrap();
+        assert!(
+            got.is_some(),
+            "row must persist across a checkpointed shutdown"
+        );
+        reopened.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

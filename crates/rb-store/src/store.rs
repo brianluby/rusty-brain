@@ -122,6 +122,25 @@ impl SqliteStore {
             embedding_dim,
         })
     }
+
+    /// Fold the WAL back into the main database file and truncate it to zero.
+    ///
+    /// Used on graceful daemon shutdown so the on-disk DB is a clean single file
+    /// with no trailing WAL frames. On an in-memory or non-WAL connection SQLite
+    /// reports the operation as a no-op and returns `SQLITE_OK`, so this never
+    /// errors for those DBs.
+    ///
+    /// Uses `execute_batch` rather than `pragma_query`: rusqlite's `pragma_query`
+    /// routes the pragma name through `push_keyword`, which rejects the
+    /// parenthesized `wal_checkpoint(TRUNCATE)` form as a non-identifier. A raw
+    /// `PRAGMA ...;` statement executed via `execute_batch` has the same
+    /// semantics and accepts the argument syntax.
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(storage_err)?;
+        Ok(())
+    }
 }
 
 /// Caches the result of the one-time process-global sqlite-vec registration.
@@ -1928,5 +1947,34 @@ mod get_many_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].links.len(), 1);
         assert_eq!(got[0].links[0].target_id, b);
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn checkpoint_truncate_is_ok_on_file_and_memory_dbs() {
+        // In-memory DB: journal_mode is "memory"; checkpoint is a harmless no-op.
+        let mem = SqliteStore::open_in_memory(8).unwrap();
+        mem.checkpoint_truncate().unwrap();
+
+        // File-backed DB in WAL: insert one row, checkpoint, row still present.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("ckpt".to_string());
+        let note = MemoryNote::new(ns, "checkpoint me".to_string(), MemoryType::Insight, 5);
+        let id = note.id.clone();
+        store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+
+        store.checkpoint_truncate().unwrap();
+
+        let got = store.get_memory(&id).unwrap();
+        assert!(got.is_some(), "row survives a wal_checkpoint(TRUNCATE)");
+        assert_eq!(got.unwrap().content, "checkpoint me");
     }
 }
