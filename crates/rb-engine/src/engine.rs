@@ -1,5 +1,6 @@
 use crate::backend::MemoryBackend;
 use crate::enrich::{default_summary, derive_keywords};
+use crate::linker::{Linker, SimilarityLinker};
 use rb_embed::EmbeddingProvider;
 use rb_search::Weights;
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
@@ -22,6 +23,7 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     embedder: P,
     weights: Weights,
     namespace: Namespace,
+    linker: Box<dyn Linker>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -33,6 +35,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             embedder,
             weights: Weights::default(),
             namespace,
+            linker: Box::new(SimilarityLinker::default()),
         }
     }
 
@@ -114,8 +117,64 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let embedding = embeddings.pop();
 
         let id = note.id.clone();
+        // Keep a copy of the embedding for candidate search before the note moves.
+        let embedding_for_links = embedding.clone();
         self.backend.write(note, embedding).await?;
+
+        // Best-effort link generation: never fails the remember.
+        if let Some(emb) = embedding_for_links {
+            if let Err(e) = self.generate_links(&id, emb).await {
+                tracing::warn!(error = %e, memory_id = %id, "link generation failed; continuing");
+            }
+        }
         Ok(id)
+    }
+
+    /// Vector-search for candidates similar to the just-written memory, fetch
+    /// their notes, run the linker, and persist the produced links. Best-effort:
+    /// callers ignore the error. `add_link` failures are logged and skipped so a
+    /// single bad link never aborts the rest.
+    async fn generate_links(&self, new_id: &MemoryId, embedding: Vec<f32>) -> rb_types::Result<()> {
+        const CANDIDATE_LIMIT: usize = 8;
+        let pairs = self
+            .backend
+            .vector(self.namespace.clone(), embedding, CANDIDATE_LIMIT)
+            .await?;
+        // Candidate ids exclude the new note itself.
+        let candidate_ids: Vec<MemoryId> = pairs
+            .iter()
+            .filter(|(id, _)| id != new_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if candidate_ids.is_empty() {
+            return Ok(());
+        }
+        let dist: std::collections::HashMap<MemoryId, f32> = pairs.into_iter().collect();
+        let notes = self
+            .backend
+            .get_many(self.namespace.clone(), candidate_ids)
+            .await?;
+        let new_note = match self
+            .backend
+            .get(self.namespace.clone(), new_id.clone())
+            .await?
+        {
+            Some(n) => n,
+            None => return Ok(()),
+        };
+        let candidates: Vec<(MemoryNote, f32)> = notes
+            .into_iter()
+            .map(|n| {
+                let d = dist.get(&n.id).copied().unwrap_or(f32::MAX);
+                (n, d)
+            })
+            .collect();
+        for link in self.linker.link(&new_note, &candidates) {
+            if let Err(e) = self.backend.add_link(link).await {
+                tracing::warn!(error = %e, "add_link failed; skipping one link");
+            }
+        }
+        Ok(())
     }
 
     /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
@@ -482,6 +541,49 @@ mod tests {
         let mut note = MemoryNote::new(namespace, content.to_string(), ty, importance);
         note.tags = tags.iter().map(|t| t.to_string()).collect();
         note
+    }
+
+    #[tokio::test]
+    async fn remember_creates_links_to_similar_existing_memories() {
+        let eng = engine();
+        // First memory: nothing to link to.
+        let first = eng
+            .remember(input("single writer over sqlite wal", 5))
+            .await
+            .unwrap();
+        assert!(eng.backend().links_of(&first).is_empty());
+
+        // Second memory: the deterministic mock vector() returns the first as a
+        // candidate at distance 0.0 (<= threshold), so a link is created.
+        let second = eng
+            .remember(input("concurrent readers never block", 5))
+            .await
+            .unwrap();
+        let links = eng.backend().links_of(&second);
+        assert!(
+            !links.is_empty(),
+            "remember should link to the prior similar memory"
+        );
+        assert_eq!(links[0].source_id, second);
+        assert!(
+            links.iter().all(|l| l.target_id != second),
+            "never links to self"
+        );
+        assert!(links.iter().any(|l| l.target_id == first));
+        assert!(links
+            .iter()
+            .all(|l| l.link_type == rb_types::LinkType::References));
+    }
+
+    #[tokio::test]
+    async fn remember_link_failure_does_not_fail_remember() {
+        // A backend whose add_link always fails must not break remember.
+        let eng = engine();
+        let _first = eng.remember(input("anchor", 5)).await.unwrap();
+        eng.backend().set_fail_add_link(true);
+        // Should still succeed (best-effort linking).
+        let id = eng.remember(input("second", 5)).await.unwrap();
+        assert!(eng.backend().note_of(&id).is_some());
     }
 
     #[tokio::test]

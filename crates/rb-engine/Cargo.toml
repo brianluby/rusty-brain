@@ -17,6 +17,7 @@ rb-search = { path = "../rb-search" }
 rb-embed = { path = "../rb-embed" }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+tracing = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
