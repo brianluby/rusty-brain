@@ -17,6 +17,31 @@ use crate::change::{ChangeKind, MemoryChanged};
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
 
+/// Count of `MemoryChanged` broadcasts that could not be delivered (no live
+/// receivers). Best-effort notification only — a non-zero value is
+/// observability, not an error.
+static DROPPED_BROADCASTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the cumulative count of dropped change-event broadcasts. Exposed for
+/// observability and tests; production callers use it for metrics/logging only.
+#[allow(dead_code)]
+pub fn dropped_broadcast_count() -> u64 {
+    DROPPED_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish a change event, counting + logging when there is no receiver to take
+/// it. `broadcast::Sender::send` returns `Err(SendError)` precisely when there
+/// are zero receivers; that is the signal we surface.
+fn publish_change(events: &broadcast::Sender<MemoryChanged>, evt: MemoryChanged) {
+    if events.send(evt).is_err() {
+        let n = DROPPED_BROADCASTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(
+            dropped_total = n,
+            "MemoryChanged broadcast had no receivers; change notification dropped"
+        );
+    }
+}
+
 enum WriteCommand {
     Insert {
         note: Box<MemoryNote>,
@@ -399,11 +424,14 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Created,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Created,
+                        },
+                    );
                 }
                 if !writer_usable {
                     break;
@@ -428,11 +456,14 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Updated,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Updated,
+                        },
+                    );
                 }
                 if !writer_usable {
                     break;
@@ -454,11 +485,14 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Archived,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Archived,
+                        },
+                    );
                 }
                 if !writer_usable {
                     break;
@@ -735,5 +769,27 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_without_subscriber_increments_dropped_event_counter() {
+        let before = dropped_broadcast_count();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        // Deliberately do NOT subscribe: the broadcast send will return Err
+        // (no receivers), which must be counted, not silently dropped.
+        let ns = Namespace::Project("no-subscriber".to_string());
+        let n = note(&ns, "nobody is listening");
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.shutdown().await;
+
+        assert!(
+            dropped_broadcast_count() > before,
+            "a broadcast with no receivers must increment the dropped counter \
+             (before={before}, after={})",
+            dropped_broadcast_count()
+        );
     }
 }
