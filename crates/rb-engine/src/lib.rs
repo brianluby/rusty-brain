@@ -8,8 +8,10 @@
 mod backend;
 mod engine;
 mod enrich;
+mod linker;
 #[cfg(test)]
 mod test_support;
 
 pub use backend::MemoryBackend;
 pub use engine::{MemoryEngine, RememberInput};
+pub use linker::{Linker, SimilarityLinker};
