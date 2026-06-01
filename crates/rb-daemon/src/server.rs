@@ -58,15 +58,7 @@ impl Daemon {
                 .map_err(|e| Error::Io(format!("create db dir {}: {e}", parent.display())))?;
         }
 
-        let socket_dir = config
-            .socket_path
-            .parent()
-            .ok_or_else(|| Error::Io("socket path has no parent dir".to_string()))?
-            .to_path_buf();
-        fs::create_dir_all(&socket_dir)
-            .map_err(|e| Error::Io(format!("create socket dir {}: {e}", socket_dir.display())))?;
-        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
-            .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))?;
+        prepare_socket_dir(&config.socket_path)?;
 
         let pidfile_path = config.socket_path.with_extension("pid");
         let mut bind_guard = BindGuard::acquire(config.socket_path.clone(), pidfile_path.clone())?;
@@ -153,6 +145,36 @@ impl Daemon {
         info!("daemon shut down cleanly");
         Ok(())
     }
+}
+
+fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
+    let socket_dir = socket_path
+        .parent()
+        .ok_or_else(|| Error::Io("socket path has no parent dir".to_string()))?;
+
+    if socket_dir.exists() {
+        let metadata = fs::metadata(socket_dir)
+            .map_err(|e| Error::Io(format!("stat socket dir {}: {e}", socket_dir.display())))?;
+        if !metadata.is_dir() {
+            return Err(Error::Io(format!(
+                "socket parent {} is not a directory",
+                socket_dir.display()
+            )));
+        }
+        let mode = metadata.permissions().mode() & 0o777;
+        if mode != 0o700 {
+            return Err(Error::Io(format!(
+                "socket dir {} must already be private (0700), got {mode:03o}",
+                socket_dir.display()
+            )));
+        }
+        return Ok(());
+    }
+
+    fs::create_dir_all(socket_dir)
+        .map_err(|e| Error::Io(format!("create socket dir {}: {e}", socket_dir.display())))?;
+    fs::set_permissions(socket_dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))
 }
 
 struct BindGuard {
@@ -292,7 +314,18 @@ async fn handle_connection(
         return Ok(());
     }
 
-    let namespace = handshake.namespace;
+    let namespace = match validate_namespace(handshake.namespace) {
+        Ok(namespace) => namespace,
+        Err(e) => {
+            let ack = HandshakeAck {
+                contract_version: CONTRACT_VERSION,
+                ok: false,
+                message: Some(e.to_string()),
+            };
+            write_frame(&mut framed, &ack).await?;
+            return Ok(());
+        }
+    };
     let ack = HandshakeAck {
         contract_version: CONTRACT_VERSION,
         ok: true,
@@ -311,6 +344,16 @@ async fn handle_connection(
     }
 
     Ok(())
+}
+
+fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namespace> {
+    let encoded = namespace.as_db_string();
+    let parsed = rb_types::Namespace::parse_db_string(&encoded)?;
+    if parsed == namespace {
+        Ok(namespace)
+    } else {
+        Err(Error::InvalidNamespace(encoded))
+    }
 }
 
 async fn dispatch<P>(engine: &MemoryEngine<StoreHandle, P>, req: Request) -> Response
@@ -386,5 +429,59 @@ where
             },
             Err(e) => error_to_response(e),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use rb_types::Namespace;
+
+    #[test]
+    fn prepare_socket_dir_creates_missing_parent_private() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("missing").join("sock");
+
+        prepare_socket_dir(&socket).unwrap();
+
+        let parent = socket.parent().unwrap();
+        let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_socket_dir_rejects_public_existing_parent_without_chmod() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket_dir = dir.path().join("public");
+        fs::create_dir(&socket_dir).unwrap();
+        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let socket = socket_dir.join("sock");
+
+        let err = prepare_socket_dir(&socket).unwrap_err();
+        assert!(
+            err.to_string().contains("must already be private"),
+            "unexpected error: {err}"
+        );
+        let mode = fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "daemon must not chmod caller-owned dirs");
+    }
+
+    #[test]
+    fn validate_namespace_rejects_non_persistable_namespaces() {
+        assert!(validate_namespace(Namespace::Global).is_ok());
+        assert!(validate_namespace(Namespace::Project("p".to_string())).is_ok());
+        assert!(matches!(
+            validate_namespace(Namespace::Project(String::new())),
+            Err(Error::InvalidNamespace(_))
+        ));
+        assert!(matches!(
+            validate_namespace(Namespace::Session {
+                project: "p".to_string(),
+                session_id: String::new(),
+            }),
+            Err(Error::InvalidNamespace(_))
+        ));
     }
 }

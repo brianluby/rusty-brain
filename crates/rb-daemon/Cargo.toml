@@ -17,13 +17,9 @@ rb-store = { path = "../rb-store" }
 rb-engine = { path = "../rb-engine" }
 rb-embed = { path = "../rb-embed" }
 rb-proto = { path = "../rb-proto" }
-rb-search = { path = "../rb-search" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
-futures = { workspace = true }
-deadpool-sqlite = { workspace = true }
 tracing = { workspace = true }
-thiserror = { workspace = true }
 serde = { workspace = true }
 async-trait = { workspace = true }
 libc = { workspace = true }

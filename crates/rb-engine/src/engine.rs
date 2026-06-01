@@ -82,6 +82,13 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
+        if !(1..=10).contains(&input.importance) {
+            return Err(rb_types::Error::Storage(format!(
+                "importance {} is out of range 1..=10",
+                input.importance
+            )));
+        }
+
         let mut note = MemoryNote::new(
             self.namespace.clone(),
             input.content,
@@ -309,6 +316,8 @@ mod tests {
     use crate::test_support::MockBackend;
     use rb_embed::DeterministicProvider;
     use rb_types::{MemoryType, Namespace};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     fn engine() -> MemoryEngine<MockBackend, DeterministicProvider> {
         MemoryEngine::new(
@@ -391,6 +400,50 @@ mod tests {
             eng.backend().embedding_of(&id1),
             eng.backend().embedding_of(&id2)
         ); // deterministic provider => same vector
+    }
+
+    struct CountingProvider {
+        calls: Arc<AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for CountingProvider {
+        fn model_id(&self) -> &str {
+            "counting"
+        }
+
+        fn dim(&self) -> usize {
+            16
+        }
+
+        async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(vec![vec![0.0; 16]; texts.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_importance_is_rejected_before_embedding() {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            CountingProvider {
+                calls: Arc::clone(&calls),
+            },
+            Namespace::Project("rb".into()),
+        );
+
+        let err = eng
+            .remember(input("invalid importance should not embed", 0))
+            .await
+            .unwrap_err();
+
+        assert!(
+            err.to_string().contains("importance"),
+            "unexpected error: {err}"
+        );
+        assert_eq!(calls.load(Ordering::SeqCst), 0);
+        assert_eq!(eng.backend().count(), 0);
     }
 
     async fn seed(

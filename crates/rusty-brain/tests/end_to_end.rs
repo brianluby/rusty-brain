@@ -37,7 +37,7 @@ fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
 #[test]
 fn remember_then_recall_round_trips_through_the_binary() {
     let dir = tempfile::tempdir().unwrap();
-    let socket = dir.path().join("rb.sock");
+    let socket = dir.path().join("runtime").join("rb.sock");
     let db = dir.path().join("rb.db");
     let exe = cargo_bin("rusty-brain");
 

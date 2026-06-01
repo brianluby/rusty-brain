@@ -28,7 +28,7 @@ struct RunningDaemon {
 impl RunningDaemon {
     async fn start(pool_size: usize) -> RunningDaemon {
         let dir = tempdir();
-        let socket = dir.path().join("sock");
+        let socket = dir.path().join("runtime").join("sock");
         let db = dir.path().join("memory.db");
         let cfg = DaemonConfig {
             socket_path: socket.clone(),
@@ -266,6 +266,22 @@ async fn namespace_isolation_enforced_server_side() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn invalid_handshake_namespace_is_rejected_before_ack() {
+    let daemon = RunningDaemon::start(2).await;
+
+    let err = Client::connect(&daemon.socket, Namespace::Project(String::new()))
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("handshake rejected")
+            || err.to_string().contains("invalid namespace"),
+        "invalid namespace must fail closed during handshake: {err}"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_bind_on_live_socket_fails_closed() {
     let daemon = RunningDaemon::start(2).await;
 
@@ -288,7 +304,7 @@ async fn second_bind_on_live_socket_fails_closed() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_bind_before_accept_loop_fails_closed() {
     let dir = tempdir();
-    let socket = dir.path().join("sock");
+    let socket = dir.path().join("runtime").join("sock");
     let cfg = DaemonConfig {
         socket_path: socket.clone(),
         db_path: dir.path().join("memory.db"),
