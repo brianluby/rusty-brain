@@ -18,6 +18,11 @@ pub struct JsonRpcRequest {
     #[serde(default)]
     pub jsonrpc: String,
     pub method: String,
+    // serde maps an explicit JSON `null` to `None` for `Option<Value>`, so
+    // `id: null` collapses to the same `None` as an absent `id`. This is safe
+    // for MCP: per the MCP/JSON-RPC spec notifications OMIT `id`, and no
+    // conformant MCP client sends a request with `id: null`, so treating both
+    // as "notification" cannot misclassify a real request.
     #[serde(default)]
     pub id: Option<Value>,
     #[serde(default)]

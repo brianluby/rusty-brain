@@ -36,16 +36,23 @@ fn opt_string(args: &Value, key: &str) -> Option<String> {
     args.get(key).and_then(Value::as_str).map(str::to_owned)
 }
 
-fn opt_string_vec(args: &Value, key: &str) -> Vec<String> {
-    args.get(key)
-        .and_then(Value::as_array)
-        .map(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(str::to_owned)
-                .collect()
-        })
-        .unwrap_or_default()
+/// Parse an optional array-of-strings argument. Absent or null yields an empty
+/// vec; an array with any non-string element fails closed with `INVALID_PARAMS`
+/// (the schema declares `items: { type: string }`, so partial coercion would be
+/// silently lossy).
+fn opt_string_vec(args: &Value, key: &str) -> Result<Vec<String>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::Array(elems)) => elems
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| invalid(format!("'{key}' must be an array of strings")))
+            })
+            .collect(),
+        Some(_) => Err(invalid(format!("'{key}' must be an array of strings"))),
+    }
 }
 
 fn opt_u8(args: &Value, key: &str) -> Result<Option<u8>, ToolError> {
@@ -97,14 +104,14 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 memory_type,
                 importance,
                 keywords: Vec::new(),
-                tags: opt_string_vec(args, "tags"),
+                tags: opt_string_vec(args, "tags")?,
                 related_files: Vec::new(),
             })
         }
         "recall" => Ok(Request::Recall {
             query: require_str(args, "query")?.to_owned(),
             memory_type: parse_type(args, "type")?,
-            tags: opt_string_vec(args, "tags"),
+            tags: opt_string_vec(args, "tags")?,
             limit: opt_usize(args, "limit", 10)?,
         }),
         "get" => Ok(Request::Get {
@@ -123,14 +130,17 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
         }
         "update" => {
             let id = parse_id(args)?;
+            // Tags absent -> leave unchanged (None); tags present -> validate the
+            // whole array, failing closed on any non-string element.
+            let tags = match args.get("tags") {
+                None | Some(Value::Null) => None,
+                Some(_) => Some(opt_string_vec(args, "tags")?),
+            };
             let updates = MemoryUpdates {
                 content: opt_string(args, "content"),
                 summary: opt_string(args, "summary"),
                 importance: opt_u8(args, "importance")?,
-                tags: args
-                    .get("tags")
-                    .and_then(Value::as_array)
-                    .map(|_| opt_string_vec(args, "tags")),
+                tags,
                 context: opt_string(args, "context"),
             };
             Ok(Request::Update { id, updates })
@@ -326,6 +336,34 @@ mod tests {
         let err =
             build_request("remember", &json!({ "content": "c", "type": "nope" })).unwrap_err();
         assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn non_string_tag_element_is_invalid_params() {
+        // The schema declares `tags: { items: { type: string } }`; an array with
+        // any non-string element is malformed and must fail closed (no partial
+        // store), across every tool that accepts tags.
+        for tool in ["remember", "recall", "update"] {
+            let args = match tool {
+                "remember" => json!({ "content": "c", "tags": [1, "x"] }),
+                "recall" => json!({ "query": "q", "tags": [1, "x"] }),
+                _ => json!({ "id": MemoryId::new().to_string(), "tags": [1, "x"] }),
+            };
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::jsonrpc::INVALID_PARAMS,
+                "{tool} must reject non-string tag elements"
+            );
+        }
+        // A valid all-string array still works.
+        let req = build_request("recall", &json!({ "query": "q", "tags": ["a", "b"] })).unwrap();
+        match req {
+            Request::Recall { tags, .. } => {
+                assert_eq!(tags, vec!["a".to_string(), "b".to_string()]);
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
     }
 
     #[test]
