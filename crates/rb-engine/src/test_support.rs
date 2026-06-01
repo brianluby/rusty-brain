@@ -1,6 +1,7 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
 use crate::backend::MemoryBackend;
+use crate::enricher::{Enricher, Enrichment};
 use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -257,5 +258,32 @@ impl MemoryBackend for MockBackend {
             .iter()
             .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
             .collect())
+    }
+}
+
+/// In-test enricher returning fixed values so `remember` wiring is assertable
+/// without any network. Used to prove the engine fills empty fields from it.
+pub(crate) struct FixedEnricher;
+
+#[async_trait::async_trait]
+impl Enricher for FixedEnricher {
+    async fn enrich(&self, _content: &str, _context: Option<&str>) -> rb_types::Result<Enrichment> {
+        Ok(Enrichment {
+            summary: Some("enriched summary".to_string()),
+            keywords: vec!["enrkw".to_string()],
+            tags: vec!["enrtag".to_string()],
+            memory_type: None,
+            importance: None,
+        })
+    }
+}
+
+/// In-test enricher that always fails, to prove `remember` falls back cleanly.
+pub(crate) struct FailingEnricher;
+
+#[async_trait::async_trait]
+impl Enricher for FailingEnricher {
+    async fn enrich(&self, _content: &str, _context: Option<&str>) -> rb_types::Result<Enrichment> {
+        Err(rb_types::Error::Enrichment("boom".to_string()))
     }
 }

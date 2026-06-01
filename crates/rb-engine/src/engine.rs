@@ -1,9 +1,11 @@
 use crate::backend::MemoryBackend;
 use crate::enrich::{default_summary, derive_keywords};
+use crate::enricher::Enricher;
 use crate::linker::{Linker, SimilarityLinker};
 use rb_embed::EmbeddingProvider;
 use rb_search::Weights;
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
+use std::sync::Arc;
 
 /// Input to `remember`. Mirrors the proto `Request::Remember` payload.
 pub struct RememberInput {
@@ -24,6 +26,7 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     weights: Weights,
     namespace: Namespace,
     linker: Box<dyn Linker>,
+    enricher: Option<Arc<dyn Enricher>>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -36,6 +39,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             weights: Weights::default(),
             namespace,
             linker: Box::new(SimilarityLinker::default()),
+            enricher: None,
         }
     }
 
@@ -52,6 +56,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Borrow the ranking weights (used by `recall`).
     pub fn weights(&self) -> Weights {
         self.weights
+    }
+
+    /// Enable opt-in enrichment. When set, `remember` asks the enricher to fill
+    /// fields the caller left empty; on enricher error it falls back to the
+    /// heuristic path (enrichment never fails a remember).
+    pub fn with_enricher(mut self, enricher: Arc<dyn Enricher>) -> Self {
+        self.enricher = Some(enricher);
+        self
     }
 
     fn in_namespace(&self, note: &MemoryNote) -> bool {
@@ -98,14 +110,38 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.memory_type,
             input.importance,
         );
-        // Heuristic enrichment (no LLM in P1).
-        note.summary = default_summary(&note.content);
-        note.keywords = if input.keywords.is_empty() {
-            derive_keywords(&note.content)
-        } else {
-            input.keywords
+        // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
+        // the caller left empty; an enricher error degrades to the heuristic.
+        let enrichment = match &self.enricher {
+            Some(e) => match e.enrich(&note.content, input.context.as_deref()).await {
+                Ok(en) => Some(en),
+                Err(err) => {
+                    tracing::warn!(error = %err, "enricher failed; using heuristic enrichment");
+                    None
+                }
+            },
+            None => None,
         };
-        note.tags = input.tags;
+
+        note.summary = match enrichment.as_ref().and_then(|e| e.summary.clone()) {
+            Some(s) => s,
+            None => default_summary(&note.content),
+        };
+        note.keywords = if !input.keywords.is_empty() {
+            input.keywords
+        } else if let Some(en) = enrichment.as_ref().filter(|e| !e.keywords.is_empty()) {
+            en.keywords.clone()
+        } else {
+            derive_keywords(&note.content)
+        };
+        note.tags = if !input.tags.is_empty() {
+            input.tags
+        } else {
+            enrichment
+                .as_ref()
+                .map(|e| e.tags.clone())
+                .unwrap_or_default()
+        };
         note.related_files = input.related_files;
         if let Some(ctx) = input.context {
             note.context = ctx;
@@ -1037,5 +1073,54 @@ mod tests {
         assert_eq!(important.len(), 1);
         assert_eq!(important[0].importance, 9);
         assert_eq!(total, 2);
+    }
+
+    use crate::test_support::{FailingEnricher, FixedEnricher};
+
+    #[tokio::test]
+    async fn remember_with_enricher_fills_empty_keywords_tags_and_summary() {
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        // caller leaves keywords/tags empty -> enricher fills them.
+        let id = eng.remember(input("some content body", 5)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.summary, "enriched summary");
+        assert_eq!(note.keywords, vec!["enrkw".to_string()]);
+        assert_eq!(note.tags, vec!["enrtag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remember_with_enricher_preserves_caller_supplied_keywords_and_tags() {
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        let mut inp = input("body", 5);
+        inp.keywords = vec!["caller".to_string()];
+        inp.tags = vec!["callertag".to_string()];
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        // explicit caller values win over the enricher.
+        assert_eq!(note.keywords, vec!["caller".to_string()]);
+        assert_eq!(note.tags, vec!["callertag".to_string()]);
+        // summary still comes from the enricher (caller never supplies it).
+        assert_eq!(note.summary, "enriched summary");
+    }
+
+    #[tokio::test]
+    async fn remember_falls_back_to_heuristic_when_enricher_errors() {
+        let eng = engine().with_enricher(Arc::new(FailingEnricher));
+        let content = "concurrent readers never block the single writer thread";
+        let id = eng.remember(input(content, 6)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        // heuristic summary == trimmed content (< 150 chars); keywords non-empty.
+        assert_eq!(note.summary, content);
+        assert!(!note.keywords.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remember_without_enricher_is_unchanged_heuristic_path() {
+        let eng = engine(); // no enricher
+        let content = "single writer over sqlite wal keeps things correct";
+        let id = eng.remember(input(content, 7)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.summary, content);
+        assert!(!note.keywords.is_empty());
     }
 }
