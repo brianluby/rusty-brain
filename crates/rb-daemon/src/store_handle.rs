@@ -34,6 +34,14 @@ enum WriteCommand {
         id: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
+    AddLink {
+        link: Box<rb_types::MemoryLink>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RecordAccess {
+        id: MemoryId,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -456,6 +464,25 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::AddLink { link, reply } => {
+                let report =
+                    run_store_op(&mut store, &db_path, embedding_dim, |s| s.add_link(&link));
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::RecordAccess { id, reply } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.record_access(&id)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
             #[cfg(test)]
             WriteCommand::PanicForTest { reply } => {
                 let report =
@@ -562,6 +589,25 @@ impl MemoryBackend for StoreHandle {
         };
         self.send_write(cmd, rx).await
     }
+
+    async fn add_link(&self, link: rb_types::MemoryLink) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::AddLink {
+            link: Box::new(link),
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn record_access(&self, id: MemoryId) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::RecordAccess { id, reply };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn get_many(&self, ns: Namespace, ids: Vec<MemoryId>) -> Result<Vec<MemoryNote>> {
+        self.with_read(move |store| store.get_many(&ns, &ids)).await
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +622,51 @@ mod tests {
 
     fn note(ns: &Namespace, body: &str) -> MemoryNote {
         MemoryNote::new(ns.clone(), body.to_string(), MemoryType::Insight, 5)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_add_link_record_access_and_get_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("p2".to_string());
+
+        let a = note(&ns, "source note");
+        let b = note(&ns, "target note");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // add_link goes through the writer and is visible via get (links loaded).
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.6,
+                reason: "similar".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let got = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(got.links.len(), 1);
+        assert_eq!(got.links[0].target_id, bid);
+
+        // record_access goes through the writer and bumps the count.
+        handle.record_access(aid.clone()).await.unwrap();
+        let after = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(after.access_count, 1);
+
+        // get_many returns ns-scoped notes in request order via the read pool.
+        let many = handle
+            .get_many(ns, vec![bid.clone(), aid.clone()])
+            .await
+            .unwrap();
+        let ids: Vec<rb_types::MemoryId> = many.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![bid, aid]);
+
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
