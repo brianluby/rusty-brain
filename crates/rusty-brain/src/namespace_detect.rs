@@ -304,4 +304,83 @@ mod tests {
         // empty project + no h1 -> git root name.
         assert_eq!(ns, Namespace::Project("app".to_string()));
     }
+
+    mod fs_walk {
+        #![allow(clippy::unwrap_used, clippy::expect_used)]
+        use super::super::{detect_namespace_with, find_nearest_claude_md};
+        use rb_types::Namespace;
+        use std::fs;
+        use std::path::Path;
+        use tempfile::TempDir;
+
+        // Build start dir + write a CLAUDE.md `levels` directories above it.
+        fn tree_with_claude(levels: usize, body: &str) -> (TempDir, std::path::PathBuf) {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+            let mut start = root.clone();
+            for i in 0..levels {
+                start = start.join(format!("d{i}"));
+            }
+            fs::create_dir_all(&start).unwrap();
+            fs::write(root.join("CLAUDE.md"), body).unwrap();
+            (tmp, start)
+        }
+
+        fn no_git(_: &Path) -> Option<std::path::PathBuf> {
+            None
+        }
+
+        #[test]
+        fn finds_claude_md_three_levels_up_and_uses_frontmatter() {
+            let (tmp, start) = tree_with_claude(3, "---\nproject: walked-up\n---\n# Ignored\n");
+            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
+            assert_eq!(ns, Namespace::Project("walked-up".to_string()));
+            drop(tmp);
+        }
+
+        #[test]
+        fn uses_h1_from_real_file_when_no_frontmatter() {
+            let (tmp, start) = tree_with_claude(2, "# Real Heading\nbody\n");
+            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
+            assert_eq!(ns, Namespace::Project("Real Heading".to_string()));
+            drop(tmp);
+        }
+
+        #[test]
+        fn nearest_claude_md_wins_over_higher_one() {
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+            let mid = root.join("mid");
+            let leaf = mid.join("leaf");
+            fs::create_dir_all(&leaf).unwrap();
+            fs::write(root.join("CLAUDE.md"), "---\nproject: outer\n---\n").unwrap();
+            fs::write(mid.join("CLAUDE.md"), "---\nproject: inner\n---\n").unwrap();
+            let ns = detect_namespace_with(&leaf, find_nearest_claude_md, no_git);
+            assert_eq!(ns, Namespace::Project("inner".to_string()));
+            drop(tmp);
+        }
+
+        #[test]
+        fn malformed_claude_md_degrades_to_cwd_dirname() {
+            // CLAUDE.md present but no project + no h1 -> cwd dir name (no git).
+            let tmp = TempDir::new().unwrap();
+            let root = tmp.path().to_path_buf();
+            let start = root.join("my-project-dir");
+            fs::create_dir_all(&start).unwrap();
+            fs::write(root.join("CLAUDE.md"), "---\nbroken\n").unwrap();
+            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
+            assert_eq!(ns, Namespace::Project("my-project-dir".to_string()));
+            drop(tmp);
+        }
+
+        #[test]
+        fn no_claude_md_anywhere_uses_cwd_dirname() {
+            let tmp = TempDir::new().unwrap();
+            let start = tmp.path().join("standalone");
+            fs::create_dir_all(&start).unwrap();
+            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
+            assert_eq!(ns, Namespace::Project("standalone".to_string()));
+            drop(tmp);
+        }
+    }
 }
