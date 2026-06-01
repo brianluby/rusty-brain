@@ -1,8 +1,10 @@
 //! Unix-domain-socket server for the daemon.
 
-use std::fs;
+use std::fs::{self, File, OpenOptions};
 use std::future::Future;
-use std::os::unix::fs::PermissionsExt;
+use std::io::{Seek, SeekFrom, Write};
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use rb_embed::EmbeddingProvider;
@@ -34,6 +36,7 @@ pub struct Daemon {
     embedder: SharedEmbedder,
     socket_path: PathBuf,
     pidfile_path: PathBuf,
+    bind_guard: BindGuard,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -55,16 +58,6 @@ impl Daemon {
                 .map_err(|e| Error::Io(format!("create db dir {}: {e}", parent.display())))?;
         }
 
-        if config.socket_path.exists() {
-            if probe_live(&config.socket_path).await {
-                return Err(Error::Io(format!(
-                    "another rusty-brain daemon is already listening at {}",
-                    config.socket_path.display()
-                )));
-            }
-            let _ = fs::remove_file(&config.socket_path);
-        }
-
         let socket_dir = config
             .socket_path
             .parent()
@@ -75,15 +68,31 @@ impl Daemon {
         fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700))
             .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))?;
 
+        let pidfile_path = config.socket_path.with_extension("pid");
+        let mut bind_guard = BindGuard::acquire(config.socket_path.clone(), pidfile_path.clone())?;
+
+        if config.socket_path.exists() {
+            if probe_live(&config.socket_path).await {
+                return Err(Error::Io(format!(
+                    "another rusty-brain daemon is already listening at {}",
+                    config.socket_path.display()
+                )));
+            }
+            fs::remove_file(&config.socket_path).map_err(|e| {
+                Error::Io(format!(
+                    "remove stale socket {}: {e}",
+                    config.socket_path.display()
+                ))
+            })?;
+        }
+
         let listener = UnixListener::bind(&config.socket_path)
             .map_err(|e| Error::Io(format!("bind {}: {e}", config.socket_path.display())))?;
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
             .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", config.socket_path.display())))?;
+        bind_guard.mark_socket_bound();
 
         let store = StoreHandle::start(config.db_path.clone(), dim, config.read_pool_size)?;
-        let pidfile_path = config.socket_path.with_extension("pid");
-        fs::write(&pidfile_path, std::process::id().to_string())
-            .map_err(|e| Error::Io(format!("write pidfile: {e}")))?;
 
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
@@ -92,6 +101,7 @@ impl Daemon {
             embedder,
             socket_path: config.socket_path,
             pidfile_path,
+            bind_guard,
         })
     }
 
@@ -101,8 +111,9 @@ impl Daemon {
             listener,
             store,
             embedder,
-            socket_path,
-            pidfile_path,
+            socket_path: _socket_path,
+            pidfile_path: _pidfile_path,
+            mut bind_guard,
         } = self;
         tokio::pin!(shutdown);
         let mut conns: JoinSet<()> = JoinSet::new();
@@ -138,11 +149,102 @@ impl Daemon {
         conns.shutdown().await;
         store.shutdown().await;
 
-        let _ = fs::remove_file(&socket_path);
-        let _ = fs::remove_file(&pidfile_path);
+        bind_guard.cleanup();
         info!("daemon shut down cleanly");
         Ok(())
     }
+}
+
+struct BindGuard {
+    socket_path: PathBuf,
+    pidfile_path: PathBuf,
+    _pidfile: File,
+    owns_socket: bool,
+    active: bool,
+}
+
+impl BindGuard {
+    fn acquire(socket_path: PathBuf, pidfile_path: PathBuf) -> Result<Self> {
+        let pidfile = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&pidfile_path)
+            .map_err(|e| Error::Io(format!("open pidfile {}: {e}", pidfile_path.display())))?;
+        fs::set_permissions(&pidfile_path, fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", pidfile_path.display())))?;
+        lock_pidfile(&pidfile, &socket_path, &pidfile_path)?;
+        write_pidfile(&pidfile, &pidfile_path)?;
+
+        Ok(Self {
+            socket_path,
+            pidfile_path,
+            _pidfile: pidfile,
+            owns_socket: false,
+            active: true,
+        })
+    }
+
+    fn mark_socket_bound(&mut self) {
+        self.owns_socket = true;
+    }
+
+    fn cleanup(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self.owns_socket {
+            let _ = fs::remove_file(&self.socket_path);
+        }
+        let _ = fs::remove_file(&self.pidfile_path);
+        self.active = false;
+    }
+}
+
+impl Drop for BindGuard {
+    fn drop(&mut self) {
+        self.cleanup();
+    }
+}
+
+fn write_pidfile(mut pidfile: &File, pidfile_path: &Path) -> Result<()> {
+    pidfile
+        .set_len(0)
+        .map_err(|e| Error::Io(format!("truncate pidfile {}: {e}", pidfile_path.display())))?;
+    pidfile
+        .seek(SeekFrom::Start(0))
+        .map_err(|e| Error::Io(format!("seek pidfile {}: {e}", pidfile_path.display())))?;
+    write!(pidfile, "{}", std::process::id())
+        .map_err(|e| Error::Io(format!("write pidfile {}: {e}", pidfile_path.display())))?;
+    pidfile
+        .flush()
+        .map_err(|e| Error::Io(format!("flush pidfile {}: {e}", pidfile_path.display())))
+}
+
+#[allow(unsafe_code)]
+fn lock_pidfile(pidfile: &File, socket_path: &Path, pidfile_path: &Path) -> Result<()> {
+    // SAFETY: flock only reads the borrowed file descriptor for the duration of
+    // the call. The File outlives the lock and is held by BindGuard.
+    let rc = unsafe { libc::flock(pidfile.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(Error::Io(format!(
+            "another rusty-brain daemon is already listening at {} (pidfile {} is locked)",
+            socket_path.display(),
+            pidfile_path.display()
+        )));
+    }
+
+    Err(Error::Io(format!(
+        "lock pidfile {}: {err}",
+        pidfile_path.display()
+    )))
 }
 
 async fn probe_live(path: &Path) -> bool {

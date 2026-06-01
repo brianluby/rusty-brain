@@ -277,3 +277,31 @@ async fn second_bind_on_live_socket_fails_closed() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn second_bind_before_accept_loop_fails_closed() {
+    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let socket = dir.path().join("sock");
+    let cfg = DaemonConfig {
+        socket_path: socket.clone(),
+        db_path: dir.path().join("memory.db"),
+        read_pool_size: 2,
+    };
+    let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
+    let daemon = Daemon::bind(cfg, embedder).await.unwrap();
+
+    let dir2 = tempfile::tempdir_in("/private/tmp").unwrap();
+    let cfg2 = DaemonConfig {
+        socket_path: socket,
+        db_path: dir2.path().join("memory.db"),
+        read_pool_size: 2,
+    };
+    let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
+    let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
+    assert!(
+        err.to_string().contains("already listening"),
+        "second bind before run must fail closed: {err}"
+    );
+
+    drop(daemon);
+}
