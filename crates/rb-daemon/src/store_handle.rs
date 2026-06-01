@@ -67,6 +67,21 @@ impl ReadPool {
     }
 }
 
+/// RAII guard that holds a popped `SqliteStore` and pushes it back to the pool
+/// in `Drop`, ensuring the connection is returned even if the closure panics.
+struct PoolGuard {
+    store: Option<SqliteStore>,
+    pool: Arc<Mutex<Vec<SqliteStore>>>,
+}
+
+impl Drop for PoolGuard {
+    fn drop(&mut self) {
+        if let Some(store) = self.store.take() {
+            self.pool.blocking_lock().push(store);
+        }
+    }
+}
+
 impl StoreHandle {
     /// Start the writer thread and open the read pool.
     pub fn start(db_path: PathBuf, embedding_dim: usize, read_pool_size: usize) -> Result<Self> {
@@ -179,17 +194,55 @@ impl StoreHandle {
             .map_err(|_| Error::Storage("read pool closed".to_string()))?;
 
         tokio::task::spawn_blocking(move || {
+            // The semaphore permit is held for the lifetime of this closure.
+            // If the task is cancelled the permit is dropped; that is fine
+            // because spawn_blocking tasks run to completion.
             let _permit = permit;
+
             let store = stores
                 .blocking_lock()
                 .pop()
                 .ok_or_else(|| Error::Storage("read pool exhausted despite permit".to_string()))?;
-            let result = f(&store);
-            stores.blocking_lock().push(store);
+
+            // RAII guard: returns `store` to the pool in Drop, even on panic.
+            let guard = PoolGuard {
+                store: Some(store),
+                pool: Arc::clone(&stores),
+            };
+
+            // Safety: guard.store is Some; we set it back to None in Drop.
+            let result = f(guard.store.as_ref().ok_or_else(|| {
+                Error::Storage("pool guard store unexpectedly missing".to_string())
+            })?);
+            // Explicit drop to be clear about ordering (not strictly necessary).
+            drop(guard);
             result
         })
         .await
         .map_err(|e| Error::Storage(format!("read task panicked or cancelled: {e}")))?
+    }
+
+    /// Test-only helper: checks that the RAII guard returns the connection even
+    /// when the read closure panics. Returns `Ok(())` if the panic is correctly
+    /// mapped to `Error::Storage`, so the test can `.unwrap()` it.
+    ///
+    /// This method is `pub` only to be reachable from `tests/`. Do NOT call
+    /// it in production code.
+    #[doc(hidden)]
+    pub async fn with_read_panicking_for_test(&self) -> Result<()> {
+        #[allow(clippy::panic)]
+        let result = self
+            .with_read(|_store| -> Result<()> {
+                panic!("deliberate test panic inside read closure");
+            })
+            .await;
+        // The JoinError from the panic is mapped to Error::Storage by with_read.
+        match result {
+            Err(Error::Storage(_)) => Ok(()),
+            other => Err(Error::Storage(format!(
+                "expected Storage error from panic, got {other:?}"
+            ))),
+        }
     }
 }
 

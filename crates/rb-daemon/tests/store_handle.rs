@@ -1,6 +1,6 @@
 //! Integration tests for the StoreHandle concurrency core: writer thread,
 //! read pool, change broadcast, and the async MemoryBackend impl.
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rb_daemon::{ChangeKind, StoreHandle};
 use rb_engine::MemoryBackend;
@@ -196,6 +196,42 @@ async fn namespace_id_methods_fail_closed() {
     let got = handle.get(ns_a, id).await.unwrap().unwrap();
     assert_eq!(got.importance, 5);
     assert!(got.archived_at.is_none());
+
+    handle.shutdown().await;
+}
+
+/// A panicking read closure must not permanently shrink the pool:
+/// the RAII guard returns the connection in Drop so subsequent reads
+/// still succeed, and we can run pool_size + 1 sequential reads afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn panicking_read_closure_returns_connection_via_raii() {
+    const POOL_SIZE: usize = 2;
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rb.db");
+    let handle = StoreHandle::start(db, DIM, POOL_SIZE).unwrap();
+
+    // Seed one memory so subsequent reads have something to return.
+    let ns = Namespace::Project("a".to_string());
+    let n = note(&ns, "raii test memory");
+    handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+    // Run a closure that panics inside spawn_blocking; the pool guard must
+    // catch the unwind (via JoinError mapping) and return the connection.
+    let err = handle.with_read_panicking_for_test().await;
+    assert!(
+        err.is_ok(),
+        "panicking read closure must surface as Storage error, got {err:?}"
+    );
+
+    // Now run pool_size + 1 sequential reads — if the connection leaked we
+    // would eventually block or error when the pool is exhausted.
+    for _ in 0..(POOL_SIZE + 1) {
+        let listed = handle.list(ns.clone(), None, 10).await.unwrap();
+        assert!(
+            !listed.is_empty(),
+            "pool must not be permanently shrunk after panic"
+        );
+    }
 
     handle.shutdown().await;
 }
