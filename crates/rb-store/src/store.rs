@@ -34,6 +34,10 @@ pub trait Store {
     /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
     /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
+    /// Fetch all of `ids` that exist AND belong to `ns`, returned in the SAME
+    /// order as `ids` (missing/out-of-namespace ids skipped). One query; fixes
+    /// the recall N+1. Links are loaded per returned note.
+    fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>>;
 }
 
 /// SQLite-backed store. Owns a single connection (write path); the daemon owns
@@ -819,6 +823,55 @@ impl Store for SqliteStore {
                 Err(e)
             }
         }
+    }
+
+    fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build "?2, ?3, ..." placeholders; ?1 is reserved for the namespace.
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                    keywords, tags, context, memory_type, importance, confidence,
+                    related_files, access_count, last_accessed_at, archived_at,
+                    superseded_by, embedding_model
+             FROM memories
+             WHERE namespace = ?1 AND memory_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        params.push(Box::new(ns.as_db_string()));
+        for id in ids {
+            params.push(Box::new(id.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query(refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Decode into an id-keyed map, then re-emit in request order.
+        let mut by_id: std::collections::HashMap<MemoryId, MemoryNote> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let note = row_to_note(&self.conn, row)?;
+            by_id.insert(note.id.clone(), note);
+        }
+
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(note) = by_id.remove(id) {
+                out.push(note);
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -1784,5 +1837,81 @@ mod access_tests {
         let got = store.get_memory(&old.id).unwrap().unwrap();
         assert!(got.superseded_by.is_none(), "rolled back: no superseded_by");
         assert!(got.archived_at.is_none(), "rolled back: not archived");
+    }
+}
+
+#[cfg(test)]
+mod get_many_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, ns: &Namespace, c: &str) -> MemoryId {
+        let m = MemoryNote::new(ns.clone(), c.into(), MemoryType::Insight, 5);
+        store.insert_memory(&m, None).unwrap();
+        m.id
+    }
+
+    #[test]
+    fn get_many_returns_notes_in_request_order() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "alpha");
+        let b = node(&store, &ns, "bravo");
+        let c = node(&store, &ns, "charlie");
+
+        // Request in a non-storage order; result must follow request order.
+        let got = store
+            .get_many(&ns, &[c.clone(), a.clone(), b.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![c, a, b]);
+    }
+
+    #[test]
+    fn get_many_skips_missing_and_out_of_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let other = Namespace::Project("other".into());
+        let in_ns = node(&store, &proj, "in scope");
+        let foreign = node(&store, &other, "foreign");
+        let missing = MemoryId::new();
+
+        let got = store
+            .get_many(&proj, &[missing, foreign.clone(), in_ns.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        // Only the in-namespace, existing id is returned.
+        assert_eq!(ids, vec![in_ns]);
+    }
+
+    #[test]
+    fn get_many_empty_input_returns_empty() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        assert!(store.get_many(&ns, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_many_loads_links_for_each_note() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "src");
+        let b = node(&store, &ns, "dst");
+        store
+            .add_link(&rb_types::MemoryLink {
+                source_id: a.clone(),
+                target_id: b.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "rel".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let got = store.get_many(&ns, std::slice::from_ref(&a)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].links.len(), 1);
+        assert_eq!(got[0].links[0].target_id, b);
     }
 }
