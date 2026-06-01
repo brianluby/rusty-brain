@@ -304,12 +304,14 @@ mod tests {
         );
     }
 
-    #[tokio::test(flavor = "multi_thread")]
-    async fn from_env_absent_key_returns_none() {
-        // NOTE: this mutates the process-global ANTHROPIC_API_KEY. It is safe in
-        // this crate only because no other (non-ignored) test reads that env var
-        // concurrently; restore the prior value to avoid leaking into ignored
-        // tests. (edition 2021: set_var/remove_var are not unsafe.)
+    #[test]
+    fn from_env_absent_key_returns_none() {
+        // NOTE: this mutates the process-global ANTHROPIC_API_KEY, so it runs as a
+        // plain single-threaded `#[test]` (no async/worker threads) to avoid a
+        // data race on global env. It is safe in this crate only because no other
+        // (non-ignored) test reads that env var concurrently; restore the prior
+        // value to avoid leaking into ignored tests. (edition 2021: set_var/
+        // remove_var are not unsafe.)
         let prev = std::env::var("ANTHROPIC_API_KEY").ok();
         std::env::remove_var("ANTHROPIC_API_KEY");
         let got = AnthropicEnricher::from_env();

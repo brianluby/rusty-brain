@@ -4,6 +4,12 @@ use rb_types::{LinkType, MemoryLink, MemoryNote};
 /// (note, vector_distance) pairs. No IO: the selection logic (which candidates
 /// are linked, and their strengths) is deterministic given the same inputs; only
 /// each link's `created_at` timestamp reflects wall-clock time.
+///
+/// WARNING: `link` is SYNCHRONOUS and may be called from within an async
+/// context. Implementations that perform blocking I/O (e.g. an LLM linker built
+/// on `reqwest::blocking`) MUST be invoked via `tokio::task::spawn_blocking`
+/// (or `tokio::task::block_in_place`); calling blocking I/O directly on an async
+/// reactor worker thread can stall the runtime or panic.
 pub trait Linker: Send + Sync {
     /// Produce links FROM `new` TO selected candidates. `candidates` are
     /// `(note, vector_distance)` where smaller distance = more similar.

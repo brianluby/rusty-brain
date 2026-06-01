@@ -180,7 +180,7 @@ mod tests {
     use super::*;
     use rb_engine::Linker;
     use rb_types::{LinkType, MemoryNote, MemoryType, Namespace};
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn note(content: &str) -> MemoryNote {
@@ -216,6 +216,8 @@ mod tests {
 
         Mock::given(method("POST"))
             .and(path("/v1/messages"))
+            .and(header("x-api-key", "link-test-key"))
+            .and(header("anthropic-version", "2023-06-01"))
             .respond_with(ResponseTemplate::new(200).set_body_json(message_response(&model_json)))
             .mount(&server)
             .await;
@@ -223,7 +225,7 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let candidates = vec![(cand, 0.4_f32)];
         let links = tokio::task::spawn_blocking(move || {
-            let linker = AnthropicLinker::for_test("claude-haiku-4-5", "k", &base);
+            let linker = AnthropicLinker::for_test("claude-haiku-4-5", "link-test-key", &base);
             linker.link(&new, &candidates)
         })
         .await
@@ -291,5 +293,39 @@ mod tests {
         let new = note("a");
         let links = linker.link(&new, &[]);
         assert!(links.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn api_key_never_leaks_into_error_messages() {
+        // Drive the error path (a 401) and assert the failure string never
+        // contains the secret key. `link` swallows errors into an empty Vec, so
+        // we exercise the inner `try_link` to inspect the Error::Enrichment
+        // message directly (this is also what the `warn!` log would render).
+        const SENTINEL_KEY: &str = "super-secret-linker-key-value";
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/messages"))
+            .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let new = note("a");
+        let candidates = vec![(note("b"), 0.5_f32)];
+        let msg = tokio::task::spawn_blocking(move || {
+            let linker = AnthropicLinker::for_test("claude-haiku-4-5", SENTINEL_KEY, &base);
+            // `link` returns an empty Vec on failure; inspect the inner error.
+            let err = linker
+                .try_link(&new, &candidates)
+                .expect_err("401 must produce an enrichment error");
+            err.to_string()
+        })
+        .await
+        .unwrap();
+
+        assert!(
+            !msg.contains(SENTINEL_KEY),
+            "error message leaked the api key: {msg}"
+        );
     }
 }

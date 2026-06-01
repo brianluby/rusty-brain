@@ -11,9 +11,11 @@ pub struct Enrichment {
     pub keywords: Vec<String>,
     /// Derived tags (used only if the caller supplied none).
     pub tags: Vec<String>,
-    /// Inferred memory type (advisory; used only if the caller did not set one).
+    /// Inferred memory type (advisory; NOT applied by the engine in v1 —
+    /// reserved for a future caller-opt-in change).
     pub memory_type: Option<MemoryType>,
-    /// Inferred importance 1..=10 (advisory; used only if the caller did not set one).
+    /// Inferred importance 1..=10 (advisory; NOT applied by the engine in v1 —
+    /// reserved for a future caller-opt-in change).
     pub importance: Option<u8>,
 }
 
