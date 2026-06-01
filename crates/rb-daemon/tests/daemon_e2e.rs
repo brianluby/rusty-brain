@@ -328,6 +328,53 @@ async fn second_bind_before_accept_loop_fails_closed() {
     drop(daemon);
 }
 
+/// A Recall or List request with a very large limit must return at most
+/// MAX_LIMIT rows and must not error. The server clamps the value before
+/// passing it to the engine, so a caller cannot over-read the store.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_limit_is_clamped_and_does_not_error() {
+    let daemon = RunningDaemon::start(4).await;
+    let ns = Namespace::Project("clamp-test".to_string());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+
+    // Store a small number of memories (well below MAX_LIMIT).
+    for i in 0..5 {
+        client
+            .remember(
+                format!("memory {i}"),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    // A limit far exceeding MAX_LIMIT (1000) must succeed and return only
+    // what is in the store (<=5), never causing a negative LIMIT or panic.
+    let listed = client.list(None, usize::MAX).await.unwrap();
+    assert!(
+        listed.len() <= 5,
+        "list with usize::MAX limit must return at most the stored count, got {}",
+        listed.len()
+    );
+
+    let recalled = client
+        .recall("memory".to_string(), None, vec![], usize::MAX)
+        .await
+        .unwrap();
+    assert!(
+        recalled.len() <= 5,
+        "recall with usize::MAX limit must return at most the stored count, got {}",
+        recalled.len()
+    );
+
+    daemon.stop().await;
+}
+
 /// A client handshaked under Project("b") must not see or mutate Project("a")
 /// data over the wire, even by direct id. This is the wire-level namespace
 /// isolation guarantee: get returns None, update/delete return NotFound-class

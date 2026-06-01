@@ -21,6 +21,11 @@ use tracing::{info, warn};
 use crate::error_map::error_to_response;
 use crate::{SharedEmbedder, StoreHandle};
 
+/// Maximum number of results returned per Recall or List request.
+const MAX_LIMIT: usize = 1000;
+/// Maximum graph traversal depth per Graph request.
+const MAX_DEPTH: u8 = 8;
+
 /// Static configuration for a daemon instance.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
@@ -392,7 +397,10 @@ where
             memory_type,
             tags,
             limit,
-        } => match engine.recall(&query, limit, memory_type, &tags).await {
+        } => match engine
+            .recall(&query, limit.min(MAX_LIMIT), memory_type, &tags)
+            .await
+        {
             Ok(results) => Response::Recalled { results },
             Err(e) => error_to_response(e),
         },
@@ -403,11 +411,11 @@ where
         Request::List {
             min_importance,
             limit,
-        } => match engine.list(min_importance, limit).await {
+        } => match engine.list(min_importance, limit.min(MAX_LIMIT)).await {
             Ok(memories) => Response::Listed { memories },
             Err(e) => error_to_response(e),
         },
-        Request::Graph { id, depth } => match engine.graph(id, depth).await {
+        Request::Graph { id, depth } => match engine.graph(id, depth.min(MAX_DEPTH)).await {
             Ok(memories) => Response::GraphResult { memories },
             Err(e) => error_to_response(e),
         },
