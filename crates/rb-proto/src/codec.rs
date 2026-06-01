@@ -49,8 +49,7 @@ mod tests {
         let (writer_raw, reader_raw) = duplex(4 * 1024 * 1024);
         let mut writer: Framed<_, LengthDelimitedCodec> =
             Framed::new(writer_raw, LengthDelimitedCodec::new());
-        let mut reader: Framed<_, LengthDelimitedCodec> =
-            Framed::new(reader_raw, bounded_codec());
+        let mut reader: Framed<_, LengthDelimitedCodec> = Framed::new(reader_raw, bounded_codec());
 
         // Build a payload just over the limit so the length-prefix exceeds
         // MAX_FRAME_BYTES. The content doesn't matter — the codec rejects
@@ -60,9 +59,7 @@ mod tests {
         writer.send(oversized_payload).await.unwrap();
 
         // The bounded reader must reject this frame.
-        let err = read_frame::<_, Request>(&mut reader)
-            .await
-            .unwrap_err();
+        let err = read_frame::<_, Request>(&mut reader).await.unwrap_err();
         assert!(
             matches!(err, rb_types::Error::Io(_)),
             "oversized frame must be Error::Io, got {err:?}"

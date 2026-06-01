@@ -14,12 +14,12 @@ use rb_proto::{
     CONTRACT_VERSION,
 };
 use rb_types::{Error, Result};
+use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
 use tracing::{info, warn};
-use std::sync::Arc;
 
 use crate::error_map::error_to_response;
 use crate::{SharedEmbedder, StoreHandle};

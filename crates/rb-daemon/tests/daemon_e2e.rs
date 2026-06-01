@@ -104,12 +104,7 @@ async fn full_round_trip_through_client() {
     assert_eq!(note.namespace, ns, "stored under the handshake namespace");
 
     let results = client
-        .recall(
-            "rusty-brain db transaction".to_string(),
-            None,
-            vec![],
-            10,
-        )
+        .recall("rusty-brain db transaction".to_string(), None, vec![], 10)
         .await
         .unwrap();
     assert!(

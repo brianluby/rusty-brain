@@ -303,7 +303,8 @@ fn writer_loop(
             } => {
                 let namespace = note.namespace.clone();
                 let id = note.id.clone();
-                let result = catch_store_op(&store, |s| s.insert_memory(&note, embedding.as_deref()));
+                let result =
+                    catch_store_op(&store, |s| s.insert_memory(&note, embedding.as_deref()));
                 let changed = result.is_ok();
                 let _ = reply.send(result);
                 if changed {
@@ -320,14 +321,10 @@ fn writer_loop(
                 updates,
                 reply,
             } => {
-                let result = catch_store_op(&store, |s| {
-                    match s.get_memory(&id) {
-                        Ok(Some(note)) if note.namespace == namespace => {
-                            s.update_memory(&id, &updates)
-                        }
-                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                        Err(e) => Err(e),
-                    }
+                let result = catch_store_op(&store, |s| match s.get_memory(&id) {
+                    Ok(Some(note)) if note.namespace == namespace => s.update_memory(&id, &updates),
+                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                    Err(e) => Err(e),
                 });
                 let changed = result.is_ok();
                 let _ = reply.send(result);
@@ -344,12 +341,10 @@ fn writer_loop(
                 id,
                 reply,
             } => {
-                let result = catch_store_op(&store, |s| {
-                    match s.get_memory(&id) {
-                        Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
-                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                        Err(e) => Err(e),
-                    }
+                let result = catch_store_op(&store, |s| match s.get_memory(&id) {
+                    Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
+                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                    Err(e) => Err(e),
                 });
                 let changed = result.is_ok();
                 let _ = reply.send(result);
