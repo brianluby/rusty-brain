@@ -46,7 +46,11 @@ struct EmbeddingData {
     /// Position of this embedding in the original input array.
     /// Voyage may return embeddings out of input order; we use this field to
     /// re-pair each embedding to its source text.
-    /// If absent (older API responses), the item's position in `data` is used.
+    ///
+    /// For a multi-item batch, a missing `index` is a fail-closed error: we
+    /// cannot safely assume array order, so we refuse rather than risk a silent
+    /// text/embedding mis-pairing. A single-item response may omit it (the only
+    /// possible position is 0, so the pairing is unambiguous).
     #[serde(default)]
     index: Option<usize>,
     embedding: Vec<f32>,
@@ -168,12 +172,23 @@ impl VoyageProvider {
 
         // Re-order embeddings by their declared `index` field so that a Voyage
         // response returned out of input order is correctly re-paired.
-        // If `index` is absent (older API responses), fall back to the item's
-        // position in the `data` array (i.e. treat as in-order).
+        //
+        // Fail closed on a multi-item batch missing `index`: without it we
+        // cannot prove the array order matches the input order, so we refuse
+        // rather than risk a silent mis-pairing. A single-item response may
+        // omit `index` (position 0 is the only option, so it is unambiguous).
         let n = texts.len();
         let mut slots: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
         for (pos, item) in parsed.data.into_iter().enumerate() {
-            let slot_idx = item.index.unwrap_or(pos);
+            let slot_idx = match item.index {
+                Some(idx) => idx,
+                None if n == 1 => pos,
+                None => {
+                    return Err(Error::Embedding(
+                        "voyage response missing index for multi-item batch".to_string(),
+                    ));
+                }
+            };
             if slot_idx >= n {
                 return Err(Error::Embedding(format!(
                     "voyage returned embedding with index {} but input length is {}",
@@ -258,10 +273,12 @@ mod tests {
         let server = MockServer::start().await;
         // The mock asserts the request shape: POST /v1/embeddings, JSON body with
         // the model, the inputs in order, and input_type "document", with bearer auth.
+        // Voyage always returns an `index` per item; we include it here to match
+        // real API behavior (a multi-item batch without index now fails closed).
         let response = serde_json::json!({
             "data": [
-                { "embedding": [0.1, 0.2, 0.3, 0.4] },
-                { "embedding": [0.5, 0.6, 0.7, 0.8] }
+                { "index": 0, "embedding": [0.1, 0.2, 0.3, 0.4] },
+                { "index": 1, "embedding": [0.5, 0.6, 0.7, 0.8] }
             ]
         });
         Mock::given(method("POST"))
@@ -380,8 +397,9 @@ mod tests {
             .respond_with(|req: &wiremock::Request| {
                 let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
                 let n = body["input"].as_array().unwrap().len();
+                // Include a per-item `index` as the real Voyage API does.
                 let data: Vec<serde_json::Value> = (0..n)
-                    .map(|_| serde_json::json!({ "embedding": [1.0, 0.0, 0.0, 0.0] }))
+                    .map(|i| serde_json::json!({ "index": i, "embedding": [1.0, 0.0, 0.0, 0.0] }))
                     .collect();
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({ "data": data }))
             })
@@ -503,6 +521,62 @@ mod tests {
             matches!(err, rb_types::Error::Embedding(_)),
             "out-of-range index must be Error::Embedding, got {err:?}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn multi_item_response_missing_index_fails_closed() {
+        let server = MockServer::start().await;
+        // A 2-item response with NO `index` fields. We cannot prove the array
+        // order matches the input order, so this must fail closed rather than
+        // silently fall back to array order (the mis-pairing risk).
+        let response = serde_json::json!({
+            "data": [
+                { "embedding": [0.1, 0.2, 0.3, 0.4] },
+                { "embedding": [0.5, 0.6, 0.7, 0.8] }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let err = p
+            .embed(&["first".to_string(), "second".to_string()])
+            .await
+            .unwrap_err();
+        match err {
+            rb_types::Error::Embedding(msg) => {
+                assert!(
+                    msg.contains("missing index for multi-item batch"),
+                    "expected the multi-item missing-index error, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Embedding, got {other:?}"),
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn single_item_response_without_index_is_accepted() {
+        let server = MockServer::start().await;
+        // A single-item response may omit `index`: position 0 is the only
+        // possible slot, so the pairing is unambiguous and allowed.
+        let response = serde_json::json!({
+            "data": [ { "embedding": [0.1, 0.2, 0.3, 0.4] } ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let out = p.embed(&["only".to_string()]).await.unwrap();
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0], vec![0.1, 0.2, 0.3, 0.4]);
     }
 
     // Real-API smoke test. Ignored by default; run with:
