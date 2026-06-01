@@ -110,6 +110,35 @@ impl MemoryBackend for VecBackend {
         note.archived_at = Some(chrono::Utc::now());
         Ok(())
     }
+
+    async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()> {
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&link.source_id)
+            .ok_or_else(|| rb_types::Error::NotFound(link.source_id.clone()))?;
+        note.links.push(link);
+        Ok(())
+    }
+
+    async fn record_access(&self, id: MemoryId) -> rb_types::Result<()> {
+        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+            note.access_count += 1;
+            note.last_accessed_at = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn get_many(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let guard = self.notes.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
+            .collect())
+    }
 }
 
 #[tokio::test]
