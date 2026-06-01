@@ -28,7 +28,7 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .context("daemon failed")?;
             Ok(())
         }
-        other => run_client(other, cli.json, &socket_path).await,
+        other => run_client(other, cli.json, &socket_path, &db_path).await,
     }
 }
 
@@ -37,10 +37,11 @@ async fn run_client(
     command: Command,
     json: bool,
     socket_path: &std::path::Path,
+    db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let namespace = detect_namespace();
     let self_exe = std::env::current_exe().context("locating own executable")?;
-    let mut client = client::connect_or_start(socket_path, namespace.clone(), self_exe)
+    let mut client = client::connect_or_start(socket_path, db_path, namespace.clone(), self_exe)
         .await
         .context("connecting to daemon")?;
 
@@ -102,7 +103,7 @@ async fn run_client(
         Command::Delete { id } => {
             let id = parse_id(&id).context("invalid memory id")?;
             client.delete(id).await.context("delete failed")?;
-            println!("Deleted");
+            println!("{}", output::render_deleted(json));
         }
         Command::Context => {
             let (recent, important, total) = client.context().await.context("context failed")?;

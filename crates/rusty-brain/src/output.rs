@@ -84,6 +84,15 @@ pub fn render_remembered(id: &rb_types::MemoryId, json: bool) -> String {
     }
 }
 
+/// Render a successful delete acknowledgement.
+pub fn render_deleted(json: bool) -> String {
+    if json {
+        "{\"deleted\":true}".to_string()
+    } else {
+        "Deleted".to_string()
+    }
+}
+
 /// Render the `context` payload.
 pub fn render_context(
     recent: &[MemoryNote],
@@ -186,5 +195,13 @@ mod tests {
         assert!(none.to_lowercase().contains("not found"));
         let json_none = render_get(&None, true);
         assert_eq!(json_none.trim(), "null");
+    }
+
+    #[test]
+    fn delete_json_is_parseable() {
+        let out = render_deleted(true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["deleted"].as_bool(), Some(true));
+        assert_eq!(render_deleted(false), "Deleted");
     }
 }

@@ -11,6 +11,10 @@ description = "rusty-brain: shared agent memory daemon and CLI."
 name = "rusty-brain"
 path = "src/main.rs"
 
+[lib]
+name = "rusty_brain"
+path = "src/lib.rs"
+
 [dependencies]
 rb-types = { path = "../rb-types" }
 rb-proto = { path = "../rb-proto" }

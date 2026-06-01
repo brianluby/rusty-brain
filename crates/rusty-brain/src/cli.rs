@@ -1,6 +1,6 @@
 //! Command-line surface for the `rusty-brain` binary (clap derive).
 
-use clap::{Parser, Subcommand};
+use clap::{value_parser, Parser, Subcommand};
 use rb_types::MemoryType;
 
 /// Parse a `--type` value into a `MemoryType` using the canonical db strings.
@@ -36,7 +36,7 @@ pub enum Command {
         #[arg(long = "type", default_value = "insight", value_parser = parse_memory_type)]
         memory_type: MemoryType,
         /// Importance 1-10.
-        #[arg(long, default_value_t = 5)]
+        #[arg(long, default_value_t = 5, value_parser = value_parser!(u8).range(1..=10))]
         importance: u8,
         /// Optional context string.
         #[arg(long)]
@@ -73,7 +73,7 @@ pub enum Command {
         #[arg(long, default_value_t = 20)]
         limit: usize,
         /// Only memories with at least this importance.
-        #[arg(long)]
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
         min_importance: Option<u8>,
     },
 

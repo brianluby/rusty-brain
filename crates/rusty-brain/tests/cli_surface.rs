@@ -59,6 +59,15 @@ fn remember_rejects_invalid_memory_type() {
 }
 
 #[test]
+fn remember_rejects_out_of_range_importance() {
+    bin()
+        .args(["remember", "some content", "--importance", "0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("1..=10").or(predicate::str::contains("range")));
+}
+
+#[test]
 fn recall_help_shows_flags() {
     bin()
         .args(["recall", "--help"])
