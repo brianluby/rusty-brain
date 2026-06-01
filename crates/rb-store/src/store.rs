@@ -28,6 +28,12 @@ pub trait Store {
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()>;
     fn archive_memory(&self, id: &MemoryId) -> Result<()>;
     fn add_link(&self, link: &MemoryLink) -> Result<()>;
+    /// Bump `access_count` and stamp `last_accessed_at = now` for `id`.
+    /// A missing id is a no-op (best-effort access tracking never errors on absence).
+    fn record_access(&self, id: &MemoryId) -> Result<()>;
+    /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
+    /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
 }
 
 /// SQLite-backed store. Owns a single connection (write path); the daemon owns
@@ -763,6 +769,56 @@ impl Store for SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    fn record_access(&self, id: &MemoryId) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memories
+                 SET access_count = access_count + 1, last_accessed_at = ?1
+                 WHERE memory_id = ?2",
+                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let result = (|| -> Result<()> {
+            // Point old -> new. FK on superseded_by makes a missing `new` fail here,
+            // rolling back the whole transaction (old stays unarchived).
+            self.conn
+                .execute(
+                    "UPDATE memories SET superseded_by = ?1, updated_at = ?2 WHERE memory_id = ?3",
+                    rusqlite::params![new.to_string(), now, old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Archive old (idempotent: only if currently active).
+            self.conn
+                .execute(
+                    "UPDATE memories SET archived_at = ?1, updated_at = ?1
+                     WHERE memory_id = ?2 AND archived_at IS NULL",
+                    rusqlite::params![now, old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -1630,5 +1686,103 @@ mod add_link_tests {
         // foreign_keys=ON => FK violation surfaces as a storage error.
         let err = store.add_link(&link).unwrap_err();
         assert!(matches!(err, Error::Storage(_)));
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            c.into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        m
+    }
+
+    #[test]
+    fn record_access_bumps_count_and_sets_last_accessed() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "accessed");
+        // Fresh note: access_count 0, last_accessed_at None.
+        let before = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(before.access_count, 0);
+        assert!(before.last_accessed_at.is_none());
+
+        store.record_access(&a.id).unwrap();
+        let after = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(after.access_count, 1);
+        assert!(after.last_accessed_at.is_some());
+
+        // A second access increments again.
+        store.record_access(&a.id).unwrap();
+        assert_eq!(store.get_memory(&a.id).unwrap().unwrap().access_count, 2);
+    }
+
+    #[test]
+    fn record_access_missing_id_is_ok_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // No row updated; must not error (best-effort access tracking).
+        store.record_access(&MemoryId::new()).unwrap();
+    }
+
+    #[test]
+    fn supersede_sets_superseded_by_and_archives_old() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old decision");
+        let new = node(&store, "new decision");
+
+        store.supersede(&old.id, &new.id).unwrap();
+
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert_eq!(got.superseded_by.as_ref(), Some(&new.id));
+        assert!(got.archived_at.is_some(), "superseded note is archived");
+        // The new note is untouched.
+        let new_got = store.get_memory(&new.id).unwrap().unwrap();
+        assert!(new_got.superseded_by.is_none());
+        assert!(new_got.archived_at.is_none());
+    }
+
+    #[test]
+    fn supersede_excludes_old_from_keyword_and_list() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let old = node(&store, "supersede excludes me");
+        let new = node(&store, "supersede keeps me");
+        store.supersede(&old.id, &new.id).unwrap();
+
+        // old is archived -> excluded from keyword + list; new remains.
+        let kw = store.keyword_search(&proj, "supersede", 10).unwrap();
+        assert!(kw.contains(&new.id));
+        assert!(!kw.contains(&old.id));
+        let listed: Vec<MemoryId> = store
+            .list(&proj, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(listed.contains(&new.id));
+        assert!(!listed.contains(&old.id));
+    }
+
+    #[test]
+    fn supersede_missing_new_target_fails_fk() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old");
+        // superseded_by REFERENCES memories(memory_id); a missing target must fail
+        // the FK and leave the old note unchanged (transaction rolled back).
+        // foreign_keys=ON is set in SqliteStore::init, so the FK is enforced
+        // immediately on the UPDATE statement (SQLite FKs are not deferred by default).
+        let err = store.supersede(&old.id, &MemoryId::new()).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)));
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert!(got.superseded_by.is_none(), "rolled back: no superseded_by");
+        assert!(got.archived_at.is_none(), "rolled back: not archived");
     }
 }
