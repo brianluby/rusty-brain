@@ -356,12 +356,7 @@ impl Store for SqliteStore {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
         // constraints are the backstop; these give a clean early error.
-        if note.importance < 1 || note.importance > 10 {
-            return Err(Error::Storage(format!(
-                "importance {} is out of range 1..=10",
-                note.importance
-            )));
-        }
+        rb_types::validate_importance(note.importance)?;
         if !(0.0..=1.0).contains(&note.confidence) {
             return Err(Error::Storage(format!(
                 "confidence {} is out of range 0.0..=1.0",
@@ -686,11 +681,7 @@ impl Store for SqliteStore {
         // Defense-in-depth validation, consistent with insert_memory, before
         // touching the DB. (MemoryUpdates has no confidence field.)
         if let Some(imp) = updates.importance {
-            if !(1..=10).contains(&imp) {
-                return Err(Error::Storage(format!(
-                    "importance {imp} is out of range 1..=10"
-                )));
-            }
+            rb_types::validate_importance(imp)?;
         }
 
         let mut sets: Vec<String> = Vec::new();
@@ -1091,16 +1082,16 @@ mod insert_tests {
         m.importance = 0;
         let err = store.insert_memory(&m, None).unwrap_err();
         assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("importance")),
-            "expected storage error about importance, got {err:?}"
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+            "expected invalid argument error about importance, got {err:?}"
         );
 
         // importance = 11 is above the valid range
         m.importance = 11;
         let err = store.insert_memory(&m, None).unwrap_err();
         assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("importance")),
-            "expected storage error about importance, got {err:?}"
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+            "expected invalid argument error about importance, got {err:?}"
         );
     }
 
@@ -1636,8 +1627,8 @@ mod update_tests {
             };
             let err = store.update_memory(&m.id, &updates).unwrap_err();
             assert!(
-                matches!(err, Error::Storage(ref s) if s.contains("importance")),
-                "expected storage error about importance for {bad}, got {err:?}"
+                matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+                "expected invalid argument error about importance for {bad}, got {err:?}"
             );
         }
     }
