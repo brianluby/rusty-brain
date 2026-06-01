@@ -547,15 +547,15 @@ mod tests {
             .embed(&["first".to_string(), "second".to_string()])
             .await
             .unwrap_err();
-        match err {
-            rb_types::Error::Embedding(msg) => {
-                assert!(
-                    msg.contains("missing index for multi-item batch"),
-                    "expected the multi-item missing-index error, got: {msg}"
-                );
-            }
-            other => panic!("expected Error::Embedding, got {other:?}"),
-        }
+        // Assert it is an Embedding error whose message names the failure mode.
+        let is_missing_index = matches!(
+            &err,
+            rb_types::Error::Embedding(msg) if msg.contains("missing index for multi-item batch")
+        );
+        assert!(
+            is_missing_index,
+            "expected the multi-item missing-index error, got: {err:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
