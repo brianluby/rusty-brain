@@ -24,7 +24,7 @@ impl Client {
     pub async fn connect(socket_path: &Path, namespace: Namespace) -> Result<Client> {
         let stream = UnixStream::connect(socket_path)
             .await
-            .map_err(|e| Error::Io(format!("connect {}: {e}", socket_path.display())))?;
+            .map_err(|e| Error::from_io(&e))?;
         let mut framed = bounded_framed(stream);
 
         let handshake = Handshake {
@@ -285,9 +285,11 @@ mod tests {
         let (_dir, path) = socket_path();
         // Never bind a listener -> connect must fail with an IO error.
         let err = Client::connect(&path, Namespace::Global).await.unwrap_err();
+        // Connect failure now carries the io::ErrorKind via Error::IoKind so the
+        // client can classify auto-start policy without string matching.
         assert!(
-            matches!(err, rb_types::Error::Io(_)),
-            "missing socket should be Error::Io, got {err:?}"
+            err.io_kind().is_some(),
+            "missing socket should carry an io::ErrorKind, got {err:?}"
         );
     }
 }

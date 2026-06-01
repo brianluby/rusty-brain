@@ -28,6 +28,10 @@ pub(crate) fn error_to_response(err: Error) -> Response {
             warn!(error = %err, "internal io error");
             ("io", "internal error".to_string())
         }
+        Error::IoKind { .. } => {
+            warn!(error = %err, "internal io error");
+            ("io", "internal error".to_string())
+        }
         Error::Migration(_) => {
             warn!(error = %err, "internal migration error");
             ("migration", "internal error".to_string())
@@ -76,6 +80,13 @@ mod tests {
                 "dimension_mismatch",
             ),
             (Error::Io("x".into()), "io"),
+            (
+                Error::IoKind {
+                    kind: std::io::ErrorKind::NotFound,
+                    message: "x".into(),
+                },
+                "io",
+            ),
             (Error::Embedding("x".into()), "embedding"),
             (Error::Enrichment("x".into()), "enrichment"),
             (Error::InvalidArgument("x".into()), "invalid_argument"),

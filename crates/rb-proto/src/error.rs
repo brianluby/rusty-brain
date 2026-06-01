@@ -29,6 +29,7 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Serialization(_) => "serialization",
         Error::DimensionMismatch { .. } => "dimension_mismatch",
         Error::Io(_) => "io",
+        Error::IoKind { .. } => "io",
         Error::Embedding(_) => "embedding",
         Error::Enrichment(_) => "enrichment",
         Error::InvalidArgument(_) => "invalid_argument",
