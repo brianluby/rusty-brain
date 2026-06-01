@@ -10,13 +10,16 @@ use std::path::{Path, PathBuf};
 use rb_embed::EmbeddingProvider;
 use rb_engine::{MemoryEngine, RememberInput};
 use rb_proto::{
-    read_frame, write_frame, Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION,
+    bounded_framed, read_frame, write_frame, Handshake, HandshakeAck, Request, Response,
+    CONTRACT_VERSION,
 };
 use rb_types::{Error, Result};
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio::time::timeout;
 use tracing::{info, warn};
+use std::sync::Arc;
 
 use crate::error_map::error_to_response;
 use crate::{SharedEmbedder, StoreHandle};
@@ -25,6 +28,12 @@ use crate::{SharedEmbedder, StoreHandle};
 const MAX_LIMIT: usize = 1000;
 /// Maximum graph traversal depth per Graph request.
 const MAX_DEPTH: u8 = 8;
+/// Maximum number of simultaneous client connections.
+const MAX_CONNECTIONS: usize = 256;
+/// Idle deadline for the initial handshake read (fail fast on stalled connects).
+const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Idle deadline between consecutive request frames from an established client.
+const REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Static configuration for a daemon instance.
 #[derive(Clone, Debug)]
@@ -114,6 +123,7 @@ impl Daemon {
         } = self;
         tokio::pin!(shutdown);
         let mut conns: JoinSet<()> = JoinSet::new();
+        let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
         loop {
             tokio::select! {
@@ -127,7 +137,20 @@ impl Daemon {
                         Ok((stream, _addr)) => {
                             let store = store.clone();
                             let embedder = embedder.clone();
+                            // Acquire a connection permit before spawning.
+                            // If all permits are taken, this back-pressures the
+                            // accept loop (the biased select still drains JoinSet
+                            // results on the next iteration, returning permits).
+                            let permit = match conn_sem.clone().try_acquire_owned() {
+                                Ok(p) => p,
+                                Err(_) => {
+                                    warn!("connection cap ({MAX_CONNECTIONS}) reached; dropping connection");
+                                    drop(stream);
+                                    continue;
+                                }
+                            };
                             conns.spawn(async move {
+                                let _permit = permit; // released when task completes
                                 if let Err(e) = handle_connection(stream, store, embedder).await {
                                     warn!(error = %e, "connection ended with error");
                                 }
@@ -277,7 +300,7 @@ fn lock_pidfile(pidfile: &File, socket_path: &Path, pidfile_path: &Path) -> Resu
 async fn probe_live(path: &Path) -> bool {
     match UnixStream::connect(path).await {
         Ok(stream) => {
-            let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+            let mut framed = bounded_framed(stream);
             let hs = Handshake {
                 contract_version: CONTRACT_VERSION,
                 namespace: rb_types::Namespace::Global,
@@ -303,8 +326,14 @@ async fn handle_connection(
     store: StoreHandle,
     embedder: SharedEmbedder,
 ) -> Result<()> {
-    let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
-    let handshake: Handshake = read_frame(&mut framed).await?;
+    let mut framed = bounded_framed(stream);
+
+    // Enforce a short deadline for the handshake so a stalled client cannot
+    // tie up a connection slot indefinitely before even identifying itself.
+    let handshake: Handshake = match timeout(HANDSHAKE_TIMEOUT, read_frame(&mut framed)).await {
+        Ok(Ok(hs)) => hs,
+        Ok(Err(_)) | Err(_) => return Ok(()), // parse error or timeout: drop silently
+    };
 
     if handshake.contract_version != CONTRACT_VERSION {
         let ack = HandshakeAck {
@@ -340,9 +369,14 @@ async fn handle_connection(
 
     let engine = MemoryEngine::new(store, embedder, namespace);
     loop {
-        let req: Request = match read_frame::<_, Request>(&mut framed).await {
-            Ok(req) => req,
-            Err(_) => break,
+        // Break the loop if the client is idle for too long between requests.
+        let req: Request = match timeout(REQUEST_IDLE_TIMEOUT, read_frame(&mut framed)).await {
+            Ok(Ok(req)) => req,
+            Ok(Err(_)) => break, // parse error or clean close
+            Err(_) => {
+                warn!("client idle timeout; closing connection");
+                break;
+            }
         };
         let resp = dispatch(&engine, req).await;
         write_frame(&mut framed, &resp).await?;

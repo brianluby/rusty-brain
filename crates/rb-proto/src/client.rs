@@ -1,5 +1,6 @@
 //! Async client for the rusty-brain daemon over a Unix domain socket.
 
+use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
 use crate::messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
 use crate::{response_error_to_error, Response as Resp};
@@ -24,7 +25,7 @@ impl Client {
         let stream = UnixStream::connect(socket_path)
             .await
             .map_err(|e| Error::Io(format!("connect {}: {e}", socket_path.display())))?;
-        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+        let mut framed = bounded_framed(stream);
 
         let handshake = Handshake {
             contract_version: CONTRACT_VERSION,

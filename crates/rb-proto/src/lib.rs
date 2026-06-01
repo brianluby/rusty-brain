@@ -5,11 +5,13 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used, clippy::panic))]
 
 mod client;
+pub mod codec;
 mod error;
 mod frame;
 mod messages;
 
 pub use client::Client;
+pub use codec::{bounded_codec, bounded_framed, MAX_FRAME_BYTES};
 pub use error::{error_to_response, response_error_to_error};
 pub use frame::{read_frame, write_frame};
 pub use messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
