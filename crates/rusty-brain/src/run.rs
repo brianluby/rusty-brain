@@ -195,6 +195,7 @@ mod tests {
     // (the signature change this task is about). We do not await it against a
     // real daemon; we only bind a typed fn pointer to assert the arity/types.
     #[test]
+    #[allow(clippy::type_complexity)]
     fn run_signature_accepts_cli_and_namespace() {
         use rb_types::Namespace;
         let _f: fn(
