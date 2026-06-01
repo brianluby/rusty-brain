@@ -235,19 +235,21 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             }
         }
 
-        // Fetch each candidate once; build the note cache + the rank meta map.
+        // ONE batch fetch (fixes the N+1). get_many is ns-scoped and order-preserving.
+        let fetched = self
+            .backend
+            .get_many(self.namespace.clone(), order.clone())
+            .await?;
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
-        for id in &order {
-            if let Some(note) = self.get_scoped(id.clone()).await? {
-                if !self.active_in_namespace(&note)
-                    || !Self::matches_recall_filters(&note, type_filter, tags)
-                {
-                    continue;
-                }
-                meta.insert(id.clone(), (note.importance, note.created_at));
-                notes.insert(id.clone(), note);
+        for note in fetched {
+            if !self.active_in_namespace(&note)
+                || !Self::matches_recall_filters(&note, type_filter, tags)
+            {
+                continue;
             }
+            meta.insert(note.id.clone(), (note.importance, note.created_at));
+            notes.insert(note.id.clone(), note);
         }
 
         let filtered_keyword: Vec<MemoryId> = keyword
@@ -284,12 +286,20 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 break;
             }
         }
+
+        // Best-effort access tracking: never fails the response.
+        let returned_ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        self.record_accesses(&returned_ids).await;
         Ok(results)
     }
 
     /// Fetch a single memory by id in the engine namespace.
     pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        self.get_scoped(id).await
+        let found = self.get_scoped(id.clone()).await?;
+        if found.is_some() {
+            self.record_accesses(std::slice::from_ref(&id)).await;
+        }
+        Ok(found)
     }
 
     /// List memories in the engine namespace, most-recent first, optionally
@@ -378,6 +388,17 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .await?;
         let total = recent.len();
         Ok((recent, important, total))
+    }
+
+    /// Record access for each id, best-effort. Errors are logged and ignored so
+    /// access tracking never affects the response. Awaited inline (the response
+    /// is already computed); the engine stays generic over `B` with no Clone bound.
+    async fn record_accesses(&self, ids: &[MemoryId]) {
+        for id in ids {
+            if let Err(e) = self.backend.record_access(id.clone()).await {
+                tracing::debug!(error = %e, memory_id = %id, "record_access failed; ignoring");
+            }
+        }
     }
 }
 
@@ -724,6 +745,43 @@ mod tests {
         let eng = engine();
         let results = eng.recall("anything", 10, None, &[]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_bumps_access_count_on_returned_results() {
+        let eng = engine();
+        seed(&eng, "alpha sqlite topic", MemoryType::Insight, 5, &[]).await;
+        seed(&eng, "beta tokio topic", MemoryType::Insight, 5, &[]).await;
+        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // each returned id had its access recorded.
+        for r in &results {
+            let note = eng.backend().note_of(&r.memory.id).unwrap();
+            assert_eq!(note.access_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_record_access_failure_does_not_fail_recall() {
+        let eng = engine();
+        seed(&eng, "probe content", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_fail_record_access(true);
+        // Recall still returns its results despite record_access failing.
+        let results = eng.recall("probe", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        // record_access was attempted (best-effort), even though it errored.
+        assert!(eng.backend().record_access_count() >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_bumps_access_count_when_found() {
+        let eng = engine();
+        let id = eng.remember(input("findable", 5)).await.unwrap();
+        let before = eng.backend().note_of(&id).unwrap().access_count;
+        let got = eng.get(id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.id, id);
+        // access recorded after a successful get.
+        assert_eq!(eng.backend().note_of(&id).unwrap().access_count, before + 1);
     }
 
     #[tokio::test]
