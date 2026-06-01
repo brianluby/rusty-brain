@@ -2,29 +2,80 @@ use std::path::PathBuf;
 
 use rb_types::{Error, Result};
 
-/// Default Unix-domain-socket path.
-pub fn default_socket_path() -> Result<PathBuf> {
-    if let Some(rt) = std::env::var_os("XDG_RUNTIME_DIR") {
-        let rt = PathBuf::from(rt);
-        if !rt.as_os_str().is_empty() {
-            return Ok(rt.join("rusty-brain").join("sock"));
+fn nonempty_env_path(name: &str) -> Option<PathBuf> {
+    std::env::var_os(name)
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+}
+
+fn home_dir() -> Result<PathBuf> {
+    nonempty_env_path("HOME")
+        .or_else(|| nonempty_env_path("USERPROFILE"))
+        .ok_or_else(|| Error::Io("cannot determine a home directory".to_string()))
+}
+
+fn cache_base_dir() -> Result<PathBuf> {
+    if let Some(path) = nonempty_env_path("XDG_CACHE_HOME") {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(home_dir()?.join("Library").join("Caches"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = nonempty_env_path("LOCALAPPDATA") {
+            Ok(path)
+        } else {
+            Ok(home_dir()?.join("AppData").join("Local"))
         }
     }
 
-    let dirs = directories::ProjectDirs::from("dev", "rusty-brain", "rusty-brain")
-        .ok_or_else(|| Error::Io("cannot determine a runtime directory".to_string()))?;
-    let base = dirs
-        .runtime_dir()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| dirs.cache_dir().to_path_buf());
-    Ok(base.join("rusty-brain").join("sock"))
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(home_dir()?.join(".cache"))
+    }
+}
+
+fn data_base_dir() -> Result<PathBuf> {
+    if let Some(path) = nonempty_env_path("XDG_DATA_HOME") {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(home_dir()?.join("Library").join("Application Support"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = nonempty_env_path("APPDATA") {
+            Ok(path)
+        } else {
+            Ok(home_dir()?.join("AppData").join("Roaming"))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(home_dir()?.join(".local").join("share"))
+    }
+}
+
+/// Default Unix-domain-socket path.
+pub fn default_socket_path() -> Result<PathBuf> {
+    if let Some(rt) = nonempty_env_path("XDG_RUNTIME_DIR") {
+        return Ok(rt.join("rusty-brain").join("sock"));
+    }
+
+    Ok(cache_base_dir()?.join("rusty-brain").join("sock"))
 }
 
 /// Default database path.
 pub fn default_db_path() -> Result<PathBuf> {
-    let dirs = directories::ProjectDirs::from("dev", "rusty-brain", "rusty-brain")
-        .ok_or_else(|| Error::Io("cannot determine a data directory".to_string()))?;
-    Ok(dirs.data_dir().join("memory.db"))
+    Ok(data_base_dir()?.join("rusty-brain").join("memory.db"))
 }
 
 #[cfg(test)]

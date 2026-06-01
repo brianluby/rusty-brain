@@ -39,7 +39,6 @@ reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-feature
 futures = "0.3"
 bytes = "1"
 secrecy = "0.10"
-directories = "5"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 clap = { version = "4", features = ["derive", "env"] }
