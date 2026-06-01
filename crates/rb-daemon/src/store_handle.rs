@@ -34,6 +34,10 @@ enum WriteCommand {
         id: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
+    #[cfg(test)]
+    PanicForTest {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -257,22 +261,31 @@ impl StoreHandle {
     }
 }
 
-/// Execute a store operation inside `catch_unwind` so a panic in the rusqlite
-/// layer does not unwind and kill the writer thread.
+struct StoreOpReport {
+    result: Result<()>,
+    writer_usable: bool,
+}
+
+enum StoreOpOutcome {
+    Completed(Result<()>),
+    Panicked(String),
+}
+
+/// Execute a store operation inside `catch_unwind` so a panic in the store
+/// layer can be converted into an explicit recovery decision.
 ///
 /// `SqliteStore` is not `UnwindSafe` (it wraps a raw FFI connection), so we
-/// use `AssertUnwindSafe`. A rusqlite panic leaves the connection in an
-/// undefined state; after catching one we log at error level and return a
-/// `Storage` error. The writer thread itself survives and continues serving
-/// subsequent commands.
+/// use `AssertUnwindSafe`. A caught panic must not continue on the same
+/// connection; the caller drops and reopens the writer store before serving
+/// further commands.
 #[allow(clippy::panic)]
-fn catch_store_op<F>(store: &SqliteStore, op: F) -> Result<()>
+fn catch_store_op<F>(store: &SqliteStore, op: F) -> StoreOpOutcome
 where
-    F: FnOnce(&SqliteStore) -> Result<()> + std::panic::UnwindSafe,
+    F: FnOnce(&SqliteStore) -> Result<()>,
 {
     use std::panic::{self, AssertUnwindSafe};
     match panic::catch_unwind(AssertUnwindSafe(|| op(store))) {
-        Ok(result) => result,
+        Ok(result) => StoreOpOutcome::Completed(result),
         Err(payload) => {
             let msg = if let Some(s) = payload.downcast_ref::<&str>() {
                 (*s).to_string()
@@ -281,10 +294,75 @@ where
             } else {
                 "unknown panic payload".to_string()
             };
-            tracing::error!(panic = %msg, "writer-thread store op panicked; connection may be degraded");
-            Err(Error::Storage(format!("writer thread panic: {msg}")))
+            StoreOpOutcome::Panicked(msg)
         }
     }
+}
+
+fn run_store_op<F>(
+    store: &mut Option<SqliteStore>,
+    db_path: &Path,
+    embedding_dim: usize,
+    op: F,
+) -> StoreOpReport
+where
+    F: FnOnce(&SqliteStore) -> Result<()>,
+{
+    let outcome = {
+        let Some(active_store) = store.as_ref() else {
+            return StoreOpReport {
+                result: Err(Error::Storage("writer thread unavailable".to_string())),
+                writer_usable: false,
+            };
+        };
+        catch_store_op(active_store, op)
+    };
+
+    match outcome {
+        StoreOpOutcome::Completed(result) => StoreOpReport {
+            result,
+            writer_usable: true,
+        },
+        StoreOpOutcome::Panicked(msg) => {
+            tracing::error!(
+                panic = %msg,
+                "writer-thread store op panicked; reopening writer connection"
+            );
+
+            // A panic may have skipped SQLite rollback code or left rusqlite's
+            // FFI state suspect. Drop the old connection first so any open
+            // transaction is closed before the replacement connection is opened.
+            drop(store.take());
+
+            match SqliteStore::open(db_path, embedding_dim) {
+                Ok(reopened) => {
+                    *store = Some(reopened);
+                    StoreOpReport {
+                        result: Err(Error::Storage(format!("writer thread panic: {msg}"))),
+                        writer_usable: true,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to reopen writer connection after panic; writer exiting"
+                    );
+                    StoreOpReport {
+                        result: Err(Error::Storage(format!(
+                            "writer thread panic: {msg}; reopen failed: {e}"
+                        ))),
+                        writer_usable: false,
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+#[allow(clippy::panic)]
+fn panic_for_test_store_op(_store: &SqliteStore) -> Result<()> {
+    panic!("deliberate writer test panic");
 }
 
 fn writer_loop(
@@ -294,10 +372,10 @@ fn writer_loop(
     events: broadcast::Sender<MemoryChanged>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
 ) {
-    let store = match SqliteStore::open(&db_path, embedding_dim) {
+    let mut store = match SqliteStore::open(&db_path, embedding_dim) {
         Ok(store) => {
             let _ = ready_tx.send(Ok(()));
-            store
+            Some(store)
         }
         Err(e) => {
             let _ = ready_tx.send(Err(e));
@@ -314,16 +392,21 @@ fn writer_loop(
             } => {
                 let namespace = note.namespace.clone();
                 let id = note.id.clone();
-                let result =
-                    catch_store_op(&store, |s| s.insert_memory(&note, embedding.as_deref()));
-                let changed = result.is_ok();
-                let _ = reply.send(result);
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.insert_memory(&note, embedding.as_deref())
+                });
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
                 if changed {
                     let _ = events.send(MemoryChanged {
                         id,
                         namespace,
                         kind: ChangeKind::Created,
                     });
+                }
+                if !writer_usable {
+                    break;
                 }
             }
             WriteCommand::Update {
@@ -332,13 +415,18 @@ fn writer_loop(
                 updates,
                 reply,
             } => {
-                let result = catch_store_op(&store, |s| match s.get_memory(&id) {
-                    Ok(Some(note)) if note.namespace == namespace => s.update_memory(&id, &updates),
-                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                    Err(e) => Err(e),
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => {
+                            s.update_memory(&id, &updates)
+                        }
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    }
                 });
-                let changed = result.is_ok();
-                let _ = reply.send(result);
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
                 if changed {
                     let _ = events.send(MemoryChanged {
                         id,
@@ -346,25 +434,44 @@ fn writer_loop(
                         kind: ChangeKind::Updated,
                     });
                 }
+                if !writer_usable {
+                    break;
+                }
             }
             WriteCommand::Archive {
                 namespace,
                 id,
                 reply,
             } => {
-                let result = catch_store_op(&store, |s| match s.get_memory(&id) {
-                    Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
-                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                    Err(e) => Err(e),
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    }
                 });
-                let changed = result.is_ok();
-                let _ = reply.send(result);
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
                 if changed {
                     let _ = events.send(MemoryChanged {
                         id,
                         namespace,
                         kind: ChangeKind::Archived,
                     });
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            WriteCommand::PanicForTest { reply } => {
+                let report =
+                    run_store_op(&mut store, &db_path, embedding_dim, panic_for_test_store_op);
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
                 }
             }
             WriteCommand::Shutdown { reply } => {
@@ -462,5 +569,53 @@ impl MemoryBackend for StoreHandle {
             reply,
         };
         self.send_write(cmd, rx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+
+    use super::*;
+    use rb_engine::MemoryBackend;
+    use rb_types::MemoryType;
+
+    const DIM: usize = 8;
+
+    fn note(ns: &Namespace, body: &str) -> MemoryNote {
+        MemoryNote::new(ns.clone(), body.to_string(), MemoryType::Insight, 5)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_reopens_after_caught_store_panic() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+
+        let (reply, rx) = oneshot::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::PanicForTest { reply })
+            .await
+            .unwrap();
+
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(_)),
+            "caught writer panic must be returned as storage error, got {err:?}"
+        );
+
+        let ns = Namespace::Project("writer-recovery".to_string());
+        let n = note(&ns, "write after caught writer panic");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        let got = handle.get(ns, id).await.unwrap();
+        assert!(
+            got.is_some(),
+            "writer must reopen its store and accept later writes after a caught panic"
+        );
+
+        handle.shutdown().await;
     }
 }
