@@ -1,0 +1,24 @@
+[package]
+name = "rb-mcp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain: MCP (Model Context Protocol) stdio adapter."
+
+[lib]
+name = "rb_mcp"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+rb-proto = { path = "../rb-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+tracing = { workspace = true }
+
+[lints]
+workspace = true

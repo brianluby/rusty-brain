@@ -8,6 +8,7 @@ members = [
     "crates/rb-search",
     "crates/rb-engine",
     "crates/rb-daemon",
+    "crates/rb-mcp",
     "crates/rusty-brain",
 ]
 
