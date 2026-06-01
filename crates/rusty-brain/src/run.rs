@@ -137,6 +137,22 @@ mod tests {
     use std::str::FromStr;
 
     #[test]
+    #[allow(clippy::type_complexity)]
+    fn run_signature_accepts_preresolved_namespace() {
+        // Compile-time guard: `run` must accept (Cli, Namespace). This fails to
+        // compile until the namespace is threaded in from main (off-runtime).
+        fn _assert_run_takes_namespace() -> fn(
+            crate::cli::Cli,
+            rb_types::Namespace,
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = anyhow::Result<()>>>,
+        > {
+            |cli, ns| Box::pin(run(cli, ns))
+        }
+        let _ = _assert_run_takes_namespace;
+    }
+
+    #[test]
     fn parse_id_accepts_valid_uuid() {
         let id = rb_types::MemoryId::new();
         let parsed = parse_id(&id.to_string()).unwrap();
