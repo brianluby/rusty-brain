@@ -31,6 +31,7 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Io(_) => "io",
         Error::Embedding(_) => "embedding",
         Error::Enrichment(_) => "enrichment",
+        Error::InvalidArgument(_) => "invalid_argument",
     }
 }
 
@@ -51,6 +52,7 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "io" => Error::Io(message.to_string()),
         "embedding" => Error::Embedding(message.to_string()),
         "enrichment" => Error::Enrichment(message.to_string()),
+        "invalid_argument" => Error::InvalidArgument(message.to_string()),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
@@ -185,6 +187,14 @@ mod tests {
         assert!(matches!(
             response_error_to_error(&kind, &message),
             Error::Enrichment(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_argument_round_trips() {
+        assert!(matches!(
+            round_trip(Error::InvalidArgument("importance 0".into())),
+            Error::InvalidArgument(_)
         ));
     }
 }

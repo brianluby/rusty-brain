@@ -17,6 +17,7 @@ pub(crate) fn error_to_response(err: Error) -> Response {
         Error::InvalidMemoryType(_) => ("invalid_memory_type", err.to_string()),
         Error::InvalidLinkType(_) => ("invalid_link_type", err.to_string()),
         Error::DimensionMismatch { .. } => ("dimension_mismatch", err.to_string()),
+        Error::InvalidArgument(_) => ("invalid_argument", err.to_string()),
 
         // Internal: log the real detail, send a generic message to the client.
         Error::Storage(_) => {
@@ -77,6 +78,7 @@ mod tests {
             (Error::Io("x".into()), "io"),
             (Error::Embedding("x".into()), "embedding"),
             (Error::Enrichment("x".into()), "enrichment"),
+            (Error::InvalidArgument("x".into()), "invalid_argument"),
         ];
         for (err, expected_kind) in cases {
             match error_to_response(err) {

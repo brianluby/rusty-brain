@@ -25,6 +25,8 @@ pub enum Error {
     Embedding(String),
     #[error("enrichment error: {0}")]
     Enrichment(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
 }
 
 /// Convenience alias used throughout rusty-brain.
@@ -103,6 +105,10 @@ mod tests {
         assert_eq!(
             Error::Enrichment("model unavailable".into()).to_string(),
             "enrichment error: model unavailable"
+        );
+        assert_eq!(
+            Error::InvalidArgument("importance 0 is out of range 1..=10".into()).to_string(),
+            "invalid argument: importance 0 is out of range 1..=10"
         );
     }
 }
