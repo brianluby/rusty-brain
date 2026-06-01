@@ -8,7 +8,7 @@ use std::time::Duration;
 use rb_daemon::{Daemon, DaemonConfig, SharedEmbedder};
 use rb_embed::DeterministicProvider;
 use rb_proto::Client;
-use rb_types::{MemoryType, MemoryUpdates, Namespace};
+use rb_types::{Error, MemoryType, MemoryUpdates, Namespace};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
 
@@ -107,7 +107,6 @@ async fn full_round_trip_through_client() {
         .recall(
             "rusty-brain db transaction".to_string(),
             None,
-            None,
             vec![],
             10,
         )
@@ -118,7 +117,7 @@ async fn full_round_trip_through_client() {
         "recall must surface the remembered memory"
     );
 
-    let listed = client.list(None, None, 50).await.unwrap();
+    let listed = client.list(None, 50).await.unwrap();
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].id, id);
 
@@ -145,7 +144,7 @@ async fn full_round_trip_through_client() {
     );
 
     client.delete(id.clone()).await.unwrap();
-    let listed_after = client.list(None, None, 50).await.unwrap();
+    let listed_after = client.list(None, 50).await.unwrap();
     assert!(
         listed_after.iter().all(|m| m.id != id),
         "archived memory is not listed"
@@ -190,7 +189,7 @@ async fn many_concurrent_clients_no_lost_writes_no_errors() {
 
     let mut verifier = Client::connect(&daemon.socket, ns).await.unwrap();
     let listed = verifier
-        .list(None, None, CLIENTS * PER_CLIENT + 10)
+        .list(None, CLIENTS * PER_CLIENT + 10)
         .await
         .unwrap();
     assert_eq!(
@@ -237,7 +236,7 @@ async fn namespace_isolation_enforced_server_side() {
         .await
         .unwrap();
 
-    let b_list = client_b.list(None, None, 50).await.unwrap();
+    let b_list = client_b.list(None, 50).await.unwrap();
     assert!(
         b_list.iter().all(|m| m.id != id_a),
         "namespace B must not see namespace A's memory via list"
@@ -248,7 +247,7 @@ async fn namespace_isolation_enforced_server_side() {
     );
 
     let b_recall = client_b
-        .recall("secret".to_string(), None, None, vec![], 50)
+        .recall("secret".to_string(), None, vec![], 50)
         .await
         .unwrap();
     assert!(
@@ -256,7 +255,7 @@ async fn namespace_isolation_enforced_server_side() {
         "namespace B must not recall namespace A's memory"
     );
 
-    let a_list = client_a.list(None, None, 50).await.unwrap();
+    let a_list = client_a.list(None, 50).await.unwrap();
     assert!(
         a_list.iter().all(|m| m.id != id_b),
         "namespace A must not see namespace B's memory"
@@ -327,4 +326,81 @@ async fn second_bind_before_accept_loop_fails_closed() {
     );
 
     drop(daemon);
+}
+
+/// A client handshaked under Project("b") must not see or mutate Project("a")
+/// data over the wire, even by direct id. This is the wire-level namespace
+/// isolation guarantee: get returns None, update/delete return NotFound-class
+/// errors, and graph returns an empty neighborhood.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
+    let daemon = RunningDaemon::start(4).await;
+
+    // Project A: store one memory.
+    let ns_a = Namespace::Project("a".to_string());
+    let mut client_a = Client::connect(&daemon.socket, ns_a.clone()).await.unwrap();
+    let id_a = client_a
+        .remember(
+            "project a secret".to_string(),
+            None,
+            MemoryType::Insight,
+            7,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Project B: connect under a different namespace.
+    let ns_b = Namespace::Project("b".to_string());
+    let mut client_b = Client::connect(&daemon.socket, ns_b).await.unwrap();
+
+    // get(id_a) must return None — not visible across namespace boundary.
+    let got = client_b.get(id_a.clone()).await.unwrap();
+    assert!(
+        got.is_none(),
+        "get across namespace boundary must return None, not expose the memory"
+    );
+
+    // update(id_a, ..) must return an error (NotFound at the store layer, surfaced
+    // as a wire Error response, which the client maps to Error::Storage or similar).
+    let update_err = client_b
+        .update(
+            id_a.clone(),
+            MemoryUpdates {
+                importance: Some(1),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(update_err, Error::Storage(_)),
+        "update across namespace boundary must error, got {update_err:?}"
+    );
+
+    // delete(id_a) must return an error.
+    let delete_err = client_b.delete(id_a.clone()).await.unwrap_err();
+    assert!(
+        matches!(delete_err, Error::Storage(_)),
+        "delete across namespace boundary must error, got {delete_err:?}"
+    );
+
+    // graph(id_a, ..) must return an empty neighborhood (anchor not in namespace).
+    let graph_result = client_b.graph(id_a.clone(), 2).await.unwrap();
+    assert!(
+        graph_result.is_empty(),
+        "graph across namespace boundary must return empty, got {} nodes",
+        graph_result.len()
+    );
+
+    // Confirm A's data is untouched: it can still get its own memory.
+    let still_there = client_a.get(id_a).await.unwrap();
+    assert!(
+        still_there.is_some(),
+        "Project A memory must remain visible to Project A after cross-namespace ops"
+    );
+
+    daemon.stop().await;
 }

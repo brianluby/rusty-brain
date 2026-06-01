@@ -75,7 +75,7 @@ async fn run_client(
             tags,
         } => {
             let results = client
-                .recall(query, Some(namespace), memory_type, tags, limit)
+                .recall(query, memory_type, tags, limit)
                 .await
                 .context("recall failed")?;
             println!("{}", output::render_recall(&results, json));
@@ -90,7 +90,7 @@ async fn run_client(
             min_importance,
         } => {
             let notes = client
-                .list(Some(namespace), min_importance, limit)
+                .list(min_importance, limit)
                 .await
                 .context("list failed")?;
             println!("{}", output::render_notes(&notes, json));

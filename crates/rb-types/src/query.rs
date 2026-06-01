@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SearchQuery {
     pub query: String,
+    /// Reserved; not honored — scope is fixed at the daemon handshake.
     pub scope: Option<Namespace>,
     pub memory_type: Option<MemoryType>,
     pub tags: Vec<String>,

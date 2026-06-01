@@ -35,7 +35,6 @@ pub enum Request {
     },
     Recall {
         query: String,
-        scope: Option<Namespace>,
         memory_type: Option<MemoryType>,
         tags: Vec<String>,
         limit: usize,
@@ -44,7 +43,6 @@ pub enum Request {
         id: MemoryId,
     },
     List {
-        scope: Option<Namespace>,
         min_importance: Option<u8>,
         limit: usize,
     },
@@ -158,14 +156,12 @@ mod tests {
             },
             Request::Recall {
                 query: "q".into(),
-                scope: Some(Namespace::Global),
                 memory_type: Some(MemoryType::BugFix),
                 tags: vec!["sqlite".into()],
                 limit: 10,
             },
             Request::Get { id: id.clone() },
             Request::List {
-                scope: Some(Namespace::Project("p".into())),
                 min_importance: Some(5),
                 limit: 20,
             },

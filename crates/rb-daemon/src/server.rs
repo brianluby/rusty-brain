@@ -389,7 +389,6 @@ where
         }
         Request::Recall {
             query,
-            scope: _,
             memory_type,
             tags,
             limit,
@@ -402,7 +401,6 @@ where
             Err(e) => error_to_response(e),
         },
         Request::List {
-            scope: _,
             min_importance,
             limit,
         } => match engine.list(min_importance, limit).await {

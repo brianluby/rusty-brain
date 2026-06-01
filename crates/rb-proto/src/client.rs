@@ -101,7 +101,6 @@ impl Client {
     pub async fn recall(
         &mut self,
         query: String,
-        scope: Option<Namespace>,
         memory_type: Option<MemoryType>,
         tags: Vec<String>,
         limit: usize,
@@ -109,7 +108,6 @@ impl Client {
         let resp = self
             .request(Request::Recall {
                 query,
-                scope,
                 memory_type,
                 tags,
                 limit,
@@ -133,13 +131,11 @@ impl Client {
     /// List memories in scope.
     pub async fn list(
         &mut self,
-        scope: Option<Namespace>,
         min_importance: Option<u8>,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
         let resp = self
             .request(Request::List {
-                scope,
                 min_importance,
                 limit,
             })
@@ -408,14 +404,14 @@ mod wrapper_tests {
             .unwrap();
         assert_eq!(id, fixed_id);
 
-        let results = c.recall("q".into(), None, None, vec![], 5).await.unwrap();
+        let results = c.recall("q".into(), None, vec![], 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!((results[0].score - 0.5).abs() < f32::EPSILON);
 
         let got = c.get(fixed_id.clone()).await.unwrap();
         assert!(got.is_some());
 
-        let listed = c.list(None, Some(5), 10).await.unwrap();
+        let listed = c.list(Some(5), 10).await.unwrap();
         assert_eq!(listed.len(), 1);
 
         let graphed = c.graph(fixed_id.clone(), 2).await.unwrap();

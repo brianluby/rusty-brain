@@ -96,7 +96,6 @@ mod tests {
         let r1 = Request::Ping;
         let r2 = Request::Recall {
             query: "transactions".into(),
-            scope: Some(Namespace::Global),
             memory_type: Some(MemoryType::BugFix),
             tags: vec![],
             limit: 5,
