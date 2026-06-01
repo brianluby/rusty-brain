@@ -14,6 +14,10 @@ use tokio::task::JoinHandle;
 
 const DIM: usize = 8;
 
+fn tempdir() -> tempfile::TempDir {
+    tempfile::tempdir_in(std::env::temp_dir()).unwrap()
+}
+
 struct RunningDaemon {
     socket: PathBuf,
     shutdown: Option<oneshot::Sender<()>>,
@@ -23,7 +27,7 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     async fn start(pool_size: usize) -> RunningDaemon {
-        let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+        let dir = tempdir();
         let socket = dir.path().join("sock");
         let db = dir.path().join("memory.db");
         let cfg = DaemonConfig {
@@ -64,7 +68,10 @@ impl RunningDaemon {
             let _ = tx.send(());
         }
         if let Some(task) = self.task.take() {
-            let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
+            tokio::time::timeout(Duration::from_secs(5), task)
+                .await
+                .expect("daemon task did not shut down within 5s")
+                .expect("daemon task failed during shutdown");
         }
     }
 }
@@ -262,7 +269,7 @@ async fn namespace_isolation_enforced_server_side() {
 async fn second_bind_on_live_socket_fails_closed() {
     let daemon = RunningDaemon::start(2).await;
 
-    let dir2 = tempfile::tempdir_in("/private/tmp").unwrap();
+    let dir2 = tempdir();
     let cfg2 = DaemonConfig {
         socket_path: daemon.socket.clone(),
         db_path: dir2.path().join("memory.db"),
@@ -280,7 +287,7 @@ async fn second_bind_on_live_socket_fails_closed() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn second_bind_before_accept_loop_fails_closed() {
-    let dir = tempfile::tempdir_in("/private/tmp").unwrap();
+    let dir = tempdir();
     let socket = dir.path().join("sock");
     let cfg = DaemonConfig {
         socket_path: socket.clone(),
@@ -290,7 +297,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let daemon = Daemon::bind(cfg, embedder).await.unwrap();
 
-    let dir2 = tempfile::tempdir_in("/private/tmp").unwrap();
+    let dir2 = tempdir();
     let cfg2 = DaemonConfig {
         socket_path: socket,
         db_path: dir2.path().join("memory.db"),

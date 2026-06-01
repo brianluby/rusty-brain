@@ -3,6 +3,7 @@
 //! pool of read connections serves concurrent reads via `spawn_blocking`.
 
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -33,6 +34,9 @@ enum WriteCommand {
         id: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
+    Shutdown {
+        reply: oneshot::Sender<()>,
+    },
 }
 
 /// Cloneable handle to the daemon's single-writer storage core.
@@ -42,6 +46,7 @@ pub struct StoreHandle {
     pool: Arc<ReadPool>,
     events: broadcast::Sender<MemoryChanged>,
     writer_join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
+    shutting_down: Arc<AtomicBool>,
 }
 
 struct ReadPool {
@@ -108,6 +113,7 @@ impl StoreHandle {
             pool,
             events,
             writer_join: Arc::new(Mutex::new(Some(writer_join))),
+            shutting_down: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -123,10 +129,23 @@ impl StoreHandle {
             pool,
             events,
             writer_join,
+            shutting_down,
         } = self;
-        drop(writer_tx);
+
+        if !shutting_down.swap(true, Ordering::SeqCst) {
+            let (reply, rx) = oneshot::channel();
+            if writer_tx
+                .send(WriteCommand::Shutdown { reply })
+                .await
+                .is_ok()
+            {
+                let _ = rx.await;
+            }
+        }
+
         drop(pool);
         drop(events);
+        drop(writer_tx);
 
         let join = { writer_join.lock().await.take() };
         if let Some(handle) = join {
@@ -135,6 +154,10 @@ impl StoreHandle {
     }
 
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+
         self.writer_tx
             .send(cmd)
             .await
@@ -250,6 +273,10 @@ fn writer_loop(
                         kind: ChangeKind::Archived,
                     });
                 }
+            }
+            WriteCommand::Shutdown { reply } => {
+                let _ = reply.send(());
+                break;
             }
         }
     }

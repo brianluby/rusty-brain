@@ -76,6 +76,28 @@ async fn write_publishes_change_event() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn shutdown_completes_with_live_handle_clone() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("rb.db");
+    let handle = StoreHandle::start(db, DIM, 2).unwrap();
+    let retained = handle.clone();
+
+    tokio::time::timeout(std::time::Duration::from_secs(2), handle.shutdown())
+        .await
+        .expect("shutdown must not wait for retained StoreHandle clones");
+
+    let ns = Namespace::Project("a".to_string());
+    let err = retained
+        .write(note(&ns, "write after shutdown"), Some(vec![0.5f32; DIM]))
+        .await
+        .expect_err("retained clones must reject writes after shutdown");
+    assert!(
+        matches!(err, Error::Storage(_)),
+        "write after shutdown should fail as storage unavailable, got {err:?}"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn update_and_archive_emit_correct_kinds() {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("rb.db");
