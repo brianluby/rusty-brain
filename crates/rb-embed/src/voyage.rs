@@ -43,6 +43,12 @@ struct EmbeddingsResponse {
 
 #[derive(Deserialize)]
 struct EmbeddingData {
+    /// Position of this embedding in the original input array.
+    /// Voyage may return embeddings out of input order; we use this field to
+    /// re-pair each embedding to its source text.
+    /// If absent (older API responses), the item's position in `data` is used.
+    #[serde(default)]
+    index: Option<usize>,
     embedding: Vec<f32>,
 }
 
@@ -160,8 +166,26 @@ impl VoyageProvider {
             )));
         }
 
-        let mut out = Vec::with_capacity(parsed.data.len());
-        for item in parsed.data {
+        // Re-order embeddings by their declared `index` field so that a Voyage
+        // response returned out of input order is correctly re-paired.
+        // If `index` is absent (older API responses), fall back to the item's
+        // position in the `data` array (i.e. treat as in-order).
+        let n = texts.len();
+        let mut slots: Vec<Option<Vec<f32>>> = (0..n).map(|_| None).collect();
+        for (pos, item) in parsed.data.into_iter().enumerate() {
+            let slot_idx = item.index.unwrap_or(pos);
+            if slot_idx >= n {
+                return Err(Error::Embedding(format!(
+                    "voyage returned embedding with index {} but input length is {}",
+                    slot_idx, n
+                )));
+            }
+            if slots[slot_idx].is_some() {
+                return Err(Error::Embedding(format!(
+                    "voyage returned duplicate embedding for index {}",
+                    slot_idx
+                )));
+            }
             if item.embedding.len() != self.dim {
                 return Err(Error::Embedding(format!(
                     "embedding dimension mismatch: expected {}, got {}",
@@ -169,9 +193,17 @@ impl VoyageProvider {
                     item.embedding.len()
                 )));
             }
-            out.push(item.embedding);
+            slots[slot_idx] = Some(item.embedding);
         }
-        Ok(out)
+
+        // Every slot must be filled; the count check above ensures exactly
+        // n items were returned, so any missing slot means a duplicate index.
+        let out: Option<Vec<Vec<f32>>> = slots.into_iter().collect();
+        out.ok_or_else(|| {
+            Error::Embedding(
+                "voyage response had missing embedding slots after index placement".to_string(),
+            )
+        })
     }
 }
 
@@ -375,6 +407,102 @@ mod tests {
             })
             .collect();
         assert_eq!(batch_sizes, vec![128, 72]);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn out_of_order_index_fields_are_correctly_re_paired() {
+        let server = MockServer::start().await;
+        // Voyage returns embeddings in reverse order (index 1 first, index 0 second).
+        // Without honoring the `index` field the results would be silently swapped.
+        let response = serde_json::json!({
+            "data": [
+                { "index": 1, "embedding": [0.5, 0.6, 0.7, 0.8] },
+                { "index": 0, "embedding": [0.1, 0.2, 0.3, 0.4] }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(header("authorization", "Bearer test-key"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let out = p
+            .embed(&["first".to_string(), "second".to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(out.len(), 2);
+        // "first" must be paired with the embedding at index 0, regardless of
+        // the order in which Voyage returned the items.
+        assert_eq!(
+            out[0],
+            vec![0.1, 0.2, 0.3, 0.4],
+            "index 0 embedding must be placed at position 0"
+        );
+        assert_eq!(
+            out[1],
+            vec![0.5, 0.6, 0.7, 0.8],
+            "index 1 embedding must be placed at position 1"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn duplicate_index_in_response_is_an_embedding_error() {
+        let server = MockServer::start().await;
+        // Both returned items claim index 0 — this must be detected and rejected.
+        let response = serde_json::json!({
+            "data": [
+                { "index": 0, "embedding": [0.1, 0.2, 0.3, 0.4] },
+                { "index": 0, "embedding": [0.5, 0.6, 0.7, 0.8] }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let err = p
+            .embed(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::Embedding(_)),
+            "duplicate index must be Error::Embedding, got {err:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn out_of_range_index_is_an_embedding_error() {
+        let server = MockServer::start().await;
+        // One item has an index beyond the input length.
+        let response = serde_json::json!({
+            "data": [
+                { "index": 0, "embedding": [0.1, 0.2, 0.3, 0.4] },
+                { "index": 99, "embedding": [0.5, 0.6, 0.7, 0.8] }
+            ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&response))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let err = p
+            .embed(&["a".to_string(), "b".to_string()])
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::Embedding(_)),
+            "out-of-range index must be Error::Embedding, got {err:?}"
+        );
     }
 
     // Real-API smoke test. Ignored by default; run with:
