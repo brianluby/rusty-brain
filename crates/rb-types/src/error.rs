@@ -23,6 +23,8 @@ pub enum Error {
     Io(String),
     #[error("embedding error: {0}")]
     Embedding(String),
+    #[error("enrichment error: {0}")]
+    Enrichment(String),
 }
 
 /// Convenience alias used throughout rusty-brain.
@@ -94,5 +96,13 @@ mod tests {
     fn result_alias_resolves() {
         let ok: Result<u8> = Ok(7);
         assert_eq!(ok.unwrap(), 7);
+    }
+
+    #[test]
+    fn enrichment_message_matches_spine() {
+        assert_eq!(
+            Error::Enrichment("model unavailable".into()).to_string(),
+            "enrichment error: model unavailable"
+        );
     }
 }
