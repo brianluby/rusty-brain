@@ -250,9 +250,7 @@ async fn panicking_read_closure_returns_connection_via_raii() {
     for _ in 0..POOL_SIZE {
         let h = handle.clone();
         let ns = ns.clone();
-        tasks.push(tokio::spawn(async move {
-            h.list(ns, None, 10).await
-        }));
+        tasks.push(tokio::spawn(async move { h.list(ns, None, 10).await }));
     }
     for t in tasks {
         let listed = tokio::time::timeout(Duration::from_secs(5), t)
