@@ -1,7 +1,9 @@
 use rb_types::{LinkType, MemoryLink, MemoryNote};
 
 /// Generates links for a newly-stored memory from a set of candidate
-/// (note, vector_distance) pairs. Pure: no IO, deterministic for a given input.
+/// (note, vector_distance) pairs. No IO: the selection logic (which candidates
+/// are linked, and their strengths) is deterministic given the same inputs; only
+/// each link's `created_at` timestamp reflects wall-clock time.
 pub trait Linker: Send + Sync {
     /// Produce links FROM `new` TO selected candidates. `candidates` are
     /// `(note, vector_distance)` where smaller distance = more similar.

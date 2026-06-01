@@ -796,12 +796,18 @@ impl Store for SqliteStore {
         let result = (|| -> Result<()> {
             // Point old -> new. FK on superseded_by makes a missing `new` fail here,
             // rolling back the whole transaction (old stays unarchived).
-            self.conn
+            let affected = self
+                .conn
                 .execute(
                     "UPDATE memories SET superseded_by = ?1, updated_at = ?2 WHERE memory_id = ?3",
                     rusqlite::params![new.to_string(), now, old.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            // Fail fast on a missing `old`: 0 rows updated means a caller bug, not a
+            // silent success. Returning the error rolls the whole transaction back.
+            if affected == 0 {
+                return Err(Error::NotFound(old.clone()));
+            }
             // Archive old (idempotent: only if currently active).
             self.conn
                 .execute(
@@ -1837,6 +1843,24 @@ mod access_tests {
         let got = store.get_memory(&old.id).unwrap().unwrap();
         assert!(got.superseded_by.is_none(), "rolled back: no superseded_by");
         assert!(got.archived_at.is_none(), "rolled back: not archived");
+    }
+
+    #[test]
+    fn supersede_missing_old_errors() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // `new` exists so the FK is satisfiable; `old` does NOT exist. The first
+        // UPDATE affects 0 rows, which must fail fast (NotFound) and roll back —
+        // never a silent Ok(()).
+        let new = node(&store, "new decision");
+        let missing_old = MemoryId::new();
+
+        let err = store.supersede(&missing_old, &new.id).unwrap_err();
+        assert!(matches!(err, Error::NotFound(ref id) if *id == missing_old));
+
+        // No partial write: `new` is untouched (not archived, not superseded).
+        let new_got = store.get_memory(&new.id).unwrap().unwrap();
+        assert!(new_got.superseded_by.is_none());
+        assert!(new_got.archived_at.is_none());
     }
 }
 
