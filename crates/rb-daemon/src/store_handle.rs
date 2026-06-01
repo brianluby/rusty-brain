@@ -246,6 +246,36 @@ impl StoreHandle {
     }
 }
 
+/// Execute a store operation inside `catch_unwind` so a panic in the rusqlite
+/// layer does not unwind and kill the writer thread.
+///
+/// `SqliteStore` is not `UnwindSafe` (it wraps a raw FFI connection), so we
+/// use `AssertUnwindSafe`. A rusqlite panic leaves the connection in an
+/// undefined state; after catching one we log at error level and return a
+/// `Storage` error. The writer thread itself survives and continues serving
+/// subsequent commands.
+#[allow(clippy::panic)]
+fn catch_store_op<F>(store: &SqliteStore, op: F) -> Result<()>
+where
+    F: FnOnce(&SqliteStore) -> Result<()> + std::panic::UnwindSafe,
+{
+    use std::panic::{self, AssertUnwindSafe};
+    match panic::catch_unwind(AssertUnwindSafe(|| op(store))) {
+        Ok(result) => result,
+        Err(payload) => {
+            let msg = if let Some(s) = payload.downcast_ref::<&str>() {
+                (*s).to_string()
+            } else if let Some(s) = payload.downcast_ref::<String>() {
+                s.clone()
+            } else {
+                "unknown panic payload".to_string()
+            };
+            tracing::error!(panic = %msg, "writer-thread store op panicked; connection may be degraded");
+            Err(Error::Storage(format!("writer thread panic: {msg}")))
+        }
+    }
+}
+
 fn writer_loop(
     db_path: PathBuf,
     embedding_dim: usize,
@@ -273,7 +303,7 @@ fn writer_loop(
             } => {
                 let namespace = note.namespace.clone();
                 let id = note.id.clone();
-                let result = store.insert_memory(&note, embedding.as_deref());
+                let result = catch_store_op(&store, |s| s.insert_memory(&note, embedding.as_deref()));
                 let changed = result.is_ok();
                 let _ = reply.send(result);
                 if changed {
@@ -290,13 +320,15 @@ fn writer_loop(
                 updates,
                 reply,
             } => {
-                let result = match store.get_memory(&id) {
-                    Ok(Some(note)) if note.namespace == namespace => {
-                        store.update_memory(&id, &updates)
+                let result = catch_store_op(&store, |s| {
+                    match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => {
+                            s.update_memory(&id, &updates)
+                        }
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
                     }
-                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                    Err(e) => Err(e),
-                };
+                });
                 let changed = result.is_ok();
                 let _ = reply.send(result);
                 if changed {
@@ -312,11 +344,13 @@ fn writer_loop(
                 id,
                 reply,
             } => {
-                let result = match store.get_memory(&id) {
-                    Ok(Some(note)) if note.namespace == namespace => store.archive_memory(&id),
-                    Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
-                    Err(e) => Err(e),
-                };
+                let result = catch_store_op(&store, |s| {
+                    match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    }
+                });
                 let changed = result.is_ok();
                 let _ = reply.send(result);
                 if changed {
