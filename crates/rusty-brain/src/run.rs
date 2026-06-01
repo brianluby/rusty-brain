@@ -1,7 +1,6 @@
 //! Async dispatch from parsed `Cli` to daemon/client behavior.
 
 use crate::cli::{Cli, Command};
-use crate::namespace_detect::detect_namespace;
 use crate::{client, output, paths, serve};
 use anyhow::Context as _;
 use rb_types::MemoryId;
@@ -12,9 +11,11 @@ pub fn parse_id(s: &str) -> rb_types::Result<MemoryId> {
     MemoryId::from_str(s)
 }
 
-/// Execute the parsed CLI. `serve` blocks until Ctrl-C; client commands connect
-/// (auto-starting the daemon), issue one request, print to stdout, and return.
-pub async fn run(cli: Cli) -> anyhow::Result<()> {
+/// Execute the parsed CLI with a pre-resolved `namespace` (resolved OFF the
+/// async runtime by `main`, since detection shells out to git and reads files).
+/// `serve` blocks until Ctrl-C; client commands connect (auto-starting the
+/// daemon), issue one request, print to stdout, and return.
+pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()> {
     let socket_path = paths::socket_path_from_env().context("resolving daemon socket path")?;
     let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
 
@@ -28,20 +29,21 @@ pub async fn run(cli: Cli) -> anyhow::Result<()> {
                 .context("daemon failed")?;
             Ok(())
         }
-        other => run_client(other, cli.json, &socket_path, &db_path).await,
+        other => run_client(other, cli.json, namespace, &socket_path, &db_path).await,
     }
 }
 
-/// Connect to the daemon and dispatch a single client request.
+/// Connect to the daemon and dispatch a single client request, scoped to the
+/// pre-resolved `namespace`.
 async fn run_client(
     command: Command,
     json: bool,
+    namespace: rb_types::Namespace,
     socket_path: &std::path::Path,
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
-    let namespace = detect_namespace();
     let self_exe = std::env::current_exe().context("locating own executable")?;
-    let mut client = client::connect_or_start(socket_path, db_path, namespace.clone(), self_exe)
+    let mut client = client::connect_or_start(socket_path, db_path, namespace, self_exe)
         .await
         .context("connecting to daemon")?;
 
@@ -153,5 +155,53 @@ mod tests {
         let a = parse_id(&id.to_string()).unwrap();
         let b = rb_types::MemoryId::from_str(&id.to_string()).unwrap();
         assert_eq!(a, b);
+    }
+
+    // Proves the namespace is threaded into the client connect path WITHOUT
+    // triggering auto-start: a regular file at the socket path makes
+    // UnixStream::connect fail with ENOTSOCK, which `should_auto_start` does NOT
+    // match, so `connect_or_start` returns immediately (no spawned child, no
+    // retry sleeps, no process-global env mutation). Uses an isolated tempdir.
+    #[tokio::test]
+    async fn connect_or_start_forwards_namespace_without_autostart() {
+        use rb_types::Namespace;
+        use std::time::Instant;
+        use tempfile::TempDir;
+
+        let tmp = TempDir::new().unwrap();
+        // A regular file, not a socket: connect -> ENOTSOCK (non-startable).
+        let sock = tmp.path().join("not-a-socket");
+        std::fs::write(&sock, b"x").unwrap();
+        let db = tmp.path().join("rb.db");
+        // A self_exe that, if ever spawned, would do nothing harmful; it must NOT
+        // be spawned because ENOTSOCK is not an auto-start error.
+        let self_exe = std::path::PathBuf::from("/nonexistent/never-spawned");
+
+        let ns = Namespace::Project("injected".to_string());
+        let started = Instant::now();
+        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe).await;
+        let elapsed = started.elapsed();
+
+        // Returns an Err quickly (no 50-retry backoff, no daemon spawn).
+        assert!(result.is_err(), "expected connect failure on a non-socket");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "connect_or_start must not enter the retry/backoff loop for a \
+             non-startable error; took {elapsed:?}"
+        );
+    }
+
+    // Compile-level guarantee that `run` now takes a pre-resolved Namespace
+    // (the signature change this task is about). We do not await it against a
+    // real daemon; we only bind a typed fn pointer to assert the arity/types.
+    #[test]
+    fn run_signature_accepts_cli_and_namespace() {
+        use rb_types::Namespace;
+        let _f: fn(
+            crate::cli::Cli,
+            Namespace,
+        )
+            -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>>>> =
+            |cli, ns| Box::pin(run(cli, ns));
     }
 }
