@@ -485,7 +485,11 @@ impl Store for SqliteStore {
 
         let rows = stmt
             .query_map(
-                rusqlite::params![match_expr, ns.as_db_string(), limit as i64],
+                rusqlite::params![
+                    match_expr,
+                    ns.as_db_string(),
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ],
                 |row| row.get::<_, String>(0),
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -534,7 +538,13 @@ impl Store for SqliteStore {
         // only, then filter candidates in Rust.
         //
         // vec0 returns min(LIMIT, total_rows) without error.
-        let k_budget = (limit as i64).saturating_mul(10).max(limit as i64);
+        // sqlite-vec enforces a hard KNN cap of 4096; k_budget must not exceed it.
+        const VEC0_KNN_MAX: i64 = 4096;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        let k_budget = limit_i64
+            .saturating_mul(10)
+            .max(limit_i64)
+            .min(VEC0_KNN_MAX);
 
         let mut stmt = self
             .conn
@@ -648,7 +658,11 @@ impl Store for SqliteStore {
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut rows = stmt
-            .query(rusqlite::params![ns.as_db_string(), min, limit as i64])
+            .query(rusqlite::params![
+                ns.as_db_string(),
+                min,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ])
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut out = Vec::new();

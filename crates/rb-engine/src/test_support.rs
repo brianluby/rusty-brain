@@ -1,0 +1,196 @@
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
+use crate::backend::MemoryBackend;
+use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
+use std::collections::HashMap;
+use std::sync::Mutex;
+
+/// In-memory `MemoryBackend` for engine unit tests. Records writes (note +
+/// embedding) so tests can assert what `remember` produced. Reads return the
+/// stored notes. Keyword/vector return ALL stored ids in a DETERMINISTIC order
+/// (created_at desc) so the ranker, not HashMap iteration order, decides
+/// result ordering; `graph` returns nothing (graph paths tested separately).
+#[derive(Default)]
+pub(crate) struct MockBackend {
+    pub notes: Mutex<HashMap<MemoryId, MemoryNote>>,
+    pub embeddings: Mutex<HashMap<MemoryId, Vec<f32>>>,
+    graph: Mutex<HashMap<MemoryId, Vec<MemoryId>>>,
+    keyword_results: Mutex<Option<Vec<MemoryId>>>,
+    vector_results: Mutex<Option<Vec<(MemoryId, f32)>>>,
+}
+
+impl MockBackend {
+    pub fn count(&self) -> usize {
+        self.notes.lock().unwrap().len()
+    }
+
+    pub fn embedding_of(&self, id: &MemoryId) -> Option<Vec<f32>> {
+        self.embeddings.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn note_of(&self, id: &MemoryId) -> Option<MemoryNote> {
+        self.notes.lock().unwrap().get(id).cloned()
+    }
+
+    pub fn insert_note(&self, note: MemoryNote) {
+        self.notes.lock().unwrap().insert(note.id.clone(), note);
+    }
+
+    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<MemoryId>) {
+        self.graph.lock().unwrap().insert(id, neighbors);
+    }
+
+    pub fn set_keyword_results(&self, ids: Vec<MemoryId>) {
+        *self.keyword_results.lock().unwrap() = Some(ids);
+    }
+
+    pub fn set_vector_results(&self, ids: Vec<(MemoryId, f32)>) {
+        *self.vector_results.lock().unwrap() = Some(ids);
+    }
+}
+
+#[async_trait::async_trait]
+impl MemoryBackend for MockBackend {
+    async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()> {
+        if let Some(emb) = embedding {
+            self.embeddings.lock().unwrap().insert(note.id.clone(), emb);
+        }
+        self.notes.lock().unwrap().insert(note.id.clone(), note);
+        Ok(())
+    }
+
+    async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        Ok(self
+            .notes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .filter(|note| note.namespace == ns)
+            .cloned())
+    }
+
+    async fn keyword(
+        &self,
+        ns: Namespace,
+        _query: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryId>> {
+        if let Some(ids) = self.keyword_results.lock().unwrap().clone() {
+            return Ok(ids.into_iter().take(limit).collect());
+        }
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.namespace == ns)
+            .cloned()
+            .collect();
+        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        Ok(v.into_iter().take(limit).map(|n| n.id).collect())
+    }
+
+    async fn vector(
+        &self,
+        ns: Namespace,
+        _embedding: Vec<f32>,
+        limit: usize,
+    ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
+        if let Some(ids) = self.vector_results.lock().unwrap().clone() {
+            return Ok(ids.into_iter().take(limit).collect());
+        }
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.namespace == ns)
+            .cloned()
+            .collect();
+        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        Ok(v.into_iter().take(limit).map(|n| (n.id, 0.0)).collect())
+    }
+
+    async fn graph(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        _depth: u8,
+    ) -> rb_types::Result<Vec<MemoryId>> {
+        let has_anchor = self
+            .notes
+            .lock()
+            .unwrap()
+            .get(&id)
+            .is_some_and(|note| note.namespace == ns);
+        if !has_anchor {
+            return Ok(Vec::new());
+        }
+        Ok(self
+            .graph
+            .lock()
+            .unwrap()
+            .get(&id)
+            .cloned()
+            .unwrap_or_default())
+    }
+
+    async fn list(
+        &self,
+        ns: Namespace,
+        min_importance: Option<u8>,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.namespace == ns)
+            .filter(|n| min_importance.map(|m| n.importance >= m).unwrap_or(true))
+            .cloned()
+            .collect();
+        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn update(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        updates: MemoryUpdates,
+    ) -> rb_types::Result<()> {
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&id)
+            .filter(|note| note.namespace == ns)
+            .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+        if let Some(c) = updates.content {
+            note.content = c;
+        }
+        if let Some(s) = updates.summary {
+            note.summary = s;
+        }
+        if let Some(i) = updates.importance {
+            note.importance = i;
+        }
+        if let Some(t) = updates.tags {
+            note.tags = t;
+        }
+        if let Some(ctx) = updates.context {
+            note.context = ctx;
+        }
+        Ok(())
+    }
+
+    async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()> {
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&id)
+            .filter(|note| note.namespace == ns)
+            .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+        note.archived_at = Some(chrono::Utc::now());
+        Ok(())
+    }
+}

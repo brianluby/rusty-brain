@@ -21,6 +21,8 @@ pub enum Error {
     DimensionMismatch { expected: usize, got: usize },
     #[error("io error: {0}")]
     Io(String),
+    #[error("embedding error: {0}")]
+    Embedding(String),
 }
 
 /// Convenience alias used throughout rusty-brain.
@@ -63,6 +65,10 @@ mod tests {
             "serialization error: json"
         );
         assert_eq!(Error::Io("eof".into()).to_string(), "io error: eof");
+        assert_eq!(
+            Error::Embedding("provider down".into()).to_string(),
+            "embedding error: provider down"
+        );
     }
 
     #[test]

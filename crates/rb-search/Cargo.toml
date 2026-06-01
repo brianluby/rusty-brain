@@ -1,0 +1,19 @@
+[package]
+name = "rb-search"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Pure, deterministic hybrid ranking for rusty-brain: combine keyword, vector, graph, importance, and recency signals."
+
+[lib]
+name = "rb_search"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+chrono = { workspace = true }
+
+[lints]
+workspace = true
