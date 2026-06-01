@@ -97,12 +97,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
-        if !(1..=10).contains(&input.importance) {
-            return Err(rb_types::Error::Storage(format!(
-                "importance {} is out of range 1..=10",
-                input.importance
-            )));
-        }
+        rb_types::validate_importance(input.importance)?;
 
         let mut note = MemoryNote::new(
             self.namespace.clone(),
@@ -387,11 +382,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             ));
         }
         if let Some(importance) = updates.importance {
-            if !(1..=10).contains(&importance) {
-                return Err(rb_types::Error::Storage(format!(
-                    "importance {importance} is out of range 1..=10"
-                )));
-            }
+            rb_types::validate_importance(importance)?;
         }
         if self.get_scoped(id.clone()).await?.is_none() {
             return Err(rb_types::Error::NotFound(id));
@@ -573,6 +564,38 @@ mod tests {
         );
         assert_eq!(calls.load(Ordering::SeqCst), 0);
         assert_eq!(eng.backend().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn out_of_range_importance_is_invalid_argument_on_both_paths() {
+        let eng = engine();
+
+        // remember path.
+        let err = eng
+            .remember(input("bad importance on remember", 0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "remember must reject with InvalidArgument, got {err:?}"
+        );
+
+        // update path.
+        let id = eng.remember(input("valid body", 5)).await.unwrap();
+        let err = eng
+            .update(
+                id,
+                rb_types::MemoryUpdates {
+                    importance: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "update must reject with InvalidArgument, got {err:?}"
+        );
     }
 
     async fn seed(
