@@ -89,8 +89,26 @@ fn spawn_daemon(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Result<(
 fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Command {
     let mut cmd = Command::new(self_exe);
     cmd.arg("serve");
+    // Security: never inherit the parent environment into a long-lived detached
+    // daemon. Clear it, then forward ONLY what the daemon needs.
+    cmd.env_clear();
     cmd.env(crate::paths::SOCKET_ENV, socket_path);
     cmd.env(crate::paths::DB_ENV, db_path);
+    // Forward each allowlisted var that is actually set in the parent.
+    const FORWARD: &[&str] = &[
+        "VOYAGE_API_KEY",
+        "ANTHROPIC_API_KEY",
+        "HOME",
+        "PATH",
+        "XDG_RUNTIME_DIR",
+        "XDG_DATA_HOME",
+        "XDG_CONFIG_HOME",
+    ];
+    for key in FORWARD {
+        if let Ok(value) = std::env::var(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
@@ -250,10 +268,16 @@ mod tests {
     }
 
     #[test]
-    fn daemon_command_inherits_resolved_socket_and_db_paths() {
+    fn daemon_command_clears_env_and_forwards_only_allowlisted_vars() {
+        // An allowlisted var the parent has set must be forwarded.
+        std::env::set_var("VOYAGE_API_KEY", "voyage-key");
+        // A parent var NOT on the allowlist must not reach the child.
+        std::env::set_var("RB_TEST_SHOULD_NOT_LEAK", "secret");
+
         let socket = Path::new("/tmp/rb.sock");
         let db = Path::new("/tmp/rb.db");
         let cmd = daemon_command(Path::new("/bin/echo"), socket, db);
+
         let envs: std::collections::HashMap<_, _> = cmd
             .get_envs()
             .filter_map(|(key, value)| {
@@ -261,6 +285,7 @@ mod tests {
             })
             .collect();
 
+        // Forwarded: resolved paths (always set explicitly).
         assert_eq!(
             envs.get(std::ffi::OsStr::new(crate::paths::SOCKET_ENV)),
             Some(&socket.as_os_str().to_os_string())
@@ -269,5 +294,18 @@ mod tests {
             envs.get(std::ffi::OsStr::new(crate::paths::DB_ENV)),
             Some(&db.as_os_str().to_os_string())
         );
+        // Forwarded: allowlisted API key present in the parent.
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("VOYAGE_API_KEY")),
+            Some(&std::ffi::OsString::from("voyage-key"))
+        );
+        // NOT forwarded: an arbitrary parent var.
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("RB_TEST_SHOULD_NOT_LEAK")),
+            "non-allowlisted parent vars must be cleared"
+        );
+
+        std::env::remove_var("RB_TEST_SHOULD_NOT_LEAK");
+        std::env::remove_var("VOYAGE_API_KEY");
     }
 }
