@@ -81,12 +81,45 @@ pub async fn connect_or_start(
 /// `RUSTY_BRAIN_SOCKET`/`RUSTY_BRAIN_DB` so child + client agree on paths.
 fn spawn_daemon(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Result<()> {
     let mut cmd = daemon_command(self_exe, socket_path, db_path);
-    cmd.spawn()
-        .map(|_child| ())
-        .map_err(|e| Error::Io(e.to_string()))
+    cmd.spawn().map(|_child| ()).map_err(|e| Error::from_io(&e))
 }
 
+/// The exact set of parent vars the auto-start child may inherit. Everything
+/// else is cleared. Keep this list minimal — adding a var widens the leak
+/// surface and must fail `daemon_command_forwards_only_allowlisted_vars`.
+const FORWARD_ENV: &[&str] = &[
+    "VOYAGE_API_KEY",
+    "ANTHROPIC_API_KEY",
+    "HOME",
+    "PATH",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+];
+
 fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Command {
+    daemon_command_with(self_exe, socket_path, db_path, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+/// Pure core: build the spawn `Command` from an injected env source so tests can
+/// drive the allowlist without mutating process-global env (unsound under
+/// parallel `#[test]` on Rust 1.81+). The real `daemon_command` injects a
+/// closure over `std::env::var`.
+///
+/// Security: `env_clear()` is called BEFORE any `.env()`, so the child inherits
+/// nothing the parent had — only the two resolved paths plus the subset of
+/// [`FORWARD_ENV`] that `get_env` reports as present.
+fn daemon_command_with<F>(
+    self_exe: &Path,
+    socket_path: &Path,
+    db_path: &Path,
+    get_env: F,
+) -> Command
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut cmd = Command::new(self_exe);
     cmd.arg("serve");
     // Security: never inherit the parent environment into a long-lived detached
@@ -94,18 +127,9 @@ fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Comman
     cmd.env_clear();
     cmd.env(crate::paths::SOCKET_ENV, socket_path);
     cmd.env(crate::paths::DB_ENV, db_path);
-    // Forward each allowlisted var that is actually set in the parent.
-    const FORWARD: &[&str] = &[
-        "VOYAGE_API_KEY",
-        "ANTHROPIC_API_KEY",
-        "HOME",
-        "PATH",
-        "XDG_RUNTIME_DIR",
-        "XDG_DATA_HOME",
-        "XDG_CONFIG_HOME",
-    ];
-    for key in FORWARD {
-        if let Ok(value) = std::env::var(key) {
+    // Forward each allowlisted var that is actually present in the source.
+    for key in FORWARD_ENV {
+        if let Some(value) = get_env(key) {
             cmd.env(key, value);
         }
     }
@@ -268,17 +292,25 @@ mod tests {
     }
 
     #[test]
-    fn daemon_command_clears_env_and_forwards_only_allowlisted_vars() {
-        // An allowlisted var the parent has set must be forwarded.
-        std::env::set_var("VOYAGE_API_KEY", "voyage-key");
-        // A parent var NOT on the allowlist must not reach the child.
-        std::env::set_var("RB_TEST_SHOULD_NOT_LEAK", "secret");
+    fn daemon_command_forwards_only_allowlisted_vars() {
+        use std::collections::HashMap;
+
+        // Injected, in-memory parent env — never touches process-global env, so
+        // this test is sound under parallel execution. It carries one allowlisted
+        // var (VOYAGE_API_KEY) and one var that must NOT leak.
+        let source: HashMap<&str, &str> = HashMap::from([
+            ("VOYAGE_API_KEY", "voyage-key"),
+            ("SECRET_SHOULD_NOT_LEAK", "secret"),
+        ]);
 
         let socket = Path::new("/tmp/rb.sock");
         let db = Path::new("/tmp/rb.db");
-        let cmd = daemon_command(Path::new("/bin/echo"), socket, db);
+        let cmd = daemon_command_with(Path::new("/bin/echo"), socket, db, |key| {
+            source.get(key).map(|v| (*v).to_string())
+        });
 
-        let envs: std::collections::HashMap<_, _> = cmd
+        // After env_clear(), get_envs() returns EXACTLY the explicitly-set vars.
+        let envs: HashMap<_, _> = cmd
             .get_envs()
             .filter_map(|(key, value)| {
                 value.map(|value| (key.to_os_string(), value.to_os_string()))
@@ -294,18 +326,24 @@ mod tests {
             envs.get(std::ffi::OsStr::new(crate::paths::DB_ENV)),
             Some(&db.as_os_str().to_os_string())
         );
-        // Forwarded: allowlisted API key present in the parent.
+        // Forwarded: the one allowlisted var present in the source.
         assert_eq!(
             envs.get(std::ffi::OsStr::new("VOYAGE_API_KEY")),
             Some(&std::ffi::OsString::from("voyage-key"))
         );
-        // NOT forwarded: an arbitrary parent var.
+        // ABSENT: a non-allowlisted var present in the source must not leak.
         assert!(
-            !envs.contains_key(std::ffi::OsStr::new("RB_TEST_SHOULD_NOT_LEAK")),
-            "non-allowlisted parent vars must be cleared"
+            !envs.contains_key(std::ffi::OsStr::new("SECRET_SHOULD_NOT_LEAK")),
+            "non-allowlisted vars must be cleared from the child env"
         );
 
-        std::env::remove_var("RB_TEST_SHOULD_NOT_LEAK");
-        std::env::remove_var("VOYAGE_API_KEY");
+        // EXACT bound: the child env is precisely SOCKET + DB + the allowlisted
+        // vars present in the source (here just VOYAGE_API_KEY) — nothing more.
+        // A future stray `.env(...)` or an added forward var fails this count.
+        assert_eq!(
+            envs.len(),
+            3,
+            "child env must be exactly {{SOCKET, DB, VOYAGE_API_KEY}}, got {envs:?}"
+        );
     }
 }

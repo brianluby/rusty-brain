@@ -117,6 +117,27 @@ mod tests {
     }
 
     #[test]
+    fn io_kind_is_internal_opaque_over_wire() {
+        // IoKind carries a std::io::Error-derived message that may embed a path;
+        // it is mapped as an internal fault, so the wire message is the opaque
+        // sentinel and the sensitive path must not leak to the caller.
+        let r = error_to_response(Error::IoKind {
+            kind: std::io::ErrorKind::ConnectionRefused,
+            message: "/secret/path/to/sock: connection refused".into(),
+        });
+        if let Response::Error { kind, message } = r {
+            assert_eq!(kind, "io");
+            assert_eq!(message, "internal error");
+            assert!(
+                !message.contains("/secret/path"),
+                "internal io path must not leak over the wire"
+            );
+        } else {
+            panic!("expected error response");
+        }
+    }
+
+    #[test]
     fn internal_errors_do_not_leak_detail_over_wire() {
         // Storage errors with internal detail must not expose that detail
         // in the wire message — only the generic "internal error" sentinel.
