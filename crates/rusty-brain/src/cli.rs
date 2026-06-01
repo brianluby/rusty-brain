@@ -28,6 +28,9 @@ pub enum Command {
     /// Run the memory daemon in the foreground until Ctrl-C.
     Serve,
 
+    /// Run the MCP (Model Context Protocol) stdio server for agents.
+    Mcp,
+
     /// Store a new memory.
     Remember {
         /// Memory content (the body to remember).

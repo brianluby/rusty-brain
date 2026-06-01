@@ -29,6 +29,9 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 .context("daemon failed")?;
             Ok(())
         }
+        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path)
+            .await
+            .context("mcp adapter failed"),
         other => run_client(other, cli.json, namespace, &socket_path, &db_path).await,
     }
 }
@@ -49,6 +52,7 @@ async fn run_client(
 
     match command {
         Command::Serve => anyhow::bail!("internal: serve must be handled before run_client"),
+        Command::Mcp => anyhow::bail!("internal: mcp must be handled before run_client"),
         Command::Remember {
             content,
             memory_type,

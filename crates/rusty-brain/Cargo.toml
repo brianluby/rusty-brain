@@ -20,6 +20,8 @@ rb-types = { path = "../rb-types" }
 rb-proto = { path = "../rb-proto" }
 rb-daemon = { path = "../rb-daemon" }
 rb-embed = { path = "../rb-embed" }
+rb-mcp = { path = "../rb-mcp" }
+async-trait = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }

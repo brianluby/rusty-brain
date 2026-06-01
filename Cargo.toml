@@ -31,7 +31,7 @@ include_dir = "0.7"
 sha2 = "0.10"
 tempfile = "3"
 # --- P1 additions ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "io-std", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
