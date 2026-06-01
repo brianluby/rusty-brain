@@ -1,23 +1,48 @@
 use rb_proto::Response;
 use rb_types::Error;
+use tracing::warn;
 
 /// Map a domain error to a stable wire error response.
+///
+/// Client-safe errors (validation / not-found variants) pass their message
+/// through. Internal errors (storage, I/O, migration, serialization,
+/// embedding) are replaced with a generic "internal error" message; the real
+/// detail is logged server-side so it never leaks to the caller.
 pub(crate) fn error_to_response(err: Error) -> Response {
-    let kind = match &err {
-        Error::Storage(_) => "storage",
-        Error::Migration(_) => "migration",
-        Error::NotFound(_) => "not_found",
-        Error::InvalidNamespace(_) => "invalid_namespace",
-        Error::InvalidMemoryType(_) => "invalid_memory_type",
-        Error::InvalidLinkType(_) => "invalid_link_type",
-        Error::Serialization(_) => "serialization",
-        Error::DimensionMismatch { .. } => "dimension_mismatch",
-        Error::Io(_) => "io",
-        Error::Embedding(_) => "embedding",
+    let (kind, message) = match &err {
+        // Client-safe: the message is meaningful to the caller and contains
+        // no internal path or infrastructure detail.
+        Error::NotFound(_) => ("not_found", err.to_string()),
+        Error::InvalidNamespace(_) => ("invalid_namespace", err.to_string()),
+        Error::InvalidMemoryType(_) => ("invalid_memory_type", err.to_string()),
+        Error::InvalidLinkType(_) => ("invalid_link_type", err.to_string()),
+        Error::DimensionMismatch { .. } => ("dimension_mismatch", err.to_string()),
+
+        // Internal: log the real detail, send a generic message to the client.
+        Error::Storage(_) => {
+            warn!(error = %err, "internal storage error");
+            ("storage", "internal error".to_string())
+        }
+        Error::Io(_) => {
+            warn!(error = %err, "internal io error");
+            ("io", "internal error".to_string())
+        }
+        Error::Migration(_) => {
+            warn!(error = %err, "internal migration error");
+            ("migration", "internal error".to_string())
+        }
+        Error::Serialization(_) => {
+            warn!(error = %err, "internal serialization error");
+            ("serialization", "internal error".to_string())
+        }
+        Error::Embedding(_) => {
+            warn!(error = %err, "internal embedding error");
+            ("embedding", "internal error".to_string())
+        }
     };
     Response::Error {
         kind: kind.to_string(),
-        message: err.to_string(),
+        message,
     }
 }
 
@@ -60,12 +85,50 @@ mod tests {
     }
 
     #[test]
-    fn message_does_not_leak_struct_internals() {
-        let r = error_to_response(Error::Storage("disk full".into()));
-        if let Response::Error { message, .. } = r {
-            assert_eq!(message, "storage error: disk full");
+    fn internal_errors_do_not_leak_detail_over_wire() {
+        // Storage errors with internal detail must not expose that detail
+        // in the wire message — only the generic "internal error" sentinel.
+        let r = error_to_response(Error::Storage("/secret/path: permission denied".into()));
+        if let Response::Error { message, kind } = r {
+            assert_eq!(kind, "storage");
+            assert_eq!(
+                message, "internal error",
+                "wire message must not contain internal Storage detail"
+            );
+            assert!(
+                !message.contains("/secret/path"),
+                "internal path must not appear in wire message"
+            );
         } else {
             panic!("expected error response");
+        }
+    }
+
+    #[test]
+    fn client_safe_errors_pass_through_message() {
+        // NotFound, InvalidNamespace, InvalidMemoryType, InvalidLinkType,
+        // and DimensionMismatch are safe to forward verbatim.
+        let id = MemoryId::new();
+        let cases: Vec<Error> = vec![
+            Error::NotFound(id),
+            Error::InvalidNamespace("bad-ns".into()),
+            Error::InvalidMemoryType("bad-type".into()),
+            Error::InvalidLinkType("bad-link".into()),
+            Error::DimensionMismatch {
+                expected: 512,
+                got: 768,
+            },
+        ];
+        for err in cases {
+            let display = err.to_string();
+            if let Response::Error { message, .. } = error_to_response(err) {
+                assert_eq!(
+                    message, display,
+                    "client-safe error message must be forwarded verbatim"
+                );
+            } else {
+                panic!("expected Response::Error");
+            }
         }
     }
 }
