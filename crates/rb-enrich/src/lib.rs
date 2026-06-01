@@ -6,6 +6,8 @@
 //! heuristic path. No live network is touched by the test suite (wiremock only).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
+mod anthropic;
 mod heuristic;
 
+pub use anthropic::AnthropicEnricher;
 pub use heuristic::HeuristicEnricher;
