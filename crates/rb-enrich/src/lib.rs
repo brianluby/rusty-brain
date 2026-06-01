@@ -8,6 +8,8 @@
 
 mod anthropic;
 mod heuristic;
+mod linker;
 
 pub use anthropic::AnthropicEnricher;
 pub use heuristic::HeuristicEnricher;
+pub use linker::AnthropicLinker;
