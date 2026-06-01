@@ -10,3 +10,4 @@ pub mod logging;
 pub mod namespace_detect;
 pub mod output;
 pub mod paths;
+pub mod serve;
