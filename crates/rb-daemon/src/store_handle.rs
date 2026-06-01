@@ -324,6 +324,14 @@ where
     }
 }
 
+/// Run one store operation on the writer thread, containing any panic so a
+/// single bad command cannot take down the daemon.
+///
+/// GUARANTEE (tested by `caught_writer_panic_isolates_and_does_not_lose_later_writes`):
+/// a caught panic (a) is reported to the caller as `Error::Storage`, (b) drops
+/// and reopens the write connection so no partial transaction leaks into later
+/// writes, and (c) keeps the writer loop alive so subsequent commands commit
+/// normally. Only a failed REOPEN (not the panic itself) stops the writer.
 fn run_store_op<F>(
     store: &mut Option<SqliteStore>,
     db_path: &Path,
@@ -766,6 +774,55 @@ mod tests {
         assert!(
             got.is_some(),
             "writer must reopen its store and accept later writes after a caught panic"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caught_writer_panic_isolates_and_does_not_lose_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("panic-isolation".to_string());
+
+        // 1. A successful write before the panic.
+        let before = note(&ns, "written before the panic");
+        let before_id = before.id.clone();
+        handle.write(before, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // 2. Induce a caught writer panic via the test-only command.
+        let (reply, rx) = oneshot::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::PanicForTest { reply })
+            .await
+            .unwrap();
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(_)),
+            "caught panic must surface as a storage error, got {err:?}"
+        );
+
+        // 3. A successful write AFTER the panic (writer reopened its connection).
+        let after = note(&ns, "written after the panic");
+        let after_id = after.id.clone();
+        handle.write(after, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // 4. Both real writes are present; the panic left no partial/corrupt row.
+        assert!(
+            handle.get(ns.clone(), before_id).await.unwrap().is_some(),
+            "pre-panic write must survive"
+        );
+        assert!(
+            handle.get(ns.clone(), after_id).await.unwrap().is_some(),
+            "post-panic write must commit on the reopened connection"
+        );
+        let listed = handle.list(ns, None, 50).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "exactly the two real writes exist; the panic added nothing"
         );
 
         handle.shutdown().await;
