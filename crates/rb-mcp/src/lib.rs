@@ -10,8 +10,10 @@ pub mod jsonrpc;
 pub mod proxy;
 pub mod server;
 pub mod tools;
+pub mod transport;
 
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use proxy::{build_request, response_to_content, DaemonProxy};
 pub use server::handle_request;
 pub use tools::{tool_definitions, ToolDef};
+pub use transport::serve_stdio;
