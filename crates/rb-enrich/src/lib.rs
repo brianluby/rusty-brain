@@ -5,3 +5,7 @@
 //! API and are NEVER required; absence of `ANTHROPIC_API_KEY` degrades to the
 //! heuristic path. No live network is touched by the test suite (wiremock only).
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
+
+mod heuristic;
+
+pub use heuristic::HeuristicEnricher;
