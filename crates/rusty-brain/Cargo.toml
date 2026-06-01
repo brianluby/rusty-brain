@@ -5,13 +5,30 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 repository.workspace = true
-description = "rusty-brain CLI and daemon binary."
+description = "rusty-brain: shared agent memory daemon and CLI."
 
 [[bin]]
 name = "rusty-brain"
 path = "src/main.rs"
 
 [dependencies]
+rb-types = { path = "../rb-types" }
+rb-proto = { path = "../rb-proto" }
+rb-daemon = { path = "../rb-daemon" }
+rb-embed = { path = "../rb-embed" }
+tokio = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+directories = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile = { workspace = true }
+anyhow = { workspace = true }
 
 [lints]
 workspace = true

@@ -1,11 +1,10 @@
-//! `rusty-brain` binary entry point.
-//!
-//! Stub for the P1 setup cluster: prints version and a not-yet-implemented
-//! notice, then exits success. The full clap CLI (serve/remember/recall/...)
-//! is implemented in the daemon and CLI cluster.
+//! `rusty-brain` binary entry point. Parses the CLI; dispatch is wired in Task 34.
 
-fn main() -> std::process::ExitCode {
-    println!("rusty-brain {}", env!("CARGO_PKG_VERSION"));
-    eprintln!("CLI not yet implemented in this build");
-    std::process::ExitCode::SUCCESS
+use clap::Parser;
+use rusty_brain::cli::Cli;
+use std::process::ExitCode;
+
+fn main() -> ExitCode {
+    let _cli = Cli::parse();
+    ExitCode::SUCCESS
 }
