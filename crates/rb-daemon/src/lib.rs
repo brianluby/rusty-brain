@@ -15,7 +15,10 @@ mod shared_embedder;
 mod store_handle;
 
 pub use change::{ChangeKind, MemoryChanged};
-pub use jobs::{ConsolidationConfig, ImportanceConfig, JobsConfig, LinkDecayConfig};
+pub use jobs::{
+    run_once, ConsolidationConfig, ImportanceConfig, JobKind, JobSummary, JobsConfig,
+    LinkDecayConfig,
+};
 pub use paths::{default_db_path, default_socket_path};
 pub use server::{Daemon, DaemonConfig};
 pub use shared_embedder::SharedEmbedder;
