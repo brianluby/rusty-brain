@@ -98,6 +98,32 @@ pub enum Command {
     /// Show the project context payload (recent + important).
     Context,
 
+    /// Stream live change notifications for the current namespace until Ctrl-C.
+    Subscribe,
+
     /// Ping the daemon and report its contract version.
     Status,
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn parses_subscribe_subcommand() {
+        let cli = Cli::parse_from(["rusty-brain", "subscribe"]);
+        assert!(
+            matches!(cli.command, Command::Subscribe),
+            "`rusty-brain subscribe` must parse to Command::Subscribe"
+        );
+    }
+
+    #[test]
+    fn parses_subscribe_with_global_json_flag() {
+        let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
+        assert!(cli.json, "--json is a global flag and applies to subscribe");
+        assert!(matches!(cli.command, Command::Subscribe));
+    }
 }

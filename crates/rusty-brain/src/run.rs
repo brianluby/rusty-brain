@@ -118,6 +118,28 @@ async fn run_client(
                 output::render_context(&recent, &important, total, json)
             );
         }
+        Command::Subscribe => {
+            client.subscribe().await.context("subscribe failed")?;
+            // Stream until the daemon closes the connection (or the process is
+            // interrupted). recv_change returns Err(Io) on a clean close, which
+            // we treat as a normal end-of-stream exit (not a failure).
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
+                    item = client.recv_change() => {
+                        match item {
+                            Ok(item) => {
+                                println!("{}", output::render_change(&item, json));
+                            }
+                            Err(_) => break, // stream closed: clean exit
+                        }
+                    }
+                }
+            }
+        }
         Command::Status => {
             let version = client.ping().await.context("status/ping failed")?;
             if json {
