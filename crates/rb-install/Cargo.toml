@@ -1,0 +1,32 @@
+[package]
+name = "rb-install"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain-install: merge/uninstall/status engine that wires JSON-protocol CLIs to rusty-brain-hooks."
+
+[[bin]]
+name = "rusty-brain-install"
+path = "src/main.rs"
+
+[lib]
+name = "rb_install"
+path = "src/lib.rs"
+
+[dependencies]
+rb-agents = { path = "../rb-agents" }
+rb-types = { path = "../rb-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

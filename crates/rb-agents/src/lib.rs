@@ -8,12 +8,12 @@
 #![forbid(unsafe_code)]
 
 mod claude_code;
-mod cli;
+pub mod cli;
 mod codex;
 mod daemon;
 mod event;
 mod gemini;
-mod install;
+pub mod install;
 mod namespace;
 mod opencode;
 
