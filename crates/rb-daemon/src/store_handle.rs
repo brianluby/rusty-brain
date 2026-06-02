@@ -71,6 +71,19 @@ enum WriteCommand {
         ids: Vec<MemoryId>,
         reply: oneshot::Sender<Result<()>>,
     },
+    SetLinkStrength {
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    DeleteLink {
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -287,6 +300,49 @@ impl StoreHandle {
     #[doc(hidden)]
     pub async fn read_pool_len_for_test(&self) -> usize {
         self.pool.stores.lock().await.len()
+    }
+
+    /// Read up to `limit` link edges (cross-namespace) via the read pool, for
+    /// the link-decay job. Reads never go through the writer.
+    pub async fn links_for_decay(&self, limit: usize) -> Result<Vec<rb_store::LinkRow>> {
+        self.with_read(move |store| store.links_for_decay(limit))
+            .await
+    }
+
+    /// Set the strength of a single link edge through the single writer.
+    pub async fn set_link_strength(
+        &self,
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::SetLinkStrength {
+            source,
+            target,
+            link_type,
+            strength,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Delete a single link edge through the single writer.
+    pub async fn delete_link(
+        &self,
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::DeleteLink {
+            source,
+            target,
+            link_type,
+            reply,
+        };
+        self.send_write(cmd, rx).await
     }
 }
 
@@ -533,6 +589,37 @@ fn writer_loop(
                 // No MemoryChanged event: access tracking is observability-only.
                 let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
                     s.record_accesses(&ids)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::SetLinkStrength {
+                source,
+                target,
+                link_type,
+                strength,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.set_link_strength(&source, &target, link_type, strength)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::DeleteLink {
+                source,
+                target,
+                link_type,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.delete_link(&source, &target, link_type)
                 });
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -869,5 +956,59 @@ mod tests {
              (before={before}, after={})",
             dropped_broadcast_count()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_link_decay_read_write_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("decay-handle".to_string());
+
+        let a = note(&ns, "source for decay");
+        let b = note(&ns, "target for decay");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.9,
+                reason: "seed".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // Read candidates via the pool.
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].strength - 0.9).abs() < f32::EPSILON);
+
+        // Set strength via the single writer.
+        handle
+            .set_link_strength(
+                aid.clone(),
+                bid.clone(),
+                rb_types::LinkType::References,
+                0.3,
+            )
+            .await
+            .unwrap();
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert!((rows[0].strength - 0.3).abs() < f32::EPSILON);
+
+        // Delete via the single writer.
+        handle
+            .delete_link(aid, bid, rb_types::LinkType::References)
+            .await
+            .unwrap();
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert!(rows.is_empty(), "link removed");
+
+        handle.shutdown().await;
     }
 }
