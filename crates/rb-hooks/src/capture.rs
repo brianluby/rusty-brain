@@ -512,7 +512,7 @@ mod tests {
                 .current_dir(tmp.path())
                 .output()
         };
-        if run(&["init"]).map(|o| o.status.success()).unwrap_or(false) == false {
+        if !run(&["init"]).map(|o| o.status.success()).unwrap_or(false) {
             return; // git unavailable; skip
         }
         let _ = run(&["config", "user.email", "t@t.com"]);

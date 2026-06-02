@@ -1,9 +1,184 @@
+//! `rusty-brain-hooks` — the per-event capture hook binary.
+//!
+//! FAIL-OPEN CONTRACT: this binary NEVER blocks, NEVER returns non-zero, and
+//! NEVER lets an error reach the agent. It reads one event JSON on stdin,
+//! captures memories / injects context best-effort, prints the CLI-specific
+//! `{"continue":true,...}` to stdout, and always exits 0. Any panic or error
+//! anywhere degrades to a literal `{"continue":true}`.
+
 mod capture;
 mod cli;
 mod dedup;
 mod dispatch;
 mod io;
 
+use std::time::Duration;
+
+use rb_agents::agent_for;
+use rb_agents::detect_namespace;
+use rb_agents::{AutoStart, DaemonClient};
+use rb_agents::{HookEvent, HookResult};
+
+use crate::cli::Args;
+use crate::dedup::DedupCache;
+
+/// Overall wall-clock budget for the connect+capture phase. On expiry the
+/// harness abandons the daemon work and still prints a fail-open response.
+const OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-connect budget for reaching the daemon.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
+
 fn main() {
+    // Optional tracing to stderr only when RUSTY_BRAIN_LOG is set (no stderr by
+    // default so we never pollute the agent's hook channel).
+    if std::env::var_os("RUSTY_BRAIN_LOG").is_some() {
+        let _ = tracing_subscriber_try_init();
+    }
+
+    let result = std::panic::catch_unwind(run);
+    let rendered = match result {
+        Ok(value) => value,
+        Err(_) => serde_json::json!({ "continue": true }),
+    };
+    io::write_stdout(&rendered);
     std::process::exit(0);
+}
+
+/// Best-effort tracing init; ignored if the subscriber crate is unavailable.
+fn tracing_subscriber_try_init() -> Result<(), ()> {
+    // We deliberately avoid a hard dependency on tracing-subscriber here; the
+    // tracing macros are no-ops without a subscriber, which is fine for fail-open.
+    Ok(())
+}
+
+/// The real body. Returns the JSON value to print. Any internal error is mapped
+/// to a fail-open render so `main` can print it unconditionally.
+fn run() -> serde_json::Value {
+    // Parse args; on failure, last-resort literal continue.
+    let args = match Args::parse_from(std::env::args()) {
+        Ok(args) => args,
+        Err(e) => {
+            tracing::warn!("arg parse failed (fail-open): {e}");
+            return serde_json::json!({ "continue": true });
+        }
+    };
+
+    let cli = agent_for(args.agent);
+
+    // Read + parse stdin (fail-open: Null on empty/invalid).
+    let raw = io::read_stdin_json();
+    let ctx = cli.parse_input(&raw);
+
+    // Namespace detection runs OFF the async runtime (it shells out to git and
+    // reads files). detect_namespace never panics; degrades to Global.
+    let namespace = detect_namespace(&ctx.cwd);
+
+    // Only SessionStart may auto-start the daemon. Other events never spawn.
+    let auto_start = match &ctx.event {
+        HookEvent::SessionStart { .. } => self_exe().map(|self_exe| AutoStart {
+            self_exe,
+            db: db_path(),
+        }),
+        _ => None,
+    };
+
+    let dedup = DedupCache::for_namespace(&namespace);
+
+    // Build a runtime; if that fails, fail open.
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(rt) => rt,
+        Err(e) => {
+            tracing::warn!("runtime build failed (fail-open): {e}");
+            return cli.render_output(&continue_result());
+        }
+    };
+
+    let result = runtime.block_on(async {
+        // Overall timeout guards the whole connect+capture phase.
+        match tokio::time::timeout(
+            OVERALL_TIMEOUT,
+            capture_phase(&namespace, auto_start, &dedup, &ctx),
+        )
+        .await
+        {
+            Ok(result) => result,
+            Err(_) => {
+                tracing::warn!("overall timeout (fail-open)");
+                continue_result()
+            }
+        }
+    });
+
+    cli.render_output(&result)
+}
+
+/// Connect (best-effort) and dispatch the event to its capture flow.
+async fn capture_phase(
+    namespace: &rb_types::Namespace,
+    auto_start: Option<AutoStart>,
+    dedup: &DedupCache,
+    ctx: &rb_agents::HookContext,
+) -> HookResult {
+    let socket = socket_path();
+    let mut client =
+        DaemonClient::connect(&socket, namespace.clone(), CONNECT_TIMEOUT, auto_start).await;
+    dispatch::dispatch(client.as_mut(), dedup, ctx).await
+}
+
+fn continue_result() -> HookResult {
+    HookResult {
+        system_message: None,
+        continue_execution: true,
+    }
+}
+
+/// Resolve the daemon socket path from `RUSTY_BRAIN_SOCKET`, else a temp default.
+fn socket_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("RUSTY_BRAIN_SOCKET") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    default_runtime_dir().join("rusty-brain").join("sock")
+}
+
+/// Resolve the daemon db path from `RUSTY_BRAIN_DB`, else a data-dir default.
+fn db_path() -> std::path::PathBuf {
+    if let Some(p) = std::env::var_os("RUSTY_BRAIN_DB") {
+        if !p.is_empty() {
+            return std::path::PathBuf::from(p);
+        }
+    }
+    default_data_dir().join("rusty-brain").join("memory.db")
+}
+
+fn default_runtime_dir() -> std::path::PathBuf {
+    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    std::env::temp_dir()
+}
+
+fn default_data_dir() -> std::path::PathBuf {
+    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
+        if !d.is_empty() {
+            return std::path::PathBuf::from(d);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        if !home.is_empty() {
+            return std::path::PathBuf::from(home).join(".local").join("share");
+        }
+    }
+    std::env::temp_dir()
+}
+
+/// Path to this executable, for daemon auto-start. `None` if unresolved.
+fn self_exe() -> Option<std::path::PathBuf> {
+    std::env::current_exe().ok()
 }

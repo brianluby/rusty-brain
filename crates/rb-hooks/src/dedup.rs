@@ -34,6 +34,7 @@ impl DedupCache {
     }
 
     /// Construct a cache at an explicit path (used by tests).
+    #[cfg(test)]
     pub fn at(cache_path: PathBuf) -> Self {
         Self { cache_path }
     }
