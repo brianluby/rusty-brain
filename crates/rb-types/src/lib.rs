@@ -5,6 +5,7 @@
 //! `MemoryLink`, `SearchQuery`, `SearchResult`, `MemoryUpdates`, `Error`) used
 //! across the engine, store, daemon, and binary.
 
+mod change;
 mod error;
 mod link;
 mod link_type;
@@ -15,6 +16,7 @@ mod namespace;
 mod query;
 mod validate;
 
+pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
 pub use link::MemoryLink;
 pub use link_type::LinkType;
