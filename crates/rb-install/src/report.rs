@@ -55,6 +55,10 @@ pub enum ReportStatus {
     Success,
     Partial,
     Failed,
+    /// Nothing was changed: no agents at all, or every agent was absent /
+    /// not-found. A neutral outcome — not a success (we configured nothing) and
+    /// not a failure (nothing went wrong).
+    NoChanges,
 }
 
 /// The full install/uninstall/status report (JSON root).
@@ -70,6 +74,20 @@ impl InstallReport {
     /// Roll up per-agent statuses into the overall report status.
     #[must_use]
     pub fn roll_up(scope: &str, dry_run: bool, agents: Vec<AgentReport>) -> Self {
+        // Nothing to do: an empty list, or every agent absent/not-found, is a
+        // neutral NoChanges — never a (misleading) Success.
+        let nothing_changed = agents.is_empty()
+            || agents
+                .iter()
+                .all(|a| matches!(a.status, AgentStatus::NotFound | AgentStatus::Absent));
+        if nothing_changed {
+            return Self {
+                status: ReportStatus::NoChanges,
+                scope: scope.to_string(),
+                dry_run,
+                agents,
+            };
+        }
         let any_failed = agents.iter().any(|a| a.status == AgentStatus::Failed);
         let any_ok = agents.iter().any(|a| {
             matches!(
@@ -127,6 +145,40 @@ mod tests {
         let json = serde_json::to_string(&r).unwrap();
         assert!(json.contains("\"status\":\"success\""));
         assert!(json.contains("\"agent\":\"claude-code\""));
+    }
+
+    #[test]
+    fn roll_up_no_changes_for_empty_agent_list() {
+        let r = InstallReport::roll_up("project", false, vec![]);
+        assert_eq!(r.status, ReportStatus::NoChanges);
+        let json = serde_json::to_string(&r).unwrap();
+        assert!(json.contains("\"status\":\"no_changes\""));
+    }
+
+    #[test]
+    fn roll_up_no_changes_when_all_absent_or_not_found() {
+        let agents = vec![
+            AgentReport {
+                agent: "claude-code".into(),
+                status: AgentStatus::NotFound,
+                config_path: None,
+                version: None,
+                error: None,
+            },
+            AgentReport {
+                agent: "codex".into(),
+                status: AgentStatus::Absent,
+                config_path: None,
+                version: None,
+                error: None,
+            },
+        ];
+        let r = InstallReport::roll_up("project", false, agents);
+        assert_eq!(
+            r.status,
+            ReportStatus::NoChanges,
+            "all agents absent/not-found must not report success"
+        );
     }
 
     #[test]
