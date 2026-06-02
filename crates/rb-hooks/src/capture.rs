@@ -1,0 +1,283 @@
+//! The four capture flows: SessionStart (inject), PostToolUse (capture mutating
+//! tools, deduped), Stop (session summary + git-modified files), PreCompact
+//! (capture decisions). Every flow returns a `HookResult` with
+//! `continue_execution: true`; nothing ever blocks.
+
+use rb_agents::DaemonClient;
+use rb_agents::HookResult;
+use rb_types::MemoryType;
+
+use crate::dedup::DedupCache;
+
+/// Mutation tools whose observations are captured. Discovery tools (Read, Grep,
+/// Glob, WebFetch, ...) are excluded to reduce noise and improve recall quality.
+const MUTATION_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "Bash"];
+
+/// Max characters retained from a tool response before head/tail truncation.
+const MAX_RESPONSE_CHARS: usize = 2000;
+
+const TRUNCATION_MARKER: &str = "[...truncated...]";
+
+/// A `HookResult` that injects no message and always continues.
+fn continue_only() -> HookResult {
+    HookResult {
+        system_message: None,
+        continue_execution: true,
+    }
+}
+
+/// True if `tool_name` is a captured mutation tool.
+fn is_mutation_tool(tool_name: &str) -> bool {
+    MUTATION_TOOLS.contains(&tool_name)
+}
+
+/// Map a tool name to a `MemoryType`: file-mutation tools are code patterns;
+/// everything else (Bash, unknown) is a reference observation.
+fn classify_tool(tool_name: &str) -> MemoryType {
+    match tool_name {
+        "Edit" | "Write" | "NotebookEdit" => MemoryType::CodePattern,
+        _ => MemoryType::Reference,
+    }
+}
+
+/// Head/tail truncate to roughly `max_chars`, inserting a marker. UTF-8 safe:
+/// boundaries are taken on `char_indices`, never raw byte offsets.
+fn truncate_head_tail(content: &str, max_chars: usize) -> String {
+    let char_count = content.chars().count();
+    if char_count <= max_chars {
+        return content.to_string();
+    }
+    let marker_len = TRUNCATION_MARKER.chars().count();
+    let budget = max_chars.saturating_sub(marker_len);
+    let head_chars = budget * 60 / 100;
+    let tail_chars = budget.saturating_sub(head_chars);
+    let head_end = content
+        .char_indices()
+        .nth(head_chars)
+        .map_or(content.len(), |(idx, _)| idx);
+    let tail_start = content
+        .char_indices()
+        .nth(char_count.saturating_sub(tail_chars))
+        .map_or(content.len(), |(idx, _)| idx);
+    let head = &content[..head_end];
+    let tail = &content[tail_start..];
+    format!("{head}{TRUNCATION_MARKER}{tail}")
+}
+
+/// Pull a string field from a JSON object, defaulting to `"unknown"`.
+fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
+    input.get(key).and_then(|v| v.as_str()).unwrap_or("unknown")
+}
+
+/// Build a concise, human-readable summary of a tool invocation.
+fn summarize_post_tool_use(tool_name: &str, tool_input: &serde_json::Value) -> String {
+    match tool_name {
+        "Edit" => format!("Edited {}", str_field(tool_input, "file_path")),
+        "Write" => format!("Wrote {}", str_field(tool_input, "file_path")),
+        "NotebookEdit" => format!("Edited notebook {}", str_field(tool_input, "notebook_path")),
+        "Bash" => {
+            let cmd = str_field(tool_input, "command");
+            let truncated = match cmd.char_indices().nth(80) {
+                Some((idx, _)) => &cmd[..idx],
+                None => cmd,
+            };
+            format!("Ran command: {truncated}")
+        }
+        other => format!("Used {other}"),
+    }
+}
+
+/// Extract text from a tool response value (string used directly; else JSON).
+fn extract_response_text(response: &serde_json::Value) -> String {
+    match response {
+        serde_json::Value::Null => String::new(),
+        serde_json::Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_default(),
+    }
+}
+
+/// PostToolUse capture flow. No-op (continue) for non-mutation tools or
+/// deduplicated observations; otherwise builds a summary + truncated context and
+/// calls `DaemonClient::remember`. Always returns `continue_execution: true`.
+pub async fn post_tool_use(
+    client: Option<&mut DaemonClient>,
+    dedup: &DedupCache,
+    tool_name: &str,
+    tool_input: &serde_json::Value,
+    tool_response: &serde_json::Value,
+) -> HookResult {
+    if !is_mutation_tool(tool_name) {
+        return continue_only();
+    }
+    let summary = summarize_post_tool_use(tool_name, tool_input);
+    if dedup.is_duplicate(tool_name, &summary) {
+        return continue_only();
+    }
+
+    let memory_type = classify_tool(tool_name);
+    let raw = extract_response_text(tool_response);
+    let context = if raw.trim().is_empty() {
+        None
+    } else {
+        Some(truncate_head_tail(&raw, MAX_RESPONSE_CHARS))
+    };
+
+    if let Some(client) = client {
+        let _ = client
+            .remember(
+                summary.clone(),
+                context,
+                memory_type,
+                5,
+                vec!["hook".to_string(), "post-tool-use".to_string()],
+            )
+            .await;
+    }
+    // Record AFTER a (best-effort) store so a failed connect does not poison the
+    // dedup window — but record regardless of remember outcome to bound retries.
+    dedup.record(tool_name, &summary);
+    continue_only()
+}
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+
+    #[test]
+    fn mutation_tools_are_recognized() {
+        for t in ["Edit", "Write", "NotebookEdit", "Bash"] {
+            assert!(is_mutation_tool(t), "{t} should be a mutation tool");
+        }
+    }
+
+    #[test]
+    fn discovery_tools_are_not_mutation() {
+        for t in ["Read", "Grep", "Glob", "WebFetch", "WebSearch", ""] {
+            assert!(!is_mutation_tool(t), "{t} should not be a mutation tool");
+        }
+    }
+
+    #[test]
+    fn classify_file_tools_to_code_pattern() {
+        assert_eq!(classify_tool("Edit"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("Write"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("NotebookEdit"), MemoryType::CodePattern);
+    }
+
+    #[test]
+    fn classify_bash_to_reference() {
+        assert_eq!(classify_tool("Bash"), MemoryType::Reference);
+    }
+
+    #[test]
+    fn classify_unknown_defaults_to_reference() {
+        assert_eq!(classify_tool("SomeFutureTool"), MemoryType::Reference);
+    }
+
+    #[test]
+    fn truncate_passes_through_short_content() {
+        let s = "short content";
+        assert_eq!(truncate_head_tail(s, 100), s);
+    }
+
+    #[test]
+    fn truncate_inserts_marker_for_long_content() {
+        let s = "a".repeat(5000);
+        let out = truncate_head_tail(&s, 100);
+        assert!(out.len() < s.len());
+        assert!(out.contains("[...truncated...]"));
+    }
+
+    #[test]
+    fn truncate_is_utf8_safe() {
+        let s = "é".repeat(5000);
+        let out = truncate_head_tail(&s, 100);
+        // Must remain valid UTF-8 (no panic on multibyte boundaries).
+        assert!(out.contains("[...truncated...]"));
+    }
+
+    #[test]
+    fn summarize_edit_includes_tool_and_path() {
+        let input = serde_json::json!({"file_path": "/src/main.rs"});
+        let summary = summarize_post_tool_use("Edit", &input);
+        assert_eq!(summary, "Edited /src/main.rs");
+    }
+
+    #[test]
+    fn summarize_write_includes_path() {
+        let input = serde_json::json!({"file_path": "/src/lib.rs"});
+        let summary = summarize_post_tool_use("Write", &input);
+        assert_eq!(summary, "Wrote /src/lib.rs");
+    }
+
+    #[test]
+    fn summarize_bash_includes_truncated_command() {
+        let input = serde_json::json!({"command": "cargo test --workspace"});
+        let summary = summarize_post_tool_use("Bash", &input);
+        assert_eq!(summary, "Ran command: cargo test --workspace");
+    }
+
+    #[test]
+    fn summarize_bash_truncates_long_command() {
+        let input = serde_json::json!({"command": "x".repeat(200)});
+        let summary = summarize_post_tool_use("Bash", &input);
+        assert!(summary.starts_with("Ran command: "));
+        assert!(summary.len() < 200);
+    }
+
+    #[test]
+    fn summarize_missing_field_uses_unknown() {
+        let input = serde_json::json!({});
+        assert_eq!(summarize_post_tool_use("Edit", &input), "Edited unknown");
+    }
+
+    #[test]
+    fn summarize_notebook_edit_uses_path() {
+        let input = serde_json::json!({"notebook_path": "/nb.ipynb"});
+        let summary = summarize_post_tool_use("NotebookEdit", &input);
+        assert_eq!(summary, "Edited notebook /nb.ipynb");
+    }
+
+    #[test]
+    fn extract_response_text_handles_variants() {
+        assert_eq!(extract_response_text(&serde_json::Value::Null), "");
+        assert_eq!(extract_response_text(&serde_json::json!("hello")), "hello");
+        let obj = extract_response_text(&serde_json::json!({"k": "v"}));
+        assert!(obj.contains("\"k\""));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_non_mutation_is_noop_continue() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "Read",
+            &serde_json::json!({"file_path": "/x"}),
+            &serde_json::json!("contents"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(result.system_message.is_none());
+        // Non-mutation must not poison the dedup cache.
+        assert!(!dedup.is_duplicate("Read", "Read /x"));
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_records_dedup_for_mutation() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "Edit",
+            &serde_json::json!({"file_path": "/src/main.rs"}),
+            &serde_json::json!("ok"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(dedup.is_duplicate("Edit", "Edited /src/main.rs"));
+    }
+}

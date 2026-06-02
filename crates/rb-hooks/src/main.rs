@@ -1,3 +1,4 @@
+mod capture;
 mod cli;
 mod dedup;
 mod io;
