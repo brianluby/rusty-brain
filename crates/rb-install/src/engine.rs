@@ -273,10 +273,45 @@ mod tests {
         assert!(matches!(result, Err(InstallError::InvalidAgent { .. })));
     }
 
+    /// A test-only installer whose `detect()` always succeeds, so engine tests
+    /// that exercise the detect -> fragment dry-run flow do not depend on a real
+    /// agent CLI being on `PATH` (it is not on CI). Emits a Claude-Code-shaped
+    /// fragment under the scope directory.
+    struct FakeInstaller;
+
+    impl AgentInstaller for FakeInstaller {
+        fn id(&self) -> AgentId {
+            AgentId::ClaudeCode
+        }
+
+        fn detect(&self) -> Option<String> {
+            Some("fake-1.0".to_string())
+        }
+
+        fn hook_fragment(
+            &self,
+            _hooks_bin: &std::path::Path,
+            scope: &InstallScope,
+        ) -> rb_types::Result<rb_agents::install::HookFragment> {
+            let base = match scope {
+                InstallScope::Project(p) => p.clone(),
+                InstallScope::Global => std::path::PathBuf::from("/tmp"),
+            };
+            Ok(rb_agents::install::HookFragment {
+                config_path: base.join(".claude").join("settings.json"),
+                merge: serde_json::json!({ "hooks": {} }),
+            })
+        }
+    }
+
     #[test]
     fn dry_run_install_writes_nothing_but_reports_would_configure() {
+        // Use a fake installer whose detect() always succeeds, so this test is
+        // deterministic regardless of whether `claude` is on PATH (it is not on
+        // CI). This exercises the engine's dry-run WouldConfigure path, not binary
+        // detection.
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
+        let installers: Vec<Box<dyn AgentInstaller>> = vec![Box::new(FakeInstaller)];
         let scope = InstallScope::Project(dir.path().to_path_buf());
         let report = run_install(
             &installers,
