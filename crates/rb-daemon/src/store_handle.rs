@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rb_engine::MemoryBackend;
-use rb_store::{SqliteStore, Store};
+use rb_store::{RecalRow, SqliteStore, Store};
 use rb_types::{Error, MemoryId, MemoryNote, MemoryUpdates, Namespace, Result};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Semaphore};
 
@@ -195,6 +195,15 @@ impl StoreHandle {
     /// Subscribe to best-effort memory change notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<MemoryChanged> {
         self.events.subscribe()
+    }
+
+    /// Read up to `limit` active memories with the fields the importance job
+    /// needs. Goes through the bounded read pool (never the writer). Used only by
+    /// the cross-namespace maintenance jobs, which then issue any importance
+    /// changes back through `update` (the single writer).
+    pub async fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
+        self.with_read(move |store| store.memories_for_recalibration(limit))
+            .await
     }
 
     /// Gracefully close the write queue and join the dedicated writer thread.
@@ -1275,6 +1284,36 @@ mod tests {
         );
         // Every returned candidate carries its namespace for per-ns grouping.
         assert!(cands.iter().all(|c| c.namespace == ns));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_memories_for_recalibration_reads_access_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("recal".to_string());
+
+        let m = note(&ns, "accessed twice");
+        let id = m.id.clone();
+        handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // Two accesses bump access_count to 2 and stamp last_accessed_at.
+        handle.record_access(id.clone()).await.unwrap();
+        handle.record_access(id.clone()).await.unwrap();
+
+        let rows = handle.memories_for_recalibration(100).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == id)
+            .expect("recal row must be present");
+        assert_eq!(row.namespace, ns);
+        assert_eq!(row.access_count, 2, "two record_access calls => count 2");
+        assert!(
+            row.last_accessed_at.is_some(),
+            "last_accessed_at must be stamped after record_access"
+        );
 
         handle.shutdown().await;
     }
