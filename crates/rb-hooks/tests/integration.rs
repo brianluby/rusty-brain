@@ -76,12 +76,12 @@ fn unknown_agent_fails_open_with_literal_continue() {
         .stderr(std::process::Stdio::piped())
         .spawn()
         .expect("spawn");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(b"{}")
-        .expect("write");
+    // The bogus-agent binary fails open and may exit BEFORE reading stdin, closing
+    // the read end of the pipe; the resulting broken-pipe write error is EXPECTED,
+    // not a failure. The contract under test is exit-0 + a literal continue,
+    // independent of whether stdin was consumed. Asserting the write succeeded
+    // raced on fast CI runners (the child exited before the parent's write).
+    let _ = child.stdin.take().expect("stdin").write_all(b"{}");
     let output = child.wait_with_output().expect("wait");
     assert!(output.status.success(), "unknown agent must exit 0");
     let stdout = String::from_utf8_lossy(&output.stdout);
