@@ -8,7 +8,7 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use rb_engine::MemoryBackend;
-use rb_store::{SqliteStore, Store};
+use rb_store::{RecalRow, SqliteStore, Store};
 use rb_types::{Error, MemoryId, MemoryNote, MemoryUpdates, Namespace, Result};
 use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Semaphore};
 
@@ -69,6 +69,25 @@ enum WriteCommand {
     },
     RecordAccesses {
         ids: Vec<MemoryId>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    SetLinkStrength {
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    DeleteLink {
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    Supersede {
+        namespace: Namespace,
+        old: MemoryId,
+        new: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
     #[cfg(test)]
@@ -176,6 +195,15 @@ impl StoreHandle {
     /// Subscribe to best-effort memory change notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<MemoryChanged> {
         self.events.subscribe()
+    }
+
+    /// Read up to `limit` active memories with the fields the importance job
+    /// needs. Goes through the bounded read pool (never the writer). Used only by
+    /// the cross-namespace maintenance jobs, which then issue any importance
+    /// changes back through `update` (the single writer).
+    pub async fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
+        self.with_read(move |store| store.memories_for_recalibration(limit))
+            .await
     }
 
     /// Gracefully close the write queue and join the dedicated writer thread.
@@ -287,6 +315,95 @@ impl StoreHandle {
     #[doc(hidden)]
     pub async fn read_pool_len_for_test(&self) -> usize {
         self.pool.stores.lock().await.len()
+    }
+
+    /// Read up to `limit` link edges (cross-namespace) via the read pool, for
+    /// the link-decay job. Reads never go through the writer.
+    pub async fn links_for_decay(&self, limit: usize) -> Result<Vec<rb_store::LinkRow>> {
+        self.with_read(move |store| store.links_for_decay(limit))
+            .await
+    }
+
+    /// Set the strength of a single link edge through the single writer.
+    pub async fn set_link_strength(
+        &self,
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::SetLinkStrength {
+            source,
+            target,
+            link_type,
+            strength,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Delete a single link edge through the single writer.
+    pub async fn delete_link(
+        &self,
+        source: MemoryId,
+        target: MemoryId,
+        link_type: rb_types::LinkType,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::DeleteLink {
+            source,
+            target,
+            link_type,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Read near-duplicate candidates for `id` within `ns` via the read pool.
+    /// Namespace-isolated (see `SqliteStore::near_duplicates`); used by the
+    /// consolidation job to find merge candidates without crossing namespaces.
+    pub async fn near_duplicates(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        self.with_read(move |store| store.near_duplicates(&ns, &id, threshold, limit))
+            .await
+    }
+
+    /// Supersede `old` with `new`: archive `old` and point it at `new`, through
+    /// the single writer. The `namespace` is carried only for the published
+    /// `Archived` change event; the FK-guarded SQL keys on ids. Fails closed
+    /// (rolls back) if `new` does not exist.
+    pub async fn supersede(
+        &self,
+        namespace: Namespace,
+        old: MemoryId,
+        new: MemoryId,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::Supersede {
+            namespace,
+            old,
+            new,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Enumerate up to `limit` active, non-superseded memories across ALL
+    /// namespaces, oldest first then by id, for the consolidation job to scan.
+    /// Each candidate carries the id/namespace/importance/created_at the job and
+    /// its survivor policy need. Reads via the pool.
+    pub async fn candidates_for_consolidation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::jobs::consolidation::Candidate>> {
+        self.with_read(move |store| store.candidates_for_consolidation(limit))
+            .await
     }
 }
 
@@ -536,6 +653,78 @@ fn writer_loop(
                 });
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::SetLinkStrength {
+                source,
+                target,
+                link_type,
+                strength,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.set_link_strength(&source, &target, link_type, strength)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::DeleteLink {
+                source,
+                target,
+                link_type,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.delete_link(&source, &target, link_type)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::Supersede {
+                namespace,
+                old,
+                new,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    // Mirror the Update/Archive arms: verify BOTH memories live in
+                    // the caller's namespace before mutating, so the primitive can
+                    // never merge across namespaces and the Archived event below is
+                    // provably published under `old`'s real namespace. Fail closed
+                    // (NotFound) on a missing or cross-namespace target.
+                    match (s.get_memory(&old), s.get_memory(&new)) {
+                        (Ok(Some(o)), Ok(Some(n)))
+                            if o.namespace == namespace && n.namespace == namespace =>
+                        {
+                            s.supersede(&old, &new)
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                        _ => Err(Error::NotFound(old.clone())),
+                    }
+                });
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                // supersede archives `old`; mirror the Archive arm so subscribers
+                // observe the consolidation as an Archived event for `old`.
+                if changed {
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id: old,
+                            namespace,
+                            kind: ChangeKind::Archived,
+                        },
+                    );
+                }
                 if !writer_usable {
                     break;
                 }
@@ -869,5 +1058,314 @@ mod tests {
              (before={before}, after={})",
             dropped_broadcast_count()
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_link_decay_read_write_round_trip() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("decay-handle".to_string());
+
+        let a = note(&ns, "source for decay");
+        let b = note(&ns, "target for decay");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.9,
+                reason: "seed".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // Read candidates via the pool.
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].strength - 0.9).abs() < f32::EPSILON);
+
+        // Set strength via the single writer.
+        handle
+            .set_link_strength(
+                aid.clone(),
+                bid.clone(),
+                rb_types::LinkType::References,
+                0.3,
+            )
+            .await
+            .unwrap();
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert!((rows[0].strength - 0.3).abs() < f32::EPSILON);
+
+        // Delete via the single writer.
+        handle
+            .delete_link(aid, bid, rb_types::LinkType::References)
+            .await
+            .unwrap();
+        let rows = handle.links_for_decay(10).await.unwrap();
+        assert!(rows.is_empty(), "link removed");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_near_duplicates_is_namespace_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns_a = Namespace::Project("a".to_string());
+        let ns_b = Namespace::Project("b".to_string());
+
+        // Anchor + near-identical twin in A.
+        let mut anchor = note(&ns_a, "anchor");
+        anchor.id = rb_types::MemoryId::new();
+        let anchor_id = anchor.id.clone();
+        handle
+            .write(
+                anchor,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let twin = note(&ns_a, "twin");
+        let twin_id = twin.id.clone();
+        handle
+            .write(twin, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // A near-identical memory in namespace B that must never be returned.
+        let foreign = note(&ns_b, "foreign");
+        let foreign_id = foreign.id.clone();
+        handle
+            .write(
+                foreign,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let dups = handle
+            .near_duplicates(ns_a.clone(), anchor_id.clone(), 0.95, 10)
+            .await
+            .unwrap();
+        let ids: Vec<rb_types::MemoryId> = dups.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![twin_id],
+            "only the same-namespace twin is returned"
+        );
+        assert!(!ids.contains(&anchor_id), "anchor excluded (self)");
+        assert!(!ids.contains(&foreign_id), "ns-B memory never crosses over");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_archives_old_and_sets_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old fact");
+        let new = note(&ns, "new fact");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        handle
+            .supersede(ns.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let got_old = handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_old.superseded_by.as_ref(), Some(&new_id));
+        assert!(got_old.archived_at.is_some(), "old must be archived");
+        let got_new = handle
+            .get(ns.clone(), new_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_new.superseded_by.is_none());
+        assert!(got_new.archived_at.is_none());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_missing_new_target_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old only");
+        let old_id = old.id.clone();
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        let err = handle
+            .supersede(ns.clone(), old_id.clone(), rb_types::MemoryId::new())
+            .await
+            .unwrap_err();
+        // The namespace guard loads `new` first and fails closed when it does not
+        // exist, before ever touching `old`.
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+        let got_old = handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_old.superseded_by.is_none(), "old untouched: no pointer");
+        assert!(got_old.archived_at.is_none(), "old untouched: not archived");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_rejects_cross_namespace_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns_a = Namespace::Project("a".to_string());
+        let ns_b = Namespace::Project("b".to_string());
+
+        let old = note(&ns_a, "a-old");
+        let new = note(&ns_b, "b-new");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // Superseding an A memory into a B memory must fail closed: the namespace
+        // guard refuses to merge across namespaces even though `new` exists.
+        let err = handle
+            .supersede(ns_a.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+        let got_old = handle
+            .get(ns_a.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            got_old.superseded_by.is_none(),
+            "no cross-namespace pointer"
+        );
+        assert!(got_old.archived_at.is_none(), "old untouched: not archived");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_publishes_archived_event_for_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old fact");
+        let new = note(&ns, "new fact");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let mut rx = handle.subscribe();
+        handle
+            .supersede(ns.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.id, old_id, "Archived event must target the old memory");
+        assert_eq!(evt.namespace, ns);
+        assert_eq!(
+            evt.kind,
+            crate::change::ChangeKind::Archived,
+            "supersede must publish an Archived event for the absorbed memory"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidates_for_consolidation_lists_active_non_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("scan".to_string());
+
+        let keep = note(&ns, "active");
+        let archived = note(&ns, "archived");
+        let new = note(&ns, "survivor");
+        let (keep_id, archived_id, new_id) = (keep.id.clone(), archived.id.clone(), new.id.clone());
+        handle.write(keep, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle
+            .write(archived, Some(vec![0.2f32; DIM]))
+            .await
+            .unwrap();
+        handle.write(new, Some(vec![0.3f32; DIM])).await.unwrap();
+
+        // Supersede `archived` into `new`: it becomes archived + superseded and
+        // must drop out of the candidate enumeration.
+        handle
+            .supersede(ns.clone(), archived_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let cands = handle.candidates_for_consolidation(100).await.unwrap();
+        let ids: Vec<rb_types::MemoryId> = cands.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&keep_id), "active memory present");
+        assert!(ids.contains(&new_id), "survivor present");
+        assert!(
+            !ids.contains(&archived_id),
+            "archived/superseded memory must be excluded"
+        );
+        // Every returned candidate carries its namespace for per-ns grouping.
+        assert!(cands.iter().all(|c| c.namespace == ns));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_memories_for_recalibration_reads_access_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("recal".to_string());
+
+        let m = note(&ns, "accessed twice");
+        let id = m.id.clone();
+        handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // Two accesses bump access_count to 2 and stamp last_accessed_at.
+        handle.record_access(id.clone()).await.unwrap();
+        handle.record_access(id.clone()).await.unwrap();
+
+        let rows = handle.memories_for_recalibration(100).await.unwrap();
+        let row = rows
+            .iter()
+            .find(|r| r.id == id)
+            .expect("recal row must be present");
+        assert_eq!(row.namespace, ns);
+        assert_eq!(row.access_count, 2, "two record_access calls => count 2");
+        assert!(
+            row.last_accessed_at.is_some(),
+            "last_accessed_at must be stamped after record_access"
+        );
+
+        handle.shutdown().await;
     }
 }

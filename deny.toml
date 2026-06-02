@@ -10,7 +10,14 @@ all-features = true
 # default to deny-style behavior via the lint surface below.
 version = 2
 yanked = "deny"
-ignore = []
+ignore = [
+    # RUSTSEC-2024-0436: `paste` is unmaintained (the author archived the repo).
+    # It is a build-time proc-macro with NO safe upgrade available, pulled in
+    # only by the optional `local` feature via tokenizers/rav1e -> fastembed.
+    # The default closure is fastembed-free, so this never ships by default.
+    # No runtime exposure; tracked for replacement when fastembed migrates off it.
+    "RUSTSEC-2024-0436",
+]
 
 [licenses]
 version = 2
@@ -27,10 +34,30 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    # Permissive licenses pulled in by the fastembed (`local` feature) closure:
+    #   Zlib  — foldhash (via hashbrown -> safetensors -> fastembed)
+    #   NCSA  — libfuzzer-sys (via rav1e -> ravif -> image -> fastembed)
+    # Both are OSI-approved, FSF Free/Libre, and contain no copyleft.
+    "Zlib",
+    "NCSA",
 ]
 confidence-threshold = 0.9
-# Permissive-only allowlist: no copyleft (weak or strong) is accepted.
+# Permissive-only allowlist: no copyleft (weak or strong) is accepted globally.
 # Anything not in `allow` fails the build.
+
+# Crate-scoped exceptions: a copyleft license is permitted ONLY for the named
+# crate, leaving the global permissive-only policy intact for the rest of the
+# graph. The single exception below is an unavoidable transitive dependency of
+# the optional `local` (fastembed) feature.
+[[licenses.exceptions]]
+# option-ext is MPL-2.0 (weak/file-level copyleft), pulled in only by the
+# optional `local` feature via dirs-sys -> dirs -> hf-hub -> fastembed. MPL-2.0
+# copyleft is per-file and does not affect our MIT-licensed sources; we link it
+# unmodified. Scoped here rather than added to `allow` so MPL-2.0 stays banned
+# everywhere else. The default closure does not include this crate.
+name = "option-ext"
+version = "=0.2.0"
+allow = ["MPL-2.0"]
 
 [bans]
 # Surface accidental dependency bloat / duplicate trees.

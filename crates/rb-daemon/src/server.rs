@@ -17,12 +17,15 @@ use rb_proto::{
 use rb_types::{Error, Result};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
 use crate::error_map::error_to_response;
+use crate::jobs::{self, JobsConfig};
 use crate::{SharedEmbedder, StoreHandle};
 
 /// Maximum number of results returned per Recall or List request.
@@ -42,6 +45,7 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
     pub read_pool_size: usize,
+    pub jobs_config: JobsConfig,
 }
 
 /// A bound, ready-to-run daemon.
@@ -53,6 +57,7 @@ pub struct Daemon {
     socket_path: PathBuf,
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
+    jobs_config: JobsConfig,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -127,6 +132,7 @@ impl Daemon {
             socket_path: config.socket_path,
             pidfile_path,
             bind_guard,
+            jobs_config: config.jobs_config,
         })
     }
 
@@ -140,8 +146,10 @@ impl Daemon {
             socket_path: _socket_path,
             pidfile_path: _pidfile_path,
             mut bind_guard,
+            jobs_config,
         } = self;
         tokio::pin!(shutdown);
+        let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
@@ -158,6 +166,7 @@ impl Daemon {
                             let store = store.clone();
                             let embedder = embedder.clone();
                             let enricher = enricher.clone();
+                            let jobs_config = jobs_config.clone();
                             // Acquire a connection permit before spawning. If
                             // all permits are taken, drop the newly accepted
                             // stream immediately instead of queueing unbounded
@@ -173,7 +182,7 @@ impl Daemon {
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
                                 if let Err(e) =
-                                    handle_connection(stream, store, embedder, enricher).await
+                                    handle_connection(stream, store, embedder, enricher, jobs_config).await
                                 {
                                     warn!(error = %e, "connection ended with error");
                                 }
@@ -189,6 +198,7 @@ impl Daemon {
         }
 
         drop(listener);
+        scheduler.abort();
         conns.shutdown().await;
         store.shutdown().await;
 
@@ -349,6 +359,7 @@ async fn handle_connection(
     store: StoreHandle,
     embedder: SharedEmbedder,
     enricher: Option<Arc<dyn Enricher>>,
+    jobs_config: JobsConfig,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -391,8 +402,10 @@ async fn handle_connection(
     };
     write_frame(&mut framed, &ack).await?;
 
+    let store_for_stream = store.clone();
+    let job_store = store.clone();
     let engine = {
-        let base = MemoryEngine::new(store, embedder, namespace);
+        let base = MemoryEngine::new(store, embedder, namespace.clone());
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -408,11 +421,64 @@ async fn handle_connection(
                 break;
             }
         };
-        let resp = dispatch(&engine, req).await;
+        // Subscribe converts this connection into a one-way change stream. It
+        // never returns to request/response cadence; it runs until the client
+        // disconnects or the broadcast closes.
+        if matches!(req, Request::Subscribe) {
+            stream_changes(&mut framed, &store_for_stream, &namespace).await;
+            break;
+        }
+        let resp = dispatch(&engine, &job_store, &jobs_config, req).await;
         write_frame(&mut framed, &resp).await?;
     }
 
     Ok(())
+}
+
+/// Stream namespace-scoped change events to a subscriber until the client
+/// disconnects or the broadcast closes.
+///
+/// HARD RULE: this must NEVER block the writer. It only reads from the broadcast
+/// receiver (which drops oldest and reports `Lagged` for slow consumers) and
+/// writes to this one connection's socket; a write error means the client is
+/// gone, so we stop. Events outside `namespace` are filtered server-side (fail
+/// closed: only exact-namespace events are forwarded).
+async fn stream_changes(
+    framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
+    store: &StoreHandle,
+    namespace: &rb_types::Namespace,
+) {
+    let mut rx = store.subscribe();
+    // Acknowledge the subscription now that the broadcast receiver is registered.
+    // The client blocks in `subscribe()` until it sees this frame, so it cannot
+    // commit (or unblock a peer that commits) a change that races ahead of an
+    // active receiver and is silently missed.
+    if write_frame(framed, &Response::SubscribeAck).await.is_err() {
+        return; // client already gone
+    }
+    loop {
+        match rx.recv().await {
+            Ok(evt) => {
+                if &evt.namespace != namespace {
+                    continue; // cross-namespace event: never leak it
+                }
+                if write_frame(framed, &Response::Change(evt)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+            Err(RecvError::Lagged(dropped)) => {
+                // The subscriber fell behind; the broadcast dropped `dropped`
+                // events for it. Surface the count and keep streaming.
+                if write_frame(framed, &Response::Lagged { dropped })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => break, // daemon shutting down
+        }
+    }
 }
 
 fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namespace> {
@@ -425,7 +491,12 @@ fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namesp
     }
 }
 
-async fn dispatch<P>(engine: &MemoryEngine<StoreHandle, P>, req: Request) -> Response
+async fn dispatch<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    jobs_config: &JobsConfig,
+    req: Request,
+) -> Response
 where
     P: EmbeddingProvider,
 {
@@ -499,6 +570,19 @@ where
             },
             Err(e) => error_to_response(e),
         },
+        // Subscribe is handled by the streaming branch in `handle_connection`
+        // before `dispatch` is called; reaching here is a protocol misuse.
+        Request::Subscribe => error_to_response(Error::InvalidArgument(
+            "Subscribe is a streaming op, not a single request".to_string(),
+        )),
+        Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config).await {
+            Ok(summary) => Response::JobRan {
+                scanned: summary.scanned,
+                changed: summary.changed,
+                skipped: summary.skipped,
+            },
+            Err(e) => error_to_response(e),
+        },
     }
 }
 
@@ -553,5 +637,57 @@ mod tests {
             }),
             Err(Error::InvalidNamespace(_))
         ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_consolidation_merges_via_store_handle() {
+        use crate::jobs::{run_once, JobKind, JobsConfig};
+        use crate::StoreHandle;
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace};
+
+        const DIM: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        // The RunJob dispatch arm operates on a StoreHandle clone (jobs are
+        // cross-namespace maintenance, not engine-bound); build one directly.
+        let store = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("a".to_string());
+
+        let mut a = MemoryNote::new(ns.clone(), "twin a".to_string(), MemoryType::Insight, 9);
+        a.id = rb_types::MemoryId::new();
+        let mut b = MemoryNote::new(ns.clone(), "twin b".to_string(), MemoryType::Insight, 3);
+        b.id = rb_types::MemoryId::new();
+        store
+            .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .write(b, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // Defaults disable the job, but run_once runs ONE pass on demand
+        // regardless of `enabled` (enabled only gates the scheduler). Provide an
+        // explicit consolidation config so the threshold is the documented 0.95.
+        let config = JobsConfig {
+            consolidation: crate::jobs::ConsolidationConfig {
+                enabled: true,
+                interval_secs: 86_400,
+                similarity_threshold: 0.95,
+                batch_limit: 200,
+            },
+            ..Default::default()
+        };
+
+        let summary = run_once(JobKind::Consolidation, &store, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.changed, 1,
+            "the RunJob(Consolidation) path must merge the duplicate"
+        );
+
+        store.shutdown().await;
     }
 }

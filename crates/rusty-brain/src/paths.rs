@@ -7,6 +7,9 @@ pub const SOCKET_ENV: &str = "RUSTY_BRAIN_SOCKET";
 /// Env var that overrides the database path.
 pub const DB_ENV: &str = "RUSTY_BRAIN_DB";
 
+/// Env var that points at the evolution-jobs TOML config.
+pub const JOBS_CONFIG_ENV: &str = "RB_JOBS_CONFIG";
+
 /// Resolve the socket path: explicit override wins, else the daemon default.
 pub fn resolve_socket_path(override_value: Option<String>) -> rb_types::Result<PathBuf> {
     match override_value.filter(|p| !p.trim().is_empty()) {
@@ -21,6 +24,19 @@ pub fn resolve_db_path(override_value: Option<String>) -> rb_types::Result<PathB
         Some(p) => Ok(PathBuf::from(p)),
         None => rb_daemon::default_db_path(),
     }
+}
+
+/// Resolve the jobs-config path: explicit override wins, else the env value,
+/// else `None` (meaning: load the all-disabled default). Blank strings are
+/// treated as absent.
+pub fn resolve_jobs_config_path(
+    override_value: Option<String>,
+    env_value: Option<String>,
+) -> Option<PathBuf> {
+    override_value
+        .filter(|p| !p.trim().is_empty())
+        .or_else(|| env_value.filter(|p| !p.trim().is_empty()))
+        .map(PathBuf::from)
 }
 
 /// Read the socket path from the environment (override) or fall back to default.
@@ -73,5 +89,26 @@ mod tests {
     fn db_path_falls_back_to_default_when_override_is_empty() {
         let got = resolve_db_path(Some("".to_string())).unwrap();
         assert_eq!(got.extension().unwrap(), "db");
+    }
+
+    #[test]
+    fn jobs_config_prefers_override_then_env_then_none() {
+        // Explicit override wins.
+        assert_eq!(
+            resolve_jobs_config_path(Some("/tmp/a.toml".to_string()), None),
+            Some(PathBuf::from("/tmp/a.toml"))
+        );
+        // Env used when no override.
+        assert_eq!(
+            resolve_jobs_config_path(None, Some("/tmp/b.toml".to_string())),
+            Some(PathBuf::from("/tmp/b.toml"))
+        );
+        // Neither -> None (all jobs disabled by default).
+        assert_eq!(resolve_jobs_config_path(None, None), None);
+        // Blank override falls through to env.
+        assert_eq!(
+            resolve_jobs_config_path(Some("  ".to_string()), Some("/tmp/c.toml".to_string())),
+            Some(PathBuf::from("/tmp/c.toml"))
+        );
     }
 }

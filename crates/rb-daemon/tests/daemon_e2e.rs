@@ -34,6 +34,7 @@ impl RunningDaemon {
             socket_path: socket.clone(),
             db_path: db,
             read_pool_size: pool_size,
+            jobs_config: rb_daemon::JobsConfig::default(),
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -297,6 +298,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         socket_path: daemon.socket.clone(),
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -316,6 +318,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         socket_path: socket.clone(),
         db_path: dir.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -325,6 +328,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         socket_path: socket,
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -456,6 +460,161 @@ async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
         still_there.is_some(),
         "Project A memory must remain visible to Project A after cross-namespace ops"
     );
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_streams_only_own_namespace_changes() {
+    use rb_proto::SubscribeItem;
+    use rb_types::ChangeKind;
+
+    let daemon = RunningDaemon::start(4).await;
+    let ns_a = Namespace::Project("a".to_string());
+    let ns_b = Namespace::Project("b".to_string());
+
+    // Subscriber on namespace A.
+    let mut sub = Client::connect(&daemon.socket, ns_a.clone()).await.unwrap();
+    sub.subscribe().await.unwrap();
+
+    // Writer on namespace A: a Created event must reach the subscriber.
+    let mut writer_a = Client::connect(&daemon.socket, ns_a.clone()).await.unwrap();
+    let id_a = writer_a
+        .remember(
+            "a memory".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // The subscriber receives the A change (skip any Lagged notices).
+    let got = loop {
+        match tokio::time::timeout(Duration::from_secs(5), sub.recv_change())
+            .await
+            .expect("subscribe stream timed out waiting for the A change")
+            .unwrap()
+        {
+            SubscribeItem::Change(evt) => break evt,
+            SubscribeItem::Lagged(_) => continue,
+        }
+    };
+    assert_eq!(
+        got.id, id_a,
+        "subscriber must receive its namespace's change"
+    );
+    assert_eq!(got.namespace, ns_a);
+    assert_eq!(got.kind, ChangeKind::Created);
+
+    // Writer on namespace B: this change must NOT be delivered to the A subscriber.
+    let mut writer_b = Client::connect(&daemon.socket, ns_b).await.unwrap();
+    writer_b
+        .remember(
+            "b memory".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Do a second A write so there IS a frame to read; the B write must have been
+    // filtered out server-side, so the very next Change is the second A event.
+    let id_a2 = writer_a
+        .remember(
+            "a memory 2".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let next = loop {
+        match tokio::time::timeout(Duration::from_secs(5), sub.recv_change())
+            .await
+            .expect("subscribe stream timed out waiting for the second A change")
+            .unwrap()
+        {
+            SubscribeItem::Change(evt) => break evt,
+            SubscribeItem::Lagged(_) => continue,
+        }
+    };
+    assert_eq!(
+        next.id, id_a2,
+        "the B-namespace change must be filtered out; next frame is the 2nd A change"
+    );
+    assert_eq!(next.namespace, ns_a, "no cross-namespace leakage");
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_job_link_decay_round_trips_over_the_wire() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("evolve-e2e".to_string());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+
+    let (scanned, changed, skipped) = client.run_job(rb_types::JobKind::LinkDecay).await.unwrap();
+    // Empty store: nothing to scan, but the wire op resolves to JobRan.
+    assert_eq!((scanned, changed, skipped), (0, 0, 0));
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_job_importance_recalibration_flows_through_client() {
+    use rb_types::JobKind;
+
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("recal-e2e".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    // Seed one memory in this namespace via the typed remember helper.
+    let id = client
+        .remember(
+            "importance recalibration target".to_string(),
+            Some("evolution".to_string()),
+            MemoryType::Insight,
+            4,
+            vec!["evolution".to_string()],
+            vec!["jobs".to_string()],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Trigger the cross-namespace importance job over the wire (Part R wrapper).
+    let (scanned, changed, skipped) = client
+        .run_job(JobKind::ImportanceRecalibration)
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned, 1,
+        "the one seeded row must be scanned by the importance job"
+    );
+    // A freshly-remembered, never-accessed row recalibrates to its base:
+    // delta is 0 => unchanged => skipped, not changed.
+    assert_eq!(changed, 0, "never-accessed row is unchanged");
+    assert_eq!(skipped, 1, "never-accessed row is skipped");
+
+    // The seeded memory still resolves and kept its base importance.
+    let got = client
+        .get(id)
+        .await
+        .unwrap()
+        .expect("seeded memory present");
+    assert_eq!(got.importance, 4, "never-accessed memory keeps its base");
 
     daemon.stop().await;
 }

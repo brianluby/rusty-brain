@@ -4,12 +4,15 @@
 //! duplex pair (contract tests) and real stdin/stdout (production). stdout
 //! receives ONLY response frames; all logging goes to stderr via `tracing`.
 
+use crate::change_buffer::ChangeBuffer;
 use crate::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR};
 use crate::proxy::DaemonProxy;
-use crate::server::handle_request;
+use crate::server::{handle_request, handle_request_with_buffer};
 use rb_types::{Error, Result};
 use serde_json::Value;
+use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::sync::Mutex;
 
 /// Maximum bytes accepted for a single newline-delimited JSON-RPC frame. A
 /// client sending more than this before a `\n` is treated as a parse error (the
@@ -29,13 +32,41 @@ enum LineRead {
     TooLong,
 }
 
-/// Serve MCP over a line-delimited byte stream until EOF on `reader`.
-///
-/// Each input line is parsed as a `JsonRpcRequest`; requests are dispatched and
-/// their responses written as one `\n`-terminated JSON line. Notifications get
-/// no output. A line that fails to parse yields a JSON-RPC parse error (null id)
-/// and the loop continues — one bad frame never tears down the session.
-pub async fn serve_stdio<R, W, P>(mut reader: R, mut writer: W, mut proxy: P) -> Result<()>
+/// Serve MCP over a line-delimited byte stream until EOF on `reader`, WITHOUT a
+/// change buffer (`poll_changes` returns empty). See [`serve_stdio_with_buffer`]
+/// for the polling-enabled variant.
+pub async fn serve_stdio<R, W, P>(reader: R, writer: W, proxy: P) -> Result<()>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWrite + Unpin,
+    P: DaemonProxy,
+{
+    serve_loop(reader, writer, proxy, None).await
+}
+
+/// Serve MCP with a shared change buffer that `poll_changes` drains. The caller
+/// is expected to run a background subscriber that pushes into the same buffer.
+pub async fn serve_stdio_with_buffer<R, W, P>(
+    reader: R,
+    writer: W,
+    proxy: P,
+    buffer: Arc<Mutex<ChangeBuffer>>,
+) -> Result<()>
+where
+    R: AsyncBufReadExt + Unpin,
+    W: AsyncWrite + Unpin,
+    P: DaemonProxy,
+{
+    serve_loop(reader, writer, proxy, Some(buffer)).await
+}
+
+/// Shared serve loop. `buffer` selects buffer-aware dispatch for `poll_changes`.
+async fn serve_loop<R, W, P>(
+    mut reader: R,
+    mut writer: W,
+    mut proxy: P,
+    buffer: Option<Arc<Mutex<ChangeBuffer>>>,
+) -> Result<()>
 where
     R: AsyncBufReadExt + Unpin,
     W: AsyncWrite + Unpin,
@@ -44,7 +75,6 @@ where
     loop {
         let response = match read_capped_line(&mut reader).await? {
             LineRead::Eof => {
-                // EOF: the client closed stdin; shut the adapter down cleanly.
                 tracing::debug!("mcp stdin closed; shutting down adapter");
                 return Ok(());
             }
@@ -67,7 +97,10 @@ where
                     continue;
                 }
                 match serde_json::from_str::<JsonRpcRequest>(trimmed) {
-                    Ok(request) => handle_request(request, &mut proxy).await,
+                    Ok(request) => match buffer.as_ref() {
+                        Some(buf) => handle_request_with_buffer(request, &mut proxy, buf).await,
+                        None => handle_request(request, &mut proxy).await,
+                    },
                     Err(e) => {
                         tracing::warn!(error = %e, "malformed JSON-RPC frame");
                         Some(JsonRpcResponse::error(
@@ -256,7 +289,7 @@ mod tests {
 
         // tools/list (id 2)
         assert_eq!(responses[1]["id"], 2);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 9);
 
         // tools/call (id 3) -> remembered id appears in the tool result text
         assert_eq!(responses[2]["id"], 3);
@@ -369,7 +402,74 @@ mod tests {
             "error for over-long line has null id"
         );
         assert_eq!(responses[1]["id"], 11);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 9);
+        server.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn poll_changes_over_stdio_drains_seeded_buffer() {
+        use crate::change_buffer::ChangeBuffer;
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let (client_to_server, server_reader) = tokio::io::duplex(64 * 1024);
+        let (server_writer, server_to_client) = tokio::io::duplex(64 * 1024);
+        let proxy = Fake {
+            id: MemoryId::new(),
+        };
+
+        let buffer = Arc::new(Mutex::new(ChangeBuffer::new(16)));
+        {
+            let mut guard = buffer.lock().await;
+            guard.push(MemoryChanged {
+                id: MemoryId::new(),
+                namespace: Namespace::Project("p".into()),
+                kind: ChangeKind::Created,
+            });
+            guard.record_dropped(4);
+        }
+
+        let server_buffer = Arc::clone(&buffer);
+        let server = tokio::spawn(async move {
+            serve_stdio_with_buffer(
+                BufReader::new(server_reader),
+                server_writer,
+                proxy,
+                server_buffer,
+            )
+            .await
+        });
+
+        let mut to_server = client_to_server;
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "poll_changes", "arguments": { "max": 10 } }
+        });
+        to_server
+            .write_all(format!("{}\n", serde_json::to_string(&frame).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        to_server.flush().await.unwrap();
+        drop(to_server);
+
+        let mut lines = BufReader::new(server_to_client).lines();
+        let mut responses: Vec<Value> = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if !line.trim().is_empty() {
+                responses.push(serde_json::from_str(&line).unwrap());
+            }
+        }
+        assert_eq!(responses.len(), 1, "one poll_changes reply: {responses:?}");
+        assert_eq!(responses[0]["id"], 1);
+        let text = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["dropped"], 4);
+        assert_ne!(responses[0]["result"]["isError"], json!(true));
+
         server.await.unwrap().unwrap();
     }
 }

@@ -1,4 +1,7 @@
-use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult};
+use rb_types::{
+    JobKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
+    SearchResult,
+};
 use serde::{Deserialize, Serialize};
 
 /// Wire contract version carried in the handshake. Clients and the daemon must
@@ -58,7 +61,16 @@ pub enum Request {
         id: MemoryId,
     },
     Context,
+    RunJob {
+        job: JobKind,
+    },
     Ping,
+    /// Open a live change-notification stream. The daemon stops the
+    /// request/response cadence for this connection and streams `Response::Change`
+    /// (and `Response::Lagged` on broadcast overflow) until the client disconnects.
+    /// The stream is scoped to the connection's handshake namespace, filtered
+    /// server-side.
+    Subscribe,
 }
 
 /// One response per request. Internally tagged on `result`.
@@ -91,17 +103,36 @@ pub enum Response {
     Pong {
         contract_version: u32,
     },
+    JobRan {
+        scanned: u64,
+        changed: u64,
+        skipped: u64,
+    },
     Error {
         kind: String,
         message: String,
     },
+    /// A streamed change event (only emitted on a `Subscribe` connection).
+    Change(MemoryChanged),
+    /// The subscriber fell behind and the broadcast channel dropped `dropped`
+    /// events for it. Observability only; the stream continues.
+    Lagged {
+        dropped: u64,
+    },
+    /// Acknowledges a `Subscribe`: the daemon has registered the change-stream
+    /// receiver and will deliver every event committed from now on. Sent exactly
+    /// once, before any `Change`/`Lagged` frame, so the client cannot make (or
+    /// unblock a peer that makes) a change that races ahead of an active receiver.
+    SubscribeAck,
 }
 
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult};
+    use rb_types::{
+        JobKind, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult,
+    };
 
     fn note() -> MemoryNote {
         MemoryNote::new(
@@ -179,6 +210,10 @@ mod tests {
             Request::Delete { id },
             Request::Context,
             Request::Ping,
+            Request::Subscribe,
+            Request::RunJob {
+                job: JobKind::LinkDecay,
+            },
         ]
     }
 
@@ -235,6 +270,18 @@ mod tests {
                 kind: "not_found".into(),
                 message: "no such memory".into(),
             },
+            Response::Change(rb_types::MemoryChanged {
+                id: MemoryId::new(),
+                namespace: Namespace::Project("rusty-brain".into()),
+                kind: rb_types::ChangeKind::Created,
+            }),
+            Response::Lagged { dropped: 3 },
+            Response::SubscribeAck,
+            Response::JobRan {
+                scanned: 10,
+                changed: 3,
+                skipped: 7,
+            },
         ]
     }
 
@@ -256,5 +303,58 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"result":"Pong","contract_version":1}"#);
+    }
+
+    #[test]
+    fn subscribe_request_round_trips_and_uses_op_tag() {
+        let json = serde_json::to_string(&Request::Subscribe).unwrap();
+        assert_eq!(json, r#"{"op":"Subscribe"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn change_and_lagged_responses_round_trip() {
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        let change = Response::Change(MemoryChanged {
+            id: MemoryId::new(),
+            namespace: Namespace::Project("rusty-brain".into()),
+            kind: ChangeKind::Created,
+        });
+        let json = serde_json::to_string(&change).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // The streamed Change frame carries `result: "Change"`.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "Change");
+
+        let lagged = Response::Lagged { dropped: 7 };
+        let json = serde_json::to_string(&lagged).unwrap();
+        assert_eq!(json, r#"{"result":"Lagged","dropped":7}"#);
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn run_job_uses_op_tag_with_snake_case_job() {
+        let json = serde_json::to_string(&Request::RunJob {
+            job: JobKind::LinkDecay,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"op":"RunJob","job":"link_decay"}"#);
+    }
+
+    #[test]
+    fn job_ran_uses_result_tag() {
+        let json = serde_json::to_string(&Response::JobRan {
+            scanned: 1,
+            changed: 0,
+            skipped: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"JobRan","scanned":1,"changed":0,"skipped":1}"#
+        );
     }
 }

@@ -20,11 +20,15 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
 
     match cli.command {
-        Command::Serve => {
+        Command::Serve { jobs_config } => {
+            let jobs_config_path = paths::resolve_jobs_config_path(
+                jobs_config,
+                std::env::var(paths::JOBS_CONFIG_ENV).ok(),
+            );
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            serve::run_serve(socket_path, db_path, 4, shutdown)
+            serve::run_serve(socket_path, db_path, 4, jobs_config_path, shutdown)
                 .await
                 .context("daemon failed")?;
             Ok(())
@@ -51,7 +55,7 @@ async fn run_client(
         .context("connecting to daemon")?;
 
     match command {
-        Command::Serve => anyhow::bail!("internal: serve must be handled before run_client"),
+        Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
         Command::Mcp => anyhow::bail!("internal: mcp must be handled before run_client"),
         Command::Remember {
             content,
@@ -118,12 +122,54 @@ async fn run_client(
                 output::render_context(&recent, &important, total, json)
             );
         }
+        Command::Subscribe => {
+            client.subscribe().await.context("subscribe failed")?;
+            // Stream until the daemon closes the connection (or the process is
+            // interrupted). recv_change returns Err(Io) on a clean close, which
+            // we treat as a normal end-of-stream exit (not a failure).
+            loop {
+                tokio::select! {
+                    biased;
+                    _ = tokio::signal::ctrl_c() => {
+                        break;
+                    }
+                    item = client.recv_change() => {
+                        match item {
+                            Ok(item) => {
+                                println!("{}", output::render_change(&item, json));
+                            }
+                            // A transport close (Io/EOF) is a normal end-of-stream.
+                            // Any other error — a daemon `Response::Error` frame or
+                            // a protocol violation — is a real failure the user must
+                            // see, so surface it (non-zero exit) instead of hiding it.
+                            Err(rb_types::Error::Io(_))
+                            | Err(rb_types::Error::IoKind { .. }) => break,
+                            Err(e) => {
+                                return Err(anyhow::Error::new(e))
+                                    .context("subscribe stream error");
+                            }
+                        }
+                    }
+                }
+            }
+        }
         Command::Status => {
             let version = client.ping().await.context("status/ping failed")?;
             if json {
                 println!("{{\"contract_version\":{version},\"ok\":true}}");
             } else {
                 println!("ok (contract v{version})");
+            }
+        }
+        Command::Evolve { job } => {
+            let kind = rb_types::JobKind::parse(&job)
+                .map_err(|e| anyhow::anyhow!("invalid job '{job}': {e}"))?;
+            let (scanned, changed, skipped) =
+                client.run_job(kind).await.context("evolve failed")?;
+            if json {
+                println!("{{\"scanned\":{scanned},\"changed\":{changed},\"skipped\":{skipped}}}");
+            } else {
+                println!("evolve {job}: scanned={scanned} changed={changed} skipped={skipped}");
             }
         }
     }

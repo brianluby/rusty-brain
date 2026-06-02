@@ -1,24 +1,48 @@
 //! MCP method dispatch: one decoded JSON-RPC request -> optional response.
 
+use crate::change_buffer::ChangeBuffer;
 use crate::jsonrpc::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
 };
 use crate::proxy::{build_request, response_to_content, DaemonProxy};
 use crate::tools::tool_definitions;
 use serde_json::{json, Value};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 /// The MCP protocol revision this adapter targets when the client omits one.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Handle one decoded JSON-RPC request. Returns `Some(response)` for requests and
-/// `None` for notifications (which JSON-RPC forbids answering).
+/// Handle one decoded JSON-RPC request WITHOUT a change buffer. `poll_changes`
+/// in this mode returns an empty result with a note, since no subscriber is
+/// running. Retained for the plain stdio transport that does not poll.
 pub async fn handle_request(
     request: JsonRpcRequest,
     proxy: &mut dyn DaemonProxy,
 ) -> Option<JsonRpcResponse> {
+    dispatch(request, proxy, None).await
+}
+
+/// Handle one decoded JSON-RPC request with a shared change buffer that
+/// `poll_changes` drains. Used by the daemon-backed MCP server that runs a
+/// background subscriber.
+pub async fn handle_request_with_buffer(
+    request: JsonRpcRequest,
+    proxy: &mut dyn DaemonProxy,
+    buffer: &Arc<Mutex<ChangeBuffer>>,
+) -> Option<JsonRpcResponse> {
+    dispatch(request, proxy, Some(buffer)).await
+}
+
+/// Shared dispatch core. `buffer` is `Some` when a background subscriber feeds
+/// the `poll_changes` ring; `None` when polling is unavailable.
+async fn dispatch(
+    request: JsonRpcRequest,
+    proxy: &mut dyn DaemonProxy,
+    buffer: Option<&Arc<Mutex<ChangeBuffer>>>,
+) -> Option<JsonRpcResponse> {
     // Notifications (no id) are acknowledged silently with no response frame.
     if request.is_notification() {
-        // `notifications/initialized` and any other notification: nothing to send.
         tracing::debug!(method = %request.method, "notification (no response)");
         return None;
     }
@@ -30,7 +54,7 @@ pub async fn handle_request(
     let response = match request.method.as_str() {
         "initialize" => JsonRpcResponse::success(id, initialize_result(&params)),
         "tools/list" => JsonRpcResponse::success(id, tools_list_result()),
-        "tools/call" => handle_tools_call(id, &params, proxy).await,
+        "tools/call" => handle_tools_call(id, &params, proxy, buffer).await,
         other => JsonRpcResponse::error(
             id,
             JsonRpcError::new(METHOD_NOT_FOUND, format!("unknown method '{other}'")),
@@ -63,13 +87,15 @@ fn tools_list_result() -> Value {
     json!({ "tools": tool_definitions() })
 }
 
-/// Handle `tools/call`: route name+arguments to a `Request`, forward via the
-/// proxy, and wrap the response. Routing errors (unknown tool, bad args) become
-/// JSON-RPC errors; daemon-reported errors become `isError` tool results.
+/// Handle `tools/call`: `poll_changes` drains the local change ring; every other
+/// tool routes name+arguments to a `Request` forwarded via the proxy. Routing
+/// errors become JSON-RPC errors; daemon-reported errors become `isError` tool
+/// results.
 async fn handle_tools_call(
     id: Value,
     params: &Value,
     proxy: &mut dyn DaemonProxy,
+    buffer: Option<&Arc<Mutex<ChangeBuffer>>>,
 ) -> JsonRpcResponse {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return JsonRpcResponse::error(
@@ -82,6 +108,10 @@ async fn handle_tools_call(
         .cloned()
         .unwrap_or_else(|| json!({}));
 
+    if name == "poll_changes" {
+        return handle_poll_changes(id, &arguments, buffer).await;
+    }
+
     let request = match build_request(name, &arguments) {
         Ok(r) => r,
         Err(err) => return JsonRpcResponse::error(id, err),
@@ -90,18 +120,53 @@ async fn handle_tools_call(
     match proxy.call(request).await {
         Ok(resp) => {
             let content = response_to_content(resp);
-            // A daemon-side error surfaces as a tool result with isError=true so
-            // the agent sees the message instead of a transport failure.
             let is_error = content.get("error").is_some();
             JsonRpcResponse::success(id, tool_result(content, is_error))
         }
         Err(e) => JsonRpcResponse::error(
             id,
-            // A transport/daemon failure (socket dropped, etc.) is a real
-            // JSON-RPC error. The message is the sanitized domain error string.
             JsonRpcError::new(INTERNAL_ERROR, format!("daemon call failed: {e}")),
         ),
     }
+}
+
+/// Default and cap for the number of events a single `poll_changes` returns.
+const POLL_DEFAULT_MAX: usize = 100;
+const POLL_HARD_CAP: usize = 1000;
+
+/// Drain the change ring for `poll_changes`. Returns `{ events, dropped }`. When
+/// no buffer is wired (plain stdio mode) returns an empty, never-erroring result.
+async fn handle_poll_changes(
+    id: Value,
+    arguments: &Value,
+    buffer: Option<&Arc<Mutex<ChangeBuffer>>>,
+) -> JsonRpcResponse {
+    let max = match arguments.get("max") {
+        None | Some(Value::Null) => POLL_DEFAULT_MAX,
+        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if n >= 1 => n.min(POLL_HARD_CAP),
+            _ => {
+                return JsonRpcResponse::error(
+                    id,
+                    JsonRpcError::new(INVALID_PARAMS, "'max' must be a positive integer".into()),
+                );
+            }
+        },
+    };
+
+    let Some(buffer) = buffer else {
+        // No background subscriber is running: nothing to drain, but this is not
+        // an error — the client can keep polling.
+        let content = json!({ "events": [], "dropped": 0 });
+        return JsonRpcResponse::success(id, tool_result(content, false));
+    };
+
+    let drained = {
+        let mut guard = buffer.lock().await;
+        guard.drain(max)
+    };
+    let content = json!({ "events": drained.events, "dropped": drained.dropped });
+    JsonRpcResponse::success(id, tool_result(content, false))
 }
 
 /// Wrap a JSON payload as an MCP tool result (a single JSON text content item).
@@ -181,6 +246,14 @@ mod tests {
                 Request::Ping => Response::Pong {
                     contract_version: 1,
                 },
+                Request::Subscribe => Response::Pong {
+                    contract_version: 1,
+                },
+                Request::RunJob { .. } => Response::JobRan {
+                    scanned: 0,
+                    changed: 0,
+                    skipped: 0,
+                },
             })
         }
     }
@@ -235,13 +308,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_eight_tools() {
+    async fn tools_list_returns_nine_tools() {
         let mut proxy = fake();
         let r = req("tools/list", Some(2), json!({}));
         let resp = handle_request(r, &mut proxy).await.unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 8);
+        assert_eq!(tools.len(), 9);
         assert!(tools.iter().any(|t| t["name"] == "remember"));
+        assert!(tools.iter().any(|t| t["name"] == "poll_changes"));
         assert!(tools[0]["inputSchema"]["type"] == "object");
     }
 
@@ -317,5 +391,57 @@ mod tests {
         let r = req("does/not/exist", Some(7), json!({}));
         let resp = handle_request(r, &mut proxy).await.unwrap();
         assert_eq!(resp.error.unwrap().code, crate::jsonrpc::METHOD_NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn poll_changes_drains_the_ring_buffer() {
+        use crate::change_buffer::ChangeBuffer;
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let mut proxy = fake();
+        let buffer = Arc::new(Mutex::new(ChangeBuffer::new(16)));
+        {
+            let mut guard = buffer.lock().await;
+            guard.push(MemoryChanged {
+                id: MemoryId::new(),
+                namespace: Namespace::Project("p".into()),
+                kind: ChangeKind::Created,
+            });
+            guard.record_dropped(2);
+        }
+
+        let r = req(
+            "tools/call",
+            Some(20),
+            json!({ "name": "poll_changes", "arguments": { "max": 10 } }),
+        );
+        let resp = handle_request_with_buffer(r, &mut proxy, &buffer)
+            .await
+            .unwrap();
+        let result = resp.result.unwrap();
+        let text = result["content"][0]["text"].as_str().unwrap();
+        let payload: serde_json::Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["dropped"], 2);
+        assert_ne!(result["isError"], json!(true));
+
+        // A second poll returns nothing new and zero drops (the ring was drained).
+        let r2 = req(
+            "tools/call",
+            Some(21),
+            json!({ "name": "poll_changes", "arguments": {} }),
+        );
+        let resp2 = handle_request_with_buffer(r2, &mut proxy, &buffer)
+            .await
+            .unwrap();
+        let text2 = resp2.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let payload2: serde_json::Value = serde_json::from_str(&text2).unwrap();
+        assert_eq!(payload2["events"].as_array().unwrap().len(), 0);
+        assert_eq!(payload2["dropped"], 0);
     }
 }

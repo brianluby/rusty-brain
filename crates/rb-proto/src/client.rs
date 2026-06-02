@@ -5,7 +5,8 @@ use crate::frame::{read_frame, write_frame};
 use crate::messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
 use crate::{response_error_to_error, Response as Resp};
 use rb_types::{
-    Error, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result, SearchResult,
+    Error, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result,
+    SearchResult,
 };
 use std::path::Path;
 use tokio::net::UnixStream;
@@ -15,6 +16,16 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[derive(Debug)]
 pub struct Client {
     framed: Framed<UnixStream, LengthDelimitedCodec>,
+}
+
+/// One item yielded by a live subscribe stream: either a change event or a
+/// notice that the broadcast dropped `n` events for this slow subscriber.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubscribeItem {
+    /// A committed change in the connection's namespace.
+    Change(MemoryChanged),
+    /// The subscriber fell behind; `n` events were dropped by the broadcast.
+    Lagged(u64),
 }
 
 impl Client {
@@ -55,6 +66,40 @@ impl Client {
         write_frame(&mut self.framed, &req).await?;
         let resp: Response = read_frame(&mut self.framed).await?;
         Ok(resp)
+    }
+
+    /// Open a live change-notification stream on this connection. After this
+    /// returns `Ok`, the connection no longer follows request/response cadence;
+    /// call [`recv_change`](Self::recv_change) in a loop to read streamed frames.
+    /// The stream is scoped server-side to the handshake namespace.
+    pub async fn subscribe(&mut self) -> Result<()> {
+        write_frame(&mut self.framed, &Request::Subscribe).await?;
+        // Block until the daemon confirms the broadcast receiver is registered.
+        // Returning before the ack would let the caller commit a change that
+        // races ahead of an active subscription and is silently missed.
+        let resp: Response = read_frame(&mut self.framed).await?;
+        match resp {
+            Resp::SubscribeAck => Ok(()),
+            Resp::Error { kind, message } => Err(response_error_to_error(&kind, &message)),
+            other => Err(Error::Storage(format!(
+                "unexpected frame awaiting subscribe ack: {other:?}"
+            ))),
+        }
+    }
+
+    /// Read the next streamed item from a subscribe stream. Blocks until the
+    /// daemon emits the next `Change`/`Lagged` frame; a closed stream surfaces as
+    /// `Error::Io`. Any non-streamed response is a protocol violation.
+    pub async fn recv_change(&mut self) -> Result<SubscribeItem> {
+        let resp: Response = read_frame(&mut self.framed).await?;
+        match resp {
+            Response::Change(evt) => Ok(SubscribeItem::Change(evt)),
+            Response::Lagged { dropped } => Ok(SubscribeItem::Lagged(dropped)),
+            Resp::Error { kind, message } => Err(response_error_to_error(&kind, &message)),
+            other => Err(Error::Storage(format!(
+                "unexpected frame on subscribe stream: {other:?}"
+            ))),
+        }
     }
 }
 
@@ -192,6 +237,21 @@ impl Client {
         let resp = self.request(Request::Ping).await?;
         match resp {
             Resp::Pong { contract_version } => Ok(contract_version),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// Trigger one bounded evolution-job pass on the daemon; returns the summary
+    /// `(scanned, changed, skipped)`. The daemon performs all mutations through
+    /// its single writer; this is just the wire trigger.
+    pub async fn run_job(&mut self, job: rb_types::JobKind) -> Result<(u64, u64, u64)> {
+        let resp = self.request(Request::RunJob { job }).await?;
+        match resp {
+            Resp::JobRan {
+                scanned,
+                changed,
+                skipped,
+            } => Ok((scanned, changed, skipped)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -375,6 +435,14 @@ mod wrapper_tests {
                 Request::Ping => Response::Pong {
                     contract_version: CONTRACT_VERSION,
                 },
+                Request::Subscribe => Response::Pong {
+                    contract_version: CONTRACT_VERSION,
+                },
+                Request::RunJob { .. } => Response::JobRan {
+                    scanned: 4,
+                    changed: 2,
+                    skipped: 2,
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -433,6 +501,9 @@ mod wrapper_tests {
         let version = c.ping().await.unwrap();
         assert_eq!(version, CONTRACT_VERSION);
 
+        let (scanned, changed, skipped) = c.run_job(rb_types::JobKind::LinkDecay).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (4, 2, 2));
+
         drop(c);
         server.await.unwrap();
     }
@@ -470,6 +541,95 @@ mod wrapper_tests {
         // NotFound degrades to Storage on the wire (see error.rs), but it is an
         // Err, not a falsely-successful None.
         assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        server.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod subscribe_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+    use crate::{
+        read_frame, write_frame, Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION,
+    };
+    use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+    use std::path::PathBuf;
+    use tokio::net::{UnixListener, UnixStream};
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
+    fn socket_path() -> (tempfile::TempDir, PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sub.sock");
+        (dir, path)
+    }
+
+    // Accept one connection, handshake, read exactly one Subscribe request, then
+    // stream a Change frame followed by a Lagged frame, then close.
+    async fn serve_stream(listener: UnixListener, change_id: MemoryId) {
+        let (stream, _addr) = listener.accept().await.unwrap();
+        let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
+            Framed::new(stream, LengthDelimitedCodec::new());
+        let _hs: Handshake = read_frame(&mut framed).await.unwrap();
+        write_frame(
+            &mut framed,
+            &HandshakeAck {
+                contract_version: CONTRACT_VERSION,
+                ok: true,
+                message: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        let req: Request = read_frame(&mut framed).await.unwrap();
+        assert!(matches!(req, Request::Subscribe), "expected Subscribe");
+
+        // The client's subscribe() blocks on this ack before returning.
+        write_frame(&mut framed, &Response::SubscribeAck)
+            .await
+            .unwrap();
+
+        write_frame(
+            &mut framed,
+            &Response::Change(MemoryChanged {
+                id: change_id,
+                namespace: Namespace::Global,
+                kind: ChangeKind::Created,
+            }),
+        )
+        .await
+        .unwrap();
+        write_frame(&mut framed, &Response::Lagged { dropped: 5 })
+            .await
+            .unwrap();
+        // Drop closes the stream; the client's next recv_change returns Err(Io).
+    }
+
+    #[tokio::test]
+    async fn subscribe_then_recv_change_and_lagged() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let change_id = MemoryId::new();
+        let server = tokio::spawn(serve_stream(listener, change_id.clone()));
+
+        let mut client = Client::connect(&path, Namespace::Global).await.unwrap();
+        client.subscribe().await.unwrap();
+
+        match client.recv_change().await.unwrap() {
+            SubscribeItem::Change(evt) => {
+                assert_eq!(evt.id, change_id);
+                assert_eq!(evt.kind, ChangeKind::Created);
+            }
+            other => panic!("expected Change, got {other:?}"),
+        }
+        match client.recv_change().await.unwrap() {
+            SubscribeItem::Lagged(n) => assert_eq!(n, 5),
+            other => panic!("expected Lagged, got {other:?}"),
+        }
+        // Stream closed -> the next recv is a transport error, not a hang.
+        let err = client.recv_change().await.unwrap_err();
+        assert!(matches!(err, Error::Io(_)), "closed stream -> Io: {err:?}");
+
         server.await.unwrap();
     }
 }

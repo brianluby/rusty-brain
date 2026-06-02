@@ -7,6 +7,23 @@ use rb_types::{
 };
 use std::path::Path;
 
+/// One link edge as read by the link-decay job. Public so the daemon's job code
+/// can consume it via the read pool. Not part of the `Store` trait: it is a
+/// cross-namespace maintenance read, not an engine operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkRow {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub link_type: rb_types::LinkType,
+    /// Current (possibly decayed) strength. Used only for change detection so a
+    /// pass that recomputes the same value writes nothing.
+    pub strength: f32,
+    /// Immutable baseline strength captured at link creation. Decay is a pure
+    /// function of this and `created_at`, which is what makes the pass idempotent.
+    pub base_strength: f32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// The synchronous storage trait. The daemon wraps this on blocking threads.
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
@@ -61,6 +78,16 @@ impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteStore").finish_non_exhaustive()
     }
+}
+
+/// A minimal projection of a memory row for the consolidation scan: only the
+/// fields the job and its survivor policy need. Avoids loading full notes/links.
+#[derive(Clone, Debug)]
+pub struct ConsolidationCandidate {
+    pub id: MemoryId,
+    pub namespace: Namespace,
+    pub importance: u8,
+    pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
 impl SqliteStore {
@@ -146,6 +173,325 @@ impl SqliteStore {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(storage_err)?;
         Ok(())
+    }
+
+    // One link edge selected for decay. `created_at` is decoded fail-closed.
+    // Defined here (not as a `Store` trait method) because the decay job calls
+    // it directly through the read pool, outside the engine's namespace scope.
+
+    /// Read up to `limit` link edges for the decay job, newest-irrelevant order
+    /// (PK order is fine; decay is per-row and idempotent). One query, no joins.
+    pub fn links_for_decay(&self, limit: usize) -> Result<Vec<LinkRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_id, target_id, link_type, strength, base_strength, created_at
+                 FROM memory_links
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                // Saturating conversion (matches candidates_for_consolidation /
+                // memories_for_recalibration): a raw `as i64` would wrap a huge
+                // usize to a negative LIMIT, which SQLite treats as unbounded.
+                rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (src, tgt, lt, strength, base_strength, created) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(LinkRow {
+                source: src.parse::<MemoryId>()?,
+                target: tgt.parse::<MemoryId>()?,
+                link_type: rb_types::LinkType::parse(&lt)?,
+                // strength is SQLite REAL (f64) narrowed to f32, matching load_links.
+                strength: strength as f32,
+                base_strength: base_strength as f32,
+                created_at: from_ts(created)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Set the `strength` of a single link edge identified by its full PK.
+    /// A missing edge is a no-op (0 rows updated); decay is best-effort.
+    pub fn set_link_strength(
+        &self,
+        source: &MemoryId,
+        target: &MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memory_links SET strength = ?1
+                 WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
+                rusqlite::params![
+                    strength as f64,
+                    source.to_string(),
+                    target.to_string(),
+                    link_type.as_str(),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a single link edge identified by its full PK. A missing edge is a
+    /// no-op. Used by the decay job's `prune_below_floor` policy.
+    pub fn delete_link(
+        &self,
+        source: &MemoryId,
+        target: &MemoryId,
+        link_type: rb_types::LinkType,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM memory_links
+                 WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
+                rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Find active memories in `ns` whose stored vector is near-identical to the
+    /// vector of `id` (cosine similarity `>= threshold`), excluding `id` itself.
+    ///
+    /// Namespace-isolated by construction: candidates are filtered to `ns` and
+    /// active (`archived_at IS NULL`) in Rust, exactly as `vector_search` does,
+    /// so a near-identical memory in another namespace is NEVER returned. Reads
+    /// the anchor's OWN stored embedding from `memory_vectors` and runs the same
+    /// vec0 KNN MATCH the search path uses. A missing anchor or an anchor with no
+    /// stored vector yields an empty result (not an error). Results are sorted by
+    /// similarity descending, then id string ascending for a deterministic
+    /// tie-break, and truncated to `limit`.
+    pub fn near_duplicates(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        // Load the anchor's stored embedding blob. No row => nothing to compare.
+        let blob: Option<Vec<u8>> = match self.conn.query_row(
+            "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+            rusqlite::params![id.to_string()],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(b) => Some(b),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(Error::Storage(e.to_string())),
+        };
+        let Some(blob) = blob else {
+            return Ok(Vec::new());
+        };
+        let anchor_vec = decode_embedding_bytes(&blob)?;
+        // Defense-in-depth: a stored vector must match the configured dimension.
+        if anchor_vec.len() != self.embedding_dim {
+            return Err(Error::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: anchor_vec.len(),
+            });
+        }
+
+        // sqlite-vec accepts the query vector as a JSON array string (same as
+        // vector_search). vec0 cannot filter on namespace/active inside KNN, so
+        // we over-fetch a candidate pool and filter in Rust.
+        let query_json =
+            serde_json::to_string(&anchor_vec).map_err(|e| Error::Serialization(e.to_string()))?;
+
+        const VEC0_KNN_MAX: i64 = 4096;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        // +1 because the anchor itself is the nearest (distance 0) and is then
+        // dropped by the self-exclusion filter below.
+        let k_budget = limit_i64
+            .saturating_add(1)
+            .saturating_mul(10)
+            .max(limit_i64)
+            .min(VEC0_KNN_MAX);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, distance
+                 FROM memory_vectors
+                 WHERE embedding MATCH ?1
+                 ORDER BY distance
+                 LIMIT ?2",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![query_json, k_budget], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let ns_str = ns.as_db_string();
+        let self_str = id.to_string();
+        let mut out: Vec<(MemoryId, f32)> = Vec::new();
+        for r in rows {
+            let (cand_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Exclude self.
+            if cand_str == self_str {
+                continue;
+            }
+
+            // Namespace + active filter, fail closed on any non-"no rows" error.
+            let active: bool = match self.conn.query_row(
+                "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
+                rusqlite::params![cand_str, ns_str],
+                |_| Ok(true),
+            ) {
+                Ok(found) => found,
+                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                Err(e) => return Err(Error::Storage(e.to_string())),
+            };
+            if !active {
+                continue;
+            }
+
+            let similarity = distance_to_similarity(dist as f32);
+            if similarity >= threshold {
+                out.push((parse_id(&cand_str)?, similarity));
+            }
+        }
+
+        // Deterministic order: similarity descending, then id string ascending.
+        out.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Active (`archived_at IS NULL`), non-superseded (`superseded_by IS NULL`)
+    /// memories, oldest first then by id, capped at `limit`. The deterministic
+    /// ORDER BY makes a consolidation pass reproducible.
+    pub fn candidates_for_consolidation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConsolidationCandidate>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, namespace, importance, created_at
+                 FROM memories
+                 WHERE archived_at IS NULL AND superseded_by IS NULL
+                 ORDER BY created_at ASC, memory_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_str, ns_str, importance, created) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(ConsolidationCandidate {
+                id: parse_id(&id_str)?,
+                namespace: Namespace::parse_db_string(&ns_str)?,
+                importance: u8::try_from(importance).map_err(|_| {
+                    Error::Storage(format!("importance {importance} out of u8 range"))
+                })?,
+                created_at: from_ts(created)?,
+            });
+        }
+        Ok(out)
+    }
+}
+
+/// One active memory's recalibration inputs: the spine fields the importance
+/// job reads to recompute `importance`. `last_accessed_at` is the raw stored
+/// unix-seconds value (`None` when the memory has never been accessed); the job
+/// passes it straight into the pure `recalibrate` function with a single `now`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecalRow {
+    pub namespace: Namespace,
+    pub id: MemoryId,
+    pub importance: u8,
+    pub access_count: i64,
+    pub last_accessed_at: Option<i64>,
+}
+
+impl SqliteStore {
+    /// Read up to `limit` ACTIVE (non-archived) memories with the fields the
+    /// importance-recalibration job needs. Bounded by `limit` and ordered by
+    /// `created_at DESC` for a stable, deterministic scan. Read-only: issues no
+    /// writes (every mutation goes through the single writer via `StoreHandle`).
+    pub fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT namespace, memory_id, importance, access_count, last_accessed_at
+                 FROM memories
+                 WHERE archived_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let namespace = Namespace::parse_db_string(
+                &row.get::<_, String>("namespace")
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+            )?;
+            let id = parse_id(
+                &row.get::<_, String>("memory_id")
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+            )?;
+            let importance = row
+                .get::<_, i64>("importance")
+                .map_err(|e| Error::Storage(e.to_string()))? as u8;
+            let access_count = row
+                .get::<_, i64>("access_count")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let last_accessed_at = row
+                .get::<_, Option<i64>>("last_accessed_at")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(RecalRow {
+                namespace,
+                id,
+                importance,
+                access_count,
+                last_accessed_at,
+            });
+        }
+        Ok(out)
     }
 }
 
@@ -243,6 +589,39 @@ fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
         buf.extend_from_slice(&f.to_le_bytes());
     }
     buf
+}
+
+/// Decode a little-endian `f32` blob (the exact byte layout `embedding_bytes`
+/// writes) back into a `Vec<f32>`. Fail closed if the length is not a multiple
+/// of four bytes rather than silently truncating a corrupt vector.
+fn decode_embedding_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::Storage(format!(
+            "stored embedding blob length {} is not a multiple of 4",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        // chunks_exact(4) yields slices of exactly 4 bytes; the conversion to a
+        // [u8; 4] cannot fail, but we handle it explicitly to avoid unwrap.
+        let arr: [u8; 4] = chunk
+            .try_into()
+            .map_err(|_| Error::Storage("embedding chunk was not 4 bytes".to_string()))?;
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+/// Convert a vec0 cosine `distance` (range `[0, 2]`) into a similarity in
+/// `[0, 1]`, matching the exact convention used by `rb-search::rank::score_one`
+/// (`1.0 - (d / 2.0).clamp(0.0, 1.0)`). A non-finite distance yields `0.0`.
+fn distance_to_similarity(distance: f32) -> f32 {
+    if distance.is_finite() {
+        1.0 - (distance / 2.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn parse_json_array(s: &str) -> Result<Vec<String>> {
@@ -446,12 +825,15 @@ impl Store for SqliteStore {
                 self.conn
                     .execute(
                         "INSERT INTO memory_links
-                            (source_id, target_id, link_type, strength, reason, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         rusqlite::params![
                             link.source_id.to_string(),
                             link.target_id.to_string(),
                             link.link_type.as_str(),
+                            link.strength as f64,
+                            // Baseline equals the created strength; decay never
+                            // mutates it, so the pass stays idempotent.
                             link.strength as f64,
                             link.reason,
                             ts(link.created_at),
@@ -776,12 +1158,15 @@ impl Store for SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO memory_links
-                    (source_id, target_id, link_type, strength, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     link.source_id.to_string(),
                     link.target_id.to_string(),
                     link.link_type.as_str(),
+                    link.strength as f64,
+                    // Baseline equals the created strength; decay never mutates
+                    // it, so the pass stays idempotent.
                     link.strength as f64,
                     link.reason,
                     link.created_at.timestamp(),
@@ -1049,6 +1434,149 @@ mod tests {
             matches!(err, Error::Storage(ref m) if m.contains("embedding_dim must be greater than 0")),
             "zero dim must be rejected with a clear Storage error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn links_for_decay_returns_link_rows_bounded_by_limit() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("decay".to_string());
+
+        // Two real memories to satisfy the FK on memory_links.
+        let a = MemoryNote::new(ns.clone(), "source".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "target".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+
+        let created = chrono::Utc::now();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: created,
+            })
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.source, a.id);
+        assert_eq!(row.target, b.id);
+        assert_eq!(row.link_type, rb_types::LinkType::References);
+        assert!((row.strength - 0.8).abs() < f32::EPSILON);
+        // base_strength is captured at creation = the created strength.
+        assert!((row.base_strength - 0.8).abs() < f32::EPSILON);
+        assert_eq!(row.created_at.timestamp(), created.timestamp());
+
+        // The limit is honoured.
+        let none = store.links_for_decay(0).unwrap();
+        assert!(none.is_empty(), "limit 0 returns no rows");
+    }
+
+    #[test]
+    fn set_link_strength_leaves_base_strength_immutable() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("decay-base".to_string());
+        let a = MemoryNote::new(ns.clone(), "source".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "target".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // Decay lowers the running strength but must NOT touch the baseline, so
+        // a subsequent recompute from the baseline is reproducible (idempotent).
+        store
+            .set_link_strength(&a.id, &b.id, rb_types::LinkType::References, 0.2)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            (rows[0].strength - 0.2).abs() < f32::EPSILON,
+            "running value updated"
+        );
+        assert!(
+            (rows[0].base_strength - 0.8).abs() < f32::EPSILON,
+            "baseline unchanged by set_link_strength"
+        );
+    }
+
+    #[test]
+    fn set_link_strength_updates_only_the_matching_edge() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("setstr".to_string());
+        let a = MemoryNote::new(ns.clone(), "s".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "t".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        store
+            .set_link_strength(&a.id, &b.id, rb_types::LinkType::References, 0.25)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].strength - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn delete_link_removes_only_the_matching_edge() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("dellink".to_string());
+        let a = MemoryNote::new(ns.clone(), "s".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "t".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        // A second, differently-typed edge between the same nodes must survive.
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::Extends,
+                strength: 0.4,
+                reason: "r2".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        store
+            .delete_link(&a.id, &b.id, rb_types::LinkType::References)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1, "only the References edge was deleted");
+        assert_eq!(rows[0].link_type, rb_types::LinkType::Extends);
     }
 }
 
@@ -2097,5 +2625,200 @@ mod checkpoint_tests {
         let got = store.get_memory(&id).unwrap();
         assert!(got.is_some(), "row survives a wal_checkpoint(TRUNCATE)");
         assert_eq!(got.unwrap().content, "checkpoint me");
+    }
+}
+
+#[cfg(test)]
+mod near_duplicates_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert_vec(
+        store: &SqliteStore,
+        ns: Namespace,
+        content: &str,
+        v: [f32; 8],
+    ) -> rb_types::MemoryId {
+        let m = MemoryNote::new(ns, content.into(), MemoryType::Insight, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, Some(&v)).unwrap();
+        id
+    }
+
+    #[test]
+    fn returns_same_namespace_twin_and_never_crosses_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj_a = Namespace::Project("a".into());
+        let proj_b = Namespace::Project("b".into());
+
+        // Anchor in A.
+        let anchor = insert_vec(
+            &store,
+            proj_a.clone(),
+            "anchor",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Near-identical twin in A (same direction => cosine distance ~0 => sim ~1).
+        let twin = insert_vec(
+            &store,
+            proj_a.clone(),
+            "twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.5).
+        let _different = insert_vec(
+            &store,
+            proj_a.clone(),
+            "different",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Near-identical to anchor BUT in namespace B: must NEVER be returned.
+        let foreign = insert_vec(
+            &store,
+            proj_b.clone(),
+            "foreign twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let dups = store.near_duplicates(&proj_a, &anchor, 0.95, 10).unwrap();
+        let ids: Vec<rb_types::MemoryId> = dups.iter().map(|(id, _)| id.clone()).collect();
+
+        assert!(ids.contains(&twin), "the same-namespace twin must be found");
+        assert!(
+            !ids.contains(&anchor),
+            "the anchor itself must be excluded (self)"
+        );
+        assert!(
+            !ids.contains(&foreign),
+            "a near-identical memory in another namespace must NEVER be returned"
+        );
+        // The orthogonal vector has similarity ~0.5, well below the 0.95 threshold.
+        assert_eq!(ids, vec![twin], "only the above-threshold twin is returned");
+        // Reported similarity for an identical vector is at/near 1.0.
+        assert!(
+            dups[0].1 >= 0.95,
+            "twin similarity must meet the threshold, got {}",
+            dups[0].1
+        );
+    }
+
+    #[test]
+    fn missing_anchor_or_no_vector_returns_empty() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("a".into());
+        // Anchor id that does not exist at all.
+        let ghost = rb_types::MemoryId::new();
+        assert!(store
+            .near_duplicates(&ns, &ghost, 0.95, 10)
+            .unwrap()
+            .is_empty());
+
+        // A memory that exists but was inserted WITHOUT an embedding has no vector
+        // row, so there is nothing to KNN against: empty, not an error.
+        let no_vec = MemoryNote::new(ns.clone(), "no vector".into(), MemoryType::Insight, 5);
+        let no_vec_id = no_vec.id.clone();
+        store.insert_memory(&no_vec, None).unwrap();
+        assert!(store
+            .near_duplicates(&ns, &no_vec_id, 0.95, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn excludes_archived_candidates() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("a".into());
+        let anchor = insert_vec(
+            &store,
+            ns.clone(),
+            "anchor",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let twin = insert_vec(
+            &store,
+            ns.clone(),
+            "twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Archive the twin: it must drop out of the candidate set.
+        store.archive_memory(&twin).unwrap();
+        let dups = store.near_duplicates(&ns, &anchor, 0.95, 10).unwrap();
+        assert!(
+            dups.is_empty(),
+            "an archived candidate must not be returned, got {dups:?}"
+        );
+    }
+
+    #[test]
+    fn memories_for_recalibration_carries_access_fields_and_excludes_archived() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+
+        // Two active rows in different namespaces; one archived row.
+        let mut a = MemoryNote::new(
+            Namespace::Global,
+            "frequently accessed".into(),
+            MemoryType::Insight,
+            5,
+        );
+        a.access_count = 7;
+        a.last_accessed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0);
+        store.insert_memory(&a, None).unwrap();
+
+        let b = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "never accessed".into(),
+            MemoryType::Reference,
+            3,
+        );
+        store.insert_memory(&b, None).unwrap();
+
+        let gone = MemoryNote::new(Namespace::Global, "archived".into(), MemoryType::Insight, 9);
+        let gone_id = gone.id.clone();
+        store.insert_memory(&gone, None).unwrap();
+        store.archive_memory(&gone_id).unwrap();
+
+        let rows = store.memories_for_recalibration(100).unwrap();
+
+        // Archived row excluded; exactly the two active rows returned.
+        assert_eq!(rows.len(), 2, "archived rows must be excluded");
+        assert!(
+            rows.iter().all(|r| r.id != gone_id),
+            "archived id must not appear"
+        );
+
+        let row_a = rows
+            .iter()
+            .find(|r| r.id == a.id)
+            .expect("active row a must be present");
+        assert_eq!(row_a.namespace, Namespace::Global);
+        assert_eq!(row_a.importance, 5);
+        assert_eq!(row_a.access_count, 7);
+        assert_eq!(row_a.last_accessed_at, Some(1_700_000_000));
+
+        let row_b = rows
+            .iter()
+            .find(|r| r.id == b.id)
+            .expect("active row b must be present");
+        assert_eq!(row_b.namespace, Namespace::Project("rb".into()));
+        assert_eq!(row_b.importance, 3);
+        assert_eq!(row_b.access_count, 0);
+        assert_eq!(row_b.last_accessed_at, None);
+    }
+
+    #[test]
+    fn memories_for_recalibration_respects_limit() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        for i in 0..5 {
+            let m = MemoryNote::new(
+                Namespace::Global,
+                format!("note {i}"),
+                MemoryType::Insight,
+                4,
+            );
+            store.insert_memory(&m, None).unwrap();
+        }
+        let rows = store.memories_for_recalibration(3).unwrap();
+        assert_eq!(rows.len(), 3, "limit must bound the row count");
     }
 }
