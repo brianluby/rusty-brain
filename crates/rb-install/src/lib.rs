@@ -5,13 +5,16 @@
 //! into each CLI's config. NEVER referenced by any core crate, so the default
 //! `rusty-brain` build never compiles it.
 
+pub mod detect;
+
+pub use detect::{find_binary_on_path, parse_version, version_of};
+
 #[cfg(test)]
 mod skeleton_tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
 
     #[test]
     fn crate_links() {
-        // Proves the crate compiles and links against rb-agents + rb-types.
         let _ = rb_agents::install::SENTINEL;
         let _ = rb_types::Namespace::Global;
         assert_eq!(rb_agents::install::SENTINEL, "rusty-brain");
