@@ -25,6 +25,7 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
 use crate::error_map::error_to_response;
+use crate::jobs::{self, JobsConfig};
 use crate::{SharedEmbedder, StoreHandle};
 
 /// Maximum number of results returned per Recall or List request.
@@ -44,6 +45,7 @@ pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
     pub read_pool_size: usize,
+    pub jobs_config: JobsConfig,
 }
 
 /// A bound, ready-to-run daemon.
@@ -55,6 +57,7 @@ pub struct Daemon {
     socket_path: PathBuf,
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
+    jobs_config: JobsConfig,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -129,6 +132,7 @@ impl Daemon {
             socket_path: config.socket_path,
             pidfile_path,
             bind_guard,
+            jobs_config: config.jobs_config,
         })
     }
 
@@ -142,8 +146,10 @@ impl Daemon {
             socket_path: _socket_path,
             pidfile_path: _pidfile_path,
             mut bind_guard,
+            jobs_config,
         } = self;
         tokio::pin!(shutdown);
+        let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config);
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
@@ -191,6 +197,7 @@ impl Daemon {
         }
 
         drop(listener);
+        scheduler.abort();
         conns.shutdown().await;
         store.shutdown().await;
 

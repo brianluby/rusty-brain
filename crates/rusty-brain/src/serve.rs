@@ -64,6 +64,7 @@ where
         socket_path,
         db_path,
         read_pool_size,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let daemon = Daemon::bind(config, SharedEmbedder::new(embedder)).await?;
     daemon.run(shutdown).await
