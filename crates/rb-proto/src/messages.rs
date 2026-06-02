@@ -1,4 +1,6 @@
-use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult};
+use rb_types::{
+    MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult,
+};
 use serde::{Deserialize, Serialize};
 
 /// Wire contract version carried in the handshake. Clients and the daemon must
@@ -59,6 +61,12 @@ pub enum Request {
     },
     Context,
     Ping,
+    /// Open a live change-notification stream. The daemon stops the
+    /// request/response cadence for this connection and streams `Response::Change`
+    /// (and `Response::Lagged` on broadcast overflow) until the client disconnects.
+    /// The stream is scoped to the connection's handshake namespace, filtered
+    /// server-side.
+    Subscribe,
 }
 
 /// One response per request. Internally tagged on `result`.
@@ -94,6 +102,13 @@ pub enum Response {
     Error {
         kind: String,
         message: String,
+    },
+    /// A streamed change event (only emitted on a `Subscribe` connection).
+    Change(MemoryChanged),
+    /// The subscriber fell behind and the broadcast channel dropped `dropped`
+    /// events for it. Observability only; the stream continues.
+    Lagged {
+        dropped: u64,
     },
 }
 
@@ -179,6 +194,7 @@ mod tests {
             Request::Delete { id },
             Request::Context,
             Request::Ping,
+            Request::Subscribe,
         ]
     }
 
@@ -235,6 +251,12 @@ mod tests {
                 kind: "not_found".into(),
                 message: "no such memory".into(),
             },
+            Response::Change(rb_types::MemoryChanged {
+                id: MemoryId::new(),
+                namespace: Namespace::Project("rusty-brain".into()),
+                kind: rb_types::ChangeKind::Created,
+            }),
+            Response::Lagged { dropped: 3 },
         ]
     }
 
@@ -256,5 +278,35 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"result":"Pong","contract_version":1}"#);
+    }
+
+    #[test]
+    fn subscribe_request_round_trips_and_uses_op_tag() {
+        let json = serde_json::to_string(&Request::Subscribe).unwrap();
+        assert_eq!(json, r#"{"op":"Subscribe"}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn change_and_lagged_responses_round_trip() {
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        let change = Response::Change(MemoryChanged {
+            id: MemoryId::new(),
+            namespace: Namespace::Project("rusty-brain".into()),
+            kind: ChangeKind::Created,
+        });
+        let json = serde_json::to_string(&change).unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
+        // The streamed Change frame carries `result: "Change"`.
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "Change");
+
+        let lagged = Response::Lagged { dropped: 7 };
+        let json = serde_json::to_string(&lagged).unwrap();
+        assert_eq!(json, r#"{"result":"Lagged","dropped":7}"#);
+        let back: Response = serde_json::from_str(&json).unwrap();
+        assert_eq!(serde_json::to_string(&back).unwrap(), json);
     }
 }
