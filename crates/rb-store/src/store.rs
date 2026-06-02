@@ -424,6 +424,71 @@ impl SqliteStore {
     }
 }
 
+/// One active memory's recalibration inputs: the spine fields the importance
+/// job reads to recompute `importance`. `last_accessed_at` is the raw stored
+/// unix-seconds value (`None` when the memory has never been accessed); the job
+/// passes it straight into the pure `recalibrate` function with a single `now`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecalRow {
+    pub namespace: Namespace,
+    pub id: MemoryId,
+    pub importance: u8,
+    pub access_count: i64,
+    pub last_accessed_at: Option<i64>,
+}
+
+impl SqliteStore {
+    /// Read up to `limit` ACTIVE (non-archived) memories with the fields the
+    /// importance-recalibration job needs. Bounded by `limit` and ordered by
+    /// `created_at DESC` for a stable, deterministic scan. Read-only: issues no
+    /// writes (every mutation goes through the single writer via `StoreHandle`).
+    pub fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT namespace, memory_id, importance, access_count, last_accessed_at
+                 FROM memories
+                 WHERE archived_at IS NULL
+                 ORDER BY created_at DESC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let namespace = Namespace::parse_db_string(
+                &row.get::<_, String>("namespace")
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+            )?;
+            let id = parse_id(
+                &row.get::<_, String>("memory_id")
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+            )?;
+            let importance = row
+                .get::<_, i64>("importance")
+                .map_err(|e| Error::Storage(e.to_string()))? as u8;
+            let access_count = row
+                .get::<_, i64>("access_count")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let last_accessed_at = row
+                .get::<_, Option<i64>>("last_accessed_at")
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(RecalRow {
+                namespace,
+                id,
+                importance,
+                access_count,
+                last_accessed_at,
+            });
+        }
+        Ok(out)
+    }
+}
+
 /// Caches the result of the one-time process-global sqlite-vec registration.
 /// `Ok(())` on success; the error message is cloned on every subsequent call.
 static VEC_REGISTERED: std::sync::OnceLock<std::result::Result<(), String>> =
@@ -2677,5 +2742,77 @@ mod near_duplicates_tests {
             dups.is_empty(),
             "an archived candidate must not be returned, got {dups:?}"
         );
+    }
+
+    #[test]
+    fn memories_for_recalibration_carries_access_fields_and_excludes_archived() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+
+        // Two active rows in different namespaces; one archived row.
+        let mut a = MemoryNote::new(
+            Namespace::Global,
+            "frequently accessed".into(),
+            MemoryType::Insight,
+            5,
+        );
+        a.access_count = 7;
+        a.last_accessed_at = chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0);
+        store.insert_memory(&a, None).unwrap();
+
+        let b = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            "never accessed".into(),
+            MemoryType::Reference,
+            3,
+        );
+        store.insert_memory(&b, None).unwrap();
+
+        let gone = MemoryNote::new(Namespace::Global, "archived".into(), MemoryType::Insight, 9);
+        let gone_id = gone.id.clone();
+        store.insert_memory(&gone, None).unwrap();
+        store.archive_memory(&gone_id).unwrap();
+
+        let rows = store.memories_for_recalibration(100).unwrap();
+
+        // Archived row excluded; exactly the two active rows returned.
+        assert_eq!(rows.len(), 2, "archived rows must be excluded");
+        assert!(
+            rows.iter().all(|r| r.id != gone_id),
+            "archived id must not appear"
+        );
+
+        let row_a = rows
+            .iter()
+            .find(|r| r.id == a.id)
+            .expect("active row a must be present");
+        assert_eq!(row_a.namespace, Namespace::Global);
+        assert_eq!(row_a.importance, 5);
+        assert_eq!(row_a.access_count, 7);
+        assert_eq!(row_a.last_accessed_at, Some(1_700_000_000));
+
+        let row_b = rows
+            .iter()
+            .find(|r| r.id == b.id)
+            .expect("active row b must be present");
+        assert_eq!(row_b.namespace, Namespace::Project("rb".into()));
+        assert_eq!(row_b.importance, 3);
+        assert_eq!(row_b.access_count, 0);
+        assert_eq!(row_b.last_accessed_at, None);
+    }
+
+    #[test]
+    fn memories_for_recalibration_respects_limit() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        for i in 0..5 {
+            let m = MemoryNote::new(
+                Namespace::Global,
+                format!("note {i}"),
+                MemoryType::Insight,
+                4,
+            );
+            store.insert_memory(&m, None).unwrap();
+        }
+        let rows = store.memories_for_recalibration(3).unwrap();
+        assert_eq!(rows.len(), 3, "limit must bound the row count");
     }
 }
