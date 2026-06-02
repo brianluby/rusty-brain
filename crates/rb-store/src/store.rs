@@ -80,6 +80,16 @@ impl std::fmt::Debug for SqliteStore {
     }
 }
 
+/// A minimal projection of a memory row for the consolidation scan: only the
+/// fields the job and its survivor policy need. Avoids loading full notes/links.
+#[derive(Clone, Debug)]
+pub struct ConsolidationCandidate {
+    pub id: MemoryId,
+    pub namespace: Namespace,
+    pub importance: u8,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 impl SqliteStore {
     /// Open (or create) a store at `path` with the given embedding dimension.
     ///
@@ -362,6 +372,54 @@ impl SqliteStore {
                 .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
         });
         out.truncate(limit);
+        Ok(out)
+    }
+
+    /// Active (`archived_at IS NULL`), non-superseded (`superseded_by IS NULL`)
+    /// memories, oldest first then by id, capped at `limit`. The deterministic
+    /// ORDER BY makes a consolidation pass reproducible.
+    pub fn candidates_for_consolidation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<ConsolidationCandidate>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, namespace, importance, created_at
+                 FROM memories
+                 WHERE archived_at IS NULL AND superseded_by IS NULL
+                 ORDER BY created_at ASC, memory_id ASC
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(
+                rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, i64>(3)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (id_str, ns_str, importance, created) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(ConsolidationCandidate {
+                id: parse_id(&id_str)?,
+                namespace: Namespace::parse_db_string(&ns_str)?,
+                importance: u8::try_from(importance).map_err(|_| {
+                    Error::Storage(format!("importance {importance} out of u8 range"))
+                })?,
+                created_at: from_ts(created)?,
+            });
+        }
         Ok(out)
     }
 }

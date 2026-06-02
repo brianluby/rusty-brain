@@ -10,4 +10,4 @@ mod migrations;
 mod store;
 
 pub use migrations::run_migrations;
-pub use store::{LinkRow, SqliteStore, Store};
+pub use store::{ConsolidationCandidate, LinkRow, SqliteStore, Store};

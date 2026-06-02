@@ -2,13 +2,18 @@
 //! duplicate of a cluster into a single deterministically-chosen survivor.
 //! Bounded, idempotent, and namespace-isolated (see `run`).
 
-use rb_types::MemoryId;
+use crate::jobs::ConsolidationConfig;
+use crate::jobs::JobSummary;
+use crate::StoreHandle;
+use rb_types::{MemoryId, Result};
+use std::collections::HashSet;
+
+/// The consolidation scan row, re-exported from the store so the daemon read
+/// helper and the job share exactly one type.
+pub use rb_store::ConsolidationCandidate as Candidate;
 
 /// The minimal metadata the survivor policy needs. Kept tiny so `pick_survivor`
 /// is a pure function over plain data, independent of the store.
-// Constructed by `run` (added in the next task) and by the survivor-policy
-// tests; allow dead_code until the `run` job wires it in.
-#[allow(dead_code)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MemoryMeta {
     pub id: MemoryId,
@@ -26,9 +31,6 @@ pub struct MemoryMeta {
 /// Returns the chosen id. `candidates` must be non-empty; an empty slice is a
 /// caller bug and yields `None` so the caller can skip the cluster rather than
 /// panic.
-// Called by `run` (added in the next task) and the survivor-policy tests; allow
-// dead_code until the `run` job wires it in.
-#[allow(dead_code)]
 pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
     candidates
         .iter()
@@ -42,6 +44,108 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
                 .then_with(|| b.id.to_string().cmp(&a.id.to_string()))
         })
         .map(|m| m.id.clone())
+}
+
+/// Run ONE bounded, idempotent, namespace-isolated consolidation pass.
+///
+/// Algorithm: read up to `batch_limit` active, non-superseded candidates
+/// (deterministic order). For each candidate `m` not already consumed by an
+/// earlier cluster, look up its near-duplicates WITHIN m's own namespace; if it
+/// has none, it is `skipped`. Otherwise form the cluster `{m} ∪ dups`, pick a
+/// deterministic survivor, and supersede every OTHER member into the survivor,
+/// marking each consumed so it is never revisited. `scanned` counts candidates
+/// examined; `changed` counts supersede writes; `skipped` counts candidates with
+/// no duplicate.
+///
+/// Idempotency: a superseded/archived member is excluded from the candidate scan
+/// AND from `near_duplicates` (both filter `archived_at IS NULL`), so a second
+/// run over unchanged data performs zero writes. Never merges across namespaces:
+/// `near_duplicates` is namespace-scoped, so a cluster only ever contains
+/// same-namespace members.
+pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<JobSummary> {
+    let candidates = store
+        .candidates_for_consolidation(config.batch_limit)
+        .await?;
+
+    let mut summary = JobSummary::default();
+    let mut consumed: HashSet<String> = HashSet::new();
+
+    for cand in &candidates {
+        summary.scanned += 1;
+
+        // Already absorbed into an earlier cluster this pass: skip silently.
+        if consumed.contains(&cand.id.to_string()) {
+            continue;
+        }
+
+        // Same-namespace near-duplicates only (namespace isolation guaranteed by
+        // the store read). `limit` is the batch budget — a cluster cannot exceed
+        // the scan size.
+        let dups = store
+            .near_duplicates(
+                cand.namespace.clone(),
+                cand.id.clone(),
+                config.similarity_threshold,
+                config.batch_limit,
+            )
+            .await?;
+
+        // Drop any dup already consumed this pass (it belongs to an earlier
+        // cluster); also drop the anchor if it somehow appears.
+        let live_dups: Vec<Candidate> = dups
+            .into_iter()
+            .filter(|(dup_id, _)| dup_id != &cand.id && !consumed.contains(&dup_id.to_string()))
+            .filter_map(|(dup_id, _)| candidates.iter().find(|c| c.id == dup_id).cloned())
+            .collect();
+
+        if live_dups.is_empty() {
+            summary.skipped += 1;
+            continue;
+        }
+
+        // Build the cluster metadata and choose the survivor deterministically.
+        let mut cluster: Vec<MemoryMeta> = Vec::with_capacity(live_dups.len() + 1);
+        cluster.push(MemoryMeta {
+            id: cand.id.clone(),
+            importance: cand.importance,
+            created_at: cand.created_at,
+        });
+        for d in &live_dups {
+            cluster.push(MemoryMeta {
+                id: d.id.clone(),
+                importance: d.importance,
+                created_at: d.created_at,
+            });
+        }
+        let Some(survivor_id) = pick_survivor(&cluster) else {
+            // Cluster is non-empty here, so this is unreachable in practice; skip
+            // defensively rather than panic.
+            summary.skipped += 1;
+            continue;
+        };
+
+        // Supersede every member that is not the survivor into the survivor.
+        for member in &cluster {
+            if member.id == survivor_id {
+                continue;
+            }
+            store
+                .supersede(
+                    cand.namespace.clone(),
+                    member.id.clone(),
+                    survivor_id.clone(),
+                )
+                .await?;
+            summary.changed += 1;
+            consumed.insert(member.id.to_string());
+        }
+        // The survivor (and the anchor, if it survived) is consumed so it is not
+        // re-clustered as a fresh anchor later in the same pass.
+        consumed.insert(survivor_id.to_string());
+        consumed.insert(cand.id.to_string());
+    }
+
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -117,5 +221,211 @@ mod tests {
             Some(expected),
             "survivor must not depend on input order"
         );
+    }
+
+    use crate::jobs::ConsolidationConfig;
+    use crate::StoreHandle;
+    use rb_engine::MemoryBackend;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    const DIM: usize = 8;
+
+    fn vnote(ns: &Namespace, body: &str, importance: u8) -> MemoryNote {
+        MemoryNote::new(
+            ns.clone(),
+            body.to_string(),
+            MemoryType::Insight,
+            importance,
+        )
+    }
+
+    fn cfg(threshold: f32, batch_limit: usize) -> ConsolidationConfig {
+        ConsolidationConfig {
+            enabled: true,
+            interval_secs: 86_400,
+            similarity_threshold: threshold,
+            batch_limit,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn merges_twins_in_same_namespace_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns_a = Namespace::Project("a".to_string());
+        let ns_b = Namespace::Project("b".to_string());
+
+        // Two near-identical memories in A (the survivor has higher importance).
+        let survivor = vnote(&ns_a, "twin survivor", 9);
+        let dup = vnote(&ns_a, "twin dup", 3);
+        let (survivor_id, dup_id) = (survivor.id.clone(), dup.id.clone());
+        handle
+            .write(
+                survivor,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+        handle
+            .write(dup, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // A near-identical memory in B: must NOT be merged with A's cluster.
+        let foreign = vnote(&ns_b, "foreign twin", 9);
+        let foreign_id = foreign.id.clone();
+        handle
+            .write(
+                foreign,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let summary = run(&handle, &cfg(0.95, 200)).await.unwrap();
+        assert_eq!(summary.changed, 1, "exactly one duplicate superseded");
+
+        // The lower-importance dup is archived and points at the survivor.
+        let got_dup = handle
+            .get(ns_a.clone(), dup_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_dup.archived_at.is_some(), "dup archived");
+        assert_eq!(got_dup.superseded_by.as_ref(), Some(&survivor_id));
+
+        // The survivor stays active and is NOT superseded.
+        let got_survivor = handle
+            .get(ns_a.clone(), survivor_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_survivor.archived_at.is_none());
+        assert!(got_survivor.superseded_by.is_none());
+
+        // The foreign memory in B is completely untouched (namespace isolation).
+        let got_foreign = handle
+            .get(ns_b.clone(), foreign_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            got_foreign.archived_at.is_none(),
+            "ns-B memory never merged"
+        );
+        assert!(got_foreign.superseded_by.is_none());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn is_idempotent_second_run_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("a".to_string());
+
+        let a = vnote(&ns, "twin a", 9);
+        let b = vnote(&ns, "twin b", 3);
+        handle
+            .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        handle
+            .write(b, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        let first = run(&handle, &cfg(0.95, 200)).await.unwrap();
+        assert_eq!(first.changed, 1, "first run merges the duplicate");
+
+        // Second run: the duplicate is now archived/superseded and excluded, so
+        // there is nothing left to merge.
+        let second = run(&handle, &cfg(0.95, 200)).await.unwrap();
+        assert_eq!(second.changed, 0, "second run must be a no-op (idempotent)");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn distinct_memories_are_not_merged_and_are_skipped() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("a".to_string());
+
+        // Two orthogonal vectors: similarity ~0.5, far below 0.95 threshold.
+        let x = vnote(&ns, "topic x", 5);
+        let y = vnote(&ns, "topic y", 5);
+        let (x_id, y_id) = (x.id.clone(), y.id.clone());
+        handle
+            .write(x, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        handle
+            .write(y, Some(vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        let summary = run(&handle, &cfg(0.95, 200)).await.unwrap();
+        assert_eq!(summary.changed, 0, "distinct memories are never merged");
+        assert!(
+            summary.skipped >= 2,
+            "both memories counted as skipped (no dup)"
+        );
+
+        // Both remain active.
+        assert!(handle
+            .get(ns.clone(), x_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+        assert!(handle
+            .get(ns.clone(), y_id)
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_consolidation_arm_returns_summary() {
+        use crate::jobs::{run_once, JobKind, JobsConfig};
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("a".to_string());
+
+        let a = vnote(&ns, "twin a", 9);
+        let b = vnote(&ns, "twin b", 3);
+        handle
+            .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        handle
+            .write(b, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // Drive through the shared run_once entry point with the Consolidation kind.
+        let config = JobsConfig {
+            consolidation: cfg(0.95, 200),
+            ..Default::default()
+        };
+        let summary = run_once(JobKind::Consolidation, &handle, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.changed, 1,
+            "run_once(Consolidation) must merge via the same path"
+        );
+
+        handle.shutdown().await;
     }
 }

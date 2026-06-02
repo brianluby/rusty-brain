@@ -384,6 +384,18 @@ impl StoreHandle {
         };
         self.send_write(cmd, rx).await
     }
+
+    /// Enumerate up to `limit` active, non-superseded memories across ALL
+    /// namespaces, oldest first then by id, for the consolidation job to scan.
+    /// Each candidate carries the id/namespace/importance/created_at the job and
+    /// its survivor policy need. Reads via the pool.
+    pub async fn candidates_for_consolidation(
+        &self,
+        limit: usize,
+    ) -> Result<Vec<crate::jobs::consolidation::Candidate>> {
+        self.with_read(move |store| store.candidates_for_consolidation(limit))
+            .await
+    }
 }
 
 struct StoreOpReport {
@@ -1224,6 +1236,45 @@ mod tests {
             crate::change::ChangeKind::Archived,
             "supersede must publish an Archived event for the absorbed memory"
         );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn candidates_for_consolidation_lists_active_non_superseded() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("scan".to_string());
+
+        let keep = note(&ns, "active");
+        let archived = note(&ns, "archived");
+        let new = note(&ns, "survivor");
+        let (keep_id, archived_id, new_id) = (keep.id.clone(), archived.id.clone(), new.id.clone());
+        handle.write(keep, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle
+            .write(archived, Some(vec![0.2f32; DIM]))
+            .await
+            .unwrap();
+        handle.write(new, Some(vec![0.3f32; DIM])).await.unwrap();
+
+        // Supersede `archived` into `new`: it becomes archived + superseded and
+        // must drop out of the candidate enumeration.
+        handle
+            .supersede(ns.clone(), archived_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let cands = handle.candidates_for_consolidation(100).await.unwrap();
+        let ids: Vec<rb_types::MemoryId> = cands.iter().map(|c| c.id.clone()).collect();
+        assert!(ids.contains(&keep_id), "active memory present");
+        assert!(ids.contains(&new_id), "survivor present");
+        assert!(
+            !ids.contains(&archived_id),
+            "archived/superseded memory must be excluded"
+        );
+        // Every returned candidate carries its namespace for per-ns grouping.
+        assert!(cands.iter().all(|c| c.namespace == ns));
 
         handle.shutdown().await;
     }
