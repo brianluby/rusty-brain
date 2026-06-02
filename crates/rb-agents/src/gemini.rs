@@ -5,8 +5,9 @@
 //! `"Stop"`, `"PreCompact"`, `"BeforeTool"`, …) and flat
 //! `tool_name`/`tool_input`/`tool_response` fields. This adapter normalizes
 //! those into the canonical [`HookContext`]/[`HookEvent`] and renders a
-//! [`HookResult`] into Gemini's strict `{ "continue", "systemMessage" }`
-//! stdout shape.
+//! [`HookResult`] into Gemini's strict `{ "continue", "hookSpecificOutput" }`
+//! stdout shape (SessionStart context rides on
+//! `hookSpecificOutput.additionalContext`, the field that feeds the model).
 //!
 //! Fail-open: an unrecognized `hook_event_name` or missing fields degrade to
 //! [`HookEvent::Other`]; parsing never panics.
@@ -79,8 +80,13 @@ impl AgentCli for GeminiCli {
 
     fn render_output(&self, result: &HookResult) -> Value {
         let mut out = json!({ "continue": result.continue_execution });
+        // SessionStart context injection rides on `hookSpecificOutput.additionalContext`
+        // — the field Gemini feeds back into the model — NOT `systemMessage` (which is
+        // user-facing only). Gemini's docs show `additionalContext` under
+        // `hookSpecificOutput` WITHOUT a required `hookEventName`, so none is emitted.
+        // `system_message` is set solely by the SessionStart flow.
         if let Some(msg) = &result.system_message {
-            out["systemMessage"] = Value::String(msg.clone());
+            out["hookSpecificOutput"] = json!({ "additionalContext": msg });
         }
         out
     }
@@ -197,7 +203,12 @@ mod tests {
         };
         let v = GeminiCli.render_output(&with_msg);
         assert_eq!(v["continue"], json!(true));
-        assert_eq!(v["systemMessage"], json!("ctx"));
+        // Context is injected via hookSpecificOutput.additionalContext (the field
+        // that feeds the model). Gemini emits no `hookEventName` under it.
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], json!("ctx"));
+        assert!(v["hookSpecificOutput"].get("hookEventName").is_none());
+        // The old user-facing systemMessage key must be gone.
+        assert!(v.get("systemMessage").is_none());
 
         let without = HookResult {
             system_message: None,
@@ -205,6 +216,7 @@ mod tests {
         };
         let v = GeminiCli.render_output(&without);
         assert_eq!(v["continue"], json!(true));
+        assert!(v.get("hookSpecificOutput").is_none());
         assert!(v.get("systemMessage").is_none());
     }
 }

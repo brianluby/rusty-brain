@@ -76,8 +76,18 @@ impl AgentCli for ClaudeCodeCli {
             Value::Bool(result.continue_execution),
         );
         out.insert("suppressOutput".to_string(), Value::Bool(true));
+        // SessionStart context injection rides on `hookSpecificOutput.additionalContext`
+        // — the only field Claude Code feeds back into the model. `systemMessage` is
+        // user-facing only and would NOT reach the model, so it is never emitted.
+        // `system_message` is set solely by the SessionStart capture flow.
         if let Some(message) = &result.system_message {
-            out.insert("systemMessage".to_string(), Value::String(message.clone()));
+            out.insert(
+                "hookSpecificOutput".to_string(),
+                serde_json::json!({
+                    "hookEventName": "SessionStart",
+                    "additionalContext": message,
+                }),
+            );
         }
         Value::Object(out)
     }
@@ -217,16 +227,27 @@ mod tests {
         });
         assert_eq!(out["continue"], true);
         assert_eq!(out["suppressOutput"], true);
+        // No context to inject => no hookSpecificOutput, and never a systemMessage.
+        assert!(out.get("hookSpecificOutput").is_none());
         assert!(out.get("systemMessage").is_none());
     }
 
     #[test]
-    fn render_output_includes_system_message_when_present() {
+    fn render_output_injects_context_via_hook_specific_output() {
         let out = cli().render_output(&HookResult {
             system_message: Some("injected context".to_string()),
             continue_execution: true,
         });
         assert_eq!(out["continue"], true);
-        assert_eq!(out["systemMessage"], "injected context");
+        assert_eq!(out["suppressOutput"], true);
+        // Context is injected via hookSpecificOutput.additionalContext (the field
+        // that actually feeds the model), tagged with the SessionStart event name.
+        assert_eq!(out["hookSpecificOutput"]["hookEventName"], "SessionStart");
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "injected context"
+        );
+        // The old user-facing systemMessage key must be gone.
+        assert!(out.get("systemMessage").is_none());
     }
 }

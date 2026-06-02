@@ -180,7 +180,12 @@ mod tests {
             system_message: Some("m".to_string()),
             continue_execution: true,
         });
-        assert_eq!(out["systemMessage"], serde_json::json!("m"));
+        // Gemini injects context via hookSpecificOutput.additionalContext, not the
+        // user-facing systemMessage key.
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            serde_json::json!("m")
+        );
     }
 
     #[test]

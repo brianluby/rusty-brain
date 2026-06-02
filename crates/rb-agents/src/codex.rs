@@ -5,7 +5,9 @@
 //! `"PostToolUse"`, `"PreCompact"`, `"Stop"`) and flat
 //! `tool_name`/`tool_input`/`tool_response` fields. This adapter normalizes
 //! those into the canonical [`HookContext`]/[`HookEvent`] and renders a
-//! [`HookResult`] into Codex's `{ "continue", "systemMessage" }` stdout shape.
+//! [`HookResult`] into Codex's `{ "continue", "hookSpecificOutput" }` stdout
+//! shape (SessionStart context rides on `hookSpecificOutput.additionalContext`,
+//! the field that feeds the model).
 //! The Codex TOML config path is handled install-side (Part Y), NOT here.
 //!
 //! Fail-open: `UserPromptSubmit`/`PreToolUse`/unknown/missing degrade to
@@ -79,8 +81,14 @@ impl AgentCli for CodexCli {
 
     fn render_output(&self, result: &HookResult) -> Value {
         let mut out = json!({ "continue": result.continue_execution });
+        // SessionStart context injection rides on `hookSpecificOutput.additionalContext`
+        // — the field Codex feeds back into the model — NOT `systemMessage` (which is
+        // user-facing only). `system_message` is set solely by the SessionStart flow.
         if let Some(msg) = &result.system_message {
-            out["systemMessage"] = Value::String(msg.clone());
+            out["hookSpecificOutput"] = json!({
+                "hookEventName": "SessionStart",
+                "additionalContext": msg,
+            });
         }
         out
     }
@@ -201,7 +209,15 @@ mod tests {
         };
         let v = CodexCli.render_output(&with_msg);
         assert_eq!(v["continue"], json!(true));
-        assert_eq!(v["systemMessage"], json!("note"));
+        // Context is injected via hookSpecificOutput.additionalContext (the field
+        // that feeds the model), tagged with the SessionStart event name.
+        assert_eq!(
+            v["hookSpecificOutput"]["hookEventName"],
+            json!("SessionStart")
+        );
+        assert_eq!(v["hookSpecificOutput"]["additionalContext"], json!("note"));
+        // The old user-facing systemMessage key must be gone.
+        assert!(v.get("systemMessage").is_none());
 
         let without = HookResult {
             system_message: None,
@@ -209,6 +225,7 @@ mod tests {
         };
         let v = CodexCli.render_output(&without);
         assert_eq!(v["continue"], json!(true));
+        assert!(v.get("hookSpecificOutput").is_none());
         assert!(v.get("systemMessage").is_none());
     }
 }
