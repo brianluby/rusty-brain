@@ -16,6 +16,7 @@ mod gemini;
 pub mod install;
 mod namespace;
 mod opencode;
+pub mod proc;
 
 pub use claude_code::ClaudeCodeCli;
 pub use cli::{agent_for, AgentCli, AgentId};
@@ -26,3 +27,4 @@ pub use gemini::GeminiCli;
 pub use install::{AgentInstaller, HookFragment, InstallScope, SENTINEL};
 pub use namespace::detect_namespace;
 pub use opencode::OpenCodeCli;
+pub use proc::run_git_bounded;

@@ -7,9 +7,11 @@
 //! MUST run OFF the async runtime (reads files, shells out to git).
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::time::Duration;
 
 use rb_types::Namespace;
+
+use crate::proc::run_git_bounded;
 
 /// Detect the namespace for `cwd`. Reads `CLAUDE.md`, invokes git. Synchronous:
 /// call this OFF the tokio runtime.
@@ -103,18 +105,15 @@ fn find_nearest_claude_md(start: &Path) -> Option<(PathBuf, String)> {
     None
 }
 
-/// Find the git toplevel for `dir` by invoking git; `None` if not a repo.
+/// Find the git toplevel for `dir` by invoking git under a 1s bound; `None` if
+/// not a repo (or git hung/failed — fail-open).
 fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(output.stdout).ok()?;
+    let bytes = run_git_bounded(
+        dir,
+        &["rev-parse", "--show-toplevel"],
+        Duration::from_secs(1),
+    )?;
+    let path = String::from_utf8(bytes).ok()?;
     let trimmed = path.trim();
     if trimmed.is_empty() {
         None
