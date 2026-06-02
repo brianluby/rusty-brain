@@ -9,7 +9,7 @@ use rb_agents::cli::AgentId;
 use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 use rb_types::Result;
 
-use super::{home_join, hooks_block};
+use super::{home_join, hooks_block, GEMINI_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
 /// Installer for the Gemini CLI.
@@ -30,7 +30,16 @@ impl AgentInstaller for GeminiInstaller {
             InstallScope::Project(root) => root.join(".gemini").join("settings.json"),
             InstallScope::Global => home_join(".gemini")?.join("settings.json"),
         };
-        let merge = hooks_block(&hooks_bin.to_string_lossy(), AgentId::Gemini.as_str());
+        // Gemini: its own event names (SessionStart/AfterTool/SessionEnd/
+        // PreCompress), tool event `AfterTool`, INLINE form (Gemini has no `args`
+        // field — the `--agent` flag must live inside the single command string).
+        let merge = hooks_block(
+            &hooks_bin.to_string_lossy(),
+            AgentId::Gemini.as_str(),
+            &GEMINI_EVENTS,
+            "AfterTool",
+            false,
+        );
         Ok(HookFragment { config_path, merge })
     }
 }
@@ -58,27 +67,39 @@ mod tests {
             frag.config_path,
             PathBuf::from("/tmp/g/.gemini/settings.json")
         );
-        let entry = frag
-            .merge
-            .get("hooks")
-            .unwrap()
-            .get("PreCompact")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
+        let hooks = frag.merge.get("hooks").unwrap();
+        // Gemini's native event keys — NOT Claude's PostToolUse/Stop/PreCompact.
+        for event in ["SessionStart", "AfterTool", "SessionEnd", "PreCompress"] {
+            assert!(
+                hooks.get(event).is_some(),
+                "expected Gemini event key {event}"
+            );
+        }
+        // The Claude-only keys must be absent.
+        assert!(hooks.get("PostToolUse").is_none());
+        assert!(hooks.get("Stop").is_none());
+        assert!(hooks.get("PreCompact").is_none());
+        // AfterTool carries a matcher; SessionEnd does not.
+        let after = hooks.get("AfterTool").unwrap().as_array().unwrap();
+        assert_eq!(after[0].get("matcher").unwrap(), &serde_json::json!("*"));
+        let session_end = hooks.get("SessionEnd").unwrap().as_array().unwrap();
+        assert!(session_end[0].get("matcher").is_none());
+
+        let entry = hooks.get("PreCompress").unwrap().as_array().unwrap()[0]
             .get("hooks")
             .unwrap()
             .as_array()
             .unwrap()[0]
             .clone();
-        // EXEC form: `command` is the raw binary path; flags live in `args`.
+        // INLINE form: the whole invocation is one shell string with the binary
+        // double-quoted; there is NO separate `args` key.
         assert_eq!(
             entry.get("command").unwrap().as_str().unwrap(),
-            "/bin/rusty-brain-hooks"
+            "\"/bin/rusty-brain-hooks\" --agent gemini"
         );
-        assert_eq!(
-            entry.get("args").unwrap(),
-            &serde_json::json!(["--agent", "gemini"])
+        assert!(
+            entry.get("args").is_none(),
+            "Gemini entries must NOT carry an `args` key (it would be dropped)"
         );
     }
 

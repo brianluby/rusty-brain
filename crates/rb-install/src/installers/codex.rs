@@ -9,7 +9,7 @@ use rb_agents::cli::AgentId;
 use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 use rb_types::Result;
 
-use super::{home_join, hooks_block};
+use super::{home_join, hooks_block, CODEX_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
 /// Installer for the Codex CLI.
@@ -30,7 +30,16 @@ impl AgentInstaller for CodexInstaller {
             InstallScope::Project(root) => root.join(".codex").join("hooks.json"),
             InstallScope::Global => home_join(".codex")?.join("hooks.json"),
         };
-        let merge = hooks_block(&hooks_bin.to_string_lossy(), AgentId::Codex.as_str());
+        // Codex: SessionStart/PostToolUse/Stop/PreCompact event names, tool event
+        // `PostToolUse`, INLINE form (Codex has no `args` field — the `--agent`
+        // flag must live inside the single command string).
+        let merge = hooks_block(
+            &hooks_bin.to_string_lossy(),
+            AgentId::Codex.as_str(),
+            &CODEX_EVENTS,
+            "PostToolUse",
+            false,
+        );
         Ok(HookFragment { config_path, merge })
     }
 }
@@ -55,27 +64,30 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frag.config_path, PathBuf::from("/tmp/c/.codex/hooks.json"));
-        let entry = frag
-            .merge
-            .get("hooks")
-            .unwrap()
-            .get("PostToolUse")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
-            .get("hooks")
-            .unwrap()
-            .as_array()
-            .unwrap()[0]
-            .clone();
-        // EXEC form: `command` is the raw binary path; flags live in `args`.
+        let hooks = frag.merge.get("hooks").unwrap();
+        // Codex uses Claude's event names — but the command form differs.
+        for event in ["SessionStart", "PostToolUse", "Stop", "PreCompact"] {
+            assert!(
+                hooks.get(event).is_some(),
+                "expected Codex event key {event}"
+            );
+        }
+        // PostToolUse carries a matcher; Stop does not.
+        let post = hooks.get("PostToolUse").unwrap().as_array().unwrap();
+        assert_eq!(post[0].get("matcher").unwrap(), &serde_json::json!("*"));
+        let stop = hooks.get("Stop").unwrap().as_array().unwrap();
+        assert!(stop[0].get("matcher").is_none());
+
+        let entry = post[0].get("hooks").unwrap().as_array().unwrap()[0].clone();
+        // INLINE form: the whole invocation is one shell string with the binary
+        // double-quoted; there is NO separate `args` key.
         assert_eq!(
             entry.get("command").unwrap().as_str().unwrap(),
-            "/bin/rusty-brain-hooks"
+            "\"/bin/rusty-brain-hooks\" --agent codex"
         );
-        assert_eq!(
-            entry.get("args").unwrap(),
-            &serde_json::json!(["--agent", "codex"])
+        assert!(
+            entry.get("args").is_none(),
+            "Codex entries must NOT carry an `args` key (it would be dropped)"
         );
     }
 

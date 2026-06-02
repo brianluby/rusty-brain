@@ -30,31 +30,60 @@ pub fn builtins() -> Vec<Box<dyn AgentInstaller>> {
     ]
 }
 
-/// The four hook events we register, paired with their Claude-Code event key.
-pub(crate) const EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
+/// Claude Code's hook event names. The tool event is `PostToolUse`.
+pub(crate) const CLAUDE_EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
+/// Gemini's hook event names. The tool event is `AfterTool`.
+pub(crate) const GEMINI_EVENTS: [&str; 4] =
+    ["SessionStart", "AfterTool", "SessionEnd", "PreCompress"];
+/// Codex's hook event names. The tool event is `PostToolUse`.
+pub(crate) const CODEX_EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
 
-/// Build one Claude-Code-shaped command-hook entry for `event`, invoking
-/// `rusty-brain-hooks --agent <agent_id>`, tagged with the sentinel marker.
+/// Build one command-hook entry, tagged with the sentinel marker, in the form
+/// required by the target CLI.
 ///
-/// Shape (one matcher-group): `{ "matcher": "*", "_rusty_brain": true,
-/// "hooks": [ { "type": "command", "command": "<bin>",
-/// "args": ["--agent", "<id>"], "_rusty_brain": true } ] }`. The `matcher` is
-/// omitted for non-tool events (SessionStart/Stop/PreCompact) to match Claude
-/// Code's schema.
+/// Two command forms exist because the CLIs differ in whether they support a
+/// separate `args` array:
 ///
-/// The command is emitted in EXEC form — `command` is the raw binary path (its
-/// own JSON string) and the flags live in a separate `args` array — rather than
-/// a single shell-form string. A shell-form `"<bin> --agent <id>"` is
-/// re-tokenized by the shell, so a binary path containing spaces (common in
-/// macOS/Windows home dirs) would be split mid-path and fail to launch.
-pub(crate) fn command_group(hooks_bin: &str, agent_id: &str, event: &str) -> serde_json::Value {
-    let entry = serde_json::json!({
-        "type": "command",
-        "command": hooks_bin,
-        "args": ["--agent", agent_id],
-        SENTINEL: true,
-    });
-    if event == "PostToolUse" {
+/// - `exec_args == true` (Claude Code): EXEC form — `command` is the raw binary
+///   path (its own JSON string) and the flags live in a separate `args` array.
+///   A shell-form string would be re-tokenized by the shell, splitting a binary
+///   path that contains spaces (common in macOS/Windows home dirs) mid-path and
+///   failing to launch.
+/// - `exec_args == false` (Gemini, Codex): INLINE form — these CLIs have **no**
+///   `args` field, so a separate `args` array is silently dropped (which would
+///   run `rusty-brain-hooks` WITHOUT `--agent`). The whole invocation is one
+///   shell string: the binary path DOUBLE-QUOTED (to tolerate spaces) followed
+///   by `--agent <id>`. No `args` key is emitted.
+fn command_entry(hooks_bin: &str, agent_id: &str, exec_args: bool) -> serde_json::Value {
+    if exec_args {
+        serde_json::json!({
+            "type": "command",
+            "command": hooks_bin,
+            "args": ["--agent", agent_id],
+            SENTINEL: true,
+        })
+    } else {
+        serde_json::json!({
+            "type": "command",
+            "command": format!("\"{hooks_bin}\" --agent {agent_id}"),
+            SENTINEL: true,
+        })
+    }
+}
+
+/// Build one matcher-group for `event`, wrapping the [`command_entry`] for this
+/// CLI. The group carries the sentinel marker; the tool event (`tool_event`)
+/// additionally carries `"matcher": "*"`, while the non-tool events omit it to
+/// match each CLI's schema.
+pub(crate) fn command_group(
+    hooks_bin: &str,
+    agent_id: &str,
+    event: &str,
+    tool_event: &str,
+    exec_args: bool,
+) -> serde_json::Value {
+    let entry = command_entry(hooks_bin, agent_id, exec_args);
+    if event == tool_event {
         serde_json::json!({
             "matcher": "*",
             SENTINEL: true,
@@ -68,15 +97,26 @@ pub(crate) fn command_group(hooks_bin: &str, agent_id: &str, event: &str) -> ser
     }
 }
 
-/// Build the full `{ "hooks": { <event>: [group], ... } }` block shared by the
-/// CLIs whose config nests hooks under a top-level `hooks` key (Claude Code,
-/// Gemini, Codex). OpenCode overrides with its own shape.
-pub(crate) fn hooks_block(hooks_bin: &str, agent_id: &str) -> serde_json::Value {
+/// Build the full `{ "hooks": { <event>: [group], ... } }` block for a CLI whose
+/// config nests hooks under a top-level `hooks` key (Claude Code, Gemini, Codex).
+///
+/// `events` is that CLI's native event-name set, `tool_event` is the member of
+/// `events` that gets the `"matcher": "*"` group, and `exec_args` selects the
+/// EXEC (`true`) vs INLINE (`false`) command form (see [`command_entry`]).
+pub(crate) fn hooks_block(
+    hooks_bin: &str,
+    agent_id: &str,
+    events: &[&str],
+    tool_event: &str,
+    exec_args: bool,
+) -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
-    for event in EVENTS {
+    for event in events {
         hooks.insert(
-            event.to_string(),
-            serde_json::Value::Array(vec![command_group(hooks_bin, agent_id, event)]),
+            (*event).to_string(),
+            serde_json::Value::Array(vec![command_group(
+                hooks_bin, agent_id, event, tool_event, exec_args,
+            )]),
         );
     }
     serde_json::json!({ "hooks": serde_json::Value::Object(hooks) })

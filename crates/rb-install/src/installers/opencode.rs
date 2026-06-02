@@ -10,7 +10,7 @@ use rb_agents::cli::AgentId;
 use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 use rb_types::Result;
 
-use super::{home_join, hooks_block};
+use super::{home_join, hooks_block, CLAUDE_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
 /// Installer for the OpenCode CLI.
@@ -31,7 +31,13 @@ impl AgentInstaller for OpenCodeInstaller {
             InstallScope::Project(root) => root.join("opencode.json"),
             InstallScope::Global => home_join(".config")?.join("opencode").join("opencode.json"),
         };
-        let merge = hooks_block(&hooks_bin.to_string_lossy(), AgentId::OpenCode.as_str());
+        let merge = hooks_block(
+            &hooks_bin.to_string_lossy(),
+            AgentId::OpenCode.as_str(),
+            &CLAUDE_EVENTS,
+            "PostToolUse",
+            true,
+        );
         Ok(HookFragment { config_path, merge })
     }
 }

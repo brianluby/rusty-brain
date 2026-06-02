@@ -9,7 +9,7 @@ use rb_agents::cli::AgentId;
 use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 use rb_types::Result;
 
-use super::{home_join, hooks_block};
+use super::{home_join, hooks_block, CLAUDE_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
 /// Installer for the Claude Code CLI.
@@ -30,7 +30,15 @@ impl AgentInstaller for ClaudeCodeInstaller {
             InstallScope::Project(root) => root.join(".claude").join("settings.json"),
             InstallScope::Global => home_join(".claude")?.join("settings.json"),
         };
-        let merge = hooks_block(&hooks_bin.to_string_lossy(), AgentId::ClaudeCode.as_str());
+        // Claude Code: its own event names, tool event `PostToolUse`, EXEC form
+        // (it supports a separate `args` array).
+        let merge = hooks_block(
+            &hooks_bin.to_string_lossy(),
+            AgentId::ClaudeCode.as_str(),
+            &CLAUDE_EVENTS,
+            "PostToolUse",
+            true,
+        );
         Ok(HookFragment { config_path, merge })
     }
 }
