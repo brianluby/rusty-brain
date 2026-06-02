@@ -138,6 +138,20 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "properties": {}
             }),
         },
+        ToolDef {
+            name: "poll_changes",
+            description: "Drain buffered change notifications for the current \
+                          namespace since the last poll. Returns up to `max` events \
+                          plus a count of events dropped (the buffer is bounded and \
+                          lossy under heavy write load).",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "max": { "type": "integer", "minimum": 1,
+                             "description": "Maximum events to return this poll (default: 100)." }
+                }
+            }),
+        },
     ]
 }
 
@@ -148,15 +162,46 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn exposes_exactly_the_eight_spine_tools() {
+    fn exposes_exactly_the_nine_tools() {
         let names: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
         let expected: BTreeSet<&str> = [
-            "remember", "recall", "get", "list", "graph", "update", "delete", "context",
+            "remember",
+            "recall",
+            "get",
+            "list",
+            "graph",
+            "update",
+            "delete",
+            "context",
+            "poll_changes",
         ]
         .into_iter()
         .collect();
-        assert_eq!(names, expected, "tool set must match the spine exactly");
-        assert_eq!(tool_definitions().len(), 8);
+        assert_eq!(
+            names, expected,
+            "tool set must be the 8 spine tools + poll_changes"
+        );
+        assert_eq!(tool_definitions().len(), 9);
+    }
+
+    #[test]
+    fn poll_changes_takes_optional_max() {
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "poll_changes")
+            .unwrap();
+        assert_eq!(t.input_schema["type"], "object");
+        let props = t.input_schema["properties"].as_object().unwrap();
+        assert!(
+            props.contains_key("max"),
+            "poll_changes accepts optional max"
+        );
+        // No required fields: polling with no args is valid.
+        let required_empty = match t.input_schema.get("required") {
+            None => true,
+            Some(v) => v.as_array().map(|a| a.is_empty()).unwrap_or(false),
+        };
+        assert!(required_empty, "poll_changes must require no input");
     }
 
     #[test]
