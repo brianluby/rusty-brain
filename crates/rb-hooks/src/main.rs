@@ -32,7 +32,7 @@ fn main() {
     // Optional tracing to stderr only when RUSTY_BRAIN_LOG is set (no stderr by
     // default so we never pollute the agent's hook channel).
     if std::env::var_os("RUSTY_BRAIN_LOG").is_some() {
-        let _ = tracing_subscriber_try_init();
+        init_tracing();
     }
 
     let result = std::panic::catch_unwind(run);
@@ -44,11 +44,21 @@ fn main() {
     std::process::exit(0);
 }
 
-/// Best-effort tracing init; ignored if the subscriber crate is unavailable.
-fn tracing_subscriber_try_init() -> Result<(), ()> {
-    // We deliberately avoid a hard dependency on tracing-subscriber here; the
-    // tracing macros are no-ops without a subscriber, which is fine for fail-open.
-    Ok(())
+/// Install a minimal stderr tracing subscriber when `RUSTY_BRAIN_LOG` is set.
+///
+/// Only called when the env var is present, so logging stays OFF by default and
+/// the hook never pollutes the agent's channel. The level comes from
+/// `RUSTY_BRAIN_LOG` (an `EnvFilter` directive, e.g. `debug` or
+/// `rb_hooks=trace`), defaulting to `warn`. Fail-open: any init error (e.g. a
+/// subscriber already set) is ignored; never panics.
+fn init_tracing() {
+    use tracing_subscriber::EnvFilter;
+    let filter =
+        EnvFilter::try_from_env("RUSTY_BRAIN_LOG").unwrap_or_else(|_| EnvFilter::new("warn"));
+    let _ = tracing_subscriber::fmt()
+        .with_writer(std::io::stderr)
+        .with_env_filter(filter)
+        .try_init();
 }
 
 /// The real body. Returns the JSON value to print. Any internal error is mapped
