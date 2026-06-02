@@ -198,6 +198,14 @@ pub fn response_to_content(resp: Response) -> Value {
         Response::Error { kind, message } => {
             json!({ "error": { "kind": kind, "message": message } })
         }
+        // Streamed subscribe frames never reach the request/response proxy path;
+        // map them defensively to an error content (unreachable in practice).
+        Response::Change(_) | Response::Lagged { .. } => json!({
+            "error": {
+                "kind": "protocol",
+                "message": "unexpected streamed frame on a request/response call",
+            }
+        }),
     }
 }
 

@@ -124,6 +124,46 @@ pub fn render_context(
     out
 }
 
+/// Render one streamed subscribe item (a change event or a lagged notice).
+/// JSON: a flat object. Human: a single line.
+pub fn render_change(item: &rb_proto::SubscribeItem, json: bool) -> String {
+    use rb_proto::SubscribeItem;
+    match item {
+        SubscribeItem::Change(evt) => {
+            let kind = match evt.kind {
+                rb_types::ChangeKind::Created => "Created",
+                rb_types::ChangeKind::Updated => "Updated",
+                rb_types::ChangeKind::Archived => "Archived",
+            };
+            if json {
+                let value = serde_json::json!({
+                    "kind": kind,
+                    "namespace": evt.namespace.as_db_string(),
+                    "id": evt.id.to_string(),
+                });
+                serde_json::to_string(&value).unwrap_or_else(|e| {
+                    tracing::warn!(error = %e, "failed to render change JSON");
+                    "{}".to_string()
+                })
+            } else {
+                format!(
+                    "{} {} {}",
+                    kind.to_lowercase(),
+                    evt.namespace.as_db_string(),
+                    evt.id
+                )
+            }
+        }
+        SubscribeItem::Lagged(dropped) => {
+            if json {
+                format!("{{\"lagged\":true,\"dropped\":{dropped}}}")
+            } else {
+                format!("lagged: {dropped} change event(s) dropped (subscriber fell behind)")
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -211,5 +251,55 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["deleted"].as_bool(), Some(true));
         assert_eq!(render_deleted(false), "Deleted");
+    }
+
+    #[test]
+    fn human_change_shows_kind_namespace_and_id() {
+        use rb_proto::SubscribeItem;
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        let id = MemoryId::new();
+        let item = SubscribeItem::Change(MemoryChanged {
+            id: id.clone(),
+            namespace: Namespace::Project("p".into()),
+            kind: ChangeKind::Created,
+        });
+        let out = render_change(&item, false);
+        assert!(out.contains("created"), "kind shown: {out}");
+        assert!(out.contains("project:p"), "namespace shown: {out}");
+        assert!(out.contains(&id.to_string()), "id shown: {out}");
+    }
+
+    #[test]
+    fn human_lagged_shows_dropped_count() {
+        use rb_proto::SubscribeItem;
+        let out = render_change(&SubscribeItem::Lagged(9), false);
+        assert!(out.to_lowercase().contains("lagged"), "lagged shown: {out}");
+        assert!(out.contains('9'), "dropped count shown: {out}");
+    }
+
+    #[test]
+    fn json_change_is_parseable_object() {
+        use rb_proto::SubscribeItem;
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        let id = MemoryId::new();
+        let item = SubscribeItem::Change(MemoryChanged {
+            id: id.clone(),
+            namespace: Namespace::Global,
+            kind: ChangeKind::Archived,
+        });
+        let out = render_change(&item, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["kind"], "Archived");
+        assert_eq!(parsed["namespace"], "global");
+        assert_eq!(parsed["id"], id.to_string());
+    }
+
+    #[test]
+    fn json_lagged_is_parseable_object() {
+        use rb_proto::SubscribeItem;
+        let out = render_change(&SubscribeItem::Lagged(4), true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["lagged"], true);
+        assert_eq!(parsed["dropped"], 4);
     }
 }
