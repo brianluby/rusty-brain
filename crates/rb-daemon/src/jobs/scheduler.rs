@@ -1,72 +1,79 @@
 //! Interval scheduler for enabled evolution jobs. Spawns one tokio task per
-//! enabled job; each ticks on its `interval_secs` and calls `run_once`, logging
-//! the summary at info and errors at warn. A job error is logged and the loop
-//! continues (never fatal, never unwraps). Disabled jobs are never scheduled.
-//! The returned `JoinHandle` is aborted by `Daemon::run` on shutdown.
+//! enabled job inside a `JoinSet`; each ticks on its `interval_secs` and calls
+//! `run_once`, logging the summary at info and errors at warn. A job error is
+//! logged and the loop continues (never fatal, never unwraps). Disabled jobs are
+//! never scheduled. The returned `JoinHandle` is aborted by `Daemon::run` on
+//! shutdown; aborting it drops the `JoinSet`, which aborts every job task.
 
 use crate::jobs::{run_once, JobKind, JobsConfig};
 use crate::StoreHandle;
 use std::time::Duration;
-use tokio::task::JoinHandle;
+use tokio::task::{JoinHandle, JoinSet};
 use tracing::{info, warn};
 
-/// Spawn the job supervisor. Returns a single `JoinHandle` owning all per-job
-/// tasks; aborting it aborts the whole tree (each child is spawned detached and
-/// the supervisor holds their handles, aborting them when it is itself aborted).
+/// Spawn the job supervisor. Returns a single `JoinHandle` whose future owns a
+/// `JoinSet` of per-job tasks. Aborting the returned handle drops that future
+/// (and thus the `JoinSet`); a `JoinSet` aborts all of its tasks when dropped, so
+/// every job tick loop is actually cancelled on shutdown. (A bare `JoinHandle`
+/// would only *detach* on drop, leaving the loop running — hence the `JoinSet`.)
 pub fn spawn(store: StoreHandle, config: JobsConfig) -> JoinHandle<()> {
     tokio::spawn(async move {
-        let mut children: Vec<JoinHandle<()>> = Vec::new();
+        let mut jobs: JoinSet<()> = JoinSet::new();
 
         if config.link_decay.enabled {
-            children.push(spawn_job(
+            spawn_job(
+                &mut jobs,
                 JobKind::LinkDecay,
                 config.link_decay.interval_secs,
                 store.clone(),
                 config.clone(),
-            ));
+            );
         }
         if config.consolidation.enabled {
-            children.push(spawn_job(
+            spawn_job(
+                &mut jobs,
                 JobKind::Consolidation,
                 config.consolidation.interval_secs,
                 store.clone(),
                 config.clone(),
-            ));
+            );
         }
         if config.importance.enabled {
-            children.push(spawn_job(
+            spawn_job(
+                &mut jobs,
                 JobKind::ImportanceRecalibration,
                 config.importance.interval_secs,
                 store.clone(),
                 config.clone(),
-            ));
+            );
         }
 
-        if children.is_empty() {
+        if jobs.is_empty() {
             // Nothing enabled: return immediately so a disabled config spawns no
             // long-lived task.
             return;
         }
 
-        // Hold the children alive until aborted. Awaiting a child only resolves
-        // if that child panics (its tick loop never returns otherwise); on abort
-        // of this supervisor, the children are dropped, which aborts them too.
-        for child in children {
-            let _ = child.await;
-        }
+        // Keep the `JoinSet` (and thus the jobs) alive until this supervisor is
+        // aborted. `join_next` only resolves when a job task ends, which happens
+        // only on panic — the tick loops never return otherwise. When
+        // `Daemon::run` aborts this supervisor, `jobs` is dropped and the
+        // `JoinSet` aborts every remaining job task.
+        while jobs.join_next().await.is_some() {}
     })
 }
 
-/// Spawn a single job's tick loop. The first tick fires immediately, then every
-/// `max(interval_secs, 1)` seconds. Each tick is fail-safe: an error is logged
-/// at warn and the loop continues.
+/// Spawn a single job's tick loop into `jobs`. The first tick fires immediately,
+/// then every `max(interval_secs, 1)` seconds. Each tick is fail-safe: an error
+/// is logged at warn and the loop continues.
 fn spawn_job(
+    jobs: &mut JoinSet<()>,
     kind: JobKind,
     interval_secs: u64,
     store: StoreHandle,
     config: JobsConfig,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
+) {
+    jobs.spawn(async move {
         let period = Duration::from_secs(interval_secs.max(1));
         let mut ticker = tokio::time::interval(period);
         // Default MissedTickBehavior::Burst is fine: we never want to skip work,
@@ -84,7 +91,7 @@ fn spawn_job(
                 Err(e) => warn!(job = kind.as_str(), error = %e, "evolution job failed"),
             }
         }
-    })
+    });
 }
 
 #[cfg(test)]
