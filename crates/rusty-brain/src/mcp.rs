@@ -6,10 +6,12 @@
 
 use crate::client::connect_or_start;
 use async_trait::async_trait;
-use rb_mcp::{serve_stdio, DaemonProxy};
-use rb_proto::{Client, Request, Response};
+use rb_mcp::{serve_stdio_with_buffer, ChangeBuffer, DaemonProxy};
+use rb_proto::{Client, Request, Response, SubscribeItem};
 use std::path::Path;
+use std::sync::Arc;
 use tokio::io::BufReader;
+use tokio::sync::Mutex;
 
 /// Adapts the daemon `rb_proto::Client` to the adapter's `DaemonProxy` seam.
 pub struct ClientProxy {
@@ -34,10 +36,12 @@ impl DaemonProxy for ClientProxy {
     }
 }
 
-/// Run the MCP adapter: connect (auto-start), serve stdio.
+/// Run the MCP adapter: connect (auto-start) a proxy connection, spawn a
+/// background subscriber on a SECOND connection that feeds a bounded change
+/// ring, then serve stdio with `poll_changes` draining that ring.
 ///
-/// The `namespace` is resolved off the async runtime in `main.rs` before
-/// `block_on` (shells out to git / reads files), consistent with the CLI path.
+/// The `namespace` is resolved off the async runtime in `main.rs` (shells out to
+/// git / reads files), consistent with the CLI path.
 pub async fn run_mcp(
     socket_path: &Path,
     db_path: &Path,
@@ -45,17 +49,69 @@ pub async fn run_mcp(
 ) -> anyhow::Result<()> {
     let self_exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("locating own executable: {e}"))?;
-    let client = connect_or_start(socket_path, db_path, namespace, self_exe)
+    let client = connect_or_start(socket_path, db_path, namespace.clone(), self_exe.clone())
         .await
         .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
+
+    // Bounded ring shared between the background subscriber and poll_changes.
+    let buffer = Arc::new(Mutex::new(ChangeBuffer::new(1024)));
+
+    // Background subscriber on a dedicated, read-only connection. If it cannot
+    // connect or subscribe, poll_changes simply returns empty — the adapter must
+    // still serve tools, so a subscriber failure is logged, not fatal.
+    let sub_buffer = Arc::clone(&buffer);
+    let sub_socket = socket_path.to_path_buf();
+    let sub_db = db_path.to_path_buf();
+    let sub_ns = namespace.clone();
+    tokio::spawn(async move {
+        run_subscriber(&sub_socket, &sub_db, sub_ns, self_exe, sub_buffer).await;
+    });
 
     let proxy = ClientProxy::new(client);
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
-    serve_stdio(stdin, stdout, proxy)
+    serve_stdio_with_buffer(stdin, stdout, proxy, buffer)
         .await
         .map_err(|e| anyhow::anyhow!("mcp adapter failed: {e}"))?;
     Ok(())
+}
+
+/// Background loop: open a subscriber connection and push namespace-scoped change
+/// events into the shared ring until the stream closes. Best-effort: connection
+/// or stream errors end the loop quietly (logged to stderr), leaving poll_changes
+/// to return whatever was already buffered.
+async fn run_subscriber(
+    socket_path: &Path,
+    db_path: &Path,
+    namespace: rb_types::Namespace,
+    self_exe: std::path::PathBuf,
+    buffer: Arc<Mutex<ChangeBuffer>>,
+) {
+    let mut client = match connect_or_start(socket_path, db_path, namespace, self_exe).await {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(error = %e, "mcp change subscriber could not connect; poll_changes will be empty");
+            return;
+        }
+    };
+    if let Err(e) = client.subscribe().await {
+        tracing::warn!(error = %e, "mcp change subscriber could not subscribe; poll_changes will be empty");
+        return;
+    }
+    loop {
+        match client.recv_change().await {
+            Ok(SubscribeItem::Change(evt)) => {
+                buffer.lock().await.push(evt);
+            }
+            Ok(SubscribeItem::Lagged(n)) => {
+                buffer.lock().await.record_dropped(n);
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "mcp change subscriber stream ended");
+                break;
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -90,5 +146,21 @@ mod tests {
             Box::pin(run_mcp(sock, db, ns))
         }
         let _ = _assert_callable as fn(_, _, _) -> _;
+    }
+
+    // Compile-time guard: the buffer-aware stdio entrypoint must exist and be
+    // importable from rb_mcp. If `serve_stdio_with_buffer` is removed or its
+    // signature changes incompatibly, this fails to compile.
+    #[test]
+    fn buffer_aware_serve_symbol_is_available() {
+        fn _assert_symbol_exists() {
+            // Reference the function path without calling it.
+            let _f = rb_mcp::serve_stdio_with_buffer::<
+                tokio::io::BufReader<tokio::io::Stdin>,
+                tokio::io::Stdout,
+                crate::mcp::ClientProxy,
+            >;
+        }
+        let _ = _assert_symbol_exists;
     }
 }

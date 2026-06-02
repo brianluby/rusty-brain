@@ -18,4 +18,4 @@ pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use proxy::{build_request, response_to_content, DaemonProxy};
 pub use server::handle_request;
 pub use tools::{tool_definitions, ToolDef};
-pub use transport::serve_stdio;
+pub use transport::{serve_stdio, serve_stdio_with_buffer};
