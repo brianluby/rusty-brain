@@ -1,24 +1,10 @@
-use rb_types::{MemoryId, Namespace};
-use serde::{Deserialize, Serialize};
+//! Change-notification re-export. The canonical `MemoryChanged`/`ChangeKind`
+//! types live in `rb-types` (the leaf crate) so both `rb-proto` (wire
+//! `Response`) and this daemon (the broadcast channel) can name them without a
+//! dependency cycle. This module re-exports them so existing intra-crate paths
+//! (`crate::change::{ChangeKind, MemoryChanged}`) keep working verbatim.
 
-/// What happened to a memory. Published after a successful commit.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ChangeKind {
-    Created,
-    Updated,
-    Archived,
-}
-
-/// Change-notification event broadcast on every successful write (spec §8).
-///
-/// Notification only - never coordination. Enables the deferred `subscribe`
-/// feature with no new machinery.
-#[derive(Clone, Debug, Serialize, Deserialize)]
-pub struct MemoryChanged {
-    pub id: MemoryId,
-    pub namespace: Namespace,
-    pub kind: ChangeKind,
-}
+pub use rb_types::{ChangeKind, MemoryChanged};
 
 #[cfg(test)]
 mod tests {
@@ -27,31 +13,17 @@ mod tests {
     use rb_types::{MemoryId, Namespace};
 
     #[test]
-    fn change_kind_round_trips_all_variants() {
-        for kind in [
-            ChangeKind::Created,
-            ChangeKind::Updated,
-            ChangeKind::Archived,
-        ] {
-            let json = serde_json::to_string(&kind).unwrap();
-            let back: ChangeKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(kind, back);
-        }
-    }
-
-    #[test]
-    fn memory_changed_round_trips_and_clones() {
-        let evt = MemoryChanged {
+    fn reexported_change_types_are_the_rb_types_definitions() {
+        // A value constructed via the rb-daemon path is byte-identical to one
+        // constructed via the rb-types path — proving there is exactly ONE
+        // definition, re-exported, not a divergent copy.
+        let via_daemon = MemoryChanged {
             id: MemoryId::new(),
-            namespace: Namespace::Project("rusty-brain".into()),
-            kind: ChangeKind::Created,
+            namespace: Namespace::Global,
+            kind: ChangeKind::Updated,
         };
-        let json = serde_json::to_string(&evt).unwrap();
-        let back: MemoryChanged = serde_json::from_str(&json).unwrap();
-        assert_eq!(evt.id, back.id);
-        assert_eq!(evt.namespace, back.namespace);
-        assert_eq!(evt.kind, back.kind);
-        // Clone is required so broadcast subscribers each get an owned copy.
-        assert_eq!(evt.clone().kind, ChangeKind::Created);
+        let direct: rb_types::MemoryChanged = via_daemon.clone();
+        assert_eq!(via_daemon, direct);
+        assert_eq!(via_daemon.kind, rb_types::ChangeKind::Updated);
     }
 }
