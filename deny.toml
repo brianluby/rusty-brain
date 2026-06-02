@@ -27,6 +27,12 @@ allow = [
     "Unicode-DFS-2016",
     "CC0-1.0",
     "CDLA-Permissive-2.0",
+    # Permissive licenses pulled in by the fastembed (`local` feature) closure:
+    #   Zlib  — foldhash (via hashbrown -> safetensors -> fastembed)
+    #   NCSA  — libfuzzer-sys (via rav1e -> ravif -> image -> fastembed)
+    # Both are OSI-approved, FSF Free/Libre, and contain no copyleft.
+    "Zlib",
+    "NCSA",
 ]
 confidence-threshold = 0.9
 # Permissive-only allowlist: no copyleft (weak or strong) is accepted.
