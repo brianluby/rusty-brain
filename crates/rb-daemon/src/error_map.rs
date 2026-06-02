@@ -45,7 +45,7 @@ pub(crate) fn error_to_response(err: Error) -> Response {
             ("embedding", "internal error".to_string())
         }
         Error::Enrichment(_) => {
-            warn!(error = %err, "internal enrichment error");
+            warn!("internal enrichment error");
             ("enrichment", "internal error".to_string())
         }
     };
