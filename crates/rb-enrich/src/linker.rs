@@ -114,10 +114,16 @@ impl OpenAiCompatLinker {
         candidates: &[(MemoryNote, f32)],
     ) -> rb_types::Result<Vec<MemoryLink>> {
         let url = format!("{}/chat/completions", self.base_url);
+        // `response_format: json_object` asks JSON-mode-capable providers to emit
+        // a bare JSON object instead of prose-wrapped text. Providers that don't
+        // support the field may ignore it; parsing stays lenient and fail-closed
+        // (a rejecting provider just yields an error and `link` degrades to an
+        // empty link set).
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "temperature": 0,
+            "response_format": { "type": "json_object" },
             "messages": [
                 { "role": "system", "content": Self::system_prompt() },
                 { "role": "user",   "content": Self::user_prompt(new, candidates) }
@@ -196,7 +202,7 @@ mod tests {
     use super::*;
     use rb_engine::Linker;
     use rb_types::{LinkType, MemoryNote, MemoryType, Namespace};
-    use wiremock::matchers::{header, method, path};
+    use wiremock::matchers::{body_partial_json, header, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn note(content: &str) -> MemoryNote {
@@ -235,6 +241,10 @@ mod tests {
         Mock::given(method("POST"))
             .and(path("/v1/chat/completions"))
             .and(header("Authorization", "Bearer link-test-key"))
+            .and(body_partial_json(serde_json::json!({
+                "model": "gpt-4o-mini",
+                "response_format": { "type": "json_object" }
+            })))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_response(&model_json)))
             .mount(&server)
             .await;

@@ -61,16 +61,26 @@ impl OpenAiCompatEnricher {
     /// either required var is absent — this is not an error, just no LLM path.
     /// Returns `Err(Error::Enrichment)` only if the HTTP client cannot be built.
     pub fn from_env() -> rb_types::Result<Option<Self>> {
-        let base_url = match std::env::var("RB_ENRICH_BASE_URL") {
-            Ok(v) if !v.is_empty() => v,
+        Self::from_env_with(|key| std::env::var(key).ok())
+    }
+
+    /// Pure core: build from an injected config getter so tests can drive the
+    /// opt-in logic without mutating process-global env (unsound under parallel
+    /// `#[test]` on Rust 1.81+). The real `from_env` injects a closure over
+    /// `std::env::var`. Mirrors `daemon_command_with` on this branch.
+    fn from_env_with<F>(get: F) -> rb_types::Result<Option<Self>>
+    where
+        F: Fn(&str) -> Option<String>,
+    {
+        let base_url = match get("RB_ENRICH_BASE_URL") {
+            Some(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
-        let model = match std::env::var("RB_ENRICH_MODEL") {
-            Ok(v) if !v.is_empty() => v,
+        let model = match get("RB_ENRICH_MODEL") {
+            Some(v) if !v.is_empty() => v,
             _ => return Ok(None),
         };
-        let api_key = std::env::var("RB_ENRICH_API_KEY")
-            .ok()
+        let api_key = get("RB_ENRICH_API_KEY")
             .filter(|k| !k.is_empty())
             .map(SecretString::from);
 
@@ -121,10 +131,16 @@ impl OpenAiCompatEnricher {
 impl Enricher for OpenAiCompatEnricher {
     async fn enrich(&self, content: &str, context: Option<&str>) -> rb_types::Result<Enrichment> {
         let url = format!("{}/chat/completions", self.base_url);
+        // `response_format: json_object` asks JSON-mode-capable providers (e.g.
+        // OpenAI) to emit a bare JSON object instead of prose-wrapped text.
+        // Providers that don't support the field may ignore it; parsing stays
+        // lenient and fail-closed (a provider that rejects the field just yields
+        // an error and the engine degrades to the heuristic fallback).
         let body = serde_json::json!({
             "model": self.model,
             "max_tokens": MAX_TOKENS,
             "temperature": 0,
+            "response_format": { "type": "json_object" },
             "messages": [
                 { "role": "system", "content": Self::system_prompt() },
                 { "role": "user",   "content": Self::user_prompt(content, context) }
@@ -237,7 +253,8 @@ mod tests {
             .and(path("/v1/chat/completions"))
             .and(header("Authorization", "Bearer test-key"))
             .and(body_partial_json(serde_json::json!({
-                "model": "gpt-4o-mini"
+                "model": "gpt-4o-mini",
+                "response_format": { "type": "json_object" }
             })))
             .respond_with(ResponseTemplate::new(200).set_body_json(chat_response(&model_json)))
             .mount(&server)
@@ -272,11 +289,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn no_authorization_header_when_key_absent() {
-        // A wiremock that returns 200 regardless verifies the request reaches the
-        // server. The enricher_no_key constructor sets no api_key, so no
-        // Authorization header should be sent — the server has no header matcher
-        // and still responds 200 (if a header were expected and absent, the mock
-        // would 404 and the test would fail via the assertion below).
+        // True negative assertion: inspect the recorded request and confirm no
+        // `authorization` header was sent when the enricher has no key.
         let server = MockServer::start().await;
         let model_json = serde_json::json!({
             "summary": "ok",
@@ -297,6 +311,14 @@ mod tests {
         let e = enricher_no_key(&base);
         let out = e.enrich("content", None).await.unwrap();
         assert_eq!(out.summary.as_deref(), Some("ok"));
+
+        // The keyless enricher must NOT have sent an Authorization header.
+        let requests = server.received_requests().await.unwrap();
+        assert_eq!(requests.len(), 1, "exactly one request recorded");
+        assert!(
+            requests[0].headers.get("authorization").is_none(),
+            "no Authorization header must be sent when the enricher has no key"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -352,40 +374,60 @@ mod tests {
         );
     }
 
-    #[test]
-    fn from_env_absent_base_url_returns_none() {
-        // NOTE: this mutates the process-global env vars, so it runs as a plain
-        // single-threaded `#[test]` (no async/worker threads) to avoid data races.
-        // Restores prior values to avoid leaking into other tests.
-        let prev_url = std::env::var("RB_ENRICH_BASE_URL").ok();
-        let prev_model = std::env::var("RB_ENRICH_MODEL").ok();
-        std::env::remove_var("RB_ENRICH_BASE_URL");
-        std::env::remove_var("RB_ENRICH_MODEL");
-        let got = OpenAiCompatEnricher::from_env();
-        if let Some(p) = prev_url {
-            std::env::set_var("RB_ENRICH_BASE_URL", p);
-        }
-        if let Some(p) = prev_model {
-            std::env::set_var("RB_ENRICH_MODEL", p);
-        }
-        assert!(got.unwrap().is_none());
+    // `from_env_with` tests drive the opt-in logic from an in-memory map so no
+    // process-global env is mutated (sound under parallel `#[test]`). The real
+    // `from_env` is a one-line closure over `std::env::var` exercised by the
+    // ignored real-API smoke test.
+    fn map_getter(pairs: &[(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        let map: std::collections::HashMap<&'static str, &'static str> =
+            pairs.iter().copied().collect();
+        move |key| map.get(key).map(|v| (*v).to_string())
     }
 
     #[test]
-    fn from_env_base_url_without_model_returns_none() {
-        let prev_url = std::env::var("RB_ENRICH_BASE_URL").ok();
-        let prev_model = std::env::var("RB_ENRICH_MODEL").ok();
-        std::env::set_var("RB_ENRICH_BASE_URL", "http://localhost:11434/v1");
-        std::env::remove_var("RB_ENRICH_MODEL");
-        let got = OpenAiCompatEnricher::from_env();
-        match prev_url {
-            Some(p) => std::env::set_var("RB_ENRICH_BASE_URL", p),
-            None => std::env::remove_var("RB_ENRICH_BASE_URL"),
-        }
-        if let Some(p) = prev_model {
-            std::env::set_var("RB_ENRICH_MODEL", p);
-        }
-        assert!(got.unwrap().is_none());
+    fn from_env_with_both_required_present_returns_some_with_key() {
+        let get = map_getter(&[
+            ("RB_ENRICH_BASE_URL", "https://api.openai.com/v1"),
+            ("RB_ENRICH_MODEL", "gpt-4o-mini"),
+            ("RB_ENRICH_API_KEY", "sk-test"),
+        ]);
+        let e = OpenAiCompatEnricher::from_env_with(get).unwrap().unwrap();
+        assert_eq!(e.base_url, "https://api.openai.com/v1");
+        assert_eq!(e.model, "gpt-4o-mini");
+        assert!(e.api_key.is_some());
+    }
+
+    #[test]
+    fn from_env_with_key_absent_returns_some_without_key() {
+        // Local servers (Ollama, llama.cpp) need no key: both required vars set
+        // but no RB_ENRICH_API_KEY -> Some with api_key None.
+        let get = map_getter(&[
+            ("RB_ENRICH_BASE_URL", "http://localhost:11434/v1"),
+            ("RB_ENRICH_MODEL", "llama3"),
+        ]);
+        let e = OpenAiCompatEnricher::from_env_with(get).unwrap().unwrap();
+        assert_eq!(e.base_url, "http://localhost:11434/v1");
+        assert_eq!(e.model, "llama3");
+        assert!(e.api_key.is_none());
+    }
+
+    #[test]
+    fn from_env_with_base_url_missing_returns_none() {
+        let get = map_getter(&[("RB_ENRICH_MODEL", "gpt-4o-mini")]);
+        assert!(OpenAiCompatEnricher::from_env_with(get).unwrap().is_none());
+    }
+
+    #[test]
+    fn from_env_with_model_missing_returns_none() {
+        let get = map_getter(&[("RB_ENRICH_BASE_URL", "https://api.openai.com/v1")]);
+        assert!(OpenAiCompatEnricher::from_env_with(get).unwrap().is_none());
+    }
+
+    #[test]
+    fn from_env_with_empty_required_values_returns_none() {
+        // Empty-string values are treated as absent (not a valid opt-in).
+        let get = map_getter(&[("RB_ENRICH_BASE_URL", ""), ("RB_ENRICH_MODEL", "")]);
+        assert!(OpenAiCompatEnricher::from_env_with(get).unwrap().is_none());
     }
 
     // Real-API smoke test. Ignored by default; run with:
