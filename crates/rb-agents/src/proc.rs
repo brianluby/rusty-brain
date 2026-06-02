@@ -35,26 +35,50 @@ pub fn run_git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Option<V
         Err(_) => return None,
     };
 
+    // Drain stdout CONCURRENTLY with the wait loop. If we waited for exit before
+    // reading, a large `git` stdout (more than the OS pipe buffer) would block
+    // git's write while we block on exit — a deadlock that only resolves when the
+    // timeout kills the child, so large outputs would never succeed. Moving the
+    // pipe into a reader thread lets git keep writing while we poll for exit.
+    let reader = child.stdout.take().map(|mut out| {
+        std::thread::spawn(move || {
+            use std::io::Read as _;
+            let mut buf = Vec::new();
+            // On read error, return whatever we have; the caller decides via the
+            // exit status whether to trust it.
+            let _ = out.read_to_end(&mut buf);
+            buf
+        })
+    });
+
+    // Join the reader thread, returning its captured bytes. A panicked reader
+    // thread (it never panics by construction) degrades to `None`.
+    let join_reader = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| -> Option<Vec<u8>> {
+        match reader {
+            Some(handle) => handle.join().ok(),
+            None => Some(Vec::new()),
+        }
+    };
+
     let deadline = Instant::now() + timeout;
     loop {
         match child.try_wait() {
             Ok(Some(status)) => {
                 if !status.success() {
+                    let _ = join_reader(reader);
                     return None;
                 }
-                let mut buf = Vec::new();
-                if let Some(mut out) = child.stdout.take() {
-                    use std::io::Read as _;
-                    if out.read_to_end(&mut buf).is_err() {
-                        return None;
-                    }
-                }
-                return Some(buf);
+                // Clean exit: the writer is done, so the reader thread will see
+                // EOF and finish. Join it to collect the full output.
+                return join_reader(reader);
             }
             Ok(None) => {
                 if Instant::now() >= deadline {
                     let _ = child.kill();
                     let _ = child.wait();
+                    // Closing the child's stdout (on kill/reap) lets the reader
+                    // hit EOF; join it so the thread never leaks.
+                    let _ = join_reader(reader);
                     return None;
                 }
                 std::thread::sleep(POLL_INTERVAL);
@@ -62,6 +86,7 @@ pub fn run_git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Option<V
             Err(_) => {
                 let _ = child.kill();
                 let _ = child.wait();
+                let _ = join_reader(reader);
                 return None;
             }
         }
@@ -128,6 +153,60 @@ mod tests {
             Duration::from_secs(5),
         );
         assert!(out.is_none(), "a non-repo dir must return None");
+    }
+
+    #[test]
+    fn large_stdout_is_fully_captured_without_deadlock() {
+        if !git_available() {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let run = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(tmp.path())
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+        };
+        if !run(&["init"]).map(|s| s.success()).unwrap_or(false) {
+            return; // git unavailable for init; skip
+        }
+
+        // Stage enough files that `git diff --cached --name-only` produces well
+        // over the OS pipe buffer (commonly 64 KiB). Each filename is padded so a
+        // few thousand entries comfortably exceed the buffer; if we did not drain
+        // stdout concurrently, git would block on write and this would deadlock
+        // until the timeout, returning None instead of the full listing.
+        const COUNT: usize = 4000;
+        for i in 0..COUNT {
+            // ~40 bytes/name → ~160 KiB of `--name-only` output.
+            let name = format!("file-{i:020}-padding-xxxxxxxx.txt");
+            std::fs::write(tmp.path().join(&name), b"x").unwrap();
+        }
+        assert!(
+            run(&["add", "-A"]).map(|s| s.success()).unwrap_or(false),
+            "git add must succeed"
+        );
+
+        let out = run_git_bounded(
+            tmp.path(),
+            &["diff", "--cached", "--name-only"],
+            Duration::from_secs(30),
+        );
+        let bytes = out.expect("large diff must be fully captured, not deadlocked");
+        assert!(
+            bytes.len() > 64 * 1024,
+            "output should exceed the pipe buffer, got {} bytes",
+            bytes.len()
+        );
+        let text = String::from_utf8(bytes).expect("name-only output is utf8");
+        let lines = text.lines().filter(|l| !l.is_empty()).count();
+        assert_eq!(
+            lines, COUNT,
+            "every staged file must appear in the captured output"
+        );
     }
 
     #[test]
