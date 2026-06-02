@@ -459,3 +459,98 @@ async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn subscribe_streams_only_own_namespace_changes() {
+    use rb_proto::SubscribeItem;
+    use rb_types::ChangeKind;
+
+    let daemon = RunningDaemon::start(4).await;
+    let ns_a = Namespace::Project("a".to_string());
+    let ns_b = Namespace::Project("b".to_string());
+
+    // Subscriber on namespace A.
+    let mut sub = Client::connect(&daemon.socket, ns_a.clone()).await.unwrap();
+    sub.subscribe().await.unwrap();
+
+    // Writer on namespace A: a Created event must reach the subscriber.
+    let mut writer_a = Client::connect(&daemon.socket, ns_a.clone()).await.unwrap();
+    let id_a = writer_a
+        .remember(
+            "a memory".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // The subscriber receives the A change (skip any Lagged notices).
+    let got = loop {
+        match tokio::time::timeout(Duration::from_secs(5), sub.recv_change())
+            .await
+            .expect("subscribe stream timed out waiting for the A change")
+            .unwrap()
+        {
+            SubscribeItem::Change(evt) => break evt,
+            SubscribeItem::Lagged(_) => continue,
+        }
+    };
+    assert_eq!(
+        got.id, id_a,
+        "subscriber must receive its namespace's change"
+    );
+    assert_eq!(got.namespace, ns_a);
+    assert_eq!(got.kind, ChangeKind::Created);
+
+    // Writer on namespace B: this change must NOT be delivered to the A subscriber.
+    let mut writer_b = Client::connect(&daemon.socket, ns_b).await.unwrap();
+    writer_b
+        .remember(
+            "b memory".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Do a second A write so there IS a frame to read; the B write must have been
+    // filtered out server-side, so the very next Change is the second A event.
+    let id_a2 = writer_a
+        .remember(
+            "a memory 2".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    let next = loop {
+        match tokio::time::timeout(Duration::from_secs(5), sub.recv_change())
+            .await
+            .expect("subscribe stream timed out waiting for the second A change")
+            .unwrap()
+        {
+            SubscribeItem::Change(evt) => break evt,
+            SubscribeItem::Lagged(_) => continue,
+        }
+    };
+    assert_eq!(
+        next.id, id_a2,
+        "the B-namespace change must be filtered out; next frame is the 2nd A change"
+    );
+    assert_eq!(next.namespace, ns_a, "no cross-namespace leakage");
+
+    daemon.stop().await;
+}

@@ -17,9 +17,11 @@ use rb_proto::{
 use rb_types::{Error, Result};
 use std::sync::Arc;
 use tokio::net::{UnixListener, UnixStream};
+use tokio::sync::broadcast::error::RecvError;
 use tokio::sync::Semaphore;
 use tokio::task::JoinSet;
 use tokio::time::timeout;
+use tokio_util::codec::{Framed, LengthDelimitedCodec};
 use tracing::{info, warn};
 
 use crate::error_map::error_to_response;
@@ -391,8 +393,9 @@ async fn handle_connection(
     };
     write_frame(&mut framed, &ack).await?;
 
+    let store_for_stream = store.clone();
     let engine = {
-        let base = MemoryEngine::new(store, embedder, namespace);
+        let base = MemoryEngine::new(store, embedder, namespace.clone());
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -408,11 +411,57 @@ async fn handle_connection(
                 break;
             }
         };
+        // Subscribe converts this connection into a one-way change stream. It
+        // never returns to request/response cadence; it runs until the client
+        // disconnects or the broadcast closes.
+        if matches!(req, Request::Subscribe) {
+            stream_changes(&mut framed, &store_for_stream, &namespace).await;
+            break;
+        }
         let resp = dispatch(&engine, req).await;
         write_frame(&mut framed, &resp).await?;
     }
 
     Ok(())
+}
+
+/// Stream namespace-scoped change events to a subscriber until the client
+/// disconnects or the broadcast closes.
+///
+/// HARD RULE: this must NEVER block the writer. It only reads from the broadcast
+/// receiver (which drops oldest and reports `Lagged` for slow consumers) and
+/// writes to this one connection's socket; a write error means the client is
+/// gone, so we stop. Events outside `namespace` are filtered server-side (fail
+/// closed: only exact-namespace events are forwarded).
+async fn stream_changes(
+    framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
+    store: &StoreHandle,
+    namespace: &rb_types::Namespace,
+) {
+    let mut rx = store.subscribe();
+    loop {
+        match rx.recv().await {
+            Ok(evt) => {
+                if &evt.namespace != namespace {
+                    continue; // cross-namespace event: never leak it
+                }
+                if write_frame(framed, &Response::Change(evt)).await.is_err() {
+                    break; // client disconnected
+                }
+            }
+            Err(RecvError::Lagged(dropped)) => {
+                // The subscriber fell behind; the broadcast dropped `dropped`
+                // events for it. Surface the count and keep streaming.
+                if write_frame(framed, &Response::Lagged { dropped })
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(RecvError::Closed) => break, // daemon shutting down
+        }
+    }
 }
 
 fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namespace> {
@@ -499,6 +548,11 @@ where
             },
             Err(e) => error_to_response(e),
         },
+        // Subscribe is handled by the streaming branch in `handle_connection`
+        // before `dispatch` is called; reaching here is a protocol misuse.
+        Request::Subscribe => error_to_response(Error::InvalidArgument(
+            "Subscribe is a streaming op, not a single request".to_string(),
+        )),
     }
 }
 
