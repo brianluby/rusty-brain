@@ -32,8 +32,12 @@ fn require_str<'a>(args: &'a Value, key: &str) -> Result<&'a str, ToolError> {
         .ok_or_else(|| invalid(format!("missing required string argument '{key}'")))
 }
 
-fn opt_string(args: &Value, key: &str) -> Option<String> {
-    args.get(key).and_then(Value::as_str).map(str::to_owned)
+fn opt_string(args: &Value, key: &str) -> Result<Option<String>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => Ok(Some(s.clone())),
+        Some(_) => Err(invalid(format!("'{key}' must be a string"))),
+    }
 }
 
 /// Parse an optional array-of-strings argument. Absent or null yields an empty
@@ -66,13 +70,30 @@ fn opt_u8(args: &Value, key: &str) -> Result<Option<u8>, ToolError> {
     }
 }
 
+/// Parse an optional importance field (1..=10). Reuses `rb_types::validate_importance`
+/// as the single source of truth for the valid range. `depth` must NOT use this;
+/// use `opt_u8` instead (depth is a traversal depth, not an importance value).
+fn opt_importance(args: &Value, key: &str) -> Result<Option<u8>, ToolError> {
+    match opt_u8(args, key)? {
+        None => Ok(None),
+        Some(v) => {
+            rb_types::validate_importance(v)
+                .map_err(|_| invalid(format!("'{key}' must be in the range 1..=10")))?;
+            Ok(Some(v))
+        }
+    }
+}
+
+const MAX_LIMIT: usize = 100;
+
 fn opt_usize(args: &Value, key: &str, default: usize) -> Result<usize, ToolError> {
     match args.get(key) {
         None | Some(Value::Null) => Ok(default),
-        Some(v) => v
-            .as_u64()
-            .map(|n| usize::try_from(n).unwrap_or(usize::MAX))
-            .ok_or_else(|| invalid(format!("'{key}' must be a non-negative integer"))),
+        Some(v) => match v.as_u64().and_then(|n| usize::try_from(n).ok()) {
+            Some(n) if n <= MAX_LIMIT => Ok(n),
+            Some(_) => Err(invalid(format!("'{key}' must be <= {MAX_LIMIT}"))),
+            None => Err(invalid(format!("'{key}' must be a non-negative integer"))),
+        },
     }
 }
 
@@ -98,10 +119,10 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
         "remember" => {
             let content = require_str(args, "content")?.to_owned();
             let memory_type = parse_type(args, "type")?.unwrap_or(MemoryType::Insight);
-            let importance = opt_u8(args, "importance")?.unwrap_or(5);
+            let importance = opt_importance(args, "importance")?.unwrap_or(5);
             Ok(Request::Remember {
                 content,
-                context: opt_string(args, "context"),
+                context: opt_string(args, "context")?,
                 memory_type,
                 importance,
                 keywords: Vec::new(),
@@ -119,7 +140,7 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
             id: parse_id(args)?,
         }),
         "list" => Ok(Request::List {
-            min_importance: opt_u8(args, "min_importance")?,
+            min_importance: opt_importance(args, "min_importance")?,
             limit: opt_usize(args, "limit", 20)?,
         }),
         "graph" => {
@@ -138,11 +159,11 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 Some(_) => Some(opt_string_vec(args, "tags")?),
             };
             let updates = MemoryUpdates {
-                content: opt_string(args, "content"),
-                summary: opt_string(args, "summary"),
-                importance: opt_u8(args, "importance")?,
+                content: opt_string(args, "content")?,
+                summary: opt_string(args, "summary")?,
+                importance: opt_importance(args, "importance")?,
                 tags,
-                context: opt_string(args, "context"),
+                context: opt_string(args, "context")?,
             };
             Ok(Request::Update { id, updates })
         }
@@ -389,6 +410,101 @@ mod tests {
         // Absent type yields Ok (defaults applied in callers).
         let ok = build_request("remember", &json!({ "content": "c" }));
         assert!(ok.is_ok(), "absent type must succeed");
+    }
+
+    #[test]
+    fn non_string_context_or_summary_is_invalid_params() {
+        // opt_string must fail closed on a non-string value, not silently drop it.
+        for (tool, args) in [
+            ("remember", json!({ "content": "c", "context": false })),
+            ("remember", json!({ "content": "c", "context": {} })),
+            (
+                "update",
+                json!({ "id": MemoryId::new().to_string(), "summary": 123 }),
+            ),
+            (
+                "update",
+                json!({ "id": MemoryId::new().to_string(), "context": [] }),
+            ),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::jsonrpc::INVALID_PARAMS,
+                "{tool} with non-string optional string field must be INVALID_PARAMS (args={args})"
+            );
+        }
+        // A valid string context still works.
+        let ok = build_request(
+            "remember",
+            &json!({ "content": "c", "context": "some context" }),
+        );
+        assert!(ok.is_ok(), "valid string context must succeed");
+        // Absent context is fine.
+        let ok = build_request("remember", &json!({ "content": "c" }));
+        assert!(ok.is_ok(), "absent context must succeed");
+    }
+
+    #[test]
+    fn out_of_range_importance_is_invalid_params() {
+        // importance must be 1..=10; 0, 42, 255 must all fail with INVALID_PARAMS.
+        for (tool, args) in [
+            ("remember", json!({ "content": "c", "importance": 0 })),
+            ("remember", json!({ "content": "c", "importance": 42 })),
+            (
+                "update",
+                json!({ "id": MemoryId::new().to_string(), "importance": 255 }),
+            ),
+            ("list", json!({ "min_importance": 0 })),
+            ("list", json!({ "min_importance": 255 })),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::jsonrpc::INVALID_PARAMS,
+                "{tool} with out-of-range importance must be INVALID_PARAMS (args={args})"
+            );
+        }
+        // Valid importance is fine.
+        let ok = build_request("remember", &json!({ "content": "c", "importance": 5 }));
+        assert!(ok.is_ok(), "valid importance 5 must succeed");
+        let ok = build_request("remember", &json!({ "content": "c", "importance": 1 }));
+        assert!(ok.is_ok(), "valid importance 1 must succeed");
+        let ok = build_request("remember", &json!({ "content": "c", "importance": 10 }));
+        assert!(ok.is_ok(), "valid importance 10 must succeed");
+        // graph{depth:3} must still work (depth uses opt_u8, not opt_importance).
+        let ok = build_request(
+            "graph",
+            &json!({ "id": MemoryId::new().to_string(), "depth": 3 }),
+        );
+        assert!(
+            ok.is_ok(),
+            "graph depth=3 must succeed (not clamped to 1..=10)"
+        );
+    }
+
+    #[test]
+    fn limit_above_max_is_invalid_params() {
+        // A hostile client requesting >100 results must be rejected.
+        for (tool, args) in [
+            ("recall", json!({ "query": "q", "limit": 1_000_000u64 })),
+            ("list", json!({ "limit": 101 })),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::jsonrpc::INVALID_PARAMS,
+                "{tool} with limit > MAX_LIMIT must be INVALID_PARAMS (args={args})"
+            );
+        }
+        // limit at the boundary is fine.
+        let ok = build_request("recall", &json!({ "query": "q", "limit": 50 }));
+        assert!(ok.is_ok(), "limit=50 must succeed");
+        let ok = build_request("recall", &json!({ "query": "q", "limit": 100 }));
+        assert!(ok.is_ok(), "limit=100 (MAX_LIMIT) must succeed");
+        // absent limit uses the default.
+        let ok = build_request("recall", &json!({ "query": "q" }));
+        assert!(ok.is_ok(), "absent limit must use default");
     }
 
     #[test]
