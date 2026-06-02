@@ -69,7 +69,12 @@ impl AgentCli for ClaudeCodeCli {
 
     fn render_output(&self, result: &HookResult) -> Value {
         let mut out = serde_json::Map::new();
-        out.insert("continue".to_string(), Value::Bool(true));
+        // Emit the canonical `continue_execution` verbatim (the 3 sibling adapters
+        // do the same); it is always `true` in P4 but the renderer must not hardcode.
+        out.insert(
+            "continue".to_string(),
+            Value::Bool(result.continue_execution),
+        );
         out.insert("suppressOutput".to_string(), Value::Bool(true));
         if let Some(message) = &result.system_message {
             out.insert("systemMessage".to_string(), Value::String(message.clone()));
