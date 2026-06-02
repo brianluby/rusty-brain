@@ -119,6 +119,11 @@ pub enum Response {
     Lagged {
         dropped: u64,
     },
+    /// Acknowledges a `Subscribe`: the daemon has registered the change-stream
+    /// receiver and will deliver every event committed from now on. Sent exactly
+    /// once, before any `Change`/`Lagged` frame, so the client cannot make (or
+    /// unblock a peer that makes) a change that races ahead of an active receiver.
+    SubscribeAck,
 }
 
 #[cfg(test)]
@@ -271,6 +276,7 @@ mod tests {
                 kind: rb_types::ChangeKind::Created,
             }),
             Response::Lagged { dropped: 3 },
+            Response::SubscribeAck,
             Response::JobRan {
                 scanned: 10,
                 changed: 3,

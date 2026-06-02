@@ -73,7 +73,18 @@ impl Client {
     /// call [`recv_change`](Self::recv_change) in a loop to read streamed frames.
     /// The stream is scoped server-side to the handshake namespace.
     pub async fn subscribe(&mut self) -> Result<()> {
-        write_frame(&mut self.framed, &Request::Subscribe).await
+        write_frame(&mut self.framed, &Request::Subscribe).await?;
+        // Block until the daemon confirms the broadcast receiver is registered.
+        // Returning before the ack would let the caller commit a change that
+        // races ahead of an active subscription and is silently missed.
+        let resp: Response = read_frame(&mut self.framed).await?;
+        match resp {
+            Resp::SubscribeAck => Ok(()),
+            Resp::Error { kind, message } => Err(response_error_to_error(&kind, &message)),
+            other => Err(Error::Storage(format!(
+                "unexpected frame awaiting subscribe ack: {other:?}"
+            ))),
+        }
     }
 
     /// Read the next streamed item from a subscribe stream. Blocks until the
@@ -572,6 +583,11 @@ mod subscribe_tests {
 
         let req: Request = read_frame(&mut framed).await.unwrap();
         assert!(matches!(req, Request::Subscribe), "expected Subscribe");
+
+        // The client's subscribe() blocks on this ack before returning.
+        write_frame(&mut framed, &Response::SubscribeAck)
+            .await
+            .unwrap();
 
         write_frame(
             &mut framed,

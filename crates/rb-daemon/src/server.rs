@@ -449,6 +449,13 @@ async fn stream_changes(
     namespace: &rb_types::Namespace,
 ) {
     let mut rx = store.subscribe();
+    // Acknowledge the subscription now that the broadcast receiver is registered.
+    // The client blocks in `subscribe()` until it sees this frame, so it cannot
+    // commit (or unblock a peer that commits) a change that races ahead of an
+    // active receiver and is silently missed.
+    if write_frame(framed, &Response::SubscribeAck).await.is_err() {
+        return; // client already gone
+    }
     loop {
         match rx.recv().await {
             Ok(evt) => {
