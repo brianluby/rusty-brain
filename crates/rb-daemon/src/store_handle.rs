@@ -695,7 +695,20 @@ fn writer_loop(
                 reply,
             } => {
                 let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.supersede(&old, &new)
+                    // Mirror the Update/Archive arms: verify BOTH memories live in
+                    // the caller's namespace before mutating, so the primitive can
+                    // never merge across namespaces and the Archived event below is
+                    // provably published under `old`'s real namespace. Fail closed
+                    // (NotFound) on a missing or cross-namespace target.
+                    match (s.get_memory(&old), s.get_memory(&new)) {
+                        (Ok(Some(o)), Ok(Some(n)))
+                            if o.namespace == namespace && n.namespace == namespace =>
+                        {
+                            s.supersede(&old, &new)
+                        }
+                        (Err(e), _) | (_, Err(e)) => Err(e),
+                        _ => Err(Error::NotFound(old.clone())),
+                    }
                 });
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
@@ -1206,14 +1219,52 @@ mod tests {
             .supersede(ns.clone(), old_id.clone(), rb_types::MemoryId::new())
             .await
             .unwrap_err();
-        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        // The namespace guard loads `new` first and fails closed when it does not
+        // exist, before ever touching `old`.
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
         let got_old = handle
             .get(ns.clone(), old_id.clone())
             .await
             .unwrap()
             .unwrap();
-        assert!(got_old.superseded_by.is_none(), "rolled back: no pointer");
-        assert!(got_old.archived_at.is_none(), "rolled back: not archived");
+        assert!(got_old.superseded_by.is_none(), "old untouched: no pointer");
+        assert!(got_old.archived_at.is_none(), "old untouched: not archived");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_rejects_cross_namespace_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns_a = Namespace::Project("a".to_string());
+        let ns_b = Namespace::Project("b".to_string());
+
+        let old = note(&ns_a, "a-old");
+        let new = note(&ns_b, "b-new");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // Superseding an A memory into a B memory must fail closed: the namespace
+        // guard refuses to merge across namespaces even though `new` exists.
+        let err = handle
+            .supersede(ns_a.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+        let got_old = handle
+            .get(ns_a.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            got_old.superseded_by.is_none(),
+            "no cross-namespace pointer"
+        );
+        assert!(got_old.archived_at.is_none(), "old untouched: not archived");
 
         handle.shutdown().await;
     }
