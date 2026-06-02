@@ -44,7 +44,7 @@
 
 ## Build order & dependencies
 
-```
+```text
 Part Q  subscribe change-stream            (independent; validates the broadcast seam)
 Part R  link decay + shared job scaffolding (brings up run_once/config/scheduler/RunJob; S and T reuse it)
 Part S  consolidation                       (depends on R's scaffolding; wires supersede)
