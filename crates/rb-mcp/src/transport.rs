@@ -256,7 +256,7 @@ mod tests {
 
         // tools/list (id 2)
         assert_eq!(responses[1]["id"], 2);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 9);
 
         // tools/call (id 3) -> remembered id appears in the tool result text
         assert_eq!(responses[2]["id"], 3);
@@ -369,7 +369,7 @@ mod tests {
             "error for over-long line has null id"
         );
         assert_eq!(responses[1]["id"], 11);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 8);
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 9);
         server.await.unwrap().unwrap();
     }
 }
