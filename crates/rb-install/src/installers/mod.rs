@@ -37,13 +37,21 @@ pub(crate) const EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "Pr
 /// `rusty-brain-hooks --agent <agent_id>`, tagged with the sentinel marker.
 ///
 /// Shape (one matcher-group): `{ "matcher": "*", "_rusty_brain": true,
-/// "hooks": [ { "type": "command", "command": "<bin> --agent <id>",
-/// "_rusty_brain": true } ] }`. The `matcher` is omitted for non-tool events
-/// (SessionStart/Stop/PreCompact) to match Claude Code's schema.
+/// "hooks": [ { "type": "command", "command": "<bin>",
+/// "args": ["--agent", "<id>"], "_rusty_brain": true } ] }`. The `matcher` is
+/// omitted for non-tool events (SessionStart/Stop/PreCompact) to match Claude
+/// Code's schema.
+///
+/// The command is emitted in EXEC form — `command` is the raw binary path (its
+/// own JSON string) and the flags live in a separate `args` array — rather than
+/// a single shell-form string. A shell-form `"<bin> --agent <id>"` is
+/// re-tokenized by the shell, so a binary path containing spaces (common in
+/// macOS/Windows home dirs) would be split mid-path and fail to launch.
 pub(crate) fn command_group(hooks_bin: &str, agent_id: &str, event: &str) -> serde_json::Value {
     let entry = serde_json::json!({
         "type": "command",
-        "command": format!("{hooks_bin} --agent {agent_id}"),
+        "command": hooks_bin,
+        "args": ["--agent", agent_id],
         SENTINEL: true,
     });
     if event == "PostToolUse" {

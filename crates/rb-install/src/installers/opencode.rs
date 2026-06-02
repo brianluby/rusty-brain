@@ -57,7 +57,7 @@ mod tests {
             )
             .unwrap();
         assert_eq!(frag.config_path, PathBuf::from("/tmp/proj/opencode.json"));
-        let cmd = frag
+        let entry = frag
             .merge
             .get("hooks")
             .unwrap()
@@ -69,12 +69,16 @@ mod tests {
             .unwrap()
             .as_array()
             .unwrap()[0]
-            .get("command")
-            .unwrap()
-            .as_str()
-            .unwrap()
-            .to_string();
-        assert_eq!(cmd, "/opt/rusty-brain-hooks --agent opencode");
+            .clone();
+        // EXEC form: `command` is the raw binary path; flags live in `args`.
+        assert_eq!(
+            entry.get("command").unwrap().as_str().unwrap(),
+            "/opt/rusty-brain-hooks"
+        );
+        assert_eq!(
+            entry.get("args").unwrap(),
+            &serde_json::json!(["--agent", "opencode"])
+        );
         // Sentinel marker present.
         assert_eq!(
             frag.merge

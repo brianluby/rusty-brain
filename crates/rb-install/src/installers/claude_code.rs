@@ -66,8 +66,13 @@ mod tests {
             let group = &arr[0];
             assert_eq!(group.get(SENTINEL).unwrap(), &serde_json::json!(true));
             let inner = group.get("hooks").unwrap().as_array().unwrap();
+            // EXEC form: `command` is the raw binary path; flags live in `args`.
             let cmd = inner[0].get("command").unwrap().as_str().unwrap();
-            assert_eq!(cmd, "/usr/local/bin/rusty-brain-hooks --agent claude-code");
+            assert_eq!(cmd, "/usr/local/bin/rusty-brain-hooks");
+            assert_eq!(
+                inner[0].get("args").unwrap(),
+                &serde_json::json!(["--agent", "claude-code"])
+            );
             assert_eq!(inner[0].get(SENTINEL).unwrap(), &serde_json::json!(true));
         }
         // PostToolUse carries a matcher; the others do not.
