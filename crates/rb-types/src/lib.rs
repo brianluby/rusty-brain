@@ -7,6 +7,7 @@
 
 mod change;
 mod error;
+mod job;
 mod link;
 mod link_type;
 mod memory;
@@ -18,6 +19,7 @@ mod validate;
 
 pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
+pub use job::JobKind;
 pub use link::MemoryLink;
 pub use link_type::LinkType;
 pub use memory::MemoryNote;
