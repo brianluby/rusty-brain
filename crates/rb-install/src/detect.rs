@@ -13,14 +13,18 @@ use std::time::{Duration, Instant};
 
 /// Scan `$PATH` for an executable named `name`. Returns the first match.
 ///
-/// On Windows also probes `name.exe`, `name.cmd`, `name.bat`. No shell is ever
-/// spawned (a literal directory join + `is_file()` check only).
+/// A candidate must be a *runnable* file, not merely present: on unix it must be
+/// a regular file with at least one execute bit set (a non-executable shadow file
+/// named `claude` must NOT count as an install). On Windows the extension itself
+/// is the executability signal, so we probe `name.exe`/`name.cmd`/`name.bat`
+/// (and accept a bare `name` if it is already a file). No shell is ever spawned
+/// (a literal directory join + metadata check only).
 #[must_use]
 pub fn find_binary_on_path(name: &str) -> Option<PathBuf> {
     let path_var = std::env::var_os("PATH")?;
     for dir in std::env::split_paths(&path_var) {
         let candidate = dir.join(name);
-        if candidate.is_file() {
+        if is_executable_file(&candidate) {
             return Some(candidate);
         }
         #[cfg(target_os = "windows")]
@@ -34,6 +38,28 @@ pub fn find_binary_on_path(name: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// True if `path` is a regular file that the OS would treat as executable.
+///
+/// On unix this requires at least one execute bit (`mode & 0o111 != 0`) so a
+/// non-executable file is rejected. On Windows executability is signalled by the
+/// file extension (handled by the caller's extension probe), so a plain
+/// `is_file()` check suffices here.
+#[cfg(unix)]
+fn is_executable_file(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt as _;
+    match std::fs::metadata(path) {
+        Ok(meta) => meta.is_file() && (meta.permissions().mode() & 0o111 != 0),
+        Err(_) => false,
+    }
+}
+
+/// See the unix variant: on Windows the extension carries the executability
+/// signal, so a regular-file check is sufficient.
+#[cfg(not(unix))]
+fn is_executable_file(path: &Path) -> bool {
+    path.is_file()
 }
 
 /// Run `<binary> --version` with a 2-second timeout and parse a version token.
@@ -159,5 +185,44 @@ mod tests {
         }
 
         assert_eq!(found, Some(bin));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_executable_shadow_file_is_not_detected_but_executable_is() {
+        // A file named like a CLI but WITHOUT an execute bit must not be treated as
+        // installed (it cannot actually run); chmod 0755 makes the same name count.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("faketool");
+        fs::write(&bin, "#!/bin/sh\necho faketool 1.0.0\n").unwrap();
+        // Non-executable (0o644): present on PATH but not runnable.
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o644)).unwrap();
+
+        let old = std::env::var_os("PATH");
+        let mut paths = vec![dir.path().to_path_buf()];
+        if let Some(ref p) = old {
+            paths.extend(std::env::split_paths(p));
+        }
+        let joined = std::env::join_paths(paths).unwrap();
+        std::env::set_var("PATH", &joined);
+
+        let before = find_binary_on_path("faketool");
+
+        // Now make it executable; it must be found.
+        fs::set_permissions(&bin, fs::Permissions::from_mode(0o755)).unwrap();
+        let after = find_binary_on_path("faketool");
+
+        match old {
+            Some(p) => std::env::set_var("PATH", p),
+            None => std::env::remove_var("PATH"),
+        }
+
+        assert_eq!(
+            before, None,
+            "a non-executable shadow file must NOT be detected"
+        );
+        assert_eq!(after, Some(bin), "a chmod 0755 file must be detected");
     }
 }
