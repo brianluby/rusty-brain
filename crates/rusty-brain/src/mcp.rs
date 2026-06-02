@@ -1,11 +1,10 @@
 //! `mcp` subcommand: run the MCP stdio adapter against the daemon.
 //!
-//! Detects the namespace (Part L), connects to the daemon (auto-starting it if
-//! the socket is absent), and serves newline-delimited JSON-RPC on stdin/stdout.
-//! stdout carries ONLY JSON-RPC frames; tracing goes to stderr.
+//! The namespace is resolved OFF the async runtime in `main.rs` (same as the
+//! CLI path) and threaded into `run_mcp`. stdout carries ONLY JSON-RPC frames;
+//! tracing goes to stderr.
 
 use crate::client::connect_or_start;
-use crate::namespace_detect::detect_namespace;
 use async_trait::async_trait;
 use rb_mcp::{serve_stdio, DaemonProxy};
 use rb_proto::{Client, Request, Response};
@@ -35,13 +34,15 @@ impl DaemonProxy for ClientProxy {
     }
 }
 
-/// Run the MCP adapter: resolve namespace, connect (auto-start), serve stdio.
+/// Run the MCP adapter: connect (auto-start), serve stdio.
 ///
-/// NOTE: `detect_namespace()` runs a synchronous `git` lookup once at startup.
-/// Moving that off the runtime is the Part L / Part P-6 should-fix; this wiring
-/// reuses the same call the bin's `run_client` already makes, for consistency.
-pub async fn run_mcp(socket_path: &Path, db_path: &Path) -> anyhow::Result<()> {
-    let namespace = detect_namespace();
+/// The `namespace` is resolved off the async runtime in `main.rs` before
+/// `block_on` (shells out to git / reads files), consistent with the CLI path.
+pub async fn run_mcp(
+    socket_path: &Path,
+    db_path: &Path,
+    namespace: rb_types::Namespace,
+) -> anyhow::Result<()> {
     let self_exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("locating own executable: {e}"))?;
     let client = connect_or_start(socket_path, db_path, namespace, self_exe)
@@ -72,5 +73,22 @@ mod tests {
     fn client_proxy_implements_daemon_proxy() {
         // If ClientProxy did not implement DaemonProxy this would not compile.
         let _ = _assert_impls_daemon_proxy::<ClientProxy>;
+    }
+
+    // Compile-time guard: run_mcp must accept a pre-resolved Namespace (threaded
+    // in from main.rs off the runtime) rather than calling detect_namespace()
+    // itself from inside the tokio runtime.
+    #[test]
+    fn run_mcp_signature_takes_preresolved_namespace() {
+        // If run_mcp's signature changed back to not accept a Namespace this
+        // closure would fail to compile.
+        fn _assert_callable<'a>(
+            sock: &'a std::path::Path,
+            db: &'a std::path::Path,
+            ns: rb_types::Namespace,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
+            Box::pin(run_mcp(sock, db, ns))
+        }
+        let _ = _assert_callable as fn(_, _, _) -> _;
     }
 }

@@ -29,7 +29,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 .context("daemon failed")?;
             Ok(())
         }
-        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path)
+        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)
             .await
             .context("mcp adapter failed"),
         other => run_client(other, cli.json, namespace, &socket_path, &db_path).await,
