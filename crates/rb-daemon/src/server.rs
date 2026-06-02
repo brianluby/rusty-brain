@@ -8,7 +8,8 @@ use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 
 use rb_embed::EmbeddingProvider;
-use rb_engine::{MemoryEngine, RememberInput};
+use rb_engine::{Enricher, MemoryEngine, RememberInput};
+use rb_enrich::OpenAiCompatEnricher;
 use rb_proto::{
     bounded_framed, read_frame, write_frame, Handshake, HandshakeAck, Request, Response,
     CONTRACT_VERSION,
@@ -48,6 +49,7 @@ pub struct Daemon {
     listener: UnixListener,
     store: StoreHandle,
     embedder: SharedEmbedder,
+    enricher: Option<Arc<dyn Enricher>>,
     socket_path: PathBuf,
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
@@ -58,6 +60,7 @@ impl std::fmt::Debug for Daemon {
         f.debug_struct("Daemon")
             .field("socket_path", &self.socket_path)
             .field("pidfile_path", &self.pidfile_path)
+            .field("enricher_active", &self.enricher.is_some())
             .finish_non_exhaustive()
     }
 }
@@ -100,11 +103,27 @@ impl Daemon {
 
         let store = StoreHandle::start(config.db_path.clone(), dim, config.read_pool_size)?;
 
+        // Build the opt-in LLM enricher once (reqwest client is reused across
+        // all connections). Activation requires RB_ENRICH_BASE_URL +
+        // RB_ENRICH_MODEL; falls back to heuristic when either is absent.
+        let enricher: Option<Arc<dyn Enricher>> = match OpenAiCompatEnricher::from_env() {
+            Ok(Some(e)) => {
+                info!("LLM enrichment active");
+                Some(Arc::new(e))
+            }
+            Ok(None) => None,
+            Err(e) => {
+                warn!(error = %e, "failed to build LLM enricher; falling back to heuristic");
+                None
+            }
+        };
+
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
             listener,
             store,
             embedder,
+            enricher,
             socket_path: config.socket_path,
             pidfile_path,
             bind_guard,
@@ -117,6 +136,7 @@ impl Daemon {
             listener,
             store,
             embedder,
+            enricher,
             socket_path: _socket_path,
             pidfile_path: _pidfile_path,
             mut bind_guard,
@@ -137,6 +157,7 @@ impl Daemon {
                         Ok((stream, _addr)) => {
                             let store = store.clone();
                             let embedder = embedder.clone();
+                            let enricher = enricher.clone();
                             // Acquire a connection permit before spawning. If
                             // all permits are taken, drop the newly accepted
                             // stream immediately instead of queueing unbounded
@@ -151,7 +172,9 @@ impl Daemon {
                             };
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
-                                if let Err(e) = handle_connection(stream, store, embedder).await {
+                                if let Err(e) =
+                                    handle_connection(stream, store, embedder, enricher).await
+                                {
                                     warn!(error = %e, "connection ended with error");
                                 }
                             });
@@ -325,6 +348,7 @@ async fn handle_connection(
     stream: UnixStream,
     store: StoreHandle,
     embedder: SharedEmbedder,
+    enricher: Option<Arc<dyn Enricher>>,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -367,7 +391,13 @@ async fn handle_connection(
     };
     write_frame(&mut framed, &ack).await?;
 
-    let engine = MemoryEngine::new(store, embedder, namespace);
+    let engine = {
+        let base = MemoryEngine::new(store, embedder, namespace);
+        match enricher {
+            Some(e) => base.with_enricher(e),
+            None => base,
+        }
+    };
     loop {
         // Break the loop if the client is idle for too long between requests.
         let req: Request = match timeout(REQUEST_IDLE_TIMEOUT, read_frame(&mut framed)).await {

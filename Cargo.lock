@@ -1228,6 +1228,7 @@ dependencies = [
  "libc",
  "rb-embed",
  "rb-engine",
+ "rb-enrich",
  "rb-proto",
  "rb-store",
  "rb-types",
