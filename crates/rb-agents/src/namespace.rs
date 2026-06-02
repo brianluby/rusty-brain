@@ -51,11 +51,41 @@ fn dir_name(p: &Path) -> Option<String> {
 }
 
 /// Parse a `CLAUDE.md` body: prefer frontmatter `project: NAME`, else first `# H1`.
+///
+/// The H1 scan deliberately skips a leading `---`...`---` YAML frontmatter block
+/// so a `#` comment INSIDE the frontmatter is never misread as the document
+/// title. If the frontmatter has no closing `---`, fall back to scanning the
+/// whole text (preserving prior behavior).
 pub fn parse_project_from_claude_md(text: &str) -> Option<String> {
     if let Some(name) = project_from_frontmatter(text) {
         return Some(name);
     }
-    first_h1(text)
+    first_h1_in(frontmatter_aware_lines(text))
+}
+
+/// Collect the lines the H1 scan should consider, skipping a leading
+/// `---`...`---` frontmatter block. With an opening fence but NO closing fence,
+/// preserve prior behavior by scanning the full text (all lines).
+fn frontmatter_aware_lines(text: &str) -> Vec<&str> {
+    let mut lines = text.lines();
+    if lines.clone().next().map(str::trim) != Some("---") {
+        return text.lines().collect();
+    }
+    // Consume the opening fence, then walk to the matching closing fence.
+    lines.next();
+    let mut closed = false;
+    for line in lines.by_ref() {
+        if line.trim() == "---" {
+            closed = true;
+            break;
+        }
+    }
+    if !closed {
+        // No closing fence: behave as before and scan everything.
+        return text.lines().collect();
+    }
+    // Whatever remains after the closing fence is the scannable body.
+    lines.collect()
 }
 
 /// Read `project: NAME` from a leading `---`-delimited frontmatter block.
@@ -80,9 +110,10 @@ fn project_from_frontmatter(text: &str) -> Option<String> {
     None
 }
 
-/// First markdown `# H1` heading text (exactly one leading `#`), trimmed.
-fn first_h1(text: &str) -> Option<String> {
-    for line in text.lines() {
+/// First markdown `# H1` heading text (exactly one leading `#`), trimmed, over
+/// the supplied lines.
+fn first_h1_in<'a>(lines: impl IntoIterator<Item = &'a str>) -> Option<String> {
+    for line in lines {
         let trimmed = line.trim_start();
         if let Some(rest) = trimmed.strip_prefix("# ") {
             let heading = rest.trim();
@@ -160,6 +191,28 @@ mod tests {
     #[test]
     fn empty_text_is_none() {
         assert_eq!(parse_project_from_claude_md(""), None);
+    }
+
+    #[test]
+    fn h1_inside_frontmatter_is_not_mistaken_for_the_title() {
+        // The frontmatter carries a `#` line (no `project:` key); the real H1 is in
+        // the body. The frontmatter `#` MUST be skipped, not read as the title.
+        let text = "---\n# not-the-title\nfoo: bar\n---\nintro prose\n# real-project\nmore\n";
+        assert_eq!(
+            parse_project_from_claude_md(text),
+            Some("real-project".to_string())
+        );
+    }
+
+    #[test]
+    fn unterminated_frontmatter_falls_back_to_full_scan() {
+        // An opening `---` with no closing fence: preserve prior behavior and scan
+        // the whole text, so a `# H1` anywhere is still found.
+        let text = "---\nfoo: bar\n# only-heading\nbody\n";
+        assert_eq!(
+            parse_project_from_claude_md(text),
+            Some("only-heading".to_string())
+        );
     }
 
     #[test]
