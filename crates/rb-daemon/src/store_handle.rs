@@ -84,6 +84,12 @@ enum WriteCommand {
         link_type: rb_types::LinkType,
         reply: oneshot::Sender<Result<()>>,
     },
+    Supersede {
+        namespace: Namespace,
+        old: MemoryId,
+        new: MemoryId,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -357,6 +363,26 @@ impl StoreHandle {
     ) -> Result<Vec<(MemoryId, f32)>> {
         self.with_read(move |store| store.near_duplicates(&ns, &id, threshold, limit))
             .await
+    }
+
+    /// Supersede `old` with `new`: archive `old` and point it at `new`, through
+    /// the single writer. The `namespace` is carried only for the published
+    /// `Archived` change event; the FK-guarded SQL keys on ids. Fails closed
+    /// (rolls back) if `new` does not exist.
+    pub async fn supersede(
+        &self,
+        namespace: Namespace,
+        old: MemoryId,
+        new: MemoryId,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::Supersede {
+            namespace,
+            old,
+            new,
+            reply,
+        };
+        self.send_write(cmd, rx).await
     }
 }
 
@@ -637,6 +663,34 @@ fn writer_loop(
                 });
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::Supersede {
+                namespace,
+                old,
+                new,
+                reply,
+            } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.supersede(&old, &new)
+                });
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                // supersede archives `old`; mirror the Archive arm so subscribers
+                // observe the consolidation as an Archived event for `old`.
+                if changed {
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id: old,
+                            namespace,
+                            kind: ChangeKind::Archived,
+                        },
+                    );
+                }
                 if !writer_usable {
                     break;
                 }
@@ -1076,6 +1130,100 @@ mod tests {
         );
         assert!(!ids.contains(&anchor_id), "anchor excluded (self)");
         assert!(!ids.contains(&foreign_id), "ns-B memory never crosses over");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_archives_old_and_sets_pointer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old fact");
+        let new = note(&ns, "new fact");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        handle
+            .supersede(ns.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let got_old = handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got_old.superseded_by.as_ref(), Some(&new_id));
+        assert!(got_old.archived_at.is_some(), "old must be archived");
+        let got_new = handle
+            .get(ns.clone(), new_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_new.superseded_by.is_none());
+        assert!(got_new.archived_at.is_none());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_missing_new_target_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old only");
+        let old_id = old.id.clone();
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        let err = handle
+            .supersede(ns.clone(), old_id.clone(), rb_types::MemoryId::new())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        let got_old = handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got_old.superseded_by.is_none(), "rolled back: no pointer");
+        assert!(got_old.archived_at.is_none(), "rolled back: not archived");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_publishes_archived_event_for_old() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("merge".to_string());
+
+        let old = note(&ns, "old fact");
+        let new = note(&ns, "new fact");
+        let (old_id, new_id) = (old.id.clone(), new.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let mut rx = handle.subscribe();
+        handle
+            .supersede(ns.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+
+        let evt = rx.recv().await.unwrap();
+        assert_eq!(evt.id, old_id, "Archived event must target the old memory");
+        assert_eq!(evt.namespace, ns);
+        assert_eq!(
+            evt.kind,
+            crate::change::ChangeKind::Archived,
+            "supersede must publish an Archived event for the absorbed memory"
+        );
 
         handle.shutdown().await;
     }
