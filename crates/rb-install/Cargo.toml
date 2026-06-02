@@ -25,6 +25,12 @@ clap = { workspace = true }
 thiserror = { workspace = true }
 
 [dev-dependencies]
+rb-types = { path = "../rb-types" }
+rb-proto = { path = "../rb-proto" }
+rb-daemon = { path = "../rb-daemon" }
+rb-embed = { path = "../rb-embed" }
+tokio = { workspace = true }
+serde_json = { workspace = true }
 assert_cmd = { workspace = true }
 predicates = { workspace = true }
 tempfile = { workspace = true }

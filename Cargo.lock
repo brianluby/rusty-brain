@@ -2578,11 +2578,15 @@ dependencies = [
  "clap",
  "predicates",
  "rb-agents",
+ "rb-daemon",
+ "rb-embed",
+ "rb-proto",
  "rb-types",
  "serde",
  "serde_json",
  "tempfile",
  "thiserror 1.0.69",
+ "tokio",
 ]
 
 [[package]]
