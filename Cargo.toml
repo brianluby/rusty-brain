@@ -12,6 +12,7 @@ members = [
     "crates/rb-mcp",
     "crates/rusty-brain",
     "crates/rb-agents",
+    "crates/rb-hooks",
 ]
 
 [workspace.package]

@@ -1,0 +1,30 @@
+[package]
+name = "rb-hooks"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain: per-event capture hook binary (fail-open) for JSON-protocol agent CLIs."
+
+[[bin]]
+name = "rusty-brain-hooks"
+path = "src/main.rs"
+
+[dependencies]
+rb-agents = { path = "../rb-agents" }
+rb-types = { path = "../rb-types" }
+rb-proto = { path = "../rb-proto" }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+
+[lints]
+workspace = true
