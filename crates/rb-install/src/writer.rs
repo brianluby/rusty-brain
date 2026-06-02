@@ -36,6 +36,38 @@ fn is_sentinel(value: &serde_json::Value) -> bool {
         .unwrap_or(false)
 }
 
+/// Coarse structural kind used to decide whether a fragment may overwrite a
+/// user's existing value. Object/Array are distinguished from each other and
+/// from any scalar; all scalars (bool/number/string) share the `Scalar` kind so
+/// a same-kind scalar still lets the fragment win.
+#[derive(PartialEq, Eq)]
+enum Kind {
+    Null,
+    Scalar,
+    Array,
+    Object,
+}
+
+fn kind_of(value: &serde_json::Value) -> Kind {
+    match value {
+        serde_json::Value::Null => Kind::Null,
+        serde_json::Value::Array(_) => Kind::Array,
+        serde_json::Value::Object(_) => Kind::Object,
+        _ => Kind::Scalar,
+    }
+}
+
+/// True if `value` is a non-empty container (object/array with members). Scalars
+/// and null are never "empty containers". Used to decide whether a structurally
+/// mismatched user value is meaningful enough to preserve.
+fn is_nonempty_container(value: &serde_json::Value) -> bool {
+    match value {
+        serde_json::Value::Array(a) => !a.is_empty(),
+        serde_json::Value::Object(o) => !o.is_empty(),
+        _ => false,
+    }
+}
+
 /// Deep-merge `fragment` into `base`, stripping prior sentinel entries first.
 ///
 /// Objects merge key-by-key. Arrays are treated as hook-group lists: any
@@ -61,8 +93,18 @@ pub fn merge_value(base: serde_json::Value, fragment: &serde_json::Value) -> ser
             out.extend(f.iter().cloned());
             serde_json::Value::Array(out)
         }
-        // Fragment wins for scalars / type mismatches (it carries our config).
-        (_, fv) => fv.clone(),
+        (base, fragment) => {
+            // Structural type mismatch (e.g. user `"hooks": ["x"]` vs our object).
+            // Only let the fragment win when the user's base is null/absent or a
+            // same-kind scalar — otherwise a meaningful, differently-typed user
+            // value (a non-empty container) would be silently dropped. Preserve it.
+            let same_scalar = kind_of(&base) == Kind::Scalar && kind_of(fragment) == Kind::Scalar;
+            if kind_of(&base) == Kind::Null || same_scalar || !is_nonempty_container(&base) {
+                fragment.clone()
+            } else {
+                base
+            }
+        }
     }
 }
 
@@ -207,6 +249,42 @@ mod tests {
         assert!(user.is_some(), "user hook must survive merge");
         let ours = ss.iter().find(|g| g.get(SENTINEL).is_some());
         assert!(ours.is_some(), "our sentinel group must be present");
+    }
+
+    #[test]
+    fn merge_preserves_user_value_on_structural_type_mismatch() {
+        // User has `hooks` as a non-empty ARRAY; our fragment merges an OBJECT at
+        // the same key. The mismatched, meaningful user value must NOT be dropped.
+        let existing = serde_json::json!({ "hooks": ["x"] });
+        let frag = serde_json::json!({ "hooks": { "SessionStart": [] } });
+        let merged = merge_value(existing, &frag);
+        assert_eq!(
+            merged.get("hooks").unwrap(),
+            &serde_json::json!(["x"]),
+            "a non-empty differently-typed user value must be preserved, not clobbered"
+        );
+    }
+
+    #[test]
+    fn merge_lets_fragment_win_over_null_and_same_scalar_and_empty_container() {
+        // null base -> fragment wins.
+        let m = merge_value(
+            serde_json::json!({ "k": serde_json::Value::Null }),
+            &serde_json::json!({ "k": 1 }),
+        );
+        assert_eq!(m.get("k").unwrap(), &serde_json::json!(1));
+        // same-kind scalar base -> fragment wins.
+        let m = merge_value(
+            serde_json::json!({ "k": "old" }),
+            &serde_json::json!({ "k": "new" }),
+        );
+        assert_eq!(m.get("k").unwrap(), &serde_json::json!("new"));
+        // empty container of a different kind -> fragment wins (nothing to lose).
+        let m = merge_value(
+            serde_json::json!({ "k": [] }),
+            &serde_json::json!({ "k": { "a": 1 } }),
+        );
+        assert_eq!(m.get("k").unwrap(), &serde_json::json!({ "a": 1 }));
     }
 
     #[test]
