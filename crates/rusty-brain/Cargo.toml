@@ -15,6 +15,11 @@ path = "src/main.rs"
 name = "rusty_brain"
 path = "src/lib.rs"
 
+[features]
+# Forward the local ONNX embedding backend to rb-embed. OFF by default;
+# enabled in CI by the `build-local` job and at runtime via `--features local`.
+local = ["rb-embed/local"]
+
 [dependencies]
 rb-types = { path = "../rb-types" }
 rb-proto = { path = "../rb-proto" }
