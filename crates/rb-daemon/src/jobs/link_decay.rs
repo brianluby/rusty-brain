@@ -1,7 +1,15 @@
 //! Link-decay job: exponentially decay link `strength` by age, floored. Reads
 //! candidate links via the read pool; writes via the single writer. Bounded by
-//! `batch_limit`; idempotent (re-running on already-decayed links no-ops once
-//! the value stops moving by more than `EPSILON`).
+//! `batch_limit`.
+//!
+//! Idempotent by construction: the decayed value is a pure function of the
+//! IMMUTABLE baseline (`base_strength`, captured at link creation) and the
+//! age measured from the immutable `created_at` — never of the running
+//! `strength`. So `new = base_strength * 0.5^(age/half_life)` is the same on
+//! every pass at a given `now`; re-running at the same instant recomputes the
+//! identical value and writes nothing (delta < `EPSILON`). Decaying the running
+//! value instead would compound the age-from-creation factor on each pass and
+//! collapse every link to the floor within days.
 
 use crate::jobs::config::LinkDecayConfig;
 use crate::jobs::JobSummary;
@@ -44,8 +52,14 @@ pub async fn run_at(
 
         let age_secs = (now - row.created_at).num_seconds();
         let age_days = (age_secs as f64) / 86_400.0;
-        let new_strength =
-            decayed_strength(row.strength, age_days, config.half_life_days, config.floor);
+        // Decay the IMMUTABLE baseline, not the running value, so repeated passes
+        // at the same `now` converge to the same result (idempotent).
+        let new_strength = decayed_strength(
+            row.base_strength,
+            age_days,
+            config.half_life_days,
+            config.floor,
+        );
 
         let floor = config.floor as f32;
         if config.prune_below_floor && new_strength <= floor {
@@ -170,6 +184,140 @@ mod tests {
             (rows[0].strength - 0.2).abs() < 1e-3,
             "got {}",
             rows[0].strength
+        );
+
+        store.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_is_idempotent_at_a_fixed_instant() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let store = crate::StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("decay-idempotent".to_string());
+
+        let a = rb_types::MemoryNote::new(
+            ns.clone(),
+            "source".to_string(),
+            rb_types::MemoryType::Insight,
+            5,
+        );
+        let b = rb_types::MemoryNote::new(
+            ns.clone(),
+            "target".to_string(),
+            rb_types::MemoryType::Insight,
+            5,
+        );
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        store.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        store.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let created = chrono::Utc::now() - chrono::Duration::days(60);
+        store
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "seed".to_string(),
+                created_at: created,
+            })
+            .await
+            .unwrap();
+
+        let cfg = LinkDecayConfig {
+            enabled: true,
+            interval_secs: 86_400,
+            half_life_days: 30.0,
+            floor: 0.05,
+            prune_below_floor: false,
+            batch_limit: 1000,
+        };
+
+        // Freeze the clock so both passes see the identical age-from-creation.
+        let now = chrono::Utc::now();
+
+        let first = run_at(&store, &cfg, now).await.unwrap();
+        assert_eq!(first.changed, 1, "first pass decays the link");
+        let after_first = store.links_for_decay(10).await.unwrap()[0].strength;
+
+        // Re-running at the SAME instant must be a no-op: the decayed value is a
+        // pure function of the immutable baseline + age, so it does not move.
+        let second = run_at(&store, &cfg, now).await.unwrap();
+        assert_eq!(second.scanned, 1);
+        assert_eq!(
+            second.changed, 0,
+            "second pass at the same now must not change anything"
+        );
+        assert_eq!(second.skipped, 1);
+        let after_second = store.links_for_decay(10).await.unwrap()[0].strength;
+        assert_eq!(
+            after_first, after_second,
+            "strength is stable across repeated passes at a fixed instant"
+        );
+
+        store.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_matches_single_exponential_across_passes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let store = crate::StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("decay-curve".to_string());
+
+        let a = rb_types::MemoryNote::new(
+            ns.clone(),
+            "source".to_string(),
+            rb_types::MemoryType::Insight,
+            5,
+        );
+        let b = rb_types::MemoryNote::new(
+            ns.clone(),
+            "target".to_string(),
+            rb_types::MemoryType::Insight,
+            5,
+        );
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        store.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        store.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let base = 0.8_f32;
+        let created = chrono::Utc::now() - chrono::Duration::days(90);
+        store
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: base,
+                reason: "seed".to_string(),
+                created_at: created,
+            })
+            .await
+            .unwrap();
+
+        let cfg = LinkDecayConfig {
+            enabled: true,
+            interval_secs: 86_400,
+            half_life_days: 30.0,
+            floor: 0.0,
+            prune_below_floor: false,
+            batch_limit: 1000,
+        };
+
+        // Two passes a day apart: the second must NOT compound on the first.
+        let t1 = created + chrono::Duration::days(60); // age 60d at pass 1
+        let t2 = created + chrono::Duration::days(90); // age 90d at pass 2
+        run_at(&store, &cfg, t1).await.unwrap();
+        run_at(&store, &cfg, t2).await.unwrap();
+
+        let strength = store.links_for_decay(10).await.unwrap()[0].strength;
+        // Closed form from the immutable baseline at age 90d (three half-lives):
+        // 0.8 * 0.5^3 = 0.1. Compounding would instead yield ~0.8*0.5^2*0.5^3.
+        let expected = (base as f64) * 0.5_f64.powf(90.0 / 30.0);
+        assert!(
+            (strength as f64 - expected).abs() < 1e-4,
+            "expected single-exponential {expected}, got {strength}"
         );
 
         store.shutdown().await;
