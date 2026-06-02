@@ -21,8 +21,10 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
 
     match cli.command {
         Command::Serve { jobs_config } => {
-            let jobs_config_path =
-                paths::resolve_jobs_config_path(jobs_config, std::env::var("RB_JOBS_CONFIG").ok());
+            let jobs_config_path = paths::resolve_jobs_config_path(
+                jobs_config,
+                std::env::var(paths::JOBS_CONFIG_ENV).ok(),
+            );
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
@@ -136,7 +138,16 @@ async fn run_client(
                             Ok(item) => {
                                 println!("{}", output::render_change(&item, json));
                             }
-                            Err(_) => break, // stream closed: clean exit
+                            // A transport close (Io/EOF) is a normal end-of-stream.
+                            // Any other error — a daemon `Response::Error` frame or
+                            // a protocol violation — is a real failure the user must
+                            // see, so surface it (non-zero exit) instead of hiding it.
+                            Err(rb_types::Error::Io(_))
+                            | Err(rb_types::Error::IoKind { .. }) => break,
+                            Err(e) => {
+                                return Err(anyhow::Error::new(e))
+                                    .context("subscribe stream error");
+                            }
                         }
                     }
                 }
