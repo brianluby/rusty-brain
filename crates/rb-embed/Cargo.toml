@@ -11,6 +11,13 @@ description = "EmbeddingProvider trait, Voyage remote provider, and an offline d
 name = "rb_embed"
 path = "src/lib.rs"
 
+[features]
+# Local ONNX embeddings via fastembed (all-MiniLM-L6-v2, 384-dim).
+# OFF by default: the default build closure MUST NOT compile or link
+# fastembed/ort/onnxruntime. Enabled in CI only by the `build-local` job
+# and at runtime via `--features local`.
+local = ["dep:fastembed"]
+
 [dependencies]
 rb-types = { path = "../rb-types" }
 async-trait = { workspace = true }
@@ -19,6 +26,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 secrecy = { workspace = true }
 sha2 = { workspace = true }
+# Optional: only compiled when the `local` feature is enabled.
+fastembed = { version = "5.15", optional = true }
 
 [dev-dependencies]
 tokio = { workspace = true }
