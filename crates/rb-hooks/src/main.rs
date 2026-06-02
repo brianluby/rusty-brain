@@ -1,4 +1,5 @@
 mod cli;
+mod dedup;
 mod io;
 
 fn main() {
