@@ -1,12 +1,15 @@
-//! Per-CLI identity (`AgentId`), the `AgentCli` JSON-adapter trait, a
-//! `PassthroughCli` placeholder, and the `agent_for` registry. Part V wires
-//! Claude Code fully and routes the other three CLIs to `PassthroughCli`; Part X
-//! replaces those arms with real adapters WITHOUT changing this signature.
+//! Per-CLI identity (`AgentId`), the `AgentCli` JSON-adapter trait, and the
+//! `agent_for` registry. Every `AgentId` maps to a real per-CLI adapter
+//! (`ClaudeCodeCli`/`OpenCodeCli`/`GeminiCli`/`CodexCli`) that normalizes that
+//! CLI's hook JSON into the canonical event model.
 
 use serde_json::Value;
 
 use crate::claude_code::ClaudeCodeCli;
-use crate::event::{HookContext, HookEvent, HookResult};
+use crate::codex::CodexCli;
+use crate::event::{HookContext, HookResult};
+use crate::gemini::GeminiCli;
+use crate::opencode::OpenCodeCli;
 
 /// The set of CLIs the agent surface targets in P4-v1.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,73 +53,18 @@ pub trait AgentCli: Send + Sync {
     fn render_output(&self, result: &HookResult) -> Value;
 }
 
-/// Placeholder adapter for CLIs not yet wired (OpenCode/Gemini/Codex in Part V).
-/// Parses EVERY input into [`HookEvent::Other`] with a default cwd and renders a
-/// Claude-style fail-open stdout object. Part X replaces the three registry arms
-/// that use this with real adapters.
-#[derive(Debug, Clone, Copy)]
-pub struct PassthroughCli {
-    id: AgentId,
-    binary_name: &'static str,
-}
-
-impl PassthroughCli {
-    fn new(id: AgentId, binary_name: &'static str) -> Self {
-        Self { id, binary_name }
-    }
-}
-
-impl AgentCli for PassthroughCli {
-    fn id(&self) -> AgentId {
-        self.id
-    }
-
-    fn binary_name(&self) -> &'static str {
-        self.binary_name
-    }
-
-    fn parse_input(&self, raw: &Value) -> HookContext {
-        let cwd = raw
-            .get("cwd")
-            .and_then(Value::as_str)
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|| std::path::PathBuf::from("."));
-        let session_id = raw
-            .get("session_id")
-            .and_then(Value::as_str)
-            .map(str::to_string);
-        let raw_name = raw
-            .get("hook_event_name")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        HookContext {
-            event: HookEvent::Other(raw_name),
-            cwd,
-            session_id,
-        }
-    }
-
-    fn render_output(&self, result: &HookResult) -> Value {
-        let mut out = serde_json::Map::new();
-        out.insert("continue".to_string(), Value::Bool(true));
-        out.insert("suppressOutput".to_string(), Value::Bool(true));
-        if let Some(message) = &result.system_message {
-            out.insert("systemMessage".to_string(), Value::String(message.clone()));
-        }
-        Value::Object(out)
-    }
-}
-
-/// Registry: return the adapter for `id`. Claude Code is the real reference
-/// adapter; the other three route to a [`PassthroughCli`] until Part X replaces
-/// them. The signature is FINAL — Part X only swaps the three placeholder arms.
+/// Construct the [`AgentCli`] adapter for the given [`AgentId`].
+///
+/// Registry: one boxed adapter per supported CLI. All four are JSON-protocol
+/// adapters; the returned trait object normalizes that CLI's hook JSON into the
+/// canonical [`HookContext`] and renders a canonical [`HookResult`] back.
+#[must_use]
 pub fn agent_for(id: AgentId) -> Box<dyn AgentCli> {
     match id {
         AgentId::ClaudeCode => Box::new(ClaudeCodeCli),
-        AgentId::OpenCode => Box::new(PassthroughCli::new(AgentId::OpenCode, "opencode")),
-        AgentId::Gemini => Box::new(PassthroughCli::new(AgentId::Gemini, "gemini")),
-        AgentId::Codex => Box::new(PassthroughCli::new(AgentId::Codex, "codex")),
+        AgentId::OpenCode => Box::new(OpenCodeCli),
+        AgentId::Gemini => Box::new(GeminiCli),
+        AgentId::Codex => Box::new(CodexCli),
     }
 }
 
@@ -124,7 +72,6 @@ pub fn agent_for(id: AgentId) -> Box<dyn AgentCli> {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use crate::event::{HookEvent, HookResult};
 
     #[test]
     fn agent_id_str_round_trips_all_variants() {
@@ -162,7 +109,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_returns_passthrough_for_other_three() {
+    fn registry_returns_real_adapters_for_other_three() {
         let opencode = agent_for(AgentId::OpenCode);
         assert_eq!(opencode.id(), AgentId::OpenCode);
         assert_eq!(opencode.binary_name(), "opencode");
@@ -177,35 +124,81 @@ mod tests {
     }
 
     #[test]
-    fn passthrough_maps_known_event_to_other_and_keeps_cwd() {
-        let cli = agent_for(AgentId::OpenCode);
-        let raw = serde_json::json!({
-            "hook_event_name": "SessionStart",
-            "cwd": "/proj",
-            "session_id": "s1"
-        });
-        let ctx = cli.parse_input(&raw);
-        assert_eq!(ctx.event, HookEvent::Other("SessionStart".to_string()));
-        assert_eq!(ctx.cwd, std::path::PathBuf::from("/proj"));
-        assert_eq!(ctx.session_id.as_deref(), Some("s1"));
-    }
-
-    #[test]
-    fn passthrough_render_is_fail_open_continue() {
-        let cli = agent_for(AgentId::Codex);
-        let out = cli.render_output(&HookResult {
-            system_message: Some("hi".to_string()),
-            continue_execution: true,
-        });
-        assert_eq!(out["continue"], true);
-        assert_eq!(out["suppressOutput"], true);
-        assert_eq!(out["systemMessage"], "hi");
-    }
-
-    #[test]
     fn agent_cli_is_object_safe() {
         // Compiles only if `AgentCli` is object-safe (used as `Box<dyn AgentCli>`).
         let cli: Box<dyn AgentCli> = agent_for(AgentId::ClaudeCode);
         assert_eq!(cli.id(), AgentId::ClaudeCode);
+    }
+
+    #[test]
+    fn agent_for_returns_matching_id_for_all_four() {
+        for id in [
+            AgentId::ClaudeCode,
+            AgentId::OpenCode,
+            AgentId::Gemini,
+            AgentId::Codex,
+        ] {
+            let cli = agent_for(id);
+            assert_eq!(cli.id(), id);
+        }
+    }
+
+    #[test]
+    fn agent_for_opencode_round_trips_post_tool_use() {
+        let cli = agent_for(AgentId::OpenCode);
+        let raw = serde_json::json!({
+            "type": "tool.execute.after",
+            "tool": "Write",
+            "args": {},
+            "output": {}
+        });
+        let ctx = cli.parse_input(&raw);
+        assert!(matches!(
+            ctx.event,
+            crate::event::HookEvent::PostToolUse { .. }
+        ));
+        let out = cli.render_output(&crate::event::HookResult {
+            system_message: None,
+            continue_execution: true,
+        });
+        assert_eq!(out["continue"], serde_json::json!(true));
+    }
+
+    #[test]
+    fn agent_for_gemini_round_trips_after_tool() {
+        let cli = agent_for(AgentId::Gemini);
+        let raw = serde_json::json!({
+            "hook_event_name": "AfterTool",
+            "tool_name": "Edit"
+        });
+        let ctx = cli.parse_input(&raw);
+        assert!(matches!(
+            ctx.event,
+            crate::event::HookEvent::PostToolUse { .. }
+        ));
+        let out = cli.render_output(&crate::event::HookResult {
+            system_message: Some("m".to_string()),
+            continue_execution: true,
+        });
+        assert_eq!(out["systemMessage"], serde_json::json!("m"));
+    }
+
+    #[test]
+    fn agent_for_codex_round_trips_post_tool_use() {
+        let cli = agent_for(AgentId::Codex);
+        let raw = serde_json::json!({
+            "hook_event_name": "PostToolUse",
+            "tool_name": "Bash"
+        });
+        let ctx = cli.parse_input(&raw);
+        assert!(matches!(
+            ctx.event,
+            crate::event::HookEvent::PostToolUse { .. }
+        ));
+        let out = cli.render_output(&crate::event::HookResult {
+            system_message: None,
+            continue_execution: true,
+        });
+        assert_eq!(out["continue"], serde_json::json!(true));
     }
 }

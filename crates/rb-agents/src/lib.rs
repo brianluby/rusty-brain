@@ -18,7 +18,7 @@ mod namespace;
 mod opencode;
 
 pub use claude_code::ClaudeCodeCli;
-pub use cli::{agent_for, AgentCli, AgentId, PassthroughCli};
+pub use cli::{agent_for, AgentCli, AgentId};
 pub use codex::CodexCli;
 pub use daemon::{AutoStart, DaemonClient};
 pub use event::{HookContext, HookEvent, HookResult};

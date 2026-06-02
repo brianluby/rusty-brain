@@ -7,8 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rb_agents::{
-    agent_for, detect_namespace, AgentCli, AgentId, AgentInstaller, AutoStart, DaemonClient,
-    HookContext, HookEvent, HookFragment, HookResult, InstallScope, PassthroughCli, SENTINEL,
+    agent_for, detect_namespace, AgentCli, AgentId, AgentInstaller, AutoStart, ClaudeCodeCli,
+    CodexCli, DaemonClient, GeminiCli, HookContext, HookEvent, HookFragment, HookResult,
+    InstallScope, OpenCodeCli, SENTINEL,
 };
 
 #[test]
@@ -30,10 +31,13 @@ fn event_model_types_are_reexported() {
 fn registry_and_adapters_are_reexported() {
     let cli: Box<dyn AgentCli> = agent_for(AgentId::ClaudeCode);
     assert_eq!(cli.id(), AgentId::ClaudeCode);
-    // PassthroughCli is part of the public surface for Part X to reference.
-    let passthrough: Box<dyn AgentCli> = agent_for(AgentId::Gemini);
-    assert_eq!(passthrough.binary_name(), "gemini");
-    let _ = std::any::type_name::<PassthroughCli>();
+    let gemini: Box<dyn AgentCli> = agent_for(AgentId::Gemini);
+    assert_eq!(gemini.binary_name(), "gemini");
+    // The four real adapters are part of the public surface.
+    let _ = std::any::type_name::<ClaudeCodeCli>();
+    let _ = std::any::type_name::<OpenCodeCli>();
+    let _ = std::any::type_name::<GeminiCli>();
+    let _ = std::any::type_name::<CodexCli>();
 }
 
 #[test]
