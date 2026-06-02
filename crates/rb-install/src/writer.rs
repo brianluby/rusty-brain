@@ -154,7 +154,7 @@ pub fn write(path: &Path, body: &str, backup: bool) -> Result<()> {
     // Drop the handle before the rename so the file is fully closed first.
     drop(file);
 
-    fs::rename(&temp, path).map_err(|e| Error::Io(e.to_string()))?;
+    rename_replacing(&temp, path)?;
 
     #[cfg(unix)]
     {
@@ -222,6 +222,25 @@ fn write_and_sync(mut file: &fs::File, body: &str) -> Result<()> {
         .map_err(|e| Error::Io(e.to_string()))?;
     file.sync_all().map_err(|e| Error::Io(e.to_string()))?;
     Ok(())
+}
+
+/// Rename `temp` onto `dest`, replacing any existing target.
+///
+/// On unix `rename` already replaces an existing `dest` atomically. On Windows
+/// `rename` FAILS if `dest` exists, so we remove an existing target immediately
+/// before the rename. The Windows branch is the only behavioral change; unix is
+/// untouched.
+///
+/// # Errors
+/// Returns [`Error::Io`] on any filesystem failure.
+fn rename_replacing(temp: &Path, dest: &Path) -> Result<()> {
+    #[cfg(windows)]
+    {
+        if dest.exists() {
+            fs::remove_file(dest).map_err(|e| Error::Io(e.to_string()))?;
+        }
+    }
+    fs::rename(temp, dest).map_err(|e| Error::Io(e.to_string()))
 }
 
 #[cfg(test)]
