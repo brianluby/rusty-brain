@@ -7,6 +7,18 @@ use rb_types::{
 };
 use std::path::Path;
 
+/// One link edge as read by the link-decay job. Public so the daemon's job code
+/// can consume it via the read pool. Not part of the `Store` trait: it is a
+/// cross-namespace maintenance read, not an engine operation.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkRow {
+    pub source: MemoryId,
+    pub target: MemoryId,
+    pub link_type: rb_types::LinkType,
+    pub strength: f32,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// The synchronous storage trait. The daemon wraps this on blocking threads.
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
@@ -145,6 +157,90 @@ impl SqliteStore {
         self.conn
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(storage_err)?;
+        Ok(())
+    }
+
+    // One link edge selected for decay. `created_at` is decoded fail-closed.
+    // Defined here (not as a `Store` trait method) because the decay job calls
+    // it directly through the read pool, outside the engine's namespace scope.
+
+    /// Read up to `limit` link edges for the decay job, newest-irrelevant order
+    /// (PK order is fine; decay is per-row and idempotent). One query, no joins.
+    pub fn links_for_decay(&self, limit: usize) -> Result<Vec<LinkRow>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT source_id, target_id, link_type, strength, created_at
+                 FROM memory_links
+                 LIMIT ?1",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params![limit as i64], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, String>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, f64>(3)?,
+                    row.get::<_, i64>(4)?,
+                ))
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        for r in rows {
+            let (src, tgt, lt, strength, created) = r.map_err(|e| Error::Storage(e.to_string()))?;
+            out.push(LinkRow {
+                source: src.parse::<MemoryId>()?,
+                target: tgt.parse::<MemoryId>()?,
+                link_type: rb_types::LinkType::parse(&lt)?,
+                // strength is SQLite REAL (f64) narrowed to f32, matching load_links.
+                strength: strength as f32,
+                created_at: from_ts(created)?,
+            });
+        }
+        Ok(out)
+    }
+
+    /// Set the `strength` of a single link edge identified by its full PK.
+    /// A missing edge is a no-op (0 rows updated); decay is best-effort.
+    pub fn set_link_strength(
+        &self,
+        source: &MemoryId,
+        target: &MemoryId,
+        link_type: rb_types::LinkType,
+        strength: f32,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memory_links SET strength = ?1
+                 WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
+                rusqlite::params![
+                    strength as f64,
+                    source.to_string(),
+                    target.to_string(),
+                    link_type.as_str(),
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Delete a single link edge identified by its full PK. A missing edge is a
+    /// no-op. Used by the decay job's `prune_below_floor` policy.
+    pub fn delete_link(
+        &self,
+        source: &MemoryId,
+        target: &MemoryId,
+        link_type: rb_types::LinkType,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "DELETE FROM memory_links
+                 WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
+                rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
 }
@@ -1049,6 +1145,110 @@ mod tests {
             matches!(err, Error::Storage(ref m) if m.contains("embedding_dim must be greater than 0")),
             "zero dim must be rejected with a clear Storage error, got {err:?}"
         );
+    }
+
+    #[test]
+    fn links_for_decay_returns_link_rows_bounded_by_limit() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("decay".to_string());
+
+        // Two real memories to satisfy the FK on memory_links.
+        let a = MemoryNote::new(ns.clone(), "source".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "target".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+
+        let created = chrono::Utc::now();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: created,
+            })
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.source, a.id);
+        assert_eq!(row.target, b.id);
+        assert_eq!(row.link_type, rb_types::LinkType::References);
+        assert!((row.strength - 0.8).abs() < f32::EPSILON);
+        assert_eq!(row.created_at.timestamp(), created.timestamp());
+
+        // The limit is honoured.
+        let none = store.links_for_decay(0).unwrap();
+        assert!(none.is_empty(), "limit 0 returns no rows");
+    }
+
+    #[test]
+    fn set_link_strength_updates_only_the_matching_edge() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("setstr".to_string());
+        let a = MemoryNote::new(ns.clone(), "s".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "t".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        store
+            .set_link_strength(&a.id, &b.id, rb_types::LinkType::References, 0.25)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!((rows[0].strength - 0.25).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn delete_link_removes_only_the_matching_edge() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("dellink".to_string());
+        let a = MemoryNote::new(ns.clone(), "s".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "t".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        // A second, differently-typed edge between the same nodes must survive.
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::Extends,
+                strength: 0.4,
+                reason: "r2".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        store
+            .delete_link(&a.id, &b.id, rb_types::LinkType::References)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1, "only the References edge was deleted");
+        assert_eq!(rows[0].link_type, rb_types::LinkType::Extends);
     }
 }
 
