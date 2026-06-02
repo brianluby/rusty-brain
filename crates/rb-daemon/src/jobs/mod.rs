@@ -2,6 +2,7 @@
 //! that read via the read pool and mutate ONLY through the single writer.
 
 mod config;
+pub mod consolidation;
 mod link_decay;
 pub mod scheduler;
 
