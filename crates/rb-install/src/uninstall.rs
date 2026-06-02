@@ -18,41 +18,62 @@ fn is_sentinel(value: &serde_json::Value) -> bool {
 
 /// Recursively strip every sentinel-marked element from `value`.
 ///
-/// In arrays, sentinel-marked elements are dropped. In objects, the `SENTINEL`
-/// key itself is removed and each remaining value is stripped recursively. Empty
-/// hook-event arrays left behind by removal are pruned, and an emptied `hooks`
-/// object is removed entirely so the file returns to its pre-install shape.
+/// Thin wrapper over [`strip_sentinel_tracked`] that discards the
+/// removed-sentinel flag; the public contract is the cleaned value.
 #[must_use]
 pub fn strip_sentinel(value: serde_json::Value) -> serde_json::Value {
+    strip_sentinel_tracked(value).0
+}
+
+/// Strip sentinel-marked entries, returning the cleaned value and whether any
+/// sentinel-marked entry was actually removed beneath (or at) this value.
+///
+/// In arrays, sentinel-marked elements are dropped. In objects, the `SENTINEL`
+/// key itself is removed and each remaining value is stripped recursively. A
+/// container that became empty is pruned ONLY when a sentinel was actually
+/// removed beneath it — so a user's deliberately-empty `{}`/`[]` that we never
+/// touched survives uninstall verbatim.
+#[must_use]
+fn strip_sentinel_tracked(value: serde_json::Value) -> (serde_json::Value, bool) {
     match value {
         serde_json::Value::Array(items) => {
-            let cleaned: Vec<serde_json::Value> = items
-                .into_iter()
-                .filter(|e| !is_sentinel(e))
-                .map(strip_sentinel)
-                .collect();
-            serde_json::Value::Array(cleaned)
+            let mut removed = false;
+            let mut cleaned = Vec::with_capacity(items.len());
+            for e in items {
+                if is_sentinel(&e) {
+                    removed = true;
+                    continue;
+                }
+                let (child, child_removed) = strip_sentinel_tracked(e);
+                removed |= child_removed;
+                cleaned.push(child);
+            }
+            (serde_json::Value::Array(cleaned), removed)
         }
         serde_json::Value::Object(map) => {
             let mut out = serde_json::Map::new();
+            let mut removed = false;
             for (k, v) in map {
                 if k == SENTINEL {
+                    removed = true;
                     continue;
                 }
-                let cleaned = strip_sentinel(v);
-                // Prune arrays/objects that became empty purely from our removal.
-                let prune = match &cleaned {
-                    serde_json::Value::Array(a) => a.is_empty(),
-                    serde_json::Value::Object(o) => o.is_empty(),
-                    _ => false,
-                };
-                if !prune {
+                let (cleaned, child_removed) = strip_sentinel_tracked(v);
+                removed |= child_removed;
+                // Prune a container ONLY when our removal is what emptied it.
+                let emptied_by_us = child_removed
+                    && match &cleaned {
+                        serde_json::Value::Array(a) => a.is_empty(),
+                        serde_json::Value::Object(o) => o.is_empty(),
+                        _ => false,
+                    };
+                if !emptied_by_us {
                     out.insert(k, cleaned);
                 }
             }
-            serde_json::Value::Object(out)
+            (serde_json::Value::Object(out), removed)
         }
-        other => other,
+        other => (other, false),
     }
 }
 
@@ -135,6 +156,36 @@ mod tests {
         });
         let stripped = strip_sentinel(user_only.clone());
         assert_eq!(stripped, user_only);
+    }
+
+    #[test]
+    fn uninstall_preserves_user_set_empty_containers() {
+        // The user deliberately set empty containers we never touched. Uninstall
+        // must NOT prune them (no sentinel was removed beneath them).
+        let config = serde_json::json!({
+            "emptyObj": {},
+            "emptyArr": [],
+            "nested": { "alsoEmpty": {} }
+        });
+        let stripped = strip_sentinel(config.clone());
+        assert_eq!(
+            stripped, config,
+            "user-set empty containers must survive uninstall verbatim"
+        );
+    }
+
+    #[test]
+    fn uninstall_preserves_user_empty_container_beside_our_pruned_hook() {
+        // A user-set empty `customEmpty` object sits next to our injected hooks.
+        // After uninstall, ours is pruned but the user's empty object survives.
+        let user = serde_json::json!({ "model": "x", "customEmpty": {} });
+        let installed = merge_value(user, &claude_fragment(Path::new("/tmp/p")));
+        let stripped = strip_sentinel(installed);
+        assert_eq!(
+            stripped,
+            serde_json::json!({ "model": "x", "customEmpty": {} }),
+            "user empty container survives while our hooks block is pruned"
+        );
     }
 
     #[test]
