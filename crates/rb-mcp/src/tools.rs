@@ -232,6 +232,64 @@ mod tests {
     }
 
     #[test]
+    fn memory_type_enum_matches_memorytype() {
+        // Drift guard: the strings in `memory_type_enum()` must exactly equal
+        // the `MemoryType::as_str()` values for ALL variants, and each must
+        // round-trip via `MemoryType::parse`. Add a variant to `MemoryType`
+        // without updating `memory_type_enum()` — this test fails.
+        use rb_types::MemoryType;
+        use std::collections::BTreeSet;
+
+        // All known MemoryType variants — must be kept in sync with rb-types.
+        const ALL_VARIANTS: [MemoryType; 9] = [
+            MemoryType::ArchitectureDecision,
+            MemoryType::CodePattern,
+            MemoryType::BugFix,
+            MemoryType::Configuration,
+            MemoryType::Constraint,
+            MemoryType::Entity,
+            MemoryType::Insight,
+            MemoryType::Reference,
+            MemoryType::Preference,
+        ];
+
+        let schema_strings: BTreeSet<String> = memory_type_enum()
+            .as_array()
+            .expect("memory_type_enum must be a JSON array")
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .expect("each enum entry must be a string")
+                    .to_string()
+            })
+            .collect();
+
+        let type_strings: BTreeSet<String> = ALL_VARIANTS
+            .iter()
+            .map(|mt| mt.as_str().to_string())
+            .collect();
+
+        assert_eq!(
+            schema_strings, type_strings,
+            "memory_type_enum() strings must exactly match MemoryType::as_str() for all variants"
+        );
+
+        // Every schema string must also round-trip through MemoryType::parse.
+        for s in &schema_strings {
+            let parsed = MemoryType::parse(s);
+            assert!(
+                parsed.is_ok(),
+                "schema string '{s}' must round-trip via MemoryType::parse"
+            );
+            assert_eq!(
+                parsed.unwrap().as_str(),
+                s.as_str(),
+                "as_str() must be the inverse of parse() for '{s}'"
+            );
+        }
+    }
+
+    #[test]
     fn tool_list_serializes_with_camelcase_input_schema() {
         // The MCP wire shape uses `inputSchema` (camelCase).
         let t = &tool_definitions()[0];

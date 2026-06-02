@@ -77,11 +77,12 @@ fn opt_usize(args: &Value, key: &str, default: usize) -> Result<usize, ToolError
 }
 
 fn parse_type(args: &Value, key: &str) -> Result<Option<MemoryType>, ToolError> {
-    match args.get(key).and_then(Value::as_str) {
-        None => Ok(None),
-        Some(s) => MemoryType::parse(s)
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => MemoryType::parse(s)
             .map(Some)
             .map_err(|e| invalid(format!("invalid '{key}': {e}"))),
+        Some(_) => Err(invalid(format!("'{key}' must be a string"))),
     }
 }
 
@@ -364,6 +365,30 @@ mod tests {
             }
             other => panic!("expected Recall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn non_string_type_arg_is_invalid_params() {
+        // A present-but-non-string `type` (e.g. an integer or boolean) must fail
+        // closed with INVALID_PARAMS, not silently degrade to `None` / a default.
+        for (tool, args) in [
+            ("remember", json!({ "content": "c", "type": 123 })),
+            ("remember", json!({ "content": "c", "type": true })),
+            ("recall", json!({ "query": "q", "type": 123 })),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code,
+                crate::jsonrpc::INVALID_PARAMS,
+                "{tool} with non-string 'type' must be INVALID_PARAMS (args={args})"
+            );
+        }
+        // A valid string type still succeeds.
+        let ok = build_request("remember", &json!({ "content": "c", "type": "insight" }));
+        assert!(ok.is_ok(), "valid string type must succeed");
+        // Absent type yields Ok (defaults applied in callers).
+        let ok = build_request("remember", &json!({ "content": "c" }));
+        assert!(ok.is_ok(), "absent type must succeed");
     }
 
     #[test]

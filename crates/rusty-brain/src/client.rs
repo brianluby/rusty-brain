@@ -138,6 +138,13 @@ where
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    // Detach the daemon into its own process group so that a Ctrl-C / SIGHUP
+    // in the client's terminal does not propagate to the long-lived daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
     cmd
 }
 

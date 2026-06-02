@@ -39,12 +39,6 @@ struct ChatMessage {
 }
 
 #[derive(Deserialize)]
-struct ModelLinks {
-    #[serde(default)]
-    links: Vec<ModelLink>,
-}
-
-#[derive(Deserialize)]
 struct ModelLink {
     index: usize,
     link_type: String,
@@ -153,12 +147,30 @@ impl OpenAiCompatLinker {
                 rb_types::Error::Enrichment("link response had no content".to_string())
             })?;
 
-        let model: ModelLinks = serde_json::from_str(text.trim())
+        // Parse the outer envelope to extract the `links` array as raw Values,
+        // then deserialize each element individually. One malformed entry is
+        // skipped (with a debug log) rather than discarding all valid links.
+        let envelope: serde_json::Value = serde_json::from_str(text.trim())
             .map_err(|e| rb_types::Error::Enrichment(format!("link json invalid: {e}")))?;
+        let raw_links = envelope
+            .get("links")
+            .and_then(|v| v.as_array())
+            .map(|a| a.as_slice())
+            .unwrap_or(&[]);
+        let model_links: Vec<ModelLink> = raw_links
+            .iter()
+            .filter_map(|v| match serde_json::from_value::<ModelLink>(v.clone()) {
+                Ok(ml) => Some(ml),
+                Err(e) => {
+                    tracing::debug!(entry = %v, error = %e, "skipping malformed link entry");
+                    None
+                }
+            })
+            .collect();
 
         let now = chrono::Utc::now();
         let mut out = Vec::new();
-        for ml in model.links {
+        for ml in model_links {
             let Some((cand, _)) = candidates.get(ml.index) else {
                 continue; // model referenced a non-existent candidate; skip.
             };
@@ -310,6 +322,51 @@ mod tests {
         .await
         .unwrap();
         assert!(links.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn malformed_link_entry_skipped_good_entry_preserved() {
+        // One valid link entry + one malformed entry (missing required fields)
+        // must yield exactly the one good link, not an empty Vec.
+        let server = MockServer::start().await;
+        let new = note("new memory");
+        let cand = note("candidate memory");
+        let cand_id = cand.id.clone();
+        let new_id = new.id.clone();
+
+        // links[0]: valid; links[1]: malformed (missing `index` and `strength`).
+        let model_json = serde_json::json!({
+            "links": [
+                { "index": 0, "link_type": "references", "strength": 0.7 },
+                { "link_type": "extends" }
+            ]
+        })
+        .to_string();
+
+        Mock::given(method("POST"))
+            .and(path("/v1/chat/completions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(chat_response(&model_json)))
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let candidates = vec![(cand, 0.3_f32)];
+        let links = tokio::task::spawn_blocking(move || {
+            let linker = OpenAiCompatLinker::for_test("gpt-4o-mini", Some("k"), &base);
+            linker.link(&new, &candidates)
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(
+            links.len(),
+            1,
+            "good entry must survive the malformed sibling"
+        );
+        assert_eq!(links[0].source_id, new_id);
+        assert_eq!(links[0].target_id, cand_id);
+        assert_eq!(links[0].link_type, LinkType::References);
+        assert!((links[0].strength - 0.7).abs() < 1e-6);
     }
 
     #[test]
