@@ -22,6 +22,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
+thiserror = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

@@ -5,8 +5,11 @@
 //! into each CLI's config. NEVER referenced by any core crate, so the default
 //! `rusty-brain` build never compiles it.
 
+pub mod cli;
 pub mod detect;
+pub mod engine;
 pub mod installers;
+pub mod report;
 pub mod uninstall;
 pub mod writer;
 
@@ -14,6 +17,7 @@ pub use detect::{find_binary_on_path, parse_version, version_of};
 pub use installers::{
     builtins, ClaudeCodeInstaller, CodexInstaller, GeminiInstaller, OpenCodeInstaller,
 };
+pub use report::{AgentReport, AgentStatus, InstallError, InstallReport, ReportStatus};
 pub use uninstall::{strip_sentinel, uninstall_file};
 pub use writer::{backup_path, merge_into_file, merge_value, read_config, write};
 
