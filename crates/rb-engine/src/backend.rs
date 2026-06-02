@@ -45,6 +45,9 @@ pub trait MemoryBackend: Send + Sync {
     async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()>;
     /// Bump access metadata for `id` (write path; best-effort at call sites).
     async fn record_access(&self, id: MemoryId) -> rb_types::Result<()>;
+    /// Bump access metadata for all `ids` in a single writer round-trip
+    /// (write path; best-effort at call sites). Missing ids are silently skipped.
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()>;
     /// Batch-fetch `ids` scoped to `ns`, in request order (read path).
     async fn get_many(
         &self,
@@ -192,6 +195,16 @@ mod tests {
             if let Some(note) = guard.get_mut(&id) {
                 note.access_count += 1;
                 note.last_accessed_at = Some(chrono::Utc::now());
+            }
+            Ok(())
+        }
+        async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
+            let mut guard = self.notes.lock().unwrap();
+            for id in ids {
+                if let Some(note) = guard.get_mut(&id) {
+                    note.access_count += 1;
+                    note.last_accessed_at = Some(chrono::Utc::now());
+                }
             }
             Ok(())
         }

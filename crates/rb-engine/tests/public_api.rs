@@ -128,6 +128,17 @@ impl MemoryBackend for VecBackend {
         Ok(())
     }
 
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
+        let mut guard = self.notes.lock().unwrap();
+        for id in ids {
+            if let Some(note) = guard.get_mut(&id) {
+                note.access_count += 1;
+                note.last_accessed_at = Some(chrono::Utc::now());
+            }
+        }
+        Ok(())
+    }
+
     async fn get_many(
         &self,
         ns: Namespace,

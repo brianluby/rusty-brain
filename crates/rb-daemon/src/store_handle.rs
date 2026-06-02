@@ -67,6 +67,10 @@ enum WriteCommand {
         id: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
+    RecordAccesses {
+        ids: Vec<MemoryId>,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -525,6 +529,17 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::RecordAccesses { ids, reply } => {
+                // No MemoryChanged event: access tracking is observability-only.
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.record_accesses(&ids)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
             #[cfg(test)]
             WriteCommand::PanicForTest { reply } => {
                 let report =
@@ -652,6 +667,12 @@ impl MemoryBackend for StoreHandle {
     async fn record_access(&self, id: MemoryId) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let cmd = WriteCommand::RecordAccess { id, reply };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::RecordAccesses { ids, reply };
         self.send_write(cmd, rx).await
     }
 

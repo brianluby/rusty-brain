@@ -248,6 +248,24 @@ impl MemoryBackend for MockBackend {
         Ok(())
     }
 
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.record_access_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_record_access.load(Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "record_accesses forced failure".to_string(),
+            ));
+        }
+        let mut guard = self.notes.lock().unwrap();
+        for id in ids {
+            if let Some(note) = guard.get_mut(&id) {
+                note.access_count += 1;
+                note.last_accessed_at = Some(chrono::Utc::now());
+            }
+        }
+        Ok(())
+    }
+
     async fn get_many(
         &self,
         ns: Namespace,

@@ -318,9 +318,13 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             }
         }
 
-        // Best-effort access tracking: never fails the response.
+        // Best-effort batch access tracking: single writer round-trip for all results.
         let returned_ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
-        self.record_accesses(&returned_ids).await;
+        if !returned_ids.is_empty() {
+            if let Err(e) = self.backend.record_accesses(returned_ids).await {
+                tracing::debug!(error = %e, "record_accesses failed; ignoring");
+            }
+        }
         Ok(results)
     }
 
@@ -328,7 +332,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
         let found = self.get_scoped(id.clone()).await?;
         if found.is_some() {
-            self.record_accesses(std::slice::from_ref(&id)).await;
+            if let Err(e) = self.backend.record_access(id.clone()).await {
+                tracing::debug!(error = %e, memory_id = %id, "record_access failed; ignoring");
+            }
         }
         Ok(found)
     }
@@ -415,17 +421,6 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .await?;
         let total = recent.len();
         Ok((recent, important, total))
-    }
-
-    /// Record access for each id, best-effort. Errors are logged and ignored so
-    /// access tracking never affects the response. Awaited inline (the response
-    /// is already computed); the engine stays generic over `B` with no Clone bound.
-    async fn record_accesses(&self, ids: &[MemoryId]) {
-        for id in ids {
-            if let Err(e) = self.backend.record_access(id.clone()).await {
-                tracing::debug!(error = %e, memory_id = %id, "record_access failed; ignoring");
-            }
-        }
     }
 }
 

@@ -31,6 +31,12 @@ pub trait Store {
     /// Bump `access_count` and stamp `last_accessed_at = now` for `id`.
     /// A missing id is a no-op (best-effort access tracking never errors on absence).
     fn record_access(&self, id: &MemoryId) -> Result<()>;
+    /// Bump `access_count` and stamp `last_accessed_at = now` for all `ids` in a
+    /// single transaction (one writer round-trip). Missing ids are silently skipped;
+    /// duplicate ids are updated once per row (the UPDATE touches each row at most
+    /// once regardless of how many times it appears in `ids`). Best-effort: an empty
+    /// slice or all-missing ids returns `Ok(())` without touching the DB.
+    fn record_accesses(&self, ids: &[MemoryId]) -> Result<()>;
     /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
     /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
@@ -797,6 +803,40 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn record_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        // Deduplicate to build the IN-list (a row can only be bumped once per SQL
+        // UPDATE regardless, but dedup keeps the placeholder list small).
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&MemoryId> = ids
+            .iter()
+            .filter(|id| seen.insert(id.to_string()))
+            .collect();
+
+        // Build "?2, ?3, ..." placeholders; ?1 is the timestamp.
+        let placeholders: Vec<String> = (0..unique.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "UPDATE memories
+             SET access_count = access_count + 1, last_accessed_at = ?1
+             WHERE memory_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(unique.len() + 1);
+        params.push(Box::new(chrono::Utc::now().timestamp()));
+        for id in &unique {
+            params.push(Box::new(id.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        self.conn
+            .execute(&sql, refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         self.conn
             .execute_batch("BEGIN IMMEDIATE;")
@@ -881,10 +921,12 @@ impl Store for SqliteStore {
             by_id.insert(note.id.clone(), note);
         }
 
+        // Use `get` (not `remove`) so duplicate ids are preserved positionally,
+        // honouring the "same order as `ids`" contract.
         let mut out = Vec::with_capacity(ids.len());
         for id in ids {
-            if let Some(note) = by_id.remove(id) {
-                out.push(note);
+            if let Some(note) = by_id.get(id) {
+                out.push(note.clone());
             }
         }
         Ok(out)
@@ -1802,6 +1844,64 @@ mod access_tests {
     }
 
     #[test]
+    fn record_accesses_bumps_all_ids_in_one_transaction() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "access_a");
+        let b = node(&store, "access_b");
+
+        // Both bumped in one call.
+        store
+            .record_accesses(&[a.id.clone(), b.id.clone()])
+            .unwrap();
+
+        let got_a = store.get_memory(&a.id).unwrap().unwrap();
+        let got_b = store.get_memory(&b.id).unwrap().unwrap();
+        assert_eq!(got_a.access_count, 1, "a must be bumped");
+        assert_eq!(got_b.access_count, 1, "b must be bumped");
+        assert!(got_a.last_accessed_at.is_some());
+        assert!(got_b.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn record_accesses_missing_id_is_silently_skipped() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "present");
+        let missing = MemoryId::new();
+
+        // A missing id must not cause an error; the present id is still bumped.
+        store.record_accesses(&[missing, a.id.clone()]).unwrap();
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got.access_count, 1, "present id must be bumped");
+    }
+
+    #[test]
+    fn record_accesses_duplicate_ids_bump_once() {
+        // The UPDATE … WHERE memory_id IN (…) touches each row at most once
+        // even when the same id appears multiple times in the slice.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "dup_target");
+
+        store
+            .record_accesses(&[a.id.clone(), a.id.clone()])
+            .unwrap();
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        // The SQL UPDATE deduplicates: the row is bumped exactly once.
+        assert_eq!(
+            got.access_count, 1,
+            "duplicate ids in the slice must not double-bump (SQL IN-list dedup)"
+        );
+    }
+
+    #[test]
+    fn record_accesses_empty_slice_is_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Must not panic or error.
+        store.record_accesses(&[]).unwrap();
+    }
+
+    #[test]
     fn supersede_sets_superseded_by_and_archives_old() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let old = node(&store, "old decision");
@@ -1947,6 +2047,27 @@ mod get_many_tests {
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].links.len(), 1);
         assert_eq!(got[0].links[0].target_id, b);
+    }
+
+    #[test]
+    fn get_many_preserves_duplicate_ids_positionally() {
+        // Request [a, a, b]: the contract says "same order as ids", including
+        // duplicates. A remove()-based reorder would collapse [a, a, b] to [a, b];
+        // get()-based must emit [a, a, b].
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "alpha");
+        let b = node(&store, &ns, "bravo");
+
+        let got = store
+            .get_many(&ns, &[a.clone(), a.clone(), b.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![a.clone(), a, b],
+            "duplicate id must appear twice in output"
+        );
     }
 }
 
