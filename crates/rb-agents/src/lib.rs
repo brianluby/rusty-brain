@@ -9,6 +9,7 @@
 
 mod claude_code;
 mod cli;
+mod codex;
 mod daemon;
 mod event;
 mod gemini;
@@ -18,6 +19,7 @@ mod opencode;
 
 pub use claude_code::ClaudeCodeCli;
 pub use cli::{agent_for, AgentCli, AgentId, PassthroughCli};
+pub use codex::CodexCli;
 pub use daemon::{AutoStart, DaemonClient};
 pub use event::{HookContext, HookEvent, HookResult};
 pub use gemini::GeminiCli;
