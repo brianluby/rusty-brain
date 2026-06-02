@@ -344,6 +344,20 @@ impl StoreHandle {
         };
         self.send_write(cmd, rx).await
     }
+
+    /// Read near-duplicate candidates for `id` within `ns` via the read pool.
+    /// Namespace-isolated (see `SqliteStore::near_duplicates`); used by the
+    /// consolidation job to find merge candidates without crossing namespaces.
+    pub async fn near_duplicates(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        self.with_read(move |store| store.near_duplicates(&ns, &id, threshold, limit))
+            .await
+    }
 }
 
 struct StoreOpReport {
@@ -1008,6 +1022,60 @@ mod tests {
             .unwrap();
         let rows = handle.links_for_decay(10).await.unwrap();
         assert!(rows.is_empty(), "link removed");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_near_duplicates_is_namespace_isolated() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns_a = Namespace::Project("a".to_string());
+        let ns_b = Namespace::Project("b".to_string());
+
+        // Anchor + near-identical twin in A.
+        let mut anchor = note(&ns_a, "anchor");
+        anchor.id = rb_types::MemoryId::new();
+        let anchor_id = anchor.id.clone();
+        handle
+            .write(
+                anchor,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let twin = note(&ns_a, "twin");
+        let twin_id = twin.id.clone();
+        handle
+            .write(twin, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // A near-identical memory in namespace B that must never be returned.
+        let foreign = note(&ns_b, "foreign");
+        let foreign_id = foreign.id.clone();
+        handle
+            .write(
+                foreign,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let dups = handle
+            .near_duplicates(ns_a.clone(), anchor_id.clone(), 0.95, 10)
+            .await
+            .unwrap();
+        let ids: Vec<rb_types::MemoryId> = dups.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![twin_id],
+            "only the same-namespace twin is returned"
+        );
+        assert!(!ids.contains(&anchor_id), "anchor excluded (self)");
+        assert!(!ids.contains(&foreign_id), "ns-B memory never crosses over");
 
         handle.shutdown().await;
     }
