@@ -130,12 +130,16 @@ mod tests {
 
     #[test]
     fn parses_after_tool_as_post_tool_use() {
+        // Gemini reports its REAL tool name in `AfterTool` (`replace` is its edit
+        // tool, with `file_path`/`old_string`/`new_string` inputs). The adapter is
+        // tool-name-agnostic: it passes the name through verbatim and the capture
+        // layer (rb-hooks) is responsible for recognizing it as a mutation.
         let raw = json!({
             "hook_event_name": "AfterTool",
             "cwd": "/work/proj",
             "session_id": "g-2",
-            "tool_name": "Edit",
-            "tool_input": {"path": "x.rs"},
+            "tool_name": "replace",
+            "tool_input": {"file_path": "x.rs", "old_string": "a", "new_string": "b"},
             "tool_response": {"ok": true}
         });
         let ctx = GeminiCli.parse_input(&raw);
@@ -145,8 +149,11 @@ mod tests {
                 tool_input,
                 tool_response,
             } => {
-                assert_eq!(tool_name, "Edit");
-                assert_eq!(tool_input, json!({"path": "x.rs"}));
+                assert_eq!(tool_name, "replace");
+                assert_eq!(
+                    tool_input,
+                    json!({"file_path": "x.rs", "old_string": "a", "new_string": "b"})
+                );
                 assert_eq!(tool_response, json!({"ok": true}));
             }
             other => panic!("expected PostToolUse, got {other:?}"),

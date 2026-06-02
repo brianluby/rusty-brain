@@ -79,11 +79,17 @@ mod tests {
         assert!(stop[0].get("matcher").is_none());
 
         let entry = post[0].get("hooks").unwrap().as_array().unwrap()[0].clone();
-        // INLINE form: the whole invocation is one shell string with the binary
-        // double-quoted; there is NO separate `args` key.
-        assert_eq!(
-            entry.get("command").unwrap().as_str().unwrap(),
-            "\"/bin/rusty-brain-hooks\" --agent codex"
+        // INLINE form: one shell string with the binary SHELL-QUOTED (the exact
+        // quoting is verified in `installers::tests`); there is NO separate `args`
+        // key.
+        let cmd = entry.get("command").unwrap().as_str().unwrap();
+        assert!(
+            cmd.contains("/bin/rusty-brain-hooks"),
+            "command must reference the hooks binary path; got {cmd}"
+        );
+        assert!(
+            cmd.ends_with("--agent codex"),
+            "command must pass the codex agent id; got {cmd}"
         );
         assert!(
             entry.get("args").is_none(),

@@ -24,11 +24,20 @@ fn continue_only() -> HookResult {
 
 /// Normalize a CLI-reported tool name to its canonical capitalized form.
 ///
-/// Claude reports capitalized names (`Edit`, `Write`, `NotebookEdit`, `Bash`);
-/// OpenCode reports lowercase (`edit`, `write`, `bash`, `patch`). Lowercasing
-/// first lets us match both. OpenCode's `patch` is treated as an `Edit`.
-/// Anything not a recognized mutation tool maps to `""` (the empty canonical),
-/// which `is_mutation_tool` reads as "not captured".
+/// Each CLI names the same handful of mutations differently, so this single
+/// function unifies every supported vocabulary:
+/// - Claude: capitalized `Edit`, `Write`, `NotebookEdit`, `Bash`.
+/// - OpenCode: lowercase `edit`, `write`, `bash`, `patch` (`patch` is an `Edit`).
+/// - Gemini: `replace` (edit), `write_file` (write), `run_shell_command` (shell).
+///   These arrive verbatim in Gemini's `AfterTool` payload, so they MUST be
+///   recognized here or every Gemini file edit/write/shell command would degrade
+///   to a no-op capture.
+/// - Codex: its shell tool reports `Bash` (already handled above); its
+///   `apply_patch` edit tool is intentionally deferred — see the inline note.
+///
+/// Lowercasing first lets the Claude (capitalized) and OpenCode/Gemini (snake)
+/// spellings match the same arms. Anything not a recognized mutation tool maps to
+/// `""` (the empty canonical), which `is_mutation_tool` reads as "not captured".
 fn normalize_tool(tool_name: &str) -> &'static str {
     match tool_name.to_lowercase().as_str() {
         "edit" => "Edit",
@@ -36,6 +45,18 @@ fn normalize_tool(tool_name: &str) -> &'static str {
         "notebookedit" => "NotebookEdit",
         "bash" => "Bash",
         "patch" => "Edit",
+        // Gemini's distinct names for the same three mutations.
+        "replace" => "Edit",
+        "write_file" => "Write",
+        "run_shell_command" => "Bash",
+        // Codex: its shell tool reports "Bash" (handled above). Its file-edit tool
+        // `apply_patch` (tool_name "apply_patch") is INTENTIONALLY not mapped yet:
+        // Codex does not currently emit PostToolUse for apply_patch (OpenAI codex
+        // issue #16732 — hooks fire only for the shell tool), and the payload
+        // carries `tool_input.command` (the raw patch), not a `file_path`, so a
+        // bare mapping would capture only "Edited unknown". Add an `apply_patch`
+        // arm plus patch path-extraction in `summarize_post_tool_use` once Codex
+        // fires the event and exposes the edited path. See rb-* follow-up note.
         _ => "",
     }
 }
@@ -412,6 +433,104 @@ mod tests {
         assert!(
             dedup.is_duplicate("write", "Wrote /src/main.rs"),
             "lowercase opencode write must be captured (recorded), not dropped"
+        );
+    }
+
+    #[test]
+    fn gemini_tools_are_mutations() {
+        // Gemini's REAL mutation tools must be recognized; otherwise its file
+        // writes/edits/shell commands silently degrade to a no-op capture.
+        for t in ["write_file", "replace", "run_shell_command"] {
+            assert!(is_mutation_tool(t), "{t} (gemini) should be a mutation");
+        }
+    }
+
+    #[test]
+    fn gemini_read_tools_are_not_mutations() {
+        // Gemini read/search tools must NOT be captured as mutations.
+        for t in [
+            "read_file",
+            "read_many_files",
+            "list_directory",
+            "glob",
+            "search_file_content",
+        ] {
+            assert!(
+                !is_mutation_tool(t),
+                "{t} (gemini) should not be a mutation"
+            );
+        }
+    }
+
+    #[test]
+    fn gemini_tools_classify_like_their_claude_equivalents() {
+        assert_eq!(classify_tool("replace"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("write_file"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("run_shell_command"), MemoryType::Reference);
+    }
+
+    #[test]
+    fn gemini_summaries_match_claude_equivalents() {
+        // Gemini's input fields (`file_path` for write_file/replace, `command` for
+        // run_shell_command) are exactly what `summarize_post_tool_use` reads, so
+        // the canonical summaries come out identical to Claude's.
+        assert_eq!(
+            summarize_post_tool_use(
+                "write_file",
+                &serde_json::json!({"file_path": "/src/lib.rs"})
+            ),
+            "Wrote /src/lib.rs"
+        );
+        assert_eq!(
+            summarize_post_tool_use("replace", &serde_json::json!({"file_path": "/src/main.rs"})),
+            "Edited /src/main.rs"
+        );
+        assert_eq!(
+            summarize_post_tool_use(
+                "run_shell_command",
+                &serde_json::json!({"command": "cargo build"})
+            ),
+            "Ran command: cargo build"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_write_file_is_captured_end_to_end() {
+        // Feed Gemini's REAL `write_file` through the capture flow and prove it is
+        // captured (recorded in dedup) rather than silently dropped.
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "write_file",
+            &serde_json::json!({"file_path": "/src/main.rs"}),
+            &serde_json::json!("ok"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(
+            dedup.is_duplicate("write_file", "Wrote /src/main.rs"),
+            "gemini write_file must be captured (recorded), not dropped"
+        );
+    }
+
+    #[tokio::test]
+    async fn gemini_run_shell_command_is_captured_end_to_end() {
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "run_shell_command",
+            &serde_json::json!({"command": "ls -la"}),
+            &serde_json::json!("ok"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(
+            dedup.is_duplicate("run_shell_command", "Ran command: ls -la"),
+            "gemini run_shell_command must be captured (recorded), not dropped"
         );
     }
 

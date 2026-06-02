@@ -87,6 +87,26 @@ impl RunningDaemon {
     }
 }
 
+/// Resolve the `rusty-brain-hooks` binary, building it on demand.
+///
+/// `rusty-brain-hooks` is owned by the `rb-hooks` package, not `rb-install`, so a
+/// focused `cargo test -p rb-install` run neither builds it nor sets
+/// `CARGO_BIN_EXE_rusty-brain-hooks`. `assert_cmd::cargo::cargo_bin` would then
+/// fall back to a `target/<profile>/rusty-brain-hooks` path that this run never
+/// builds, and the spawn below would fail with "No such file". escargot builds
+/// the cross-package binary explicitly (a near-instant no-op when it is already
+/// built, e.g. in CI's multi-package run) and returns its true artifact path, so
+/// the test passes whether run alone (`-p rb-install`) or alongside `rb-hooks`.
+fn hooks_bin() -> PathBuf {
+    escargot::CargoBuild::new()
+        .package("rb-hooks")
+        .bin("rusty-brain-hooks")
+        .run()
+        .expect("build rusty-brain-hooks for the e2e test")
+        .path()
+        .to_path_buf()
+}
+
 /// Read `.claude/settings.json` under `project` as JSON, or `Value::Null` if it
 /// does not exist.
 fn read_settings(project: &Path) -> serde_json::Value {
@@ -173,7 +193,9 @@ async fn install_capture_uninstall_round_trip() {
     );
 
     // --- 2) fire a PostToolUse Edit through the built hooks binary ------------
-    let hooks_bin = cargo_bin("rusty-brain-hooks");
+    // Built via escargot (see `hooks_bin`): it is owned by `rb-hooks`, so a
+    // focused `cargo test -p rb-install` run would not otherwise build it.
+    let hooks_bin = hooks_bin();
     let unique = "rb-e2e marker edit to src/zztest.rs at unique-token-9f3a";
     let event = serde_json::json!({
         "session_id": "rb-e2e-session",
