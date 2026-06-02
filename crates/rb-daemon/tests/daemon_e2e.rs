@@ -571,3 +571,50 @@ async fn run_job_link_decay_round_trips_over_the_wire() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_job_importance_recalibration_flows_through_client() {
+    use rb_types::JobKind;
+
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("recal-e2e".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    // Seed one memory in this namespace via the typed remember helper.
+    let id = client
+        .remember(
+            "importance recalibration target".to_string(),
+            Some("evolution".to_string()),
+            MemoryType::Insight,
+            4,
+            vec!["evolution".to_string()],
+            vec!["jobs".to_string()],
+            vec![],
+        )
+        .await
+        .unwrap();
+
+    // Trigger the cross-namespace importance job over the wire (Part R wrapper).
+    let (scanned, changed, skipped) = client
+        .run_job(JobKind::ImportanceRecalibration)
+        .await
+        .unwrap();
+    assert_eq!(
+        scanned, 1,
+        "the one seeded row must be scanned by the importance job"
+    );
+    // A freshly-remembered, never-accessed row recalibrates to its base:
+    // delta is 0 => unchanged => skipped, not changed.
+    assert_eq!(changed, 0, "never-accessed row is unchanged");
+    assert_eq!(skipped, 1, "never-accessed row is skipped");
+
+    // The seeded memory still resolves and kept its base importance.
+    let got = client
+        .get(id)
+        .await
+        .unwrap()
+        .expect("seeded memory present");
+    assert_eq!(got.importance, 4, "never-accessed memory keeps its base");
+
+    daemon.stop().await;
+}
