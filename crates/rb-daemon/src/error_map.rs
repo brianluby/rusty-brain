@@ -17,6 +17,7 @@ pub(crate) fn error_to_response(err: Error) -> Response {
         Error::InvalidMemoryType(_) => ("invalid_memory_type", err.to_string()),
         Error::InvalidLinkType(_) => ("invalid_link_type", err.to_string()),
         Error::DimensionMismatch { .. } => ("dimension_mismatch", err.to_string()),
+        Error::InvalidArgument(_) => ("invalid_argument", err.to_string()),
 
         // Internal: log the real detail, send a generic message to the client.
         Error::Storage(_) => {
@@ -24,6 +25,10 @@ pub(crate) fn error_to_response(err: Error) -> Response {
             ("storage", "internal error".to_string())
         }
         Error::Io(_) => {
+            warn!(error = %err, "internal io error");
+            ("io", "internal error".to_string())
+        }
+        Error::IoKind { .. } => {
             warn!(error = %err, "internal io error");
             ("io", "internal error".to_string())
         }
@@ -38,6 +43,10 @@ pub(crate) fn error_to_response(err: Error) -> Response {
         Error::Embedding(_) => {
             warn!(error = %err, "internal embedding error");
             ("embedding", "internal error".to_string())
+        }
+        Error::Enrichment(_) => {
+            warn!("internal enrichment error");
+            ("enrichment", "internal error".to_string())
         }
     };
     Response::Error {
@@ -71,7 +80,16 @@ mod tests {
                 "dimension_mismatch",
             ),
             (Error::Io("x".into()), "io"),
+            (
+                Error::IoKind {
+                    kind: std::io::ErrorKind::NotFound,
+                    message: "x".into(),
+                },
+                "io",
+            ),
             (Error::Embedding("x".into()), "embedding"),
+            (Error::Enrichment("x".into()), "enrichment"),
+            (Error::InvalidArgument("x".into()), "invalid_argument"),
         ];
         for (err, expected_kind) in cases {
             match error_to_response(err) {
@@ -81,6 +99,41 @@ mod tests {
                 }
                 other => panic!("expected Response::Error, got {other:?}"),
             }
+        }
+    }
+
+    #[test]
+    fn enrichment_is_internal_opaque_over_wire() {
+        // Enrichment is an internal fault: the stable kind is forwarded but the
+        // detail is replaced with the generic sentinel (no leak to the caller).
+        let r = error_to_response(Error::Enrichment("llm 401: bad key abc".into()));
+        if let Response::Error { kind, message } = r {
+            assert_eq!(kind, "enrichment");
+            assert_eq!(message, "internal error");
+            assert!(!message.contains("abc"), "internal detail must not leak");
+        } else {
+            panic!("expected error response");
+        }
+    }
+
+    #[test]
+    fn io_kind_is_internal_opaque_over_wire() {
+        // IoKind carries a std::io::Error-derived message that may embed a path;
+        // it is mapped as an internal fault, so the wire message is the opaque
+        // sentinel and the sensitive path must not leak to the caller.
+        let r = error_to_response(Error::IoKind {
+            kind: std::io::ErrorKind::ConnectionRefused,
+            message: "/secret/path/to/sock: connection refused".into(),
+        });
+        if let Response::Error { kind, message } = r {
+            assert_eq!(kind, "io");
+            assert_eq!(message, "internal error");
+            assert!(
+                !message.contains("/secret/path"),
+                "internal io path must not leak over the wire"
+            );
+        } else {
+            panic!("expected error response");
         }
     }
 

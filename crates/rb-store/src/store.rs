@@ -28,6 +28,22 @@ pub trait Store {
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()>;
     fn archive_memory(&self, id: &MemoryId) -> Result<()>;
     fn add_link(&self, link: &MemoryLink) -> Result<()>;
+    /// Bump `access_count` and stamp `last_accessed_at = now` for `id`.
+    /// A missing id is a no-op (best-effort access tracking never errors on absence).
+    fn record_access(&self, id: &MemoryId) -> Result<()>;
+    /// Bump `access_count` and stamp `last_accessed_at = now` for all `ids` in a
+    /// single transaction (one writer round-trip). Missing ids are silently skipped;
+    /// duplicate ids are updated once per row (the UPDATE touches each row at most
+    /// once regardless of how many times it appears in `ids`). Best-effort: an empty
+    /// slice or all-missing ids returns `Ok(())` without touching the DB.
+    fn record_accesses(&self, ids: &[MemoryId]) -> Result<()>;
+    /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
+    /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
+    /// Fetch all of `ids` that exist AND belong to `ns`, returned in the SAME
+    /// order as `ids` (missing/out-of-namespace ids skipped). One query; fixes
+    /// the recall N+1. Links are loaded per returned note.
+    fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>>;
 }
 
 /// SQLite-backed store. Owns a single connection (write path); the daemon owns
@@ -111,6 +127,25 @@ impl SqliteStore {
             conn,
             embedding_dim,
         })
+    }
+
+    /// Fold the WAL back into the main database file and truncate it to zero.
+    ///
+    /// Used on graceful daemon shutdown so the on-disk DB is a clean single file
+    /// with no trailing WAL frames. On an in-memory or non-WAL connection SQLite
+    /// reports the operation as a no-op and returns `SQLITE_OK`, so this never
+    /// errors for those DBs.
+    ///
+    /// Uses `execute_batch` rather than `pragma_query`: rusqlite's `pragma_query`
+    /// routes the pragma name through `push_keyword`, which rejects the
+    /// parenthesized `wal_checkpoint(TRUNCATE)` form as a non-identifier. A raw
+    /// `PRAGMA ...;` statement executed via `execute_batch` has the same
+    /// semantics and accepts the argument syntax.
+    pub fn checkpoint_truncate(&self) -> Result<()> {
+        self.conn
+            .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+            .map_err(storage_err)?;
+        Ok(())
     }
 }
 
@@ -346,12 +381,7 @@ impl Store for SqliteStore {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
         // constraints are the backstop; these give a clean early error.
-        if note.importance < 1 || note.importance > 10 {
-            return Err(Error::Storage(format!(
-                "importance {} is out of range 1..=10",
-                note.importance
-            )));
-        }
+        rb_types::validate_importance(note.importance)?;
         if !(0.0..=1.0).contains(&note.confidence) {
             return Err(Error::Storage(format!(
                 "confidence {} is out of range 0.0..=1.0",
@@ -676,11 +706,7 @@ impl Store for SqliteStore {
         // Defense-in-depth validation, consistent with insert_memory, before
         // touching the DB. (MemoryUpdates has no confidence field.)
         if let Some(imp) = updates.importance {
-            if !(1..=10).contains(&imp) {
-                return Err(Error::Storage(format!(
-                    "importance {imp} is out of range 1..=10"
-                )));
-            }
+            rb_types::validate_importance(imp)?;
         }
 
         let mut sets: Vec<String> = Vec::new();
@@ -763,6 +789,147 @@ impl Store for SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    fn record_access(&self, id: &MemoryId) -> Result<()> {
+        self.conn
+            .execute(
+                "UPDATE memories
+                 SET access_count = access_count + 1, last_accessed_at = ?1
+                 WHERE memory_id = ?2",
+                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn record_accesses(&self, ids: &[MemoryId]) -> Result<()> {
+        if ids.is_empty() {
+            return Ok(());
+        }
+
+        // Deduplicate to build the IN-list (a row can only be bumped once per SQL
+        // UPDATE regardless, but dedup keeps the placeholder list small).
+        let mut seen = std::collections::HashSet::new();
+        let unique: Vec<&MemoryId> = ids
+            .iter()
+            .filter(|id| seen.insert(id.to_string()))
+            .collect();
+
+        // Build "?2, ?3, ..." placeholders; ?1 is the timestamp.
+        let placeholders: Vec<String> = (0..unique.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "UPDATE memories
+             SET access_count = access_count + 1, last_accessed_at = ?1
+             WHERE memory_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(unique.len() + 1);
+        params.push(Box::new(chrono::Utc::now().timestamp()));
+        for id in &unique {
+            params.push(Box::new(id.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        self.conn
+            .execute(&sql, refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let now = chrono::Utc::now().timestamp();
+        let result = (|| -> Result<()> {
+            // Point old -> new. FK on superseded_by makes a missing `new` fail here,
+            // rolling back the whole transaction (old stays unarchived).
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories SET superseded_by = ?1, updated_at = ?2 WHERE memory_id = ?3",
+                    rusqlite::params![new.to_string(), now, old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Fail fast on a missing `old`: 0 rows updated means a caller bug, not a
+            // silent success. Returning the error rolls the whole transaction back.
+            if affected == 0 {
+                return Err(Error::NotFound(old.clone()));
+            }
+            // Archive old (idempotent: only if currently active).
+            self.conn
+                .execute(
+                    "UPDATE memories SET archived_at = ?1, updated_at = ?1
+                     WHERE memory_id = ?2 AND archived_at IS NULL",
+                    rusqlite::params![now, old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
+    }
+
+    fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>> {
+        if ids.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Build "?2, ?3, ..." placeholders; ?1 is reserved for the namespace.
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 2)).collect();
+        let sql = format!(
+            "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                    keywords, tags, context, memory_type, importance, confidence,
+                    related_files, access_count, last_accessed_at, archived_at,
+                    superseded_by, embedding_model
+             FROM memories
+             WHERE namespace = ?1 AND memory_id IN ({})",
+            placeholders.join(", ")
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        params.push(Box::new(ns.as_db_string()));
+        for id in ids {
+            params.push(Box::new(id.to_string()));
+        }
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query(refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        // Decode into an id-keyed map, then re-emit in request order.
+        let mut by_id: std::collections::HashMap<MemoryId, MemoryNote> =
+            std::collections::HashMap::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let note = row_to_note(&self.conn, row)?;
+            by_id.insert(note.id.clone(), note);
+        }
+
+        // Use `get` (not `remove`) so duplicate ids are preserved positionally,
+        // honouring the "same order as `ids`" contract.
+        let mut out = Vec::with_capacity(ids.len());
+        for id in ids {
+            if let Some(note) = by_id.get(id) {
+                out.push(note.clone());
+            }
+        }
+        Ok(out)
     }
 }
 
@@ -976,16 +1143,16 @@ mod insert_tests {
         m.importance = 0;
         let err = store.insert_memory(&m, None).unwrap_err();
         assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("importance")),
-            "expected storage error about importance, got {err:?}"
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+            "expected invalid argument error about importance, got {err:?}"
         );
 
         // importance = 11 is above the valid range
         m.importance = 11;
         let err = store.insert_memory(&m, None).unwrap_err();
         assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("importance")),
-            "expected storage error about importance, got {err:?}"
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+            "expected invalid argument error about importance, got {err:?}"
         );
     }
 
@@ -1521,8 +1688,8 @@ mod update_tests {
             };
             let err = store.update_memory(&m.id, &updates).unwrap_err();
             assert!(
-                matches!(err, Error::Storage(ref s) if s.contains("importance")),
-                "expected storage error about importance for {bad}, got {err:?}"
+                matches!(err, Error::InvalidArgument(ref s) if s.contains("importance")),
+                "expected invalid argument error about importance for {bad}, got {err:?}"
             );
         }
     }
@@ -1630,5 +1797,305 @@ mod add_link_tests {
         // foreign_keys=ON => FK violation surfaces as a storage error.
         let err = store.add_link(&link).unwrap_err();
         assert!(matches!(err, Error::Storage(_)));
+    }
+}
+
+#[cfg(test)]
+mod access_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let m = MemoryNote::new(
+            Namespace::Project("rb".into()),
+            c.into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        m
+    }
+
+    #[test]
+    fn record_access_bumps_count_and_sets_last_accessed() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "accessed");
+        // Fresh note: access_count 0, last_accessed_at None.
+        let before = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(before.access_count, 0);
+        assert!(before.last_accessed_at.is_none());
+
+        store.record_access(&a.id).unwrap();
+        let after = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(after.access_count, 1);
+        assert!(after.last_accessed_at.is_some());
+
+        // A second access increments again.
+        store.record_access(&a.id).unwrap();
+        assert_eq!(store.get_memory(&a.id).unwrap().unwrap().access_count, 2);
+    }
+
+    #[test]
+    fn record_access_missing_id_is_ok_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // No row updated; must not error (best-effort access tracking).
+        store.record_access(&MemoryId::new()).unwrap();
+    }
+
+    #[test]
+    fn record_accesses_bumps_all_ids_in_one_transaction() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "access_a");
+        let b = node(&store, "access_b");
+
+        // Both bumped in one call.
+        store
+            .record_accesses(&[a.id.clone(), b.id.clone()])
+            .unwrap();
+
+        let got_a = store.get_memory(&a.id).unwrap().unwrap();
+        let got_b = store.get_memory(&b.id).unwrap().unwrap();
+        assert_eq!(got_a.access_count, 1, "a must be bumped");
+        assert_eq!(got_b.access_count, 1, "b must be bumped");
+        assert!(got_a.last_accessed_at.is_some());
+        assert!(got_b.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn record_accesses_missing_id_is_silently_skipped() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "present");
+        let missing = MemoryId::new();
+
+        // A missing id must not cause an error; the present id is still bumped.
+        store.record_accesses(&[missing, a.id.clone()]).unwrap();
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got.access_count, 1, "present id must be bumped");
+    }
+
+    #[test]
+    fn record_accesses_duplicate_ids_bump_once() {
+        // The UPDATE … WHERE memory_id IN (…) touches each row at most once
+        // even when the same id appears multiple times in the slice.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "dup_target");
+
+        store
+            .record_accesses(&[a.id.clone(), a.id.clone()])
+            .unwrap();
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        // The SQL UPDATE deduplicates: the row is bumped exactly once.
+        assert_eq!(
+            got.access_count, 1,
+            "duplicate ids in the slice must not double-bump (SQL IN-list dedup)"
+        );
+    }
+
+    #[test]
+    fn record_accesses_empty_slice_is_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Must not panic or error.
+        store.record_accesses(&[]).unwrap();
+    }
+
+    #[test]
+    fn supersede_sets_superseded_by_and_archives_old() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old decision");
+        let new = node(&store, "new decision");
+
+        store.supersede(&old.id, &new.id).unwrap();
+
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert_eq!(got.superseded_by.as_ref(), Some(&new.id));
+        assert!(got.archived_at.is_some(), "superseded note is archived");
+        // The new note is untouched.
+        let new_got = store.get_memory(&new.id).unwrap().unwrap();
+        assert!(new_got.superseded_by.is_none());
+        assert!(new_got.archived_at.is_none());
+    }
+
+    #[test]
+    fn supersede_excludes_old_from_keyword_and_list() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let old = node(&store, "supersede excludes me");
+        let new = node(&store, "supersede keeps me");
+        store.supersede(&old.id, &new.id).unwrap();
+
+        // old is archived -> excluded from keyword + list; new remains.
+        let kw = store.keyword_search(&proj, "supersede", 10).unwrap();
+        assert!(kw.contains(&new.id));
+        assert!(!kw.contains(&old.id));
+        let listed: Vec<MemoryId> = store
+            .list(&proj, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert!(listed.contains(&new.id));
+        assert!(!listed.contains(&old.id));
+    }
+
+    #[test]
+    fn supersede_missing_new_target_fails_fk() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old");
+        // superseded_by REFERENCES memories(memory_id); a missing target must fail
+        // the FK and leave the old note unchanged (transaction rolled back).
+        // foreign_keys=ON is set in SqliteStore::init, so the FK is enforced
+        // immediately on the UPDATE statement (SQLite FKs are not deferred by default).
+        let err = store.supersede(&old.id, &MemoryId::new()).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)));
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert!(got.superseded_by.is_none(), "rolled back: no superseded_by");
+        assert!(got.archived_at.is_none(), "rolled back: not archived");
+    }
+
+    #[test]
+    fn supersede_missing_old_errors() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // `new` exists so the FK is satisfiable; `old` does NOT exist. The first
+        // UPDATE affects 0 rows, which must fail fast (NotFound) and roll back —
+        // never a silent Ok(()).
+        let new = node(&store, "new decision");
+        let missing_old = MemoryId::new();
+
+        let err = store.supersede(&missing_old, &new.id).unwrap_err();
+        assert!(matches!(err, Error::NotFound(ref id) if *id == missing_old));
+
+        // No partial write: `new` is untouched (not archived, not superseded).
+        let new_got = store.get_memory(&new.id).unwrap().unwrap();
+        assert!(new_got.superseded_by.is_none());
+        assert!(new_got.archived_at.is_none());
+    }
+}
+
+#[cfg(test)]
+mod get_many_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, ns: &Namespace, c: &str) -> MemoryId {
+        let m = MemoryNote::new(ns.clone(), c.into(), MemoryType::Insight, 5);
+        store.insert_memory(&m, None).unwrap();
+        m.id
+    }
+
+    #[test]
+    fn get_many_returns_notes_in_request_order() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "alpha");
+        let b = node(&store, &ns, "bravo");
+        let c = node(&store, &ns, "charlie");
+
+        // Request in a non-storage order; result must follow request order.
+        let got = store
+            .get_many(&ns, &[c.clone(), a.clone(), b.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![c, a, b]);
+    }
+
+    #[test]
+    fn get_many_skips_missing_and_out_of_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let other = Namespace::Project("other".into());
+        let in_ns = node(&store, &proj, "in scope");
+        let foreign = node(&store, &other, "foreign");
+        let missing = MemoryId::new();
+
+        let got = store
+            .get_many(&proj, &[missing, foreign.clone(), in_ns.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        // Only the in-namespace, existing id is returned.
+        assert_eq!(ids, vec![in_ns]);
+    }
+
+    #[test]
+    fn get_many_empty_input_returns_empty() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        assert!(store.get_many(&ns, &[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn get_many_loads_links_for_each_note() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "src");
+        let b = node(&store, &ns, "dst");
+        store
+            .add_link(&rb_types::MemoryLink {
+                source_id: a.clone(),
+                target_id: b.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "rel".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        let got = store.get_many(&ns, std::slice::from_ref(&a)).unwrap();
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].links.len(), 1);
+        assert_eq!(got[0].links[0].target_id, b);
+    }
+
+    #[test]
+    fn get_many_preserves_duplicate_ids_positionally() {
+        // Request [a, a, b]: the contract says "same order as ids", including
+        // duplicates. A remove()-based reorder would collapse [a, a, b] to [a, b];
+        // get()-based must emit [a, a, b].
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let a = node(&store, &ns, "alpha");
+        let b = node(&store, &ns, "bravo");
+
+        let got = store
+            .get_many(&ns, &[a.clone(), a.clone(), b.clone()])
+            .unwrap();
+        let ids: Vec<MemoryId> = got.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![a.clone(), a, b],
+            "duplicate id must appear twice in output"
+        );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn checkpoint_truncate_is_ok_on_file_and_memory_dbs() {
+        // In-memory DB: journal_mode is "memory"; checkpoint is a harmless no-op.
+        let mem = SqliteStore::open_in_memory(8).unwrap();
+        mem.checkpoint_truncate().unwrap();
+
+        // File-backed DB in WAL: insert one row, checkpoint, row still present.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("ckpt".to_string());
+        let note = MemoryNote::new(ns, "checkpoint me".to_string(), MemoryType::Insight, 5);
+        let id = note.id.clone();
+        store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+
+        store.checkpoint_truncate().unwrap();
+
+        let got = store.get_memory(&id).unwrap();
+        assert!(got.is_some(), "row survives a wal_checkpoint(TRUNCATE)");
+        assert_eq!(got.unwrap().content, "checkpoint me");
     }
 }

@@ -7,7 +7,9 @@ members = [
     "crates/rb-embed",
     "crates/rb-search",
     "crates/rb-engine",
+    "crates/rb-enrich",
     "crates/rb-daemon",
+    "crates/rb-mcp",
     "crates/rusty-brain",
 ]
 
@@ -30,11 +32,11 @@ include_dir = "0.7"
 sha2 = "0.10"
 tempfile = "3"
 # --- P1 additions ---
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "sync", "time", "io-util", "io-std", "signal"] }
 tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
-reqwest = { version = "0.12", features = ["json", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
 futures = "0.3"
 bytes = "1"
 secrecy = "0.10"
@@ -44,6 +46,8 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 wiremock = "0.6"
 libc = "0.2"
+assert_cmd = "2"
+predicates = "3"
 
 [workspace.lints.clippy]
 unwrap_used = "deny"

@@ -16,6 +16,7 @@ rb-types = { path = "../rb-types" }
 rb-store = { path = "../rb-store" }
 rb-engine = { path = "../rb-engine" }
 rb-embed = { path = "../rb-embed" }
+rb-enrich = { path = "../rb-enrich" }
 rb-proto = { path = "../rb-proto" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
@@ -27,6 +28,7 @@ libc = { workspace = true }
 [dev-dependencies]
 serde_json = { workspace = true }
 tempfile = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true

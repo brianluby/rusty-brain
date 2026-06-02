@@ -81,33 +81,86 @@ pub async fn connect_or_start(
 /// `RUSTY_BRAIN_SOCKET`/`RUSTY_BRAIN_DB` so child + client agree on paths.
 fn spawn_daemon(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Result<()> {
     let mut cmd = daemon_command(self_exe, socket_path, db_path);
-    cmd.spawn()
-        .map(|_child| ())
-        .map_err(|e| Error::Io(e.to_string()))
+    cmd.spawn().map(|_child| ()).map_err(|e| Error::from_io(&e))
 }
 
+/// The exact set of parent vars the auto-start child may inherit. Everything
+/// else is cleared. Keep this list minimal — adding a var widens the leak
+/// surface and must fail `daemon_command_forwards_only_allowlisted_vars`.
+const FORWARD_ENV: &[&str] = &[
+    "VOYAGE_API_KEY",
+    "RB_ENRICH_BASE_URL",
+    "RB_ENRICH_MODEL",
+    "RB_ENRICH_API_KEY",
+    "HOME",
+    "PATH",
+    "XDG_RUNTIME_DIR",
+    "XDG_DATA_HOME",
+    "XDG_CONFIG_HOME",
+];
+
 fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Command {
+    daemon_command_with(self_exe, socket_path, db_path, |key| {
+        std::env::var(key).ok()
+    })
+}
+
+/// Pure core: build the spawn `Command` from an injected env source so tests can
+/// drive the allowlist without mutating process-global env (unsound under
+/// parallel `#[test]` on Rust 1.81+). The real `daemon_command` injects a
+/// closure over `std::env::var`.
+///
+/// Security: `env_clear()` is called BEFORE any `.env()`, so the child inherits
+/// nothing the parent had — only the two resolved paths plus the subset of
+/// [`FORWARD_ENV`] that `get_env` reports as present.
+fn daemon_command_with<F>(
+    self_exe: &Path,
+    socket_path: &Path,
+    db_path: &Path,
+    get_env: F,
+) -> Command
+where
+    F: Fn(&str) -> Option<String>,
+{
     let mut cmd = Command::new(self_exe);
     cmd.arg("serve");
+    // Security: never inherit the parent environment into a long-lived detached
+    // daemon. Clear it, then forward ONLY what the daemon needs.
+    cmd.env_clear();
     cmd.env(crate::paths::SOCKET_ENV, socket_path);
     cmd.env(crate::paths::DB_ENV, db_path);
+    // Forward each allowlisted var that is actually present in the source.
+    for key in FORWARD_ENV {
+        if let Some(value) = get_env(key) {
+            cmd.env(key, value);
+        }
+    }
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::null());
     cmd.stderr(Stdio::null());
+    // Detach the daemon into its own process group so that a Ctrl-C / SIGHUP
+    // in the client's terminal does not propagate to the long-lived daemon.
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        cmd.process_group(0);
+    }
     cmd
 }
 
+/// Classify whether a connect failure is one a freshly-spawned daemon would fix.
+/// Only `NotFound` (socket file absent) and `ConnectionRefused` (no listener)
+/// are transient-on-start; everything else (incl. `PermissionDenied`) is
+/// permanent and must NOT trigger a spawn or further retries.
+fn should_auto_start_kind(kind: Option<std::io::ErrorKind>) -> bool {
+    matches!(
+        kind,
+        Some(std::io::ErrorKind::NotFound) | Some(std::io::ErrorKind::ConnectionRefused)
+    )
+}
+
 fn should_auto_start(error: &Error) -> bool {
-    let Error::Io(message) = error else {
-        return false;
-    };
-    let message = message.to_ascii_lowercase();
-    message.contains("no such file")
-        || message.contains("not found")
-        || message.contains("connection refused")
-        || message.contains("os error 2")
-        || message.contains("os error 61")
-        || message.contains("os error 111")
+    should_auto_start_kind(error.io_kind())
 }
 
 #[cfg(test)]
@@ -157,7 +210,9 @@ mod tests {
             let n = at.fetch_add(1, Ordering::SeqCst);
             async move {
                 if n < 2 {
-                    Err(rb_types::Error::Io("No such file or directory".into()))
+                    Err(rb_types::Error::from_io(&std::io::Error::from(
+                        std::io::ErrorKind::NotFound,
+                    )))
                 } else {
                     Ok::<u32, rb_types::Error>(42)
                 }
@@ -185,7 +240,9 @@ mod tests {
     async fn gives_up_after_max_attempts() {
         let spawn = || Ok(());
         let connect = || async {
-            Err::<u32, rb_types::Error>(rb_types::Error::Io("Connection refused".into()))
+            Err::<u32, rb_types::Error>(rb_types::Error::from_io(&std::io::Error::from(
+                std::io::ErrorKind::ConnectionRefused,
+            )))
         };
         let err = connect_with_retry(
             connect,
@@ -196,7 +253,7 @@ mod tests {
         )
         .await
         .unwrap_err();
-        assert!(matches!(err, rb_types::Error::Io(_)));
+        assert!(err.io_kind().is_some());
     }
 
     #[tokio::test]
@@ -226,17 +283,50 @@ mod tests {
     }
 
     #[test]
-    fn daemon_command_inherits_resolved_socket_and_db_paths() {
+    fn auto_starts_only_for_notfound_and_connection_refused() {
+        assert!(should_auto_start_kind(Some(std::io::ErrorKind::NotFound)));
+        assert!(should_auto_start_kind(Some(
+            std::io::ErrorKind::ConnectionRefused
+        )));
+    }
+
+    #[test]
+    fn does_not_auto_start_for_permanent_or_unknown_errors() {
+        // Permission denied is permanent: spawning a child will not fix it.
+        assert!(!should_auto_start_kind(Some(
+            std::io::ErrorKind::PermissionDenied
+        )));
+        // A non-io error (no ErrorKind) is never auto-started.
+        assert!(!should_auto_start_kind(None));
+    }
+
+    #[test]
+    fn daemon_command_forwards_only_allowlisted_vars() {
+        use std::collections::HashMap;
+
+        // Injected, in-memory parent env — never touches process-global env, so
+        // this test is sound under parallel execution. It carries one allowlisted
+        // var (VOYAGE_API_KEY) and one var that must NOT leak.
+        let source: HashMap<&str, &str> = HashMap::from([
+            ("VOYAGE_API_KEY", "voyage-key"),
+            ("SECRET_SHOULD_NOT_LEAK", "secret"),
+        ]);
+
         let socket = Path::new("/tmp/rb.sock");
         let db = Path::new("/tmp/rb.db");
-        let cmd = daemon_command(Path::new("/bin/echo"), socket, db);
-        let envs: std::collections::HashMap<_, _> = cmd
+        let cmd = daemon_command_with(Path::new("/bin/echo"), socket, db, |key| {
+            source.get(key).map(|v| (*v).to_string())
+        });
+
+        // After env_clear(), get_envs() returns EXACTLY the explicitly-set vars.
+        let envs: HashMap<_, _> = cmd
             .get_envs()
             .filter_map(|(key, value)| {
                 value.map(|value| (key.to_os_string(), value.to_os_string()))
             })
             .collect();
 
+        // Forwarded: resolved paths (always set explicitly).
         assert_eq!(
             envs.get(std::ffi::OsStr::new(crate::paths::SOCKET_ENV)),
             Some(&socket.as_os_str().to_os_string())
@@ -244,6 +334,26 @@ mod tests {
         assert_eq!(
             envs.get(std::ffi::OsStr::new(crate::paths::DB_ENV)),
             Some(&db.as_os_str().to_os_string())
+        );
+        // Forwarded: the one allowlisted var present in the source.
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("VOYAGE_API_KEY")),
+            Some(&std::ffi::OsString::from("voyage-key"))
+        );
+        // ABSENT: a non-allowlisted var present in the source must not leak.
+        assert!(
+            !envs.contains_key(std::ffi::OsStr::new("SECRET_SHOULD_NOT_LEAK")),
+            "non-allowlisted vars must be cleared from the child env"
+        );
+
+        // EXACT bound: the child env is precisely SOCKET + DB + the allowlisted
+        // vars present in the source (here just VOYAGE_API_KEY; the RB_ENRICH_*
+        // vars are absent from the source so they are not forwarded) — nothing
+        // more. A future stray `.env(...)` or added forward var fails this count.
+        assert_eq!(
+            envs.len(),
+            3,
+            "child env must be exactly {{SOCKET, DB, VOYAGE_API_KEY}}, got {envs:?}"
         );
     }
 }

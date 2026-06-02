@@ -1,6 +1,7 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, dead_code)]
 
 use crate::backend::MemoryBackend;
+use crate::enricher::{Enricher, Enrichment};
 use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
 use std::collections::HashMap;
 use std::sync::Mutex;
@@ -17,6 +18,9 @@ pub(crate) struct MockBackend {
     graph: Mutex<HashMap<MemoryId, Vec<MemoryId>>>,
     keyword_results: Mutex<Option<Vec<MemoryId>>>,
     vector_results: Mutex<Option<Vec<(MemoryId, f32)>>>,
+    record_access_calls: std::sync::atomic::AtomicUsize,
+    fail_record_access: std::sync::atomic::AtomicBool,
+    fail_add_link: std::sync::atomic::AtomicBool,
 }
 
 impl MockBackend {
@@ -46,6 +50,27 @@ impl MockBackend {
 
     pub fn set_vector_results(&self, ids: Vec<(MemoryId, f32)>) {
         *self.vector_results.lock().unwrap() = Some(ids);
+    }
+
+    pub fn record_access_count(&self) -> usize {
+        self.record_access_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn set_fail_record_access(&self, fail: bool) {
+        self.fail_record_access
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn set_fail_add_link(&self, fail: bool) {
+        self.fail_add_link
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn links_of(&self, id: &MemoryId) -> Vec<rb_types::MemoryLink> {
+        self.notes
+            .lock()
+            .unwrap()
+            .get(id)
+            .map(|n| n.links.clone())
+            .unwrap_or_default()
     }
 }
 
@@ -192,5 +217,91 @@ impl MemoryBackend for MockBackend {
             .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
         note.archived_at = Some(chrono::Utc::now());
         Ok(())
+    }
+
+    async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()> {
+        if self.fail_add_link.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "add_link forced failure".to_string(),
+            ));
+        }
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&link.source_id)
+            .ok_or_else(|| rb_types::Error::NotFound(link.source_id.clone()))?;
+        note.links.push(link);
+        Ok(())
+    }
+
+    async fn record_access(&self, id: MemoryId) -> rb_types::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.record_access_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_record_access.load(Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "record_access forced failure".to_string(),
+            ));
+        }
+        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+            note.access_count += 1;
+            note.last_accessed_at = Some(chrono::Utc::now());
+        }
+        Ok(())
+    }
+
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.record_access_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_record_access.load(Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "record_accesses forced failure".to_string(),
+            ));
+        }
+        let mut guard = self.notes.lock().unwrap();
+        for id in ids {
+            if let Some(note) = guard.get_mut(&id) {
+                note.access_count += 1;
+                note.last_accessed_at = Some(chrono::Utc::now());
+            }
+        }
+        Ok(())
+    }
+
+    async fn get_many(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let guard = self.notes.lock().unwrap();
+        Ok(ids
+            .iter()
+            .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
+            .collect())
+    }
+}
+
+/// In-test enricher returning fixed values so `remember` wiring is assertable
+/// without any network. Used to prove the engine fills empty fields from it.
+pub(crate) struct FixedEnricher;
+
+#[async_trait::async_trait]
+impl Enricher for FixedEnricher {
+    async fn enrich(&self, _content: &str, _context: Option<&str>) -> rb_types::Result<Enrichment> {
+        Ok(Enrichment {
+            summary: Some("enriched summary".to_string()),
+            keywords: vec!["enrkw".to_string()],
+            tags: vec!["enrtag".to_string()],
+            memory_type: None,
+            importance: None,
+        })
+    }
+}
+
+/// In-test enricher that always fails, to prove `remember` falls back cleanly.
+pub(crate) struct FailingEnricher;
+
+#[async_trait::async_trait]
+impl Enricher for FailingEnricher {
+    async fn enrich(&self, _content: &str, _context: Option<&str>) -> rb_types::Result<Enrichment> {
+        Err(rb_types::Error::Enrichment("boom".to_string()))
     }
 }

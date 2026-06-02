@@ -29,7 +29,10 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Serialization(_) => "serialization",
         Error::DimensionMismatch { .. } => "dimension_mismatch",
         Error::Io(_) => "io",
+        Error::IoKind { .. } => "io",
         Error::Embedding(_) => "embedding",
+        Error::Enrichment(_) => "enrichment",
+        Error::InvalidArgument(_) => "invalid_argument",
     }
 }
 
@@ -49,6 +52,8 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "serialization" => Error::Serialization(message.to_string()),
         "io" => Error::Io(message.to_string()),
         "embedding" => Error::Embedding(message.to_string()),
+        "enrichment" => Error::Enrichment(message.to_string()),
+        "invalid_argument" => Error::InvalidArgument(message.to_string()),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
@@ -169,5 +174,28 @@ mod tests {
     fn unknown_kind_maps_to_storage() {
         let back = response_error_to_error("totally_unknown_kind", "weird");
         assert!(matches!(back, Error::Storage(_)));
+    }
+
+    #[test]
+    fn enrichment_round_trips_as_enrichment_kind() {
+        // error_kind -> "enrichment", and reconstruct must stay Enrichment
+        // (fail-closed: no silent downgrade to a different variant).
+        let resp = error_to_response(&Error::Enrichment("llm down".into()));
+        let crate::Response::Error { kind, message } = resp else {
+            panic!("expected Response::Error");
+        };
+        assert_eq!(kind, "enrichment");
+        assert!(matches!(
+            response_error_to_error(&kind, &message),
+            Error::Enrichment(_)
+        ));
+    }
+
+    #[test]
+    fn invalid_argument_round_trips() {
+        assert!(matches!(
+            round_trip(Error::InvalidArgument("importance 0".into())),
+            Error::InvalidArgument(_)
+        ));
     }
 }

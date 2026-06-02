@@ -17,6 +17,31 @@ use crate::change::{ChangeKind, MemoryChanged};
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
 
+/// Count of `MemoryChanged` broadcasts that could not be delivered (no live
+/// receivers). Best-effort notification only — a non-zero value is
+/// observability, not an error.
+static DROPPED_BROADCASTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the cumulative count of dropped change-event broadcasts. Exposed for
+/// observability and tests; production callers use it for metrics/logging only.
+#[allow(dead_code)]
+pub fn dropped_broadcast_count() -> u64 {
+    DROPPED_BROADCASTS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Publish a change event, counting + logging when there is no receiver to take
+/// it. `broadcast::Sender::send` returns `Err(SendError)` precisely when there
+/// are zero receivers; that is the signal we surface.
+fn publish_change(events: &broadcast::Sender<MemoryChanged>, evt: MemoryChanged) {
+    if events.send(evt).is_err() {
+        let n = DROPPED_BROADCASTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+        tracing::warn!(
+            dropped_total = n,
+            "MemoryChanged broadcast had no receivers; change notification dropped"
+        );
+    }
+}
+
 enum WriteCommand {
     Insert {
         note: Box<MemoryNote>,
@@ -32,6 +57,18 @@ enum WriteCommand {
     Archive {
         namespace: Namespace,
         id: MemoryId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    AddLink {
+        link: Box<rb_types::MemoryLink>,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RecordAccess {
+        id: MemoryId,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    RecordAccesses {
+        ids: Vec<MemoryId>,
         reply: oneshot::Sender<Result<()>>,
     },
     #[cfg(test)]
@@ -291,6 +328,14 @@ where
     }
 }
 
+/// Run one store operation on the writer thread, containing any panic so a
+/// single bad command cannot take down the daemon.
+///
+/// GUARANTEE (tested by `caught_writer_panic_isolates_and_does_not_lose_later_writes`):
+/// a caught panic (a) is reported to the caller as `Error::Storage`, (b) drops
+/// and reopens the write connection so no partial transaction leaks into later
+/// writes, and (c) keeps the writer loop alive so subsequent commands commit
+/// normally. Only a failed REOPEN (not the panic itself) stops the writer.
 fn run_store_op<F>(
     store: &mut Option<SqliteStore>,
     db_path: &Path,
@@ -391,11 +436,14 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Created,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Created,
+                        },
+                    );
                 }
                 if !writer_usable {
                     break;
@@ -420,11 +468,14 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Updated,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Updated,
+                        },
+                    );
                 }
                 if !writer_usable {
                     break;
@@ -446,12 +497,45 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    let _ = events.send(MemoryChanged {
-                        id,
-                        namespace,
-                        kind: ChangeKind::Archived,
-                    });
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Archived,
+                        },
+                    );
                 }
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::AddLink { link, reply } => {
+                let report =
+                    run_store_op(&mut store, &db_path, embedding_dim, |s| s.add_link(&link));
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::RecordAccess { id, reply } => {
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.record_access(&id)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::RecordAccesses { ids, reply } => {
+                // No MemoryChanged event: access tracking is observability-only.
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.record_accesses(&ids)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
                 if !writer_usable {
                     break;
                 }
@@ -467,6 +551,14 @@ fn writer_loop(
                 }
             }
             WriteCommand::Shutdown { reply } => {
+                // Fold the WAL back into the main file before the connection is
+                // dropped, so the on-disk DB is a clean single file. Best-effort:
+                // a checkpoint failure is logged but must not block shutdown.
+                if let Some(active) = store.as_ref() {
+                    if let Err(e) = active.checkpoint_truncate() {
+                        tracing::warn!(error = %e, "WAL checkpoint on shutdown failed");
+                    }
+                }
                 let _ = reply.send(());
                 break;
             }
@@ -562,6 +654,31 @@ impl MemoryBackend for StoreHandle {
         };
         self.send_write(cmd, rx).await
     }
+
+    async fn add_link(&self, link: rb_types::MemoryLink) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::AddLink {
+            link: Box::new(link),
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn record_access(&self, id: MemoryId) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::RecordAccess { id, reply };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::RecordAccesses { ids, reply };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn get_many(&self, ns: Namespace, ids: Vec<MemoryId>) -> Result<Vec<MemoryNote>> {
+        self.with_read(move |store| store.get_many(&ns, &ids)).await
+    }
 }
 
 #[cfg(test)]
@@ -576,6 +693,78 @@ mod tests {
 
     fn note(ns: &Namespace, body: &str) -> MemoryNote {
         MemoryNote::new(ns.clone(), body.to_string(), MemoryType::Insight, 5)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_add_link_record_access_and_get_many() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("p2".to_string());
+
+        let a = note(&ns, "source note");
+        let b = note(&ns, "target note");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // add_link goes through the writer and is visible via get (links loaded).
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.6,
+                reason: "similar".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        let got = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(got.links.len(), 1);
+        assert_eq!(got.links[0].target_id, bid);
+
+        // record_access goes through the writer and bumps the count.
+        handle.record_access(aid.clone()).await.unwrap();
+        let after = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(after.access_count, 1);
+
+        // get_many returns ns-scoped notes in request order via the read pool.
+        let many = handle
+            .get_many(ns, vec![bid.clone(), aid.clone()])
+            .await
+            .unwrap();
+        let ids: Vec<rb_types::MemoryId> = many.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![bid, aid]);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_checkpoints_so_data_survives_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+
+        let ns = Namespace::Project("ckpt-shutdown".to_string());
+        let id;
+        {
+            let handle = StoreHandle::start(db.clone(), DIM, 2).unwrap();
+            let n = note(&ns, "survive the shutdown checkpoint");
+            id = n.id.clone();
+            handle.write(n, Some(vec![0.2f32; DIM])).await.unwrap();
+            // Graceful shutdown runs PRAGMA wal_checkpoint(TRUNCATE) in the writer
+            // Shutdown arm, then joins the writer thread.
+            handle.shutdown().await;
+        }
+
+        // Reopen a brand-new handle on the same file; the row must be present.
+        let reopened = StoreHandle::start(db, DIM, 1).unwrap();
+        let got = reopened.get(ns, id).await.unwrap();
+        assert!(
+            got.is_some(),
+            "row must persist across a checkpointed shutdown"
+        );
+        reopened.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -609,5 +798,76 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn caught_writer_panic_isolates_and_does_not_lose_later_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("panic-isolation".to_string());
+
+        // 1. A successful write before the panic.
+        let before = note(&ns, "written before the panic");
+        let before_id = before.id.clone();
+        handle.write(before, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // 2. Induce a caught writer panic via the test-only command.
+        let (reply, rx) = oneshot::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::PanicForTest { reply })
+            .await
+            .unwrap();
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(_)),
+            "caught panic must surface as a storage error, got {err:?}"
+        );
+
+        // 3. A successful write AFTER the panic (writer reopened its connection).
+        let after = note(&ns, "written after the panic");
+        let after_id = after.id.clone();
+        handle.write(after, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        // 4. Both real writes are present; the panic left no partial/corrupt row.
+        assert!(
+            handle.get(ns.clone(), before_id).await.unwrap().is_some(),
+            "pre-panic write must survive"
+        );
+        assert!(
+            handle.get(ns.clone(), after_id).await.unwrap().is_some(),
+            "post-panic write must commit on the reopened connection"
+        );
+        let listed = handle.list(ns, None, 50).await.unwrap();
+        assert_eq!(
+            listed.len(),
+            2,
+            "exactly the two real writes exist; the panic added nothing"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn write_without_subscriber_increments_dropped_event_counter() {
+        let before = dropped_broadcast_count();
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        // Deliberately do NOT subscribe: the broadcast send will return Err
+        // (no receivers), which must be counted, not silently dropped.
+        let ns = Namespace::Project("no-subscriber".to_string());
+        let n = note(&ns, "nobody is listening");
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.shutdown().await;
+
+        assert!(
+            dropped_broadcast_count() > before,
+            "a broadcast with no receivers must increment the dropped counter \
+             (before={before}, after={})",
+            dropped_broadcast_count()
+        );
     }
 }

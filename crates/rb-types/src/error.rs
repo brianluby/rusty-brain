@@ -23,6 +23,36 @@ pub enum Error {
     Io(String),
     #[error("embedding error: {0}")]
     Embedding(String),
+    #[error("enrichment error: {0}")]
+    Enrichment(String),
+    #[error("invalid argument: {0}")]
+    InvalidArgument(String),
+    #[error("io error ({kind:?}): {message}")]
+    IoKind {
+        kind: std::io::ErrorKind,
+        message: String,
+    },
+}
+
+impl Error {
+    /// Build an `IoKind` error preserving the originating `std::io::ErrorKind`.
+    pub fn from_io(e: &std::io::Error) -> Self {
+        Error::IoKind {
+            kind: e.kind(),
+            message: e.to_string(),
+        }
+    }
+
+    /// Best-effort recovery of the originating `std::io::ErrorKind`. Returns
+    /// `Some` only for `IoKind` errors; `None` for every other variant. Callers
+    /// use this to decide retry/auto-start policy WITHOUT substring-matching the
+    /// message.
+    pub fn io_kind(&self) -> Option<std::io::ErrorKind> {
+        match self {
+            Error::IoKind { kind, .. } => Some(*kind),
+            _ => None,
+        }
+    }
 }
 
 /// Convenience alias used throughout rusty-brain.
@@ -94,5 +124,25 @@ mod tests {
     fn result_alias_resolves() {
         let ok: Result<u8> = Ok(7);
         assert_eq!(ok.unwrap(), 7);
+    }
+
+    #[test]
+    fn enrichment_message_matches_spine() {
+        assert_eq!(
+            Error::Enrichment("model unavailable".into()).to_string(),
+            "enrichment error: model unavailable"
+        );
+        assert_eq!(
+            Error::InvalidArgument("importance 0 is out of range 1..=10".into()).to_string(),
+            "invalid argument: importance 0 is out of range 1..=10"
+        );
+    }
+
+    #[test]
+    fn io_kind_round_trips_through_from_io() {
+        let raw = std::io::Error::from(std::io::ErrorKind::ConnectionRefused);
+        let err = Error::from_io(&raw);
+        assert_eq!(err.io_kind(), Some(std::io::ErrorKind::ConnectionRefused));
+        assert_eq!(Error::Storage("x".into()).io_kind(), None);
     }
 }

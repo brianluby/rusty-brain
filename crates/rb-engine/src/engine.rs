@@ -1,8 +1,11 @@
 use crate::backend::MemoryBackend;
 use crate::enrich::{default_summary, derive_keywords};
+use crate::enricher::Enricher;
+use crate::linker::{Linker, SimilarityLinker};
 use rb_embed::EmbeddingProvider;
 use rb_search::Weights;
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
+use std::sync::Arc;
 
 /// Input to `remember`. Mirrors the proto `Request::Remember` payload.
 pub struct RememberInput {
@@ -22,6 +25,8 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     embedder: P,
     weights: Weights,
     namespace: Namespace,
+    linker: Box<dyn Linker>,
+    enricher: Option<Arc<dyn Enricher>>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -33,6 +38,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             embedder,
             weights: Weights::default(),
             namespace,
+            linker: Box::new(SimilarityLinker::default()),
+            enricher: None,
         }
     }
 
@@ -49,6 +56,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Borrow the ranking weights (used by `recall`).
     pub fn weights(&self) -> Weights {
         self.weights
+    }
+
+    /// Enable opt-in enrichment. When set, `remember` asks the enricher to fill
+    /// fields the caller left empty; on enricher error it falls back to the
+    /// heuristic path (enrichment never fails a remember).
+    pub fn with_enricher(mut self, enricher: Arc<dyn Enricher>) -> Self {
+        self.enricher = Some(enricher);
+        self
     }
 
     fn in_namespace(&self, note: &MemoryNote) -> bool {
@@ -82,12 +97,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
-        if !(1..=10).contains(&input.importance) {
-            return Err(rb_types::Error::Storage(format!(
-                "importance {} is out of range 1..=10",
-                input.importance
-            )));
-        }
+        rb_types::validate_importance(input.importance)?;
 
         let mut note = MemoryNote::new(
             self.namespace.clone(),
@@ -95,14 +105,38 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.memory_type,
             input.importance,
         );
-        // Heuristic enrichment (no LLM in P1).
-        note.summary = default_summary(&note.content);
-        note.keywords = if input.keywords.is_empty() {
-            derive_keywords(&note.content)
-        } else {
-            input.keywords
+        // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
+        // the caller left empty; an enricher error degrades to the heuristic.
+        let enrichment = match &self.enricher {
+            Some(e) => match e.enrich(&note.content, input.context.as_deref()).await {
+                Ok(en) => Some(en),
+                Err(err) => {
+                    tracing::warn!(error = %err, "enricher failed; using heuristic enrichment");
+                    None
+                }
+            },
+            None => None,
         };
-        note.tags = input.tags;
+
+        note.summary = match enrichment.as_ref().and_then(|e| e.summary.clone()) {
+            Some(s) => s,
+            None => default_summary(&note.content),
+        };
+        note.keywords = if !input.keywords.is_empty() {
+            input.keywords
+        } else if let Some(en) = enrichment.as_ref().filter(|e| !e.keywords.is_empty()) {
+            en.keywords.clone()
+        } else {
+            derive_keywords(&note.content)
+        };
+        note.tags = if !input.tags.is_empty() {
+            input.tags
+        } else {
+            enrichment
+                .as_ref()
+                .map(|e| e.tags.clone())
+                .unwrap_or_default()
+        };
         note.related_files = input.related_files;
         if let Some(ctx) = input.context {
             note.context = ctx;
@@ -114,8 +148,64 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let embedding = embeddings.pop();
 
         let id = note.id.clone();
+        // Keep a copy of the embedding for candidate search before the note moves.
+        let embedding_for_links = embedding.clone();
         self.backend.write(note, embedding).await?;
+
+        // Best-effort link generation: never fails the remember.
+        if let Some(emb) = embedding_for_links {
+            if let Err(e) = self.generate_links(&id, emb).await {
+                tracing::warn!(error = %e, memory_id = %id, "link generation failed; continuing");
+            }
+        }
         Ok(id)
+    }
+
+    /// Vector-search for candidates similar to the just-written memory, fetch
+    /// their notes, run the linker, and persist the produced links. Best-effort:
+    /// callers ignore the error. `add_link` failures are logged and skipped so a
+    /// single bad link never aborts the rest.
+    async fn generate_links(&self, new_id: &MemoryId, embedding: Vec<f32>) -> rb_types::Result<()> {
+        const CANDIDATE_LIMIT: usize = 8;
+        let pairs = self
+            .backend
+            .vector(self.namespace.clone(), embedding, CANDIDATE_LIMIT)
+            .await?;
+        // Candidate ids exclude the new note itself.
+        let candidate_ids: Vec<MemoryId> = pairs
+            .iter()
+            .filter(|(id, _)| id != new_id)
+            .map(|(id, _)| id.clone())
+            .collect();
+        if candidate_ids.is_empty() {
+            return Ok(());
+        }
+        let dist: std::collections::HashMap<MemoryId, f32> = pairs.into_iter().collect();
+        let notes = self
+            .backend
+            .get_many(self.namespace.clone(), candidate_ids)
+            .await?;
+        let new_note = match self
+            .backend
+            .get(self.namespace.clone(), new_id.clone())
+            .await?
+        {
+            Some(n) => n,
+            None => return Ok(()),
+        };
+        let candidates: Vec<(MemoryNote, f32)> = notes
+            .into_iter()
+            .map(|n| {
+                let d = dist.get(&n.id).copied().unwrap_or(f32::MAX);
+                (n, d)
+            })
+            .collect();
+        for link in self.linker.link(&new_note, &candidates) {
+            if let Err(e) = self.backend.add_link(link).await {
+                tracing::warn!(error = %e, "add_link failed; skipping one link");
+            }
+        }
+        Ok(())
     }
 
     /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
@@ -176,19 +266,21 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             }
         }
 
-        // Fetch each candidate once; build the note cache + the rank meta map.
+        // ONE batch fetch (fixes the N+1). get_many is ns-scoped and order-preserving.
+        let fetched = self
+            .backend
+            .get_many(self.namespace.clone(), order.clone())
+            .await?;
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
-        for id in &order {
-            if let Some(note) = self.get_scoped(id.clone()).await? {
-                if !self.active_in_namespace(&note)
-                    || !Self::matches_recall_filters(&note, type_filter, tags)
-                {
-                    continue;
-                }
-                meta.insert(id.clone(), (note.importance, note.created_at));
-                notes.insert(id.clone(), note);
+        for note in fetched {
+            if !self.active_in_namespace(&note)
+                || !Self::matches_recall_filters(&note, type_filter, tags)
+            {
+                continue;
             }
+            meta.insert(note.id.clone(), (note.importance, note.created_at));
+            notes.insert(note.id.clone(), note);
         }
 
         let filtered_keyword: Vec<MemoryId> = keyword
@@ -225,12 +317,26 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 break;
             }
         }
+
+        // Best-effort batch access tracking: single writer round-trip for all results.
+        let returned_ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        if !returned_ids.is_empty() {
+            if let Err(e) = self.backend.record_accesses(returned_ids).await {
+                tracing::debug!(error = %e, "record_accesses failed; ignoring");
+            }
+        }
         Ok(results)
     }
 
     /// Fetch a single memory by id in the engine namespace.
     pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        self.get_scoped(id).await
+        let found = self.get_scoped(id.clone()).await?;
+        if found.is_some() {
+            if let Err(e) = self.backend.record_access(id.clone()).await {
+                tracing::debug!(error = %e, memory_id = %id, "record_access failed; ignoring");
+            }
+        }
+        Ok(found)
     }
 
     /// List memories in the engine namespace, most-recent first, optionally
@@ -282,11 +388,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             ));
         }
         if let Some(importance) = updates.importance {
-            if !(1..=10).contains(&importance) {
-                return Err(rb_types::Error::Storage(format!(
-                    "importance {importance} is out of range 1..=10"
-                )));
-            }
+            rb_types::validate_importance(importance)?;
         }
         if self.get_scoped(id.clone()).await?.is_none() {
             return Err(rb_types::Error::NotFound(id));
@@ -459,6 +561,38 @@ mod tests {
         assert_eq!(eng.backend().count(), 0);
     }
 
+    #[tokio::test]
+    async fn out_of_range_importance_is_invalid_argument_on_both_paths() {
+        let eng = engine();
+
+        // remember path.
+        let err = eng
+            .remember(input("bad importance on remember", 0))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "remember must reject with InvalidArgument, got {err:?}"
+        );
+
+        // update path.
+        let id = eng.remember(input("valid body", 5)).await.unwrap();
+        let err = eng
+            .update(
+                id,
+                rb_types::MemoryUpdates {
+                    importance: Some(11),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "update must reject with InvalidArgument, got {err:?}"
+        );
+    }
+
     async fn seed(
         eng: &MemoryEngine<MockBackend, DeterministicProvider>,
         content: &str,
@@ -482,6 +616,49 @@ mod tests {
         let mut note = MemoryNote::new(namespace, content.to_string(), ty, importance);
         note.tags = tags.iter().map(|t| t.to_string()).collect();
         note
+    }
+
+    #[tokio::test]
+    async fn remember_creates_links_to_similar_existing_memories() {
+        let eng = engine();
+        // First memory: nothing to link to.
+        let first = eng
+            .remember(input("single writer over sqlite wal", 5))
+            .await
+            .unwrap();
+        assert!(eng.backend().links_of(&first).is_empty());
+
+        // Second memory: the deterministic mock vector() returns the first as a
+        // candidate at distance 0.0 (<= threshold), so a link is created.
+        let second = eng
+            .remember(input("concurrent readers never block", 5))
+            .await
+            .unwrap();
+        let links = eng.backend().links_of(&second);
+        assert!(
+            !links.is_empty(),
+            "remember should link to the prior similar memory"
+        );
+        assert_eq!(links[0].source_id, second);
+        assert!(
+            links.iter().all(|l| l.target_id != second),
+            "never links to self"
+        );
+        assert!(links.iter().any(|l| l.target_id == first));
+        assert!(links
+            .iter()
+            .all(|l| l.link_type == rb_types::LinkType::References));
+    }
+
+    #[tokio::test]
+    async fn remember_link_failure_does_not_fail_remember() {
+        // A backend whose add_link always fails must not break remember.
+        let eng = engine();
+        let _first = eng.remember(input("anchor", 5)).await.unwrap();
+        eng.backend().set_fail_add_link(true);
+        // Should still succeed (best-effort linking).
+        let id = eng.remember(input("second", 5)).await.unwrap();
+        assert!(eng.backend().note_of(&id).is_some());
     }
 
     #[tokio::test]
@@ -622,6 +799,43 @@ mod tests {
         let eng = engine();
         let results = eng.recall("anything", 10, None, &[]).await.unwrap();
         assert!(results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_bumps_access_count_on_returned_results() {
+        let eng = engine();
+        seed(&eng, "alpha sqlite topic", MemoryType::Insight, 5, &[]).await;
+        seed(&eng, "beta tokio topic", MemoryType::Insight, 5, &[]).await;
+        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // each returned id had its access recorded.
+        for r in &results {
+            let note = eng.backend().note_of(&r.memory.id).unwrap();
+            assert_eq!(note.access_count, 1);
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_record_access_failure_does_not_fail_recall() {
+        let eng = engine();
+        seed(&eng, "probe content", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_fail_record_access(true);
+        // Recall still returns its results despite record_access failing.
+        let results = eng.recall("probe", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        // record_access was attempted (best-effort), even though it errored.
+        assert!(eng.backend().record_access_count() >= 1);
+    }
+
+    #[tokio::test]
+    async fn get_bumps_access_count_when_found() {
+        let eng = engine();
+        let id = eng.remember(input("findable", 5)).await.unwrap();
+        let before = eng.backend().note_of(&id).unwrap().access_count;
+        let got = eng.get(id.clone()).await.unwrap().unwrap();
+        assert_eq!(got.id, id);
+        // access recorded after a successful get.
+        assert_eq!(eng.backend().note_of(&id).unwrap().access_count, before + 1);
     }
 
     #[tokio::test]
@@ -877,5 +1091,54 @@ mod tests {
         assert_eq!(important.len(), 1);
         assert_eq!(important[0].importance, 9);
         assert_eq!(total, 2);
+    }
+
+    use crate::test_support::{FailingEnricher, FixedEnricher};
+
+    #[tokio::test]
+    async fn remember_with_enricher_fills_empty_keywords_tags_and_summary() {
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        // caller leaves keywords/tags empty -> enricher fills them.
+        let id = eng.remember(input("some content body", 5)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.summary, "enriched summary");
+        assert_eq!(note.keywords, vec!["enrkw".to_string()]);
+        assert_eq!(note.tags, vec!["enrtag".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn remember_with_enricher_preserves_caller_supplied_keywords_and_tags() {
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        let mut inp = input("body", 5);
+        inp.keywords = vec!["caller".to_string()];
+        inp.tags = vec!["callertag".to_string()];
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        // explicit caller values win over the enricher.
+        assert_eq!(note.keywords, vec!["caller".to_string()]);
+        assert_eq!(note.tags, vec!["callertag".to_string()]);
+        // summary still comes from the enricher (caller never supplies it).
+        assert_eq!(note.summary, "enriched summary");
+    }
+
+    #[tokio::test]
+    async fn remember_falls_back_to_heuristic_when_enricher_errors() {
+        let eng = engine().with_enricher(Arc::new(FailingEnricher));
+        let content = "concurrent readers never block the single writer thread";
+        let id = eng.remember(input(content, 6)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        // heuristic summary == trimmed content (< 150 chars); keywords non-empty.
+        assert_eq!(note.summary, content);
+        assert!(!note.keywords.is_empty());
+    }
+
+    #[tokio::test]
+    async fn remember_without_enricher_is_unchanged_heuristic_path() {
+        let eng = engine(); // no enricher
+        let content = "single writer over sqlite wal keeps things correct";
+        let id = eng.remember(input(content, 7)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.summary, content);
+        assert!(!note.keywords.is_empty());
     }
 }

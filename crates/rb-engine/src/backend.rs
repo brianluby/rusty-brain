@@ -41,6 +41,19 @@ pub trait MemoryBackend: Send + Sync {
         updates: MemoryUpdates,
     ) -> rb_types::Result<()>;
     async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()>;
+    /// Persist a directed link (write path).
+    async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()>;
+    /// Bump access metadata for `id` (write path; best-effort at call sites).
+    async fn record_access(&self, id: MemoryId) -> rb_types::Result<()>;
+    /// Bump access metadata for all `ids` in a single writer round-trip
+    /// (write path; best-effort at call sites). Missing ids are silently skipped.
+    async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()>;
+    /// Batch-fetch `ids` scoped to `ns`, in request order (read path).
+    async fn get_many(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<Vec<MemoryNote>>;
 }
 
 #[cfg(test)]
@@ -169,6 +182,43 @@ mod tests {
             note.archived_at = Some(chrono::Utc::now());
             Ok(())
         }
+        async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()> {
+            let mut guard = self.notes.lock().unwrap();
+            let note = guard
+                .get_mut(&link.source_id)
+                .ok_or_else(|| rb_types::Error::NotFound(link.source_id.clone()))?;
+            note.links.push(link);
+            Ok(())
+        }
+        async fn record_access(&self, id: MemoryId) -> rb_types::Result<()> {
+            let mut guard = self.notes.lock().unwrap();
+            if let Some(note) = guard.get_mut(&id) {
+                note.access_count += 1;
+                note.last_accessed_at = Some(chrono::Utc::now());
+            }
+            Ok(())
+        }
+        async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
+            let mut guard = self.notes.lock().unwrap();
+            for id in ids {
+                if let Some(note) = guard.get_mut(&id) {
+                    note.access_count += 1;
+                    note.last_accessed_at = Some(chrono::Utc::now());
+                }
+            }
+            Ok(())
+        }
+        async fn get_many(
+            &self,
+            ns: Namespace,
+            ids: Vec<MemoryId>,
+        ) -> rb_types::Result<Vec<MemoryNote>> {
+            let guard = self.notes.lock().unwrap();
+            Ok(ids
+                .iter()
+                .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
+                .collect())
+        }
     }
 
     #[tokio::test]
@@ -206,5 +256,43 @@ mod tests {
             .unwrap()
             .archived_at
             .is_some());
+    }
+
+    #[tokio::test]
+    async fn mock_backend_supports_links_access_and_batch_fetch() {
+        let backend = MockBackend::default();
+        let ns = Namespace::Global;
+        let a = MemoryNote::new(ns.clone(), "a".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "b".to_string(), MemoryType::Insight, 5);
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        backend.write(a, None).await.unwrap();
+        backend.write(b, None).await.unwrap();
+
+        // add_link is accepted (stored on the source note).
+        backend
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.7,
+                reason: "similar".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        // record_access bumps the count.
+        backend.record_access(aid.clone()).await.unwrap();
+        let got = backend.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(got.access_count, 1);
+        assert_eq!(got.links.len(), 1);
+
+        // get_many returns ns-scoped notes in request order.
+        let many = backend
+            .get_many(ns, vec![bid.clone(), aid.clone()])
+            .await
+            .unwrap();
+        let ids: Vec<rb_types::MemoryId> = many.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(ids, vec![bid, aid]);
     }
 }
