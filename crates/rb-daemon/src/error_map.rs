@@ -106,7 +106,7 @@ mod tests {
     fn enrichment_is_internal_opaque_over_wire() {
         // Enrichment is an internal fault: the stable kind is forwarded but the
         // detail is replaced with the generic sentinel (no leak to the caller).
-        let r = error_to_response(Error::Enrichment("anthropic 401: bad key abc".into()));
+        let r = error_to_response(Error::Enrichment("llm 401: bad key abc".into()));
         if let Response::Error { kind, message } = r {
             assert_eq!(kind, "enrichment");
             assert_eq!(message, "internal error");
