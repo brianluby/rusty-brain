@@ -26,11 +26,14 @@ pub fn resolve_hooks_bin() -> PathBuf {
     }
 }
 
-/// Select installers: all four when `requested` is `None`, else exactly the
-/// named subset. Fail closed on an unknown agent id.
+/// Select installers: all shipped installers when `requested` is `None`, else
+/// exactly the named subset. Fail closed on an unknown agent id, and reject the
+/// deferred `opencode` agent with a clear error rather than silently doing
+/// nothing (it has no JSON installer — it needs a JS/TS plugin).
 ///
 /// # Errors
-/// Returns [`InstallError::InvalidAgent`] for any unrecognized name.
+/// Returns [`InstallError::InvalidAgent`] for any unrecognized name, and
+/// [`InstallError::AgentDeferred`] when `opencode` is explicitly requested.
 pub fn select_installers(
     requested: Option<&[String]>,
 ) -> Result<Vec<Box<dyn AgentInstaller>>, InstallError> {
@@ -39,10 +42,20 @@ pub fn select_installers(
         None => Ok(all),
         Some(names) => {
             for name in names {
-                if AgentId::parse(name).is_none() {
-                    return Err(InstallError::InvalidAgent {
-                        agent: name.clone(),
-                    });
+                match AgentId::parse(name) {
+                    None => {
+                        return Err(InstallError::InvalidAgent {
+                            agent: name.clone(),
+                        });
+                    }
+                    // `opencode` is a real AgentId (the hook binary still supports
+                    // `--agent opencode`) but has no installer — fail clearly.
+                    Some(AgentId::OpenCode) => {
+                        return Err(InstallError::AgentDeferred {
+                            agent: name.clone(),
+                        });
+                    }
+                    Some(_) => {}
                 }
             }
             Ok(all
@@ -253,8 +266,10 @@ mod tests {
 
     #[test]
     fn select_installers_all_when_none() {
+        // OpenCode is deferred, so the default set is three installers.
         let all = select_installers(None).unwrap();
-        assert_eq!(all.len(), 4);
+        assert_eq!(all.len(), 3);
+        assert!(!all.iter().any(|i| i.id() == AgentId::OpenCode));
     }
 
     #[test]
@@ -271,6 +286,18 @@ mod tests {
         // compile. The assertion below pins the identical plan intent.
         let result = select_installers(Some(&["cursor".to_string()]));
         assert!(matches!(result, Err(InstallError::InvalidAgent { .. })));
+    }
+
+    #[test]
+    fn select_installers_defers_opencode_with_clear_error() {
+        // `opencode` is a valid AgentId but has no installer (JS/TS plugin); it must
+        // fail with a clear deferred error, NOT silently select zero installers.
+        let result = select_installers(Some(&["opencode".to_string()]));
+        assert!(matches!(result, Err(InstallError::AgentDeferred { .. })));
+        if let Err(e) = result {
+            assert!(e.to_string().contains("deferred"));
+            assert!(e.to_string().contains("[E_INSTALL_AGENT_DEFERRED]"));
+        }
     }
 
     /// A test-only installer whose `detect()` always succeeds, so engine tests

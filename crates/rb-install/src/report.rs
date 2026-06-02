@@ -12,8 +12,12 @@ use serde::Serialize;
 pub enum InstallError {
     #[error("[E_INSTALL_AGENT_NOT_FOUND] agent '{agent}' not found on this system")]
     AgentNotFound { agent: String },
-    #[error("[E_INSTALL_INVALID_AGENT] unknown agent '{agent}'. supported: claude-code, opencode, gemini, codex")]
+    #[error(
+        "[E_INSTALL_INVALID_AGENT] unknown agent '{agent}'. supported: claude-code, gemini, codex"
+    )]
     InvalidAgent { agent: String },
+    #[error("[E_INSTALL_AGENT_DEFERRED] opencode integration is deferred (requires a JS/TS plugin) and is not available yet")]
+    AgentDeferred { agent: String },
     #[error("[E_INSTALL_IO_ERROR] i/o error at '{path}': {message}")]
     IoError { path: PathBuf, message: String },
     #[error("[E_INSTALL_CONFIG_CORRUPTED] existing config at '{path}' is not valid json")]

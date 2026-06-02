@@ -7,7 +7,6 @@
 mod claude_code;
 mod codex;
 mod gemini;
-mod opencode;
 
 use std::path::PathBuf;
 
@@ -17,14 +16,17 @@ use rb_types::Error;
 pub use claude_code::ClaudeCodeInstaller;
 pub use codex::CodexInstaller;
 pub use gemini::GeminiInstaller;
-pub use opencode::OpenCodeInstaller;
 
-/// Every built-in installer, in display order (Claude Code first — the lead adapter).
+/// Every built-in installer, in display order (Claude Code first — the lead
+/// adapter). OpenCode is intentionally absent: it loads hooks via a JS/TS plugin
+/// in `.opencode/plugins/`, not a JSON hooks block, so a JSON-writing installer
+/// would be inert. OpenCode install is deferred to a follow-on; the dormant
+/// `rb-agents` OpenCode adapter and `--agent opencode` hook support remain so the
+/// future plugin can reuse them.
 #[must_use]
 pub fn builtins() -> Vec<Box<dyn AgentInstaller>> {
     vec![
         Box::new(ClaudeCodeInstaller),
-        Box::new(OpenCodeInstaller),
         Box::new(GeminiInstaller),
         Box::new(CodexInstaller),
     ]
