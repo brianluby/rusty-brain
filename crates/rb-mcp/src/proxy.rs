@@ -195,6 +195,11 @@ pub fn response_to_content(resp: Response) -> Value {
             total,
         } => json!({ "recent": recent, "important": important, "total": total }),
         Response::Pong { contract_version } => json!({ "contract_version": contract_version }),
+        Response::JobRan {
+            scanned,
+            changed,
+            skipped,
+        } => json!({ "scanned": scanned, "changed": changed, "skipped": skipped }),
         Response::Error { kind, message } => {
             json!({ "error": { "kind": kind, "message": message } })
         }

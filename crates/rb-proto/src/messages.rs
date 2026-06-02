@@ -1,5 +1,6 @@
 use rb_types::{
-    MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult,
+    JobKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
+    SearchResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -60,6 +61,9 @@ pub enum Request {
         id: MemoryId,
     },
     Context,
+    RunJob {
+        job: JobKind,
+    },
     Ping,
     /// Open a live change-notification stream. The daemon stops the
     /// request/response cadence for this connection and streams `Response::Change`
@@ -99,6 +103,11 @@ pub enum Response {
     Pong {
         contract_version: u32,
     },
+    JobRan {
+        scanned: u64,
+        changed: u64,
+        skipped: u64,
+    },
     Error {
         kind: String,
         message: String,
@@ -116,7 +125,9 @@ pub enum Response {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
-    use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult};
+    use rb_types::{
+        JobKind, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult,
+    };
 
     fn note() -> MemoryNote {
         MemoryNote::new(
@@ -195,6 +206,9 @@ mod tests {
             Request::Context,
             Request::Ping,
             Request::Subscribe,
+            Request::RunJob {
+                job: JobKind::LinkDecay,
+            },
         ]
     }
 
@@ -257,6 +271,11 @@ mod tests {
                 kind: rb_types::ChangeKind::Created,
             }),
             Response::Lagged { dropped: 3 },
+            Response::JobRan {
+                scanned: 10,
+                changed: 3,
+                skipped: 7,
+            },
         ]
     }
 
@@ -308,5 +327,28 @@ mod tests {
         assert_eq!(json, r#"{"result":"Lagged","dropped":7}"#);
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn run_job_uses_op_tag_with_snake_case_job() {
+        let json = serde_json::to_string(&Request::RunJob {
+            job: JobKind::LinkDecay,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"op":"RunJob","job":"link_decay"}"#);
+    }
+
+    #[test]
+    fn job_ran_uses_result_tag() {
+        let json = serde_json::to_string(&Response::JobRan {
+            scanned: 1,
+            changed: 0,
+            skipped: 1,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"JobRan","scanned":1,"changed":0,"skipped":1}"#
+        );
     }
 }

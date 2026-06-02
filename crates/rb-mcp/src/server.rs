@@ -249,6 +249,11 @@ mod tests {
                 Request::Subscribe => Response::Pong {
                     contract_version: 1,
                 },
+                Request::RunJob { .. } => Response::JobRan {
+                    scanned: 0,
+                    changed: 0,
+                    skipped: 0,
+                },
             })
         }
     }

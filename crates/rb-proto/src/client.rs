@@ -229,6 +229,21 @@ impl Client {
             other => Err(Self::unexpected(other)),
         }
     }
+
+    /// Trigger one bounded evolution-job pass on the daemon; returns the summary
+    /// `(scanned, changed, skipped)`. The daemon performs all mutations through
+    /// its single writer; this is just the wire trigger.
+    pub async fn run_job(&mut self, job: rb_types::JobKind) -> Result<(u64, u64, u64)> {
+        let resp = self.request(Request::RunJob { job }).await?;
+        match resp {
+            Resp::JobRan {
+                scanned,
+                changed,
+                skipped,
+            } => Ok((scanned, changed, skipped)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -412,6 +427,11 @@ mod wrapper_tests {
                 Request::Subscribe => Response::Pong {
                     contract_version: CONTRACT_VERSION,
                 },
+                Request::RunJob { .. } => Response::JobRan {
+                    scanned: 4,
+                    changed: 2,
+                    skipped: 2,
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -469,6 +489,9 @@ mod wrapper_tests {
 
         let version = c.ping().await.unwrap();
         assert_eq!(version, CONTRACT_VERSION);
+
+        let (scanned, changed, skipped) = c.run_job(rb_types::JobKind::LinkDecay).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (4, 2, 2));
 
         drop(c);
         server.await.unwrap();
