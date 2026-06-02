@@ -105,6 +105,21 @@ fn has_sentinel_block(settings: &serde_json::Value) -> bool {
     text.contains("rusty-brain") && text.contains("rusty-brain-hooks")
 }
 
+/// Create a fake `claude` executable inside `dir` and return a `PATH` string
+/// that prepends `dir`, so `ClaudeCodeInstaller::detect()` resolves `claude` on
+/// `PATH`. Without this, CI — where `claude` is absent — would short-circuit the
+/// installer to `NotFound`, write nothing, and the `has_sentinel_block`
+/// assertion below would fail (the merge would never genuinely run).
+#[cfg(unix)]
+fn fake_claude_path(dir: &Path) -> String {
+    use std::os::unix::fs::PermissionsExt as _;
+    let bin_path = dir.join("claude");
+    std::fs::write(&bin_path, "#!/bin/sh\necho claude 1.0.0\n").unwrap();
+    std::fs::set_permissions(&bin_path, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let existing = std::env::var("PATH").unwrap_or_default();
+    format!("{}:{}", dir.display(), existing)
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn install_capture_uninstall_round_trip() {
     // --- fixture project -----------------------------------------------------
@@ -123,13 +138,25 @@ async fn install_capture_uninstall_round_trip() {
 
     // --- 1) install the Claude Code hook block -------------------------------
     let install_bin = cargo_bin("rusty-brain-install");
+    // A fake `claude` on PATH so detect() succeeds and the installer genuinely
+    // runs the merge in CI (where `claude` is absent). Without it the installer
+    // short-circuits to NotFound, writes nothing, and `has_sentinel_block` below
+    // fails. The temp dir is kept alive for the duration of the test.
+    #[cfg(unix)]
+    let path_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    #[cfg(unix)]
+    let test_path = fake_claude_path(path_dir.path());
     // NOTE (Part Z deviation): the Part Y CLI resolves the project scope from the
     // current working directory (no `--project <dir>` flag exists), so we run the
     // installer with `current_dir(&project)` to target the fixture project — the
     // same scoping the plan's `--project <project>` was intended to express.
-    let install_out = Command::new(&install_bin)
+    let mut install_cmd = Command::new(&install_bin);
+    install_cmd
         .args(["install", "--agents", "claude-code"])
-        .current_dir(&project)
+        .current_dir(&project);
+    #[cfg(unix)]
+    install_cmd.env("PATH", &test_path);
+    let install_out = install_cmd
         .output()
         .expect("run rusty-brain-install install");
     assert!(
@@ -232,9 +259,13 @@ async fn install_capture_uninstall_round_trip() {
     );
 
     // --- 3) uninstall removes ONLY the sentinel block ------------------------
-    let uninstall_out = Command::new(&install_bin)
+    let mut uninstall_cmd = Command::new(&install_bin);
+    uninstall_cmd
         .args(["uninstall", "--agents", "claude-code"])
-        .current_dir(&project)
+        .current_dir(&project);
+    #[cfg(unix)]
+    uninstall_cmd.env("PATH", &test_path);
+    let uninstall_out = uninstall_cmd
         .output()
         .expect("run rusty-brain-install uninstall");
     assert!(
