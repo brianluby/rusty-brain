@@ -34,6 +34,7 @@ impl RunningDaemon {
             socket_path: socket.clone(),
             db_path: db,
             read_pool_size: pool_size,
+            jobs_config: rb_daemon::JobsConfig::default(),
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -297,6 +298,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         socket_path: daemon.socket.clone(),
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -316,6 +318,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         socket_path: socket.clone(),
         db_path: dir.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -325,6 +328,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         socket_path: socket,
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -551,6 +555,19 @@ async fn subscribe_streams_only_own_namespace_changes() {
         "the B-namespace change must be filtered out; next frame is the 2nd A change"
     );
     assert_eq!(next.namespace, ns_a, "no cross-namespace leakage");
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn run_job_link_decay_round_trips_over_the_wire() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("evolve-e2e".to_string());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+
+    let (scanned, changed, skipped) = client.run_job(rb_types::JobKind::LinkDecay).await.unwrap();
+    // Empty store: nothing to scan, but the wire op resolves to JobRan.
+    assert_eq!((scanned, changed, skipped), (0, 0, 0));
 
     daemon.stop().await;
 }
