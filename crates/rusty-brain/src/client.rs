@@ -89,7 +89,9 @@ fn spawn_daemon(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Result<(
 /// surface and must fail `daemon_command_forwards_only_allowlisted_vars`.
 const FORWARD_ENV: &[&str] = &[
     "VOYAGE_API_KEY",
-    "ANTHROPIC_API_KEY",
+    "RB_ENRICH_BASE_URL",
+    "RB_ENRICH_MODEL",
+    "RB_ENRICH_API_KEY",
     "HOME",
     "PATH",
     "XDG_RUNTIME_DIR",
@@ -338,8 +340,9 @@ mod tests {
         );
 
         // EXACT bound: the child env is precisely SOCKET + DB + the allowlisted
-        // vars present in the source (here just VOYAGE_API_KEY) — nothing more.
-        // A future stray `.env(...)` or an added forward var fails this count.
+        // vars present in the source (here just VOYAGE_API_KEY; the RB_ENRICH_*
+        // vars are absent from the source so they are not forwarded) — nothing
+        // more. A future stray `.env(...)` or added forward var fails this count.
         assert_eq!(
             envs.len(),
             3,
