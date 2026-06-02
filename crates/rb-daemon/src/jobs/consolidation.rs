@@ -51,7 +51,8 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
 /// Algorithm: read up to `batch_limit` active, non-superseded candidates
 /// (deterministic order). For each candidate `m` not already consumed by an
 /// earlier cluster, look up its near-duplicates WITHIN m's own namespace; if it
-/// has none, it is `skipped`. Otherwise form the cluster `{m} ∪ dups`, pick a
+/// has none, it is `skipped`. Otherwise form the cluster from `m` plus the
+/// near-duplicates that also appear in this pass's candidate window, pick a
 /// deterministic survivor, and supersede every OTHER member into the survivor,
 /// marking each consumed so it is never revisited. `scanned` counts candidates
 /// examined; `changed` counts supersede writes; `skipped` counts candidates with
@@ -62,6 +63,15 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
 /// run over unchanged data performs zero writes. Never merges across namespaces:
 /// `near_duplicates` is namespace-scoped, so a cluster only ever contains
 /// same-namespace members.
+///
+/// Convergence (bounded batches): both the candidate scan and `near_duplicates`
+/// are capped at `batch_limit`. When a namespace holds more active memories than
+/// `batch_limit`, a near-duplicate whose `created_at` sorts outside the candidate
+/// window is deferred, not dropped — it is scanned as its own anchor on a later
+/// pass and re-pairs with its still-active twin (similarity is symmetric), and
+/// every merge only shrinks the active set. The job therefore converges across
+/// repeated scheduled passes; set `batch_limit` >= the per-namespace active count
+/// for single-pass completeness.
 pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<JobSummary> {
     let candidates = store
         .candidates_for_consolidation(config.batch_limit)
