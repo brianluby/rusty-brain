@@ -2469,6 +2469,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-agents"
+version = "0.0.1"
+dependencies = [
+ "rb-daemon",
+ "rb-embed",
+ "rb-proto",
+ "rb-types",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "rb-daemon"
 version = "0.0.1"
 dependencies = [

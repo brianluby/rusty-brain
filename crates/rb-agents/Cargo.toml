@@ -1,0 +1,28 @@
+[package]
+name = "rb-agents"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain: CLI-agnostic agent hook + install spine."
+
+[lib]
+name = "rb_agents"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+rb-proto = { path = "../rb-proto" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+rb-embed = { path = "../rb-embed" }
+rb-daemon = { path = "../rb-daemon" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
