@@ -405,4 +405,71 @@ mod tests {
         assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 9);
         server.await.unwrap().unwrap();
     }
+
+    #[tokio::test]
+    async fn poll_changes_over_stdio_drains_seeded_buffer() {
+        use crate::change_buffer::ChangeBuffer;
+        use rb_types::{ChangeKind, MemoryChanged, MemoryId, Namespace};
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let (client_to_server, server_reader) = tokio::io::duplex(64 * 1024);
+        let (server_writer, server_to_client) = tokio::io::duplex(64 * 1024);
+        let proxy = Fake {
+            id: MemoryId::new(),
+        };
+
+        let buffer = Arc::new(Mutex::new(ChangeBuffer::new(16)));
+        {
+            let mut guard = buffer.lock().await;
+            guard.push(MemoryChanged {
+                id: MemoryId::new(),
+                namespace: Namespace::Project("p".into()),
+                kind: ChangeKind::Created,
+            });
+            guard.record_dropped(4);
+        }
+
+        let server_buffer = Arc::clone(&buffer);
+        let server = tokio::spawn(async move {
+            serve_stdio_with_buffer(
+                BufReader::new(server_reader),
+                server_writer,
+                proxy,
+                server_buffer,
+            )
+            .await
+        });
+
+        let mut to_server = client_to_server;
+        let frame = json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": { "name": "poll_changes", "arguments": { "max": 10 } }
+        });
+        to_server
+            .write_all(format!("{}\n", serde_json::to_string(&frame).unwrap()).as_bytes())
+            .await
+            .unwrap();
+        to_server.flush().await.unwrap();
+        drop(to_server);
+
+        let mut lines = BufReader::new(server_to_client).lines();
+        let mut responses: Vec<Value> = Vec::new();
+        while let Some(line) = lines.next_line().await.unwrap() {
+            if !line.trim().is_empty() {
+                responses.push(serde_json::from_str(&line).unwrap());
+            }
+        }
+        assert_eq!(responses.len(), 1, "one poll_changes reply: {responses:?}");
+        assert_eq!(responses[0]["id"], 1);
+        let text = responses[0]["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap();
+        let payload: Value = serde_json::from_str(text).unwrap();
+        assert_eq!(payload["events"].as_array().unwrap().len(), 1);
+        assert_eq!(payload["dropped"], 4);
+        assert_ne!(responses[0]["result"]["isError"], json!(true));
+
+        server.await.unwrap().unwrap();
+    }
 }
