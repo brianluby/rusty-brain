@@ -2,7 +2,7 @@
 //!
 //! Gemini delivers hook events as strict JSON on stdin with an
 //! `hook_event_name` discriminator (`"SessionStart"`, `"AfterTool"`,
-//! `"Stop"`, `"PreCompact"`, `"BeforeTool"`, …) and flat
+//! `"SessionEnd"`, `"PreCompress"`, `"BeforeTool"`, …) and flat
 //! `tool_name`/`tool_input`/`tool_response` fields. This adapter normalizes
 //! those into the canonical [`HookContext`]/[`HookEvent`] and renders a
 //! [`HookResult`] into Gemini's strict `{ "continue", "hookSpecificOutput" }`
@@ -50,6 +50,10 @@ impl AgentCli for GeminiCli {
             .unwrap_or_else(|| PathBuf::from("."));
         let session_id = str_field(raw, "session_id");
 
+        // Gemini's native hook event names differ from Claude's: the tool event is
+        // `AfterTool` (not `PostToolUse`), the stop event is `SessionEnd` (not
+        // `Stop`), and the pre-compaction event is `PreCompress` (not `PreCompact`).
+        // Map each native name onto the canonical [`HookEvent`].
         let event = match raw.get("hook_event_name").and_then(Value::as_str) {
             Some("SessionStart") => HookEvent::SessionStart {
                 source: str_field(raw, "source"),
@@ -60,10 +64,10 @@ impl AgentCli for GeminiCli {
                 tool_input: value_field(raw, "tool_input"),
                 tool_response: value_field(raw, "tool_response"),
             },
-            Some("Stop") => HookEvent::Stop {
+            Some("SessionEnd") => HookEvent::Stop {
                 last_assistant_message: str_field(raw, "last_assistant_message"),
             },
-            Some("PreCompact") => HookEvent::PreCompact {
+            Some("PreCompress") => HookEvent::PreCompact {
                 custom_instructions: str_field(raw, "custom_instructions"),
             },
             // DEFAULTED: BeforeTool / unknown => not captured in P4.
@@ -150,9 +154,10 @@ mod tests {
     }
 
     #[test]
-    fn parses_stop() {
+    fn parses_session_end_as_stop() {
+        // Gemini's stop event is named `SessionEnd`; it maps to canonical `Stop`.
         let raw = json!({
-            "hook_event_name": "Stop",
+            "hook_event_name": "SessionEnd",
             "last_assistant_message": "finished"
         });
         let ctx = GeminiCli.parse_input(&raw);
@@ -165,9 +170,11 @@ mod tests {
     }
 
     #[test]
-    fn parses_pre_compact() {
+    fn parses_pre_compress_as_pre_compact() {
+        // Gemini's pre-compaction event is named `PreCompress`; it maps to canonical
+        // `PreCompact`.
         let raw = json!({
-            "hook_event_name": "PreCompact",
+            "hook_event_name": "PreCompress",
             "custom_instructions": "keep decisions"
         });
         let ctx = GeminiCli.parse_input(&raw);
@@ -177,6 +184,19 @@ mod tests {
                 custom_instructions: Some("keep decisions".to_string())
             }
         );
+    }
+
+    #[test]
+    fn claude_stop_name_is_not_recognized_as_stop() {
+        // The Claude name `Stop` is NOT a Gemini event; it must degrade to Other,
+        // proving the adapter keys off Gemini's real `SessionEnd`/`PreCompress`.
+        let raw = json!({ "hook_event_name": "Stop" });
+        let ctx = GeminiCli.parse_input(&raw);
+        assert_eq!(ctx.event, HookEvent::Other("Stop".to_string()));
+
+        let raw = json!({ "hook_event_name": "PreCompact" });
+        let ctx = GeminiCli.parse_input(&raw);
+        assert_eq!(ctx.event, HookEvent::Other("PreCompact".to_string()));
     }
 
     #[test]
