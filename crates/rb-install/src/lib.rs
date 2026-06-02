@@ -6,8 +6,12 @@
 //! `rusty-brain` build never compiles it.
 
 pub mod detect;
+pub mod installers;
 
 pub use detect::{find_binary_on_path, parse_version, version_of};
+pub use installers::{
+    builtins, ClaudeCodeInstaller, CodexInstaller, GeminiInstaller, OpenCodeInstaller,
+};
 
 #[cfg(test)]
 mod skeleton_tests {
@@ -18,5 +22,12 @@ mod skeleton_tests {
         let _ = rb_agents::install::SENTINEL;
         let _ = rb_types::Namespace::Global;
         assert_eq!(rb_agents::install::SENTINEL, "rusty-brain");
+    }
+
+    #[test]
+    fn builtins_has_four_in_lead_order() {
+        let b = super::builtins();
+        assert_eq!(b.len(), 4);
+        assert_eq!(b[0].id(), rb_agents::cli::AgentId::ClaudeCode);
     }
 }
