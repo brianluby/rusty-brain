@@ -65,3 +65,26 @@ jobs:
       - uses: rustsec/audit-check@v2
         with:
           token: ${{ secrets.GITHUB_TOKEN }}
+
+  build-agents:
+    name: build + clippy + test (agent crates)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build agent crates
+        run: cargo build -p rb-agents -p rb-hooks -p rb-install
+      - name: Clippy agent crates
+        run: cargo clippy -p rb-agents -p rb-hooks -p rb-install --all-targets -- -D warnings
+      - name: Test agent crates
+        run: cargo test -p rb-agents -p rb-hooks -p rb-install
+      - name: Assert agent crates stay out of the default rusty-brain closure
+        run: |
+          set -euo pipefail
+          if cargo tree -e no-dev -p rusty-brain | grep -E "rb-agents|rb-hooks|rb-install"; then
+            echo "ERROR: an agent crate leaked into the default rusty-brain (non-dev) dependency closure." >&2
+            echo "The rusty-brain binary must NEVER depend on rb-agents/rb-hooks/rb-install." >&2
+            exit 1
+          fi
+          echo "OK: rb-agents/rb-hooks/rb-install are absent from the default rusty-brain closure."
