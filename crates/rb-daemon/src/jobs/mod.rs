@@ -3,6 +3,7 @@
 
 mod config;
 pub mod consolidation;
+mod importance;
 mod link_decay;
 pub mod scheduler;
 
