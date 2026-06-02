@@ -75,8 +75,8 @@ fn run() -> serde_json::Value {
 
     // Only SessionStart may auto-start the daemon. Other events never spawn.
     let auto_start = match &ctx.event {
-        HookEvent::SessionStart { .. } => self_exe().map(|self_exe| AutoStart {
-            self_exe,
+        HookEvent::SessionStart { .. } => Some(AutoStart {
+            self_exe: daemon_bin(),
             db: db_path(),
         }),
         _ => None,
@@ -178,7 +178,50 @@ fn default_data_dir() -> std::path::PathBuf {
     std::env::temp_dir()
 }
 
-/// Path to this executable, for daemon auto-start. `None` if unresolved.
-fn self_exe() -> Option<std::path::PathBuf> {
-    std::env::current_exe().ok()
+/// Resolve the `rusty-brain` DAEMON binary for auto-start.
+///
+/// The auto-start path runs `<bin> serve`, which MUST be the daemon binary, not
+/// this hooks binary. `install.sh` places `rusty-brain` and `rusty-brain-hooks`
+/// together in the same directory, so we resolve the daemon as a sibling of the
+/// running hooks executable. If the sibling is missing (or `current_exe` is
+/// unresolvable), fall back to the bare name `rusty-brain`, which the OS resolves
+/// on `PATH`. Fully fail-open: if nothing is resolvable, auto-start simply fails
+/// and `connect` degrades to `None` — never panics, never blocks.
+fn daemon_bin() -> std::path::PathBuf {
+    let sibling = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.parent().map(|d| d.join(DAEMON_BIN_NAME)));
+    match sibling {
+        Some(p) if p.exists() => p,
+        _ => std::path::PathBuf::from(DAEMON_BIN_NAME),
+    }
+}
+
+/// Bare name of the daemon binary (no `.exe`: this hook path is unix-only in
+/// practice, and the bare name still resolves on `PATH` everywhere).
+const DAEMON_BIN_NAME: &str = "rusty-brain";
+
+#[cfg(test)]
+mod tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
+    use super::*;
+
+    #[test]
+    fn daemon_bin_resolves_to_the_daemon_not_the_hooks_binary() {
+        let path = daemon_bin();
+        let name = path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .expect("daemon binary path must have a utf8 file name");
+        // It must point at the daemon binary, never at the hooks binary that runs
+        // this code (`<self> serve` would be invalid for `rusty-brain-hooks`).
+        assert_eq!(
+            name, DAEMON_BIN_NAME,
+            "auto-start must target the rusty-brain daemon, not the hooks binary"
+        );
+        assert_ne!(
+            name, "rusty-brain-hooks",
+            "auto-start must NOT target the hooks binary"
+        );
+    }
 }
