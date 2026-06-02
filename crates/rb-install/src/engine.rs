@@ -76,7 +76,6 @@ pub fn run_install(
         }
         let report = match inst.hook_fragment(hooks_bin, scope) {
             Ok(frag) => {
-                let exists = frag.config_path.exists();
                 if dry_run {
                     AgentReport {
                         agent: id,
@@ -86,10 +85,19 @@ pub fn run_install(
                         error: None,
                     }
                 } else {
+                    // "Upgraded" means we replaced OUR previously-installed block.
+                    // Classify by whether our sentinel already exists in the
+                    // config, NOT by mere file existence: a first-time install into
+                    // a pre-existing (unrelated) user config is a fresh Configure,
+                    // and an idempotent re-run over our own block is an Upgrade.
+                    let had_sentinel = read_config(&frag.config_path)
+                        .ok()
+                        .map(|v| contains_sentinel(&v))
+                        .unwrap_or(false);
                     match merge_into_file(&frag.config_path, &frag.merge) {
                         Ok(_) => AgentReport {
                             agent: id,
-                            status: if exists {
+                            status: if had_sentinel {
                                 AgentStatus::Upgraded
                             } else {
                                 AgentStatus::Configured
@@ -280,6 +288,54 @@ mod tests {
         assert!(report.dry_run);
         // Nothing written to disk.
         assert!(!dir.path().join(".claude").join("settings.json").exists());
+    }
+
+    #[test]
+    fn first_install_into_existing_unrelated_config_classifies_configured() {
+        // A pre-existing, unrelated user config (no sentinel) must classify as a
+        // fresh Configure, NOT Upgraded — the old file-existence check mislabeled
+        // this as Upgraded.
+        let dir = tempfile::tempdir().unwrap();
+        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
+        let scope = InstallScope::Project(dir.path().to_path_buf());
+        let bin = std::path::Path::new("/x/rusty-brain-hooks");
+        let frag = installers[0].hook_fragment(bin, &scope).unwrap();
+
+        // Seed an existing config that has none of our markers.
+        crate::writer::write(&frag.config_path, r#"{"model":"opus"}"#, false).unwrap();
+
+        // The classification predicate run_install uses: no sentinel yet => fresh.
+        let had_sentinel = read_config(&frag.config_path)
+            .ok()
+            .map(|v| contains_sentinel(&v))
+            .unwrap_or(false);
+        assert!(
+            !had_sentinel,
+            "an unrelated existing config must classify as Configured, not Upgraded"
+        );
+    }
+
+    #[test]
+    fn reinstall_over_our_own_block_classifies_upgraded() {
+        // After we have already installed our block, a re-run must classify as
+        // Upgraded (our sentinel is present before the merge).
+        let dir = tempfile::tempdir().unwrap();
+        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
+        let scope = InstallScope::Project(dir.path().to_path_buf());
+        let bin = std::path::Path::new("/x/rusty-brain-hooks");
+        let frag = installers[0].hook_fragment(bin, &scope).unwrap();
+
+        // First install lays down our sentinel-marked block.
+        crate::writer::merge_into_file(&frag.config_path, &frag.merge).unwrap();
+
+        let had_sentinel = read_config(&frag.config_path)
+            .ok()
+            .map(|v| contains_sentinel(&v))
+            .unwrap_or(false);
+        assert!(
+            had_sentinel,
+            "a re-install over our own block must classify as Upgraded"
+        );
     }
 
     #[test]
