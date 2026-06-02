@@ -7,12 +7,14 @@
 
 pub mod detect;
 pub mod installers;
+pub mod uninstall;
 pub mod writer;
 
 pub use detect::{find_binary_on_path, parse_version, version_of};
 pub use installers::{
     builtins, ClaudeCodeInstaller, CodexInstaller, GeminiInstaller, OpenCodeInstaller,
 };
+pub use uninstall::{strip_sentinel, uninstall_file};
 pub use writer::{backup_path, merge_into_file, merge_value, read_config, write};
 
 #[cfg(test)]
