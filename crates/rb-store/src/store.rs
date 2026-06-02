@@ -15,7 +15,12 @@ pub struct LinkRow {
     pub source: MemoryId,
     pub target: MemoryId,
     pub link_type: rb_types::LinkType,
+    /// Current (possibly decayed) strength. Used only for change detection so a
+    /// pass that recomputes the same value writes nothing.
     pub strength: f32,
+    /// Immutable baseline strength captured at link creation. Decay is a pure
+    /// function of this and `created_at`, which is what makes the pass idempotent.
+    pub base_strength: f32,
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
@@ -170,7 +175,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT source_id, target_id, link_type, strength, created_at
+                "SELECT source_id, target_id, link_type, strength, base_strength, created_at
                  FROM memory_links
                  LIMIT ?1",
             )
@@ -182,20 +187,23 @@ impl SqliteStore {
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
                     row.get::<_, f64>(3)?,
-                    row.get::<_, i64>(4)?,
+                    row.get::<_, f64>(4)?,
+                    row.get::<_, i64>(5)?,
                 ))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut out = Vec::new();
         for r in rows {
-            let (src, tgt, lt, strength, created) = r.map_err(|e| Error::Storage(e.to_string()))?;
+            let (src, tgt, lt, strength, base_strength, created) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
             out.push(LinkRow {
                 source: src.parse::<MemoryId>()?,
                 target: tgt.parse::<MemoryId>()?,
                 link_type: rb_types::LinkType::parse(&lt)?,
                 // strength is SQLite REAL (f64) narrowed to f32, matching load_links.
                 strength: strength as f32,
+                base_strength: base_strength as f32,
                 created_at: from_ts(created)?,
             });
         }
@@ -542,12 +550,15 @@ impl Store for SqliteStore {
                 self.conn
                     .execute(
                         "INSERT INTO memory_links
-                            (source_id, target_id, link_type, strength, reason, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                            (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                         rusqlite::params![
                             link.source_id.to_string(),
                             link.target_id.to_string(),
                             link.link_type.as_str(),
+                            link.strength as f64,
+                            // Baseline equals the created strength; decay never
+                            // mutates it, so the pass stays idempotent.
                             link.strength as f64,
                             link.reason,
                             ts(link.created_at),
@@ -872,12 +883,15 @@ impl Store for SqliteStore {
         self.conn
             .execute(
                 "INSERT INTO memory_links
-                    (source_id, target_id, link_type, strength, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                    (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 rusqlite::params![
                     link.source_id.to_string(),
                     link.target_id.to_string(),
                     link.link_type.as_str(),
+                    link.strength as f64,
+                    // Baseline equals the created strength; decay never mutates
+                    // it, so the pass stays idempotent.
                     link.strength as f64,
                     link.reason,
                     link.created_at.timestamp(),
@@ -1177,11 +1191,50 @@ mod tests {
         assert_eq!(row.target, b.id);
         assert_eq!(row.link_type, rb_types::LinkType::References);
         assert!((row.strength - 0.8).abs() < f32::EPSILON);
+        // base_strength is captured at creation = the created strength.
+        assert!((row.base_strength - 0.8).abs() < f32::EPSILON);
         assert_eq!(row.created_at.timestamp(), created.timestamp());
 
         // The limit is honoured.
         let none = store.links_for_decay(0).unwrap();
         assert!(none.is_empty(), "limit 0 returns no rows");
+    }
+
+    #[test]
+    fn set_link_strength_leaves_base_strength_immutable() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("decay-base".to_string());
+        let a = MemoryNote::new(ns.clone(), "source".to_string(), MemoryType::Insight, 5);
+        let b = MemoryNote::new(ns.clone(), "target".to_string(), MemoryType::Insight, 5);
+        store.insert_memory(&a, Some(&[0.1f32; 8])).unwrap();
+        store.insert_memory(&b, Some(&[0.2f32; 8])).unwrap();
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 0.8,
+                reason: "r".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+
+        // Decay lowers the running strength but must NOT touch the baseline, so
+        // a subsequent recompute from the baseline is reproducible (idempotent).
+        store
+            .set_link_strength(&a.id, &b.id, rb_types::LinkType::References, 0.2)
+            .unwrap();
+
+        let rows = store.links_for_decay(10).unwrap();
+        assert_eq!(rows.len(), 1);
+        assert!(
+            (rows[0].strength - 0.2).abs() < f32::EPSILON,
+            "running value updated"
+        );
+        assert!(
+            (rows[0].base_strength - 0.8).abs() < f32::EPSILON,
+            "baseline unchanged by set_link_strength"
+        );
     }
 
     #[test]
