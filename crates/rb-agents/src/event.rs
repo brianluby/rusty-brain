@@ -31,12 +31,24 @@ pub enum HookEvent {
 
 /// The result of handling a hook event. In P4 `continue_execution` is ALWAYS
 /// `true`: capture hooks are strictly fail-open and never block the CLI.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookResult {
     /// Text to surface to the agent (e.g. injected context). `None` = nothing.
     pub system_message: Option<String>,
     /// Always `true` in P4. Kept explicit so renderers emit it verbatim.
     pub continue_execution: bool,
+}
+
+/// Fail-open default: a defaulted `HookResult` must NEVER block the CLI, so
+/// `continue_execution` defaults to `true` (the derived `Default` would have made
+/// it `false`, contradicting the P4 fail-open contract).
+impl Default for HookResult {
+    fn default() -> Self {
+        Self {
+            system_message: None,
+            continue_execution: true,
+        }
+    }
 }
 
 /// A normalized hook invocation: the event plus the resolved cwd and session id.
@@ -54,9 +66,10 @@ mod tests {
     use std::path::PathBuf;
 
     #[test]
-    fn hook_result_default_does_not_continue_and_has_no_message() {
+    fn hook_result_default_is_fail_open() {
         let r = HookResult::default();
-        assert!(!r.continue_execution);
+        // Fail-open contract: a defaulted result must continue (never block).
+        assert!(r.continue_execution);
         assert_eq!(r.system_message, None);
     }
 
