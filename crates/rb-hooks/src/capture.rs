@@ -139,6 +139,72 @@ pub async fn post_tool_use(
     continue_only()
 }
 
+/// Pure: format recent + important memories into a markdown system message.
+/// `important` is split into critical (`importance >= 8`) and important
+/// (`importance == 7`). Returns a header-only message when everything is empty.
+fn format_session_start(
+    recent: &[rb_types::MemoryNote],
+    important: &[rb_types::MemoryNote],
+    total: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str("# Rusty Brain — Memory Active\n");
+    out.push_str(&format!("Total memories in scope: {total}\n"));
+
+    let critical: Vec<&rb_types::MemoryNote> =
+        important.iter().filter(|m| m.importance >= 8).collect();
+    let merely_important: Vec<&rb_types::MemoryNote> =
+        important.iter().filter(|m| m.importance == 7).collect();
+
+    if !critical.is_empty() {
+        out.push_str("\n## Critical\n");
+        for m in critical {
+            out.push_str(&format!("- {}\n", memory_line(m)));
+        }
+    }
+    if !merely_important.is_empty() {
+        out.push_str("\n## Important\n");
+        for m in merely_important {
+            out.push_str(&format!("- {}\n", memory_line(m)));
+        }
+    }
+    if !recent.is_empty() {
+        out.push_str("\n## Recent\n");
+        for m in recent {
+            out.push_str(&format!("- {}\n", memory_line(m)));
+        }
+    }
+    out
+}
+
+/// One-line rendering of a memory: prefer its summary, else its content.
+fn memory_line(memory: &rb_types::MemoryNote) -> String {
+    let text = if memory.summary.trim().is_empty() {
+        memory.content.as_str()
+    } else {
+        memory.summary.as_str()
+    };
+    format!("[{}] {}", memory.memory_type.as_str(), text.trim())
+}
+
+/// SessionStart flow: fetch context and inject a markdown system message.
+/// Always continues. With no client (degraded), continues with no message.
+pub async fn session_start(client: Option<&mut DaemonClient>) -> HookResult {
+    let Some(client) = client else {
+        return continue_only();
+    };
+    match client.context().await {
+        Some((recent, important, total)) => {
+            let message = format_session_start(&recent, &important, total);
+            HookResult {
+                system_message: Some(message),
+                continue_execution: true,
+            }
+        }
+        None => continue_only(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -279,5 +345,48 @@ mod tests {
         .await;
         assert!(result.continue_execution);
         assert!(dedup.is_duplicate("Edit", "Edited /src/main.rs"));
+    }
+
+    fn sample_note(content: &str, importance: u8) -> rb_types::MemoryNote {
+        rb_types::MemoryNote::new(
+            rb_types::Namespace::Project("rusty-brain".into()),
+            content.to_string(),
+            MemoryType::Insight,
+            importance,
+        )
+    }
+
+    #[test]
+    fn format_session_start_empty_has_header_and_no_sections() {
+        let msg = format_session_start(&[], &[], 0);
+        assert!(msg.contains("# Rusty Brain"));
+        assert!(!msg.contains("## Critical"));
+        assert!(!msg.contains("## Recent"));
+    }
+
+    #[test]
+    fn format_session_start_splits_critical_and_important() {
+        let important = vec![sample_note("crit decision", 9), sample_note("imp note", 7)];
+        let msg = format_session_start(&[], &important, 2);
+        assert!(msg.contains("## Critical"));
+        assert!(msg.contains("crit decision"));
+        assert!(msg.contains("## Important"));
+        assert!(msg.contains("imp note"));
+    }
+
+    #[test]
+    fn format_session_start_lists_recent_and_total() {
+        let recent = vec![sample_note("did a thing", 5)];
+        let msg = format_session_start(&recent, &[], 12);
+        assert!(msg.contains("## Recent"));
+        assert!(msg.contains("did a thing"));
+        assert!(msg.contains("12"), "should mention the total count");
+    }
+
+    #[tokio::test]
+    async fn session_start_without_client_continues_with_no_message() {
+        let result = session_start(None).await;
+        assert!(result.continue_execution);
+        assert!(result.system_message.is_none());
     }
 }
