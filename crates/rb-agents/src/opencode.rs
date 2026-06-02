@@ -151,11 +151,13 @@ mod tests {
 
     #[test]
     fn parses_tool_execute_after_as_post_tool_use() {
+        // OpenCode reports the tool name in lowercase; the adapter preserves it
+        // verbatim (capture-layer normalization maps it to canonical "Write").
         let raw = json!({
             "type": "tool.execute.after",
             "directory": "/work/proj",
             "sessionID": "s-2",
-            "tool": "Write",
+            "tool": "write",
             "args": {"file_path": "/tmp/a.txt"},
             "output": {"ok": true}
         });
@@ -166,7 +168,7 @@ mod tests {
                 tool_input,
                 tool_response,
             } => {
-                assert_eq!(tool_name, "Write");
+                assert_eq!(tool_name, "write");
                 assert_eq!(tool_input, json!({"file_path": "/tmp/a.txt"}));
                 assert_eq!(tool_response, json!({"ok": true}));
             }

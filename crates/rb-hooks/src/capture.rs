@@ -9,10 +9,6 @@ use rb_types::MemoryType;
 
 use crate::dedup::DedupCache;
 
-/// Mutation tools whose observations are captured. Discovery tools (Read, Grep,
-/// Glob, WebFetch, ...) are excluded to reduce noise and improve recall quality.
-const MUTATION_TOOLS: &[&str] = &["Edit", "Write", "NotebookEdit", "Bash"];
-
 /// Max characters retained from a tool response before head/tail truncation.
 const MAX_RESPONSE_CHARS: usize = 2000;
 
@@ -26,15 +22,34 @@ fn continue_only() -> HookResult {
     }
 }
 
-/// True if `tool_name` is a captured mutation tool.
+/// Normalize a CLI-reported tool name to its canonical capitalized form.
+///
+/// Claude reports capitalized names (`Edit`, `Write`, `NotebookEdit`, `Bash`);
+/// OpenCode reports lowercase (`edit`, `write`, `bash`, `patch`). Lowercasing
+/// first lets us match both. OpenCode's `patch` is treated as an `Edit`.
+/// Anything not a recognized mutation tool maps to `""` (the empty canonical),
+/// which `is_mutation_tool` reads as "not captured".
+fn normalize_tool(tool_name: &str) -> &'static str {
+    match tool_name.to_lowercase().as_str() {
+        "edit" => "Edit",
+        "write" => "Write",
+        "notebookedit" => "NotebookEdit",
+        "bash" => "Bash",
+        "patch" => "Edit",
+        _ => "",
+    }
+}
+
+/// True if `tool_name` is a captured mutation tool (case-insensitive across CLIs).
 fn is_mutation_tool(tool_name: &str) -> bool {
-    MUTATION_TOOLS.contains(&tool_name)
+    !normalize_tool(tool_name).is_empty()
 }
 
 /// Map a tool name to a `MemoryType`: file-mutation tools are code patterns;
-/// everything else (Bash, unknown) is a reference observation.
+/// everything else (Bash, unknown) is a reference observation. Normalizes first
+/// so lowercase (OpenCode) names classify identically to capitalized ones.
 fn classify_tool(tool_name: &str) -> MemoryType {
-    match tool_name {
+    match normalize_tool(tool_name) {
         "Edit" | "Write" | "NotebookEdit" => MemoryType::CodePattern,
         _ => MemoryType::Reference,
     }
@@ -69,9 +84,11 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
     input.get(key).and_then(|v| v.as_str()).unwrap_or("unknown")
 }
 
-/// Build a concise, human-readable summary of a tool invocation.
+/// Build a concise, human-readable summary of a tool invocation. Normalizes the
+/// tool name first so lowercase (OpenCode) `write`/`edit`/`bash`/`patch` produce
+/// the same summaries as Claude's capitalized names.
 fn summarize_post_tool_use(tool_name: &str, tool_input: &serde_json::Value) -> String {
-    match tool_name {
+    match normalize_tool(tool_name) {
         "Edit" => format!("Edited {}", str_field(tool_input, "file_path")),
         "Write" => format!("Wrote {}", str_field(tool_input, "file_path")),
         "NotebookEdit" => format!("Edited notebook {}", str_field(tool_input, "notebook_path")),
@@ -83,7 +100,8 @@ fn summarize_post_tool_use(tool_name: &str, tool_input: &serde_json::Value) -> S
             };
             format!("Ran command: {truncated}")
         }
-        other => format!("Used {other}"),
+        // Unknown tool: normalize yields "", so report the raw name for diagnostics.
+        _ => format!("Used {tool_name}"),
     }
 }
 
@@ -347,6 +365,54 @@ mod tests {
     #[test]
     fn classify_unknown_defaults_to_reference() {
         assert_eq!(classify_tool("SomeFutureTool"), MemoryType::Reference);
+    }
+
+    #[test]
+    fn lowercase_opencode_tools_are_mutations() {
+        // OpenCode reports lowercase tool names; they must be recognized.
+        for t in ["write", "edit", "bash", "patch"] {
+            assert!(is_mutation_tool(t), "{t} (opencode) should be a mutation");
+        }
+    }
+
+    #[test]
+    fn lowercase_opencode_tools_classify_like_capitalized() {
+        assert_eq!(classify_tool("write"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("edit"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("patch"), MemoryType::CodePattern);
+        assert_eq!(classify_tool("bash"), MemoryType::Reference);
+    }
+
+    #[test]
+    fn lowercase_write_summary_matches_capitalized() {
+        let input = serde_json::json!({"file_path": "/src/lib.rs"});
+        // OpenCode lowercase `write` yields the same "Wrote ..." summary as Claude.
+        assert_eq!(
+            summarize_post_tool_use("write", &input),
+            "Wrote /src/lib.rs"
+        );
+    }
+
+    #[tokio::test]
+    async fn opencode_lowercase_write_is_captured_end_to_end() {
+        // Feed the REAL OpenCode lowercase `write` through the capture flow and
+        // prove it is captured (recorded in dedup) rather than silently dropped.
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "write",
+            &serde_json::json!({"file_path": "/src/main.rs"}),
+            &serde_json::json!("ok"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        // Captured => the canonical summary was recorded in the dedup window.
+        assert!(
+            dedup.is_duplicate("write", "Wrote /src/main.rs"),
+            "lowercase opencode write must be captured (recorded), not dropped"
+        );
     }
 
     #[test]

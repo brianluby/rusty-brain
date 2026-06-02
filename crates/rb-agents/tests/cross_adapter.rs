@@ -18,11 +18,13 @@ fn post_tool_payload(id: AgentId) -> serde_json::Value {
             "tool_input": {"file_path": "/x"},
             "tool_response": {"ok": true}
         }),
+        // OpenCode reports lowercase tool names verbatim; the adapter preserves
+        // the CLI-native casing (capture-time normalization handles the mapping).
         AgentId::OpenCode => serde_json::json!({
             "type": "tool.execute.after",
             "directory": "/proj",
             "sessionID": "s",
-            "tool": "Write",
+            "tool": "write",
             "args": {"file_path": "/x"},
             "output": {"ok": true}
         }),
@@ -46,20 +48,24 @@ fn post_tool_payload(id: AgentId) -> serde_json::Value {
 }
 
 #[test]
-fn all_four_adapters_normalize_post_tool_use_to_same_tool_name() {
-    let ids = [
-        AgentId::ClaudeCode,
-        AgentId::OpenCode,
-        AgentId::Gemini,
-        AgentId::Codex,
+fn all_four_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
+    // Every dialect maps its post-tool event to canonical `PostToolUse`. The
+    // adapter preserves the CLI's *native* tool-name casing verbatim (Claude/
+    // Gemini/Codex capitalize `Write`; OpenCode reports lowercase `write`);
+    // case-folding to a single canonical name is the capture layer's job.
+    let cases = [
+        (AgentId::ClaudeCode, "Write"),
+        (AgentId::OpenCode, "write"),
+        (AgentId::Gemini, "Write"),
+        (AgentId::Codex, "Write"),
     ];
-    for id in ids {
+    for (id, expected) in cases {
         let cli = agent_for(id);
         let raw = post_tool_payload(id);
         let ctx = cli.parse_input(&raw);
         match ctx.event {
             HookEvent::PostToolUse { tool_name, .. } => {
-                assert_eq!(tool_name, "Write", "tool_name mismatch for {:?}", id);
+                assert_eq!(tool_name, expected, "tool_name mismatch for {id:?}");
             }
             other => panic!("expected PostToolUse for {id:?}, got {other:?}"),
         }
