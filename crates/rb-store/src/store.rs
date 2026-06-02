@@ -191,16 +191,22 @@ impl SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         let rows = stmt
-            .query_map(rusqlite::params![limit as i64], |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, f64>(3)?,
-                    row.get::<_, f64>(4)?,
-                    row.get::<_, i64>(5)?,
-                ))
-            })
+            .query_map(
+                // Saturating conversion (matches candidates_for_consolidation /
+                // memories_for_recalibration): a raw `as i64` would wrap a huge
+                // usize to a negative LIMIT, which SQLite treats as unbounded.
+                rusqlite::params![i64::try_from(limit).unwrap_or(i64::MAX)],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, f64>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut out = Vec::new();
