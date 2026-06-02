@@ -7,13 +7,6 @@
 //! closure so the `rusty-brain` binary never links it.
 #![forbid(unsafe_code)]
 
-#[cfg(test)]
-mod crate_smoke {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+mod event;
 
-    #[test]
-    fn crate_compiles_and_links() {
-        // Placeholder proving the crate is wired into the workspace and builds.
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use event::{HookContext, HookEvent, HookResult};
