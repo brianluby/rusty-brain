@@ -27,7 +27,15 @@ impl DedupCache {
     /// to the system temp dir if neither is set.
     pub fn for_namespace(namespace: &Namespace) -> Self {
         let dir = Self::cache_dir();
-        let file = format!("dedup-{}.json", Self::namespace_slug(namespace));
+        let raw = namespace.as_db_string();
+        // The sanitized slug alone is NOT injective (`my-app`, `my_app`, `my.app`
+        // all collapse to `my_app`), so distinct namespaces would cross-suppress.
+        // Append a stable FNV-1a hash of the raw db string to disambiguate.
+        let file = format!(
+            "dedup-{}-{:08x}.json",
+            Self::namespace_slug(namespace),
+            Self::fnv1a(raw.as_bytes())
+        );
         Self {
             cache_path: dir.join(file),
         }
@@ -62,23 +70,30 @@ impl DedupCache {
             .collect()
     }
 
-    /// Stable FNV-1a 64-bit hash of `tool_name` + NUL + `summary`. Stable across
-    /// processes and Rust versions (required: persisted to disk, read by a later
-    /// invocation within the TTL window).
-    fn hash_key(tool_name: &str, summary: &str) -> String {
+    /// Stable FNV-1a 64-bit hash of arbitrary bytes. Stable across processes and
+    /// Rust versions (required: persisted to disk / embedded in cache filenames,
+    /// read by a later invocation within the TTL window).
+    fn fnv1a(bytes: &[u8]) -> u64 {
         const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
         const FNV_PRIME: u64 = 0x0000_0100_0000_01b3;
         let mut hash = FNV_OFFSET;
-        for byte in tool_name
-            .as_bytes()
-            .iter()
-            .chain(b"\0")
-            .chain(summary.as_bytes())
-        {
+        for byte in bytes {
             hash ^= u64::from(*byte);
             hash = hash.wrapping_mul(FNV_PRIME);
         }
-        hash.to_string()
+        hash
+    }
+
+    /// Stable FNV-1a hash key of `tool_name` + NUL + `summary`.
+    fn hash_key(tool_name: &str, summary: &str) -> String {
+        let bytes: Vec<u8> = tool_name
+            .as_bytes()
+            .iter()
+            .copied()
+            .chain(std::iter::once(0u8))
+            .chain(summary.as_bytes().iter().copied())
+            .collect();
+        Self::fnv1a(&bytes).to_string()
     }
 
     fn now_secs() -> u64 {
@@ -217,5 +232,21 @@ mod tests {
             slug.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'),
             "slug must be fs-safe, got {slug}"
         );
+    }
+
+    #[test]
+    fn for_namespace_is_injective_across_slug_collisions() {
+        // `my-app` and `my_app` both sanitize to `my_app`; the appended hash of
+        // the raw db string must keep their cache files distinct (no cross-suppress).
+        let a = DedupCache::for_namespace(&Namespace::Project("my-app".into()));
+        let b = DedupCache::for_namespace(&Namespace::Project("my_app".into()));
+        assert_ne!(
+            a.cache_path, b.cache_path,
+            "distinct namespaces that share a slug must map to different cache files"
+        );
+        // And a third collision (`my.app`) is also distinct.
+        let c = DedupCache::for_namespace(&Namespace::Project("my.app".into()));
+        assert_ne!(a.cache_path, c.cache_path);
+        assert_ne!(b.cache_path, c.cache_path);
     }
 }
