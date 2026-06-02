@@ -631,4 +631,56 @@ mod tests {
             Err(Error::InvalidNamespace(_))
         ));
     }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_job_consolidation_merges_via_store_handle() {
+        use crate::jobs::{run_once, JobKind, JobsConfig};
+        use crate::StoreHandle;
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace};
+
+        const DIM: usize = 8;
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        // The RunJob dispatch arm operates on a StoreHandle clone (jobs are
+        // cross-namespace maintenance, not engine-bound); build one directly.
+        let store = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("a".to_string());
+
+        let mut a = MemoryNote::new(ns.clone(), "twin a".to_string(), MemoryType::Insight, 9);
+        a.id = rb_types::MemoryId::new();
+        let mut b = MemoryNote::new(ns.clone(), "twin b".to_string(), MemoryType::Insight, 3);
+        b.id = rb_types::MemoryId::new();
+        store
+            .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+        store
+            .write(b, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
+            .await
+            .unwrap();
+
+        // Defaults disable the job, but run_once runs ONE pass on demand
+        // regardless of `enabled` (enabled only gates the scheduler). Provide an
+        // explicit consolidation config so the threshold is the documented 0.95.
+        let config = JobsConfig {
+            consolidation: crate::jobs::ConsolidationConfig {
+                enabled: true,
+                interval_secs: 86_400,
+                similarity_threshold: 0.95,
+                batch_limit: 200,
+            },
+            ..Default::default()
+        };
+
+        let summary = run_once(JobKind::Consolidation, &store, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.changed, 1,
+            "the RunJob(Consolidation) path must merge the duplicate"
+        );
+
+        store.shutdown().await;
+    }
 }
