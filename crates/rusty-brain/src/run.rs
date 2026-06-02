@@ -20,11 +20,13 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
 
     match cli.command {
-        Command::Serve => {
+        Command::Serve { jobs_config } => {
+            let jobs_config_path =
+                paths::resolve_jobs_config_path(jobs_config, std::env::var("RB_JOBS_CONFIG").ok());
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            serve::run_serve(socket_path, db_path, 4, shutdown)
+            serve::run_serve(socket_path, db_path, 4, jobs_config_path, shutdown)
                 .await
                 .context("daemon failed")?;
             Ok(())
@@ -51,7 +53,7 @@ async fn run_client(
         .context("connecting to daemon")?;
 
     match command {
-        Command::Serve => anyhow::bail!("internal: serve must be handled before run_client"),
+        Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
         Command::Mcp => anyhow::bail!("internal: mcp must be handled before run_client"),
         Command::Remember {
             content,
@@ -146,6 +148,17 @@ async fn run_client(
                 println!("{{\"contract_version\":{version},\"ok\":true}}");
             } else {
                 println!("ok (contract v{version})");
+            }
+        }
+        Command::Evolve { job } => {
+            let kind = rb_types::JobKind::parse(&job)
+                .map_err(|e| anyhow::anyhow!("invalid job '{job}': {e}"))?;
+            let (scanned, changed, skipped) =
+                client.run_job(kind).await.context("evolve failed")?;
+            if json {
+                println!("{{\"scanned\":{scanned},\"changed\":{changed},\"skipped\":{skipped}}}");
+            } else {
+                println!("evolve {job}: scanned={scanned} changed={changed} skipped={skipped}");
             }
         }
     }

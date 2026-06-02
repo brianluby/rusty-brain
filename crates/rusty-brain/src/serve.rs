@@ -29,13 +29,23 @@ pub async fn run_serve(
     socket_path: PathBuf,
     db_path: PathBuf,
     read_pool_size: usize,
+    jobs_config_path: Option<PathBuf>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
+    let jobs_config = rb_daemon::JobsConfig::load(jobs_config_path.as_deref())?;
     let api_key = std::env::var("VOYAGE_API_KEY").ok();
     match select_provider_kind(api_key) {
         ProviderKind::Voyage => {
             let embedder = VoyageProvider::from_env()?;
-            run_with_embedder(socket_path, db_path, read_pool_size, embedder, shutdown).await
+            run_with_embedder(
+                socket_path,
+                db_path,
+                read_pool_size,
+                jobs_config,
+                embedder,
+                shutdown,
+            )
+            .await
         }
         ProviderKind::Deterministic => {
             tracing::warn!(
@@ -44,7 +54,15 @@ pub async fn run_serve(
                  are not portable to a real model."
             );
             let embedder = DeterministicProvider::new(DEFAULT_DIM);
-            run_with_embedder(socket_path, db_path, read_pool_size, embedder, shutdown).await
+            run_with_embedder(
+                socket_path,
+                db_path,
+                read_pool_size,
+                jobs_config,
+                embedder,
+                shutdown,
+            )
+            .await
         }
     }
 }
@@ -54,6 +72,7 @@ async fn run_with_embedder<P>(
     socket_path: PathBuf,
     db_path: PathBuf,
     read_pool_size: usize,
+    jobs_config: rb_daemon::JobsConfig,
     embedder: P,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
@@ -64,7 +83,7 @@ where
         socket_path,
         db_path,
         read_pool_size,
-        jobs_config: rb_daemon::JobsConfig::default(),
+        jobs_config,
     };
     let daemon = Daemon::bind(config, SharedEmbedder::new(embedder)).await?;
     daemon.run(shutdown).await

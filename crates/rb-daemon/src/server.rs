@@ -149,7 +149,7 @@ impl Daemon {
             jobs_config,
         } = self;
         tokio::pin!(shutdown);
-        let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config);
+        let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
 
@@ -166,6 +166,7 @@ impl Daemon {
                             let store = store.clone();
                             let embedder = embedder.clone();
                             let enricher = enricher.clone();
+                            let jobs_config = jobs_config.clone();
                             // Acquire a connection permit before spawning. If
                             // all permits are taken, drop the newly accepted
                             // stream immediately instead of queueing unbounded
@@ -181,7 +182,7 @@ impl Daemon {
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
                                 if let Err(e) =
-                                    handle_connection(stream, store, embedder, enricher).await
+                                    handle_connection(stream, store, embedder, enricher, jobs_config).await
                                 {
                                     warn!(error = %e, "connection ended with error");
                                 }
@@ -358,6 +359,7 @@ async fn handle_connection(
     store: StoreHandle,
     embedder: SharedEmbedder,
     enricher: Option<Arc<dyn Enricher>>,
+    jobs_config: JobsConfig,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -401,6 +403,7 @@ async fn handle_connection(
     write_frame(&mut framed, &ack).await?;
 
     let store_for_stream = store.clone();
+    let job_store = store.clone();
     let engine = {
         let base = MemoryEngine::new(store, embedder, namespace.clone());
         match enricher {
@@ -425,7 +428,7 @@ async fn handle_connection(
             stream_changes(&mut framed, &store_for_stream, &namespace).await;
             break;
         }
-        let resp = dispatch(&engine, req).await;
+        let resp = dispatch(&engine, &job_store, &jobs_config, req).await;
         write_frame(&mut framed, &resp).await?;
     }
 
@@ -481,7 +484,12 @@ fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namesp
     }
 }
 
-async fn dispatch<P>(engine: &MemoryEngine<StoreHandle, P>, req: Request) -> Response
+async fn dispatch<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    jobs_config: &JobsConfig,
+    req: Request,
+) -> Response
 where
     P: EmbeddingProvider,
 {
@@ -560,6 +568,14 @@ where
         Request::Subscribe => error_to_response(Error::InvalidArgument(
             "Subscribe is a streaming op, not a single request".to_string(),
         )),
+        Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config).await {
+            Ok(summary) => Response::JobRan {
+                scanned: summary.scanned,
+                changed: summary.changed,
+                skipped: summary.skipped,
+            },
+            Err(e) => error_to_response(e),
+        },
     }
 }
 

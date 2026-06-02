@@ -26,7 +26,12 @@ pub struct Cli {
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Run the memory daemon in the foreground until Ctrl-C.
-    Serve,
+    Serve {
+        /// Path to the evolution-jobs TOML config (else `RB_JOBS_CONFIG`, else
+        /// all jobs disabled).
+        #[arg(long = "jobs-config", env = "RB_JOBS_CONFIG")]
+        jobs_config: Option<String>,
+    },
 
     /// Run the MCP (Model Context Protocol) stdio server for agents.
     Mcp,
@@ -103,11 +108,18 @@ pub enum Command {
 
     /// Ping the daemon and report its contract version.
     Status,
+
+    /// Trigger one bounded evolution-job pass on the running daemon.
+    Evolve {
+        /// Which job to run: `link_decay`, `consolidation`, or
+        /// `importance_recalibration`.
+        job: String,
+    },
 }
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use clap::Parser;
 
@@ -125,5 +137,25 @@ mod tests {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
         assert!(matches!(cli.command, Command::Subscribe));
+    }
+
+    #[test]
+    fn evolve_parses_link_decay_job() {
+        let cli = Cli::parse_from(["rusty-brain", "evolve", "link_decay"]);
+        match cli.command {
+            Command::Evolve { job } => assert_eq!(job, "link_decay"),
+            other => panic!("expected Evolve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_jobs_config_flag() {
+        let cli = Cli::parse_from(["rusty-brain", "serve", "--jobs-config", "/tmp/jobs.toml"]);
+        match cli.command {
+            Command::Serve { jobs_config } => {
+                assert_eq!(jobs_config.as_deref(), Some("/tmp/jobs.toml"));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
     }
 }
