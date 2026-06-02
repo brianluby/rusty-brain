@@ -32,6 +32,20 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  build-local:
+    name: build + clippy (local feature)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build with local feature
+        run: cargo build -p rusty-brain --features local
+      - name: Clippy with local feature
+        run: cargo clippy -p rusty-brain --features local --all-targets -- -D warnings
+      - name: Test rb-embed local (offline only; real-model tests are #[ignore])
+        run: cargo test -p rb-embed --features local
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
