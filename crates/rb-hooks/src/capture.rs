@@ -263,6 +263,48 @@ pub async fn stop(client: Option<&mut DaemonClient>, cwd: &std::path::Path) -> H
     continue_only()
 }
 
+/// Decision marker substrings (lowercased match) used to detect that compaction
+/// is about to drop a recorded decision worth persisting.
+const DECISION_MARKERS: &[&str] = &[
+    "decided",
+    "decision",
+    "chosen",
+    "we will use",
+    "approach is",
+];
+
+/// True if `text` contains any decision marker (case-insensitive).
+fn has_decision_marker(text: &str) -> bool {
+    let lower = text.to_lowercase();
+    DECISION_MARKERS.iter().any(|m| lower.contains(m))
+}
+
+/// PreCompact flow: if the custom instructions reference a decision, capture it
+/// as a high-importance architecture decision. Always continues.
+pub async fn pre_compact(
+    client: Option<&mut DaemonClient>,
+    custom_instructions: Option<&str>,
+) -> HookResult {
+    let Some(text) = custom_instructions else {
+        return continue_only();
+    };
+    if !has_decision_marker(text) {
+        return continue_only();
+    }
+    if let Some(client) = client {
+        let _ = client
+            .remember(
+                format!("Pre-compaction decision snapshot: {}", text.trim()),
+                None,
+                MemoryType::ArchitectureDecision,
+                8,
+                vec!["hook".to_string(), "pre-compact".to_string()],
+            )
+            .await;
+    }
+    continue_only()
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -504,6 +546,32 @@ mod tests {
     async fn stop_without_client_continues() {
         let tmp = tempfile::tempdir().unwrap();
         let result = stop(None, tmp.path()).await;
+        assert!(result.continue_execution);
+    }
+
+    #[test]
+    fn decision_marker_detected_case_insensitively() {
+        assert!(has_decision_marker("We DECIDED to use SQLite."));
+        assert!(has_decision_marker("Decision: single writer."));
+        assert!(has_decision_marker("the chosen approach is X"));
+    }
+
+    #[test]
+    fn no_decision_marker_in_plain_text() {
+        assert!(!has_decision_marker("just some ordinary notes"));
+        assert!(!has_decision_marker(""));
+    }
+
+    #[tokio::test]
+    async fn pre_compact_without_marker_is_noop_continue() {
+        let result = pre_compact(None, Some("ordinary instructions")).await;
+        assert!(result.continue_execution);
+        assert!(result.system_message.is_none());
+    }
+
+    #[tokio::test]
+    async fn pre_compact_with_marker_continues() {
+        let result = pre_compact(None, Some("Decision: use one DB")).await;
         assert!(result.continue_execution);
     }
 }
