@@ -168,6 +168,10 @@ async fn install_capture_uninstall_round_trip() {
         .args(["--agent", "claude-code"])
         .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
         .env("RUSTY_BRAIN_DB", &daemon.db)
+        // Isolate the dedup cache to the fixture tempdir so this test never reads
+        // or writes the real ~/.cache and a prior run cannot suppress this edit as
+        // a duplicate (mirrors crates/rb-hooks/tests/integration.rs).
+        .env("XDG_CACHE_HOME", &project)
         .env_remove("VOYAGE_API_KEY")
         .current_dir(&project)
         .stdin(std::process::Stdio::piped())
