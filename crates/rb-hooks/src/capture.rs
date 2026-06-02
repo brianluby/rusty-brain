@@ -206,22 +206,30 @@ pub async fn session_start(client: Option<&mut DaemonClient>) -> HookResult {
 }
 
 /// Detect working-tree-modified files via `git diff --name-only HEAD`. Fail-open:
-/// returns an empty vec on any failure (git missing, not a repo, non-zero exit).
-/// Arguments are hardcoded literals (no shell, no user interpolation).
-fn git_modified_files(cwd: &std::path::Path) -> Vec<String> {
-    let output = std::process::Command::new("git")
-        .args(["diff", "--name-only", "HEAD"])
-        .current_dir(cwd)
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output();
-    let Ok(output) = output else {
+/// returns an empty vec on any failure (git missing, not a repo, non-zero exit,
+/// or a hung git killed by the bound). Arguments are hardcoded literals (no
+/// shell, no user interpolation).
+///
+/// Runs the blocking git call via `spawn_blocking` so it leaves the single
+/// current-thread runtime free — otherwise a slow git would block the runtime
+/// thread and the harness `OVERALL_TIMEOUT` could never fire. `run_git_bounded`
+/// additionally kills a git that hangs past its own 2s bound.
+async fn git_modified_files(cwd: &std::path::Path) -> Vec<String> {
+    let cwd = cwd.to_path_buf();
+    let bytes = tokio::task::spawn_blocking(move || {
+        rb_agents::run_git_bounded(
+            &cwd,
+            &["diff", "--name-only", "HEAD"],
+            std::time::Duration::from_secs(2),
+        )
+    })
+    .await
+    .ok()
+    .flatten();
+    let Some(bytes) = bytes else {
         return Vec::new();
     };
-    if !output.status.success() {
-        return Vec::new();
-    }
-    let Ok(text) = String::from_utf8(output.stdout) else {
+    let Ok(text) = String::from_utf8(bytes) else {
         return Vec::new();
     };
     text.lines()
@@ -247,7 +255,7 @@ fn format_stop_summary(modified: &[String]) -> String {
 /// Stop flow: record a session summary memory (including git-modified files).
 /// Always continues. With no client (degraded), continues with no store.
 pub async fn stop(client: Option<&mut DaemonClient>, cwd: &std::path::Path) -> HookResult {
-    let modified = git_modified_files(cwd);
+    let modified = git_modified_files(cwd).await;
     let summary = format_stop_summary(&modified);
     if let Some(client) = client {
         let _ = client
@@ -490,21 +498,21 @@ mod tests {
         assert!(result.system_message.is_none());
     }
 
-    #[test]
-    fn git_modified_files_empty_for_non_repo() {
+    #[tokio::test]
+    async fn git_modified_files_empty_for_non_repo() {
         let tmp = tempfile::tempdir().unwrap();
-        let files = git_modified_files(tmp.path());
+        let files = git_modified_files(tmp.path()).await;
         assert!(files.is_empty(), "non-repo must yield empty vec");
     }
 
-    #[test]
-    fn git_modified_files_empty_for_nonexistent_dir() {
-        let files = git_modified_files(std::path::Path::new("/nonexistent/path/xyz"));
+    #[tokio::test]
+    async fn git_modified_files_empty_for_nonexistent_dir() {
+        let files = git_modified_files(std::path::Path::new("/nonexistent/path/xyz")).await;
         assert!(files.is_empty());
     }
 
-    #[test]
-    fn git_modified_files_detects_change_in_repo() {
+    #[tokio::test]
+    async fn git_modified_files_detects_change_in_repo() {
         let tmp = tempfile::tempdir().unwrap();
         let run = |args: &[&str]| {
             std::process::Command::new("git")
@@ -521,7 +529,7 @@ mod tests {
         let _ = run(&["add", "."]);
         let _ = run(&["commit", "-m", "init"]);
         std::fs::write(tmp.path().join("f.txt"), "changed").unwrap();
-        let files = git_modified_files(tmp.path());
+        let files = git_modified_files(tmp.path()).await;
         assert!(
             files.contains(&"f.txt".to_string()),
             "should detect modified file, got {files:?}"
