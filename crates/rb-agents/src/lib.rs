@@ -7,6 +7,10 @@
 //! closure so the `rusty-brain` binary never links it.
 #![forbid(unsafe_code)]
 
+mod claude_code;
+mod cli;
 mod event;
 
+pub use claude_code::ClaudeCodeCli;
+pub use cli::{agent_for, AgentCli, AgentId, PassthroughCli};
 pub use event::{HookContext, HookEvent, HookResult};
