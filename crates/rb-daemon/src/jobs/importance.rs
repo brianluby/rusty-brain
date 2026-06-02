@@ -2,6 +2,10 @@
 //! last_accessed_at (recency), clamped to the validated 1..=10 range.
 
 use crate::jobs::config::ImportanceConfig;
+use crate::jobs::JobSummary;
+use crate::StoreHandle;
+use rb_engine::MemoryBackend;
+use rb_types::{MemoryUpdates, Result};
 
 /// Recompute an importance value from access frequency and recency.
 ///
@@ -16,9 +20,6 @@ use crate::jobs::config::ImportanceConfig;
 ///   signal  = access_weight*access + recency_weight*recency
 ///   if signal <= 0 => new = clamp(round(base))                  // untouched: keep author's value
 ///   else           => new = clamp(round(1 + 9*tanh(signal)))    // touched: pure access target
-// `run` (Task T4) is the production caller; until then only the unit tests
-// exercise this, so the lint is suppressed for this single task and removed in T4.
-#[allow(dead_code)]
 pub fn recalibrate(
     base: u8,
     access_count: i64,
@@ -65,6 +66,48 @@ pub fn recalibrate(
     // Always a valid importance (1..=10): the clamp is the single source of truth
     // that keeps the output inside validate_importance's range.
     value.round().clamp(1.0, 10.0) as u8
+}
+
+/// Run one bounded, idempotent recalibration pass.
+///
+/// Reads up to `cfg.batch_limit` active memories via the read pool, recomputes
+/// each importance with [`recalibrate`], and — only when the value actually
+/// changes — writes it back through the single-writer `update` path using the
+/// row's OWN namespace. Idempotent: a second pass over unchanged access data
+/// recomputes the same values and writes nothing. Fail-safe: each update is its
+/// own writer transaction; a single failed update aborts the pass with an error
+/// rather than leaving a half-applied batch.
+pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSummary> {
+    let now = chrono::Utc::now().timestamp();
+    let rows = store.memories_for_recalibration(cfg.batch_limit).await?;
+
+    let mut summary = JobSummary::default();
+    for row in rows {
+        summary.scanned += 1;
+        let new = recalibrate(
+            row.importance,
+            row.access_count,
+            row.last_accessed_at,
+            now,
+            cfg,
+        );
+        if new == row.importance {
+            summary.skipped += 1;
+            continue;
+        }
+        store
+            .update(
+                row.namespace.clone(),
+                row.id.clone(),
+                MemoryUpdates {
+                    importance: Some(new),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        summary.changed += 1;
+    }
+    Ok(summary)
 }
 
 #[cfg(test)]
@@ -208,5 +251,112 @@ mod tests {
             out, out_other_base,
             "touched target ignores base: {out} vs {out_other_base}"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_recalibrates_accessed_memories_and_is_idempotent() {
+        use crate::StoreHandle;
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, 8, 2).unwrap();
+        let ns = Namespace::Project("recal-job".to_string());
+
+        // hot: low base importance, will be accessed many times.
+        let hot = MemoryNote::new(ns.clone(), "hot memory".into(), MemoryType::Insight, 3);
+        let hot_id = hot.id.clone();
+        handle.write(hot, Some(vec![0.1f32; 8])).await.unwrap();
+
+        // cold: never accessed, importance should not change (delta 0 => skipped).
+        let cold = MemoryNote::new(ns.clone(), "cold memory".into(), MemoryType::Reference, 3);
+        let cold_id = cold.id.clone();
+        handle.write(cold, Some(vec![0.2f32; 8])).await.unwrap();
+
+        for _ in 0..50 {
+            handle.record_access(hot_id.clone()).await.unwrap();
+        }
+
+        let cfg = ImportanceConfig {
+            enabled: true,
+            interval_secs: 86_400,
+            access_weight: 1.0,
+            recency_weight: 1.0,
+            half_life_days: 30.0,
+            batch_limit: 1000,
+        };
+
+        // First pass: hot rises, cold unchanged.
+        let summary = run(&handle, &cfg).await.unwrap();
+        assert_eq!(summary.scanned, 2, "both active rows scanned");
+        assert_eq!(summary.changed, 1, "only the hot memory changed");
+        assert_eq!(summary.skipped, 1, "the cold memory was skipped");
+
+        let hot_after = handle
+            .get(ns.clone(), hot_id.clone())
+            .await
+            .unwrap()
+            .expect("hot memory present");
+        assert!(
+            hot_after.importance > 3,
+            "accessed memory's importance must rise above base 3, got {}",
+            hot_after.importance
+        );
+        assert_eq!(
+            hot_after.namespace, ns,
+            "update must preserve the row's own namespace"
+        );
+
+        let cold_after = handle
+            .get(ns.clone(), cold_id.clone())
+            .await
+            .unwrap()
+            .expect("cold memory present");
+        assert_eq!(
+            cold_after.importance, 3,
+            "never-accessed memory keeps its base importance"
+        );
+
+        // Second pass with unchanged access data: nothing changes (idempotent).
+        let again = run(&handle, &cfg).await.unwrap();
+        assert_eq!(again.scanned, 2, "second pass still scans both rows");
+        assert_eq!(
+            again.changed, 0,
+            "idempotent: re-running with unchanged access data changes nothing"
+        );
+        assert_eq!(
+            again.skipped, 2,
+            "both rows already at their recalibrated value"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_once_dispatches_importance_arm() {
+        use crate::jobs::{run_once, JobKind, JobsConfig};
+        use crate::StoreHandle;
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, 8, 2).unwrap();
+        let ns = Namespace::Global;
+
+        let m = MemoryNote::new(ns.clone(), "dispatched".into(), MemoryType::Insight, 4);
+        handle.write(m, Some(vec![0.1f32; 8])).await.unwrap();
+
+        let config = JobsConfig::default();
+        let summary = run_once(JobKind::ImportanceRecalibration, &handle, &config)
+            .await
+            .unwrap();
+        assert_eq!(
+            summary.scanned, 1,
+            "run_once must route ImportanceRecalibration through importance::run"
+        );
+
+        handle.shutdown().await;
     }
 }

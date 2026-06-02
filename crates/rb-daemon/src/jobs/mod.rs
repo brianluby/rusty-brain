@@ -34,9 +34,7 @@ pub async fn run_once(
     match kind {
         JobKind::LinkDecay => link_decay::run(store, &config.link_decay).await,
         JobKind::Consolidation => consolidation::run(store, &config.consolidation).await,
-        JobKind::ImportanceRecalibration => Err(rb_types::Error::InvalidArgument(
-            "importance recalibration job is not implemented yet".to_string(),
-        )),
+        JobKind::ImportanceRecalibration => importance::run(store, &config.importance).await,
     }
 }
 
