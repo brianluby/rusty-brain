@@ -9,10 +9,12 @@
 
 mod claude_code;
 mod cli;
+mod daemon;
 mod event;
 mod namespace;
 
 pub use claude_code::ClaudeCodeCli;
 pub use cli::{agent_for, AgentCli, AgentId, PassthroughCli};
+pub use daemon::{AutoStart, DaemonClient};
 pub use event::{HookContext, HookEvent, HookResult};
 pub use namespace::detect_namespace;
