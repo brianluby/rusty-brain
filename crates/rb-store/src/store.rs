@@ -251,6 +251,119 @@ impl SqliteStore {
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
     }
+
+    /// Find active memories in `ns` whose stored vector is near-identical to the
+    /// vector of `id` (cosine similarity `>= threshold`), excluding `id` itself.
+    ///
+    /// Namespace-isolated by construction: candidates are filtered to `ns` and
+    /// active (`archived_at IS NULL`) in Rust, exactly as `vector_search` does,
+    /// so a near-identical memory in another namespace is NEVER returned. Reads
+    /// the anchor's OWN stored embedding from `memory_vectors` and runs the same
+    /// vec0 KNN MATCH the search path uses. A missing anchor or an anchor with no
+    /// stored vector yields an empty result (not an error). Results are sorted by
+    /// similarity descending, then id string ascending for a deterministic
+    /// tie-break, and truncated to `limit`.
+    pub fn near_duplicates(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        // Load the anchor's stored embedding blob. No row => nothing to compare.
+        let blob: Option<Vec<u8>> = match self.conn.query_row(
+            "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+            rusqlite::params![id.to_string()],
+            |row| row.get::<_, Vec<u8>>(0),
+        ) {
+            Ok(b) => Some(b),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(Error::Storage(e.to_string())),
+        };
+        let Some(blob) = blob else {
+            return Ok(Vec::new());
+        };
+        let anchor_vec = decode_embedding_bytes(&blob)?;
+        // Defense-in-depth: a stored vector must match the configured dimension.
+        if anchor_vec.len() != self.embedding_dim {
+            return Err(Error::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: anchor_vec.len(),
+            });
+        }
+
+        // sqlite-vec accepts the query vector as a JSON array string (same as
+        // vector_search). vec0 cannot filter on namespace/active inside KNN, so
+        // we over-fetch a candidate pool and filter in Rust.
+        let query_json =
+            serde_json::to_string(&anchor_vec).map_err(|e| Error::Serialization(e.to_string()))?;
+
+        const VEC0_KNN_MAX: i64 = 4096;
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        // +1 because the anchor itself is the nearest (distance 0) and is then
+        // dropped by the self-exclusion filter below.
+        let k_budget = limit_i64
+            .saturating_add(1)
+            .saturating_mul(10)
+            .max(limit_i64)
+            .min(VEC0_KNN_MAX);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, distance
+                 FROM memory_vectors
+                 WHERE embedding MATCH ?1
+                 ORDER BY distance
+                 LIMIT ?2",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let rows = stmt
+            .query_map(rusqlite::params![query_json, k_budget], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let ns_str = ns.as_db_string();
+        let self_str = id.to_string();
+        let mut out: Vec<(MemoryId, f32)> = Vec::new();
+        for r in rows {
+            let (cand_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
+
+            // Exclude self.
+            if cand_str == self_str {
+                continue;
+            }
+
+            // Namespace + active filter, fail closed on any non-"no rows" error.
+            let active: bool = match self.conn.query_row(
+                "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
+                rusqlite::params![cand_str, ns_str],
+                |_| Ok(true),
+            ) {
+                Ok(found) => found,
+                Err(rusqlite::Error::QueryReturnedNoRows) => false,
+                Err(e) => return Err(Error::Storage(e.to_string())),
+            };
+            if !active {
+                continue;
+            }
+
+            let similarity = distance_to_similarity(dist as f32);
+            if similarity >= threshold {
+                out.push((parse_id(&cand_str)?, similarity));
+            }
+        }
+
+        // Deterministic order: similarity descending, then id string ascending.
+        out.sort_by(|a, b| {
+            b.1.total_cmp(&a.1)
+                .then_with(|| a.0.to_string().cmp(&b.0.to_string()))
+        });
+        out.truncate(limit);
+        Ok(out)
+    }
 }
 
 /// Caches the result of the one-time process-global sqlite-vec registration.
@@ -347,6 +460,39 @@ fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
         buf.extend_from_slice(&f.to_le_bytes());
     }
     buf
+}
+
+/// Decode a little-endian `f32` blob (the exact byte layout `embedding_bytes`
+/// writes) back into a `Vec<f32>`. Fail closed if the length is not a multiple
+/// of four bytes rather than silently truncating a corrupt vector.
+fn decode_embedding_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
+    if !bytes.len().is_multiple_of(4) {
+        return Err(Error::Storage(format!(
+            "stored embedding blob length {} is not a multiple of 4",
+            bytes.len()
+        )));
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    for chunk in bytes.chunks_exact(4) {
+        // chunks_exact(4) yields slices of exactly 4 bytes; the conversion to a
+        // [u8; 4] cannot fail, but we handle it explicitly to avoid unwrap.
+        let arr: [u8; 4] = chunk
+            .try_into()
+            .map_err(|_| Error::Storage("embedding chunk was not 4 bytes".to_string()))?;
+        out.push(f32::from_le_bytes(arr));
+    }
+    Ok(out)
+}
+
+/// Convert a vec0 cosine `distance` (range `[0, 2]`) into a similarity in
+/// `[0, 1]`, matching the exact convention used by `rb-search::rank::score_one`
+/// (`1.0 - (d / 2.0).clamp(0.0, 1.0)`). A non-finite distance yields `0.0`.
+fn distance_to_similarity(distance: f32) -> f32 {
+    if distance.is_finite() {
+        1.0 - (distance / 2.0).clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
 }
 
 fn parse_json_array(s: &str) -> Result<Vec<String>> {
@@ -2350,5 +2496,128 @@ mod checkpoint_tests {
         let got = store.get_memory(&id).unwrap();
         assert!(got.is_some(), "row survives a wal_checkpoint(TRUNCATE)");
         assert_eq!(got.unwrap().content, "checkpoint me");
+    }
+}
+
+#[cfg(test)]
+mod near_duplicates_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert_vec(
+        store: &SqliteStore,
+        ns: Namespace,
+        content: &str,
+        v: [f32; 8],
+    ) -> rb_types::MemoryId {
+        let m = MemoryNote::new(ns, content.into(), MemoryType::Insight, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, Some(&v)).unwrap();
+        id
+    }
+
+    #[test]
+    fn returns_same_namespace_twin_and_never_crosses_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj_a = Namespace::Project("a".into());
+        let proj_b = Namespace::Project("b".into());
+
+        // Anchor in A.
+        let anchor = insert_vec(
+            &store,
+            proj_a.clone(),
+            "anchor",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Near-identical twin in A (same direction => cosine distance ~0 => sim ~1).
+        let twin = insert_vec(
+            &store,
+            proj_a.clone(),
+            "twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.5).
+        let _different = insert_vec(
+            &store,
+            proj_a.clone(),
+            "different",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Near-identical to anchor BUT in namespace B: must NEVER be returned.
+        let foreign = insert_vec(
+            &store,
+            proj_b.clone(),
+            "foreign twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let dups = store.near_duplicates(&proj_a, &anchor, 0.95, 10).unwrap();
+        let ids: Vec<rb_types::MemoryId> = dups.iter().map(|(id, _)| id.clone()).collect();
+
+        assert!(ids.contains(&twin), "the same-namespace twin must be found");
+        assert!(
+            !ids.contains(&anchor),
+            "the anchor itself must be excluded (self)"
+        );
+        assert!(
+            !ids.contains(&foreign),
+            "a near-identical memory in another namespace must NEVER be returned"
+        );
+        // The orthogonal vector has similarity ~0.5, well below the 0.95 threshold.
+        assert_eq!(ids, vec![twin], "only the above-threshold twin is returned");
+        // Reported similarity for an identical vector is at/near 1.0.
+        assert!(
+            dups[0].1 >= 0.95,
+            "twin similarity must meet the threshold, got {}",
+            dups[0].1
+        );
+    }
+
+    #[test]
+    fn missing_anchor_or_no_vector_returns_empty() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("a".into());
+        // Anchor id that does not exist at all.
+        let ghost = rb_types::MemoryId::new();
+        assert!(store
+            .near_duplicates(&ns, &ghost, 0.95, 10)
+            .unwrap()
+            .is_empty());
+
+        // A memory that exists but was inserted WITHOUT an embedding has no vector
+        // row, so there is nothing to KNN against: empty, not an error.
+        let no_vec = MemoryNote::new(ns.clone(), "no vector".into(), MemoryType::Insight, 5);
+        let no_vec_id = no_vec.id.clone();
+        store.insert_memory(&no_vec, None).unwrap();
+        assert!(store
+            .near_duplicates(&ns, &no_vec_id, 0.95, 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn excludes_archived_candidates() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("a".into());
+        let anchor = insert_vec(
+            &store,
+            ns.clone(),
+            "anchor",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let twin = insert_vec(
+            &store,
+            ns.clone(),
+            "twin",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Archive the twin: it must drop out of the candidate set.
+        store.archive_memory(&twin).unwrap();
+        let dups = store.near_duplicates(&ns, &anchor, 0.95, 10).unwrap();
+        assert!(
+            dups.is_empty(),
+            "an archived candidate must not be returned, got {dups:?}"
+        );
     }
 }
