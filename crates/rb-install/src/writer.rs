@@ -141,8 +141,8 @@ pub fn write(path: &Path, body: &str, backup: bool) -> Result<()> {
     }
 
     let parent = path.parent().unwrap_or_else(|| Path::new("."));
-    let temp = tempfile_in(parent)?;
-    fs::write(&temp, body).map_err(|e| Error::Io(e.to_string()))?;
+    let (temp, file) = create_tempfile_in(parent)?;
+    write_and_sync(&file, body)?;
 
     #[cfg(unix)]
     {
@@ -151,10 +151,8 @@ pub fn write(path: &Path, body: &str, backup: bool) -> Result<()> {
         fs::set_permissions(&temp, perms).map_err(|e| Error::Io(e.to_string()))?;
     }
 
-    {
-        let f = fs::File::open(&temp).map_err(|e| Error::Io(e.to_string()))?;
-        f.sync_all().map_err(|e| Error::Io(e.to_string()))?;
-    }
+    // Drop the handle before the rename so the file is fully closed first.
+    drop(file);
 
     fs::rename(&temp, path).map_err(|e| Error::Io(e.to_string()))?;
 
@@ -175,20 +173,55 @@ pub fn backup_path(path: &Path) -> std::path::PathBuf {
     }
 }
 
-/// Create a unique temp file path inside `dir` (no external tempfile dep here —
-/// the dev-dep `tempfile` is for tests; impl uses pid+nanos for uniqueness).
-fn tempfile_in(dir: &Path) -> Result<std::path::PathBuf> {
-    let nanos = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
+/// Atomically create a fresh temp file inside `dir` and return its path + handle.
+///
+/// Uses `create_new` (`O_EXCL`): the open fails if the path already exists, so
+/// there is no TOCTOU/symlink race between an `exists()` check and the create.
+/// On the rare name collision we retry with a fresh `pid.nanos.counter` name a
+/// bounded number of times, then fail (the installer is fail-CLOSED — surfacing
+/// an IO error here is correct; only the hook path is fail-open).
+///
+/// # Errors
+/// Returns [`Error::Io`] if no unique temp file can be created within the bounded
+/// retries, or on any other create failure.
+fn create_tempfile_in(dir: &Path) -> Result<(std::path::PathBuf, fs::File)> {
+    use std::io::ErrorKind;
+
+    const MAX_ATTEMPTS: u32 = 16;
     let pid = std::process::id();
-    let name = format!(".rusty-brain-install.{pid}.{nanos}.tmp");
-    let candidate = dir.join(name);
-    if candidate.exists() {
-        return Err(Error::Io("temp file already exists".to_string()));
+    for attempt in 0..MAX_ATTEMPTS {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let name = format!(".rusty-brain-install.{pid}.{nanos}.{attempt}.tmp");
+        let candidate = dir.join(name);
+        match fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&candidate)
+        {
+            Ok(file) => return Ok((candidate, file)),
+            // Collision (or a pre-existing symlink at the path): try a fresh name.
+            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
+            Err(e) => return Err(Error::Io(e.to_string())),
+        }
     }
-    Ok(candidate)
+    Err(Error::Io(
+        "could not create a unique temp file after bounded retries".to_string(),
+    ))
+}
+
+/// Write `body` to an already-open temp file handle and fsync it durably.
+///
+/// # Errors
+/// Returns [`Error::Io`] on any write or fsync failure.
+fn write_and_sync(mut file: &fs::File, body: &str) -> Result<()> {
+    use std::io::Write as _;
+    file.write_all(body.as_bytes())
+        .map_err(|e| Error::Io(e.to_string()))?;
+    file.sync_all().map_err(|e| Error::Io(e.to_string()))?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -333,6 +366,48 @@ mod tests {
             serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
         assert_eq!(on_disk, merged);
         assert!(on_disk.get("hooks").is_some());
+    }
+
+    #[test]
+    fn create_tempfile_in_makes_a_fresh_exclusive_file() {
+        // The temp file is created with create_new (O_EXCL): the path must not
+        // pre-exist, and a second create at the SAME path must fail with
+        // AlreadyExists — proving the exclusive create, not a TOCTOU exists()+open.
+        let dir = tempfile::tempdir().unwrap();
+        let (path, _file) = create_tempfile_in(dir.path()).unwrap();
+        assert!(path.exists(), "temp file must have been created");
+        let second = fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path);
+        assert!(
+            matches!(second, Err(ref e) if e.kind() == std::io::ErrorKind::AlreadyExists),
+            "a second exclusive create at the same path must fail AlreadyExists"
+        );
+    }
+
+    #[test]
+    fn repeated_writes_succeed_and_preserve_latest_content() {
+        // Rapid successive writes exercise unique temp creation; each must land
+        // atomically with the latest content (no temp-name collision failure).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        for i in 0..25 {
+            let body = format!(r#"{{"n":{i}}}"#);
+            write(&path, &body, false).unwrap();
+            let on_disk = std::fs::read_to_string(&path).unwrap();
+            assert_eq!(on_disk, body, "write {i} must produce the latest content");
+        }
+        // No stray temp files left behind in the directory.
+        let leftover = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".rusty-brain-install.")
+            });
+        assert!(!leftover, "no temp files should remain after writes");
     }
 
     #[test]
