@@ -164,7 +164,14 @@ impl Corpus {
                     )));
                 }
             }
+            let mut expected_seen: HashSet<&str> = HashSet::new();
             for key in &q.expected {
+                if !expected_seen.insert(key.as_str()) {
+                    return Err(CorpusError::Invalid(format!(
+                        "golden query '{}' has duplicate expected key '{key}'",
+                        q.query
+                    )));
+                }
                 if !keys.contains(key.as_str()) {
                     return Err(CorpusError::Invalid(format!(
                         "golden query '{}' references unknown key '{key}'",
@@ -180,7 +187,13 @@ impl Corpus {
                     "dedup cluster {ci} needs >= 2 members"
                 )));
             }
+            let mut member_seen: HashSet<&str> = HashSet::new();
             for key in &cluster.members {
+                if !member_seen.insert(key.as_str()) {
+                    return Err(CorpusError::Invalid(format!(
+                        "dedup cluster {ci} has duplicate member '{key}'"
+                    )));
+                }
                 if !keys.contains(key.as_str()) {
                     return Err(CorpusError::Invalid(format!(
                         "dedup cluster {ci} references unknown key '{key}'"
@@ -287,6 +300,23 @@ mod tests {
             "\"members\": [\"a\", \"b\"]",
             "\"members\": [\"a\", \"zzz\"]",
         );
+        let err = Corpus::from_json(&bad).unwrap_err();
+        assert!(matches!(err, CorpusError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_duplicate_expected_key_in_golden_query() {
+        // A duplicate within one query's expected list would double-count in
+        // recall@k / mrr, so it is rejected even though the key is known.
+        let bad = MINIMAL.replace("\"expected\": [\"a\"]", "\"expected\": [\"a\", \"a\"]");
+        let err = Corpus::from_json(&bad).unwrap_err();
+        assert!(matches!(err, CorpusError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_duplicate_member_in_dedup_cluster() {
+        // A duplicate cluster member would skew dedup_precision; reject it.
+        let bad = MINIMAL.replace("\"members\": [\"a\", \"b\"]", "\"members\": [\"a\", \"a\"]");
         let err = Corpus::from_json(&bad).unwrap_err();
         assert!(matches!(err, CorpusError::Invalid(_)));
     }
