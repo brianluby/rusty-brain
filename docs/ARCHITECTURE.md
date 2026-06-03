@@ -20,7 +20,7 @@ left as guidelines.
 
 | Principle | How it shows up |
 |---|---|
-| Focused crates, never a monolith | A 13-crate workspace with a compiler-enforced dependency DAG; heavy/optional pieces (ONNX) behind a feature flag; supply-chain policy checked in CI. |
+| Focused crates, never a monolith | A workspace of 13 focused crates plus a dev-only harness (14 members), with a compiler-enforced dependency DAG; heavy/optional pieces (ONNX) behind a feature flag; supply-chain policy checked in CI. |
 | One database, one transaction, one truth | Memories, FTS, and vectors in a single SQLite file; all writes serialize through one thread; reads run concurrently over WAL. |
 | Fail-closed boundaries | Namespace isolation and the embedding-dimension contract refuse to run on doubt. |
 | Fail-open capture | Best-effort capture hooks degrade silently and never block an agent session. |

@@ -2,7 +2,7 @@
 
 > Local-first, persistent memory for AI coding agents — a Rust daemon with hybrid
 > (vector + keyword + graph) retrieval over SQLite, exposed via MCP and a CLI.
-
+>
 > **Status: early development.** The pieces described below are implemented and
 > covered by unit and integration tests, but the project has only had **basic
 > correctness testing**. It has **not** been performance-, scale-, or
@@ -257,8 +257,9 @@ cargo deny check                                              # supply-chain / l
 
 Conventions:
 
-- Workspace lints **deny** `unwrap`, `expect`, and `panic` outside tests; `unsafe` is
-  warned. Shipped request paths return errors, they don't panic.
+- Workspace lints **deny** `unwrap`, `expect`, and `panic` by default, with a few
+  narrow, explicit per-module exceptions (e.g. panic-recovery and test-support seams);
+  `unsafe` is warned. Shipped request paths return errors, they don't panic.
 - Migrations are append-only and checksummed; a CI gate rebuilds a fresh database from
   committed SQL and exercises every query path.
 - Commits follow Conventional Commits.
