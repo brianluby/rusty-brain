@@ -1354,7 +1354,26 @@ mod tests {
             .await
             .unwrap();
 
-        let evt = rx.recv().await.unwrap();
+        // A write's MemoryChanged event can be published just after its write reply
+        // returns, so a late Created event for `old`/`new` may still land on this
+        // freshly-subscribed receiver ahead of the supersede event. Drain until the
+        // Archived event for the absorbed (old) memory rather than assuming it is
+        // strictly first (de-flakes the subscribe/write-event race seen under CI
+        // scheduling; the supersede call above guarantees the event is sent).
+        let mut archived = None;
+        for _ in 0..6 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(evt))
+                    if evt.kind == crate::change::ChangeKind::Archived && evt.id == old_id =>
+                {
+                    archived = Some(evt);
+                    break;
+                }
+                Ok(Ok(_)) => continue, // a stray Created event from the prior writes
+                _ => break,
+            }
+        }
+        let evt = archived.expect("supersede must publish an Archived event for the old memory");
         assert_eq!(evt.id, old_id, "Archived event must target the old memory");
         assert_eq!(evt.namespace, ns);
         assert_eq!(
