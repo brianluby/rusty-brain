@@ -150,6 +150,61 @@ impl MemoryBackend for VecBackend {
             .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
             .collect())
     }
+
+    async fn active_contradicts(
+        &self,
+        _ns: Namespace,
+        _ids: Vec<MemoryId>,
+    ) -> rb_types::Result<std::collections::HashSet<MemoryId>> {
+        Ok(std::collections::HashSet::new())
+    }
+
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.archived_at.is_none())
+            .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
+            .cloned()
+            .collect();
+        // Mirror the store's scan order: oldest first, then memory_id ascending —
+        // bounded + deterministic (created_at ASC, memory_id ASC), as the contract
+        // requires, so a `limit` here selects the same batch as production.
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        _embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> rb_types::Result<()> {
+        // Fail closed on a missing id, like SqliteStore::update_vector, so the
+        // public-API backend matches the store-backed behavior.
+        let mut guard = self.notes.lock().unwrap();
+        match guard.get_mut(&id) {
+            Some(note) => {
+                note.embedding_model = model;
+                note.embedding_input_version = input_version;
+                Ok(())
+            }
+            None => Err(rb_types::Error::NotFound(id)),
+        }
+    }
 }
 
 #[tokio::test]

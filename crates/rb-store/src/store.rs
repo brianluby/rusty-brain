@@ -61,6 +61,43 @@ pub trait Store {
     /// order as `ids` (missing/out-of-namespace ids skipped). One query; fixes
     /// the recall N+1. Links are loaded per returned note.
     fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>>;
+    /// For each id in `ids`, return whether it has at least one ACTIVE
+    /// `contradicts` link — inbound OR outbound — where BOTH endpoints are active
+    /// (`archived_at IS NULL`) AND live in namespace `ns`. One batched query over
+    /// `memory_links` (Feature C, spec §9). Requiring the LOCAL endpoint active too
+    /// means an archived memory fetched via `get` is never flagged `contested`.
+    /// Scoping both endpoints to `ns` preserves namespace isolation: `memory_links` carries
+    /// no namespace and `add_link` permits cross-namespace edges, so without this an
+    /// out-of-namespace memory could flag a result `contested`. The returned set
+    /// contains exactly the ids that are contested; ids absent from the set are not
+    /// contested. Read path; used post-ranking to annotate `MemoryNote.contested`.
+    fn active_contradicts(
+        &self,
+        ns: &Namespace,
+        ids: &[MemoryId],
+    ) -> Result<std::collections::HashSet<MemoryId>>;
+    /// Read up to `limit` ACTIVE memories (across ALL namespaces) whose stamped
+    /// `(embedding_model, embedding_input_version)` differs from the current
+    /// `(model, input_version)` — the re-embed candidates. Bounded, deterministic
+    /// order. Read-only (every mutation goes through the single writer).
+    fn memories_for_reembed(
+        &self,
+        model: &str,
+        input_version: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>>;
+    /// Replace `id`'s stored vector and stamp the row's
+    /// `(embedding_model, embedding_input_version)` to the current pair, in one
+    /// transaction. This is the ONLY vector-UPDATE path (insert is write-once).
+    /// A missing memory id is `Error::NotFound`. The embedding dimension is
+    /// validated fail-closed before the write.
+    fn update_vector(
+        &self,
+        id: &MemoryId,
+        embedding: &[f32],
+        model: &str,
+        input_version: &str,
+    ) -> Result<()>;
 }
 
 /// SQLite-backed store. Owns a single connection (write path); the daemon owns
@@ -248,6 +285,43 @@ impl SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
+    /// fail-closed (matching the insert path). A missing id is a no-op (0 rows).
+    /// Used by maintenance/test paths; the engine never mutates confidence on the
+    /// shipped recall/remember flow.
+    pub fn set_confidence(&self, id: &MemoryId, confidence: f32) -> Result<()> {
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(Error::InvalidArgument(format!(
+                "confidence {confidence} out of range 0.0..=1.0"
+            )));
+        }
+        self.conn
+            .execute(
+                "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
+                rusqlite::params![confidence as f64, id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(())
+    }
+
+    /// Read a value from the key/value `meta` table (e.g. the
+    /// `embedding_input_version` seed written by migration 003), or `None` if the
+    /// key is absent. A small read helper for invariant checks and the migration
+    /// reproducibility gate.
+    pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Storage(other.to_string())),
+            })
     }
 
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -741,7 +815,12 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
             .map(|s| parse_id(&s))
             .transpose()?,
         embedding_model: g("embedding_model")?,
+        embedding_input_version: g("embedding_input_version")?,
         links,
+        // `contested` (Feature C) is a read-side annotation computed by the engine
+        // from `memory_links` after ranking; it is never stored, so loads default
+        // it to false.
+        contested: false,
     })
 }
 
@@ -784,10 +863,10 @@ impl Store for SqliteStore {
                         memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model
+                        superseded_by, embedding_model, embedding_input_version
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19
                      )",
                     rusqlite::params![
                         note.id.to_string(),
@@ -808,6 +887,7 @@ impl Store for SqliteStore {
                         opt_ts(note.archived_at),
                         note.superseded_by.as_ref().map(|id| id.to_string()),
                         note.embedding_model,
+                        note.embedding_input_version,
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -864,7 +944,7 @@ impl Store for SqliteStore {
                 "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model
+                        superseded_by, embedding_model, embedding_input_version
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1059,7 +1139,7 @@ impl Store for SqliteStore {
                 "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model
+                        superseded_by, embedding_model, embedding_input_version
                  FROM memories
                  WHERE namespace = ?1
                    AND archived_at IS NULL
@@ -1113,6 +1193,20 @@ impl Store for SqliteStore {
         if let Some(context) = &updates.context {
             sets.push(format!("context = ?{}", params.len() + 1));
             params.push(Box::new(context.clone()));
+        }
+
+        // If a field that feeds `embedding_input` (content / tags / context — the
+        // composite document text) changed, stale this row's embedding stamp so the
+        // next `reembed` recomputes its vector. Without this, a tags/context edit
+        // would leave the stored vector permanently stale: the version-only reembed
+        // scan only revisits rows whose `(model, input_version)` differs from
+        // current, and an in-place field edit keeps the current stamp. Empty string
+        // is the documented "stale, re-embed me" sentinel. (Content edits are
+        // rejected upstream in the engine, but stamping it here keeps the storage
+        // invariant self-contained.)
+        if updates.content.is_some() || updates.tags.is_some() || updates.context.is_some() {
+            sets.push(format!("embedding_input_version = ?{}", params.len() + 1));
+            params.push(Box::new(String::new()));
         }
 
         // An all-None update is a true no-op: do not bump updated_at or issue an
@@ -1277,7 +1371,7 @@ impl Store for SqliteStore {
             "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                     keywords, tags, context, memory_type, importance, confidence,
                     related_files, access_count, last_accessed_at, archived_at,
-                    superseded_by, embedding_model
+                    superseded_by, embedding_model, embedding_input_version
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -1315,6 +1409,192 @@ impl Store for SqliteStore {
             }
         }
         Ok(out)
+    }
+
+    fn active_contradicts(
+        &self,
+        ns: &Namespace,
+        ids: &[MemoryId],
+    ) -> Result<std::collections::HashSet<MemoryId>> {
+        use std::collections::HashSet;
+        if ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        // One batched query: a contradicts link where BOTH the local endpoint
+        // (the flagged id) and the far endpoint live in `ns`, and the far endpoint
+        // is active. Scoping BOTH endpoints to `ns` keeps the result namespace-pure
+        // regardless of caller: `memory_links` carries no namespace and `add_link`
+        // permits cross-namespace edges, so a contradiction with a memory in another
+        // namespace must neither flag an in-namespace id (`far` scope) nor leak an
+        // out-of-namespace id into the result (`loc` scope). Only ACTIVE,
+        // in-namespace contradictions count (spec §9). The SELECT returns the local
+        // endpoint id for every matching row; we collect the distinct set.
+        //
+        // Both UNION halves share the same ?1..?N (ids) and ?{N+1} (namespace)
+        // positional slots — SQLite parameters are shared across UNION, so binding
+        // N+1 values covers both halves. Do NOT double the params.
+        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
+        let in_list = placeholders.join(", ");
+        let ns_param = format!("?{}", ids.len() + 1);
+        let sql = format!(
+            "SELECT l.source_id AS local FROM memory_links l
+               JOIN memories far ON far.memory_id = l.target_id
+               JOIN memories loc ON loc.memory_id = l.source_id
+             WHERE l.link_type = 'contradicts'
+               AND far.archived_at IS NULL
+               AND loc.archived_at IS NULL
+               AND far.namespace = {ns_param}
+               AND loc.namespace = {ns_param}
+               AND l.source_id IN ({in_list})
+             UNION
+             SELECT l.target_id AS local FROM memory_links l
+               JOIN memories far ON far.memory_id = l.source_id
+               JOIN memories loc ON loc.memory_id = l.target_id
+             WHERE l.link_type = 'contradicts'
+               AND far.archived_at IS NULL
+               AND loc.archived_at IS NULL
+               AND far.namespace = {ns_param}
+               AND loc.namespace = {ns_param}
+               AND l.target_id IN ({in_list})"
+        );
+
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+        for id in ids {
+            params.push(Box::new(id.to_string()));
+        }
+        params.push(Box::new(ns.as_db_string()));
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query(refs.as_slice())
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut contested: HashSet<MemoryId> = HashSet::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let s = row
+                .get::<_, String>(0)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            contested.insert(parse_id(&s)?);
+        }
+        Ok(contested)
+    }
+
+    fn memories_for_reembed(
+        &self,
+        model: &str,
+        input_version: &str,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>> {
+        // Bounded, deterministic scan (oldest first then by id, mirroring the
+        // consolidation candidate order) of active rows whose stamp is stale.
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                        keywords, tags, context, memory_type, importance, confidence,
+                        related_files, access_count, last_accessed_at, archived_at,
+                        superseded_by, embedding_model, embedding_input_version
+                 FROM memories
+                 WHERE archived_at IS NULL
+                   AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
+                 ORDER BY created_at ASC, memory_id ASC
+                 LIMIT ?3",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut rows = stmt
+            .query(rusqlite::params![
+                model,
+                input_version,
+                i64::try_from(limit).unwrap_or(i64::MAX)
+            ])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            out.push(row_to_note(&self.conn, row)?);
+        }
+        Ok(out)
+    }
+
+    fn update_vector(
+        &self,
+        id: &MemoryId,
+        embedding: &[f32],
+        model: &str,
+        input_version: &str,
+    ) -> Result<()> {
+        // Fail-closed dimension check before any write, identical to the search
+        // path: a wrong-length vector must never land in the vec0 table.
+        if embedding.len() != self.embedding_dim {
+            return Err(Error::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: embedding.len(),
+            });
+        }
+
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let result = (|| -> Result<()> {
+            // Stamp the memory row. 0 rows updated means the id does not exist:
+            // fail closed (NotFound) so the whole transaction rolls back rather
+            // than leaving a vector update with no owning row.
+            // `updated_at` is intentionally NOT bumped: re-embed is a maintenance-only
+            // path that refreshes the search vector, leaving the note's user-visible
+            // content unchanged. The daemon writer emits no MemoryChanged event for the
+            // same reason; bumping updated_at here would make every re-embedded note
+            // look freshly modified to list/context and any updated_at-based sync.
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories
+                     SET embedding_model = ?1, embedding_input_version = ?2
+                     WHERE memory_id = ?3",
+                    rusqlite::params![model, input_version, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected == 0 {
+                return Err(Error::NotFound(id.clone()));
+            }
+
+            // Replace the stored vector. vec0 supports UPDATE on the PK; a row
+            // that had no vector yet (written without an embedding) is handled by
+            // falling back to INSERT when the UPDATE touches nothing.
+            let bytes = embedding_bytes(embedding);
+            let updated = self
+                .conn
+                .execute(
+                    "UPDATE memory_vectors SET embedding = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![bytes, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if updated == 0 {
+                self.conn
+                    .execute(
+                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                        rusqlite::params![id.to_string(), embedding_bytes(embedding)],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 }
 
@@ -2204,6 +2484,110 @@ mod update_tests {
     }
 
     #[test]
+    fn editing_embedded_field_stales_embedding_stamp_for_reembed() {
+        // Editing a field that feeds embedding_input (tags here) must stale the
+        // row's embedding_input_version so the next reembed scan recomputes its
+        // vector — otherwise the stored vector stays permanently stale.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.embedding_model = "model-x".into();
+        m.embedding_input_version = "v2-composite".into();
+        store.insert_memory(&m, None).unwrap();
+
+        // Up to date: not a reembed candidate.
+        assert!(store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap()
+            .is_empty());
+
+        // Edit tags (an embedded field) -> stamp staled to the empty sentinel.
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    tags: Some(vec!["new".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(
+            got.embedding_input_version, "",
+            "embedded-field edit stales the stamp"
+        );
+
+        // Now a reembed candidate.
+        let stale = store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, m.id);
+    }
+
+    #[test]
+    fn editing_non_embedded_field_does_not_stale_stamp() {
+        // Editing importance/summary (NOT part of embedding_input) must leave the
+        // stamp intact so it never triggers a needless reembed.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.embedding_model = "model-x".into();
+        m.embedding_input_version = "v2-composite".into();
+        store.insert_memory(&m, None).unwrap();
+
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    summary: Some("s".into()),
+                    importance: Some(7),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(
+            got.embedding_input_version, "v2-composite",
+            "non-embedded edit keeps the stamp"
+        );
+        assert!(store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn set_confidence_updates_validates_range_and_noops_on_missing() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.confidence = 1.0;
+        store.insert_memory(&m, None).unwrap();
+
+        // A valid value lands on the row.
+        store.set_confidence(&m.id, 0.75).unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((got.confidence - 0.75).abs() < 1e-6);
+
+        // Out-of-range and non-finite values fail closed with InvalidArgument,
+        // and leave the stored value untouched.
+        for bad in [-0.1f32, 1.1, f32::NAN] {
+            assert!(matches!(
+                store.set_confidence(&m.id, bad),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        let unchanged = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((unchanged.confidence - 0.75).abs() < 1e-6);
+
+        // A missing id is a no-op Ok (0 rows) that touches no existing row.
+        store.set_confidence(&MemoryId::new(), 0.2).unwrap();
+        let still = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((still.confidence - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
     fn rejects_out_of_range_importance() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let m = MemoryNote::new(Namespace::Global, "x".into(), MemoryType::Reference, 5);
@@ -2820,5 +3204,149 @@ mod near_duplicates_tests {
         }
         let rows = store.memories_for_recalibration(3).unwrap();
         assert_eq!(rows.len(), 3, "limit must bound the row count");
+    }
+}
+
+#[cfg(test)]
+mod contradiction_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let m = MemoryNote::new(Namespace::Global, c.into(), MemoryType::Insight, 5);
+        store.insert_memory(&m, None).unwrap();
+        m
+    }
+
+    fn contradicts(store: &SqliteStore, src: &MemoryNote, tgt: &MemoryNote) {
+        store
+            .add_link(&MemoryLink {
+                source_id: src.id.clone(),
+                target_id: tgt.id.clone(),
+                link_type: LinkType::Contradicts,
+                strength: 1.0,
+                reason: "conflicting claims".into(),
+                created_at: src.created_at,
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn empty_input_returns_empty_set() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        assert!(store
+            .active_contradicts(&Namespace::Global, &[])
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn flags_both_endpoints_of_an_active_contradicts_link() {
+        // A contradicts B (directed). BOTH endpoints must be flagged: outbound for
+        // the source, inbound for the target.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a says x");
+        let b = node(&store, "b says not-x");
+        contradicts(&store, &a, &b);
+
+        let flagged = store
+            .active_contradicts(&Namespace::Global, &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        assert!(flagged.contains(&a.id), "source flagged (outbound)");
+        assert!(flagged.contains(&b.id), "target flagged (inbound)");
+    }
+
+    #[test]
+    fn uncontested_memory_is_not_flagged() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        // A references B — NOT a contradiction.
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: LinkType::References,
+                strength: 1.0,
+                reason: String::new(),
+                created_at: a.created_at,
+            })
+            .unwrap();
+        let flagged = store
+            .active_contradicts(&Namespace::Global, &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        assert!(flagged.is_empty(), "references is not a contradiction");
+    }
+
+    #[test]
+    fn contradiction_with_archived_endpoint_is_not_active() {
+        // A contradicts B, then B is archived. The contradiction is no longer
+        // "active" — A must NOT be flagged (the contradicting memory is gone).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a survives");
+        let b = node(&store, "b archived");
+        contradicts(&store, &a, &b);
+        store.archive_memory(&b.id).unwrap();
+
+        let flagged = store
+            .active_contradicts(&Namespace::Global, &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        assert!(
+            !flagged.contains(&a.id),
+            "contradiction with an archived memory is inactive"
+        );
+    }
+
+    #[test]
+    fn archived_local_endpoint_is_not_flagged() {
+        // get() can return an archived memory; even with a live contradicts edge to
+        // an ACTIVE partner, an archived LOCAL row must not be flagged contested
+        // (Feature C: "ACTIVE contradicts" requires BOTH endpoints active).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a active");
+        let b = node(&store, "b will be archived");
+        contradicts(&store, &a, &b);
+        store.archive_memory(&b.id).unwrap();
+        let flagged = store
+            .active_contradicts(&Namespace::Global, std::slice::from_ref(&b.id))
+            .unwrap();
+        assert!(
+            !flagged.contains(&b.id),
+            "an archived local endpoint must not be flagged contested"
+        );
+    }
+
+    #[test]
+    fn cross_namespace_contradiction_does_not_flag() {
+        // `memory_links` carries no namespace and add_link permits cross-namespace
+        // edges. A contradicts B where A is Global and B lives in another namespace:
+        // querying Global must NOT flag A, or B's existence leaks across the
+        // isolation boundary (the bug this scoping fixes).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "global claim"); // Namespace::Global
+        let other = Namespace::Project("secret".into());
+        let b = MemoryNote::new(other.clone(), "hidden claim".into(), MemoryType::Insight, 5);
+        store.insert_memory(&b, None).unwrap();
+        contradicts(&store, &a, &b);
+
+        // Queried in Global: A is not flagged — its only contradiction is in another ns.
+        let in_global = store
+            .active_contradicts(&Namespace::Global, &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        assert!(
+            in_global.is_empty(),
+            "a cross-namespace contradiction must not flag any Global id"
+        );
+
+        // Queried in the OTHER namespace: B sees A as the far endpoint, but A is
+        // Global, so B is still not flagged — both directions stay isolated.
+        let in_other = store
+            .active_contradicts(&other, &[a.id.clone(), b.id.clone()])
+            .unwrap();
+        assert!(
+            in_other.is_empty(),
+            "neither endpoint is flagged from either namespace's view"
+        );
     }
 }

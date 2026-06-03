@@ -1,0 +1,188 @@
+{
+  "_comment": "Hand-authored coding-memory corpus for rb-eval. Keys are stable handles (not UUIDs); the runner maps each to the engine-minted MemoryId after ingestion. Authored to exercise FTS (exact term), vector (deterministic-similarity), and graph (1-hop link expansion) paths. See README.md for the honest framing of what these metrics do and do not measure.",
+
+  "memories": [
+    {
+      "key": "single_writer",
+      "content": "rusty-brain uses a single writer thread that owns the only writable sqlite connection; all mutations are serialized through a WriteCommand channel.",
+      "summary": "single writer thread owns the sqlite write connection",
+      "keywords": ["single", "writer", "sqlite", "writecommand"],
+      "tags": ["concurrency", "store"],
+      "context": "architecture decision for the daemon store layer",
+      "memory_type": "ArchitectureDecision",
+      "importance": 9
+    },
+    {
+      "key": "read_pool",
+      "content": "Readers use a bounded read pool of sqlite connections with WAL mode, so concurrent readers never block the single writer.",
+      "summary": "bounded read pool over WAL for concurrent readers",
+      "keywords": ["read", "pool", "wal", "readers"],
+      "tags": ["concurrency", "store"],
+      "context": "daemon read path",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "wal_checkpoint",
+      "content": "On shutdown the daemon runs a WAL checkpoint truncate so the database file is fully consolidated and the journal is reset.",
+      "summary": "checkpoint truncate on shutdown consolidates the WAL",
+      "keywords": ["wal", "checkpoint", "truncate", "shutdown"],
+      "tags": ["store", "lifecycle"],
+      "context": "graceful shutdown",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "namespace_isolation",
+      "content": "Every store operation is namespace scoped; the engine is bound to one namespace from the client handshake and cross-namespace reads are silently excluded.",
+      "summary": "namespace isolation enforced at every store operation",
+      "keywords": ["namespace", "isolation", "scope", "handshake"],
+      "tags": ["security", "store"],
+      "context": "multi-tenant scoping invariant",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "deterministic_embed",
+      "content": "The DeterministicProvider hashes text with sha256 per dimension and normalizes to a unit vector, giving reproducible embeddings with no network.",
+      "summary": "deterministic sha256-based unit-vector embeddings",
+      "keywords": ["deterministic", "embedding", "sha256", "vector"],
+      "tags": ["embedding", "testing"],
+      "context": "offline embedding provider",
+      "memory_type": "CodePattern",
+      "importance": 7
+    },
+    {
+      "key": "voyage_embed",
+      "content": "The VoyageProvider calls a remote embeddings API over https, batching inputs and re-pairing responses by index to preserve input order.",
+      "summary": "voyage remote embedding provider with index re-pairing",
+      "keywords": ["voyage", "embedding", "https", "remote"],
+      "tags": ["embedding", "network"],
+      "context": "production embedding backend",
+      "memory_type": "Reference",
+      "importance": 6
+    },
+    {
+      "key": "linear_ranking",
+      "content": "Default recall ranks candidates with a weighted linear sum of normalized vector similarity, reciprocal keyword rank, reciprocal graph hops, importance, and recency.",
+      "summary": "linear weighted-sum hybrid ranking is the default",
+      "keywords": ["ranking", "linear", "weights", "hybrid"],
+      "tags": ["search", "ranking"],
+      "context": "rb-search default fusion",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "recency_decay",
+      "content": "The recency signal uses an exponential decay with a thirty day half-life, so a memory thirty days old contributes about 0.368 on the recency term.",
+      "summary": "recency uses 30-day half-life exponential decay",
+      "keywords": ["recency", "decay", "halflife", "exponential"],
+      "tags": ["search", "ranking"],
+      "context": "ranking recency prior",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "migration_additive",
+      "content": "Schema migrations are additive only; each is a new numbered file, file-discovered and checksummed, and an applied migration is never edited.",
+      "summary": "migrations are additive, numbered, checksummed, never edited",
+      "keywords": ["migration", "schema", "additive", "checksum"],
+      "tags": ["store", "schema"],
+      "context": "migration discipline",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "fts_trigger",
+      "content": "Full text search is kept in sync with the memories table by sqlite triggers that update the fts5 virtual table on insert and update.",
+      "summary": "fts5 kept in sync via insert/update triggers",
+      "keywords": ["fts", "fts5", "trigger", "search"],
+      "tags": ["store", "search"],
+      "context": "keyword retrieval index",
+      "memory_type": "CodePattern",
+      "importance": 6
+    },
+    {
+      "key": "writer_thread_dup",
+      "content": "All writes are serialized on the dedicated single writer thread that exclusively owns the writable sqlite connection in rusty-brain.",
+      "summary": "writes serialized on the dedicated single writer thread",
+      "keywords": ["single", "writer", "thread", "sqlite"],
+      "tags": ["concurrency", "store"],
+      "context": "near-duplicate restatement of the single-writer decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "namespace_isolation_dup",
+      "content": "Cross namespace access is impossible because the engine is pinned to one namespace and every store query is namespace scoped before it runs.",
+      "summary": "cross-namespace access impossible; queries namespace-scoped",
+      "keywords": ["namespace", "isolation", "scope", "crossnamespace"],
+      "tags": ["security", "store"],
+      "context": "near-duplicate restatement of namespace isolation",
+      "memory_type": "Constraint",
+      "importance": 8
+    }
+  ],
+
+  "golden_queries": [
+    {
+      "query": "writer writecommand",
+      "expected": ["single_writer", "writer_thread_dup"],
+      "k": 5
+    },
+    {
+      "query": "readers pool",
+      "expected": ["read_pool"],
+      "k": 5
+    },
+    {
+      "query": "checkpoint truncate",
+      "expected": ["wal_checkpoint"],
+      "k": 3
+    },
+    {
+      "query": "namespace isolation",
+      "expected": ["namespace_isolation", "namespace_isolation_dup"],
+      "k": 5
+    },
+    {
+      "query": "deterministic sha256",
+      "expected": ["deterministic_embed"],
+      "k": 3
+    },
+    {
+      "query": "voyage https",
+      "expected": ["voyage_embed"],
+      "k": 3
+    },
+    {
+      "query": "linear ranking",
+      "expected": ["linear_ranking"],
+      "k": 3
+    },
+    {
+      "query": "recency halflife",
+      "expected": ["recency_decay"],
+      "k": 3
+    },
+    {
+      "query": "migration checksum",
+      "expected": ["migration_additive"],
+      "k": 3
+    },
+    {
+      "query": "fts5 trigger",
+      "expected": ["fts_trigger"],
+      "k": 3
+    }
+  ],
+
+  "dedup_clusters": [
+    {
+      "members": ["single_writer", "writer_thread_dup"]
+    },
+    {
+      "members": ["namespace_isolation", "namespace_isolation_dup"]
+    }
+  ]
+}

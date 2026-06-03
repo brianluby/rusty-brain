@@ -90,6 +90,17 @@ enum WriteCommand {
         new: MemoryId,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Replace one memory's stored vector and stamp it to the current
+    /// `(model, input_version)` (P5 Feature A re-embed write path). The engine
+    /// recomputes the vector and passes it here; the store performs the only
+    /// vector-UPDATE path under the single writer.
+    Reembed {
+        id: MemoryId,
+        embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -729,6 +740,24 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::Reembed {
+                id,
+                embedding,
+                model,
+                input_version,
+                reply,
+            } => {
+                // No MemoryChanged event: re-embed only refreshes the vector for
+                // search quality; the note's user-visible content is unchanged.
+                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
+                    s.update_vector(&id, &embedding, &model, &input_version)
+                });
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
             #[cfg(test)]
             WriteCommand::PanicForTest { reply } => {
                 let report =
@@ -867,6 +896,43 @@ impl MemoryBackend for StoreHandle {
 
     async fn get_many(&self, ns: Namespace, ids: Vec<MemoryId>) -> Result<Vec<MemoryNote>> {
         self.with_read(move |store| store.get_many(&ns, &ids)).await
+    }
+
+    async fn active_contradicts(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> Result<std::collections::HashSet<MemoryId>> {
+        self.with_read(move |store| store.active_contradicts(&ns, &ids))
+            .await
+    }
+
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>> {
+        self.with_read(move |store| store.memories_for_reembed(&model, &input_version, limit))
+            .await
+    }
+
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::Reembed {
+            id,
+            embedding,
+            model,
+            input_version,
+            reply,
+        };
+        self.send_write(cmd, rx).await
     }
 }
 
@@ -1288,7 +1354,26 @@ mod tests {
             .await
             .unwrap();
 
-        let evt = rx.recv().await.unwrap();
+        // A write's MemoryChanged event can be published just after its write reply
+        // returns, so a late Created event for `old`/`new` may still land on this
+        // freshly-subscribed receiver ahead of the supersede event. Drain until the
+        // Archived event for the absorbed (old) memory rather than assuming it is
+        // strictly first (de-flakes the subscribe/write-event race seen under CI
+        // scheduling; the supersede call above guarantees the event is sent).
+        let mut archived = None;
+        for _ in 0..6 {
+            match tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv()).await {
+                Ok(Ok(evt))
+                    if evt.kind == crate::change::ChangeKind::Archived && evt.id == old_id =>
+                {
+                    archived = Some(evt);
+                    break;
+                }
+                Ok(Ok(_)) => continue, // a stray Created event from the prior writes
+                _ => break,
+            }
+        }
+        let evt = archived.expect("supersede must publish an Archived event for the old memory");
         assert_eq!(evt.id, old_id, "Archived event must target the old memory");
         assert_eq!(evt.namespace, ns);
         assert_eq!(
@@ -1335,6 +1420,80 @@ mod tests {
         );
         // Every returned candidate carries its namespace for per-ns grouping.
         assert!(cands.iter().all(|c| c.namespace == ns));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_reembed_scan_and_update_vector_through_single_writer() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("reembed".to_string());
+
+        // Write a row with a stale stamp (as if remembered pre-P5).
+        let mut stale = note(&ns, "stale stamped row");
+        stale.embedding_model = "old-model".to_string();
+        stale.embedding_input_version = "v1-content-only".to_string();
+        let id = stale.id.clone();
+        handle.write(stale, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // The scan finds it (cross-namespace read pool path).
+        let cands = handle
+            .memories_for_reembed("deterministic".to_string(), "v2-composite".to_string(), 100)
+            .await
+            .unwrap();
+        assert!(cands.iter().any(|n| n.id == id), "stale row is a candidate");
+
+        // Re-embed it through the single writer; the row is stamped current.
+        handle
+            .update_vector(
+                id.clone(),
+                vec![0.5f32; DIM],
+                "deterministic".to_string(),
+                "v2-composite".to_string(),
+            )
+            .await
+            .unwrap();
+        let after = handle.get(ns.clone(), id.clone()).await.unwrap().unwrap();
+        assert_eq!(after.embedding_model, "deterministic");
+        assert_eq!(after.embedding_input_version, "v2-composite");
+
+        // Idempotent: a second scan finds nothing stale, so a re-run writes 0.
+        let cands2 = handle
+            .memories_for_reembed("deterministic".to_string(), "v2-composite".to_string(), 100)
+            .await
+            .unwrap();
+        assert!(cands2.iter().all(|n| n.id != id), "row no longer stale");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_update_vector_rejects_wrong_dimension() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("dim".to_string());
+
+        let n = note(&ns, "dim contract");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // A wrong-length vector fails closed (dim contract is unchanged).
+        let err = handle
+            .update_vector(
+                id,
+                vec![0.5f32; DIM + 3],
+                "deterministic".to_string(),
+                "v2-composite".to_string(),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::DimensionMismatch { .. }),
+            "got {err:?}"
+        );
 
         handle.shutdown().await;
     }

@@ -3,7 +3,7 @@ use crate::enrich::{default_summary, derive_keywords};
 use crate::enricher::Enricher;
 use crate::linker::{Linker, SimilarityLinker};
 use rb_embed::EmbeddingProvider;
-use rb_search::Weights;
+use rb_search::{FusionMode, RrfConfig, Weights};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 use std::sync::Arc;
 
@@ -24,6 +24,8 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     backend: B,
     embedder: P,
     weights: Weights,
+    fusion_mode: FusionMode,
+    rrf_config: RrfConfig,
     namespace: Namespace,
     linker: Box<dyn Linker>,
     enricher: Option<Arc<dyn Enricher>>,
@@ -37,6 +39,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             backend,
             embedder,
             weights: Weights::default(),
+            // Default `Linear` preserves current recall behavior byte-for-byte;
+            // `Rrf` is opt-in via `with_fusion_mode` (spec §7, eval-gated flip).
+            fusion_mode: FusionMode::default(),
+            rrf_config: RrfConfig::default(),
             namespace,
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
@@ -56,6 +62,26 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Borrow the ranking weights (used by `recall`).
     pub fn weights(&self) -> Weights {
         self.weights
+    }
+
+    /// The fusion mode `recall` dispatches on (`Linear` default, `Rrf` opt-in).
+    pub fn fusion_mode(&self) -> FusionMode {
+        self.fusion_mode
+    }
+
+    /// Select the fusion strategy for `recall`. `Linear` (default) is the
+    /// existing weighted-sum ranking; `Rrf` is the two-stage hybrid (spec §7).
+    /// Opt-in only — the default stays `Linear` so behavior is unchanged unless
+    /// a caller flips it through the config plumbing.
+    pub fn with_fusion_mode(mut self, mode: FusionMode) -> Self {
+        self.fusion_mode = mode;
+        self
+    }
+
+    /// Override the `Rrf` tuning (k + prior weights). No effect under `Linear`.
+    pub fn with_rrf_config(mut self, config: RrfConfig) -> Self {
+        self.rrf_config = config;
+        self
     }
 
     /// Enable opt-in enrichment. When set, `remember` asks the enricher to fill
@@ -142,9 +168,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             note.context = ctx;
         }
         note.embedding_model = self.embedder.model_id().to_string();
+        // Stamp the composition version alongside the model so the `reembed`
+        // batch can detect rows built from an older representation (Feature A).
+        note.embedding_input_version = crate::embed_input::EMBEDDING_INPUT_VERSION.to_string();
 
-        // Embed the content (single text in, single vector out).
-        let mut embeddings = self.embedder.embed(&[note.content.clone()]).await?;
+        // Embed the COMPOSITE document representation (content + keywords + tags
+        // + context), not raw content (spec §8). The query stays embedded raw.
+        let input = crate::embed_input::embedding_input(&note);
+        let mut embeddings = self.embedder.embed(&[input]).await?;
         let embedding = embeddings.pop();
 
         let id = note.id.clone();
@@ -272,14 +303,20 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .get_many(self.namespace.clone(), order.clone())
             .await?;
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
-        let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        let mut meta: HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)> = HashMap::new();
         for note in fetched {
             if !self.active_in_namespace(&note)
                 || !Self::matches_recall_filters(&note, type_filter, tags)
             {
                 continue;
             }
-            meta.insert(note.id.clone(), (note.importance, note.created_at));
+            // Carry confidence into ranking (Feature C): low-confidence memories
+            // are dampened post-score so a wrong, high-matching note cannot
+            // dominate recall (the context-poisoning mitigation).
+            meta.insert(
+                note.id.clone(),
+                (note.importance, note.confidence, note.created_at),
+            );
             notes.insert(note.id.clone(), note);
         }
 
@@ -301,7 +338,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         let signals =
             rb_search::build_signals(&filtered_keyword, &filtered_vector, &filtered_graph, &meta);
-        let ranked = rb_search::rank(signals, self.weights, chrono::Utc::now(), candidate_limit);
+        // Dispatch on the configured fusion mode. `Linear` is the default and
+        // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
+        // hybrid (spec §7).
+        let now = chrono::Utc::now();
+        let ranked = match self.fusion_mode {
+            FusionMode::Linear => rb_search::rank(signals, self.weights, now, candidate_limit),
+            FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
+        };
 
         // Assemble results in ranked order, truncating to limit.
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
@@ -318,8 +362,18 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             }
         }
 
-        // Best-effort batch access tracking: single writer round-trip for all results.
         let returned_ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+
+        // Contradiction surfacing (Feature C): for the returned (post-ranking,
+        // truncated) set only, batch-load active contradicts links and flag each
+        // contested memory. FAIL-OPEN: a lookup error leaves results unflagged
+        // rather than failing recall.
+        let contested = self.contested_set(&returned_ids).await;
+        for r in &mut results {
+            r.memory.contested = contested.contains(&r.memory.id);
+        }
+
+        // Best-effort batch access tracking: single writer round-trip for all results.
         if !returned_ids.is_empty() {
             if let Err(e) = self.backend.record_accesses(returned_ids).await {
                 tracing::debug!(error = %e, "record_accesses failed; ignoring");
@@ -328,10 +382,123 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         Ok(results)
     }
 
+    /// Batch-load the subset of `ids` that have an active `contradicts` link
+    /// (Feature C). FAIL-OPEN: on a lookup error this returns an empty set (so
+    /// results surface unflagged), logging at debug — surfacing contested state
+    /// is best-effort enrichment, never a gate on retrieval.
+    async fn contested_set(&self, ids: &[MemoryId]) -> std::collections::HashSet<MemoryId> {
+        if ids.is_empty() {
+            return std::collections::HashSet::new();
+        }
+        match self
+            .backend
+            .active_contradicts(self.namespace.clone(), ids.to_vec())
+            .await
+        {
+            Ok(set) => set,
+            Err(e) => {
+                tracing::debug!(error = %e, "contradiction lookup failed; returning unflagged");
+                std::collections::HashSet::new()
+            }
+        }
+    }
+
+    /// Annotate each note's `contested` flag from one batched contradiction
+    /// lookup over the slice (fail-open). Mirrors `recall`'s post-ranking step for
+    /// the `get`/`list`/`context` surfaces.
+    async fn annotate_contested(&self, notes: &mut [MemoryNote]) {
+        if notes.is_empty() {
+            return;
+        }
+        let ids: Vec<MemoryId> = notes.iter().map(|n| n.id.clone()).collect();
+        let contested = self.contested_set(&ids).await;
+        for n in notes.iter_mut() {
+            n.contested = contested.contains(&n.id);
+        }
+    }
+
+    /// Re-embed up to `limit` ACTIVE memories whose stored
+    /// `(embedding_model, embedding_input_version)` stamp is stale relative to
+    /// the current embedder + composition version (Feature A, spec §8).
+    ///
+    /// Cross-namespace maintenance (like the evolution jobs): the engine's bound
+    /// namespace does NOT restrict the scan, so a single `reembed` converges the
+    /// whole corpus. For each candidate it recomputes the composite
+    /// [`crate::embed_input::embedding_input`], embeds it, and replaces the
+    /// vector + stamp through the single writer.
+    ///
+    /// Bounded and idempotent: candidates are exactly the rows whose stamp
+    /// differs from current, so a row already at `(model, version)` is never
+    /// scanned, and a second run over unchanged data writes nothing (returns
+    /// `changed == 0`). Fail-safe per row: an embedding or write failure is
+    /// logged and counted as `skipped` (retried on the next run), never fatal.
+    /// Returns `(scanned, changed, skipped)`.
+    ///
+    /// Scope: `reembed` converges *vectors* only. Similarity-derived graph links
+    /// created at `remember` time are NOT regenerated here, so the graph leg of
+    /// `recall` may still reflect pre-reembed neighborhoods until links are rebuilt.
+    /// Link evolution on re-embed (A-MEM's "evolve-and-re-embed neighbors") is
+    /// deferred to P6; the graph term is a minor 0.10-weight signal and links decay
+    /// independently, so vector convergence is sufficient for P5's transition.
+    pub async fn reembed(&self, limit: usize) -> rb_types::Result<(u64, u64, u64)> {
+        let model = self.embedder.model_id().to_string();
+        let input_version = crate::embed_input::EMBEDDING_INPUT_VERSION.to_string();
+
+        let candidates = self
+            .backend
+            .memories_for_reembed(model.clone(), input_version.clone(), limit)
+            .await?;
+
+        let mut scanned: u64 = 0;
+        let mut changed: u64 = 0;
+        let mut skipped: u64 = 0;
+
+        for note in candidates {
+            scanned += 1;
+            let input = crate::embed_input::embedding_input(&note);
+            let embedding = match self.embedder.embed(&[input]).await {
+                Ok(mut v) => match v.pop() {
+                    Some(emb) => emb,
+                    None => {
+                        tracing::warn!(memory_id = %note.id, "reembed: embedder returned no vector; skipping");
+                        skipped += 1;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    tracing::warn!(error = %e, memory_id = %note.id, "reembed: embed failed; will retry next run");
+                    skipped += 1;
+                    continue;
+                }
+            };
+            match self
+                .backend
+                .update_vector(
+                    note.id.clone(),
+                    embedding,
+                    model.clone(),
+                    input_version.clone(),
+                )
+                .await
+            {
+                Ok(()) => changed += 1,
+                Err(e) => {
+                    tracing::warn!(error = %e, memory_id = %note.id, "reembed: vector update failed; will retry next run");
+                    skipped += 1;
+                }
+            }
+        }
+
+        Ok((scanned, changed, skipped))
+    }
+
     /// Fetch a single memory by id in the engine namespace.
     pub async fn get(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
-        let found = self.get_scoped(id.clone()).await?;
-        if found.is_some() {
+        let mut found = self.get_scoped(id.clone()).await?;
+        if let Some(note) = found.as_mut() {
+            // Surface the contested flag on the get payload (Feature C, fail-open).
+            let contested = self.contested_set(std::slice::from_ref(&id)).await;
+            note.contested = contested.contains(&id);
             if let Err(e) = self.backend.record_access(id.clone()).await {
                 tracing::debug!(error = %e, memory_id = %id, "record_access failed; ignoring");
             }
@@ -346,9 +513,13 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         min_importance: Option<u8>,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
-        self.backend
+        let mut notes = self
+            .backend
             .list(self.namespace.clone(), min_importance, limit)
-            .await
+            .await?;
+        // Annotate the contested flag on list result rows (Feature C, fail-open).
+        self.annotate_contested(&mut notes).await;
+        Ok(notes)
     }
 
     /// Expand the graph around `id` to `depth` hops and fetch the connected notes.
@@ -411,15 +582,18 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         const CONTEXT_LIMIT: usize = 50;
         const IMPORTANT_FLOOR: u8 = 8;
-        let recent = self
+        let mut recent = self
             .backend
             .list(self.namespace.clone(), None, CONTEXT_LIMIT)
             .await?;
-        let important = self
+        let mut important = self
             .backend
             .list(self.namespace.clone(), Some(IMPORTANT_FLOOR), CONTEXT_LIMIT)
             .await?;
         let total = recent.len();
+        // Annotate contested on both context halves (Feature C, fail-open).
+        self.annotate_contested(&mut recent).await;
+        self.annotate_contested(&mut important).await;
         Ok((recent, important, total))
     }
 }
@@ -503,6 +677,159 @@ mod tests {
         let id = eng.remember(input("model id check", 5)).await.unwrap();
         let note = eng.backend().note_of(&id).unwrap();
         assert_eq!(note.embedding_model, eng.embedder().model_id());
+    }
+
+    #[tokio::test]
+    async fn remember_stamps_current_embedding_input_version() {
+        let eng = engine();
+        let id = eng
+            .remember(input("composite input stamp", 5))
+            .await
+            .unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(
+            note.embedding_input_version,
+            crate::embed_input::EMBEDDING_INPUT_VERSION
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_embeds_composite_not_raw_content() {
+        // The composite (content + keywords + tags + context) differs from raw
+        // content, so the stored vector must equal the composite's embedding.
+        let eng = engine();
+        let mut inp = input("body of the note", 5);
+        inp.keywords = vec!["alpha".to_string()];
+        inp.tags = vec!["beta".to_string()];
+        inp.context = Some("gamma".to_string());
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        let stored = eng.backend().embedding_of(&id).unwrap();
+
+        let composite = crate::embed_input::embedding_input(&note);
+        let expected = DeterministicProvider::new(16)
+            .embed(&[composite])
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(
+            stored, expected,
+            "stored vector must be the composite embedding"
+        );
+
+        // And it must NOT equal the raw-content embedding (composite added signal).
+        let raw = DeterministicProvider::new(16)
+            .embed(std::slice::from_ref(&note.content))
+            .await
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_ne!(stored, raw, "composite differs from raw-content embedding");
+    }
+
+    #[tokio::test]
+    async fn reembed_on_fresh_corpus_is_a_no_op() {
+        // Every note remembered through this engine is already at current stamps,
+        // so a reembed scans nothing and writes nothing.
+        let eng = engine();
+        eng.remember(input("already current one", 5)).await.unwrap();
+        eng.remember(input("already current two", 5)).await.unwrap();
+        let (scanned, changed, skipped) = eng.reembed(100).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (0, 0, 0));
+        assert_eq!(eng.backend().update_vector_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn reembed_updates_stale_rows_then_second_run_is_idempotent() {
+        let eng = engine();
+        // A stale row: stamped with an old model/version (as if written pre-P5).
+        let mut stale = note(
+            Namespace::Project("rb".into()),
+            "stale content needing reembed",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        stale.embedding_model = "old-model".to_string();
+        stale.embedding_input_version = "v1-content-only".to_string();
+        let id = stale.id.clone();
+        eng.backend().insert_note(stale);
+
+        // First run re-embeds the one stale row.
+        let (scanned, changed, skipped) = eng.reembed(100).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (1, 1, 0));
+        let after = eng.backend().note_of(&id).unwrap();
+        assert_eq!(after.embedding_model, eng.embedder().model_id());
+        assert_eq!(
+            after.embedding_input_version,
+            crate::embed_input::EMBEDDING_INPUT_VERSION
+        );
+        // The vector now exists for the row.
+        assert!(eng.backend().embedding_of(&id).is_some());
+
+        // Second run over unchanged data writes nothing (idempotent).
+        let (scanned2, changed2, skipped2) = eng.reembed(100).await.unwrap();
+        assert_eq!((scanned2, changed2, skipped2), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn reembed_skips_archived_rows() {
+        let eng = engine();
+        let mut archived = note(
+            Namespace::Project("rb".into()),
+            "archived stale row",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        archived.embedding_model = "old-model".to_string();
+        archived.embedding_input_version = "v1-content-only".to_string();
+        archived.archived_at = Some(chrono::Utc::now());
+        eng.backend().insert_note(archived);
+
+        let (scanned, changed, skipped) = eng.reembed(100).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (0, 0, 0));
+    }
+
+    #[tokio::test]
+    async fn reembed_is_fail_safe_per_row_on_write_error() {
+        let eng = engine();
+        let mut stale = note(
+            Namespace::Project("rb".into()),
+            "row whose vector update fails",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        stale.embedding_model = "old-model".to_string();
+        stale.embedding_input_version = "v1-content-only".to_string();
+        eng.backend().insert_note(stale);
+
+        eng.backend().set_fail_update_vector(true);
+        // The write error is caught per row: scanned 1, changed 0, skipped 1,
+        // and the call still succeeds (never fatal).
+        let (scanned, changed, skipped) = eng.reembed(100).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (1, 0, 1));
+    }
+
+    #[tokio::test]
+    async fn reembed_respects_limit() {
+        let eng = engine();
+        for i in 0..5 {
+            let mut stale = note(
+                Namespace::Project("rb".into()),
+                &format!("stale row {i}"),
+                MemoryType::Insight,
+                5,
+                &[],
+            );
+            stale.embedding_model = "old-model".to_string();
+            stale.embedding_input_version = "v1-content-only".to_string();
+            eng.backend().insert_note(stale);
+        }
+        let (scanned, changed, skipped) = eng.reembed(2).await.unwrap();
+        assert_eq!((scanned, changed, skipped), (2, 2, 0));
     }
 
     #[tokio::test]
@@ -792,6 +1119,153 @@ mod tests {
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.score.is_finite()));
         assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn engine_defaults_to_linear_fusion() {
+        let eng = engine();
+        assert_eq!(eng.fusion_mode(), rb_search::FusionMode::Linear);
+    }
+
+    #[tokio::test]
+    async fn with_fusion_mode_selects_rrf_and_recall_still_returns_results() {
+        let eng = engine().with_fusion_mode(rb_search::FusionMode::Rrf);
+        assert_eq!(eng.fusion_mode(), rb_search::FusionMode::Rrf);
+        seed(
+            &eng,
+            "alpha topic about sqlite",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        seed(&eng, "beta topic about tokio", MemoryType::Insight, 5, &[]).await;
+        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        // RRF path returns ranked results with finite, descending scores.
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.score.is_finite()));
+        assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn recall_flags_both_contradicting_memories_as_contested() {
+        // Feature C: create A and B, link A contradicts B, recall -> both flagged.
+        let eng = engine();
+        let a = seed(
+            &eng,
+            "claim alpha about caching",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        let b = seed(
+            &eng,
+            "claim alpha says no caching",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        eng.backend().link_contradicts(&a, &b);
+
+        let results = eng.recall("alpha", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        // both endpoints of the active contradicts link are contested.
+        assert!(results.iter().all(|r| r.memory.contested));
+    }
+
+    #[tokio::test]
+    async fn recall_does_not_flag_uncontested_memories() {
+        let eng = engine();
+        seed(&eng, "uncontested note one", MemoryType::Insight, 5, &[]).await;
+        seed(&eng, "uncontested note two", MemoryType::Insight, 5, &[]).await;
+        let results = eng.recall("note", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| !r.memory.contested));
+    }
+
+    #[tokio::test]
+    async fn recall_is_fail_open_when_contradiction_lookup_errors() {
+        // Feature C fail-open: a forced contradiction-lookup error must NOT fail
+        // recall; results return UNFLAGGED.
+        let eng = engine();
+        let a = seed(&eng, "claim x yes", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "claim x no", MemoryType::Insight, 5, &[]).await;
+        eng.backend().link_contradicts(&a, &b);
+        eng.backend().set_fail_contradicts(true);
+
+        let results = eng.recall("claim", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2, "recall still succeeds on lookup error");
+        assert!(
+            results.iter().all(|r| !r.memory.contested),
+            "fail-open => unflagged"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_low_confidence_wrong_memory_ranks_below_high_confidence_correct() {
+        // Poison scenario at the engine level: two equally-matching memories where
+        // the wrong one has low confidence. The confidence dampener must rank the
+        // high-confidence (correct) one first.
+        let eng = engine();
+        let correct = note(
+            Namespace::Project("rb".into()),
+            "shared probe content",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let mut wrong = note(
+            Namespace::Project("rb".into()),
+            "shared probe content",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        wrong.confidence = 0.1; // low confidence "poison"
+        let correct_id = correct.id.clone();
+        let wrong_id = wrong.id.clone();
+        // Same vector distance for both so only confidence separates them.
+        eng.backend().insert_note(correct);
+        eng.backend().insert_note(wrong);
+        eng.backend().set_keyword_results(Vec::new());
+        eng.backend()
+            .set_vector_results(vec![(wrong_id.clone(), 0.2), (correct_id.clone(), 0.2)]);
+
+        let results = eng.recall("probe", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2);
+        assert_eq!(
+            results[0].memory.id, correct_id,
+            "high-confidence correct memory ranks first"
+        );
+        assert_eq!(results[1].memory.id, wrong_id);
+        assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn get_surfaces_contested_flag() {
+        let eng = engine();
+        let a = eng.remember(input("a contested side", 5)).await.unwrap();
+        let b = eng.remember(input("b contested side", 5)).await.unwrap();
+        eng.backend().link_contradicts(&a, &b);
+        let got = eng.get(a.clone()).await.unwrap().unwrap();
+        assert!(got.contested, "get payload carries the contested flag");
+        // a memory with no contradicts link is not contested.
+        let c = eng.remember(input("c lonely", 5)).await.unwrap();
+        let got_c = eng.get(c).await.unwrap().unwrap();
+        assert!(!got_c.contested);
+    }
+
+    #[tokio::test]
+    async fn list_surfaces_contested_flag() {
+        let eng = engine();
+        let a = eng.remember(input("list a", 5)).await.unwrap();
+        let b = eng.remember(input("list b", 5)).await.unwrap();
+        eng.backend().link_contradicts(&a, &b);
+        let notes = eng.list(None, 10).await.unwrap();
+        assert!(notes.iter().find(|n| n.id == a).unwrap().contested);
+        assert!(notes.iter().find(|n| n.id == b).unwrap().contested);
     }
 
     #[tokio::test]

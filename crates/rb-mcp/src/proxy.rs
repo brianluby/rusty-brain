@@ -567,4 +567,20 @@ mod tests {
             "error variant carries an `error` key"
         );
     }
+
+    #[test]
+    fn recall_result_carries_contested_flag() {
+        use rb_proto::Response;
+        // Feature C: the additive `contested` boolean surfaces in the MCP result
+        // schema for each recall row.
+        let mut contested = note();
+        contested.contested = true;
+        let recalled = response_to_content(Response::Recalled {
+            results: vec![SearchResult {
+                memory: contested,
+                score: 0.9,
+            }],
+        });
+        assert_eq!(recalled["results"][0]["memory"]["contested"], true);
+    }
 }

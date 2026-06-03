@@ -32,6 +32,11 @@ use crate::{SharedEmbedder, StoreHandle};
 const MAX_LIMIT: usize = 1000;
 /// Maximum graph traversal depth per Graph request.
 const MAX_DEPTH: u8 = 8;
+/// Default re-embed batch size when a `Reembed` request omits a limit. Bounded
+/// so one pass converges a slice of the corpus; rerun until `changed == 0`.
+const REEMBED_DEFAULT_LIMIT: usize = 1000;
+/// Hard cap on a single re-embed pass to bound writer-thread work per request.
+const REEMBED_MAX_LIMIT: usize = 10_000;
 /// Maximum number of simultaneous client connections.
 const MAX_CONNECTIONS: usize = 256;
 /// Idle deadline for the initial handshake read (fail fast on stalled connects).
@@ -583,6 +588,23 @@ where
             },
             Err(e) => error_to_response(e),
         },
+        Request::Reembed { limit } => {
+            // Bounded, idempotent re-embed batch (P5 Feature A). Cross-namespace
+            // maintenance driven through the engine (it owns the embedder); the
+            // vector UPDATE goes through the single writer. `None` uses the
+            // daemon batch default.
+            let batch = limit
+                .unwrap_or(REEMBED_DEFAULT_LIMIT)
+                .min(REEMBED_MAX_LIMIT);
+            match engine.reembed(batch).await {
+                Ok((scanned, changed, skipped)) => Response::JobRan {
+                    scanned,
+                    changed,
+                    skipped,
+                },
+                Err(e) => error_to_response(e),
+            }
+        }
     }
 }
 

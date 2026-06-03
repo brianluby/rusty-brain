@@ -20,11 +20,18 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
         } else {
             r.memory.summary.as_str()
         };
+        // Surface the contested flag (Feature C) inline for the human reader.
+        let contested = if r.memory.contested {
+            " [contested]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "[{:.2}] {} ({}) {}\n",
+            "[{:.2}] {} ({}){} {}\n",
             r.score,
             r.memory.id,
             r.memory.memory_type.as_str(),
+            contested,
             summary
         ));
     }
@@ -49,11 +56,14 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         } else {
             n.summary.as_str()
         };
+        // Surface the contested flag (Feature C) inline for the human reader.
+        let contested = if n.contested { " [contested]" } else { "" };
         out.push_str(&format!(
-            "{} (imp {}, {}) {}\n",
+            "{} (imp {}, {}){} {}\n",
             n.id,
             n.importance,
             n.memory_type.as_str(),
+            contested,
             summary
         ));
     }
@@ -69,14 +79,20 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
         });
     }
     match memory {
-        Some(n) => format!(
-            "{}\nnamespace: {}\ntype: {}\nimportance: {}\n\n{}",
-            n.id,
-            n.namespace.as_db_string(),
-            n.memory_type.as_str(),
-            n.importance,
-            n.content
-        ),
+        Some(n) => {
+            // Surface the contested flag (Feature C) on the get read path too, so
+            // every human surface (recall/list/context/get) marks a contradicted note.
+            let contested = if n.contested { " [contested]" } else { "" };
+            format!(
+                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}\n\n{}",
+                n.id,
+                contested,
+                n.namespace.as_db_string(),
+                n.memory_type.as_str(),
+                n.importance,
+                n.content
+            )
+        }
         None => "Memory not found.".to_string(),
     }
 }
@@ -197,6 +213,39 @@ mod tests {
     }
 
     #[test]
+    fn human_recall_marks_contested_results() {
+        let mut n = note("conflicting claim", 5);
+        n.contested = true;
+        let results = vec![SearchResult {
+            memory: n,
+            score: 0.8,
+        }];
+        let out = render_recall(&results, false);
+        assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
+    fn json_recall_includes_contested_field() {
+        let mut n = note("conflicting claim", 5);
+        n.contested = true;
+        let results = vec![SearchResult {
+            memory: n,
+            score: 0.8,
+        }];
+        let out = render_recall(&results, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed[0]["memory"]["contested"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn human_list_marks_contested_notes() {
+        let mut n = note("conflicting note", 5);
+        n.contested = true;
+        let out = render_notes(std::slice::from_ref(&n), false);
+        assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
     fn json_recall_is_parseable_array() {
         let n = note("body", 5);
         let results = vec![SearchResult {
@@ -243,6 +292,15 @@ mod tests {
         assert!(none.to_lowercase().contains("not found"));
         let json_none = render_get(&None, true);
         assert_eq!(json_none.trim(), "null");
+    }
+
+    #[test]
+    fn human_get_marks_contested_note() {
+        // The get read path must also surface the contested marker (Feature C).
+        let mut n = note("body", 5);
+        n.contested = true;
+        let out = render_get(&Some(n), false);
+        assert!(out.contains("[contested]"), "get marks contested: {out}");
     }
 
     #[test]

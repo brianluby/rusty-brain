@@ -6,7 +6,12 @@ use serde::{Deserialize, Serialize};
 
 /// Wire contract version carried in the handshake. Clients and the daemon must
 /// agree on this exact value; mismatch is rejected at connect time.
-pub const CONTRACT_VERSION: u32 = 1;
+///
+/// v2 (P5 Feature C): result rows (recall/list/context) and the `get` payload
+/// carry an additive `MemoryNote.contested` boolean. The field is
+/// `#[serde(default)]`, so a v1 payload without it deserializes to `false` — but
+/// the version bump lets clients detect (and rely on) the richer shape.
+pub const CONTRACT_VERSION: u32 = 2;
 
 /// First frame the client sends after connecting.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -63,6 +68,13 @@ pub enum Request {
     Context,
     RunJob {
         job: JobKind,
+    },
+    /// Re-embed up to `limit` active memories whose stored
+    /// `(embedding_model, embedding_input_version)` stamp is stale (P5 Feature
+    /// A). `None` uses the daemon's configured batch default. Replies with
+    /// `Response::JobRan { scanned, changed, skipped }`; bounded + idempotent.
+    Reembed {
+        limit: Option<usize>,
     },
     Ping,
     /// Open a live change-notification stream. The daemon stops the
@@ -144,8 +156,9 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_one() {
-        assert_eq!(CONTRACT_VERSION, 1);
+    fn contract_version_is_two() {
+        // Bumped to 2 for the additive `contested` field (P5 Feature C).
+        assert_eq!(CONTRACT_VERSION, 2);
     }
 
     #[test]
@@ -214,6 +227,8 @@ mod tests {
             Request::RunJob {
                 job: JobKind::LinkDecay,
             },
+            Request::Reembed { limit: Some(100) },
+            Request::Reembed { limit: None },
         ]
     }
 
@@ -342,6 +357,14 @@ mod tests {
         })
         .unwrap();
         assert_eq!(json, r#"{"op":"RunJob","job":"link_decay"}"#);
+    }
+
+    #[test]
+    fn reembed_uses_op_tag_with_optional_limit() {
+        let json = serde_json::to_string(&Request::Reembed { limit: Some(50) }).unwrap();
+        assert_eq!(json, r#"{"op":"Reembed","limit":50}"#);
+        let json = serde_json::to_string(&Request::Reembed { limit: None }).unwrap();
+        assert_eq!(json, r#"{"op":"Reembed","limit":null}"#);
     }
 
     #[test]

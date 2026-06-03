@@ -14,6 +14,7 @@ members = [
     "crates/rb-agents",
     "crates/rb-hooks",
     "crates/rb-install",
+    "crates/rb-eval",
 ]
 
 [workspace.package]

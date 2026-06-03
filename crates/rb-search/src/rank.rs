@@ -5,6 +5,46 @@ use rb_types::MemoryId;
 /// on the recency term. Documented, fixed constant for deterministic ranking.
 pub const HALF_LIFE: f32 = 30.0;
 
+/// Floor for the confidence dampener (Feature C, spec §9). The final score is
+/// multiplied by `CONFIDENCE_FLOOR + (1 - CONFIDENCE_FLOOR) * confidence`, so a
+/// confidence-1.0 memory is unchanged (no-op) and a confidence-0.0 memory keeps
+/// `CONFIDENCE_FLOOR` of its score: meaningfully suppressed, never fully zeroed
+/// (the context-poisoning mitigation). Documented, configurable constant — the
+/// same floor is applied to the `Rrf` confidence prior (`RrfConfig::confidence_floor`).
+pub const CONFIDENCE_FLOOR: f32 = 0.5;
+
+/// Multiplicative confidence dampener shared by `Linear` and `Rrf`.
+///
+/// Returns `floor + (1 - floor) * confidence`, clamped so that a confidence of
+/// `1.0` is a no-op (`1.0`) and a confidence of `0.0` floors at `floor`. A
+/// non-finite confidence is sanitized to the neutral `1.0` (never poisons the
+/// score). Pure and deterministic.
+pub(crate) fn confidence_dampener(confidence: f32, floor: f32) -> f32 {
+    let confidence = if confidence.is_finite() {
+        confidence.clamp(0.0, 1.0)
+    } else {
+        1.0
+    };
+    let floor = if floor.is_finite() {
+        floor.clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    floor + (1.0 - floor) * confidence
+}
+
+/// Exponential recency decay over age in days, shared by Linear and RRF.
+///
+/// Returns `e^(-age_days / HALF_LIFE)` in `(0, 1]`. Future timestamps clamp to
+/// age 0 (score 1.0). Pure and deterministic.
+pub(crate) fn recency_decay(
+    created_at: chrono::DateTime<chrono::Utc>,
+    now: chrono::DateTime<chrono::Utc>,
+) -> f32 {
+    let age_days = ((now - created_at).num_seconds() as f32 / 86_400.0).max(0.0);
+    (-age_days / HALF_LIFE).exp()
+}
+
 /// Per-candidate raw signals gathered from the three retrieval paths.
 ///
 /// Any `Option` left as `None` means "this path did not surface this candidate";
@@ -21,6 +61,10 @@ pub struct Signals {
     /// Importance 0..=10.
     pub importance: u8,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    /// Confidence in `[0, 1]`, sourced from the note. Applied as a multiplicative
+    /// dampener in both `Linear` (final score) and `Rrf` (Stage 2 prior), Feature C.
+    /// Defaults to `1.0` (neutral) so adding it leaves `Linear` byte-for-byte.
+    pub confidence: f32,
 }
 
 /// Normalize a single candidate's signals into a weighted score in `[0, 1]`.
@@ -44,8 +88,7 @@ fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f3
     // Importance normalized to [0, 1].
     let importance = (s.importance as f32 / 10.0).clamp(0.0, 1.0);
     // Recency: exponential decay over age in days. Future timestamps clamp to age 0.
-    let age_days = ((now - s.created_at).num_seconds() as f32 / 86_400.0).max(0.0);
-    let recency = (-age_days / HALF_LIFE).exp();
+    let recency = recency_decay(s.created_at, now);
 
     let finite_weight = |weight: f32| if weight.is_finite() { weight } else { 0.0 };
     let score = finite_weight(w.vector) * vector_sim
@@ -54,11 +97,15 @@ fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f3
         + finite_weight(w.importance) * importance
         + finite_weight(w.recency) * recency;
 
-    if score.is_finite() {
+    let score = if score.is_finite() {
         score.clamp(0.0, 1.0)
     } else {
         0.0
-    }
+    };
+    // Confidence dampener (Feature C): multiplicatively suppress low-confidence
+    // memories on the FINAL score, with a floor so they are never fully zeroed.
+    // Neutral at confidence 1.0, so the default corpus is byte-for-byte unchanged.
+    score * confidence_dampener(s.confidence, CONFIDENCE_FLOOR)
 }
 
 /// Rank candidates by weighted, normalized signal score.
@@ -111,6 +158,7 @@ mod tests {
                 graph_hops: None,
                 importance: 2,
                 created_at: n - Duration::days(120),
+                confidence: 1.0,
             },
             Signals {
                 id: strong.clone(),
@@ -119,6 +167,7 @@ mod tests {
                 graph_hops: Some(1),
                 importance: 9,
                 created_at: n,
+                confidence: 1.0,
             },
         ];
         let ranked = rank(signals, Weights::default(), n, 10);
@@ -144,6 +193,7 @@ mod tests {
             graph_hops: Some(2),
             importance: 5,
             created_at: created,
+            confidence: 1.0,
         };
         let signals = vec![
             mk(old.clone(), n - Duration::days(200)),
@@ -166,6 +216,7 @@ mod tests {
             graph_hops: Some(0), // adjacent -> graph proximity 1.0
             importance: 0,
             created_at: n - Duration::days(10_000), // ancient -> recency ~0
+            confidence: 1.0,
         }];
         let ranked = rank(signals, Weights::default(), n, 10);
         assert_eq!(ranked.len(), 1);
@@ -190,6 +241,7 @@ mod tests {
                 graph_hops: None,
                 importance: 0,
                 created_at: n - Duration::days(10_000),
+                confidence: 1.0,
             },
             Signals {
                 id: b.clone(),
@@ -198,6 +250,7 @@ mod tests {
                 graph_hops: None,
                 importance: 0,
                 created_at: n - Duration::days(10_000),
+                confidence: 1.0,
             },
         ];
         let ranked = rank(signals, Weights::default(), n, 10);
@@ -220,6 +273,7 @@ mod tests {
                 graph_hops: None,
                 importance: (10 - i) as u8,
                 created_at: n,
+                confidence: 1.0,
             })
             .collect();
         let ranked = rank(signals, Weights::default(), n, 2);
@@ -247,6 +301,7 @@ mod tests {
                 },
                 importance: (i % 11) as u8,
                 created_at: n - Duration::days(i as i64),
+                confidence: 1.0,
             })
             .collect();
         let first = rank(signals.clone(), Weights::default(), n, 20);
@@ -291,6 +346,7 @@ mod tests {
                 graph_hops: None,
                 importance: 10,
                 created_at: n,
+                confidence: 1.0,
             },
             Signals {
                 id: infinity.clone(),
@@ -299,6 +355,7 @@ mod tests {
                 graph_hops: None,
                 importance: 10,
                 created_at: n,
+                confidence: 1.0,
             },
             Signals {
                 id: finite.clone(),
@@ -307,6 +364,7 @@ mod tests {
                 graph_hops: None,
                 importance: 0,
                 created_at: n,
+                confidence: 1.0,
             },
         ];
 
@@ -338,10 +396,91 @@ mod tests {
             graph_hops: Some(0),
             importance: 10,
             created_at: n,
+            confidence: 1.0,
         }];
 
         let ranked = rank(signals, weights, n, 10);
 
+        assert_eq!(ranked, vec![(id, 1.0)]);
+        assert!(ranked[0].1.is_finite());
+    }
+
+    #[test]
+    fn low_confidence_ranks_below_equal_high_confidence() {
+        // Two candidates identical on every signal EXCEPT confidence. The
+        // confidence dampener (Feature C) must rank the low-confidence one below
+        // the high-confidence one, but never zero it (floor honored).
+        let n = now();
+        let low = MemoryId::new();
+        let high = MemoryId::new();
+        let mk = |id: MemoryId, confidence| Signals {
+            id,
+            keyword_rank: Some(0),
+            vector_distance: Some(0.0),
+            graph_hops: Some(0),
+            importance: 5,
+            created_at: n,
+            confidence,
+        };
+        let signals = vec![mk(low.clone(), 0.0), mk(high.clone(), 1.0)];
+        let ranked = rank(signals, Weights::default(), n, 10);
+        assert_eq!(ranked[0].0, high, "high-confidence ranks first");
+        assert_eq!(ranked[1].0, low);
+        assert!(ranked[1].1 > 0.0, "floor keeps low-confidence score > 0");
+        // With CONFIDENCE_FLOOR = 0.5 and confidence 0.0, the low score is exactly
+        // half the high (which is at confidence 1.0 -> dampener no-op).
+        assert!((ranked[1].1 - ranked[0].1 * CONFIDENCE_FLOOR).abs() < 1e-6);
+    }
+
+    #[test]
+    fn confidence_one_is_a_no_op_dampener() {
+        // A default-confidence (1.0) candidate scores identically to the
+        // pre-Feature-C weighted sum: dampener multiplies by exactly 1.0.
+        let n = now();
+        let id = MemoryId::new();
+        let weights = Weights {
+            vector: 1.0,
+            keyword: 0.0,
+            graph: 0.0,
+            importance: 0.0,
+            recency: 0.0,
+        };
+        let signals = vec![Signals {
+            id: id.clone(),
+            keyword_rank: None,
+            vector_distance: Some(0.0), // sim 1.0 -> raw score 1.0
+            graph_hops: None,
+            importance: 0,
+            created_at: n,
+            confidence: 1.0,
+        }];
+        let ranked = rank(signals, weights, n, 10);
+        assert_eq!(ranked, vec![(id, 1.0)], "confidence 1.0 => unchanged score");
+    }
+
+    #[test]
+    fn non_finite_confidence_is_treated_as_neutral() {
+        // A corrupt (NaN) confidence must not poison the score: sanitized to the
+        // neutral 1.0 dampener, leaving the raw weighted score intact and finite.
+        let n = now();
+        let id = MemoryId::new();
+        let weights = Weights {
+            vector: 1.0,
+            keyword: 0.0,
+            graph: 0.0,
+            importance: 0.0,
+            recency: 0.0,
+        };
+        let signals = vec![Signals {
+            id: id.clone(),
+            keyword_rank: None,
+            vector_distance: Some(0.0),
+            graph_hops: None,
+            importance: 0,
+            created_at: n,
+            confidence: f32::NAN,
+        }];
+        let ranked = rank(signals, weights, n, 10);
         assert_eq!(ranked, vec![(id, 1.0)]);
         assert!(ranked[0].1.is_finite());
     }
@@ -364,6 +503,7 @@ mod tests {
             graph_hops: None,
             importance: 0,
             created_at: n,
+            confidence: 1.0,
         }];
 
         let ranked = rank(signals, weights, n, 10);

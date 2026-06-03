@@ -2563,6 +2563,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-eval"
+version = "0.0.1"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "rb-embed",
+ "rb-engine",
+ "rb-search",
+ "rb-store",
+ "rb-types",
+ "serde",
+ "serde_json",
+ "tokio",
+]
+
+[[package]]
 name = "rb-hooks"
 version = "0.0.1"
 dependencies = [

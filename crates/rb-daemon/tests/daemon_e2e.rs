@@ -618,3 +618,43 @@ async fn run_job_importance_recalibration_flows_through_client() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reembed_over_the_wire_is_stamp_skip_and_idempotent() {
+    // Memories remembered through the daemon are written at the CURRENT stamp
+    // (composite embedding + EMBEDDING_INPUT_VERSION), so a reembed pass scans
+    // none of them and writes nothing — proving the stamp-skip + idempotency
+    // contract end-to-end over the wire.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("reembed-e2e".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    for i in 0..3 {
+        client
+            .remember(
+                format!("reembed target {i}"),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![format!("kw{i}")],
+                vec!["reembed".to_string()],
+                vec![],
+            )
+            .await
+            .unwrap();
+    }
+
+    // All rows are already current => scanned/changed/skipped all zero.
+    let (scanned, changed, skipped) = client.reembed(None).await.unwrap();
+    assert_eq!(
+        (scanned, changed, skipped),
+        (0, 0, 0),
+        "freshly-remembered rows are already at the current stamp"
+    );
+
+    // A second pass is likewise a no-op (idempotent).
+    let (s2, c2, k2) = client.reembed(Some(100)).await.unwrap();
+    assert_eq!((s2, c2, k2), (0, 0, 0), "reembed is idempotent");
+
+    daemon.stop().await;
+}

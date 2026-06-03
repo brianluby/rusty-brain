@@ -255,6 +255,22 @@ impl Client {
             other => Err(Self::unexpected(other)),
         }
     }
+
+    /// Trigger one bounded, idempotent re-embed pass on the daemon (P5 Feature
+    /// A): up to `limit` active memories with a stale embedding stamp are
+    /// re-embedded through the single writer. `None` uses the daemon default.
+    /// Returns `(scanned, changed, skipped)`.
+    pub async fn reembed(&mut self, limit: Option<usize>) -> Result<(u64, u64, u64)> {
+        let resp = self.request(Request::Reembed { limit }).await?;
+        match resp {
+            Resp::JobRan {
+                scanned,
+                changed,
+                skipped,
+            } => Ok((scanned, changed, skipped)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +459,11 @@ mod wrapper_tests {
                     changed: 2,
                     skipped: 2,
                 },
+                Request::Reembed { .. } => Response::JobRan {
+                    scanned: 6,
+                    changed: 5,
+                    skipped: 1,
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -503,6 +524,9 @@ mod wrapper_tests {
 
         let (scanned, changed, skipped) = c.run_job(rb_types::JobKind::LinkDecay).await.unwrap();
         assert_eq!((scanned, changed, skipped), (4, 2, 2));
+
+        let (rs, rc, rk) = c.reembed(Some(10)).await.unwrap();
+        assert_eq!((rs, rc, rk), (6, 5, 1));
 
         drop(c);
         server.await.unwrap();

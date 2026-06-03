@@ -171,3 +171,126 @@ fn fresh_db_exercises_every_query_path() {
         "archived_at column must be set"
     );
 }
+
+#[test]
+fn fresh_db_has_embedding_input_version_column_and_meta_seed() {
+    // The 003 migration column + meta seed must apply on a fresh DB and round-trip.
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("eiv.db");
+    let store = SqliteStore::open(&db_path, DIM).unwrap();
+    let ns = Namespace::Project("eiv".to_string());
+
+    // A note stamped with the current composite version persists and reads back.
+    let mut a = note(&ns, "composite stamped note", MemoryType::Insight, 5);
+    a.embedding_model = "deterministic".to_string();
+    a.embedding_input_version = "v2-composite".to_string();
+    let emb: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
+    store.insert_memory(&a, Some(&emb)).unwrap();
+    let got = store.get_memory(&a.id).unwrap().unwrap();
+    assert_eq!(got.embedding_input_version, "v2-composite");
+
+    // A row written WITHOUT a stamp (e.g. an old code path) lands with the SQL
+    // default backfill 'v1-content-only' — proving the column default works.
+    let mut b = note(&ns, "unstamped row", MemoryType::Reference, 5);
+    b.embedding_model = "deterministic".to_string();
+    b.embedding_input_version = String::new(); // explicit empty stamp
+    let emb_b: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
+    store.insert_memory(&b, Some(&emb_b)).unwrap();
+    let got_b = store.get_memory(&b.id).unwrap().unwrap();
+    // We inserted an explicit empty string, so it round-trips as empty (the SQL
+    // DEFAULT only applies when the column is omitted from the INSERT).
+    assert_eq!(got_b.embedding_input_version, "");
+
+    // The 003 migration also SEEDS meta.embedding_input_version = 'v2-composite'
+    // (INSERT OR IGNORE). Assert it explicitly — the column round-trip above does
+    // not exercise the meta seed, so a broken seed would otherwise pass this gate.
+    assert_eq!(
+        store
+            .meta_value("embedding_input_version")
+            .unwrap()
+            .as_deref(),
+        Some("v2-composite"),
+        "migration 003 must seed meta.embedding_input_version"
+    );
+}
+
+#[test]
+fn reembed_scan_and_update_vector_round_trip() {
+    use rb_store::Store as _;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reembed.db");
+    let store = SqliteStore::open(&db_path, DIM).unwrap();
+    let ns = Namespace::Project("reembed".to_string());
+
+    // A stale row (old model + version) and a current row.
+    let mut stale = note(&ns, "stale row", MemoryType::Insight, 5);
+    stale.embedding_model = "old-model".to_string();
+    stale.embedding_input_version = "v1-content-only".to_string();
+    let stale_emb: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
+    store.insert_memory(&stale, Some(&stale_emb)).unwrap();
+
+    let mut current = note(&ns, "current row", MemoryType::Insight, 5);
+    current.embedding_model = "deterministic".to_string();
+    current.embedding_input_version = "v2-composite".to_string();
+    let cur_emb: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
+    store.insert_memory(&current, Some(&cur_emb)).unwrap();
+
+    // Only the stale row is a re-embed candidate.
+    let cands = store
+        .memories_for_reembed("deterministic", "v2-composite", 100)
+        .unwrap();
+    let ids: Vec<_> = cands.iter().map(|c| c.id.clone()).collect();
+    assert!(ids.contains(&stale.id), "stale row is a candidate");
+    assert!(!ids.contains(&current.id), "current row is not a candidate");
+
+    // Re-embed the stale row: replaces vector + stamps to current.
+    let new_emb: [f32; DIM] = [0.0, 0.0, 1.0, 0.0];
+    store
+        .update_vector(&stale.id, &new_emb, "deterministic", "v2-composite")
+        .unwrap();
+    let after = store.get_memory(&stale.id).unwrap().unwrap();
+    assert_eq!(after.embedding_model, "deterministic");
+    assert_eq!(after.embedding_input_version, "v2-composite");
+
+    // Now it is no longer a candidate: a second scan finds nothing (idempotent).
+    let cands2 = store
+        .memories_for_reembed("deterministic", "v2-composite", 100)
+        .unwrap();
+    assert!(
+        cands2.iter().all(|c| c.id != stale.id),
+        "re-embedded row is no longer stale"
+    );
+
+    // The replacement vector is the nearest neighbor of new_emb.
+    let hits = store.vector_search(&ns, &new_emb, 1).unwrap();
+    assert_eq!(hits[0].0, stale.id, "updated vector is searchable");
+}
+
+#[test]
+fn update_vector_rejects_missing_id_and_wrong_dim() {
+    use rb_store::Store as _;
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("reembed_err.db");
+    let store = SqliteStore::open(&db_path, DIM).unwrap();
+
+    // Missing id => NotFound.
+    let missing = MemoryId::new();
+    let emb: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
+    let err = store
+        .update_vector(&missing, &emb, "deterministic", "v2-composite")
+        .unwrap_err();
+    assert!(matches!(err, rb_types::Error::NotFound(_)), "got {err:?}");
+
+    // Wrong dimension => DimensionMismatch (fail-closed), before any write.
+    let ns = Namespace::Project("dim".to_string());
+    let n = note(&ns, "dim guard", MemoryType::Insight, 5);
+    store.insert_memory(&n, Some(&emb)).unwrap();
+    let bad: [f32; 2] = [1.0, 2.0];
+    let err = store
+        .update_vector(&n.id, &bad, "deterministic", "v2-composite")
+        .unwrap_err();
+    assert!(
+        matches!(err, rb_types::Error::DimensionMismatch { .. }),
+        "got {err:?}"
+    );
+}

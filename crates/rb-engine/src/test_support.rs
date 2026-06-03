@@ -21,6 +21,9 @@ pub(crate) struct MockBackend {
     record_access_calls: std::sync::atomic::AtomicUsize,
     fail_record_access: std::sync::atomic::AtomicBool,
     fail_add_link: std::sync::atomic::AtomicBool,
+    update_vector_calls: std::sync::atomic::AtomicUsize,
+    fail_update_vector: std::sync::atomic::AtomicBool,
+    fail_contradicts: std::sync::atomic::AtomicBool,
 }
 
 impl MockBackend {
@@ -71,6 +74,32 @@ impl MockBackend {
             .get(id)
             .map(|n| n.links.clone())
             .unwrap_or_default()
+    }
+    pub fn update_vector_count(&self) -> usize {
+        self.update_vector_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn set_fail_update_vector(&self, fail: bool) {
+        self.fail_update_vector
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn set_fail_contradicts(&self, fail: bool) {
+        self.fail_contradicts
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Record a directed contradicts link on the source note (test helper).
+    pub fn link_contradicts(&self, source: &MemoryId, target: &MemoryId) {
+        let mut guard = self.notes.lock().unwrap();
+        if let Some(note) = guard.get_mut(source) {
+            note.links.push(rb_types::MemoryLink {
+                source_id: source.clone(),
+                target_id: target.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "test contradiction".to_string(),
+                created_at: chrono::Utc::now(),
+            });
+        }
     }
 }
 
@@ -276,6 +305,110 @@ impl MemoryBackend for MockBackend {
             .iter()
             .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
             .collect())
+    }
+
+    async fn active_contradicts(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<std::collections::HashSet<MemoryId>> {
+        use std::collections::HashSet;
+        if self
+            .fail_contradicts
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(rb_types::Error::Storage(
+                "active_contradicts forced failure".to_string(),
+            ));
+        }
+        let guard = self.notes.lock().unwrap();
+        // Mirror the store contract: flag an endpoint only when BOTH endpoints are
+        // active AND in the queried namespace. (SqliteStore::active_contradicts
+        // requires `archived_at IS NULL` and `namespace = ns` on both the local and
+        // far endpoints.) Without gating the local endpoint the mock would flag
+        // archived or out-of-namespace ids the store never returns.
+        let active = |id: &MemoryId| {
+            guard
+                .get(id)
+                .is_some_and(|n| n.archived_at.is_none() && n.namespace == ns)
+        };
+        let requested: HashSet<&MemoryId> = ids.iter().collect();
+        let mut contested: HashSet<MemoryId> = HashSet::new();
+        // Scan every stored note's outbound contradicts links; flag BOTH endpoints
+        // when each is requested and both endpoints are active + in namespace
+        // (mirrors the store's inbound-OR-outbound, both-active, both-in-ns semantics).
+        for note in guard.values() {
+            for link in &note.links {
+                if link.link_type != rb_types::LinkType::Contradicts {
+                    continue;
+                }
+                let (src, tgt) = (&link.source_id, &link.target_id);
+                if requested.contains(src) && active(src) && active(tgt) {
+                    contested.insert(src.clone());
+                }
+                if requested.contains(tgt) && active(tgt) && active(src) {
+                    contested.insert(tgt.clone());
+                }
+            }
+        }
+        Ok(contested)
+    }
+
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.archived_at.is_none())
+            .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
+            .cloned()
+            .collect();
+        // Mirror the store's scan order: oldest first, then memory_id (the TEXT
+        // column) ascending — bounded + deterministic, matching the contract
+        // (HashMap iteration order must never decide which rows a `limit` selects).
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> rb_types::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.update_vector_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_update_vector.load(Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "update_vector forced failure".to_string(),
+            ));
+        }
+        // Fail closed on a missing id, like SqliteStore::update_vector (NotFound),
+        // so engine tests cannot pass on a vector-update path production rejects.
+        if !self.notes.lock().unwrap().contains_key(&id) {
+            return Err(rb_types::Error::NotFound(id));
+        }
+        self.embeddings
+            .lock()
+            .unwrap()
+            .insert(id.clone(), embedding);
+        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+            note.embedding_model = model;
+            note.embedding_input_version = input_version;
+        }
+        Ok(())
     }
 }
 

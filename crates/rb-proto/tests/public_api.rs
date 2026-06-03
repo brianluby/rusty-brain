@@ -8,8 +8,8 @@ use rb_types::{Error, MemoryId, Namespace};
 
 #[test]
 fn public_surface_is_reachable_and_stable() {
-    // Constants and messages.
-    assert_eq!(CONTRACT_VERSION, 1);
+    // Constants and messages. v2 = P5 Feature C (additive `contested`).
+    assert_eq!(CONTRACT_VERSION, 2);
     let _hs = Handshake {
         contract_version: CONTRACT_VERSION,
         namespace: Namespace::Global,

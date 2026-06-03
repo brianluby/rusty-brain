@@ -7,7 +7,9 @@ use std::collections::HashMap;
 /// - `keyword`: ids in rank order (index 0 = best keyword hit).
 /// - `vector`: `(id, cosine_distance)` pairs (smaller distance = closer).
 /// - `graph`: ids in hop order (index 0 = nearest in the graph walk).
-/// - `meta`: per-id `(importance, created_at)`, the source of truth for scoring/fetch.
+/// - `meta`: per-id `(importance, confidence, created_at)`, the source of truth
+///   for scoring/fetch. `confidence` (Feature C) flows into `Signals.confidence`
+///   and is applied as a multiplicative dampener at rank time.
 ///
 /// A candidate may appear in any subset of the three paths; each path fills only its
 /// own field, leaving the rest `None` so `rank` contributes 0 for absent signals.
@@ -18,7 +20,7 @@ pub fn build_signals(
     keyword: &[MemoryId],
     vector: &[(MemoryId, f32)],
     graph: &[MemoryId],
-    meta: &HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)>,
+    meta: &HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)>,
 ) -> Vec<Signals> {
     // Preserve first-seen order with a parallel index map into `out`.
     let mut index: HashMap<MemoryId, usize> = HashMap::new();
@@ -35,7 +37,7 @@ pub fn build_signals(
             return Some(i);
         }
         // Only materialize a candidate we have metadata for.
-        let (importance, created_at) = *meta.get(id)?;
+        let (importance, confidence, created_at) = *meta.get(id)?;
         let i = out.len();
         out.push(Signals {
             id: id.clone(),
@@ -43,6 +45,9 @@ pub fn build_signals(
             vector_distance: None,
             graph_hops: None,
             importance,
+            // Confidence flows from `meta` (Feature C); applied as a multiplicative
+            // dampener at rank time. A confidence of 1.0 is the neutral no-op.
+            confidence,
             created_at,
         });
         index.insert(id.clone(), i);
@@ -90,9 +95,9 @@ mod tests {
         let vec_only = MemoryId::new();
         let graph_only = MemoryId::new();
 
-        let mut meta: HashMap<MemoryId, (u8, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        let mut meta: HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)> = HashMap::new();
         for id in [&shared, &kw_only, &vec_only, &graph_only] {
-            meta.insert(id.clone(), (5, now));
+            meta.insert(id.clone(), (5, 1.0, now));
         }
 
         let keyword = vec![shared.clone(), kw_only.clone()];
@@ -139,7 +144,7 @@ mod tests {
         let c = MemoryId::new();
         let mut meta = HashMap::new();
         for id in [&a, &b, &c] {
-            meta.insert(id.clone(), (5, now));
+            meta.insert(id.clone(), (5, 1.0, now));
         }
         let keyword = vec![a.clone(), b.clone(), c.clone()];
         let graph = vec![c.clone(), b.clone(), a.clone()];
@@ -163,7 +168,7 @@ mod tests {
         let earlier = MemoryId::new();
         let mut meta = HashMap::new();
         for id in [&duplicate, &earlier] {
-            meta.insert(id.clone(), (5, now));
+            meta.insert(id.clone(), (5, 1.0, now));
         }
 
         let keyword = vec![duplicate.clone(), earlier, duplicate.clone()];
@@ -179,7 +184,7 @@ mod tests {
         let now = Utc::now();
         let duplicate = MemoryId::new();
         let mut meta = HashMap::new();
-        meta.insert(duplicate.clone(), (5, now));
+        meta.insert(duplicate.clone(), (5, 1.0, now));
 
         let vector = vec![(duplicate.clone(), 0.8), (duplicate.clone(), 0.2)];
         let signals = build_signals(&[], &vector, &[], &meta);
@@ -194,7 +199,7 @@ mod tests {
         let other = MemoryId::new();
         let mut meta = HashMap::new();
         for id in [&duplicate, &other] {
-            meta.insert(id.clone(), (5, now));
+            meta.insert(id.clone(), (5, 1.0, now));
         }
 
         let graph = vec![duplicate.clone(), other, duplicate.clone()];
@@ -206,14 +211,16 @@ mod tests {
     }
 
     #[test]
-    fn carries_importance_and_created_at_from_meta() {
+    fn carries_importance_confidence_and_created_at_from_meta() {
         let created = Utc::now();
         let id = MemoryId::new();
         let mut meta = HashMap::new();
-        meta.insert(id.clone(), (8u8, created));
+        meta.insert(id.clone(), (8u8, 0.4f32, created));
         let signals = build_signals(std::slice::from_ref(&id), &[], &[], &meta);
         assert_eq!(signals.len(), 1);
         assert_eq!(signals[0].importance, 8);
+        // confidence now flows from meta (Feature C), not a hardcoded neutral.
+        assert!((signals[0].confidence - 0.4).abs() < f32::EPSILON);
         assert_eq!(signals[0].created_at, created);
     }
 
@@ -223,7 +230,7 @@ mod tests {
         let known = MemoryId::new();
         let unknown = MemoryId::new(); // appears in results but has no meta entry
         let mut meta = HashMap::new();
-        meta.insert(known.clone(), (5, now));
+        meta.insert(known.clone(), (5, 1.0, now));
         let keyword = vec![known.clone(), unknown.clone()];
         let signals = build_signals(&keyword, &[], &[], &meta);
         // the unknown id is dropped (cannot be scored or fetched) -> fail closed.
@@ -237,8 +244,8 @@ mod tests {
         let strong = MemoryId::new();
         let weak = MemoryId::new();
         let mut meta = HashMap::new();
-        meta.insert(strong.clone(), (9u8, now));
-        meta.insert(weak.clone(), (2u8, now));
+        meta.insert(strong.clone(), (9u8, 1.0, now));
+        meta.insert(weak.clone(), (2u8, 1.0, now));
         let keyword = vec![strong.clone(), weak.clone()];
         let vector = vec![(strong.clone(), 0.1), (weak.clone(), 1.7)];
         let signals = build_signals(&keyword, &vector, &[], &meta);
