@@ -322,8 +322,12 @@ impl MemoryBackend for MockBackend {
             ));
         }
         let guard = self.notes.lock().unwrap();
-        // Mirror the store: the FAR endpoint must be active AND in the queried
-        // namespace, so a cross-namespace contradiction never flags a result.
+        // Mirror the store contract: flag a LOCAL endpoint only when it lives in the
+        // queried namespace AND its FAR endpoint is active and in the same namespace.
+        // (SqliteStore::active_contradicts scopes BOTH endpoints to `ns`, with the
+        // far endpoint also required active.) Without the local-namespace gate the
+        // mock would flag out-of-namespace ids the store never returns.
+        let in_ns = |id: &MemoryId| guard.get(id).is_some_and(|n| n.namespace == ns);
         let active = |id: &MemoryId| {
             guard
                 .get(id)
@@ -332,18 +336,18 @@ impl MemoryBackend for MockBackend {
         let requested: HashSet<&MemoryId> = ids.iter().collect();
         let mut contested: HashSet<MemoryId> = HashSet::new();
         // Scan every stored note's outbound contradicts links; flag BOTH endpoints
-        // when each is requested and the FAR endpoint is active (mirrors the store
-        // query's inbound-OR-outbound, active-far-endpoint semantics).
+        // when each is requested, IN namespace, and its FAR endpoint is active
+        // (mirrors the store's inbound-OR-outbound, both-in-ns, active-far semantics).
         for note in guard.values() {
             for link in &note.links {
                 if link.link_type != rb_types::LinkType::Contradicts {
                     continue;
                 }
                 let (src, tgt) = (&link.source_id, &link.target_id);
-                if requested.contains(src) && active(tgt) {
+                if requested.contains(src) && in_ns(src) && active(tgt) {
                     contested.insert(src.clone());
                 }
-                if requested.contains(tgt) && active(src) {
+                if requested.contains(tgt) && in_ns(tgt) && active(src) {
                     contested.insert(tgt.clone());
                 }
             }
@@ -366,7 +370,14 @@ impl MemoryBackend for MockBackend {
             .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
             .cloned()
             .collect();
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        // Mirror the store's scan order: oldest first, then memory_id (the TEXT
+        // column) ascending — bounded + deterministic, matching the contract
+        // (HashMap iteration order must never decide which rows a `limit` selects).
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
         v.truncate(limit);
         Ok(v)
     }
@@ -384,6 +395,11 @@ impl MemoryBackend for MockBackend {
             return Err(rb_types::Error::Storage(
                 "update_vector forced failure".to_string(),
             ));
+        }
+        // Fail closed on a missing id, like SqliteStore::update_vector (NotFound),
+        // so engine tests cannot pass on a vector-update path production rejects.
+        if !self.notes.lock().unwrap().contains_key(&id) {
+            return Err(rb_types::Error::NotFound(id));
         }
         self.embeddings
             .lock()

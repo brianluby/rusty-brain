@@ -1176,6 +1176,20 @@ impl Store for SqliteStore {
             params.push(Box::new(context.clone()));
         }
 
+        // If a field that feeds `embedding_input` (content / tags / context — the
+        // composite document text) changed, stale this row's embedding stamp so the
+        // next `reembed` recomputes its vector. Without this, a tags/context edit
+        // would leave the stored vector permanently stale: the version-only reembed
+        // scan only revisits rows whose `(model, input_version)` differs from
+        // current, and an in-place field edit keeps the current stamp. Empty string
+        // is the documented "stale, re-embed me" sentinel. (Content edits are
+        // rejected upstream in the engine, but stamping it here keeps the storage
+        // invariant self-contained.)
+        if updates.content.is_some() || updates.tags.is_some() || updates.context.is_some() {
+            sets.push(format!("embedding_input_version = ?{}", params.len() + 1));
+            params.push(Box::new(String::new()));
+        }
+
         // An all-None update is a true no-op: do not bump updated_at or issue an
         // UPDATE when nothing changed.
         if sets.is_empty() {
@@ -2446,6 +2460,80 @@ mod update_tests {
             before.updated_at.timestamp(),
             "all-None update must not bump updated_at"
         );
+    }
+
+    #[test]
+    fn editing_embedded_field_stales_embedding_stamp_for_reembed() {
+        // Editing a field that feeds embedding_input (tags here) must stale the
+        // row's embedding_input_version so the next reembed scan recomputes its
+        // vector — otherwise the stored vector stays permanently stale.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.embedding_model = "model-x".into();
+        m.embedding_input_version = "v2-composite".into();
+        store.insert_memory(&m, None).unwrap();
+
+        // Up to date: not a reembed candidate.
+        assert!(store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap()
+            .is_empty());
+
+        // Edit tags (an embedded field) -> stamp staled to the empty sentinel.
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    tags: Some(vec!["new".into()]),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(
+            got.embedding_input_version, "",
+            "embedded-field edit stales the stamp"
+        );
+
+        // Now a reembed candidate.
+        let stale = store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap();
+        assert_eq!(stale.len(), 1);
+        assert_eq!(stale[0].id, m.id);
+    }
+
+    #[test]
+    fn editing_non_embedded_field_does_not_stale_stamp() {
+        // Editing importance/summary (NOT part of embedding_input) must leave the
+        // stamp intact so it never triggers a needless reembed.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.embedding_model = "model-x".into();
+        m.embedding_input_version = "v2-composite".into();
+        store.insert_memory(&m, None).unwrap();
+
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    summary: Some("s".into()),
+                    importance: Some(7),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert_eq!(
+            got.embedding_input_version, "v2-composite",
+            "non-embedded edit keeps the stamp"
+        );
+        assert!(store
+            .memories_for_reembed("model-x", "v2-composite", 10)
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

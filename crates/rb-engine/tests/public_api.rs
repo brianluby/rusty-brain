@@ -174,7 +174,14 @@ impl MemoryBackend for VecBackend {
             .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
             .cloned()
             .collect();
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        // Mirror the store's scan order: oldest first, then memory_id ascending —
+        // bounded + deterministic (created_at ASC, memory_id ASC), as the contract
+        // requires, so a `limit` here selects the same batch as production.
+        v.sort_by(|a, b| {
+            a.created_at
+                .cmp(&b.created_at)
+                .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+        });
         v.truncate(limit);
         Ok(v)
     }

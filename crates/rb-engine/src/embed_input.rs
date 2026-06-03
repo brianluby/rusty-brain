@@ -28,9 +28,12 @@ pub const EMBEDDING_INPUT_VERSION: &str = "v2-composite";
 pub fn embedding_input(note: &MemoryNote) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(4);
 
-    let content = note.content.trim();
-    if !content.is_empty() {
-        parts.push(content.to_string());
+    // Push raw content (NOT trimmed): pre-P5 embedded `note.content` verbatim, so a
+    // content-only note must reproduce that exact representation — otherwise
+    // re-embedding silently shifts its vector, and two notes differing only by
+    // surrounding whitespace would collide. Skip only when content is truly blank.
+    if !note.content.trim().is_empty() {
+        parts.push(note.content.clone());
     }
 
     let keywords = join_non_empty(&note.keywords);
@@ -88,6 +91,15 @@ mod tests {
         // lines), so a never-enriched memory matches the pre-P5 representation.
         let n = note("single writer over sqlite wal");
         assert_eq!(embedding_input(&n), "single writer over sqlite wal");
+    }
+
+    #[test]
+    fn content_only_note_preserves_raw_whitespace_for_v1_parity() {
+        // Pre-P5 embedded note.content verbatim. A content-only note must embed the
+        // RAW string (including surrounding whitespace) so re-embedding is a true
+        // no-op for it and whitespace-variant notes do not collide on one vector.
+        let n = note("  spaced out  ");
+        assert_eq!(embedding_input(&n), "  spaced out  ");
     }
 
     #[test]

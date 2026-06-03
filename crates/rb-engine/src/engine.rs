@@ -433,6 +433,13 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// `changed == 0`). Fail-safe per row: an embedding or write failure is
     /// logged and counted as `skipped` (retried on the next run), never fatal.
     /// Returns `(scanned, changed, skipped)`.
+    ///
+    /// Scope: `reembed` converges *vectors* only. Similarity-derived graph links
+    /// created at `remember` time are NOT regenerated here, so the graph leg of
+    /// `recall` may still reflect pre-reembed neighborhoods until links are rebuilt.
+    /// Link evolution on re-embed (A-MEM's "evolve-and-re-embed neighbors") is
+    /// deferred to P6; the graph term is a minor 0.10-weight signal and links decay
+    /// independently, so vector convergence is sufficient for P5's transition.
     pub async fn reembed(&self, limit: usize) -> rb_types::Result<(u64, u64, u64)> {
         let model = self.embedder.model_id().to_string();
         let input_version = crate::embed_input::EMBEDDING_INPUT_VERSION.to_string();
