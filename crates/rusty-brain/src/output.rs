@@ -79,14 +79,20 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
         });
     }
     match memory {
-        Some(n) => format!(
-            "{}\nnamespace: {}\ntype: {}\nimportance: {}\n\n{}",
-            n.id,
-            n.namespace.as_db_string(),
-            n.memory_type.as_str(),
-            n.importance,
-            n.content
-        ),
+        Some(n) => {
+            // Surface the contested flag (Feature C) on the get read path too, so
+            // every human surface (recall/list/context/get) marks a contradicted note.
+            let contested = if n.contested { " [contested]" } else { "" };
+            format!(
+                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}\n\n{}",
+                n.id,
+                contested,
+                n.namespace.as_db_string(),
+                n.memory_type.as_str(),
+                n.importance,
+                n.content
+            )
+        }
         None => "Memory not found.".to_string(),
     }
 }
@@ -286,6 +292,15 @@ mod tests {
         assert!(none.to_lowercase().contains("not found"));
         let json_none = render_get(&None, true);
         assert_eq!(json_none.trim(), "null");
+    }
+
+    #[test]
+    fn human_get_marks_contested_note() {
+        // The get read path must also surface the contested marker (Feature C).
+        let mut n = note("body", 5);
+        n.contested = true;
+        let out = render_get(&Some(n), false);
+        assert!(out.contains("[contested]"), "get marks contested: {out}");
     }
 
     #[test]

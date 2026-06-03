@@ -62,10 +62,11 @@ pub trait Store {
     /// the recall N+1. Links are loaded per returned note.
     fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>>;
     /// For each id in `ids`, return whether it has at least one ACTIVE
-    /// `contradicts` link — inbound OR outbound — where the OTHER endpoint memory
-    /// is itself active (`archived_at IS NULL`) AND both endpoints live in namespace
-    /// `ns`. One batched query over `memory_links` (Feature C, spec §9). Scoping
-    /// both endpoints to `ns` preserves namespace isolation: `memory_links` carries
+    /// `contradicts` link — inbound OR outbound — where BOTH endpoints are active
+    /// (`archived_at IS NULL`) AND live in namespace `ns`. One batched query over
+    /// `memory_links` (Feature C, spec §9). Requiring the LOCAL endpoint active too
+    /// means an archived memory fetched via `get` is never flagged `contested`.
+    /// Scoping both endpoints to `ns` preserves namespace isolation: `memory_links` carries
     /// no namespace and `add_link` permits cross-namespace edges, so without this an
     /// out-of-namespace memory could flag a result `contested`. The returned set
     /// contains exactly the ids that are contested; ids absent from the set are not
@@ -303,6 +304,24 @@ impl SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         Ok(())
+    }
+
+    /// Read a value from the key/value `meta` table (e.g. the
+    /// `embedding_input_version` seed written by migration 003), or `None` if the
+    /// key is absent. A small read helper for invariant checks and the migration
+    /// reproducibility gate.
+    pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT value FROM meta WHERE key = ?1",
+                rusqlite::params![key],
+                |r| r.get::<_, String>(0),
+            )
+            .map(Some)
+            .or_else(|e| match e {
+                rusqlite::Error::QueryReturnedNoRows => Ok(None),
+                other => Err(Error::Storage(other.to_string())),
+            })
     }
 
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -1423,6 +1442,7 @@ impl Store for SqliteStore {
                JOIN memories loc ON loc.memory_id = l.source_id
              WHERE l.link_type = 'contradicts'
                AND far.archived_at IS NULL
+               AND loc.archived_at IS NULL
                AND far.namespace = {ns_param}
                AND loc.namespace = {ns_param}
                AND l.source_id IN ({in_list})
@@ -1432,6 +1452,7 @@ impl Store for SqliteStore {
                JOIN memories loc ON loc.memory_id = l.target_id
              WHERE l.link_type = 'contradicts'
                AND far.archived_at IS NULL
+               AND loc.archived_at IS NULL
                AND far.namespace = {ns_param}
                AND loc.namespace = {ns_param}
                AND l.target_id IN ({in_list})"
@@ -3274,6 +3295,25 @@ mod contradiction_tests {
         assert!(
             !flagged.contains(&a.id),
             "contradiction with an archived memory is inactive"
+        );
+    }
+
+    #[test]
+    fn archived_local_endpoint_is_not_flagged() {
+        // get() can return an archived memory; even with a live contradicts edge to
+        // an ACTIVE partner, an archived LOCAL row must not be flagged contested
+        // (Feature C: "ACTIVE contradicts" requires BOTH endpoints active).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a active");
+        let b = node(&store, "b will be archived");
+        contradicts(&store, &a, &b);
+        store.archive_memory(&b.id).unwrap();
+        let flagged = store
+            .active_contradicts(&Namespace::Global, std::slice::from_ref(&b.id))
+            .unwrap();
+        assert!(
+            !flagged.contains(&b.id),
+            "an archived local endpoint must not be flagged contested"
         );
     }
 

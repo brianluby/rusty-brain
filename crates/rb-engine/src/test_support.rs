@@ -322,12 +322,11 @@ impl MemoryBackend for MockBackend {
             ));
         }
         let guard = self.notes.lock().unwrap();
-        // Mirror the store contract: flag a LOCAL endpoint only when it lives in the
-        // queried namespace AND its FAR endpoint is active and in the same namespace.
-        // (SqliteStore::active_contradicts scopes BOTH endpoints to `ns`, with the
-        // far endpoint also required active.) Without the local-namespace gate the
-        // mock would flag out-of-namespace ids the store never returns.
-        let in_ns = |id: &MemoryId| guard.get(id).is_some_and(|n| n.namespace == ns);
+        // Mirror the store contract: flag an endpoint only when BOTH endpoints are
+        // active AND in the queried namespace. (SqliteStore::active_contradicts
+        // requires `archived_at IS NULL` and `namespace = ns` on both the local and
+        // far endpoints.) Without gating the local endpoint the mock would flag
+        // archived or out-of-namespace ids the store never returns.
         let active = |id: &MemoryId| {
             guard
                 .get(id)
@@ -336,18 +335,18 @@ impl MemoryBackend for MockBackend {
         let requested: HashSet<&MemoryId> = ids.iter().collect();
         let mut contested: HashSet<MemoryId> = HashSet::new();
         // Scan every stored note's outbound contradicts links; flag BOTH endpoints
-        // when each is requested, IN namespace, and its FAR endpoint is active
-        // (mirrors the store's inbound-OR-outbound, both-in-ns, active-far semantics).
+        // when each is requested and both endpoints are active + in namespace
+        // (mirrors the store's inbound-OR-outbound, both-active, both-in-ns semantics).
         for note in guard.values() {
             for link in &note.links {
                 if link.link_type != rb_types::LinkType::Contradicts {
                     continue;
                 }
                 let (src, tgt) = (&link.source_id, &link.target_id);
-                if requested.contains(src) && in_ns(src) && active(tgt) {
+                if requested.contains(src) && active(src) && active(tgt) {
                     contested.insert(src.clone());
                 }
-                if requested.contains(tgt) && in_ns(tgt) && active(src) {
+                if requested.contains(tgt) && active(tgt) && active(src) {
                     contested.insert(tgt.clone());
                 }
             }

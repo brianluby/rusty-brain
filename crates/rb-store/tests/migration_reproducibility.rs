@@ -200,6 +200,18 @@ fn fresh_db_has_embedding_input_version_column_and_meta_seed() {
     // We inserted an explicit empty string, so it round-trips as empty (the SQL
     // DEFAULT only applies when the column is omitted from the INSERT).
     assert_eq!(got_b.embedding_input_version, "");
+
+    // The 003 migration also SEEDS meta.embedding_input_version = 'v2-composite'
+    // (INSERT OR IGNORE). Assert it explicitly — the column round-trip above does
+    // not exercise the meta seed, so a broken seed would otherwise pass this gate.
+    assert_eq!(
+        store
+            .meta_value("embedding_input_version")
+            .unwrap()
+            .as_deref(),
+        Some("v2-composite"),
+        "migration 003 must seed meta.embedding_input_version"
+    );
 }
 
 #[test]
