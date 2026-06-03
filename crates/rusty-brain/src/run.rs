@@ -172,6 +172,15 @@ async fn run_client(
                 println!("evolve {job}: scanned={scanned} changed={changed} skipped={skipped}");
             }
         }
+        Command::Reembed { limit } => {
+            let (scanned, changed, skipped) =
+                client.reembed(limit).await.context("reembed failed")?;
+            if json {
+                println!("{{\"scanned\":{scanned},\"changed\":{changed},\"skipped\":{skipped}}}");
+            } else {
+                println!("reembed: scanned={scanned} changed={changed} skipped={skipped}");
+            }
+        }
     }
     Ok(())
 }

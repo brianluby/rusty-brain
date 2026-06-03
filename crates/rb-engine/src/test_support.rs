@@ -21,6 +21,9 @@ pub(crate) struct MockBackend {
     record_access_calls: std::sync::atomic::AtomicUsize,
     fail_record_access: std::sync::atomic::AtomicBool,
     fail_add_link: std::sync::atomic::AtomicBool,
+    update_vector_calls: std::sync::atomic::AtomicUsize,
+    fail_update_vector: std::sync::atomic::AtomicBool,
+    fail_contradicts: std::sync::atomic::AtomicBool,
 }
 
 impl MockBackend {
@@ -71,6 +74,32 @@ impl MockBackend {
             .get(id)
             .map(|n| n.links.clone())
             .unwrap_or_default()
+    }
+    pub fn update_vector_count(&self) -> usize {
+        self.update_vector_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
+    }
+    pub fn set_fail_update_vector(&self, fail: bool) {
+        self.fail_update_vector
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn set_fail_contradicts(&self, fail: bool) {
+        self.fail_contradicts
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    /// Record a directed contradicts link on the source note (test helper).
+    pub fn link_contradicts(&self, source: &MemoryId, target: &MemoryId) {
+        let mut guard = self.notes.lock().unwrap();
+        if let Some(note) = guard.get_mut(source) {
+            note.links.push(rb_types::MemoryLink {
+                source_id: source.clone(),
+                target_id: target.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "test contradiction".to_string(),
+                created_at: chrono::Utc::now(),
+            });
+        }
     }
 }
 
@@ -276,6 +305,95 @@ impl MemoryBackend for MockBackend {
             .iter()
             .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
             .collect())
+    }
+
+    async fn active_contradicts(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<std::collections::HashSet<MemoryId>> {
+        use std::collections::HashSet;
+        if self
+            .fail_contradicts
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            return Err(rb_types::Error::Storage(
+                "active_contradicts forced failure".to_string(),
+            ));
+        }
+        let guard = self.notes.lock().unwrap();
+        // Mirror the store: the FAR endpoint must be active AND in the queried
+        // namespace, so a cross-namespace contradiction never flags a result.
+        let active = |id: &MemoryId| {
+            guard
+                .get(id)
+                .is_some_and(|n| n.archived_at.is_none() && n.namespace == ns)
+        };
+        let requested: HashSet<&MemoryId> = ids.iter().collect();
+        let mut contested: HashSet<MemoryId> = HashSet::new();
+        // Scan every stored note's outbound contradicts links; flag BOTH endpoints
+        // when each is requested and the FAR endpoint is active (mirrors the store
+        // query's inbound-OR-outbound, active-far-endpoint semantics).
+        for note in guard.values() {
+            for link in &note.links {
+                if link.link_type != rb_types::LinkType::Contradicts {
+                    continue;
+                }
+                let (src, tgt) = (&link.source_id, &link.target_id);
+                if requested.contains(src) && active(tgt) {
+                    contested.insert(src.clone());
+                }
+                if requested.contains(tgt) && active(src) {
+                    contested.insert(tgt.clone());
+                }
+            }
+        }
+        Ok(contested)
+    }
+
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.archived_at.is_none())
+            .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
+            .cloned()
+            .collect();
+        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> rb_types::Result<()> {
+        use std::sync::atomic::Ordering;
+        self.update_vector_calls.fetch_add(1, Ordering::SeqCst);
+        if self.fail_update_vector.load(Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage(
+                "update_vector forced failure".to_string(),
+            ));
+        }
+        self.embeddings
+            .lock()
+            .unwrap()
+            .insert(id.clone(), embedding);
+        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+            note.embedding_model = model;
+            note.embedding_input_version = input_version;
+        }
+        Ok(())
     }
 }
 

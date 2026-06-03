@@ -20,11 +20,18 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
         } else {
             r.memory.summary.as_str()
         };
+        // Surface the contested flag (Feature C) inline for the human reader.
+        let contested = if r.memory.contested {
+            " [contested]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "[{:.2}] {} ({}) {}\n",
+            "[{:.2}] {} ({}){} {}\n",
             r.score,
             r.memory.id,
             r.memory.memory_type.as_str(),
+            contested,
             summary
         ));
     }
@@ -49,11 +56,14 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         } else {
             n.summary.as_str()
         };
+        // Surface the contested flag (Feature C) inline for the human reader.
+        let contested = if n.contested { " [contested]" } else { "" };
         out.push_str(&format!(
-            "{} (imp {}, {}) {}\n",
+            "{} (imp {}, {}){} {}\n",
             n.id,
             n.importance,
             n.memory_type.as_str(),
+            contested,
             summary
         ));
     }
@@ -194,6 +204,39 @@ mod tests {
             "summary shown: {out}"
         );
         assert!(out.contains(&n.id.to_string()), "id shown: {out}");
+    }
+
+    #[test]
+    fn human_recall_marks_contested_results() {
+        let mut n = note("conflicting claim", 5);
+        n.contested = true;
+        let results = vec![SearchResult {
+            memory: n,
+            score: 0.8,
+        }];
+        let out = render_recall(&results, false);
+        assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
+    fn json_recall_includes_contested_field() {
+        let mut n = note("conflicting claim", 5);
+        n.contested = true;
+        let results = vec![SearchResult {
+            memory: n,
+            score: 0.8,
+        }];
+        let out = render_recall(&results, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert!(parsed[0]["memory"]["contested"].as_bool().unwrap());
+    }
+
+    #[test]
+    fn human_list_marks_contested_notes() {
+        let mut n = note("conflicting note", 5);
+        n.contested = true;
+        let out = render_notes(std::slice::from_ref(&n), false);
+        assert!(out.contains("[contested]"), "contested marker shown: {out}");
     }
 
     #[test]

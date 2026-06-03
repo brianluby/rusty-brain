@@ -1,0 +1,30 @@
+[package]
+name = "rb-eval"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "Offline, deterministic retrieval-quality regression harness for rusty-brain (dev/CI only)."
+publish = false
+
+# This is a dev/measurement crate. It is deliberately NOT a dependency of the
+# `rusty-brain` binary; nothing in the shipped closure depends on it. The CI
+# agent/closure gate asserts it never appears in `cargo tree -e no-dev -p rusty-brain`.
+
+[lints]
+workspace = true
+
+[dependencies]
+rb-engine = { path = "../rb-engine" }
+rb-store = { path = "../rb-store" }
+rb-search = { path = "../rb-search" }
+rb-embed = { path = "../rb-embed" }
+rb-types = { path = "../rb-types" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+async-trait = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+tokio = { workspace = true }

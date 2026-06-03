@@ -254,6 +254,11 @@ mod tests {
                     changed: 0,
                     skipped: 0,
                 },
+                Request::Reembed { .. } => Response::JobRan {
+                    scanned: 0,
+                    changed: 0,
+                    skipped: 0,
+                },
             })
         }
     }

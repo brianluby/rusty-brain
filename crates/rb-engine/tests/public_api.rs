@@ -150,6 +150,48 @@ impl MemoryBackend for VecBackend {
             .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
             .collect())
     }
+
+    async fn active_contradicts(
+        &self,
+        _ns: Namespace,
+        _ids: Vec<MemoryId>,
+    ) -> rb_types::Result<std::collections::HashSet<MemoryId>> {
+        Ok(std::collections::HashSet::new())
+    }
+
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>> {
+        let mut v: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.archived_at.is_none())
+            .filter(|n| n.embedding_model != model || n.embedding_input_version != input_version)
+            .cloned()
+            .collect();
+        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        v.truncate(limit);
+        Ok(v)
+    }
+
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        _embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> rb_types::Result<()> {
+        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+            note.embedding_model = model;
+            note.embedding_input_version = input_version;
+        }
+        Ok(())
+    }
 }
 
 #[tokio::test]

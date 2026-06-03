@@ -54,6 +54,38 @@ pub trait MemoryBackend: Send + Sync {
         ns: Namespace,
         ids: Vec<MemoryId>,
     ) -> rb_types::Result<Vec<MemoryNote>>;
+    /// Return the subset of `ids` that have at least one ACTIVE `contradicts`
+    /// link (inbound OR outbound) whose far endpoint is active AND where both
+    /// endpoints live in namespace `ns` (Feature C, spec §9). Scoping to `ns`
+    /// preserves namespace isolation — `memory_links` carries no namespace, so an
+    /// out-of-namespace edge must not flag a result `contested`. One batched read
+    /// over `memory_links`. Used post-ranking to set `MemoryNote.contested`;
+    /// callers treat errors as fail-open (unflagged).
+    async fn active_contradicts(
+        &self,
+        ns: Namespace,
+        ids: Vec<MemoryId>,
+    ) -> rb_types::Result<std::collections::HashSet<MemoryId>>;
+    /// Scan up to `limit` ACTIVE memories (across ALL namespaces) whose stamped
+    /// `(embedding_model, embedding_input_version)` differs from the current
+    /// `(model, input_version)` pair — the re-embed candidates (read path).
+    /// Bounded; deterministic order. Used by the `reembed` batch.
+    async fn memories_for_reembed(
+        &self,
+        model: String,
+        input_version: String,
+        limit: usize,
+    ) -> rb_types::Result<Vec<MemoryNote>>;
+    /// Replace `id`'s stored vector and stamp its row with the current
+    /// `(model, input_version)` in one transaction (write path, single writer).
+    /// This is the first vector-UPDATE path; `remember` only ever INSERTs.
+    async fn update_vector(
+        &self,
+        id: MemoryId,
+        embedding: Vec<f32>,
+        model: String,
+        input_version: String,
+    ) -> rb_types::Result<()>;
 }
 
 #[cfg(test)]
@@ -218,6 +250,51 @@ mod tests {
                 .iter()
                 .filter_map(|id| guard.get(id).filter(|n| n.namespace == ns).cloned())
                 .collect())
+        }
+        async fn active_contradicts(
+            &self,
+            _ns: Namespace,
+            _ids: Vec<MemoryId>,
+        ) -> rb_types::Result<std::collections::HashSet<MemoryId>> {
+            Ok(std::collections::HashSet::new())
+        }
+        async fn memories_for_reembed(
+            &self,
+            model: String,
+            input_version: String,
+            limit: usize,
+        ) -> rb_types::Result<Vec<MemoryNote>> {
+            let mut v: Vec<MemoryNote> = self
+                .notes
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|n| n.archived_at.is_none())
+                .filter(|n| {
+                    n.embedding_model != model || n.embedding_input_version != input_version
+                })
+                .cloned()
+                .collect();
+            v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+            v.truncate(limit);
+            Ok(v)
+        }
+        async fn update_vector(
+            &self,
+            id: MemoryId,
+            embedding: Vec<f32>,
+            model: String,
+            input_version: String,
+        ) -> rb_types::Result<()> {
+            self.embeddings
+                .lock()
+                .unwrap()
+                .insert(id.clone(), embedding);
+            if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
+                note.embedding_model = model;
+                note.embedding_input_version = input_version;
+            }
+            Ok(())
         }
     }
 

@@ -115,6 +115,16 @@ pub enum Command {
         /// `importance_recalibration`.
         job: String,
     },
+
+    /// Re-embed active memories whose vector is built from a stale composition
+    /// (P5 Feature A). Bounded and idempotent: a second run over unchanged data
+    /// reports `changed=0`. Re-run until `changed=0` to converge a large corpus.
+    Reembed {
+        /// Maximum memories to scan/re-embed in this pass (else the daemon
+        /// batch default).
+        #[arg(long)]
+        limit: Option<usize>,
+    },
 }
 
 #[cfg(test)]
@@ -145,6 +155,20 @@ mod tests {
         match cli.command {
             Command::Evolve { job } => assert_eq!(job, "link_decay"),
             other => panic!("expected Evolve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reembed_parses_with_optional_limit() {
+        let cli = Cli::parse_from(["rusty-brain", "reembed"]);
+        match cli.command {
+            Command::Reembed { limit } => assert_eq!(limit, None),
+            other => panic!("expected Reembed, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["rusty-brain", "reembed", "--limit", "250"]);
+        match cli.command {
+            Command::Reembed { limit } => assert_eq!(limit, Some(250)),
+            other => panic!("expected Reembed, got {other:?}"),
         }
     }
 

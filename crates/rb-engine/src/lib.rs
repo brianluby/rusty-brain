@@ -7,6 +7,7 @@
 #![cfg_attr(test, allow(clippy::unwrap_used, clippy::expect_used))]
 
 mod backend;
+mod embed_input;
 mod engine;
 mod enrich;
 mod enricher;
@@ -15,6 +16,7 @@ mod linker;
 mod test_support;
 
 pub use backend::MemoryBackend;
+pub use embed_input::{embedding_input, EMBEDDING_INPUT_VERSION};
 pub use engine::{MemoryEngine, RememberInput};
 pub use enricher::{Enricher, Enrichment};
 pub use linker::{Linker, SimilarityLinker};

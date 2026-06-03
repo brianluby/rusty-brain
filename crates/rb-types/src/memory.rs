@@ -27,7 +27,20 @@ pub struct MemoryNote {
     pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
     pub superseded_by: Option<MemoryId>,
     pub embedding_model: String,
+    /// Stamp of the composition that produced this row's vector (P5 Feature A).
+    /// Empty until set at write by the engine; the `reembed` batch re-embeds
+    /// rows whose `(embedding_model, embedding_input_version)` stamp is stale.
+    /// `#[serde(default)]` so pre-P5 payloads (which lack this field) deserialize
+    /// to an empty stamp — already the valid "stale, re-embed me" sentinel.
+    #[serde(default)]
+    pub embedding_input_version: String,
     pub links: Vec<MemoryLink>,
+    /// Read-side annotation (P5 Feature C): `true` when this memory has at least
+    /// one ACTIVE `contradicts` link (inbound or outbound). NOT persisted —
+    /// computed per recall/get/list/context from `memory_links`. Additive and
+    /// `#[serde(default)]` so older payloads (and clients) default to `false`.
+    #[serde(default)]
+    pub contested: bool,
 }
 
 impl MemoryNote {
@@ -60,7 +73,9 @@ impl MemoryNote {
             archived_at: None,
             superseded_by: None,
             embedding_model: String::new(),
+            embedding_input_version: String::new(),
             links: Vec::new(),
+            contested: false,
         }
     }
 }
@@ -98,6 +113,7 @@ mod tests {
         assert!((m.confidence - 1.0).abs() < f32::EPSILON);
         assert_eq!(m.access_count, 0);
         assert_eq!(m.embedding_model, "");
+        assert_eq!(m.embedding_input_version, "");
         assert!(m.keywords.is_empty());
         assert!(m.tags.is_empty());
         assert!(m.related_files.is_empty());
@@ -105,6 +121,22 @@ mod tests {
         assert!(m.last_accessed_at.is_none());
         assert!(m.archived_at.is_none());
         assert!(m.superseded_by.is_none());
+        // `contested` is a computed read-side flag (Feature C), not persisted; a
+        // fresh note is never contested.
+        assert!(!m.contested);
+    }
+
+    #[test]
+    fn contested_defaults_to_false_when_absent_from_json() {
+        // Backward compatibility: an older payload without `contested` must
+        // deserialize with `contested == false` (serde default), keeping old
+        // clients/data correct.
+        let m = sample();
+        let mut value = serde_json::to_value(&m).unwrap();
+        value.as_object_mut().unwrap().remove("contested");
+        let back: MemoryNote = serde_json::from_value(value).unwrap();
+        assert!(!back.contested);
+        assert_eq!(back.id, m.id);
     }
 
     #[test]
@@ -126,5 +158,20 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: MemoryNote = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn deserializes_pre_p5_payload_missing_additive_fields() {
+        // A pre-P5 MemoryNote JSON lacks `embedding_input_version` (and
+        // `contested`). `#[serde(default)]` must let it deserialize, defaulting
+        // the stamp to an empty string — the valid "stale, re-embed me" sentinel.
+        let m = sample();
+        let mut value = serde_json::to_value(&m).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        obj.remove("embedding_input_version");
+        obj.remove("contested");
+        let back: MemoryNote = serde_json::from_value(value).unwrap();
+        assert_eq!(back.embedding_input_version, "");
+        assert!(!back.contested);
     }
 }
