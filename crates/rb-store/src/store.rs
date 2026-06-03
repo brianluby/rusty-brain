@@ -2537,6 +2537,36 @@ mod update_tests {
     }
 
     #[test]
+    fn set_confidence_updates_validates_range_and_noops_on_missing() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(proj, "body".into(), MemoryType::Insight, 5);
+        m.confidence = 1.0;
+        store.insert_memory(&m, None).unwrap();
+
+        // A valid value lands on the row.
+        store.set_confidence(&m.id, 0.75).unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((got.confidence - 0.75).abs() < 1e-6);
+
+        // Out-of-range and non-finite values fail closed with InvalidArgument,
+        // and leave the stored value untouched.
+        for bad in [-0.1f32, 1.1, f32::NAN] {
+            assert!(matches!(
+                store.set_confidence(&m.id, bad),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+        let unchanged = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((unchanged.confidence - 0.75).abs() < 1e-6);
+
+        // A missing id is a no-op Ok (0 rows) that touches no existing row.
+        store.set_confidence(&MemoryId::new(), 0.2).unwrap();
+        let still = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((still.confidence - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
     fn rejects_out_of_range_importance() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let m = MemoryNote::new(Namespace::Global, "x".into(), MemoryType::Reference, 5);

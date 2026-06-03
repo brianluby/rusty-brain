@@ -286,6 +286,10 @@ mod tests {
             model: String,
             input_version: String,
         ) -> rb_types::Result<()> {
+            // Fail closed on a missing id, like SqliteStore::update_vector.
+            if !self.notes.lock().unwrap().contains_key(&id) {
+                return Err(rb_types::Error::NotFound(id));
+            }
             self.embeddings
                 .lock()
                 .unwrap()

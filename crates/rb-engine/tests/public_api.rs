@@ -193,11 +193,17 @@ impl MemoryBackend for VecBackend {
         model: String,
         input_version: String,
     ) -> rb_types::Result<()> {
-        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
-            note.embedding_model = model;
-            note.embedding_input_version = input_version;
+        // Fail closed on a missing id, like SqliteStore::update_vector, so the
+        // public-API backend matches the store-backed behavior.
+        let mut guard = self.notes.lock().unwrap();
+        match guard.get_mut(&id) {
+            Some(note) => {
+                note.embedding_model = model;
+                note.embedding_input_version = input_version;
+                Ok(())
+            }
+            None => Err(rb_types::Error::NotFound(id)),
         }
-        Ok(())
     }
 }
 
