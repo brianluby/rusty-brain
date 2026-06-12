@@ -391,6 +391,7 @@ async fn probe_live(path: &Path) -> bool {
             let hs = Handshake {
                 contract_version: CONTRACT_VERSION,
                 namespace: rb_types::Namespace::Global,
+                identity: None,
             };
             if write_frame(&mut framed, &hs).await.is_err() {
                 return false;
@@ -457,6 +458,19 @@ async fn handle_connection(
     };
     write_frame(&mut framed, &ack).await?;
 
+    // Connection-scoped provenance (W0.5): client-declared identity with a
+    // daemon-side whoami fallback for user/host (same-host UDS, so the daemon's
+    // view is authoritative when the client stays silent). agent/session/source
+    // are client knowledge only — an old client (no identity) leaves them None.
+    let identity = handshake.identity.unwrap_or_default();
+    let provenance = rb_engine::Provenance {
+        origin_user: identity.user.or_else(rb_config::current_user),
+        origin_host: identity.host.or_else(rb_config::current_hostname),
+        origin_agent: identity.agent,
+        origin_source: identity.source,
+        session_id: identity.session_id,
+    };
+
     let store_for_stream = store.clone();
     let job_store = store.clone();
     let engine = {
@@ -483,7 +497,7 @@ async fn handle_connection(
             stream_changes(&mut framed, &store_for_stream, &namespace).await;
             break;
         }
-        let resp = dispatch(&engine, &job_store, &jobs_config, req).await;
+        let resp = dispatch(&engine, &job_store, &jobs_config, &provenance, req).await;
         write_frame(&mut framed, &resp).await?;
     }
 
@@ -550,6 +564,7 @@ async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
+    provenance: &rb_engine::Provenance,
     req: Request,
 ) -> Response
 where
@@ -567,6 +582,7 @@ where
             keywords,
             tags,
             related_files,
+            confidence,
         } => {
             let input = RememberInput {
                 content,
@@ -576,6 +592,8 @@ where
                 keywords,
                 tags,
                 related_files,
+                confidence,
+                provenance: provenance.clone(),
             };
             match engine.remember(input).await {
                 Ok(id) => Response::Remembered { id },

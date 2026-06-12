@@ -31,8 +31,20 @@ pub enum SubscribeItem {
 impl Client {
     /// Connect to the daemon socket, perform the versioned handshake, and verify
     /// the daemon speaks `CONTRACT_VERSION`. Fails closed on any version drift or
-    /// a non-ok ack.
+    /// a non-ok ack. Sends no identity; provenance-aware callers use
+    /// [`connect_with_identity`](Self::connect_with_identity).
     pub async fn connect(socket_path: &Path, namespace: Namespace) -> Result<Client> {
+        Self::connect_with_identity(socket_path, namespace, None).await
+    }
+
+    /// [`connect`](Self::connect) carrying an optional client identity on the
+    /// handshake (W0.5): the daemon stamps it as provenance on every memory this
+    /// connection writes. `None` matches the pre-W0.5 wire shape exactly.
+    pub async fn connect_with_identity(
+        socket_path: &Path,
+        namespace: Namespace,
+        identity: Option<crate::ClientIdentity>,
+    ) -> Result<Client> {
         let stream = UnixStream::connect(socket_path)
             .await
             .map_err(|e| Error::from_io(&e))?;
@@ -41,6 +53,7 @@ impl Client {
         let handshake = Handshake {
             contract_version: CONTRACT_VERSION,
             namespace,
+            identity,
         };
         write_frame(&mut framed, &handshake).await?;
 
@@ -130,7 +143,8 @@ impl Client {
         }
     }
 
-    /// Store a new memory; returns its id.
+    /// Store a new memory; returns its id. `confidence` is the trust prior in
+    /// `0.0..=1.0` (1.0 = today's full-trust default; hook captures send 0.7).
     #[allow(clippy::too_many_arguments)]
     pub async fn remember(
         &mut self,
@@ -141,6 +155,7 @@ impl Client {
         keywords: Vec<String>,
         tags: Vec<String>,
         related_files: Vec<String>,
+        confidence: f32,
     ) -> Result<MemoryId> {
         let resp = self
             .request(Request::Remember {
@@ -151,6 +166,7 @@ impl Client {
                 keywords,
                 tags,
                 related_files,
+                confidence,
             })
             .await?;
         match resp {
@@ -378,6 +394,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn connect_with_identity_carries_identity_on_the_handshake() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        // Inline responder that captures the handshake identity for assertion.
+        let server = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
+                Framed::new(stream, LengthDelimitedCodec::new());
+            let hs: Handshake = read_frame(&mut framed).await.unwrap();
+            write_frame(
+                &mut framed,
+                &HandshakeAck {
+                    contract_version: CONTRACT_VERSION,
+                    ok: true,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+            hs.identity
+        });
+
+        let identity = crate::ClientIdentity {
+            agent: Some("claude-code".into()),
+            session_id: Some("s-7".into()),
+            source: Some("hook".into()),
+            ..Default::default()
+        };
+        let _client =
+            Client::connect_with_identity(&path, Namespace::Global, Some(identity.clone()))
+                .await
+                .unwrap();
+        let got = server.await.unwrap();
+        assert_eq!(got, Some(identity), "identity must reach the daemon");
+    }
+
+    #[tokio::test]
     async fn connect_rejects_contract_version_mismatch() {
         let (_dir, path) = socket_path();
         let listener = UnixListener::bind(&path).unwrap();
@@ -527,6 +580,7 @@ mod wrapper_tests {
                 vec!["k".into()],
                 vec!["t".into()],
                 vec![],
+                1.0,
             )
             .await
             .unwrap();

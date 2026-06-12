@@ -15,6 +15,8 @@ path = "src/lib.rs"
 rb-types = { path = "../rb-types" }
 serde = { workspace = true }
 toml = { workspace = true }
+# gethostname(2) for the daemon-side provenance fallback (unix-only in practice).
+libc = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

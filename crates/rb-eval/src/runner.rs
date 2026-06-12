@@ -104,6 +104,8 @@ async fn ingest<P: EmbeddingProvider>(
                 keywords: m.keywords.clone(),
                 tags: m.tags.clone(),
                 related_files: Vec::new(),
+                confidence: 1.0,
+                provenance: Default::default(),
             })
             .await?;
         // Apply the authored confidence (no-op at the 1.0 default).

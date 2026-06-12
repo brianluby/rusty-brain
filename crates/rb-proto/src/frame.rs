@@ -81,6 +81,7 @@ mod tests {
         let hs = Handshake {
             contract_version: CONTRACT_VERSION,
             namespace: Namespace::Project("rusty-brain".into()),
+            identity: None,
         };
         write_frame(&mut client, &hs).await.unwrap();
 

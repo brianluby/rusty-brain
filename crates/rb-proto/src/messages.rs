@@ -18,6 +18,31 @@ pub const CONTRACT_VERSION: u32 = 2;
 pub struct Handshake {
     pub contract_version: u32,
     pub namespace: Namespace,
+    /// Optional client-declared identity (W0.5). Additive + `#[serde(default)]`
+    /// — an old client omits it (`None`) and an old daemon ignores it (serde
+    /// tolerates unknown fields), so NO contract-version bump is needed.
+    #[serde(default)]
+    pub identity: Option<ClientIdentity>,
+}
+
+/// Who/where/what is on the other end of a connection, declared by the client
+/// at handshake and stamped onto every memory it writes. All fields optional:
+/// the daemon falls back to its own whoami for `user`/`host` (same-host UDS),
+/// while `agent`/`session_id`/`source` are client-knowledge only.
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
+pub struct ClientIdentity {
+    #[serde(default)]
+    pub user: Option<String>,
+    #[serde(default)]
+    pub host: Option<String>,
+    /// The agent CLI driving the write (e.g. `claude-code`), when known.
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Producer surface, declared per binary: `hook` | `mcp` | `cli`.
+    #[serde(default)]
+    pub source: Option<String>,
 }
 
 /// Daemon reply to a `Handshake`.
@@ -40,6 +65,11 @@ pub enum Request {
         keywords: Vec<String>,
         tags: Vec<String>,
         related_files: Vec<String>,
+        /// Trust prior in `0.0..=1.0` (W0.5 / F39 producer down-payment).
+        /// `#[serde(default)]` to 1.0 so old clients keep today's behavior;
+        /// hook captures send 0.7. Range-validated by the engine.
+        #[serde(default = "default_confidence")]
+        confidence: f32,
     },
     Recall {
         query: String,
@@ -83,6 +113,12 @@ pub enum Request {
     /// The stream is scoped to the connection's handshake namespace, filtered
     /// server-side.
     Subscribe,
+}
+
+/// Serde default for `Request::Remember::confidence`: full trust, the
+/// pre-W0.5 hardwired value.
+fn default_confidence() -> f32 {
+    1.0
 }
 
 /// One response per request. Internally tagged on `result`.
@@ -166,11 +202,96 @@ mod tests {
         let hs = Handshake {
             contract_version: CONTRACT_VERSION,
             namespace: Namespace::Project("rusty-brain".into()),
+            identity: None,
         };
         let json = serde_json::to_string(&hs).unwrap();
         let back: Handshake = serde_json::from_str(&json).unwrap();
         assert_eq!(back.contract_version, CONTRACT_VERSION);
         assert_eq!(back.namespace, Namespace::Project("rusty-brain".into()));
+        assert!(back.identity.is_none());
+    }
+
+    #[test]
+    fn handshake_identity_round_trips() {
+        let hs = Handshake {
+            contract_version: CONTRACT_VERSION,
+            namespace: Namespace::Global,
+            identity: Some(ClientIdentity {
+                user: Some("alice".into()),
+                host: Some("devbox".into()),
+                agent: Some("claude-code".into()),
+                session_id: Some("s-1".into()),
+                source: Some("hook".into()),
+            }),
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let back: Handshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.identity, hs.identity);
+    }
+
+    #[test]
+    fn old_client_handshake_without_identity_deserializes() {
+        // A pre-W0.5 client sends exactly {contract_version, namespace}; the
+        // daemon must accept it with identity == None (no CONTRACT_VERSION bump:
+        // the field is additive and serde-default).
+        let hs = Handshake {
+            contract_version: CONTRACT_VERSION,
+            namespace: Namespace::Global,
+            identity: None,
+        };
+        let mut value = serde_json::to_value(&hs).unwrap();
+        value.as_object_mut().unwrap().remove("identity");
+        let back: Handshake = serde_json::from_value(value).unwrap();
+        assert!(back.identity.is_none());
+    }
+
+    #[test]
+    fn old_daemon_tolerates_identity_field_on_the_wire() {
+        // The reverse direction: a new client's handshake (with identity) must
+        // still deserialize under a decoder that doesn't know the field — serde
+        // ignores unknown fields by default, which this pins for Handshake.
+        #[derive(serde::Deserialize)]
+        struct OldHandshake {
+            contract_version: u32,
+            #[allow(dead_code)]
+            namespace: Namespace,
+        }
+        let hs = Handshake {
+            contract_version: CONTRACT_VERSION,
+            namespace: Namespace::Global,
+            identity: Some(ClientIdentity {
+                source: Some("cli".into()),
+                ..Default::default()
+            }),
+        };
+        let json = serde_json::to_string(&hs).unwrap();
+        let back: OldHandshake = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contract_version, CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn remember_without_confidence_defaults_to_full_trust() {
+        // Pre-W0.5 Remember payloads carry no confidence: serde must default it
+        // to 1.0 (today's hardwired value), keeping old clients byte-compatible.
+        let req = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: 0.3,
+        };
+        let mut value = serde_json::to_value(&req).unwrap();
+        value.as_object_mut().unwrap().remove("confidence");
+        let back: Request = serde_json::from_value(value).unwrap();
+        match back {
+            Request::Remember { confidence, .. } => {
+                assert!((confidence - 1.0).abs() < f32::EPSILON);
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
     }
 
     #[test]
@@ -197,6 +318,7 @@ mod tests {
                 keywords: vec!["k".into()],
                 tags: vec!["t".into()],
                 related_files: vec!["src/lib.rs".into()],
+                confidence: 0.7,
             },
             Request::Recall {
                 query: "q".into(),

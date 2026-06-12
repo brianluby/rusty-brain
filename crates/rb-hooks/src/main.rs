@@ -125,11 +125,21 @@ fn run() -> serde_json::Value {
         }
     };
 
+    // Provenance identity (W0.5): every hook write declares source=hook plus
+    // the driving agent CLI and the event's session id; the daemon stamps these
+    // onto the stored memories (user/host fall back to daemon-side whoami).
+    let identity = rb_proto::ClientIdentity {
+        agent: Some(cli.id().as_str().to_string()),
+        session_id: ctx.session_id.clone(),
+        source: Some("hook".to_string()),
+        ..Default::default()
+    };
+
     let result = runtime.block_on(async {
         // Overall timeout guards the whole connect+capture phase.
         match tokio::time::timeout(
             OVERALL_TIMEOUT,
-            capture_phase(&socket, &namespace, auto_start, &dedup, &ctx),
+            capture_phase(&socket, &namespace, auto_start, identity, &dedup, &ctx),
         )
         .await
         {
@@ -149,11 +159,18 @@ async fn capture_phase(
     socket: &std::path::Path,
     namespace: &rb_types::Namespace,
     auto_start: Option<AutoStart>,
+    identity: rb_proto::ClientIdentity,
     dedup: &DedupCache,
     ctx: &rb_agents::HookContext,
 ) -> HookResult {
-    let mut client =
-        DaemonClient::connect(socket, namespace.clone(), CONNECT_TIMEOUT, auto_start).await;
+    let mut client = DaemonClient::connect(
+        socket,
+        namespace.clone(),
+        CONNECT_TIMEOUT,
+        auto_start,
+        Some(identity),
+    )
+    .await;
     dispatch::dispatch(client.as_mut(), dedup, ctx).await
 }
 

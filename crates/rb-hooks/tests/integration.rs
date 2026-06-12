@@ -100,22 +100,37 @@ use rb_types::MemoryId;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+/// What the mock daemon observed from the hook: the handshake identity and
+/// the first Remember's payload (W0.5 provenance + confidence assertions).
+#[derive(Debug, Default, Clone)]
+struct Observed {
+    saw_remember: bool,
+    identity_source: Option<String>,
+    identity_agent: Option<String>,
+    confidence: Option<f32>,
+}
+
 // Accept one connection, handshake-ack, and answer the first Remember with a
-// canned id. Signals back via the channel that a Remember was observed.
-async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<bool>) {
+// canned id. Signals back via the channel what was observed.
+async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<Observed>) {
+    let mut observed = Observed::default();
     let Ok((stream, _addr)) = listener.accept().await else {
-        let _ = tx.send(false);
+        let _ = tx.send(observed);
         return;
     };
     let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
         Framed::new(stream, LengthDelimitedCodec::new());
-    let _hs: Handshake = match read_frame(&mut framed).await {
+    let hs: Handshake = match read_frame(&mut framed).await {
         Ok(h) => h,
         Err(_) => {
-            let _ = tx.send(false);
+            let _ = tx.send(observed);
             return;
         }
     };
+    if let Some(identity) = hs.identity {
+        observed.identity_source = identity.source;
+        observed.identity_agent = identity.agent;
+    }
     let _ = write_frame(
         &mut framed,
         &HandshakeAck {
@@ -125,11 +140,11 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
         },
     )
     .await;
-    let mut saw_remember = false;
     while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
         let resp = match req {
-            Request::Remember { .. } => {
-                saw_remember = true;
+            Request::Remember { confidence, .. } => {
+                observed.saw_remember = true;
+                observed.confidence = Some(confidence);
                 Response::Remembered {
                     id: MemoryId::new(),
                 }
@@ -150,7 +165,7 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
             break;
         }
     }
-    let _ = tx.send(saw_remember);
+    let _ = tx.send(observed);
 }
 
 #[test]
@@ -159,7 +174,7 @@ fn post_tool_use_against_live_daemon_remembers() {
     let socket = dir.path().join("live.sock");
     let socket_str = socket.to_string_lossy().to_string();
 
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let (tx, rx) = std::sync::mpsc::channel::<Observed>();
     let socket_for_thread = socket.clone();
     let server = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -168,11 +183,11 @@ fn post_tool_use_against_live_daemon_remembers() {
             .expect("rt");
         rt.block_on(async move {
             let listener = UnixListener::bind(&socket_for_thread).expect("bind");
-            let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
+            let (otx, orx) = tokio::sync::oneshot::channel::<Observed>();
             let accept = tokio::spawn(serve_one_remember(listener, otx));
-            let saw = orx.await.unwrap_or(false);
+            let observed = orx.await.unwrap_or_default();
             let _ = accept.await;
-            let _ = tx.send(saw);
+            let _ = tx.send(observed);
         });
     });
 
@@ -201,10 +216,22 @@ fn post_tool_use_against_live_daemon_remembers() {
     let output = child.wait_with_output().expect("wait for output");
     assert!(output.status.success(), "must exit 0");
 
-    let saw_remember = rx
+    let observed = rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap_or(false);
-    assert!(saw_remember, "the daemon should have observed a Remember");
+        .unwrap_or_default();
+    assert!(
+        observed.saw_remember,
+        "the daemon should have observed a Remember"
+    );
+    // W0.5: a hook-written memory declares source=hook + the driving agent on
+    // the handshake identity, and carries confidence 0.7 on the Remember.
+    assert_eq!(observed.identity_source.as_deref(), Some("hook"));
+    assert_eq!(observed.identity_agent.as_deref(), Some("claude-code"));
+    let confidence = observed.confidence.expect("Remember carries confidence");
+    assert!(
+        (confidence - 0.7).abs() < f32::EPSILON,
+        "hook captures must send confidence 0.7, got {confidence}"
+    );
     let _ = server.join();
     let _: PathBuf = socket; // keep tempdir alive until here
 }

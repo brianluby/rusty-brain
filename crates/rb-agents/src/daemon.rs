@@ -10,7 +10,7 @@ use std::time::Duration;
 // Auto-start env allowlist + override var names are owned by rb-config so the
 // hooks spawner and the CLI spawner can never disagree.
 use rb_config::{DB_ENV, FORWARD_ENV, SOCKET_ENV};
-use rb_proto::Client;
+use rb_proto::{Client, ClientIdentity};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 
 /// Auto-start parameters. Provided ONLY for `SessionStart`; any other event
@@ -32,14 +32,17 @@ impl DaemonClient {
     /// Connect with the rb-proto handshake inside `timeout`. ANY failure (IO,
     /// timeout, contract-version mismatch) yields `None`. When `auto_start` is
     /// `Some` (SessionStart only) and the first connect fails, spawn a detached
-    /// daemon then retry the connect briefly; otherwise never spawn.
+    /// daemon then retry the connect briefly; otherwise never spawn. `identity`
+    /// is the hook's provenance declaration (source/agent/session), stamped by
+    /// the daemon onto every memory this connection writes.
     pub async fn connect(
         socket: &Path,
         namespace: Namespace,
         timeout: Duration,
         auto_start: Option<AutoStart>,
+        identity: Option<ClientIdentity>,
     ) -> Option<DaemonClient> {
-        if let Some(client) = try_connect(socket, &namespace, timeout).await {
+        if let Some(client) = try_connect(socket, &namespace, timeout, identity.clone()).await {
             return Some(DaemonClient { client, timeout });
         }
         let auto = auto_start?;
@@ -49,7 +52,7 @@ impl DaemonClient {
             return None;
         }
         for _ in 0..50 {
-            if let Some(client) = try_connect(socket, &namespace, timeout).await {
+            if let Some(client) = try_connect(socket, &namespace, timeout, identity.clone()).await {
                 return Some(DaemonClient { client, timeout });
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -58,6 +61,7 @@ impl DaemonClient {
     }
 
     /// Best-effort `remember`. Returns the new id, or `None` on any error/timeout.
+    /// `confidence` is the trust prior in `0.0..=1.0` (hook captures send 0.7).
     pub async fn remember(
         &mut self,
         content: String,
@@ -65,6 +69,7 @@ impl DaemonClient {
         memory_type: MemoryType,
         importance: u8,
         tags: Vec<String>,
+        confidence: f32,
     ) -> Option<MemoryId> {
         let fut = self.client.remember(
             content,
@@ -74,6 +79,7 @@ impl DaemonClient {
             Vec::new(),
             tags,
             Vec::new(),
+            confidence,
         );
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(id)) => Some(id),
@@ -91,8 +97,18 @@ impl DaemonClient {
 }
 
 /// Connect + handshake within `timeout`; any error or timeout => `None`.
-async fn try_connect(socket: &Path, namespace: &Namespace, timeout: Duration) -> Option<Client> {
-    match tokio::time::timeout(timeout, Client::connect(socket, namespace.clone())).await {
+async fn try_connect(
+    socket: &Path,
+    namespace: &Namespace,
+    timeout: Duration,
+    identity: Option<ClientIdentity>,
+) -> Option<Client> {
+    match tokio::time::timeout(
+        timeout,
+        Client::connect_with_identity(socket, namespace.clone(), identity),
+    )
+    .await
+    {
         Ok(Ok(client)) => Some(client),
         Ok(Err(_)) | Err(_) => None,
     }
@@ -177,6 +193,12 @@ mod tests {
             Namespace::Project("rb-agents-test".to_string()),
             Duration::from_secs(5),
             None,
+            Some(ClientIdentity {
+                agent: Some("claude-code".to_string()),
+                session_id: Some("sess-42".to_string()),
+                source: Some("hook".to_string()),
+                ..Default::default()
+            }),
         )
         .await
         .expect("connect must succeed against a live daemon");
@@ -188,6 +210,7 @@ mod tests {
                 MemoryType::ArchitectureDecision,
                 9,
                 vec!["daemon".to_string()],
+                0.7,
             )
             .await
             .expect("remember must return an id");
@@ -198,10 +221,67 @@ mod tests {
             .await
             .expect("context must return a triple");
         assert!(total >= 1, "the stored memory must be counted");
+        let note = recent
+            .iter()
+            .chain(important.iter())
+            .find(|m| m.id == id)
+            .expect("stored memory must appear in recent or important");
+
+        // W0.5: the handshake identity is stamped onto the write, and the
+        // declared confidence (0.7 for hook captures) is persisted.
+        assert_eq!(note.origin_source.as_deref(), Some("hook"));
+        assert_eq!(note.origin_agent.as_deref(), Some("claude-code"));
+        assert_eq!(note.session_id.as_deref(), Some("sess-42"));
+        assert!((note.confidence - 0.7).abs() < f32::EPSILON);
+        // user/host were not declared: the daemon fell back to its own whoami.
+        assert_eq!(note.origin_user, rb_config::current_user());
+        assert_eq!(note.origin_host, rb_config::current_hostname());
+
+        let _ = shutdown.send(());
+        let _ = handle.await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn old_client_without_identity_gets_whoami_fallback_provenance() {
+        let (_dir, socket, shutdown, handle) = start_daemon().await;
+
+        // identity=None is exactly the pre-W0.5 handshake wire shape.
+        let mut client = DaemonClient::connect(
+            &socket,
+            Namespace::Project("rb-agents-old".to_string()),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .expect("old-shape connect must still succeed");
+
+        let id = client
+            .remember(
+                "legacy client write".to_string(),
+                None,
+                MemoryType::Insight,
+                8,
+                vec![],
+                1.0,
+            )
+            .await
+            .expect("remember must return an id");
+
+        let (recent, important, _total) = client.context().await.expect("context");
+        let note = recent
+            .iter()
+            .chain(important.iter())
+            .find(|m| m.id == id)
+            .expect("note present");
+        assert_eq!(note.origin_user, rb_config::current_user());
+        assert_eq!(note.origin_host, rb_config::current_hostname());
+        assert!(note.origin_agent.is_none());
         assert!(
-            !recent.is_empty() || !important.is_empty(),
-            "stored memory must appear in recent or important"
+            note.origin_source.is_none(),
+            "source is client-declared only"
         );
+        assert!(note.session_id.is_none());
 
         let _ = shutdown.send(());
         let _ = handle.await;
@@ -217,6 +297,7 @@ mod tests {
             Namespace::Global,
             Duration::from_millis(200),
             None, // no auto-start: must not spawn, must degrade to None
+            None,
         )
         .await;
         assert!(result.is_none(), "dead socket must degrade to None");

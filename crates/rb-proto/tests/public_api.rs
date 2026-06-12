@@ -13,6 +13,7 @@ fn public_surface_is_reachable_and_stable() {
     let _hs = Handshake {
         contract_version: CONTRACT_VERSION,
         namespace: Namespace::Global,
+        identity: None,
     };
     let _ack = HandshakeAck {
         contract_version: CONTRACT_VERSION,

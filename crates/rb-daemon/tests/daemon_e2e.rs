@@ -101,6 +101,7 @@ async fn full_round_trip_through_client() {
             vec!["sqlite".to_string()],
             vec!["design".to_string()],
             vec!["src/store.rs".to_string()],
+            1.0,
         )
         .await
         .unwrap();
@@ -186,6 +187,7 @@ async fn many_concurrent_clients_no_lost_writes_no_errors() {
                         vec!["concurrent".to_string()],
                         vec![],
                         vec![],
+                        1.0,
                     )
                     .await
                     .unwrap();
@@ -226,6 +228,7 @@ async fn namespace_isolation_enforced_server_side() {
             vec!["alpha".to_string()],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -241,6 +244,7 @@ async fn namespace_isolation_enforced_server_side() {
             vec!["beta".to_string()],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -360,6 +364,7 @@ async fn large_limit_is_clamped_and_does_not_error() {
                 vec![],
                 vec![],
                 vec![],
+                1.0,
             )
             .await
             .unwrap();
@@ -407,6 +412,7 @@ async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
             vec![],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -488,6 +494,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -521,6 +528,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -536,6 +544,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -590,6 +599,7 @@ async fn run_job_importance_recalibration_flows_through_client() {
             vec!["evolution".to_string()],
             vec!["jobs".to_string()],
             vec![],
+            1.0,
         )
         .await
         .unwrap();
@@ -639,6 +649,7 @@ async fn reembed_over_the_wire_is_stamp_skip_and_idempotent() {
                 vec![format!("kw{i}")],
                 vec!["reembed".to_string()],
                 vec![],
+                1.0,
             )
             .await
             .unwrap();

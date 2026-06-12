@@ -4,7 +4,7 @@
 // forwards the identical set; adding a var there widens the leak surface and
 // must fail `daemon_command_forwards_only_allowlisted_vars`.
 use rb_config::FORWARD_ENV;
-use rb_proto::Client;
+use rb_proto::{Client, ClientIdentity};
 use rb_types::{Error, Namespace, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -53,20 +53,34 @@ where
     Err(last_err.unwrap_or_else(|| Error::Io("connect failed".into())))
 }
 
+/// Build this binary's provenance identity (W0.5): `source` is the producer
+/// surface (`cli` | `mcp`); user/host are left for the daemon's whoami
+/// fallback (same host, same user over the UDS).
+pub fn client_identity(source: &str) -> ClientIdentity {
+    ClientIdentity {
+        source: Some(source.to_string()),
+        ..Default::default()
+    }
+}
+
 /// Connect to the daemon at `socket_path` for `namespace`, auto-starting a
 /// detached `rusty-brain serve` child if the socket is not yet accepting.
+/// `identity` (see [`client_identity`]) is stamped as provenance on every
+/// memory the connection writes.
 pub async fn connect_or_start(
     socket_path: &Path,
     db_path: &Path,
     namespace: Namespace,
     self_exe: PathBuf,
+    identity: Option<ClientIdentity>,
 ) -> Result<Client> {
     let sock = socket_path.to_path_buf();
     let ns = namespace.clone();
     let connect = || {
         let sock = sock.clone();
         let ns = ns.clone();
-        async move { Client::connect(&sock, ns).await }
+        let identity = identity.clone();
+        async move { Client::connect_with_identity(&sock, ns, identity).await }
     };
     let spawn_sock = socket_path.to_path_buf();
     let spawn_db = db_path.to_path_buf();

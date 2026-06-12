@@ -2499,6 +2499,7 @@ dependencies = [
 name = "rb-config"
 version = "0.0.1"
 dependencies = [
+ "libc",
  "rb-types",
  "serde",
  "tempfile",

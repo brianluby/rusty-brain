@@ -122,6 +122,7 @@ impl ClientProxy {
                 &self.db_path,
                 self.namespace.clone(),
                 self.self_exe.clone(),
+                Some(crate::client::client_identity("mcp")),
             )
             .await
             {
@@ -217,9 +218,15 @@ pub async fn run_mcp(
 ) -> anyhow::Result<()> {
     let self_exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("locating own executable: {e}"))?;
-    let client = connect_or_start(socket_path, db_path, namespace.clone(), self_exe.clone())
-        .await
-        .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
+    let client = connect_or_start(
+        socket_path,
+        db_path,
+        namespace.clone(),
+        self_exe.clone(),
+        Some(crate::client::client_identity("mcp")),
+    )
+    .await
+    .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
 
     // Bounded ring shared between the background subscriber and poll_changes.
     let buffer = Arc::new(Mutex::new(ChangeBuffer::new(1024)));
@@ -296,7 +303,14 @@ async fn connect_and_subscribe(
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
 ) -> rb_types::Result<Client> {
-    let mut client = connect_or_start(socket_path, db_path, namespace, self_exe).await?;
+    let mut client = connect_or_start(
+        socket_path,
+        db_path,
+        namespace,
+        self_exe,
+        Some(crate::client::client_identity("mcp")),
+    )
+    .await?;
     client.subscribe().await?;
     Ok(client)
 }
@@ -371,6 +385,7 @@ mod tests {
                 keywords: vec![],
                 tags: vec![],
                 related_files: vec![],
+                confidence: 1.0,
             },
             Request::Update {
                 id: id(),

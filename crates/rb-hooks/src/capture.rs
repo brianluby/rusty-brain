@@ -12,6 +12,11 @@ use crate::dedup::DedupCache;
 /// Max characters retained from a tool response before head/tail truncation.
 const MAX_RESPONSE_CHARS: usize = 2000;
 
+/// Trust prior for hook-captured memories (W0.5 / F39): automatic captures are
+/// unreviewed observations, not user-asserted facts, so they carry less than
+/// full confidence. Ranking already dampens low-confidence results.
+const HOOK_CONFIDENCE: f32 = 0.7;
+
 const TRUNCATION_MARKER: &str = "[...truncated...]";
 
 /// A `HookResult` that injects no message and always continues.
@@ -169,6 +174,7 @@ pub async fn post_tool_use(
                 memory_type,
                 5,
                 vec!["hook".to_string(), "post-tool-use".to_string()],
+                HOOK_CONFIDENCE,
             )
             .await;
     }
@@ -304,6 +310,7 @@ pub async fn stop(client: Option<&mut DaemonClient>, cwd: &std::path::Path) -> H
                 MemoryType::Reference,
                 4,
                 vec!["hook".to_string(), "session-summary".to_string()],
+                HOOK_CONFIDENCE,
             )
             .await;
     }
@@ -346,6 +353,7 @@ pub async fn pre_compact(
                 MemoryType::ArchitectureDecision,
                 8,
                 vec!["hook".to_string(), "pre-compact".to_string()],
+                HOOK_CONFIDENCE,
             )
             .await;
     }

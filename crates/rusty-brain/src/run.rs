@@ -60,9 +60,15 @@ async fn run_client(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
-    let mut client = client::connect_or_start(socket_path, db_path, namespace, self_exe)
-        .await
-        .context("connecting to daemon")?;
+    let mut client = client::connect_or_start(
+        socket_path,
+        db_path,
+        namespace,
+        self_exe,
+        Some(client::client_identity("cli")),
+    )
+    .await
+    .context("connecting to daemon")?;
 
     match command {
         Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
@@ -83,6 +89,7 @@ async fn run_client(
                     Vec::new(),
                     tags,
                     Vec::new(),
+                    1.0,
                 )
                 .await
                 .context("remember failed")?;
@@ -264,7 +271,7 @@ mod tests {
 
         let ns = Namespace::Project("injected".to_string());
         let started = Instant::now();
-        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe).await;
+        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe, None).await;
         let elapsed = started.elapsed();
 
         // Returns an Err quickly (no 50-retry backoff, no daemon spawn).

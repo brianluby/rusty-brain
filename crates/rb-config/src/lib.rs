@@ -157,6 +157,40 @@ pub fn default_db_path() -> Result<PathBuf> {
     Ok(data_base_dir()?.join("rusty-brain").join("memory.db"))
 }
 
+/// The current OS user, for provenance fallback (W0.5): `USER` then `LOGNAME`,
+/// `None` in a degenerate environment. The daemon stamps this onto memories
+/// written by clients that declared no identity (same-host UDS, so the
+/// daemon's view of the user is the client's user).
+pub fn current_user() -> Option<String> {
+    ["USER", "LOGNAME"]
+        .iter()
+        .find_map(|name| std::env::var(name).ok().filter(|value| !value.is_empty()))
+}
+
+/// The local hostname, for provenance fallback (W0.5). Unix: `gethostname(2)`;
+/// elsewhere (and on any failure) the `HOSTNAME` env var; else `None`.
+pub fn current_hostname() -> Option<String> {
+    #[cfg(unix)]
+    {
+        // _SC_HOST_NAME_MAX is at most 255 on supported platforms; a fixed
+        // 256-byte buffer (incl. NUL) is the conventional portable bound.
+        let mut buf = [0u8; 256];
+        // SAFETY: gethostname writes at most `len` bytes into the provided
+        // buffer and NUL-terminates when it fits; the buffer outlives the call.
+        #[allow(unsafe_code)]
+        let rc = unsafe { libc::gethostname(buf.as_mut_ptr().cast::<libc::c_char>(), buf.len()) };
+        if rc == 0 {
+            let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            if let Ok(name) = std::str::from_utf8(&buf[..end]) {
+                if !name.is_empty() {
+                    return Some(name.to_string());
+                }
+            }
+        }
+    }
+    std::env::var("HOSTNAME").ok().filter(|v| !v.is_empty())
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
@@ -185,6 +219,23 @@ mod tests {
                 None => std::env::remove_var(self.name),
             }
         }
+    }
+
+    #[test]
+    fn current_user_reads_user_env_first() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let _g = EnvGuard::set("USER", std::path::Path::new("provenance-test-user"));
+        assert_eq!(current_user().as_deref(), Some("provenance-test-user"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_hostname_resolves_on_unix() {
+        let name = current_hostname();
+        assert!(
+            name.as_deref().is_some_and(|n| !n.is_empty()),
+            "gethostname must resolve on unix, got {name:?}"
+        );
     }
 
     #[test]
