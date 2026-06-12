@@ -242,7 +242,13 @@ mod tests {
         }
         async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
             let mut guard = self.notes.lock().unwrap();
+            // Trait contract: duplicates within one call bump once (mirrors
+            // StoreHandle::buffer_accesses and the store's SQL IN-list dedup).
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
             for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
                 if let Some(note) = guard.get_mut(&id) {
                     note.access_count += 1;
                     note.last_accessed_at = Some(chrono::Utc::now());
@@ -385,5 +391,24 @@ mod tests {
             .unwrap();
         let ids: Vec<rb_types::MemoryId> = many.iter().map(|n| n.id.clone()).collect();
         assert_eq!(ids, vec![bid, aid]);
+    }
+
+    #[tokio::test]
+    async fn mock_backend_record_accesses_duplicate_ids_bump_once() {
+        // Trait contract (`record_accesses` doc): duplicates within one call
+        // bump once. Mirrors store.rs's record_accesses_duplicate_ids_bump_once.
+        let backend = MockBackend::default();
+        let note = MemoryNote::new(Namespace::Global, "dup".to_string(), MemoryType::Insight, 5);
+        let id = note.id.clone();
+        backend.write(note, None).await.unwrap();
+        backend
+            .record_accesses(vec![id.clone(), id.clone()])
+            .await
+            .unwrap();
+        let got = backend.get(Namespace::Global, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 1,
+            "duplicate ids in one call must not double-bump"
+        );
     }
 }

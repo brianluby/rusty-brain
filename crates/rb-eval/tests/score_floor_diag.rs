@@ -95,23 +95,31 @@ async fn sweep<P: EmbeddingProvider>(label: &str, engine: &MemoryEngine<SqliteBa
     junk_scores.sort_by(|a, b| a.total_cmp(b));
     let pct = |v: &[f64], p: f64| v[((v.len() - 1) as f64 * p) as usize];
     println!("== {label} ==");
-    println!(
-        "expected-in-top-k scores: n={} min={:.4} p05={:.4} p25={:.4} med={:.4}",
-        expected_scores.len(),
-        expected_scores.first().unwrap(),
-        pct(&expected_scores, 0.05),
-        pct(&expected_scores, 0.25),
-        pct(&expected_scores, 0.50),
-    );
-    println!(
-        "non-expected returned scores: n={} min={:.4} med={:.4} p75={:.4} p95={:.4} max={:.4}",
-        junk_scores.len(),
-        junk_scores.first().unwrap(),
-        pct(&junk_scores, 0.50),
-        pct(&junk_scores, 0.75),
-        pct(&junk_scores, 0.95),
-        junk_scores.last().unwrap(),
-    );
+    if expected_scores.is_empty() {
+        println!("expected-in-top-k scores: n=0");
+    } else {
+        println!(
+            "expected-in-top-k scores: n={} min={:.4} p05={:.4} p25={:.4} med={:.4}",
+            expected_scores.len(),
+            expected_scores.first().unwrap(),
+            pct(&expected_scores, 0.05),
+            pct(&expected_scores, 0.25),
+            pct(&expected_scores, 0.50),
+        );
+    }
+    if junk_scores.is_empty() {
+        println!("non-expected returned scores: n=0");
+    } else {
+        println!(
+            "non-expected returned scores: n={} min={:.4} med={:.4} p75={:.4} p95={:.4} max={:.4}",
+            junk_scores.len(),
+            junk_scores.first().unwrap(),
+            pct(&junk_scores, 0.50),
+            pct(&junk_scores, 0.75),
+            pct(&junk_scores, 0.95),
+            junk_scores.last().unwrap(),
+        );
+    }
 
     for floor in [
         0.0, 0.05, 0.075, 0.10, 0.125, 0.15, 0.175, 0.20, 0.25, 0.30, 0.35, 0.40,

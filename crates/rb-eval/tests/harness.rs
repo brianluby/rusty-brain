@@ -114,6 +114,7 @@ async fn fixtures_run_under_both_modes_and_report_metric_delta() {
         assert!((0.0..=1.0).contains(&r.mean_recall_at_k));
         assert!((0.0..=1.0).contains(&r.mrr));
         assert!((0.0..=1.0).contains(&r.dedup_precision));
+        assert!((0.0..=1.0).contains(&r.ndcg));
     }
     assert!(cmp.recall_at_k_delta.is_finite());
     assert!(cmp.mrr_delta.is_finite());
@@ -141,6 +142,10 @@ async fn linear_mode_matches_default_eval_quality_metrics() {
         (default.dedup_precision - linear.dedup_precision).abs() < 1e-12,
         "explicit Linear dedup must equal the default eval"
     );
+    assert!(
+        (default.ndcg - linear.ndcg).abs() < 1e-12,
+        "explicit Linear ndcg must equal the default eval"
+    );
 }
 
 #[tokio::test]
@@ -161,6 +166,10 @@ async fn rrf_mode_is_deterministic_across_runs() {
         (a.dedup_precision - b.dedup_precision).abs() < 1e-12,
         "rrf dedup drifted between runs"
     );
+    assert!(
+        (a.ndcg - b.ndcg).abs() < 1e-12,
+        "rrf ndcg drifted between runs"
+    );
 }
 
 #[tokio::test]
@@ -179,6 +188,7 @@ async fn report_is_deterministic_across_runs() {
         (a.dedup_precision - b.dedup_precision).abs() < 1e-12,
         "dedup_precision drifted between runs"
     );
+    assert!((a.ndcg - b.ndcg).abs() < 1e-12, "ndcg drifted between runs");
 }
 
 #[tokio::test]

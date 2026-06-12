@@ -40,6 +40,8 @@ for bin in rusty-brain rusty-brain-hooks rusty-brain-install; do
   [ -x "$BIN_DIR/$bin" ] || { echo "missing binary: $BIN_DIR/$bin (build with: cargo build --release -p rusty-brain -p rb-hooks -p rb-install)" >&2; exit 1; }
 done
 command -v claude >/dev/null 2>&1 || { echo "claude not on PATH (npm install -g @anthropic-ai/claude-code)" >&2; exit 1; }
+command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (needed to edit .claude/settings.json permissions)" >&2; exit 1; }
+command -v lsof >/dev/null 2>&1 || { echo "lsof not on PATH (needed for the one-daemon-process check)" >&2; exit 1; }
 [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "ANTHROPIC_API_KEY is not set" >&2; exit 1; }
 
 # Planted FAKE AWS access key id: matches the hook redaction rule
