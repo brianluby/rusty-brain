@@ -345,6 +345,16 @@ The current test suite is about **correctness, not performance or quality**:
   deterministic (non-semantic) vectors. It guards **ranking determinism and
   relative-ordering regressions** — "did this change reorder results?" — and explicitly
   does **not** measure absolute semantic quality.
+- **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
+  scheduled macOS job drives a real headless Claude Code session (`claude -p`) against
+  freshly built binaries with hooks + MCP installed into an isolated `HOME`, then proves
+  capture → idle → recall against exactly one daemon and one `0600` database,
+  and greps the raw DB bytes for a planted fake AWS key (zero plaintext hits, redaction
+  marker present). It is scheduled-only — it never gates PRs — and on failure it opens
+  or updates a pinned issue titled "nightly claude smoke failing". It requires the
+  **`ANTHROPIC_API_KEY`** repository secret (small spend: the session runs
+  `--model haiku --max-budget-usd 1`). Run it locally with
+  `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
 
 **Not yet tested:** performance and latency, behavior at scale (large corpora, many
 concurrent clients), real-world semantic recall quality with a production embedding
