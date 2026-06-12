@@ -14,6 +14,14 @@
 //! measure absolute semantic quality; that is the job of the optional, manual
 //! `#[ignore]` real-model mode (Voyage / `local`). See `README.md`.
 //!
+//! ## Evolution jobs are OFF in every eval run (W1.9)
+//!
+//! `rb-eval` deliberately does not depend on `rb-daemon`, where the background
+//! evolution jobs (importance recalibration, link decay, consolidation) live,
+//! so no eval run can mutate importance/links/duplicates behind retrieval's
+//! back — baselines measure retrieval alone. The harness test
+//! `eval_runs_with_evolution_jobs_off` pins this behaviorally.
+//!
 //! As a test-only crate it opts out of the workspace's
 //! `unwrap_used`/`expect_used` denials at the crate root; no panics leak into any
 //! shipped crate because nothing shipped depends on `rb-eval`.

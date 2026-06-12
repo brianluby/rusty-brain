@@ -292,6 +292,71 @@ async fn dedup_clusters_are_scored() {
     );
 }
 
+#[tokio::test]
+async fn eval_runs_with_evolution_jobs_off() {
+    // W1.9: rb-eval must measure retrieval with the evolution jobs OFF, so
+    // baselines never depend on importance recalibration / link decay /
+    // consolidation. That is structural — rb-eval does not depend on
+    // rb-daemon, where the jobs live — and this test pins it behaviorally:
+    // recall during a run records access signals (the recalibration job's
+    // only input), yet no memory's importance moves from its authored value.
+    use rb_engine::MemoryBackend;
+    use rb_eval::backend::{eval_namespace, EVAL_DIM};
+
+    let memories = vec![
+        mem(
+            "critical",
+            "the writer thread owns every sqlite mutation",
+            10,
+        ),
+        mem("minor", "the read pool serves recall lookups", 3),
+    ];
+    let corpus = Corpus {
+        memories,
+        golden_queries: vec![GoldenQuery {
+            query: "writer thread mutation".into(),
+            expected: vec!["critical".into()],
+            grades: vec![3],
+            k: Some(5),
+        }],
+        dedup_clusters: Vec::new(),
+    };
+
+    let engine =
+        rb_eval::build_engine_with(rb_embed::DeterministicProvider::new(EVAL_DIM)).expect("engine");
+    let run = rb_eval::run_corpus_with(&engine, &corpus)
+        .await
+        .expect("run");
+    assert!(
+        run.per_query[0].channels.returned > 0,
+        "the golden query must return results so accesses get recorded"
+    );
+
+    let stored = engine
+        .backend()
+        .list(eval_namespace(), None, 100)
+        .await
+        .expect("list");
+    assert_eq!(stored.len(), 2, "both fixtures stored");
+    assert!(
+        stored.iter().any(|m| m.access_count > 0),
+        "recall must have recorded access signals during the run"
+    );
+    for note in &stored {
+        let authored = corpus
+            .memories
+            .iter()
+            .find(|f| f.content == note.content)
+            .expect("stored note maps back to a fixture");
+        assert_eq!(
+            note.importance, authored.importance,
+            "evolution jobs are off in eval: importance must stay authored \
+             (fixture {})",
+            authored.key
+        );
+    }
+}
+
 fn mem(key: &str, content: &str, importance: u8) -> FixtureMemory {
     FixtureMemory {
         key: key.into(),

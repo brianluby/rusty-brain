@@ -76,6 +76,12 @@ impl Default for ConsolidationConfig {
 
 /// Importance-recalibration tuning (used by Part T). Declared here for a stable
 /// config schema; the job itself lands in Part T.
+///
+/// W1.9 (F33): the job modulates EFFECTIVE importance within ±2 of the
+/// immutable author-set prior (`base_importance`) — author intent is the
+/// anchor. It ships `enabled: false` and is intended to STAY disabled until
+/// the W3.7 usefulness signal exists, because today's only access signal
+/// (`access_count`) counts returned-from-recall, not actually-useful.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ImportanceConfig {

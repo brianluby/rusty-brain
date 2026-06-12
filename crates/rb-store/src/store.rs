@@ -476,6 +476,36 @@ impl SqliteStore {
         })
     }
 
+    /// Set the EFFECTIVE `importance` of a single memory WITHOUT touching its
+    /// `base_importance` author prior (W1.9). This is the importance
+    /// recalibration job's only write path; the user-facing `update_memory`
+    /// path is the only writer of `base_importance`. Validates the `1..=10`
+    /// range fail-closed (matching the insert path). A missing id is a no-op
+    /// (0 rows), mirroring `set_confidence`/`set_link_strength`.
+    pub fn set_recalibrated_importance(&self, id: &MemoryId, importance: u8) -> Result<()> {
+        rb_types::validate_importance(importance)?;
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — importance is durable ranking state replay must reproduce.
+        immediate_tx(&self.conn, || {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories SET importance = ?1, updated_at = ?2 WHERE memory_id = ?3",
+                    rusqlite::params![
+                        importance as i64,
+                        chrono::Utc::now().timestamp(),
+                        id.to_string()
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({ "importance": importance }).to_string();
+                append_oplog(&self.conn, &self.site_id, "set_importance", id, &details)?;
+            }
+            Ok(())
+        })
+    }
+
     /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
     /// fail-closed (matching the insert path). A missing id is a no-op (0 rows).
     /// Used by maintenance/test paths; the engine never mutates confidence on the
@@ -720,7 +750,14 @@ impl SqliteStore {
 pub struct RecalRow {
     pub namespace: Namespace,
     pub id: MemoryId,
+    /// Current EFFECTIVE importance (what ranking reads). The job uses it only
+    /// for change detection — never as a formula input.
     pub importance: u8,
+    /// Author-set importance prior (W1.9). The recalibration target is a pure
+    /// function of THIS value plus the access signals, bounded to its ±2 band,
+    /// which is what makes the job idempotent and author-intent-preserving.
+    /// Reads COALESCE to `importance` should the column ever be NULL.
+    pub base_importance: u8,
     pub access_count: i64,
     pub last_accessed_at: Option<i64>,
 }
@@ -734,7 +771,9 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT namespace, memory_id, importance, access_count, last_accessed_at
+                "SELECT namespace, memory_id, importance,
+                        COALESCE(base_importance, importance) AS base_importance,
+                        access_count, last_accessed_at
                  FROM memories
                  WHERE archived_at IS NULL
                  ORDER BY created_at DESC
@@ -759,6 +798,9 @@ impl SqliteStore {
             let importance = row
                 .get::<_, i64>("importance")
                 .map_err(|e| Error::Storage(e.to_string()))? as u8;
+            let base_importance =
+                row.get::<_, i64>("base_importance")
+                    .map_err(|e| Error::Storage(e.to_string()))? as u8;
             let access_count = row
                 .get::<_, i64>("access_count")
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -769,6 +811,7 @@ impl SqliteStore {
                 namespace,
                 id,
                 importance,
+                base_importance,
                 access_count,
                 last_accessed_at,
             });
@@ -1410,10 +1453,11 @@ impl Store for SqliteStore {
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id
+                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        base_importance
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
                      )",
                     rusqlite::params![
                         note.id.to_string(),
@@ -1440,6 +1484,10 @@ impl Store for SqliteStore {
                         note.origin_agent,
                         note.origin_source,
                         note.session_id,
+                        // W1.9: the author-set importance prior. Stamped once at
+                        // insert; the recalibration job never writes it, so the
+                        // bounded-delta formula stays anchored to author intent.
+                        note.importance as i64,
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1757,6 +1805,12 @@ impl Store for SqliteStore {
         }
         if let Some(importance) = updates.importance {
             sets.push(format!("importance = ?{}", params.len() + 1));
+            params.push(Box::new(importance as i64));
+            // W1.9: an explicit importance update is the author RE-DECLARING
+            // intent, so the prior moves with it. Only this user-facing path
+            // re-stamps `base_importance`; the recalibration job writes through
+            // `set_recalibrated_importance`, which leaves the prior untouched.
+            sets.push(format!("base_importance = ?{}", params.len() + 1));
             params.push(Box::new(importance as i64));
         }
         if let Some(tags) = &updates.tags {
@@ -4140,6 +4194,7 @@ mod near_duplicates_tests {
             .expect("active row a must be present");
         assert_eq!(row_a.namespace, Namespace::Global);
         assert_eq!(row_a.importance, 5);
+        assert_eq!(row_a.base_importance, 5, "insert stamps the author prior");
         assert_eq!(row_a.access_count, 7);
         assert_eq!(row_a.last_accessed_at, Some(1_700_000_000));
 
@@ -4149,8 +4204,93 @@ mod near_duplicates_tests {
             .expect("active row b must be present");
         assert_eq!(row_b.namespace, Namespace::Project("rb".into()));
         assert_eq!(row_b.importance, 3);
+        assert_eq!(row_b.base_importance, 3, "insert stamps the author prior");
         assert_eq!(row_b.access_count, 0);
         assert_eq!(row_b.last_accessed_at, None);
+    }
+
+    #[test]
+    fn set_recalibrated_importance_moves_effective_but_never_the_author_prior() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(Namespace::Global, "anchored".into(), MemoryType::Insight, 4);
+        store.insert_memory(&m, None).unwrap();
+
+        store.set_recalibrated_importance(&m.id, 6).unwrap();
+
+        let row = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("row present");
+        assert_eq!(row.importance, 6, "effective importance moved");
+        assert_eq!(
+            row.base_importance, 4,
+            "author prior must survive the job write"
+        );
+
+        let note = store.get_memory(&m.id).unwrap().expect("note present");
+        assert_eq!(note.importance, 6, "ranking reads the effective value");
+        assert!(
+            note.updated_at >= note.created_at,
+            "the job write bumps updated_at"
+        );
+    }
+
+    #[test]
+    fn set_recalibrated_importance_validates_range_and_ignores_missing_id() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Out-of-range importance fails closed (matching the insert path).
+        let err = store
+            .set_recalibrated_importance(&MemoryId::new(), 11)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "11 must be rejected, got {err:?}"
+        );
+        // Missing id with a valid value is a best-effort no-op.
+        store
+            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_importance_update_redeclares_the_author_prior() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(
+            Namespace::Global,
+            "re-declared".into(),
+            MemoryType::Insight,
+            3,
+        );
+        store.insert_memory(&m, None).unwrap();
+
+        // Simulate a prior recalibration: effective drifts, prior anchored.
+        store.set_recalibrated_importance(&m.id, 5).unwrap();
+
+        // The USER explicitly sets importance: both effective AND prior move —
+        // an explicit update is the author re-declaring intent.
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    importance: Some(9),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let row = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("row present");
+        assert_eq!(row.importance, 9);
+        assert_eq!(
+            row.base_importance, 9,
+            "an explicit user update re-anchors the author prior"
+        );
     }
 
     #[test]
@@ -4414,6 +4554,29 @@ mod oplog_tests {
         let details: serde_json::Value = serde_json::from_str(details).unwrap();
         assert_eq!(details["type"], "extends");
         assert_eq!(details["target"], target.id.to_string());
+    }
+
+    #[test]
+    fn set_recalibrated_importance_appends_oplog_only_on_real_change() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to recalibrate");
+
+        // Missing-id write: best-effort no-op, no oplog row.
+        store
+            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .unwrap();
+        assert_eq!(oplog_rows(&store).len(), 1, "only the insert is logged");
+
+        // A real job write logs a `set_importance` row a replay consumer can
+        // reproduce (importance is durable ranking state).
+        store.set_recalibrated_importance(&n.id, 7).unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2);
+        let (op, mid, _, _, details) = &rows[1];
+        assert_eq!(op, "set_importance");
+        assert_eq!(mid, &n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        assert_eq!(details["importance"], 7);
     }
 
     #[test]
@@ -4926,6 +5089,99 @@ mod mem_au_narrowing_migration_tests {
             fts_index_state(&store.conn),
             after_edit,
             "archive must not write FTS"
+        );
+    }
+}
+
+#[cfg(test)]
+mod base_importance_migration_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn migration_007_backfills_base_importance_on_populated_pre_007_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 006-schema DB
+        // with rows across the importance range, open via SqliteStore (007
+        // applies), and prove every row's author prior was backfilled from
+        // its pre-007 importance and that post-migration writes keep the
+        // prior/effective split intact.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 6).unwrap();
+            // The pre-007 schema must genuinely lack the column, or this test
+            // would not be exercising the ALTER + backfill at all.
+            let has: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('memories') \
+                     WHERE name='base_importance'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has, 0, "pre-007 schema must lack base_importance");
+            for (suffix, importance) in [(1, 1i64), (2, 7), (3, 10)] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO memories (memory_id, namespace, created_at, updated_at, \
+                         content, summary, keywords, tags, memory_type, importance, confidence, \
+                         embedding_model) \
+                         VALUES ('00000000-0000-4000-8000-00000000000{suffix}','project:legacy',\
+                         {suffix},0,'legacy row {suffix}','s','[]','[]','insight',{importance},\
+                         1.0,'')"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+
+        // Open via SqliteStore: 007 applies on top of the populated DB.
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let rows = store.memories_for_recalibration(10).unwrap();
+        assert_eq!(rows.len(), 3, "all legacy rows survive the migration");
+        for row in &rows {
+            assert_eq!(
+                row.base_importance, row.importance,
+                "backfill must anchor the prior at the pre-007 importance ({})",
+                row.id
+            );
+        }
+
+        // FTS untouched by the migration (mem_au is column-scoped post-006 and
+        // the backfill assigns no indexed column): legacy content still matches.
+        let ns = Namespace::Project("legacy".into());
+        let hits = store.keyword_search(&ns, "legacy", 10).unwrap();
+        assert_eq!(hits.len(), 3, "index survives the migration");
+
+        // A post-migration insert stamps the prior...
+        let m = MemoryNote::new(ns.clone(), "fresh row".into(), MemoryType::Insight, 8);
+        store.insert_memory(&m, None).unwrap();
+        let fresh = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("fresh row present");
+        assert_eq!(fresh.base_importance, 8, "insert stamps the author prior");
+
+        // ...and a job write on a MIGRATED row moves only the effective value,
+        // leaving the backfilled prior anchored.
+        let legacy_id: MemoryId = "00000000-0000-4000-8000-000000000003".parse().unwrap();
+        store.set_recalibrated_importance(&legacy_id, 8).unwrap();
+        let legacy = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == legacy_id)
+            .expect("legacy row present");
+        assert_eq!(legacy.importance, 8, "job write moved the effective value");
+        assert_eq!(
+            legacy.base_importance, 10,
+            "backfilled prior survives a job write"
         );
     }
 }

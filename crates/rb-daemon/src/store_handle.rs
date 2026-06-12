@@ -83,6 +83,15 @@ enum WriteCommand {
         strength: f32,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Set one memory's EFFECTIVE importance without touching its
+    /// `base_importance` author prior (W1.9). The importance-recalibration
+    /// job's only write path; namespace-verified like `Update`.
+    SetRecalibratedImportance {
+        namespace: Namespace,
+        id: MemoryId,
+        importance: u8,
+        reply: oneshot::Sender<Result<()>>,
+    },
     DeleteLink {
         source: MemoryId,
         target: MemoryId,
@@ -388,7 +397,8 @@ impl StoreHandle {
     /// Read up to `limit` active memories with the fields the importance job
     /// needs. Goes through the bounded read pool (never the writer). Used only by
     /// the cross-namespace maintenance jobs, which then issue any importance
-    /// changes back through `update` (the single writer).
+    /// changes back through `set_recalibrated_importance` (the single writer,
+    /// W1.9: effective importance only — never the author prior).
     pub async fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
         self.with_read(move |store| store.memories_for_recalibration(limit))
             .await
@@ -646,6 +656,26 @@ impl StoreHandle {
             target,
             link_type,
             strength,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Set one memory's EFFECTIVE importance through the single writer,
+    /// leaving its `base_importance` author prior untouched (W1.9). The
+    /// importance-recalibration job's only write path. Namespace-verified:
+    /// a missing or cross-namespace id fails closed with `NotFound`.
+    pub async fn set_recalibrated_importance(
+        &self,
+        namespace: Namespace,
+        id: MemoryId,
+        importance: u8,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::SetRecalibratedImportance {
+            namespace,
+            id,
+            importance,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -1088,6 +1118,45 @@ fn writer_loop(
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::SetRecalibratedImportance {
+                namespace,
+                id,
+                importance,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    // Mirror the Update arm: verify the row lives in the
+                    // caller's namespace before mutating, fail closed
+                    // (NotFound) on a missing or cross-namespace id.
+                    |s| match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => {
+                            s.set_recalibrated_importance(&id, importance)
+                        }
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    },
+                );
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if changed {
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Updated,
+                        },
+                    );
+                }
                 if !writer_usable {
                     break;
                 }
@@ -2121,6 +2190,54 @@ mod tests {
         assert!(
             row.last_accessed_at.is_some(),
             "last_accessed_at must be stamped after record_access"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_set_recalibrated_importance_is_namespace_scoped_and_keeps_prior() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("recal-write".to_string());
+
+        let m = note(&ns, "anchored to its author prior");
+        let id = m.id.clone();
+        let base = m.importance;
+        handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // Cross-namespace write fails closed, exactly like Update.
+        let err = handle
+            .set_recalibrated_importance(Namespace::Global, id.clone(), 7)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "cross-namespace job write must be NotFound, got {err:?}"
+        );
+
+        // In-namespace write moves the EFFECTIVE importance only (W1.9).
+        handle
+            .set_recalibrated_importance(ns.clone(), id.clone(), 7)
+            .await
+            .unwrap();
+        let after = handle
+            .get(ns.clone(), id.clone())
+            .await
+            .unwrap()
+            .expect("memory present");
+        assert_eq!(after.importance, 7, "effective importance moved");
+        let row = handle
+            .memories_for_recalibration(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("recal row present");
+        assert_eq!(
+            row.base_importance, base,
+            "the author prior must survive the job write"
         );
 
         handle.shutdown().await;
