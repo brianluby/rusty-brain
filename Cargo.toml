@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rb-types",
+    "crates/rb-config",
     "crates/rb-store",
     "crates/rb-proto",
     "crates/rb-embed",

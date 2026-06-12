@@ -2,27 +2,23 @@
 
 use std::path::PathBuf;
 
-/// Env var that overrides the daemon socket path.
-pub const SOCKET_ENV: &str = "RUSTY_BRAIN_SOCKET";
-/// Env var that overrides the database path.
-pub const DB_ENV: &str = "RUSTY_BRAIN_DB";
+// Env-var names are owned by rb-config (shared with the daemon and hooks);
+// re-exported so existing `crate::paths::*` consumers keep working.
+pub use rb_config::{DB_ENV, JOBS_CONFIG_ENV, SOCKET_ENV};
 
-/// Env var that points at the evolution-jobs TOML config.
-pub const JOBS_CONFIG_ENV: &str = "RB_JOBS_CONFIG";
-
-/// Resolve the socket path: explicit override wins, else the daemon default.
+/// Resolve the socket path: explicit override wins, else the shared default.
 pub fn resolve_socket_path(override_value: Option<String>) -> rb_types::Result<PathBuf> {
     match override_value.filter(|p| !p.trim().is_empty()) {
         Some(p) => Ok(PathBuf::from(p)),
-        None => rb_daemon::default_socket_path(),
+        None => rb_config::default_socket_path(),
     }
 }
 
-/// Resolve the database path: explicit override wins, else the daemon default.
+/// Resolve the database path: explicit override wins, else the shared default.
 pub fn resolve_db_path(override_value: Option<String>) -> rb_types::Result<PathBuf> {
     match override_value.filter(|p| !p.trim().is_empty()) {
         Some(p) => Ok(PathBuf::from(p)),
-        None => rb_daemon::default_db_path(),
+        None => rb_config::default_db_path(),
     }
 }
 

@@ -83,12 +83,31 @@ fn run() -> serde_json::Value {
     // reads files). detect_namespace never panics; degrades to Global.
     let namespace = detect_namespace(&ctx.cwd);
 
+    // Resolve daemon paths through rb-config (one truth with daemon + CLI). In
+    // a degenerate environment (no HOME/XDG at all) the socket is unresolvable:
+    // fail open with no daemon work rather than guessing a divergent path.
+    let socket = match socket_path() {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::warn!("socket path unresolvable (fail-open): {e}");
+            return cli.render_output(&continue_result());
+        }
+    };
+
     // Only SessionStart may auto-start the daemon. Other events never spawn.
+    // An unresolvable db path only disables auto-start; connecting to an
+    // already-running daemon at `socket` still works.
     let auto_start = match &ctx.event {
-        HookEvent::SessionStart { .. } => Some(AutoStart {
-            self_exe: daemon_bin(),
-            db: db_path(),
-        }),
+        HookEvent::SessionStart { .. } => match db_path() {
+            Ok(db) => Some(AutoStart {
+                self_exe: daemon_bin(),
+                db,
+            }),
+            Err(e) => {
+                tracing::warn!("db path unresolvable; auto-start disabled (fail-open): {e}");
+                None
+            }
+        },
         _ => None,
     };
 
@@ -110,7 +129,7 @@ fn run() -> serde_json::Value {
         // Overall timeout guards the whole connect+capture phase.
         match tokio::time::timeout(
             OVERALL_TIMEOUT,
-            capture_phase(&namespace, auto_start, &dedup, &ctx),
+            capture_phase(&socket, &namespace, auto_start, &dedup, &ctx),
         )
         .await
         {
@@ -127,14 +146,14 @@ fn run() -> serde_json::Value {
 
 /// Connect (best-effort) and dispatch the event to its capture flow.
 async fn capture_phase(
+    socket: &std::path::Path,
     namespace: &rb_types::Namespace,
     auto_start: Option<AutoStart>,
     dedup: &DedupCache,
     ctx: &rb_agents::HookContext,
 ) -> HookResult {
-    let socket = socket_path();
     let mut client =
-        DaemonClient::connect(&socket, namespace.clone(), CONNECT_TIMEOUT, auto_start).await;
+        DaemonClient::connect(socket, namespace.clone(), CONNECT_TIMEOUT, auto_start).await;
     dispatch::dispatch(client.as_mut(), dedup, ctx).await
 }
 
@@ -145,47 +164,26 @@ fn continue_result() -> HookResult {
     }
 }
 
-/// Resolve the daemon socket path from `RUSTY_BRAIN_SOCKET`, else a temp default.
-fn socket_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("RUSTY_BRAIN_SOCKET") {
+/// Resolve the daemon socket path: `RUSTY_BRAIN_SOCKET` override, else the
+/// rb-config default shared with the daemon and CLI.
+fn socket_path() -> rb_types::Result<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os(rb_config::SOCKET_ENV) {
         if !p.is_empty() {
-            return std::path::PathBuf::from(p);
+            return Ok(std::path::PathBuf::from(p));
         }
     }
-    default_runtime_dir().join("rusty-brain").join("sock")
+    rb_config::default_socket_path()
 }
 
-/// Resolve the daemon db path from `RUSTY_BRAIN_DB`, else a data-dir default.
-fn db_path() -> std::path::PathBuf {
-    if let Some(p) = std::env::var_os("RUSTY_BRAIN_DB") {
+/// Resolve the daemon db path: `RUSTY_BRAIN_DB` override, else the rb-config
+/// default shared with the daemon and CLI.
+fn db_path() -> rb_types::Result<std::path::PathBuf> {
+    if let Some(p) = std::env::var_os(rb_config::DB_ENV) {
         if !p.is_empty() {
-            return std::path::PathBuf::from(p);
+            return Ok(std::path::PathBuf::from(p));
         }
     }
-    default_data_dir().join("rusty-brain").join("memory.db")
-}
-
-fn default_runtime_dir() -> std::path::PathBuf {
-    if let Some(d) = std::env::var_os("XDG_RUNTIME_DIR") {
-        if !d.is_empty() {
-            return std::path::PathBuf::from(d);
-        }
-    }
-    std::env::temp_dir()
-}
-
-fn default_data_dir() -> std::path::PathBuf {
-    if let Some(d) = std::env::var_os("XDG_DATA_HOME") {
-        if !d.is_empty() {
-            return std::path::PathBuf::from(d);
-        }
-    }
-    if let Some(home) = std::env::var_os("HOME") {
-        if !home.is_empty() {
-            return std::path::PathBuf::from(home).join(".local").join("share");
-        }
-    }
-    std::env::temp_dir()
+    rb_config::default_db_path()
 }
 
 /// Resolve the `rusty-brain` DAEMON binary for auto-start.
@@ -215,6 +213,113 @@ const DAEMON_BIN_NAME: &str = "rusty-brain";
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes env-mutating tests (process-global env; see rb-config tests).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        name: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvGuard {
+        fn set(name: &'static str, value: &std::path::Path) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::set_var(name, value);
+            Self { name, previous }
+        }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(self.name, value),
+                None => std::env::remove_var(self.name),
+            }
+        }
+    }
+
+    /// Clear the `RUSTY_BRAIN_*` overrides so the default-resolution path runs.
+    fn without_overrides() -> [EnvGuard; 2] {
+        [
+            EnvGuard::remove("RUSTY_BRAIN_SOCKET"),
+            EnvGuard::remove("RUSTY_BRAIN_DB"),
+        ]
+    }
+
+    // F03/F12/F49 regression: the hooks binary and the daemon MUST resolve the
+    // same default socket/db paths, or capture writes to a daemon the CLI never
+    // reads. rb_daemon re-exports rb-config, so these pin hooks == daemon.
+    #[test]
+    fn hook_default_paths_agree_with_daemon_when_xdg_vars_are_set() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _overrides = without_overrides();
+        let runtime = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let _g1 = EnvGuard::set("XDG_RUNTIME_DIR", runtime.path());
+        let _g2 = EnvGuard::set("XDG_DATA_HOME", data.path());
+
+        assert_eq!(
+            socket_path().unwrap(),
+            rb_daemon::default_socket_path().unwrap(),
+            "hooks and daemon must agree on the socket path"
+        );
+        assert_eq!(
+            db_path().unwrap(),
+            rb_daemon::default_db_path().unwrap(),
+            "hooks and daemon must agree on the db path"
+        );
+    }
+
+    #[test]
+    fn hook_default_paths_agree_with_daemon_when_xdg_vars_are_unset() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _overrides = without_overrides();
+        let home = tempfile::tempdir().unwrap();
+        let _g1 = EnvGuard::remove("XDG_RUNTIME_DIR");
+        let _g2 = EnvGuard::remove("XDG_CACHE_HOME");
+        let _g3 = EnvGuard::remove("XDG_DATA_HOME");
+        let _g4 = EnvGuard::set("HOME", home.path());
+
+        let socket = socket_path().unwrap();
+        let db = db_path().unwrap();
+        assert_eq!(
+            socket,
+            rb_daemon::default_socket_path().unwrap(),
+            "hooks and daemon must agree on the socket path"
+        );
+        assert_eq!(
+            db,
+            rb_daemon::default_db_path().unwrap(),
+            "hooks and daemon must agree on the db path"
+        );
+        // Both live under HOME-derived platform dirs, never a temp dir.
+        assert!(
+            socket.starts_with(home.path()),
+            "socket under HOME: {socket:?}"
+        );
+        assert!(db.starts_with(home.path()), "db under HOME: {db:?}");
+    }
+
+    #[test]
+    fn explicit_env_overrides_win_over_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("override.sock");
+        let db = dir.path().join("override.db");
+        let _g1 = EnvGuard::set("RUSTY_BRAIN_SOCKET", &sock);
+        let _g2 = EnvGuard::set("RUSTY_BRAIN_DB", &db);
+
+        assert_eq!(socket_path().unwrap(), sock);
+        assert_eq!(db_path().unwrap(), db);
+    }
 
     #[test]
     fn daemon_bin_resolves_to_the_daemon_not_the_hooks_binary() {

@@ -1,0 +1,21 @@
+[package]
+name = "rb-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain: single source of truth for default paths, config env-var names, and the auto-start env allowlist."
+
+[lib]
+name = "rb_config"
+path = "src/lib.rs"
+
+[dependencies]
+rb-types = { path = "../rb-types" }
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[lints]
+workspace = true

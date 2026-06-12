@@ -7,6 +7,9 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+// Auto-start env allowlist + override var names are owned by rb-config so the
+// hooks spawner and the CLI spawner can never disagree.
+use rb_config::{DB_ENV, FORWARD_ENV, SOCKET_ENV};
 use rb_proto::Client;
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 
@@ -24,24 +27,6 @@ pub struct DaemonClient {
     client: Client,
     timeout: Duration,
 }
-
-/// The minimal set of parent env vars an auto-start daemon child may inherit.
-/// Everything else is cleared before spawn (no parent-env leak into a long-lived
-/// detached process).
-const FORWARD_ENV: &[&str] = &[
-    "VOYAGE_API_KEY",
-    "RB_ENRICH_BASE_URL",
-    "RB_ENRICH_MODEL",
-    "RB_ENRICH_API_KEY",
-    "HOME",
-    "PATH",
-    "XDG_RUNTIME_DIR",
-    "XDG_DATA_HOME",
-    "XDG_CONFIG_HOME",
-];
-
-const SOCKET_ENV: &str = "RUSTY_BRAIN_SOCKET";
-const DB_ENV: &str = "RUSTY_BRAIN_DB";
 
 impl DaemonClient {
     /// Connect with the rb-proto handshake inside `timeout`. ANY failure (IO,

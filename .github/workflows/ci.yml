@@ -32,6 +32,21 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+  # macOS mirrors the ubuntu clippy+test job: path resolution is platform-
+  # conditional (Library/Caches vs ~/.cache), so the agreement tests must run
+  # on both platforms.
+  clippy-test-macos:
+    name: clippy + test (macOS)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - name: Test
+        run: cargo test --workspace
+
   build-local:
     name: build + clippy (local feature)
     runs-on: ubuntu-latest

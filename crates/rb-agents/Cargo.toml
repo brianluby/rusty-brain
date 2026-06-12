@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 rb-types = { path = "../rb-types" }
+rb-config = { path = "../rb-config" }
 rb-proto = { path = "../rb-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }

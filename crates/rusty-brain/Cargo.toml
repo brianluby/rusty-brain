@@ -22,6 +22,7 @@ local = ["rb-embed/local"]
 
 [dependencies]
 rb-types = { path = "../rb-types" }
+rb-config = { path = "../rb-config" }
 rb-proto = { path = "../rb-proto" }
 rb-daemon = { path = "../rb-daemon" }
 rb-embed = { path = "../rb-embed" }
