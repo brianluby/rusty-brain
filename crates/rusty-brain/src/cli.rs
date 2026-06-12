@@ -31,6 +31,13 @@ pub enum Command {
         /// all jobs disabled).
         #[arg(long = "jobs-config", env = "RB_JOBS_CONFIG")]
         jobs_config: Option<String>,
+
+        /// Accept a changed embedding model: adopt the configured model and
+        /// mark the whole corpus for re-embedding (run `rusty-brain reembed`
+        /// until changed=0). Without this, a model swap refuses to start.
+        /// Env equivalent (for auto-start): `RB_ACCEPT_MODEL_CHANGE`.
+        #[arg(long = "accept-model-change")]
+        accept_model_change: bool,
     },
 
     /// Run the MCP (Model Context Protocol) stdio server for agents.
@@ -176,9 +183,25 @@ mod tests {
     fn serve_accepts_jobs_config_flag() {
         let cli = Cli::parse_from(["rusty-brain", "serve", "--jobs-config", "/tmp/jobs.toml"]);
         match cli.command {
-            Command::Serve { jobs_config } => {
+            Command::Serve {
+                jobs_config,
+                accept_model_change,
+            } => {
                 assert_eq!(jobs_config.as_deref(), Some("/tmp/jobs.toml"));
+                assert!(!accept_model_change, "opt-in flag defaults to off");
             }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_the_accept_model_change_flag() {
+        let cli = Cli::parse_from(["rusty-brain", "serve", "--accept-model-change"]);
+        match cli.command {
+            Command::Serve {
+                accept_model_change,
+                ..
+            } => assert!(accept_model_change),
             other => panic!("expected Serve, got {other:?}"),
         }
     }

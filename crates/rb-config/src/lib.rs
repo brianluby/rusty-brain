@@ -13,6 +13,10 @@ pub const SOCKET_ENV: &str = "RUSTY_BRAIN_SOCKET";
 pub const DB_ENV: &str = "RUSTY_BRAIN_DB";
 /// Env var that points at the evolution-jobs TOML config.
 pub const JOBS_CONFIG_ENV: &str = "RB_JOBS_CONFIG";
+/// Env var that opts in to an embedding-model swap (equivalent to the
+/// `--accept-model-change` serve flag; used by auto-start, where no flag can
+/// be passed). Truthy = non-empty and not `0`/`false`.
+pub const ACCEPT_MODEL_CHANGE_ENV: &str = "RB_ACCEPT_MODEL_CHANGE";
 
 /// The exact set of parent env vars an auto-start daemon child may inherit.
 /// Everything else is cleared before spawn (no parent-env leak into a

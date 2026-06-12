@@ -34,6 +34,24 @@ pub fn select_provider_kind(api_key: Option<String>, local_requested: bool) -> P
     }
 }
 
+/// Read the `RB_ACCEPT_MODEL_CHANGE` opt-in from the environment (the
+/// auto-start path, where no flag can be passed).
+fn accept_model_change_from_env() -> bool {
+    env_truthy(std::env::var(rb_config::ACCEPT_MODEL_CHANGE_ENV).ok())
+}
+
+/// Pure core for env-flag parsing: truthy = present, non-empty, and not
+/// `0`/`false` (case-insensitive). Injected value so tests never mutate
+/// process-global env.
+fn env_truthy(value: Option<String>) -> bool {
+    value
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+        })
+        .unwrap_or(false)
+}
+
 /// Read whether the local backend was requested via the environment.
 /// True when `RB_EMBED_BACKEND=local` (case-insensitive) or `RB_LOCAL_MODEL`
 /// is set to a non-empty value.
@@ -52,22 +70,28 @@ fn local_requested_from_env() -> bool {
 /// Run the daemon at the given paths until `shutdown` resolves.
 /// Picks the embedding provider from the environment (`RB_EMBED_BACKEND` /
 /// `RB_LOCAL_MODEL` for local, `VOYAGE_API_KEY` for Voyage).
+/// `accept_model_change` (the `--accept-model-change` flag, OR-ed with
+/// `RB_ACCEPT_MODEL_CHANGE` for auto-start) opts in to an embedding-model
+/// swap; without it a swap fails closed at bind.
 pub async fn run_serve(
     socket_path: PathBuf,
     db_path: PathBuf,
     read_pool_size: usize,
     jobs_config_path: Option<PathBuf>,
+    accept_model_change: bool,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let jobs_config = rb_daemon::JobsConfig::load(jobs_config_path.as_deref())?;
     let api_key = std::env::var("VOYAGE_API_KEY").ok();
     let kind = select_provider_kind(api_key, local_requested_from_env());
+    let accept = accept_model_change || accept_model_change_from_env();
     run_with_kind(
         kind,
         socket_path,
         db_path,
         read_pool_size,
         jobs_config,
+        accept,
         shutdown,
     )
     .await
@@ -81,6 +105,7 @@ async fn run_with_kind(
     db_path: PathBuf,
     read_pool_size: usize,
     jobs_config: rb_daemon::JobsConfig,
+    accept_model_change: bool,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     match kind {
@@ -104,13 +129,21 @@ async fn run_with_kind(
                     read_pool_size,
                     jobs_config,
                     embedder,
+                    accept_model_change,
                     shutdown,
                 )
                 .await
             }
             #[cfg(not(feature = "local"))]
             {
-                let _ = (socket_path, db_path, read_pool_size, jobs_config, shutdown);
+                let _ = (
+                    socket_path,
+                    db_path,
+                    read_pool_size,
+                    jobs_config,
+                    accept_model_change,
+                    shutdown,
+                );
                 Err(rb_types::Error::Embedding(
                     "local embedding backend requested but this binary was built \
                      without the `local` feature; rebuild with `--features local`"
@@ -126,6 +159,7 @@ async fn run_with_kind(
                 read_pool_size,
                 jobs_config,
                 embedder,
+                accept_model_change,
                 shutdown,
             )
             .await
@@ -143,6 +177,7 @@ async fn run_with_kind(
                 read_pool_size,
                 jobs_config,
                 embedder,
+                accept_model_change,
                 shutdown,
             )
             .await
@@ -157,11 +192,25 @@ async fn run_with_embedder<P>(
     read_pool_size: usize,
     jobs_config: rb_daemon::JobsConfig,
     embedder: P,
+    accept_model_change: bool,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()>
 where
     P: EmbeddingProvider + 'static,
 {
+    // Explicit opt-in to an embedding-model swap, BEFORE bind so the daemon's
+    // model-verified opens then succeed. A no-op when nothing changed.
+    if accept_model_change {
+        let changed =
+            rb_daemon::accept_model_change(&db_path, embedder.dim(), embedder.model_id())?;
+        if changed {
+            tracing::info!(
+                model = embedder.model_id(),
+                "accepted embedding model change; corpus marked for re-embed \
+                 (run `rusty-brain reembed` until changed=0)"
+            );
+        }
+    }
     let config = DaemonConfig {
         socket_path,
         db_path,
@@ -176,6 +225,17 @@ where
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn env_truthy_accepts_set_values_and_rejects_off_values() {
+        for v in ["1", "true", "TRUE", "yes"] {
+            assert!(env_truthy(Some(v.to_string())), "{v:?} must opt in");
+        }
+        for v in ["", "  ", "0", "false", "FALSE"] {
+            assert!(!env_truthy(Some(v.to_string())), "{v:?} must not opt in");
+        }
+        assert!(!env_truthy(None), "absent var must not opt in");
+    }
 
     #[test]
     fn selects_voyage_when_key_present_and_local_not_requested() {
@@ -230,6 +290,7 @@ mod tests {
             db,
             4,
             rb_daemon::JobsConfig::default(),
+            false,
             std::future::ready(()),
         )
         .await

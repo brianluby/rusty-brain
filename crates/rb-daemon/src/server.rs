@@ -111,7 +111,14 @@ impl Daemon {
             .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", config.socket_path.display())))?;
         bind_guard.mark_socket_bound();
 
-        let store = StoreHandle::start(config.db_path.clone(), dim, config.read_pool_size)?;
+        // Bind the embedder's model identity into every store open so a
+        // same-dim provider swap fails closed instead of mixing vector spaces.
+        let store = StoreHandle::start_with_model(
+            config.db_path.clone(),
+            dim,
+            embedder.model_id().to_string(),
+            config.read_pool_size,
+        )?;
 
         // Build the opt-in LLM enricher once (reqwest client is reused across
         // all connections). Activation requires RB_ENRICH_BASE_URL +

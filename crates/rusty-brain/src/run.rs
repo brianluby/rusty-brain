@@ -20,7 +20,10 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
 
     match cli.command {
-        Command::Serve { jobs_config } => {
+        Command::Serve {
+            jobs_config,
+            accept_model_change,
+        } => {
             let jobs_config_path = paths::resolve_jobs_config_path(
                 jobs_config,
                 std::env::var(paths::JOBS_CONFIG_ENV).ok(),
@@ -28,9 +31,16 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            serve::run_serve(socket_path, db_path, 4, jobs_config_path, shutdown)
-                .await
-                .context("daemon failed")?;
+            serve::run_serve(
+                socket_path,
+                db_path,
+                4,
+                jobs_config_path,
+                accept_model_change,
+                shutdown,
+            )
+            .await
+            .context("daemon failed")?;
             Ok(())
         }
         Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)

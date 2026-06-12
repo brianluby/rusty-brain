@@ -23,4 +23,4 @@ pub use jobs::{
 pub use rb_config::{default_db_path, default_socket_path};
 pub use server::{Daemon, DaemonConfig};
 pub use shared_embedder::SharedEmbedder;
-pub use store_handle::StoreHandle;
+pub use store_handle::{accept_model_change, StoreHandle};

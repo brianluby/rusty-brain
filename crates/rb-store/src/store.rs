@@ -133,7 +133,32 @@ impl SqliteStore {
     /// Registers sqlite-vec, enables WAL + foreign keys, runs migrations,
     /// creates the dynamic-dim `memory_vectors` table, and enforces the
     /// embedding-dimension invariant fail-closed.
+    ///
+    /// The embedding-MODEL invariant is NOT enforced here (no model is bound);
+    /// any path that serves a real embedding provider must open via
+    /// [`SqliteStore::open_with_model`] so a same-dim provider swap cannot
+    /// silently mix vector spaces.
     pub fn open(path: &Path, embedding_dim: usize) -> Result<Self> {
+        Self::open_inner(path, embedding_dim, None)
+    }
+
+    /// Open (or create) a store at `path`, enforcing BOTH embedding invariants:
+    /// the dimension and the model identity. Seeds `meta.embedding_model` on
+    /// first init; fails closed when the stored model differs from
+    /// `embedding_model` (remediation: [`SqliteStore::accept_model_change`]).
+    pub fn open_with_model(
+        path: &Path,
+        embedding_dim: usize,
+        embedding_model: &str,
+    ) -> Result<Self> {
+        Self::open_inner(path, embedding_dim, Some(embedding_model))
+    }
+
+    fn open_inner(
+        path: &Path,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+    ) -> Result<Self> {
         register_vec()?;
         let conn = rusqlite::Connection::open(path).map_err(|e| {
             io_err(std::io::Error::other(format!(
@@ -141,18 +166,23 @@ impl SqliteStore {
                 path.display()
             )))
         })?;
-        Self::init(conn, embedding_dim)
+        Self::init(conn, embedding_dim, embedding_model)
     }
 
     /// Open an ephemeral in-memory store with the given embedding dimension.
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self> {
         register_vec()?;
         let conn = rusqlite::Connection::open_in_memory().map_err(storage_err)?;
-        Self::init(conn, embedding_dim)
+        Self::init(conn, embedding_dim, None)
     }
 
-    /// Shared init path: pragmas, migrations, vectors table, dim invariant.
-    fn init(conn: rusqlite::Connection, embedding_dim: usize) -> Result<Self> {
+    /// Shared init path: pragmas, migrations, vectors table, dim invariant,
+    /// and (when a model is bound) the model-identity invariant.
+    fn init(
+        conn: rusqlite::Connection,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+    ) -> Result<Self> {
         // A zero-dimension embedding produces a malformed `float[0]` vec0 column.
         // Reject it up front rather than letting SQLite fail cryptically later.
         if embedding_dim == 0 {
@@ -186,11 +216,63 @@ impl SqliteStore {
         .map_err(storage_err)?;
 
         seed_or_verify_dim(&conn, embedding_dim)?;
+        if let Some(model) = embedding_model {
+            seed_or_verify_model(&conn, model)?;
+        }
 
         Ok(Self {
             conn,
             embedding_dim,
         })
+    }
+
+    /// Explicit opt-in for an embedding-model swap: atomically point
+    /// `meta.embedding_model` at `new_model` and stale every row's
+    /// `embedding_input_version` to the `''` sentinel so the existing reembed
+    /// machinery converges the corpus onto the new vector space.
+    ///
+    /// Returns `true` when a swap occurred (rows were staled). Idempotent:
+    /// `false` when `new_model` is already current, or when no model was
+    /// recorded yet (legacy/fresh DB — it is seeded without staling, because
+    /// the per-row `embedding_model` stamps already drive reembed there).
+    pub fn accept_model_change(&self, new_model: &str) -> Result<bool> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let result = (|| -> Result<bool> {
+            let stored = meta_value(&self.conn, "embedding_model")?;
+            if stored.as_deref() == Some(new_model) {
+                return Ok(false);
+            }
+            let swapping = stored.is_some();
+            self.conn
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![new_model],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if swapping {
+                self.conn
+                    .execute("UPDATE memories SET embedding_input_version = ''", [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Ok(swapping)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn
+                    .execute_batch("COMMIT;")
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                Ok(changed)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Fold the WAL back into the main database file and truncate it to zero.
@@ -603,20 +685,24 @@ fn register_vec() -> Result<()> {
     outcome.clone().map_err(Error::Storage)
 }
 
+/// Read one `meta` value; `None` when the key was never seeded.
+fn meta_value(conn: &rusqlite::Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        rusqlite::params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(storage_err(other)),
+    })
+}
+
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
 /// Fails closed with `Error::DimensionMismatch` on disagreement.
 fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='embedding_dim'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(storage_err(other)),
-        })?;
+    let existing = meta_value(conn, "embedding_dim")?;
 
     match existing {
         Some(v) => {
@@ -634,6 +720,31 @@ fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Resu
             conn.execute(
                 "INSERT INTO meta (key, value) VALUES ('embedding_dim', ?1)",
                 rusqlite::params![embedding_dim.to_string()],
+            )
+            .map_err(storage_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed `meta.embedding_model` on first init (or on the first open of a DB
+/// created before the key existed), or verify it matches on re-open. A
+/// same-dim provider swap would silently mix vector spaces, so this fails
+/// closed with the explicit remediation.
+fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> Result<()> {
+    match meta_value(conn, "embedding_model")? {
+        Some(stored) => {
+            if stored != embedding_model {
+                return Err(Error::Storage(format!(
+                    "embedding model changed (stored: {stored}, configured: {embedding_model}); \
+                     run with --accept-model-change to mark the corpus for re-embedding"
+                )));
+            }
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)",
+                rusqlite::params![embedding_model],
             )
             .map_err(storage_err)?;
         }
@@ -1683,6 +1794,146 @@ mod tests {
             }
             other => panic!("expected DimensionMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_with_model_seeds_then_reopens_with_same_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        }
+        let s2 = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        let model: String = s2
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            model, "deterministic",
+            "embedding_model seeded at first init"
+        );
+    }
+
+    #[test]
+    fn open_with_a_different_model_refuses_with_remediation_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        // Deterministic-seeded DB; a same-dim provider swap must fail closed.
+        {
+            let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        }
+        let err = SqliteStore::open_with_model(&path, 8, "voyage-3").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedding model changed"),
+            "refusal names the invariant: {msg}"
+        );
+        assert!(
+            msg.contains("stored: deterministic") && msg.contains("configured: voyage-3"),
+            "refusal names both models: {msg}"
+        );
+        assert!(
+            msg.contains("--accept-model-change"),
+            "refusal carries the remediation hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn open_with_model_seeds_model_on_a_db_created_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        // Legacy shape: DB created without a bound model (no meta key).
+        {
+            let _s = SqliteStore::open(&path, 8).unwrap();
+        }
+        // First model-bound open adopts the configured model.
+        let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        // ...and a later swap is then refused.
+        let err = SqliteStore::open_with_model(&path, 8, "other-model").unwrap_err();
+        assert!(err.to_string().contains("embedding model changed"), "{err}");
+    }
+
+    #[test]
+    fn accept_model_change_swaps_model_and_stales_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let ns = Namespace::Project("model-swap".to_string());
+
+        {
+            let store = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+            let mut note =
+                MemoryNote::new(ns.clone(), "stale me".to_string(), MemoryType::Insight, 5);
+            note.embedding_model = "deterministic".to_string();
+            note.embedding_input_version = "v2-composite".to_string();
+            store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+        }
+
+        // The model-bound open refuses; the opt-in path uses the unbound open.
+        let store = SqliteStore::open(&path, 8).unwrap();
+        let changed = store.accept_model_change("voyage-3").unwrap();
+        assert!(changed, "a real swap reports true");
+
+        let model: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "voyage-3", "meta points at the new model");
+
+        let stale: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories WHERE embedding_input_version = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let total: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, total, "every row carries the reembed sentinel");
+        drop(store);
+
+        // The accepted model now opens cleanly.
+        let _reopened = SqliteStore::open_with_model(&path, 8, "voyage-3").unwrap();
+    }
+
+    #[test]
+    fn accept_model_change_with_current_model_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let ns = Namespace::Project("model-noop".to_string());
+
+        let store = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        let mut note = MemoryNote::new(ns, "keep stamp".to_string(), MemoryType::Insight, 5);
+        note.embedding_model = "deterministic".to_string();
+        note.embedding_input_version = "v2-composite".to_string();
+        store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+
+        // Same model (e.g. a lingering RB_ACCEPT_MODEL_CHANGE on every restart):
+        // no swap, and crucially no corpus-wide re-stale.
+        let changed = store.accept_model_change("deterministic").unwrap();
+        assert!(!changed, "accepting the current model is a no-op");
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT embedding_input_version FROM memories LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "v2-composite", "stamps survive a no-op accept");
     }
 
     #[test]
