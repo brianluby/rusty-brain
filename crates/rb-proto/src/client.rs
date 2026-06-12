@@ -201,7 +201,10 @@ impl Client {
             })
             .await?;
         match resp {
-            Resp::Recalled { results } => Ok(results),
+            // The typed client keeps its results-only shape; callers that
+            // surface the W1.6d degraded flag (rb-mcp) consume the raw
+            // `Response` frame instead.
+            Resp::Recalled { results, .. } => Ok(results),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -547,6 +550,7 @@ mod wrapper_tests {
                         score: 0.5,
                         channels: rb_types::ChannelHits::default(),
                     }],
+                    degraded: false,
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),

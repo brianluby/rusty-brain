@@ -190,10 +190,28 @@ pub fn response_to_content(resp: Response) -> Value {
         // model-legible hint instead of a bare empty array, so the model knows
         // "nothing is stored" rather than suspecting a tool failure. Projection
         // only — the wire `Response` is unchanged (no CONTRACT_VERSION bump).
-        Response::Recalled { results } if results.is_empty() => {
-            json!({ "results": [], "hint": "no stored memories match" })
+        Response::Recalled { results, degraded } => {
+            let mut content = if results.is_empty() {
+                json!({ "results": [], "hint": "no stored memories match" })
+            } else {
+                json!({ "results": results })
+            };
+            // W1.6d: a degraded recall (embedder outage) carries a one-line
+            // warning so the model knows the results came from the keyword and
+            // graph channels only, not that nothing semantically similar exists.
+            if degraded {
+                if let Some(obj) = content.as_object_mut() {
+                    obj.insert(
+                        "warning".to_string(),
+                        json!(
+                            "vector search unavailable (embedding provider error); \
+                             results from keyword and graph channels only"
+                        ),
+                    );
+                }
+            }
+            content
         }
-        Response::Recalled { results } => json!({ "results": results }),
         Response::Got { memory } => json!({ "memory": memory }),
         Response::Listed { memories } => json!({ "memories": memories }),
         Response::GraphResult { memories } => json!({ "memories": memories }),
@@ -552,6 +570,7 @@ mod tests {
                 score: 0.5,
                 channels: rb_types::ChannelHits::default(),
             }],
+            degraded: false,
         });
         assert!(recalled["results"].is_array());
         assert_eq!(recalled["results"][0]["score"], 0.5);
@@ -594,6 +613,7 @@ mod tests {
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
             }],
+            degraded: false,
         });
         assert_eq!(recalled["results"][0]["memory"]["contested"], true);
     }
@@ -605,6 +625,7 @@ mod tests {
         // the model can tell "nothing stored matches" from a tool failure.
         let recalled = response_to_content(Response::Recalled {
             results: Vec::new(),
+            degraded: false,
         });
         assert!(recalled["results"].is_array());
         assert_eq!(recalled["results"].as_array().map(Vec::len), Some(0));
@@ -622,7 +643,54 @@ mod tests {
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
             }],
+            degraded: false,
         });
         assert!(recalled.get("hint").is_none(), "hint only on empty results");
+    }
+
+    #[test]
+    fn degraded_recall_renders_a_one_line_warning() {
+        use rb_proto::Response;
+        // W1.6d: a degraded recall (embedder outage; keyword+graph only)
+        // surfaces a one-line warning in the rendered output — on both the
+        // populated and the empty shape.
+        let recalled = response_to_content(Response::Recalled {
+            results: vec![SearchResult {
+                memory: note(),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+            }],
+            degraded: true,
+        });
+        let warning = recalled["warning"]
+            .as_str()
+            .expect("degraded recall must carry a warning line");
+        assert!(
+            warning.contains("vector search unavailable"),
+            "warning names the degradation: {warning}"
+        );
+
+        let empty = response_to_content(Response::Recalled {
+            results: Vec::new(),
+            degraded: true,
+        });
+        assert_eq!(empty["hint"], "no stored memories match");
+        assert!(
+            empty["warning"].is_string(),
+            "the empty state keeps the degradation warning too"
+        );
+    }
+
+    #[test]
+    fn non_degraded_recall_carries_no_warning() {
+        use rb_proto::Response;
+        let recalled = response_to_content(Response::Recalled {
+            results: Vec::new(),
+            degraded: false,
+        });
+        assert!(
+            recalled.get("warning").is_none(),
+            "warning only when degraded"
+        );
     }
 }

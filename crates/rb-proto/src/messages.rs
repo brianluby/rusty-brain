@@ -148,6 +148,14 @@ pub enum Response {
     },
     Recalled {
         results: Vec<SearchResult>,
+        /// `true` when recall DEGRADED to keyword+graph because the embedder
+        /// errored (W1.6d / F19). Additive + `#[serde(default)]`: an old
+        /// daemon omits it (`false`) and an old client ignores it, so NO
+        /// contract-version bump is needed — the `Pong.recall_channels`
+        /// precedent. `skip_serializing_if` keeps a non-degraded Recalled
+        /// frame byte-identical to the pre-W1.6 shape.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        degraded: bool,
     },
     Got {
         memory: Option<MemoryNote>,
@@ -409,6 +417,11 @@ mod tests {
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
                 }],
+                degraded: false,
+            },
+            Response::Recalled {
+                results: Vec::new(),
+                degraded: true,
             },
             Response::Got {
                 memory: Some(note()),
@@ -480,6 +493,42 @@ mod tests {
         // A `None` recall_channels keeps the pre-W1.0 byte shape (additive,
         // skip-serializing field), so old clients see an unchanged frame.
         assert_eq!(json, r#"{"result":"Pong","contract_version":1}"#);
+    }
+
+    #[test]
+    fn recalled_without_degraded_field_decodes_to_false() {
+        // Wire compat: a pre-W1.6 Recalled frame (no `degraded` key) must
+        // decode, defaulting the flag off.
+        let back: Response = serde_json::from_str(r#"{"result":"Recalled","results":[]}"#).unwrap();
+        match back {
+            Response::Recalled { results, degraded } => {
+                assert!(results.is_empty());
+                assert!(!degraded, "absent degraded key must default to false");
+            }
+            other => panic!("expected Recalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_degraded_recalled_keeps_the_pre_w16_byte_shape() {
+        // `degraded: false` is skip-serialized, so old clients see an
+        // unchanged frame; `degraded: true` rides along explicitly.
+        let json = serde_json::to_string(&Response::Recalled {
+            results: Vec::new(),
+            degraded: false,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"result":"Recalled","results":[]}"#);
+
+        let json = serde_json::to_string(&Response::Recalled {
+            results: Vec::new(),
+            degraded: true,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"Recalled","results":[],"degraded":true}"#
+        );
     }
 
     #[test]

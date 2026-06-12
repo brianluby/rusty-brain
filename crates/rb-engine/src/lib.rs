@@ -17,6 +17,6 @@ mod test_support;
 
 pub use backend::MemoryBackend;
 pub use embed_input::{embedding_input, EMBEDDING_INPUT_VERSION};
-pub use engine::{MemoryEngine, Provenance, RememberInput};
+pub use engine::{MemoryEngine, Provenance, RecallOutcome, RememberInput};
 pub use enricher::{Enricher, Enrichment};
 pub use linker::{Linker, SimilarityLinker};

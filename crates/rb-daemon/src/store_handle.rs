@@ -10,7 +10,7 @@ use async_trait::async_trait;
 use rb_engine::MemoryBackend;
 use rb_store::{RecalRow, SqliteStore, Store};
 use rb_types::{Error, MemoryId, MemoryNote, MemoryUpdates, Namespace, Result};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Semaphore};
 
 use crate::change::{ChangeKind, MemoryChanged};
 
@@ -105,6 +105,18 @@ enum WriteCommand {
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Test-only: run an op that opens a transaction and returns `Err` WITHOUT
+    /// rolling back, exercising the W1.6b post-op `is_autocommit` poison check.
+    #[cfg(test)]
+    PoisonForTest {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Test-only: exit the writer loop abnormally (death guard left armed),
+    /// simulating an unrecoverable writer failure such as a failed reopen.
+    #[cfg(test)]
+    DieForTest {
+        reply: oneshot::Sender<Result<()>>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -118,6 +130,9 @@ pub struct StoreHandle {
     events: broadcast::Sender<MemoryChanged>,
     writer_join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     shutting_down: Arc<AtomicBool>,
+    /// Becomes `true` when the writer thread dies ABNORMALLY (W1.6c). Graceful
+    /// shutdown never flips it; see [`StoreHandle::writer_died`].
+    writer_death: watch::Receiver<bool>,
 }
 
 struct ReadPool {
@@ -207,6 +222,9 @@ impl StoreHandle {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+        // Writer-death signal (W1.6c): the writer thread owns the sender via a
+        // drop guard; the daemon races the receiver in `Server::run`'s select!.
+        let (death_tx, death_rx) = watch::channel(false);
 
         // The WRITER opens first; the read pool only after its ready signal.
         // `SqliteStore::init` runs the one-shot vector-schema rebuild
@@ -227,6 +245,7 @@ impl StoreHandle {
                     writer_rx,
                     writer_events,
                     ready_tx,
+                    death_tx,
                 );
             })
             .map_err(|e| Error::Io(format!("spawn writer thread: {e}")))?;
@@ -268,7 +287,46 @@ impl StoreHandle {
             events,
             writer_join: Arc::new(Mutex::new(Some(writer_join))),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            writer_death: death_rx,
         })
+    }
+
+    /// Resolves when the writer thread has died ABNORMALLY — it exited its
+    /// loop without a graceful shutdown (e.g. a failed reopen after a panic or
+    /// after a poisoned connection). NEVER resolves on graceful shutdown.
+    ///
+    /// `Server::run` races this future in its `select!` so a dead writer shuts
+    /// the daemon down instead of leaving a zombie that pongs `Ping` while
+    /// every write fails (W1.6c / F17). The returned future is `'static`: it
+    /// owns a clone of the watch receiver, so it can be pinned across the
+    /// accept loop without borrowing the handle.
+    pub fn writer_died(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.writer_death.clone();
+        async move {
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    // Sender dropped without ever signaling: the writer exited
+                    // gracefully. Park forever — a graceful exit must not trip
+                    // the daemon's writer-death arm.
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+
+    /// Test-only: make the writer thread exit abnormally (death guard armed),
+    /// as if an unrecoverable failure stopped it.
+    #[cfg(test)]
+    pub(crate) async fn kill_writer_for_test(&self) {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .writer_tx
+            .send(WriteCommand::DieForTest { reply })
+            .await;
+        let _ = rx.await;
     }
 
     /// Subscribe to best-effort memory change notifications.
@@ -293,6 +351,7 @@ impl StoreHandle {
             events,
             writer_join,
             shutting_down,
+            writer_death: _writer_death,
         } = self;
 
         if !shutting_down.swap(true, Ordering::SeqCst) {
@@ -553,10 +612,44 @@ where
     };
 
     match outcome {
-        StoreOpOutcome::Completed(result) => StoreOpReport {
-            result,
-            writer_usable: true,
-        },
+        StoreOpOutcome::Completed(result) => {
+            // W1.6b poison check: a COMPLETED op that returned Err while
+            // leaving the connection mid-transaction (e.g. a failed COMMIT
+            // whose drop-rollback also failed) would make every later op die
+            // with "cannot start a transaction within a transaction". Reuse
+            // the panic path's drop+reopen machinery; the caller still gets
+            // the op's own error.
+            let poisoned = result.is_err() && store.as_ref().is_some_and(|s| !s.is_autocommit());
+            if !poisoned {
+                return StoreOpReport {
+                    result,
+                    writer_usable: true,
+                };
+            }
+            tracing::error!(
+                "writer op failed and left an open transaction; reopening writer connection"
+            );
+            drop(store.take());
+            match open_store(db_path, embedding_dim, embedding_model) {
+                Ok(reopened) => {
+                    *store = Some(reopened);
+                    StoreOpReport {
+                        result,
+                        writer_usable: true,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to reopen writer connection after poisoned op; writer exiting"
+                    );
+                    StoreOpReport {
+                        result,
+                        writer_usable: false,
+                    }
+                }
+            }
+        }
         StoreOpOutcome::Panicked(msg) => {
             tracing::error!(
                 panic = %msg,
@@ -599,6 +692,42 @@ fn panic_for_test_store_op(_store: &SqliteStore) -> Result<()> {
     panic!("deliberate writer test panic");
 }
 
+/// Test-only op for the W1.6b poison check: open a transaction, then complete
+/// with `Err` WITHOUT rolling back — the failed-COMMIT-then-failed-ROLLBACK
+/// shape no public write path can produce now that every op is RAII-guarded.
+#[cfg(test)]
+fn poison_for_test_store_op(store: &SqliteStore) -> Result<()> {
+    store.leave_transaction_open_for_test()?;
+    Err(Error::Storage(
+        "deliberate poisoned writer op for test".to_string(),
+    ))
+}
+
+/// Arms the writer-death signal (W1.6c). Dropped ARMED — including on a panic
+/// unwinding out of the writer loop — it flips the watch to `true`, which
+/// resolves [`StoreHandle::writer_died`] and shuts the daemon down. The loop
+/// disarms it only on the graceful exits (a `Shutdown` command, or every
+/// handle dropping the command channel), so a writer that stops serving writes
+/// for any other reason can never leave a zombie daemon behind.
+struct WriterDeathGuard {
+    tx: watch::Sender<bool>,
+    graceful: bool,
+}
+
+impl WriterDeathGuard {
+    fn disarm(&mut self) {
+        self.graceful = true;
+    }
+}
+
+impl Drop for WriterDeathGuard {
+    fn drop(&mut self) {
+        if !self.graceful {
+            let _ = self.tx.send(true);
+        }
+    }
+}
+
 fn writer_loop(
     db_path: PathBuf,
     embedding_dim: usize,
@@ -606,19 +735,36 @@ fn writer_loop(
     mut rx: mpsc::Receiver<WriteCommand>,
     events: broadcast::Sender<MemoryChanged>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
+    death_tx: watch::Sender<bool>,
 ) {
+    let mut death = WriterDeathGuard {
+        tx: death_tx,
+        graceful: false,
+    };
+
     let mut store = match open_store(&db_path, embedding_dim, embedding_model.as_deref()) {
         Ok(store) => {
             let _ = ready_tx.send(Ok(()));
             Some(store)
         }
         Err(e) => {
+            // The open failure is surfaced to `start_inner` via the ready
+            // channel and no handle ever exists: a construction failure, not
+            // a writer death.
+            death.disarm();
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
 
-    while let Some(cmd) = rx.blocking_recv() {
+    loop {
+        let Some(cmd) = rx.blocking_recv() else {
+            // Every sender dropped (a failed construction's cleanup, or a
+            // shutdown path that skipped the Shutdown command): deliberate
+            // teardown, not a writer death.
+            death.disarm();
+            break;
+        };
         match cmd {
             WriteCommand::Insert {
                 note,
@@ -886,6 +1032,28 @@ fn writer_loop(
                     break;
                 }
             }
+            #[cfg(test)]
+            WriteCommand::PoisonForTest { reply } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    poison_for_test_store_op,
+                );
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            WriteCommand::DieForTest { reply } => {
+                // Exit WITHOUT disarming the death guard: the abnormal-exit
+                // shape (e.g. a failed reopen) the daemon must react to.
+                let _ = reply.send(Err(Error::Storage("writer killed for test".to_string())));
+                break;
+            }
             WriteCommand::Shutdown { reply } => {
                 // Fold the WAL back into the main file before the connection is
                 // dropped, so the on-disk DB is a clean single file. Best-effort:
@@ -895,6 +1063,7 @@ fn writer_loop(
                         tracing::warn!(error = %e, "WAL checkpoint on shutdown failed");
                     }
                 }
+                death.disarm();
                 let _ = reply.send(());
                 break;
             }
@@ -1269,6 +1438,99 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_recovers_after_an_op_leaves_an_open_transaction() {
+        // W1.6b: a completed-with-Err op that strands the connection inside a
+        // transaction (failed COMMIT + failed ROLLBACK shape) must trigger the
+        // drop+reopen path, so subsequent writes commit on a clean connection
+        // instead of dying with "cannot start a transaction within a
+        // transaction".
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("txn-poison".to_string());
+
+        // 1. A successful write before the poisoned op.
+        let before = note(&ns, "written before the poison");
+        let before_id = before.id.clone();
+        handle.write(before, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // 2. Inject the mid-transaction failure via the test-only command.
+        let (reply, rx) = oneshot::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::PoisonForTest { reply })
+            .await
+            .unwrap();
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(_)),
+            "the poisoned op's own error reaches the caller, got {err:?}"
+        );
+
+        // 3. The next write commits: the writer detected !is_autocommit and
+        //    reopened its connection rather than running inside the leftover
+        //    transaction.
+        let after = note(&ns, "written after the poison");
+        let after_id = after.id.clone();
+        handle.write(after, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        assert!(
+            handle.get(ns.clone(), before_id).await.unwrap().is_some(),
+            "pre-poison write must survive"
+        );
+        assert!(
+            handle.get(ns.clone(), after_id).await.unwrap().is_some(),
+            "post-poison write must commit on the reopened connection"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abnormal_writer_death_resolves_writer_died() {
+        // W1.6c: an abnormal writer exit must resolve the death signal the
+        // daemon races in its accept loop.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+
+        let died = handle.writer_died();
+        handle.kill_writer_for_test().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), died)
+            .await
+            .expect("writer_died must resolve after an abnormal writer exit");
+
+        // The dead writer rejects further writes (no silent acceptance).
+        let ns = Namespace::Project("dead-writer".to_string());
+        let err = handle
+            .write(note(&ns, "after death"), Some(vec![0.1f32; DIM]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_does_not_resolve_writer_died() {
+        // The death signal is for ABNORMAL exits only: a clean shutdown must
+        // never trip the daemon's writer-death arm.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+
+        let died = handle.writer_died();
+        handle.shutdown().await;
+
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(300), died).await;
+        assert!(
+            raced.is_err(),
+            "writer_died must stay pending across a graceful shutdown"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

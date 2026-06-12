@@ -23,6 +23,16 @@ pub struct RememberInput {
     pub provenance: Provenance,
 }
 
+/// What `recall_with_status` returns (W1.6d): the ranked results plus whether
+/// retrieval DEGRADED to keyword + graph because the embedder errored. The
+/// daemon forwards `degraded` on the wire so clients can warn instead of
+/// silently serving vector-blind results.
+#[derive(Debug, Clone)]
+pub struct RecallOutcome {
+    pub results: Vec<rb_types::SearchResult>,
+    pub degraded: bool,
+}
+
 /// Who/where/what produced a write (W0.5): the connection's handshake identity
 /// after the daemon's whoami fallback for user/host. `Default` (all `None`)
 /// matches pre-W0.5 behavior and is what direct engine callers (tests, eval)
@@ -296,6 +306,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
     /// candidates scoped to the engine namespace, rank with `rb_search`, then
     /// return ranked `SearchResult`s after applying type/tag filters.
+    ///
+    /// Thin wrapper over [`MemoryEngine::recall_with_status`] that drops the
+    /// degraded flag; callers that surface degradation (the daemon's Recall
+    /// dispatch) use the `_with_status` form.
     pub async fn recall(
         &self,
         query: &str,
@@ -303,6 +317,25 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         type_filter: Option<MemoryType>,
         tags: &[String],
     ) -> rb_types::Result<Vec<rb_types::SearchResult>> {
+        Ok(self
+            .recall_with_status(query, limit, type_filter, tags)
+            .await?
+            .results)
+    }
+
+    /// [`MemoryEngine::recall`] plus a degradation flag (W1.6d / F19): when the
+    /// embedder errors, recall DEGRADES to the keyword + graph channels instead
+    /// of failing outright — an embedding-API outage must not take retrieval
+    /// down with it — and `degraded` is set so the response can carry a
+    /// warning. The vector channel is skipped entirely in that case; ranking
+    /// proceeds on the surviving signals.
+    pub async fn recall_with_status(
+        &self,
+        query: &str,
+        limit: usize,
+        type_filter: Option<MemoryType>,
+        tags: &[String],
+    ) -> rb_types::Result<RecallOutcome> {
         use std::collections::HashMap;
 
         // Over-fetch candidates so post-filtering still has enough to fill `limit`.
@@ -310,20 +343,32 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         // Recall path => EmbedKind::Query (W1.4): asymmetric providers (Voyage
         // input_type) condition the query vector for retrieval.
-        let mut query_emb = self
+        let (embedding, degraded) = match self
             .embedder
             .embed(&[query.to_string()], EmbedKind::Query)
-            .await?;
-        let embedding = query_emb.pop().unwrap_or_default();
+            .await
+        {
+            Ok(mut query_emb) => (query_emb.pop().unwrap_or_default(), false),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "query embedding failed; recall degrades to keyword+graph"
+                );
+                (Vec::new(), true)
+            }
+        };
 
         let keyword = self
             .backend
             .keyword(self.namespace.clone(), query.to_string(), candidate_limit)
             .await?;
-        let vector = self
-            .backend
-            .vector(self.namespace.clone(), embedding, candidate_limit)
-            .await?;
+        let vector = if degraded {
+            Vec::new()
+        } else {
+            self.backend
+                .vector(self.namespace.clone(), embedding, candidate_limit)
+                .await?
+        };
 
         // Bounded 1-hop graph expansion of the top active in-namespace keyword hit only.
         let mut graph_seed = None;
@@ -471,7 +516,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 tracing::debug!(error = %e, "record_accesses failed; ignoring");
             }
         }
-        Ok(results)
+        Ok(RecallOutcome { results, degraded })
     }
 
     /// Batch-load the subset of `ids` that have an active `contradicts` link
@@ -1069,6 +1114,87 @@ mod tests {
             vec![EmbedKind::Document, EmbedKind::Query, EmbedKind::Document],
             "remember=Document, recall=Query, reembed=Document"
         );
+    }
+
+    /// Document embeds succeed (so seeding via `remember` works); Query embeds
+    /// fail, simulating an embedding-API outage at recall time (W1.6d).
+    struct QueryFailingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for QueryFailingProvider {
+        fn model_id(&self) -> &str {
+            "query-failing"
+        }
+
+        fn dim(&self) -> usize {
+            16
+        }
+
+        async fn embed(
+            &self,
+            texts: &[String],
+            kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
+            match kind {
+                EmbedKind::Document => Ok(vec![vec![1.0; 16]; texts.len()]),
+                EmbedKind::Query => {
+                    Err(rb_types::Error::Embedding("embedding API down".to_string()))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_degrades_to_keyword_and_graph_when_the_embedder_errors() {
+        // W1.6d / F19: an embedder error at recall time must DEGRADE retrieval
+        // to the keyword + graph channels (flagged), not fail the request.
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            QueryFailingProvider,
+            Namespace::Project("rb".into()),
+        );
+        eng.remember(input("sqlite wal checkpoint decision", 5))
+            .await
+            .unwrap();
+
+        let outcome = eng
+            .recall_with_status("sqlite checkpoint", 10, None, &[])
+            .await
+            .unwrap();
+        assert!(outcome.degraded, "embedder error must flag degradation");
+        assert!(
+            !outcome.results.is_empty(),
+            "the keyword channel must still serve the stored memory"
+        );
+        assert!(
+            outcome.results.iter().all(|r| !r.channels.vector),
+            "no result may claim a vector contribution while degraded"
+        );
+        assert!(
+            outcome.results.iter().any(|r| r.channels.fts),
+            "the surviving keyword channel attributes the hits"
+        );
+
+        // The thin recall() wrapper serves the same degraded results.
+        let results = eng
+            .recall("sqlite checkpoint", 10, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), outcome.results.len());
+    }
+
+    #[tokio::test]
+    async fn recall_with_status_is_not_degraded_under_a_healthy_embedder() {
+        let eng = engine();
+        eng.remember(input("healthy embedder note", 5))
+            .await
+            .unwrap();
+        let outcome = eng
+            .recall_with_status("healthy embedder", 10, None, &[])
+            .await
+            .unwrap();
+        assert!(!outcome.degraded, "a healthy embedder never degrades");
+        assert!(!outcome.results.is_empty());
     }
 
     #[tokio::test]

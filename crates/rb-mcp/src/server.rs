@@ -251,6 +251,7 @@ mod tests {
                         score: 0.9,
                         channels: rb_types::ChannelHits::default(),
                     }],
+                    degraded: false,
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),

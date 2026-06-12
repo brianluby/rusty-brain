@@ -223,6 +223,12 @@ impl Daemon {
             request_idle_timeout,
         } = self;
         tokio::pin!(shutdown);
+        // Writer-death signal (W1.6c): resolves only on an ABNORMAL writer
+        // exit. Raced in the select! below so a daemon whose writer is gone
+        // shuts down instead of zombieing — ponging Ping while every write
+        // fails with "writer thread unavailable" (F17).
+        let writer_died = store.writer_died();
+        tokio::pin!(writer_died);
         let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
@@ -234,6 +240,12 @@ impl Daemon {
                 biased;
                 _ = &mut shutdown => {
                     info!("shutdown signal received; stopping accept loop");
+                    break;
+                }
+                () = &mut writer_died => {
+                    tracing::error!(
+                        "writer thread died; shutting down daemon instead of zombieing"
+                    );
                     break;
                 }
                 accepted = listener.accept() => {
@@ -677,14 +689,20 @@ where
             tags,
             limit,
         } => match engine
-            .recall(&query, limit.min(MAX_LIMIT), memory_type, &tags)
+            .recall_with_status(&query, limit.min(MAX_LIMIT), memory_type, &tags)
             .await
         {
-            Ok(results) => {
+            Ok(outcome) => {
                 // Per-channel hit-contribution counters (W1.0): four relaxed
                 // atomic adds per served recall — never a failure path.
-                recall_counters.record(&results);
-                Response::Recalled { results }
+                recall_counters.record(&outcome.results);
+                // `degraded` (W1.6d): an embedder outage downgraded this
+                // recall to keyword+graph; the flag rides the wire so clients
+                // can warn instead of silently serving vector-blind results.
+                Response::Recalled {
+                    results: outcome.results,
+                    degraded: outcome.degraded,
+                }
             }
             Err(e) => error_to_response(e),
         },
@@ -895,6 +913,44 @@ mod tests {
         assert_eq!(snap.fts_hits, 1);
         assert_eq!(snap.vector_hits, 2);
         assert_eq!(snap.graph_hits, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_death_exits_the_accept_loop() {
+        // W1.6c / F17: a daemon whose writer thread died must exit `run`
+        // instead of zombieing — accepting connections and ponging Ping while
+        // every write fails.
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        // The socket parent must be private (prepare_socket_dir fail-closed);
+        // tempdir permissions are umask-derived, so tighten explicitly.
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = DaemonConfig {
+            socket_path: dir.path().join("rb.sock"),
+            db_path: dir.path().join("rb.db"),
+            read_pool_size: 1,
+            jobs_config: JobsConfig::default(),
+        };
+        let daemon = Daemon::bind(
+            config,
+            crate::SharedEmbedder::new(DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap();
+        let store = daemon.store.clone();
+
+        // A shutdown future that never resolves: only the writer-death arm
+        // can break the accept loop.
+        let run = tokio::spawn(daemon.run(std::future::pending::<()>()));
+
+        store.kill_writer_for_test().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("daemon must exit its accept loop after writer death")
+            .expect("run task must not panic")
+            .expect("run must return Ok on writer-death shutdown");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

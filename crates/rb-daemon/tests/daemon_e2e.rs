@@ -27,6 +27,14 @@ struct RunningDaemon {
 
 impl RunningDaemon {
     async fn start(pool_size: usize) -> RunningDaemon {
+        Self::start_with_embedder(
+            pool_size,
+            SharedEmbedder::new(DeterministicProvider::new(DIM)),
+        )
+        .await
+    }
+
+    async fn start_with_embedder(pool_size: usize, embedder: SharedEmbedder) -> RunningDaemon {
         let dir = tempdir();
         let socket = dir.path().join("runtime").join("sock");
         let db = dir.path().join("memory.db");
@@ -36,7 +44,6 @@ impl RunningDaemon {
             read_pool_size: pool_size,
             jobs_config: rb_daemon::JobsConfig::default(),
         };
-        let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
 
         let (tx, rx) = oneshot::channel::<()>();
@@ -673,6 +680,113 @@ async fn reembed_over_the_wire_is_stamp_skip_and_idempotent() {
     // A second pass is likewise a no-op (idempotent).
     let (s2, c2, k2) = client.reembed(Some(100)).await.unwrap();
     assert_eq!((s2, c2, k2), (0, 0, 0), "reembed is idempotent");
+
+    daemon.stop().await;
+}
+
+/// Document embeds succeed (so `remember` works); Query embeds fail — the
+/// W1.6d embedding-API-outage shape, injected per test run.
+struct QueryFailingProvider;
+
+#[async_trait::async_trait]
+impl rb_embed::EmbeddingProvider for QueryFailingProvider {
+    fn model_id(&self) -> &str {
+        "query-failing"
+    }
+
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    async fn embed(
+        &self,
+        texts: &[String],
+        kind: rb_embed::EmbedKind,
+    ) -> rb_types::Result<Vec<Vec<f32>>> {
+        match kind {
+            rb_embed::EmbedKind::Document => Ok(vec![vec![1.0; DIM]; texts.len()]),
+            rb_embed::EmbedKind::Query => Err(Error::Embedding(
+                "embedding API down (injected)".to_string(),
+            )),
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
+    // W1.6d / F19 end-to-end: with the embedder down at recall time, the
+    // daemon still serves keyword+graph results AND the wire Response carries
+    // the additive `degraded` flag.
+    let daemon =
+        RunningDaemon::start_with_embedder(2, SharedEmbedder::new(QueryFailingProvider)).await;
+    let ns = Namespace::Project("degraded-recall".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    let id = client
+        .remember(
+            "daemon survives embedding outages".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // Typed client path: recall succeeds (no hard failure) and the keyword
+    // channel serves the stored memory.
+    let results = client
+        .recall("embedding outages".to_string(), None, vec![], 10)
+        .await
+        .unwrap();
+    assert!(
+        results.iter().any(|r| r.memory.id == id),
+        "keyword channel must still serve the memory while the embedder is down"
+    );
+
+    // Raw frame path: the degraded flag rides the wire Response.
+    let stream = tokio::net::UnixStream::connect(&daemon.socket)
+        .await
+        .unwrap();
+    let mut framed = rb_proto::bounded_framed(stream);
+    rb_proto::write_frame(
+        &mut framed,
+        &rb_proto::Handshake {
+            contract_version: rb_proto::CONTRACT_VERSION,
+            namespace: ns.clone(),
+            identity: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ack: rb_proto::HandshakeAck = rb_proto::read_frame(&mut framed).await.unwrap();
+    assert!(ack.ok, "handshake must succeed: {:?}", ack.message);
+
+    rb_proto::write_frame(
+        &mut framed,
+        &rb_proto::Request::Recall {
+            query: "embedding outages".to_string(),
+            memory_type: None,
+            tags: vec![],
+            limit: 10,
+        },
+    )
+    .await
+    .unwrap();
+    let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
+    match resp {
+        rb_proto::Response::Recalled { results, degraded } => {
+            assert!(degraded, "embedder outage must flag the wire response");
+            assert!(
+                results.iter().any(|r| r.memory.id == id),
+                "degraded recall still returns the keyword hit"
+            );
+        }
+        other => unreachable!("expected Recalled, got {other:?}"),
+    }
 
     daemon.stop().await;
 }

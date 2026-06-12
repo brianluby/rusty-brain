@@ -285,6 +285,32 @@ impl SqliteStore {
         &self.site_id
     }
 
+    /// Whether the connection is in autocommit mode (no open transaction).
+    ///
+    /// `false` after a COMPLETED writer op means the op leaked a transaction —
+    /// e.g. a failed COMMIT whose drop-rollback also failed — and every later
+    /// op on this connection would die with "cannot start a transaction within
+    /// a transaction". The daemon's writer checks this after any op that
+    /// returns `Err` and drops + reopens the connection instead of letting the
+    /// poison spread (W1.6b, F07/F16).
+    pub fn is_autocommit(&self) -> bool {
+        self.conn.is_autocommit()
+    }
+
+    /// Test-only seam (W1.6b): open a transaction and LEAVE it open, simulating
+    /// a writer op that errored out mid-transaction without rolling back (the
+    /// failed-COMMIT-then-failed-ROLLBACK poison case, which cannot be induced
+    /// through the public write API now that every op rolls back via RAII).
+    ///
+    /// This method is `pub` only to be reachable from the daemon's writer
+    /// tests. Do NOT call it in production code.
+    #[doc(hidden)]
+    pub fn leave_transaction_open_for_test(&self) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(storage_err)
+    }
+
     /// Explicit opt-in for an embedding-model swap: atomically point
     /// `meta.embedding_model` at `new_model` and stale every row's
     /// `embedding_input_version` to the `''` sentinel so the existing reembed
@@ -295,11 +321,7 @@ impl SqliteStore {
     /// recorded yet (legacy/fresh DB — it is seeded without staling, because
     /// the per-row `embedding_model` stamps already drive reembed there).
     pub fn accept_model_change(&self, new_model: &str) -> Result<bool> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<bool> {
+        immediate_tx(&self.conn, || {
             let stored = meta_value(&self.conn, "embedding_model")?;
             if stored.as_deref() == Some(new_model) {
                 return Ok(false);
@@ -318,20 +340,7 @@ impl SqliteStore {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             Ok(swapping)
-        })();
-
-        match result {
-            Ok(changed) => {
-                self.conn
-                    .execute_batch("COMMIT;")
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                Ok(changed)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Fold the WAL back into the main database file and truncate it to zero.
@@ -415,11 +424,7 @@ impl SqliteStore {
     ) -> Result<()> {
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — link strength is durable graph state replay must reproduce.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -449,18 +454,7 @@ impl SqliteStore {
                 )?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
@@ -475,11 +469,7 @@ impl SqliteStore {
         }
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — confidence is durable ranking state replay must reproduce.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -492,18 +482,7 @@ impl SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "set_confidence", id, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Read a value from the key/value `meta` table (e.g. the
@@ -524,11 +503,7 @@ impl SqliteStore {
     ) -> Result<()> {
         // Transaction: the DELETE and its oplog row commit (or roll back)
         // together — a pruned edge must be reproducible from the log.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -546,18 +521,7 @@ impl SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "unlink", source, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Find active memories in `ns` whose stored vector is near-identical to the
@@ -870,6 +834,29 @@ fn vector_table_ddl(embedding_dim: usize) -> String {
     )
 }
 
+/// Run `body` inside one `BEGIN IMMEDIATE` transaction with RAII drop-rollback
+/// (W1.6a).
+///
+/// On a body error the `Transaction` guard drops and rolls the transaction
+/// back. On a failed COMMIT the guard (consumed by `commit`) still drops and
+/// attempts ROLLBACK, because rusqlite's drop path only skips rollback when the
+/// connection is already back in autocommit. The manual BEGIN/COMMIT/ROLLBACK
+/// pattern this replaces left the connection mid-transaction in exactly the
+/// failed-COMMIT case, poisoning every later writer op with "cannot start a
+/// transaction within a transaction" (F07/F16). A leaked transaction that even
+/// the drop-rollback cannot clear is caught by the writer's post-op
+/// `is_autocommit` check (W1.6b).
+///
+/// Statements inside `body` run on the same connection, so they participate in
+/// the transaction without touching the guard.
+fn immediate_tx<T>(conn: &rusqlite::Connection, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage_err)?;
+    let value = body()?;
+    tx.commit().map_err(storage_err)?;
+    Ok(value)
+}
+
 /// Upsert one `meta` key.
 fn upsert_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<()> {
     conn.execute(
@@ -914,9 +901,7 @@ fn ensure_vector_schema(conn: &rusqlite::Connection, embedding_dim: usize) -> Re
 
     // One transaction for create-or-rebuild + marker: a crash mid-way rolls
     // everything back and the next open retries from the same state.
-    conn.execute_batch("BEGIN IMMEDIATE;")
-        .map_err(storage_err)?;
-    let result = (|| -> Result<()> {
+    immediate_tx(conn, || {
         if table_exists > 0 {
             rebuild_vector_table(conn, embedding_dim)?;
         } else {
@@ -927,15 +912,7 @@ fn ensure_vector_schema(conn: &rusqlite::Connection, embedding_dim: usize) -> Re
         // Human-legible companion marker (the version gate above is canonical).
         upsert_meta(conn, "vector_metric", "cosine")?;
         Ok(())
-    })();
-
-    match result {
-        Ok(()) => conn.execute_batch("COMMIT;").map_err(storage_err),
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK;");
-            Err(e)
-        }
-    }
+    })
 }
 
 /// Rebuild `memory_vectors` from a previous layout into the version-2 layout.
@@ -1406,11 +1383,7 @@ impl Store for SqliteStore {
         // writer mid-transaction; the busy_timeout above makes a contended BEGIN
         // wait rather than fail immediately. Atomicity is unchanged: all writes
         // commit together, and any error rolls the whole transaction back.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             self.conn
                 .execute(
                     "INSERT INTO memories (
@@ -1501,19 +1474,7 @@ impl Store for SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                // Best-effort rollback; surface the original error.
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>> {
@@ -1823,11 +1784,7 @@ impl Store for SqliteStore {
         );
 
         // Transaction: the UPDATE and its oplog row commit (or roll back) together.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
             let affected = self
                 .conn
@@ -1839,27 +1796,12 @@ impl Store for SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "update", id, "")?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn archive_memory(&self, id: &MemoryId) -> Result<()> {
         // Transaction: the archive and its oplog row commit (or roll back) together.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -1884,28 +1826,13 @@ impl Store for SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "archive", id, "")?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
         // Transaction: the link INSERT and its oplog row commit (or roll back)
         // together (an FK failure on a missing endpoint rolls back both).
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             self.conn
                 .execute(
                     "INSERT INTO memory_links
@@ -1930,18 +1857,7 @@ impl Store for SqliteStore {
             })
             .to_string();
             append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn record_access(&self, id: &MemoryId) -> Result<()> {
@@ -1991,12 +1907,8 @@ impl Store for SqliteStore {
     }
 
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
         let now = chrono::Utc::now().timestamp();
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             // Point old -> new. FK on superseded_by makes a missing `new` fail here,
             // rolling back the whole transaction (old stays unarchived).
             let affected = self
@@ -2032,18 +1944,7 @@ impl Store for SqliteStore {
             // (pointer + archive); the replacement id rides in `details`.
             let details = serde_json::json!({ "new": new.to_string() }).to_string();
             append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>> {
@@ -2225,11 +2126,7 @@ impl Store for SqliteStore {
             });
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             // Stamp the memory row. 0 rows updated means the id does not exist:
             // fail closed (NotFound) so the whole transaction rolls back rather
             // than leaving a vector update with no owning row.
@@ -2275,18 +2172,7 @@ impl Store for SqliteStore {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 }
 
@@ -5275,6 +5161,55 @@ mod vector_schema_tests {
         assert!(
             store.vector_search(&other, &v, 5).unwrap().is_empty(),
             "absent from every other partition"
+        );
+    }
+
+    #[test]
+    fn failed_mid_transaction_insert_rolls_back_and_restores_autocommit() {
+        // W1.6a: a constraint violation AFTER the transaction opened (the
+        // memories INSERT succeeded; the link INSERT hits the FK on a missing
+        // target) must roll the whole op back via the RAII guard and leave the
+        // connection in autocommit, so the next write runs cleanly.
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("raii".into());
+
+        let mut bad = MemoryNote::new(ns.clone(), "doomed insert".into(), MemoryType::Insight, 5);
+        bad.links.push(MemoryLink {
+            source_id: bad.id.clone(),
+            target_id: MemoryId::new(), // does not exist -> FK violation
+            link_type: rb_types::LinkType::References,
+            strength: 0.5,
+            reason: "ghost target".into(),
+            created_at: chrono::Utc::now(),
+        });
+        let err = store.insert_memory(&bad, Some(&[0.1; DIM])).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+
+        assert!(
+            store.is_autocommit(),
+            "the failed op must not leave an open transaction"
+        );
+        assert!(
+            store.get_memory(&bad.id).unwrap().is_none(),
+            "the partial memories INSERT must roll back with the failed link"
+        );
+
+        // The same connection accepts the next write (no transaction poison).
+        let ok = MemoryNote::new(ns, "clean follow-up".into(), MemoryType::Insight, 5);
+        store.insert_memory(&ok, Some(&[0.2; DIM])).unwrap();
+        assert!(store.get_memory(&ok.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn is_autocommit_reflects_a_leaked_transaction() {
+        // The W1.6b poison probe: the writer uses `is_autocommit` to detect a
+        // connection stranded mid-transaction; the test seam strands one.
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        assert!(store.is_autocommit(), "fresh connection is in autocommit");
+        store.leave_transaction_open_for_test().unwrap();
+        assert!(
+            !store.is_autocommit(),
+            "an open transaction must be visible to the poison probe"
         );
     }
 }
