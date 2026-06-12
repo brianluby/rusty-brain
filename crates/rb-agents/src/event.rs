@@ -19,9 +19,14 @@ pub enum HookEvent {
         tool_input: serde_json::Value,
         tool_response: serde_json::Value,
     },
-    /// The assistant turn is stopping. Carries the last assistant message, if any.
+    /// The assistant turn is stopping. Carries the last assistant message, if
+    /// any, and whether this Stop was itself caused by a Stop hook forcing
+    /// continuation (Claude Code `stop_hook_active` — real payloads carry it;
+    /// W3.1's retained Stop logic must check it to avoid re-capture loops).
+    /// CLIs without an equivalent field parse it as `false`.
     Stop {
         last_assistant_message: Option<String>,
+        stop_hook_active: bool,
     },
     /// The context is about to be compacted. Carries any custom instructions.
     PreCompact { custom_instructions: Option<String> },
@@ -57,6 +62,12 @@ pub struct HookContext {
     pub event: HookEvent,
     pub cwd: PathBuf,
     pub session_id: Option<String>,
+    /// Path to the CLI's session transcript, when the CLI reports one. Claude
+    /// Code sends `transcript_path` on EVERY hook event (verified against the
+    /// recorded fixtures in `rb-hooks/tests/fixtures/claude_code/`); W3.1's
+    /// PreCompact redesign reads decisions out of it. CLIs without an
+    /// equivalent parse it as `None`.
+    pub transcript_path: Option<PathBuf>,
 }
 
 #[cfg(test)]
@@ -81,6 +92,7 @@ mod tests {
             },
             cwd: PathBuf::from("/work/project"),
             session_id: Some("sess-1".to_string()),
+            transcript_path: Some(PathBuf::from("/work/transcript.jsonl")),
         };
         assert_eq!(
             ctx.event,
@@ -90,6 +102,10 @@ mod tests {
         );
         assert_eq!(ctx.cwd, PathBuf::from("/work/project"));
         assert_eq!(ctx.session_id.as_deref(), Some("sess-1"));
+        assert_eq!(
+            ctx.transcript_path,
+            Some(PathBuf::from("/work/transcript.jsonl"))
+        );
     }
 
     #[test]

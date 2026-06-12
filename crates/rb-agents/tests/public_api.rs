@@ -18,6 +18,7 @@ fn event_model_types_are_reexported() {
         event: HookEvent::SessionStart { source: None },
         cwd: PathBuf::from("."),
         session_id: None,
+        transcript_path: None,
     };
     assert_eq!(ctx.event, HookEvent::SessionStart { source: None });
     let result = HookResult {

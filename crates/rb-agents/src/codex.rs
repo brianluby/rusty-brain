@@ -63,6 +63,8 @@ impl AgentCli for CodexCli {
             },
             Some("Stop") => HookEvent::Stop {
                 last_assistant_message: str_field(raw, "last_assistant_message"),
+                // Codex has no stop-hook-forced-continuation equivalent.
+                stop_hook_active: false,
             },
             Some("PreCompact") => HookEvent::PreCompact {
                 custom_instructions: str_field(raw, "custom_instructions"),
@@ -76,6 +78,8 @@ impl AgentCli for CodexCli {
             event,
             cwd,
             session_id,
+            // Codex's hook payloads do not document a transcript-path field.
+            transcript_path: None,
         }
     }
 
@@ -161,7 +165,8 @@ mod tests {
         assert_eq!(
             ctx.event,
             HookEvent::Stop {
-                last_assistant_message: Some("wrapped up".to_string())
+                last_assistant_message: Some("wrapped up".to_string()),
+                stop_hook_active: false,
             }
         );
     }
