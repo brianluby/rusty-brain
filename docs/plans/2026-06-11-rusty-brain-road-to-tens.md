@@ -145,7 +145,7 @@ Target: teamfit →9.5+, security →9.5+. Design first: **P8 spec** precedes 5a
 
 ## 9. Spike register (time-boxed, before committing the dependent phase)
 
-- **S1 (before the Phase 0 gate is finalized, 1 day):** prove `claude -p` fires SessionStart/PostToolUse/SessionEnd hooks headlessly with an API key in CI. If not, the nightly tier becomes fixture-only and real-CC checks stay a per-phase manual ritual — W3.5's design depends on this answer.
+- **S1 (answered on knowledge 2026-06-12; empirical CI run still owed):** `claude -p` (headless/print mode) does fire lifecycle hooks — SessionStart, PostToolUse, Stop/SessionEnd — so the nightly real-CC smoke tier and W3.5's A/B eval design are viable. Two operational consequences: (a) unprompted MCP tool calls stall on permission prompts in non-interactive mode unless allowlisted — `permissions.allow` entries for `mcp__rusty-brain__*` (W3.2) are a hard prerequisite for any headless eval arm that expects model-initiated remember/recall; (b) the nightly job needs an API-key secret and a small spend budget. Remaining to close S1: one recorded CI run on a macOS runner proving the hook events arrive (lands with gate tier (b), see Phase-0 carryover debt).
 - **S2 (during Phase 2, 1–2 days):** hub auth design note — token vs mTLS vs SSH tunnel — pinning the handshake identity field shape so the wire contract bumps once.
 - **S3 (retired):** vec0 `distance_metric=cosine` support confirmed in vendored sqlite-vec 0.1.9; rebuild mechanics folded into W1.1 as open-time code.
 
