@@ -30,14 +30,14 @@ impl AgentInstaller for ClaudeCodeInstaller {
             InstallScope::Project(root) => root.join(".claude").join("settings.json"),
             InstallScope::Global => home_join(".claude")?.join("settings.json"),
         };
-        // Claude Code: its own event names, tool event `PostToolUse`, EXEC form
-        // (it supports a separate `args` array).
+        // Claude Code: its own event names, tool event `PostToolUse`. The
+        // documented hooks schema takes `command` as ONE shell string (no `args`
+        // field — verified against a recorded real settings.json, F50).
         let merge = hooks_block(
             &hooks_bin.to_string_lossy(),
             AgentId::ClaudeCode.as_str(),
             &CLAUDE_EVENTS,
             "PostToolUse",
-            true,
         );
         Ok(HookFragment { config_path, merge })
     }
@@ -74,14 +74,21 @@ mod tests {
             let group = &arr[0];
             assert_eq!(group.get(SENTINEL).unwrap(), &serde_json::json!(true));
             let inner = group.get("hooks").unwrap().as_array().unwrap();
-            // EXEC form: `command` is the raw binary path; flags live in `args`.
-            let cmd = inner[0].get("command").unwrap().as_str().unwrap();
-            assert_eq!(cmd, "/usr/local/bin/rusty-brain-hooks");
-            assert_eq!(
-                inner[0].get("args").unwrap(),
-                &serde_json::json!(["--agent", "claude-code"])
+            // Documented shape: exactly {type, command}; the flag lives inside
+            // the single shell string, never in a separate `args` array.
+            let entry = inner[0].as_object().unwrap();
+            let keys: Vec<&str> = entry.keys().map(String::as_str).collect();
+            assert_eq!(keys, ["command", "type"], "no args key, no unknown keys");
+            assert_eq!(entry.get("type").unwrap(), &serde_json::json!("command"));
+            let cmd = entry.get("command").unwrap().as_str().unwrap();
+            assert!(
+                cmd.contains("/usr/local/bin/rusty-brain-hooks"),
+                "command must reference the hooks binary path; got {cmd}"
             );
-            assert_eq!(inner[0].get(SENTINEL).unwrap(), &serde_json::json!(true));
+            assert!(
+                cmd.ends_with("--agent claude-code"),
+                "command must pass the claude-code agent id; got {cmd}"
+            );
         }
         // PostToolUse carries a matcher; the others do not.
         let post = hooks.get("PostToolUse").unwrap().as_array().unwrap();
