@@ -230,6 +230,7 @@ async fn dedup_clusters_are_scored() {
         golden_queries: vec![GoldenQuery {
             query: "writer".into(),
             expected: vec!["dup_a".into()],
+            grades: vec![3],
             k: Some(5),
         }],
         dedup_clusters: vec![DedupCluster {

@@ -60,12 +60,28 @@ semantic gain.
 
 ## Components
 
-- `fixtures/corpus.json` — committed, hand-authored coding-memory corpus. Each
-  memory has stable string **keys** (not UUIDs; the runner maps each key to the
-  engine-minted `MemoryId` after ingestion), enrichment fields
-  (summary/keywords/tags/context), golden queries mapping to expected-relevant
-  keys, and near-duplicate clusters for dedup scoring. Authored to exercise the
-  FTS, vector, and graph retrieval paths.
+- `fixtures/corpus.json` — committed, hand-authored coding-memory corpus
+  (Phase-1 scale: **205 memories, 72 graded golden queries, 8 near-duplicate
+  clusters**). Each memory has stable string **keys** (not UUIDs; the runner
+  maps each key to the engine-minted `MemoryId` after ingestion) and enrichment
+  fields (summary/keywords/tags/context). The corpus simulates a dev team's
+  shared memory across four fictional projects (`mer_*` payments backend,
+  `sky_*` TypeScript dashboard, `pk_*` Python build cache, `ops_*` platform)
+  plus rusty-brain itself: decisions, constraints, gotchas, incidents, review
+  outcomes, preferences, and hook-captured session summaries (`*_session_*`
+  keys, `confidence < 1.0`). It deliberately contains near-duplicate
+  restatements (the dedup clusters) and six contradiction pairs (decision
+  reversals). Golden queries are natural-language developer questions with
+  **relevance grades** (`grades` aligns with `expected`; 3 = primary, 2 =
+  relevant, 1 = marginal — consumed by graded metrics later, W1.0b). The README
+  quickstart query (`how is writing serialized?`) is committed verbatim with
+  its verbatim target memory (`readme_quickstart`).
+- `fixtures/holdout_queries.json` — the **held-out** graded query set (20
+  queries). It must **never** be used for weight tuning, threshold selection,
+  or tokenizer choice; it is reserved for the Phase 4 (W4.1) CI gate so that
+  gate runs on queries no tuning loop has seen. `corpus.rs` validates it
+  against the committed corpus, and the harness asserts it stays disjoint from
+  the tuning goldens.
 - `corpus.rs` — fixture loader + validation; fails fast on any malformed fixture
   (unknown memory type, out-of-range importance/confidence, duplicate keys,
   queries/clusters referencing unknown keys).
@@ -85,6 +101,13 @@ semantic gain.
 one** (for a justified trade-off) is a deliberate, reviewed commit — never an
 incidental change. Latency p50/p99 are reported but **not gated** (they are
 machine-dependent).
+
+The Phase-1 plan's ground rule applies: every retrieval-semantics change lands
+with a re-captured `baselines.json` in the same commit, with a one-line
+justification of which metric moved and why. The W1.0a corpus expansion reset
+the absolute numbers downward (natural-language goldens against today's FTS
+tokenization and non-semantic deterministic vectors); that low starting line is
+the measurement Phase 1's retrieval workstreams are expected to raise.
 
 ## Error handling
 

@@ -1,0 +1,26 @@
+{
+  "_comment": "HELD-OUT evaluation query set (W1.0a). These queries reference memory keys in corpus.json and are graded exactly like golden queries (grades align with expected; 3 = primary answer, 2 = substantially relevant, 1 = marginal). RULE: this set must NEVER be used for weight tuning, threshold selection, tokenizer choice, or any other optimization loop -- automated or human. It exists solely so Phase 4 (W4.1) can gate CI on retrieval quality over queries that no tuning process has ever seen. Do not add these queries to corpus.json, do not iterate ranking changes against them, and do not 'fix' a ranking regression by editing this file. Reading individual results to debug a CI failure after the fact is fine; optimizing against them is not.",
+
+  "golden_queries": [
+    { "query": "how do we stop a payment from being charged twice?", "expected": ["mer_idempotency_keys", "mer_idempotency_dup", "mer_double_charge_incident"], "grades": [3, 3, 2] },
+    { "query": "what is the maximum initial bundle size for a route?", "expected": ["sky_bundle_budget", "sky_bundle_budget_dup"], "grades": [3, 3] },
+    { "query": "is it ok to mutate a posted ledger entry?", "expected": ["mer_ledger_immutable"], "grades": [3] },
+    { "query": "which state management library should I use for new dashboard features?", "expected": ["sky_redux_removed", "sky_react_query"], "grades": [3, 2] },
+    { "query": "how does the build cache stop a PR from poisoning main?", "expected": ["pk_cache_poisoning_incident", "ops_runner_pool"], "grades": [3, 2] },
+    { "query": "what happens to old unreferenced artifacts?", "expected": ["pk_retention_90d"], "grades": [3] },
+    { "query": "who is allowed to apply infrastructure changes to production?", "expected": ["ops_terraform_atlantis"], "grades": [3] },
+    { "query": "why did both replicas go down during the node drain?", "expected": ["ops_pod_disruption"], "grades": [3] },
+    { "query": "what is our currency rounding convention?", "expected": ["mer_decimal_rounding"], "grades": [3] },
+    { "query": "how much clock skew do webhook signatures tolerate?", "expected": ["mer_clock_skew_webhooks", "mer_webhook_signing"], "grades": [3, 2] },
+    { "query": "why is the sqlx statement cache turned off in prod?", "expected": ["mer_pgbouncer_prepared", "mer_session_pgbouncer"], "grades": [3, 2] },
+    { "query": "is localStorage acceptable for session credentials?", "expected": ["sky_auth_session_cookie", "sky_no_secrets_client"], "grades": [3, 2] },
+    { "query": "how often are backups restore tested?", "expected": ["ops_backup_restore_test"], "grades": [3] },
+    { "query": "what is the minimum supported python version?", "expected": ["pk_python_312"], "grades": [3] },
+    { "query": "how do I make CI archives byte identical between runs?", "expected": ["pk_zip_timestamps"], "grades": [3] },
+    { "query": "which fusion mode does recall use by default?", "expected": ["linear_ranking"], "grades": [3] },
+    { "query": "how is the full text index kept in sync with the memories table?", "expected": ["fts_trigger"], "grades": [3] },
+    { "query": "what does the daemon do with the WAL on shutdown?", "expected": ["wal_checkpoint"], "grades": [3] },
+    { "query": "can an unsigned image run in a prod namespace?", "expected": ["ops_image_signing"], "grades": [3] },
+    { "query": "when did we move off jest and what replaced it?", "expected": ["sky_vitest", "sky_jest_decision"], "grades": [3, 2] }
+  ]
+}

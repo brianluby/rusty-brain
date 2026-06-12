@@ -1,5 +1,5 @@
 {
-  "_comment": "Hand-authored coding-memory corpus for rb-eval. Keys are stable handles (not UUIDs); the runner maps each to the engine-minted MemoryId after ingestion. Authored to exercise FTS (exact term), vector (deterministic-similarity), and graph (1-hop link expansion) paths. See README.md for the honest framing of what these metrics do and do not measure.",
+  "_comment": "Hand-authored Phase-1 evaluation corpus for rb-eval (W1.0a). Keys are stable handles (not UUIDs); the runner maps each to the engine-minted MemoryId after ingestion. The corpus simulates a dev team's shared memory across four fictional projects plus rusty-brain itself: 'meridian' (payments platform: Rust services, Postgres ledger, Kafka), 'skyline' (TypeScript/Next.js dashboard), 'packrat' (Python build-artifact cache: FastAPI, S3), and 'ops' (shared platform/infrastructure), with a few cross-team 'team_' policies. Content covers architecture decisions, constraints, gotchas, incident learnings, code-review outcomes, preferences, and hook-captured session summaries (the session_* keys carry confidence < 1.0, matching W0.5's hook-capture rule). Deliberate structure: dedup_clusters list mutually redundant near-duplicate restatements; six contradiction pairs model decision reversals (the newer memory names the older one in its context field): mer_money_integer_cents/mer_money_numeric_reversal, mer_settlement_cutoff/mer_settlement_cutoff_change, sky_redux_decision/sky_redux_removed, sky_jest_decision/sky_vitest, pk_pin_all_transitives/pk_pin_direct_only, ops_blue_green/ops_canary_reversal. Golden queries are natural-language questions a developer actually asks; 'grades' aligns index-for-index with 'expected' (3 = primary answer, 2 = substantially relevant, 1 = marginal). The README quickstart query appears verbatim ('how is writing serialized?') with its verbatim target memory (readme_quickstart). The held-out query set lives in holdout_queries.json and must NEVER be used for tuning. See README.md for the honest framing of what the deterministic metrics do and do not measure.",
 
   "memories": [
     {
@@ -121,68 +121,2035 @@
       "context": "near-duplicate restatement of namespace isolation",
       "memory_type": "Constraint",
       "importance": 8
+    },
+    {
+      "key": "readme_quickstart",
+      "content": "We use a single-writer daemon over SQLite WAL",
+      "summary": "single-writer daemon over SQLite WAL",
+      "keywords": [],
+      "tags": ["storage", "concurrency"],
+      "context": "",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "rb_mcp_tools",
+      "content": "The MCP server exposes nine tools over stdio: remember, recall, get, update, delete, list, graph, context, and poll_changes.",
+      "summary": "nine MCP tools exposed over stdio",
+      "keywords": ["mcp", "tools", "stdio", "remember", "recall"],
+      "tags": ["mcp", "api"],
+      "context": "rb-mcp tool surface",
+      "memory_type": "Reference",
+      "importance": 5
+    },
+    {
+      "key": "rb_hooks_redaction",
+      "content": "Hook capture redacts bearer tokens, key=value secret pairs, AWS-style access keys, and PEM blocks before a memory is stored. Redaction is best-effort; the 0600 file permissions are the backstop, not a substitute.",
+      "summary": "capture-time secret redaction: bearer, key=value, AWS keys, PEM",
+      "keywords": ["redaction", "secrets", "hooks", "capture", "tokens"],
+      "tags": ["security", "hooks"],
+      "context": "W0.5 minimal redaction pattern set in rb-hooks",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "rb_contract_version",
+      "content": "Client and daemon exchange CONTRACT_VERSION during the handshake and fail closed on mismatch instead of guessing at wire compatibility.",
+      "summary": "handshake CONTRACT_VERSION check fails closed on mismatch",
+      "keywords": ["contract", "version", "handshake", "protocol"],
+      "tags": ["protocol", "compat"],
+      "context": "rb-proto versioning rule",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "rb_db_permissions",
+      "content": "The daemon creates the database file with mode 0600 and its parent directory with 0700, matching the unix socket permissions, so other local users cannot read stored memories.",
+      "summary": "DB file 0600, dir 0700, parity with the socket",
+      "keywords": ["permissions", "0600", "database", "socket"],
+      "tags": ["security", "store"],
+      "context": "file permission hardening from Phase 0",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "mer_event_sourced_ledger",
+      "content": "The meridian ledger is append-only and event-sourced: every balance is a projection over ledger events, and projections can always be rebuilt from the event stream. Nothing mutates a balance in place.",
+      "summary": "ledger is append-only event-sourced; balances are projections",
+      "keywords": ["ledger", "event-sourced", "append-only", "projection", "balance"],
+      "tags": ["meridian", "architecture", "ledger"],
+      "context": "core ledger architecture decision, ADR-0003",
+      "memory_type": "ArchitectureDecision",
+      "importance": 9
+    },
+    {
+      "key": "mer_outbox_pattern",
+      "content": "meridian publishes domain events to Kafka via a transactional outbox: the event row is written in the same Postgres transaction as the state change, and a relay process polls the outbox table and publishes. We never call the Kafka producer inside a request handler.",
+      "summary": "transactional outbox decouples Postgres commits from Kafka publish",
+      "keywords": ["outbox", "kafka", "transactional", "publish", "events"],
+      "tags": ["meridian", "architecture", "kafka"],
+      "context": "ADR-0007 event publishing",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "mer_outbox_dup",
+      "content": "Domain events in meridian go through an outbox table committed atomically with the business write; a separate relay drains the outbox to Kafka. Direct produces from request handlers are banned.",
+      "summary": "outbox table + relay; no direct Kafka produce from handlers",
+      "keywords": ["outbox", "relay", "kafka", "atomic"],
+      "tags": ["meridian", "kafka"],
+      "context": "near-duplicate restatement of the outbox decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_idempotency_keys",
+      "content": "Every mutating meridian API call (POST /charges, POST /refunds) requires an Idempotency-Key header. Keys are stored in Postgres with a unique index; a replay within the retention window returns the original response instead of re-executing, so client retries can never create duplicate charges.",
+      "summary": "Idempotency-Key required on mutating calls; replays return the original response",
+      "keywords": ["idempotency", "duplicate", "retry", "charges", "unique"],
+      "tags": ["meridian", "api", "payments"],
+      "context": "ADR-0009 idempotent API writes",
+      "memory_type": "ArchitectureDecision",
+      "importance": 9
+    },
+    {
+      "key": "mer_idempotency_dup",
+      "content": "Duplicate payment protection in meridian: clients send an Idempotency-Key on every charge or refund request, the key is persisted with a unique constraint, and a retried request gets the stored response rather than executing twice.",
+      "summary": "idempotency keys with unique constraint stop duplicate charges on retry",
+      "keywords": ["idempotency", "retry", "duplicate", "charge"],
+      "tags": ["meridian", "api", "payments"],
+      "context": "near-duplicate restatement of the idempotency-key decision",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "mer_money_integer_cents",
+      "content": "Money amounts in meridian are stored as integer cents (i64), never as floats. All arithmetic happens on minor units and formatting to decimal only occurs at the API edge.",
+      "summary": "amounts as integer cents, never floats",
+      "keywords": ["money", "integer", "cents", "amounts", "float"],
+      "tags": ["meridian", "ledger", "money"],
+      "context": "original money representation decision, ADR-0004 (later reversed by ADR-0021)",
+      "memory_type": "ArchitectureDecision",
+      "importance": 9
+    },
+    {
+      "key": "mer_money_numeric_reversal",
+      "content": "ADR-0021 reverses ADR-0004: ledger amounts migrated from integer cents to NUMERIC(20,4) because multi-currency support broke the cents assumption (JPY has zero minor units, BHD has three). The 'divide by 100' idiom is banned; use the currency exponent table.",
+      "summary": "amounts now NUMERIC(20,4); integer-cents assumption removed for multi-currency",
+      "keywords": ["money", "numeric", "currency", "cents", "migration"],
+      "tags": ["meridian", "ledger", "money"],
+      "context": "contradicts mer_money_integer_cents (ADR-0021 supersedes ADR-0004)",
+      "memory_type": "ArchitectureDecision",
+      "importance": 9
+    },
+    {
+      "key": "mer_sqlx_over_diesel",
+      "content": "meridian services use sqlx rather than diesel: compile-time checked SQL against a live schema beats a DSL for our review culture, and the team prefers reading plain SQL in PRs. The offline query cache is committed so CI does not need a database to type-check.",
+      "summary": "sqlx chosen over diesel for compile-time checked plain SQL",
+      "keywords": ["sqlx", "diesel", "sql", "postgres", "rust"],
+      "tags": ["meridian", "tooling", "database"],
+      "context": "ADR-0002 data access layer",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_grpc_internal",
+      "content": "Service-to-service calls inside meridian are gRPC with protobuf contracts; the public merchant-facing API is REST+JSON. Do not expose gRPC publicly and do not add internal REST endpoints.",
+      "summary": "gRPC internal, REST external",
+      "keywords": ["grpc", "rest", "api", "protobuf", "internal"],
+      "tags": ["meridian", "architecture", "api"],
+      "context": "ADR-0005 service communication",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_saga_orchestration",
+      "content": "Refunds in meridian run as an orchestrated saga: the refund-coordinator service owns the state machine and issues compensating ledger entries on failure. We rejected choreography because debugging implicit event chains during the INC-2041 retro took two days.",
+      "summary": "refunds are an orchestrated saga owned by refund-coordinator",
+      "keywords": ["saga", "refund", "orchestration", "compensation", "coordinator"],
+      "tags": ["meridian", "architecture", "payments"],
+      "context": "ADR-0014 refund flow",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "mer_kafka_partition_by_account",
+      "content": "Kafka topics in meridian are partitioned by account_id so all events for one account are strictly ordered. Consumers must never assume cross-account ordering.",
+      "summary": "Kafka partitioned by account_id; ordering only per account",
+      "keywords": ["kafka", "partition", "account", "ordering"],
+      "tags": ["meridian", "kafka"],
+      "context": "event stream partitioning decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "mer_read_replicas_reporting",
+      "content": "Reporting and analytics queries in meridian go to Postgres read replicas, never the primary. The replication lag SLO is 30 seconds; reports must tolerate that staleness.",
+      "summary": "reporting reads on replicas, 30s lag SLO",
+      "keywords": ["replica", "reporting", "postgres", "lag"],
+      "tags": ["meridian", "database"],
+      "context": "load isolation for the primary",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "mer_workspace_layout",
+      "content": "meridian is one cargo workspace: each service is a crate, shared domain types live in mer-core, and no service crate may depend on another service's database schema. Cross-service data access goes through the service API only.",
+      "summary": "one cargo workspace; cross-service data access only via APIs",
+      "keywords": ["workspace", "cargo", "crates", "boundaries"],
+      "tags": ["meridian", "architecture", "rust"],
+      "context": "repo layout decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "mer_webhook_signing",
+      "content": "Outbound merchant webhooks from meridian are signed with HMAC-SHA256 using a per-endpoint secret; the signature header includes a timestamp and receivers must reject anything older than 5 minutes to stop replay.",
+      "summary": "webhooks HMAC-SHA256 signed, per-endpoint secret, 5 min replay window",
+      "keywords": ["webhook", "hmac", "signature", "replay", "secret"],
+      "tags": ["meridian", "security", "api"],
+      "context": "webhook security design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "mer_retry_budget",
+      "content": "Outbound HTTP retries in meridian are capped by a per-service retry budget of 10% of request volume; when the budget is exhausted, calls fail fast instead of retrying. This is the lesson from the 2025 retry-storm brownout.",
+      "summary": "10% retry budget per service; fail fast when exhausted",
+      "keywords": ["retry", "budget", "storm", "backoff", "http"],
+      "tags": ["meridian", "resilience"],
+      "context": "post-brownout resilience rule",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_feature_flags_unleash",
+      "content": "Feature flags in meridian come from self-hosted Unleash. Policy: every flag has an owner and a 90-day expiry; the weekly cron files a ticket for any flag past expiry.",
+      "summary": "Unleash flags, 90-day expiry policy",
+      "keywords": ["feature", "flags", "unleash", "expiry"],
+      "tags": ["meridian", "tooling"],
+      "context": "flag lifecycle policy",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "mer_api_path_versioning",
+      "content": "The meridian public API is versioned in the path (/v1/, /v2/), not in headers. We tried header versioning in the beta and merchants kept hitting the wrong version from copied curl examples.",
+      "summary": "path versioning for the public API, not headers",
+      "keywords": ["versioning", "api", "path", "v1"],
+      "tags": ["meridian", "api"],
+      "context": "API versioning decision after beta feedback",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "mer_fx_rates_cache",
+      "content": "FX rates are pulled hourly from the provider and cached with a 2 hour TTL. Conversion requests must refuse (422) if the cached rate is older than 6 hours rather than convert at a stale rate.",
+      "summary": "hourly FX pull, 2h TTL, refuse conversions on rates older than 6h",
+      "keywords": ["fx", "rates", "cache", "ttl", "stale"],
+      "tags": ["meridian", "money"],
+      "context": "FX staleness policy",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "mer_payout_batching",
+      "content": "Merchant payouts are batched per merchant per day at the settlement run; instant payouts exist behind the instant_payout flag and carry a 1% fee. Batch is the default because acquirer fees are per-transfer.",
+      "summary": "payouts batched daily per merchant; instant payouts behind a flag",
+      "keywords": ["payout", "batch", "settlement", "merchant"],
+      "tags": ["meridian", "payments"],
+      "context": "payout design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 5
+    },
+    {
+      "key": "mer_chargeback_flow",
+      "content": "Chargebacks arrive as gateway webhooks and are ingested into a dedicated disputes ledger account; evidence submission deadlines are tracked in the disputes table with an alert 72 hours before expiry.",
+      "summary": "chargebacks ingested via webhooks into a disputes ledger account",
+      "keywords": ["chargeback", "dispute", "webhook", "evidence"],
+      "tags": ["meridian", "payments"],
+      "context": "disputes handling reference",
+      "memory_type": "Reference",
+      "importance": 6
+    },
+    {
+      "key": "mer_rate_limit_429",
+      "content": "The public API rate limits per API key with a token bucket, default 100 requests per second, and returns 429 with a Retry-After header. Enterprise tiers get custom buckets via config, not code.",
+      "summary": "per-key token bucket, 100 rps default, 429 + Retry-After",
+      "keywords": ["rate", "limit", "429", "token", "bucket"],
+      "tags": ["meridian", "api"],
+      "context": "API rate limiting configuration",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "mer_audit_log_append",
+      "content": "Admin actions in meridian append to an audit_log table where each row carries a hash of the previous row, making tampering evident. Audit rows are never deleted, including by GDPR erasure (the actor id is pseudonymous).",
+      "summary": "hash-chained append-only audit log for admin actions",
+      "keywords": ["audit", "log", "hash", "tamper", "admin"],
+      "tags": ["meridian", "security", "compliance"],
+      "context": "ADR-0018 audit trail",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_kyc_provider",
+      "content": "KYC checks go through the external verification provider; results are cached for 24 hours and scores between 40 and 70 route to the manual review queue instead of auto-deciding.",
+      "summary": "external KYC, 24h result cache, 40-70 scores go to manual review",
+      "keywords": ["kyc", "verification", "review", "onboarding"],
+      "tags": ["meridian", "compliance"],
+      "context": "merchant onboarding flow",
+      "memory_type": "Reference",
+      "importance": 5
+    },
+    {
+      "key": "mer_db_partitioning",
+      "content": "ledger_events is range-partitioned by month on posted_at. Partitions older than 18 months are detached and archived to S3 parquet; queries against archived ranges go through the warehouse, not Postgres.",
+      "summary": "ledger_events partitioned monthly; >18mo detached to S3 parquet",
+      "keywords": ["partition", "ledger_events", "posted_at", "archive"],
+      "tags": ["meridian", "database"],
+      "context": "ledger table growth management",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_idempotent_consumers",
+      "content": "Kafka delivery in meridian is at-least-once; every consumer must be idempotent, typically by upserting keyed on event_id. A consumer that double-applies on redelivery is a bug, full stop.",
+      "summary": "at-least-once delivery; consumers must upsert by event_id",
+      "keywords": ["kafka", "idempotent", "consumer", "at-least-once", "event_id"],
+      "tags": ["meridian", "kafka"],
+      "context": "consumer correctness invariant",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "mer_load_test_gate",
+      "content": "A meridian release cannot ship unless the k6 load test sustains 2x peak observed TPS in staging with p99 under 250ms. The gate runs nightly and on release branches.",
+      "summary": "release gate: k6 at 2x peak TPS, p99 < 250ms",
+      "keywords": ["load", "test", "k6", "tps", "gate"],
+      "tags": ["meridian", "ci", "performance"],
+      "context": "release performance gate",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "mer_pci_no_pan_logs",
+      "content": "PCI rule: full card numbers (PANs) must never appear in logs, traces, error messages, or stored memories. Only the BIN and last4 are loggable. A PAN in a log is a SEV2 security incident, not a bug.",
+      "summary": "no full PANs anywhere in logs/traces; BIN + last4 only",
+      "keywords": ["pci", "pan", "card", "logs", "redaction"],
+      "tags": ["meridian", "security", "compliance"],
+      "context": "PCI-DSS logging constraint",
+      "memory_type": "Constraint",
+      "importance": 10
+    },
+    {
+      "key": "mer_pci_tokenization",
+      "content": "Raw card data only ever touches the vault service, which exchanges it for a token; every other meridian service handles tokens exclusively. This keeps the PCI audit scope to one service.",
+      "summary": "card data confined to the vault service; everything else sees tokens",
+      "keywords": ["tokenization", "vault", "pci", "card", "scope"],
+      "tags": ["meridian", "security", "architecture"],
+      "context": "PCI scope reduction design",
+      "memory_type": "Constraint",
+      "importance": 10
+    },
+    {
+      "key": "mer_ledger_immutable",
+      "content": "Posted ledger entries are immutable. A mistake is corrected by posting a reversing entry plus the corrected entry, never by UPDATE. The mer-core API does not even expose an update on posted entries.",
+      "summary": "posted entries immutable; corrections are reversing entries",
+      "keywords": ["ledger", "immutable", "reversing", "correction", "update"],
+      "tags": ["meridian", "ledger"],
+      "context": "accounting integrity invariant",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "mer_eu_data_residency",
+      "content": "EU merchant data stays in eu-central-1: no cross-region replication of PII, and support tooling accesses EU records through the EU-resident proxy. US-region batch jobs must filter EU accounts out.",
+      "summary": "EU merchant PII pinned to eu-central-1",
+      "keywords": ["eu", "residency", "pii", "region", "gdpr"],
+      "tags": ["meridian", "compliance"],
+      "context": "data residency commitment in enterprise contracts",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "mer_api_backwards_compat",
+      "content": "No breaking change to the public meridian API without a new versioned path, and deprecated versions get a 12-month sunset window with per-merchant usage tracking before shutdown.",
+      "summary": "breaking changes need a new version; 12-month deprecation window",
+      "keywords": ["compatibility", "deprecation", "api", "breaking"],
+      "tags": ["meridian", "api"],
+      "context": "public API stability policy",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "mer_double_entry",
+      "content": "Every ledger transaction must balance to zero across its debit and credit legs. mer-core asserts it before write and a database CHECK constraint backstops it; an unbalanced transaction reaching Postgres means a bug in mer-core.",
+      "summary": "transactions balance to zero; asserted in mer-core and CHECKed in Postgres",
+      "keywords": ["double-entry", "balance", "debit", "credit", "check"],
+      "tags": ["meridian", "ledger"],
+      "context": "double-entry invariant",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "mer_no_sync_io_handlers",
+      "content": "Async request handlers in meridian must not perform blocking IO or CPU-heavy work inline; bcrypt hashing and CSV export generation go through spawn_blocking. We found tokio worker starvation from an inline bcrypt call in the auth path.",
+      "summary": "no blocking IO in async handlers; spawn_blocking for bcrypt/CSV",
+      "keywords": ["async", "blocking", "spawn_blocking", "tokio", "bcrypt"],
+      "tags": ["meridian", "rust", "performance"],
+      "context": "tokio runtime hygiene rule",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "mer_settlement_cutoff",
+      "content": "The settlement batch cutoff is 23:30 UTC; transactions after cutoff roll into the next business day's batch.",
+      "summary": "settlement cutoff 23:30 UTC",
+      "keywords": ["settlement", "cutoff", "batch", "utc"],
+      "tags": ["meridian", "payments"],
+      "context": "original settlement schedule (changed later, see mer_settlement_cutoff_change)",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "mer_settlement_cutoff_change",
+      "content": "Settlement cutoff moved from 23:30 UTC to 22:00 UTC when the EU acquiring bank integration went live; their file window closes at 22:30 UTC. Anything referencing the old 23:30 cutoff is stale.",
+      "summary": "settlement cutoff is now 22:00 UTC (EU bank file window)",
+      "keywords": ["settlement", "cutoff", "22:00", "utc", "bank"],
+      "tags": ["meridian", "payments"],
+      "context": "contradicts mer_settlement_cutoff; current as of the EU bank integration",
+      "memory_type": "Configuration",
+      "importance": 7
+    },
+    {
+      "key": "mer_double_charge_incident",
+      "content": "INC-2041: merchants saw duplicate charges when clients retried after a gateway timeout. Root cause: the idempotency key lookup happened after the gateway call, so a retry raced the first attempt. Fix: lookup-and-reserve the key in Postgres before calling the gateway, with a unique constraint as the backstop.",
+      "summary": "INC-2041 duplicate charges on retry; key now reserved before the gateway call",
+      "keywords": ["incident", "duplicate", "charge", "idempotency", "race"],
+      "tags": ["meridian", "incident", "payments"],
+      "context": "INC-2041 postmortem",
+      "memory_type": "BugFix",
+      "importance": 9
+    },
+    {
+      "key": "mer_serializable_retry",
+      "content": "Postgres SERIALIZABLE transactions abort with error 40001 under contention and sqlx does not retry for you. All ledger writes must go through the with_serializable_retry helper in mer-core, which retries up to 5 times with jittered backoff.",
+      "summary": "wrap ledger txns in with_serializable_retry; 40001 aborts are expected",
+      "keywords": ["serializable", "40001", "retry", "postgres", "transaction"],
+      "tags": ["meridian", "database", "rust"],
+      "context": "code pattern for serializable isolation",
+      "memory_type": "CodePattern",
+      "importance": 8
+    },
+    {
+      "key": "mer_kafka_rebalance_storm",
+      "content": "Rolling deploys triggered consumer group rebalance storms that paused processing for minutes. Fixed by switching to the cooperative-sticky assignor and raising max.poll.interval.ms to 10 minutes for the slow batch consumers.",
+      "summary": "rebalance storm fixed with cooperative-sticky assignor",
+      "keywords": ["kafka", "rebalance", "cooperative-sticky", "assignor", "consumer"],
+      "tags": ["meridian", "kafka", "incident"],
+      "context": "deploy-time consumer disruption fix",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "mer_clock_skew_webhooks",
+      "content": "Webhook signature verification failed intermittently for one merchant because a node in our fleet had 7 seconds of clock skew, pushing signed timestamps outside their tolerance. NTP was fixed and the documented receiver tolerance is now 5 minutes.",
+      "summary": "clock skew broke webhook signatures; tolerance documented at 5 min",
+      "keywords": ["clock", "skew", "webhook", "signature", "ntp"],
+      "tags": ["meridian", "incident", "api"],
+      "context": "webhook verification failure analysis",
+      "memory_type": "BugFix",
+      "importance": 6
+    },
+    {
+      "key": "mer_decimal_rounding",
+      "content": "Refund amounts drifted by one minor unit because our Rust code used round-half-up while the gateway used banker's rounding. Decision: all money rounding in meridian is round-half-even (banker's), matching the gateway and the ledger reconciliation job.",
+      "summary": "all money rounding is half-even (banker's), matching the gateway",
+      "keywords": ["rounding", "half-even", "bankers", "refund", "drift"],
+      "tags": ["meridian", "money", "bug"],
+      "context": "rounding mismatch fix and convention",
+      "memory_type": "BugFix",
+      "importance": 8
+    },
+    {
+      "key": "mer_pgbouncer_prepared",
+      "content": "pgbouncer runs in transaction pooling mode in prod, which breaks server-side prepared statements. The sqlx statement cache is disabled in production config (statement-cache-capacity=0); if you see 'prepared statement does not exist' errors, that config regressed.",
+      "summary": "pgbouncer transaction mode: sqlx statement cache disabled in prod",
+      "keywords": ["pgbouncer", "prepared", "statements", "sqlx", "pooling"],
+      "tags": ["meridian", "database", "config"],
+      "context": "prod connection pooling constraint",
+      "memory_type": "Configuration",
+      "importance": 7
+    },
+    {
+      "key": "mer_ledger_drift_incident",
+      "content": "INC-2088: balance projections drifted from the event stream because the outbox relay crashed mid-batch and marked rows published without the Kafka ack. Fix: the relay now commits the published flag only after the producer ack, and a nightly reconciliation job diffs projections against events.",
+      "summary": "INC-2088 projection drift; relay acks before marking published + nightly reconciliation",
+      "keywords": ["drift", "projection", "outbox", "relay", "reconciliation"],
+      "tags": ["meridian", "incident", "ledger"],
+      "context": "INC-2088 postmortem",
+      "memory_type": "BugFix",
+      "importance": 8
+    },
+    {
+      "key": "mer_timeout_budget",
+      "content": "Timeout ordering matters: the gateway client timeout (8s) must sit below the load balancer idle timeout (60s) and above the gateway's p99 (3s). A misordered timeout caused a 504 cascade where the LB cut connections the client still considered live.",
+      "summary": "timeout hierarchy: client 8s < LB 60s, above gateway p99",
+      "keywords": ["timeout", "504", "load", "balancer", "cascade"],
+      "tags": ["meridian", "resilience"],
+      "context": "timeout alignment lesson",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "mer_uuid_v7_ids",
+      "content": "Charge ids switched from UUIDv4 to UUIDv7. The time-ordered prefix restored btree index locality and p99 insert latency on charges dropped about 40% at peak.",
+      "summary": "UUIDv7 charge ids fixed index locality; p99 inserts -40%",
+      "keywords": ["uuid", "uuidv7", "index", "locality", "insert"],
+      "tags": ["meridian", "database", "performance"],
+      "context": "id format decision with measured win",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "mer_vacuum_bloat",
+      "content": "ledger_events bloated because long-running reporting transactions on the primary held back the xmin horizon and autovacuum could not reclaim tuples. Reports moved to replicas and autovacuum cost limits were raised for the ledger tables.",
+      "summary": "long reporting txns blocked vacuum; reports moved to replicas",
+      "keywords": ["vacuum", "bloat", "xmin", "autovacuum", "postgres"],
+      "tags": ["meridian", "database"],
+      "context": "table bloat investigation",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "mer_currency_minor_units",
+      "content": "JPY refunds failed because a hardcoded divide-by-100 assumed two minor units; JPY has zero and BHD has three. All minor-unit conversion must use the currency exponent table in mer-core::currency, never a literal 100.",
+      "summary": "JPY broke the /100 assumption; use the currency exponent table",
+      "keywords": ["jpy", "currency", "minor", "units", "exponent"],
+      "tags": ["meridian", "money", "bug"],
+      "context": "multi-currency correctness fix",
+      "memory_type": "BugFix",
+      "importance": 8
+    },
+    {
+      "key": "mer_idempotency_ttl_gotcha",
+      "content": "Idempotency keys expire after 24 hours. A merchant's queue replayed day-old requests and created duplicates because the keys had expired. The API now returns 409 idempotency_key_expired when a replay arrives after expiry instead of executing.",
+      "summary": "replays after the 24h key TTL now 409 instead of re-executing",
+      "keywords": ["idempotency", "ttl", "expiry", "replay", "409"],
+      "tags": ["meridian", "api", "payments"],
+      "context": "idempotency window edge case",
+      "memory_type": "Insight",
+      "importance": 7
+    },
+    {
+      "key": "mer_tls_cert_incident",
+      "content": "INC-2102: gateway callback failures for 40 minutes because an intermediate TLS certificate expired on our callback endpoint. Monitoring now alerts when any cert in the serving chain is within 21 days of expiry.",
+      "summary": "INC-2102 expired intermediate cert; alert at 21 days before expiry",
+      "keywords": ["tls", "certificate", "expiry", "incident", "callback"],
+      "tags": ["meridian", "incident", "security"],
+      "context": "INC-2102 postmortem",
+      "memory_type": "BugFix",
+      "importance": 6
+    },
+    {
+      "key": "mer_hot_partition",
+      "content": "One enterprise account generated enough volume to make its Kafka partition hot, lagging its consumer 20 minutes behind. Mitigation: accounts in the enterprise tier are sub-partitioned by charge_id, with consumer-side reordering only where per-account order is required.",
+      "summary": "hot partition from one enterprise account; sub-partitioned by charge_id",
+      "keywords": ["kafka", "hot", "partition", "lag", "enterprise"],
+      "tags": ["meridian", "kafka", "performance"],
+      "context": "partitioning scaling lesson",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "mer_error_taxonomy",
+      "content": "meridian errors are classified as Validation, Conflict, Downstream, or Internal, mapped to 400/409/502/500 at the handler edge. Review rule: handlers must not return anyhow::Error; every error reaching a handler is one of the four taxonomy types.",
+      "summary": "four-class error taxonomy mapped to 400/409/502/500",
+      "keywords": ["error", "taxonomy", "validation", "conflict", "handler"],
+      "tags": ["meridian", "rust", "api"],
+      "context": "error handling convention",
+      "memory_type": "CodePattern",
+      "importance": 7
+    },
+    {
+      "key": "mer_no_unwrap_prod",
+      "content": "Workspace lints deny unwrap_used and expect_used in all meridian service crates; tests opt out locally. A panic in a request handler pages the on-call, so 'it cannot fail here' must be proven to the compiler, not asserted.",
+      "summary": "clippy denies unwrap/expect in service crates",
+      "keywords": ["unwrap", "expect", "clippy", "lint", "panic"],
+      "tags": ["meridian", "rust", "review"],
+      "context": "panic hygiene lint policy",
+      "memory_type": "Preference",
+      "importance": 7
+    },
+    {
+      "key": "mer_testcontainers",
+      "content": "Integration tests run against a real Postgres via testcontainers, not mocks; CI provisions one container per suite. Mock-based data layer tests kept passing while prod broke on a constraint, which is why mocks are banned for the data layer.",
+      "summary": "data-layer integration tests use testcontainers Postgres, not mocks",
+      "keywords": ["testcontainers", "postgres", "integration", "mocks", "ci"],
+      "tags": ["meridian", "testing"],
+      "context": "test realism preference",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "mer_migration_review",
+      "content": "Schema migration PRs in meridian require two approvals, one from the data team, and the PR description must include a rollback note. Migrations that rewrite large tables need a maintenance window sign-off.",
+      "summary": "migrations: two approvals + rollback note + window sign-off for rewrites",
+      "keywords": ["migration", "review", "rollback", "approval"],
+      "tags": ["meridian", "review", "database"],
+      "context": "migration review process",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "mer_tracing_fields",
+      "content": "Every span in meridian must carry account_id and charge_id fields where applicable; log lines without correlation ids get flagged in review. Cross-service debugging depends on the trace id propagating through gRPC metadata.",
+      "summary": "spans carry account_id/charge_id; correlation ids required",
+      "keywords": ["tracing", "span", "correlation", "observability"],
+      "tags": ["meridian", "observability", "review"],
+      "context": "tracing field convention",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "mer_prefer_thiserror",
+      "content": "Library crates in meridian define errors with thiserror; anyhow is allowed only in binary crates and test code. Typed errors at crate boundaries keep the taxonomy mapping honest.",
+      "summary": "thiserror in libraries, anyhow only in binaries",
+      "keywords": ["thiserror", "anyhow", "errors", "rust"],
+      "tags": ["meridian", "rust", "review"],
+      "context": "error crate convention",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "mer_review_sql_binds",
+      "content": "Review checklist: any dynamic SQL must use bind parameters; string-built SQL is rejected. We had one near-miss where an ORDER BY direction was string-interpolated from a query param.",
+      "summary": "dynamic SQL must use binds; string-built SQL rejected in review",
+      "keywords": ["sql", "injection", "bind", "parameters", "review"],
+      "tags": ["meridian", "security", "review"],
+      "context": "SQL injection review rule",
+      "memory_type": "Preference",
+      "importance": 7
+    },
+    {
+      "key": "mer_bench_criterion",
+      "content": "Changes to perf-sensitive ledger code paths require a criterion benchmark in the PR showing before/after numbers. The benchmarks live in mer-core/benches and run nightly to catch drift.",
+      "summary": "ledger perf changes need criterion before/after in the PR",
+      "keywords": ["criterion", "benchmark", "performance", "ledger"],
+      "tags": ["meridian", "performance", "review"],
+      "context": "performance review requirement",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "mer_api_pagination",
+      "content": "All public list endpoints use cursor pagination keyed on (created_at, id); offset pagination is banned on large tables because OFFSET scans burned the primary during the analytics backfill.",
+      "summary": "cursor pagination on (created_at, id); offset banned on large tables",
+      "keywords": ["pagination", "cursor", "offset", "list", "api"],
+      "tags": ["meridian", "api", "database"],
+      "context": "pagination convention",
+      "memory_type": "CodePattern",
+      "importance": 7
+    },
+    {
+      "key": "mer_owner_rotation",
+      "content": "Module ownership in meridian rotates quarterly and OWNERS.md is the authoritative source for review routing; stale GitHub CODEOWNERS entries are regenerated from it by a bot.",
+      "summary": "OWNERS.md authoritative; quarterly rotation",
+      "keywords": ["owners", "rotation", "review", "codeowners"],
+      "tags": ["meridian", "process"],
+      "context": "ownership process",
+      "memory_type": "Reference",
+      "importance": 4
+    },
+    {
+      "key": "mer_session_refund_saga",
+      "content": "Session summary (claude-code): implemented the refund saga compensation step. Files touched: services/refund-coordinator/src/saga.rs, crates/mer-core/src/ledger.rs, services/refund-coordinator/tests/saga_flow.rs. Commands: cargo test -p refund-coordinator (3 runs, 1 flake), cargo clippy --workspace. Failure: saga_timeout_compensates flaked at the 30s CI timeout; raised to 120s. Decision: compensation entries reuse the reversing-entry helper from mer-core instead of a new entry type.",
+      "summary": "hook capture: refund saga compensation implemented; reused reversing-entry helper",
+      "keywords": ["session", "refund", "saga", "compensation", "reversing"],
+      "tags": ["meridian", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "mer_session_idempotency_migration",
+      "content": "Session summary (claude-code): backfilled the idempotency_keys unique index. Files touched: migrations/0042_idempotency_unique.sql, services/api/src/middleware/idempotency.rs. Commands: cargo sqlx prepare, psql staging dry run. Failure: CREATE UNIQUE INDEX CONCURRENTLY failed once on a duplicate pair from the pre-fix era; resolved by deleting the older duplicate row first. Outcome: index live in prod, lookup-before-gateway path enabled.",
+      "summary": "hook capture: idempotency unique index backfill; duplicate pre-fix row cleaned",
+      "keywords": ["session", "idempotency", "index", "migration", "backfill"],
+      "tags": ["meridian", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "mer_session_kafka_upgrade",
+      "content": "Session summary (claude-code): upgraded rdkafka to 0.36 and pinned librdkafka. Files touched: Cargo.toml, services/relay/src/producer.rs, .github/workflows/ci.yml. Commands: cargo update -p rdkafka, cargo test --workspace. Failure: CI segfaulted on the musl target with the vendored librdkafka build; switched the relay job to gnu runners and noted musl as unsupported for the relay.",
+      "summary": "hook capture: rdkafka 0.36 upgrade; musl unsupported for the relay",
+      "keywords": ["session", "rdkafka", "upgrade", "musl", "segfault"],
+      "tags": ["meridian", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "mer_session_pgbouncer",
+      "content": "Session summary (claude-code): debugged 'prepared statement s3 does not exist' errors in staging. Commands: kubectl logs api-7d4f, psql via pgbouncer, grep statement-cache. Finding: a config refactor re-enabled the sqlx statement cache behind pgbouncer transaction mode. Fix: statement-cache-capacity pinned to 0 in the shared prod profile and a config test added.",
+      "summary": "hook capture: statement cache re-enabled by refactor; pinned to 0 with a test",
+      "keywords": ["session", "pgbouncer", "prepared", "statement", "staging"],
+      "tags": ["meridian", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 4,
+      "confidence": 0.8
+    },
+    {
+      "key": "mer_session_jpy_hotfix",
+      "content": "Session summary (claude-code): hotfix for failing JPY refunds. Files touched: crates/mer-core/src/currency.rs, services/refund-coordinator/src/amounts.rs. Commands: cargo test -p mer-core currency, k6 smoke against staging. Root cause confirmed as the divide-by-100 literal; replaced with exponent-table lookup. Released as v2.41.1 within the incident window.",
+      "summary": "hook capture: JPY refund hotfix v2.41.1, exponent table replaces /100",
+      "keywords": ["session", "jpy", "hotfix", "refund", "currency"],
+      "tags": ["meridian", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "sky_app_router",
+      "content": "skyline uses the Next.js App Router with React Server Components by default; client components are opt-in islands for interactivity only. New pages must not be added under the legacy pages/ directory.",
+      "summary": "App Router + RSC default; client components are opt-in islands",
+      "keywords": ["nextjs", "app", "router", "rsc", "server", "components"],
+      "tags": ["skyline", "architecture", "frontend"],
+      "context": "frontend framework decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "sky_react_query",
+      "content": "Server state in skyline lives in TanStack Query (React Query): caching, retries, and invalidation are its job. There is no hand-rolled fetch cache and no global client store for server data.",
+      "summary": "TanStack Query owns server state",
+      "keywords": ["react-query", "tanstack", "server", "state", "cache"],
+      "tags": ["skyline", "frontend", "state"],
+      "context": "server-state management decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "sky_redux_decision",
+      "content": "skyline adopts Redux Toolkit as the single store for all application state; every feature registers a slice and side effects go through thunks.",
+      "summary": "Redux Toolkit as the single app store",
+      "keywords": ["redux", "toolkit", "store", "slice", "state"],
+      "tags": ["skyline", "frontend", "state"],
+      "context": "original state decision (reversed later, see sky_redux_removed)",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "sky_redux_removed",
+      "content": "Redux was removed from skyline in the Q3 cleanup: server state moved to React Query and remaining local state lives in component state or small context providers. Do not add new Redux slices; the redux directory only exists until the billing feature finishes migrating.",
+      "summary": "Redux removed; React Query for server state, context for local state",
+      "keywords": ["redux", "removed", "react-query", "migration", "state"],
+      "tags": ["skyline", "frontend", "state"],
+      "context": "contradicts sky_redux_decision; current state architecture",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "sky_tailwind",
+      "content": "Styling in skyline is Tailwind utilities over a design-token layer; styled-components and CSS modules are not used in new code. Token values come from the synced Figma variables, never hardcoded hex.",
+      "summary": "Tailwind over design tokens; no styled-components",
+      "keywords": ["tailwind", "css", "tokens", "styling"],
+      "tags": ["skyline", "frontend", "design"],
+      "context": "styling stack decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "sky_pnpm_workspaces",
+      "content": "The skyline monorepo uses pnpm workspaces; npm and yarn lockfiles are gitignored and CI fails if package-lock.json appears. Install with pnpm only, and use pnpm dlx instead of npx.",
+      "summary": "pnpm workspaces; npm/yarn lockfiles banned",
+      "keywords": ["pnpm", "workspaces", "monorepo", "lockfile"],
+      "tags": ["skyline", "tooling"],
+      "context": "package manager decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "sky_jest_decision",
+      "content": "skyline standardizes on Jest with testing-library for unit and component tests; ts-jest handles the TypeScript transform.",
+      "summary": "Jest + testing-library for unit tests",
+      "keywords": ["jest", "testing-library", "unit", "tests"],
+      "tags": ["skyline", "testing"],
+      "context": "original test-runner decision (replaced later, see sky_vitest)",
+      "memory_type": "ArchitectureDecision",
+      "importance": 5
+    },
+    {
+      "key": "sky_vitest",
+      "content": "skyline replaced Jest with Vitest: the ESM/TypeScript transform pain went away and the unit suite runs about 3x faster. Playwright covers e2e. Jest config and ts-jest were deleted; do not reintroduce them.",
+      "summary": "Vitest replaced Jest (3x faster); Playwright for e2e",
+      "keywords": ["vitest", "jest", "playwright", "test", "runner"],
+      "tags": ["skyline", "testing"],
+      "context": "contradicts sky_jest_decision; current test stack",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "sky_zod_boundaries",
+      "content": "Every API response entering skyline is parsed with a zod schema at the boundary; casting fetch results with 'as' is forbidden. A response shape change should fail loudly in one place, not corrupt component state silently.",
+      "summary": "zod-parse all API responses at the boundary; no 'as' casts",
+      "keywords": ["zod", "validation", "boundary", "api", "parse"],
+      "tags": ["skyline", "frontend", "typescript"],
+      "context": "runtime validation convention",
+      "memory_type": "CodePattern",
+      "importance": 8
+    },
+    {
+      "key": "sky_zod_boundaries_dup",
+      "content": "Data from the network must go through zod schema validation before it reaches skyline application code; unvalidated JSON casts are rejected in review. The schema lives next to the generated client for each endpoint.",
+      "summary": "network data zod-validated before use; casts rejected in review",
+      "keywords": ["zod", "schema", "validation", "network"],
+      "tags": ["skyline", "frontend", "typescript"],
+      "context": "near-duplicate restatement of the zod boundary rule",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "sky_feature_folders",
+      "content": "skyline organizes code by feature folder (features/billing, features/alerts) rather than by type; shared UI lives in ui/ and anything imported by two features must move to shared explicitly.",
+      "summary": "feature-folder layout; promotion to shared is explicit",
+      "keywords": ["feature", "folders", "structure", "layout"],
+      "tags": ["skyline", "architecture"],
+      "context": "code organization preference",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "sky_openapi_codegen",
+      "content": "The skyline API client is generated from the backend OpenAPI spec on every backend release; hand-written fetch wrappers are banned. If the generated client is missing an endpoint, fix the spec, not the client.",
+      "summary": "API client generated from OpenAPI; no hand-written fetchers",
+      "keywords": ["openapi", "codegen", "client", "spec"],
+      "tags": ["skyline", "api", "tooling"],
+      "context": "client generation decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "sky_edge_runtime_auth",
+      "content": "The auth middleware in skyline runs on the edge runtime, so it must not use Node APIs (no crypto.createHmac, use Web Crypto). A Node-only import in middleware.ts breaks every route at deploy time.",
+      "summary": "auth middleware is edge runtime: Web Crypto only, no Node APIs",
+      "keywords": ["edge", "runtime", "middleware", "auth", "webcrypto"],
+      "tags": ["skyline", "frontend", "auth"],
+      "context": "edge runtime constraint",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "sky_storybook_contract",
+      "content": "Every shared component in skyline ships with a Storybook story, and Chromatic runs visual regression on PRs. A shared component without a story does not pass review.",
+      "summary": "shared components need stories; Chromatic visual regression on PR",
+      "keywords": ["storybook", "chromatic", "visual", "regression"],
+      "tags": ["skyline", "testing", "design"],
+      "context": "component contract preference",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "sky_bundle_budget",
+      "content": "The initial JavaScript bundle for any skyline route must stay at or under 250 KB gzipped. CI fails the build when a route exceeds the budget; exceptions require a perf-team sign-off recorded in the PR.",
+      "summary": "250 KB gzipped initial JS budget per route, CI-enforced",
+      "keywords": ["bundle", "budget", "250kb", "javascript", "size"],
+      "tags": ["skyline", "performance", "ci"],
+      "context": "bundle size constraint",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "sky_bundle_budget_dup",
+      "content": "Per-route JS payload in skyline is capped at 250 KB gzipped for the initial load; the size check runs in CI and a route over the cap blocks merge until the perf team approves an exception.",
+      "summary": "initial route JS capped at 250 KB gzipped; merge-blocking check",
+      "keywords": ["bundle", "size", "cap", "route", "gzipped"],
+      "tags": ["skyline", "performance", "ci"],
+      "context": "near-duplicate restatement of the bundle budget",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "sky_a11y_wcag",
+      "content": "skyline targets WCAG 2.1 AA: axe checks run inside the Playwright suite, and any new interactive component must be fully keyboard-navigable with visible focus. Color choices must meet 4.5:1 contrast.",
+      "summary": "WCAG 2.1 AA: axe in Playwright, keyboard nav, 4.5:1 contrast",
+      "keywords": ["accessibility", "wcag", "axe", "keyboard", "contrast"],
+      "tags": ["skyline", "accessibility"],
+      "context": "accessibility bar",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "sky_browser_matrix",
+      "content": "Supported browsers for skyline: the last two versions of Chrome, Firefox, Safari, and Edge. No IE11, no polyfills for it; browserslist is the single source of truth for tooling.",
+      "summary": "last-2 evergreen browsers; browserslist authoritative",
+      "keywords": ["browsers", "support", "matrix", "browserslist"],
+      "tags": ["skyline", "frontend"],
+      "context": "browser support policy",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "sky_no_secrets_client",
+      "content": "Anything prefixed NEXT_PUBLIC_ is compiled into the client bundle and is public by definition. Secrets (API keys, signing secrets) may only be read in server components, server actions, or route handlers; a secret behind NEXT_PUBLIC_ is an incident.",
+      "summary": "NEXT_PUBLIC_ vars are public; secrets server-side only",
+      "keywords": ["secrets", "next_public", "environment", "client", "bundle"],
+      "tags": ["skyline", "security"],
+      "context": "client/server env var boundary",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "sky_lcp_slo",
+      "content": "Dashboard home LCP must stay at or under 2.5s at p75 on real-user metrics; the perf budget is tracked in CI via Lighthouse runs on PR previews and regressions block merge.",
+      "summary": "LCP p75 <= 2.5s on dashboard home; Lighthouse gates PRs",
+      "keywords": ["lcp", "performance", "slo", "lighthouse", "p75"],
+      "tags": ["skyline", "performance"],
+      "context": "core web vitals SLO",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "sky_i18n_keys",
+      "content": "All user-facing strings in skyline go through i18n message keys; hardcoded English literals in JSX fail the lint rule. Pluralization uses ICU message format, not string concatenation.",
+      "summary": "user-facing strings via i18n keys; ICU plurals",
+      "keywords": ["i18n", "localization", "strings", "icu"],
+      "tags": ["skyline", "frontend"],
+      "context": "internationalization rule",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "sky_hydration_mismatch",
+      "content": "Hydration mismatches in skyline came from locale-dependent date formatting: the server rendered with en-US and the client with the user's locale. Rule: pass the resolved locale from the server, or render relative dates after mount; never call Intl with an implicit locale during SSR.",
+      "summary": "locale-dependent Intl during SSR causes hydration mismatch; pass locale explicitly",
+      "keywords": ["hydration", "mismatch", "locale", "intl", "ssr", "dates"],
+      "tags": ["skyline", "frontend", "bug"],
+      "context": "hydration debugging lesson",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "sky_cdn_cache_incident",
+      "content": "INC-311: a user saw another user's dashboard data. Root cause: a personalized API response was served with no Cache-Control and the CDN cached it on the shared URL. Fix: Cache-Control private + no-store on all authenticated responses, a Vary on the session header, and a Playwright test that two sessions never share cached payloads.",
+      "summary": "INC-311 CDN cached a personalized response; private/no-store enforced + e2e test",
+      "keywords": ["cdn", "cache", "incident", "personalized", "cache-control"],
+      "tags": ["skyline", "incident", "security"],
+      "context": "INC-311 postmortem",
+      "memory_type": "BugFix",
+      "importance": 9
+    },
+    {
+      "key": "sky_swr_stale_token",
+      "content": "A 401 retry loop hammered the API when React Query retried requests carrying a stale auth token. Fix: a global onError that triggers token refresh once, retry disabled for 401/403, and queries resume after the refresh promise resolves.",
+      "summary": "401 retry loop fixed: single refresh flow, no retry on auth errors",
+      "keywords": ["401", "token", "refresh", "retry", "react-query"],
+      "tags": ["skyline", "bug", "auth"],
+      "context": "auth retry loop fix",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "sky_use_effect_fetch",
+      "content": "Review rule: no data fetching inside useEffect in skyline. Use the React Query hooks (or an RSC load) instead. StrictMode double-invocation produced duplicate POSTs from an effect-based fetch once; that class of bug is designed out.",
+      "summary": "no fetching in useEffect; React Query hooks or RSC loads",
+      "keywords": ["useeffect", "fetch", "react-query", "strictmode"],
+      "tags": ["skyline", "frontend", "review"],
+      "context": "data fetching convention",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "sky_timezone_chart",
+      "content": "The usage chart x-axis was off by one day for users east of UTC+12 because day bucketing happened in client local time while the API bucketed in UTC. All time bucketing now happens server-side in UTC and the client only formats for display.",
+      "summary": "chart day-bucketing moved server-side UTC; client formats only",
+      "keywords": ["timezone", "chart", "utc", "bucketing", "off-by-one"],
+      "tags": ["skyline", "bug", "frontend"],
+      "context": "timezone bucketing fix",
+      "memory_type": "BugFix",
+      "importance": 6
+    },
+    {
+      "key": "sky_memory_leak_ws",
+      "content": "The live-updates websocket leaked listeners across client-side route changes, growing heap until the tab crashed on long-lived dashboards. Fix: subscription teardown in the effect cleanup plus a singleton socket manager; a CI canary takes heap snapshots across 50 navigations.",
+      "summary": "websocket listener leak across routes; cleanup + heap canary",
+      "keywords": ["websocket", "leak", "listeners", "heap", "cleanup"],
+      "tags": ["skyline", "bug", "frontend"],
+      "context": "memory leak fix",
+      "memory_type": "BugFix",
+      "importance": 6
+    },
+    {
+      "key": "sky_safari_date_parse",
+      "content": "Safari returns Invalid Date for new Date('2026-06-12 10:00') while Chrome accepts it. Date strings must be strict ISO 8601 with the T separator, and parsing goes through the shared parseApiDate helper, not the Date constructor.",
+      "summary": "Safari rejects space-separated datetimes; strict ISO 8601 via parseApiDate",
+      "keywords": ["safari", "date", "parsing", "iso8601"],
+      "tags": ["skyline", "bug", "frontend"],
+      "context": "cross-browser date parsing gotcha",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "sky_next_image_oom",
+      "content": "The next/image optimizer OOMed the node when users uploaded 80 MB TIFFs; image optimization for user uploads now runs on the imgproxy service with input size limits, and next/image only handles static assets.",
+      "summary": "user-upload image optimization offloaded to imgproxy after OOM",
+      "keywords": ["next/image", "oom", "imgproxy", "uploads"],
+      "tags": ["skyline", "bug", "infrastructure"],
+      "context": "image pipeline fix",
+      "memory_type": "BugFix",
+      "importance": 5
+    },
+    {
+      "key": "sky_rsc_serialization",
+      "content": "Values passed from server to client components are serialized: Date objects become strings and Map/Set silently lose their type. The lint rule restricts RSC-to-client props to plain JSON shapes, and the zod boundary re-parses them on the client side.",
+      "summary": "RSC-to-client props must be plain JSON; lint enforces it",
+      "keywords": ["rsc", "serialization", "props", "client", "boundary"],
+      "tags": ["skyline", "frontend", "typescript"],
+      "context": "server/client boundary gotcha",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "sky_playwright_flake",
+      "content": "Most Playwright flakes traced to CSS animation timing. The test profile now forces prefers-reduced-motion and disables transitions globally, and waits use explicit expect polling instead of fixed sleeps. Flake rate dropped from 4% to under 0.5%.",
+      "summary": "Playwright flakes fixed: reduced-motion test profile + expect polling",
+      "keywords": ["playwright", "flake", "animation", "reduced-motion"],
+      "tags": ["skyline", "testing"],
+      "context": "e2e stability work",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "sky_pnpm_phantom",
+      "content": "After enabling pnpm's strict node linker, several imports broke because they relied on phantom dependencies hoisted by npm. Rule: import only packages declared in your own package.json; CI runs a depcheck to catch undeclared imports.",
+      "summary": "phantom dependencies banned; depcheck in CI",
+      "keywords": ["pnpm", "phantom", "dependencies", "hoisting", "depcheck"],
+      "tags": ["skyline", "tooling"],
+      "context": "dependency hygiene lesson",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "sky_csp_inline",
+      "content": "The CSP rollout broke a third-party widget that injected inline scripts. We moved to a nonce-based Content-Security-Policy: every inline script gets the per-request nonce from middleware, unsafe-inline stays off, and the widget loads in a sandboxed iframe instead.",
+      "summary": "nonce-based CSP; no unsafe-inline; third-party widget sandboxed",
+      "keywords": ["csp", "nonce", "inline", "scripts", "security"],
+      "tags": ["skyline", "security"],
+      "context": "CSP rollout outcome",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "sky_prefer_server_actions",
+      "content": "Mutations from skyline UI prefer server actions; route handlers exist for external/API clients. Server actions keep input validation and revalidation co-located with the form that triggers them.",
+      "summary": "server actions for UI mutations; route handlers for external clients",
+      "keywords": ["server", "actions", "mutations", "route", "handlers"],
+      "tags": ["skyline", "frontend"],
+      "context": "mutation channel preference",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "sky_eslint_boundaries",
+      "content": "eslint-plugin-boundaries enforces feature isolation in skyline: a feature may import from shared and ui, but cross-feature imports must go through the target feature's public index. Deep imports into another feature's internals fail lint.",
+      "summary": "feature isolation lint: cross-feature imports only via public index",
+      "keywords": ["eslint", "boundaries", "imports", "isolation"],
+      "tags": ["skyline", "tooling", "architecture"],
+      "context": "module boundary enforcement",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "sky_no_barrel_files",
+      "content": "Deep barrel files (index.ts re-exporting whole trees) are banned in skyline because they defeat tree-shaking and inflated the vendor chunk by 60 KB once. The single exception is each feature's intentional public API index.",
+      "summary": "barrel files banned except feature public APIs (tree-shaking)",
+      "keywords": ["barrel", "files", "tree-shaking", "exports"],
+      "tags": ["skyline", "performance", "tooling"],
+      "context": "bundle hygiene preference",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "sky_commit_convention",
+      "content": "skyline commits follow Conventional Commits enforced by commitlint in CI; the changelog and release notes are generated from commit subjects, so a vague subject line shows up verbatim in customer-facing notes.",
+      "summary": "Conventional Commits enforced; changelog generated from subjects",
+      "keywords": ["commits", "conventional", "commitlint", "changelog"],
+      "tags": ["skyline", "process"],
+      "context": "commit message policy",
+      "memory_type": "Preference",
+      "importance": 4
+    },
+    {
+      "key": "sky_design_tokens_source",
+      "content": "Design tokens are sourced from Figma variables and synced into the repo weekly by a bot PR; hand-editing the generated tokens file gets overwritten on the next sync. Token changes start in Figma.",
+      "summary": "tokens synced from Figma weekly; generated file is read-only",
+      "keywords": ["design", "tokens", "figma", "sync"],
+      "tags": ["skyline", "design"],
+      "context": "token pipeline reference",
+      "memory_type": "Reference",
+      "importance": 4
+    },
+    {
+      "key": "sky_error_boundary",
+      "content": "Every route segment in skyline defines error.tsx with a reset affordance; uncaught render errors report to Sentry with the user-feedback dialog attached. A segment without an error boundary fails the route checklist.",
+      "summary": "error.tsx per route segment; Sentry + feedback dialog",
+      "keywords": ["error", "boundary", "sentry", "route"],
+      "tags": ["skyline", "frontend", "observability"],
+      "context": "error handling convention",
+      "memory_type": "CodePattern",
+      "importance": 6
+    },
+    {
+      "key": "sky_dark_mode_tokens",
+      "content": "Dark mode in skyline is implemented entirely through CSS variables on the token layer; components never branch on theme. A component with theme conditionals in JSX gets rejected in review.",
+      "summary": "dark mode via token CSS variables; no theme branches in components",
+      "keywords": ["dark", "mode", "tokens", "css", "variables"],
+      "tags": ["skyline", "design", "frontend"],
+      "context": "theming pattern",
+      "memory_type": "CodePattern",
+      "importance": 4
+    },
+    {
+      "key": "sky_table_virtualization",
+      "content": "Any skyline table that can exceed 200 rows must virtualize with tanstack-virtual; the billing table rendered 8000 DOM rows before virtualization and froze low-end machines for seconds.",
+      "summary": "tables over 200 rows must virtualize (tanstack-virtual)",
+      "keywords": ["table", "virtualization", "tanstack-virtual", "rows"],
+      "tags": ["skyline", "performance", "frontend"],
+      "context": "list rendering rule",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "sky_sentry_sourcemaps",
+      "content": "Production sourcemaps upload to Sentry during release and are stripped from the public CDN; hidden-source-maps mode keeps stack traces readable internally without shipping source to users.",
+      "summary": "sourcemaps to Sentry only; hidden from the public CDN",
+      "keywords": ["sentry", "sourcemaps", "release", "cdn"],
+      "tags": ["skyline", "observability", "security"],
+      "context": "sourcemap handling",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "sky_feature_flag_client",
+      "content": "skyline evaluates feature flags server-side and passes resolved values to client components as props; there is deliberately no client-side flag SDK because it added 30 KB to every bundle and caused visible UI flicker while flags loaded.",
+      "summary": "flags resolved server-side; no client flag SDK (bundle + flicker)",
+      "keywords": ["feature", "flags", "server-side", "sdk", "flicker"],
+      "tags": ["skyline", "frontend", "architecture"],
+      "context": "flag evaluation decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "sky_auth_session_cookie",
+      "content": "skyline auth uses an httpOnly, Secure, SameSite=Lax session cookie. Tokens are never stored in localStorage or sessionStorage; any XSS-readable storage of credentials is treated as a vulnerability, not a refactor candidate.",
+      "summary": "httpOnly SameSite=Lax session cookie; no tokens in localStorage",
+      "keywords": ["auth", "cookie", "httponly", "localstorage", "session"],
+      "tags": ["skyline", "security", "auth"],
+      "context": "session storage constraint",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "sky_graphql_rejected",
+      "content": "GraphQL was evaluated for the skyline data layer and rejected: the dashboard's access patterns are well-served by REST plus OpenAPI codegen, and the team did not want to own a federation layer. Decision recorded in ADR-12; revisit only if the mobile app's over-fetching becomes measurable.",
+      "summary": "GraphQL evaluated and rejected; REST + codegen kept (ADR-12)",
+      "keywords": ["graphql", "rejected", "rest", "openapi", "adr"],
+      "tags": ["skyline", "architecture", "api"],
+      "context": "data layer evaluation outcome",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "sky_e2e_test_data",
+      "content": "Playwright e2e runs against a seeded ephemeral environment created per pipeline, never against shared staging. This rule exists because an e2e teardown once wiped the staging data another team was demoing from.",
+      "summary": "e2e runs on ephemeral seeded envs, never shared staging",
+      "keywords": ["e2e", "playwright", "ephemeral", "staging", "seed"],
+      "tags": ["skyline", "testing", "ci"],
+      "context": "test environment isolation rule",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "sky_lighthouse_ci_budget",
+      "content": "Lighthouse CI runs against PR preview deployments and asserts the performance budget file (LCP, TBT, bundle weights). Budgets live in lighthouse-budgets.json and changing them requires perf-team review.",
+      "summary": "Lighthouse CI asserts budgets on PR previews",
+      "keywords": ["lighthouse", "ci", "budget", "preview"],
+      "tags": ["skyline", "performance", "ci"],
+      "context": "perf budget tooling",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "sky_session_csp",
+      "content": "Session summary (claude-code): rolled out the nonce-based CSP. Files touched: middleware.ts, app/layout.tsx, lib/csp.ts. Commands: pnpm test, pnpm playwright test, curl -I preview URL to inspect headers. Failure: the support-chat widget broke (inline script, no nonce) and was moved into the sandboxed iframe loader. Decision: report-only mode for one week before enforce.",
+      "summary": "hook capture: nonce CSP rollout; widget sandboxed; report-only first",
+      "keywords": ["session", "csp", "nonce", "middleware", "widget"],
+      "tags": ["skyline", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "sky_session_next_upgrade",
+      "content": "Session summary (claude-code): upgraded Next.js to 15. Files touched: package.json, next.config.mjs, 14 component files via codemod. Commands: pnpm dlx @next/codemod, pnpm vitest run, pnpm playwright test. Failures: two breaking changes hit us (async request APIs, fetch no longer cached by default); fixed by awaiting headers() and adding explicit cache options to three loaders.",
+      "summary": "hook capture: Next 15 upgrade; async request APIs and fetch caching fixed",
+      "keywords": ["session", "nextjs", "upgrade", "codemod", "caching"],
+      "tags": ["skyline", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "sky_session_billing_table",
+      "content": "Session summary (claude-code): virtualized the billing table. Files touched: features/billing/components/InvoiceTable.tsx, features/billing/hooks/useInvoiceRows.ts. Commands: pnpm vitest run billing, pnpm playwright test billing. Result: interaction latency on a 5k-row account went from 1.8s to 90ms; scroll restoration kept via the virtualizer's measure cache.",
+      "summary": "hook capture: billing table virtualized; 1.8s -> 90ms on 5k rows",
+      "keywords": ["session", "billing", "virtualization", "table", "latency"],
+      "tags": ["skyline", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 4,
+      "confidence": 0.8
+    },
+    {
+      "key": "sky_session_a11y_audit",
+      "content": "Session summary (claude-code): fixed the a11y audit findings on the settings pages. Files touched: features/settings/* (9 files). Commands: pnpm playwright test --grep @a11y. Result: axe violations went from 17 to 0; main fixes were missing form labels, a focus trap in the API-keys modal, and contrast on the muted text token.",
+      "summary": "hook capture: settings a11y violations 17 -> 0",
+      "keywords": ["session", "a11y", "axe", "settings", "labels"],
+      "tags": ["skyline", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 4,
+      "confidence": 0.85
+    },
+    {
+      "key": "pk_uv_package_manager",
+      "content": "packrat uses uv for Python dependency management: it replaced pip plus pip-tools, uv.lock is committed, and CI installs with uv sync --frozen. The requirements.txt export is gone.",
+      "summary": "uv replaced pip/pip-tools; uv.lock committed, frozen sync in CI",
+      "keywords": ["uv", "pip", "python", "dependencies", "lockfile"],
+      "tags": ["packrat", "tooling", "python"],
+      "context": "package manager migration decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "pk_click_cli",
+      "content": "The packrat CLI is built on click rather than argparse: nested subcommands (packrat cache push/pull/gc) and testability via CliRunner drove the choice. Output formatting goes through rich.",
+      "summary": "click over argparse for nested subcommands; rich output",
+      "keywords": ["click", "argparse", "cli", "subcommands"],
+      "tags": ["packrat", "python", "cli"],
+      "context": "CLI framework decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 5
+    },
+    {
+      "key": "pk_fastapi_service",
+      "content": "The packrat cache API is FastAPI on uvicorn with pydantic v2 models; the OpenAPI schema it generates is the contract the CLI client is generated from.",
+      "summary": "FastAPI + pydantic v2; OpenAPI schema is the client contract",
+      "keywords": ["fastapi", "uvicorn", "pydantic", "api"],
+      "tags": ["packrat", "python", "api"],
+      "context": "service framework decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "pk_s3_content_addressed",
+      "content": "packrat stores build artifacts content-addressed in S3: the object key is the sha256 of the content, metadata lives in DynamoDB, and identical artifacts from different builds dedupe to one object automatically.",
+      "summary": "artifacts content-addressed by sha256 in S3; metadata in DynamoDB",
+      "keywords": ["s3", "content-addressed", "sha256", "artifacts", "dynamodb"],
+      "tags": ["packrat", "architecture", "storage"],
+      "context": "artifact storage design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 8
+    },
+    {
+      "key": "pk_zstd_compression",
+      "content": "Artifacts are compressed with zstd level 6 before upload: measured as the best speed/ratio tradeoff on our artifact mix (level 19 saved 4% more space but tripled CPU time on large wheels).",
+      "summary": "zstd level 6 measured as the speed/ratio sweet spot",
+      "keywords": ["zstd", "compression", "level", "tradeoff"],
+      "tags": ["packrat", "performance", "storage"],
+      "context": "compression benchmark outcome",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "pk_python_312",
+      "content": "packrat requires Python 3.12 or newer: tomllib from the stdlib, modern typing syntax everywhere, and no compatibility shims. The CI matrix tests 3.12 and 3.13 only.",
+      "summary": "Python >= 3.12 floor; no compat shims",
+      "keywords": ["python", "3.12", "version", "floor"],
+      "tags": ["packrat", "python"],
+      "context": "minimum runtime decision",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "pk_ruff_format",
+      "content": "ruff handles both linting and formatting in packrat; black, isort, and flake8 were removed. One tool, one config block in pyproject.toml, and pre-commit runs ruff --fix.",
+      "summary": "ruff for lint+format; black/isort/flake8 removed",
+      "keywords": ["ruff", "lint", "format", "black"],
+      "tags": ["packrat", "tooling", "python"],
+      "context": "lint tooling consolidation",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "pk_mypy_strict",
+      "content": "mypy runs in strict mode over src/packrat; tests are checked gradually (untyped defs allowed). New modules must be strict-clean from the start; loosening a module-level override needs a comment with the issue link.",
+      "summary": "mypy strict on src/, gradual on tests",
+      "keywords": ["mypy", "strict", "typing", "python"],
+      "tags": ["packrat", "python", "tooling"],
+      "context": "type checking policy",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "pk_bazel_rejected",
+      "content": "Bazel was evaluated for the monorepo build and rejected: the team is too small to staff the maintenance, and packrat's own remote caching already achieved the 80% cache-hit goal on CI. Revisit if the C++ components land.",
+      "summary": "Bazel rejected: maintenance cost; packrat caching met the goal",
+      "keywords": ["bazel", "rejected", "build", "monorepo"],
+      "tags": ["packrat", "architecture", "tooling"],
+      "context": "build system evaluation outcome",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "pk_presigned_urls",
+      "content": "packrat clients upload and download artifact bytes via S3 presigned URLs; the API service only issues URLs and records metadata, it never proxies artifact content. This keeps the service stateless and cheap.",
+      "summary": "presigned URLs for bytes; API never proxies artifact content",
+      "keywords": ["presigned", "urls", "s3", "upload", "download"],
+      "tags": ["packrat", "architecture", "storage"],
+      "context": "data plane design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "pk_cache_immutable",
+      "content": "Cache entries in packrat are immutable: a key, once written, is never overwritten. Changed content means a changed key (the key embeds the content hash). Any 'update' API would reintroduce the poisoning class of bugs.",
+      "summary": "cache entries immutable; new content = new key",
+      "keywords": ["cache", "immutable", "overwrite", "key"],
+      "tags": ["packrat", "storage", "correctness"],
+      "context": "cache integrity invariant",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "pk_immutable_dup",
+      "content": "packrat never overwrites an existing cache entry: writes to an existing key are rejected, and changed artifact content always produces a different key. Immutability is the core integrity property of the cache.",
+      "summary": "existing keys never overwritten; immutability is the integrity core",
+      "keywords": ["cache", "immutability", "rejected", "integrity"],
+      "tags": ["packrat", "storage", "correctness"],
+      "context": "near-duplicate restatement of cache immutability",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "pk_no_creds_in_artifacts",
+      "content": "Uploaded artifacts must not contain credentials: the upload path scans for .env files, private keys, and high-entropy token patterns, and blocks the upload with a 422 listing the offending paths. The scanner's patterns mirror the gitleaks default set.",
+      "summary": "upload-time credential scan blocks artifacts containing secrets",
+      "keywords": ["credentials", "scan", "secrets", "upload", "gitleaks"],
+      "tags": ["packrat", "security"],
+      "context": "artifact hygiene constraint",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "pk_retention_90d",
+      "content": "Artifacts unreferenced for 90 days are garbage-collected by the nightly job; entries pinned to a release tag are exempt. Retention is config (retention_days), not code.",
+      "summary": "90-day GC for unreferenced artifacts; release pins exempt",
+      "keywords": ["retention", "gc", "90", "days", "pinned"],
+      "tags": ["packrat", "storage"],
+      "context": "retention policy",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "pk_pin_all_transitives",
+      "content": "packrat pins every transitive Python dependency by exporting the full lock to requirements.txt, so production installs resolve nothing at install time.",
+      "summary": "all transitives pinned via exported requirements.txt",
+      "keywords": ["pin", "transitive", "dependencies", "requirements"],
+      "tags": ["packrat", "python", "tooling"],
+      "context": "original pinning policy (changed later, see pk_pin_direct_only)",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "pk_pin_direct_only",
+      "content": "The requirements.txt export of pinned transitives is retired: uv.lock is the single source of resolved versions, direct dependencies declare bounds in pyproject.toml, and installs use uv sync --frozen. Keeping two pinned representations caused the divergence that broke the 3.13 rollout.",
+      "summary": "uv.lock is the only pin source; requirements export retired",
+      "keywords": ["uv.lock", "pins", "direct", "dependencies", "frozen"],
+      "tags": ["packrat", "python", "tooling"],
+      "context": "contradicts pk_pin_all_transitives; current pinning policy",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "pk_api_tokens_scoped",
+      "content": "packrat API tokens are scoped per repository with read or write level and a 90-day maximum expiry; an unscoped or non-expiring token cannot be created through the API at all.",
+      "summary": "repo-scoped read/write tokens, 90-day max expiry",
+      "keywords": ["tokens", "scoped", "expiry", "auth"],
+      "tags": ["packrat", "security"],
+      "context": "token policy",
+      "memory_type": "Constraint",
+      "importance": 7
+    },
+    {
+      "key": "pk_zip_timestamps",
+      "content": "Archives built by packrat are byte-reproducible: file entries are sorted, mtimes are clamped to SOURCE_DATE_EPOCH, and permissions are normalized. Without this, identical inputs produced different hashes and the content-addressed dedupe never hit.",
+      "summary": "reproducible archives: sorted entries + SOURCE_DATE_EPOCH",
+      "keywords": ["reproducible", "zip", "timestamps", "source_date_epoch", "deterministic"],
+      "tags": ["packrat", "correctness"],
+      "context": "deterministic archive pattern",
+      "memory_type": "CodePattern",
+      "importance": 7
+    },
+    {
+      "key": "pk_cache_poisoning_incident",
+      "content": "INC-77: a PR build wrote a broken artifact under the main-branch cache key and every subsequent main build pulled the poisoned entry. Fix: write keys are branch-scoped, only trunk CI can write main-prefixed keys, and PR builds get read-only tokens for shared prefixes.",
+      "summary": "INC-77 PR build poisoned a main cache key; branch-scoped write keys now",
+      "keywords": ["poisoning", "incident", "cache", "branch", "write"],
+      "tags": ["packrat", "incident", "security"],
+      "context": "INC-77 postmortem",
+      "memory_type": "BugFix",
+      "importance": 9
+    },
+    {
+      "key": "pk_disk_full_incident",
+      "content": "INC-82: CI runners failed builds with ENOSPC because the local packrat cache grew unbounded. The local cache now evicts LRU at 80% disk usage and the runner AMI alarms at 90%.",
+      "summary": "INC-82 runner disk full; LRU eviction at 80% disk",
+      "keywords": ["disk", "full", "enospc", "lru", "eviction"],
+      "tags": ["packrat", "incident", "ci"],
+      "context": "INC-82 postmortem",
+      "memory_type": "BugFix",
+      "importance": 6
+    },
+    {
+      "key": "pk_dynamo_hot_key",
+      "content": "DynamoDB throttled reads on the metadata row for the empty-input artifact hash (every no-op build hits it). That row is now served from an in-process cache with a 60s TTL; partition-level throttling went away.",
+      "summary": "hot metadata key (empty-input hash) cached in-process",
+      "keywords": ["dynamodb", "hot", "key", "throttling", "cache"],
+      "tags": ["packrat", "performance", "storage"],
+      "context": "hot key mitigation",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "pk_multipart_etag",
+      "content": "S3 multipart upload ETags are not MD5 digests, so ETag comparison cannot verify artifact integrity. packrat verifies integrity against its own sha256 metadata field; treating the ETag as a checksum was a bug we shipped once.",
+      "summary": "multipart ETags are not checksums; verify via our sha256 field",
+      "keywords": ["s3", "etag", "multipart", "integrity", "sha256"],
+      "tags": ["packrat", "storage", "correctness"],
+      "context": "integrity verification gotcha",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "pk_resumable_downloads",
+      "content": "Large artifact downloads are resumable with HTTP Range requests and verified after assembly; CI timeout flakes on the 2 GB model artifacts dropped about 90% once partial downloads stopped restarting from zero.",
+      "summary": "Range-based resumable downloads cut large-artifact flakes ~90%",
+      "keywords": ["resumable", "range", "downloads", "timeout"],
+      "tags": ["packrat", "performance", "ci"],
+      "context": "download reliability improvement",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "pk_asyncio_subprocess",
+      "content": "An asyncio subprocess in packrat deadlocked when a child filled the stderr pipe while we awaited stdout. Rule: always read stdout and stderr concurrently (gather or communicate), never sequentially.",
+      "summary": "read child stdout/stderr concurrently or the pipe deadlocks",
+      "keywords": ["asyncio", "subprocess", "deadlock", "pipe", "stderr"],
+      "tags": ["packrat", "python", "bug"],
+      "context": "subprocess handling gotcha",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "pk_tz_naive_datetime",
+      "content": "The retention job deleted artifacts that were only hours old: it compared a tz-naive datetime.utcnow() against tz-aware DynamoDB timestamps, and the naive value parsed as local time. All datetimes in packrat are now timezone-aware UTC, datetime.utcnow() is banned, and ruff's DTZ rules enforce it.",
+      "summary": "naive/aware datetime comparison deleted fresh artifacts; DTZ rules enforce aware UTC",
+      "keywords": ["timezone", "datetime", "naive", "aware", "utc", "retention"],
+      "tags": ["packrat", "python", "bug"],
+      "context": "retention job datetime fix",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "pk_pydantic_v2_perf",
+      "content": "After the pydantic v2 upgrade, model_validate measured about 5x faster than v1 parse_obj on our metadata payloads, so the validation that had been hoisted out of the hot path for performance moved back inline where it belongs.",
+      "summary": "pydantic v2 5x faster; validation moved back inline",
+      "keywords": ["pydantic", "v2", "performance", "validation"],
+      "tags": ["packrat", "python", "performance"],
+      "context": "post-upgrade measurement",
+      "memory_type": "Insight",
+      "importance": 4
+    },
+    {
+      "key": "pk_manylinux_wheels",
+      "content": "A wheel built on the Alpine-based image failed to import on glibc runners (musl symbols). Release wheels are now built in the manylinux container and auditwheel runs in CI; Alpine images are fine for the service, not for building distributable wheels.",
+      "summary": "build wheels in manylinux, not Alpine; auditwheel in CI",
+      "keywords": ["manylinux", "musl", "wheel", "alpine", "glibc"],
+      "tags": ["packrat", "python", "ci"],
+      "context": "wheel build environment lesson",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "pk_windows_path_length",
+      "content": "Cache extraction failed on Windows runners due to the 260-character MAX_PATH limit on deeply nested node_modules artifacts. Fix: the CLI enables long-path support where available and the cache layout shortens the staging directory prefix.",
+      "summary": "Windows MAX_PATH broke extraction; long paths + shorter staging prefix",
+      "keywords": ["windows", "path", "max_path", "260", "extraction"],
+      "tags": ["packrat", "bug", "ci"],
+      "context": "Windows path limit fix",
+      "memory_type": "BugFix",
+      "importance": 5
+    },
+    {
+      "key": "pk_signal_handling",
+      "content": "Ctrl-C during an upload used to leave orphaned temp files and a half-registered metadata row. The CLI now installs a SIGINT handler that cancels the upload task, cleans the temp directory, and only ever publishes metadata after a successful atomic rename.",
+      "summary": "SIGINT-safe uploads: cleanup + metadata only after atomic rename",
+      "keywords": ["sigint", "signal", "cleanup", "atomic", "rename"],
+      "tags": ["packrat", "python", "bug"],
+      "context": "interrupt safety fix",
+      "memory_type": "BugFix",
+      "importance": 5
+    },
+    {
+      "key": "pk_concurrent_uploads",
+      "content": "Multi-part uploads run with 8-way concurrency bounded by a semaphore; the original unbounded asyncio.gather spawned one task per chunk and OOMed the runner on a 6 GB artifact.",
+      "summary": "uploads bounded at 8-way concurrency; unbounded gather OOMed",
+      "keywords": ["concurrency", "semaphore", "uploads", "oom", "gather"],
+      "tags": ["packrat", "python", "performance"],
+      "context": "upload concurrency fix",
+      "memory_type": "BugFix",
+      "importance": 5
+    },
+    {
+      "key": "pk_pytest_fixtures",
+      "content": "A module-scoped S3 stub fixture leaked state between tests and produced order-dependent failures. Stub fixtures in packrat are function-scoped by default; widening a fixture's scope requires a comment justifying why shared state is safe.",
+      "summary": "stub fixtures function-scoped; scope widening needs justification",
+      "keywords": ["pytest", "fixtures", "scope", "stub", "isolation"],
+      "tags": ["packrat", "testing", "python"],
+      "context": "test isolation lesson",
+      "memory_type": "Insight",
+      "importance": 5
+    },
+    {
+      "key": "pk_no_print_debug",
+      "content": "print() outside the CLI output module fails lint in packrat; diagnostics go through the logging module with structured extra fields so they can be filtered and shipped.",
+      "summary": "no print() outside CLI output; structured logging only",
+      "keywords": ["print", "logging", "lint", "structured"],
+      "tags": ["packrat", "python", "review"],
+      "context": "logging discipline",
+      "memory_type": "Preference",
+      "importance": 4
+    },
+    {
+      "key": "pk_coverage_floor",
+      "content": "Coverage on src/packrat/core has an 85% floor enforced in CI. The floor only ratchets upward; lowering it requires a team decision recorded in an ADR, which has never happened.",
+      "summary": "85% coverage floor on core; ratchets up only",
+      "keywords": ["coverage", "floor", "85", "ci"],
+      "tags": ["packrat", "testing", "ci"],
+      "context": "coverage policy",
+      "memory_type": "Constraint",
+      "importance": 5
+    },
+    {
+      "key": "pk_docstring_style",
+      "content": "Public packrat APIs use Google-style docstrings checked by pydocstyle; internal helpers need a docstring only when behavior is non-obvious. Docstrings restating the signature get flagged in review.",
+      "summary": "Google-style docstrings on public APIs",
+      "keywords": ["docstrings", "google", "pydocstyle", "style"],
+      "tags": ["packrat", "python", "review"],
+      "context": "documentation style",
+      "memory_type": "Preference",
+      "importance": 3
+    },
+    {
+      "key": "pk_perf_regression_check",
+      "content": "CI runs the cache-hit benchmark on every PR; a regression of more than 10% on the hit-path latency fails the build. The benchmark's reference numbers are re-baselined monthly on the dedicated runner.",
+      "summary": "cache-hit benchmark gates PRs at 10% regression",
+      "keywords": ["benchmark", "regression", "cache-hit", "ci"],
+      "tags": ["packrat", "performance", "ci"],
+      "context": "perf regression gate",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "pk_release_tags",
+      "content": "packrat releases are cut by CI from signed git tags only, published to PyPI via trusted publishing (OIDC); the manual twine upload path is disabled and there are no long-lived PyPI tokens anywhere.",
+      "summary": "releases from signed tags via PyPI trusted publishing; no manual uploads",
+      "keywords": ["release", "pypi", "oidc", "trusted", "publishing", "tags"],
+      "tags": ["packrat", "ci", "security"],
+      "context": "release process",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "pk_sbom_generation",
+      "content": "Every packrat release generates a CycloneDX SBOM and runs a license scan; copyleft licenses in the runtime dependency set block the release until reviewed.",
+      "summary": "CycloneDX SBOM per release; copyleft blocks until reviewed",
+      "keywords": ["sbom", "cyclonedx", "license", "scan"],
+      "tags": ["packrat", "ci", "compliance"],
+      "context": "supply chain artifacts",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "pk_grpc_rejected",
+      "content": "gRPC was considered for the packrat cache API and rejected: CI clients live behind assorted proxies where plain HTTP plus presigned URLs just works, and streaming wasn't needed since the data plane bypasses the API anyway.",
+      "summary": "gRPC rejected for the cache API; HTTP + presigned URLs suffice",
+      "keywords": ["grpc", "rejected", "http", "api"],
+      "tags": ["packrat", "architecture", "api"],
+      "context": "API protocol evaluation",
+      "memory_type": "ArchitectureDecision",
+      "importance": 5
+    },
+    {
+      "key": "pk_metrics_prometheus",
+      "content": "packrat exposes Prometheus metrics; the headline SLI is cache hit rate with an 85% goal over 7 days, and the dashboard breaks hits down by repo and artifact class. Alerting fires on hit rate below 70% for 6 hours.",
+      "summary": "Prometheus metrics; cache hit rate SLI, 85% goal",
+      "keywords": ["prometheus", "metrics", "hit", "rate", "sli"],
+      "tags": ["packrat", "observability"],
+      "context": "service metrics",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "pk_cli_exit_codes",
+      "content": "packrat CLI exit codes are a stable scripting contract: 0 success, 2 usage error, 3 cache miss (so scripts can branch on miss without parsing output), 4 auth failure, 5 server error. Changing them is a breaking change.",
+      "summary": "stable exit codes: 0 ok, 2 usage, 3 miss, 4 auth, 5 server",
+      "keywords": ["exit", "codes", "cli", "contract", "scripting"],
+      "tags": ["packrat", "cli", "api"],
+      "context": "CLI contract reference",
+      "memory_type": "Reference",
+      "importance": 6
+    },
+    {
+      "key": "pk_session_gc_rewrite",
+      "content": "Session summary (claude-code): rewrote the GC mark phase. Files touched: src/packrat/gc.py, src/packrat/refs.py, tests/test_gc.py. Commands: uv run pytest (412 passed, 1 skipped), uv run mypy src. Decision: two-phase mark/sweep with a 24h grace period between phases so an in-flight upload can never lose its referent. Failure: first draft double-counted pinned refs; caught by the new property test.",
+      "summary": "hook capture: GC rewritten as two-phase mark/sweep with 24h grace",
+      "keywords": ["session", "gc", "mark", "sweep", "grace"],
+      "tags": ["packrat", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "pk_session_uv_migration",
+      "content": "Session summary (claude-code): migrated CI from pip-tools to uv. Files touched: pyproject.toml, .github/workflows/ci.yml, removed requirements*.txt. Commands: uv lock, uv sync --frozen, act -j test locally. Result: CI install step went from 9 minutes to 4; one pin conflict on urllib3 resolved by raising the boto3 floor.",
+      "summary": "hook capture: pip-tools -> uv migration; CI install 9m -> 4m",
+      "keywords": ["session", "uv", "migration", "ci", "pip-tools"],
+      "tags": ["packrat", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "pk_session_token_rotation",
+      "content": "Session summary (claude-code): rotated all packrat CI tokens after the scanner flagged a token-shaped string in a public build log. Commands: packrat tokens list --expiring, packrat tokens rotate --repo all, grep of the log archive. Finding: the flagged string was a false positive (a sha256 prefix), but rotation completed anyway as a drill; no real exposure.",
+      "summary": "hook capture: precautionary token rotation; flagged string was a false positive",
+      "keywords": ["session", "tokens", "rotation", "scanner", "drill"],
+      "tags": ["packrat", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 6,
+      "confidence": 0.9
+    },
+    {
+      "key": "ops_eks_clusters",
+      "content": "Workloads run on EKS 1.29 with one cluster per environment; prod and staging never share a cluster, nodegroup, or VPC. Cluster upgrades go staging-first with a one-week soak.",
+      "summary": "EKS per-env clusters; staging-first upgrades with soak",
+      "keywords": ["eks", "kubernetes", "clusters", "environments"],
+      "tags": ["ops", "kubernetes"],
+      "context": "cluster topology decision",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "ops_terraform_atlantis",
+      "content": "All infrastructure changes apply through Atlantis on PR merge; terraform apply from a laptop against prod is prohibited and the prod role denies it. Plan output is a PR comment so reviewers see the diff before approval.",
+      "summary": "Terraform via Atlantis only; local applies to prod denied",
+      "keywords": ["terraform", "atlantis", "apply", "infrastructure"],
+      "tags": ["ops", "infrastructure", "process"],
+      "context": "infrastructure change control",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "ops_blue_green",
+      "content": "Services deploy blue/green: the new color takes traffic only after smoke tests pass against it, and rollback is a router flip back to the old color.",
+      "summary": "blue/green deploys with smoke-gated traffic switch",
+      "keywords": ["blue", "green", "deploy", "rollback"],
+      "tags": ["ops", "deploys"],
+      "context": "original deploy strategy (changed later, see ops_canary_reversal)",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "ops_canary_reversal",
+      "content": "Deploys moved from blue/green to progressive canary with Argo Rollouts (5% -> 25% -> 100%, gated on error-rate and latency analysis) after blue/green doubled steady-state capacity cost. Blue/green remains only for the edge gateway where instant rollback matters more than cost.",
+      "summary": "progressive canary via Argo Rollouts; blue/green only for the gateway",
+      "keywords": ["canary", "argo", "rollouts", "deploy", "progressive"],
+      "tags": ["ops", "deploys"],
+      "context": "contradicts ops_blue_green; current deploy strategy",
+      "memory_type": "ArchitectureDecision",
+      "importance": 7
+    },
+    {
+      "key": "ops_alert_runbooks",
+      "content": "Every paging alert must link a runbook with first-response steps; the monthly alert review deletes pages that fired without one. An alert nobody can act on at 3am is noise, not monitoring.",
+      "summary": "paging alerts require runbooks; runbook-less alerts get deleted",
+      "keywords": ["alerts", "runbook", "paging", "oncall"],
+      "tags": ["ops", "observability", "process"],
+      "context": "alert hygiene policy",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "ops_oncall_handoff",
+      "content": "On-call handoff happens Monday 10:00 local with a written doc: open incidents, silenced alerts with expiry, and anything weird observed but not diagnosed. A silence without an expiry is treated as an incident in itself.",
+      "summary": "Monday handoff doc; silences must carry expiries",
+      "keywords": ["oncall", "handoff", "silences", "incidents"],
+      "tags": ["ops", "process"],
+      "context": "on-call process",
+      "memory_type": "Preference",
+      "importance": 5
+    },
+    {
+      "key": "ops_secrets_external",
+      "content": "Kubernetes secrets come from AWS Secrets Manager via External Secrets Operator; raw Secret manifests in git are banned and the admission policy rejects them. Rotation happens in Secrets Manager and propagates automatically.",
+      "summary": "ESO syncs secrets from Secrets Manager; Secret manifests in git banned",
+      "keywords": ["secrets", "external-secrets", "secrets-manager", "kubernetes", "eso"],
+      "tags": ["ops", "security", "kubernetes"],
+      "context": "secret management design",
+      "memory_type": "Constraint",
+      "importance": 9
+    },
+    {
+      "key": "ops_secrets_external_dup",
+      "content": "No plaintext secrets in manifests or git anywhere: External Secrets Operator pulls everything from AWS Secrets Manager into the cluster, and CI rejects any committed kubernetes Secret object.",
+      "summary": "no secrets in git; ESO pulls from Secrets Manager",
+      "keywords": ["secrets", "git", "eso", "manifests"],
+      "tags": ["ops", "security", "kubernetes"],
+      "context": "near-duplicate restatement of the secrets rule",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "ops_pod_disruption",
+      "content": "A node drain during patching evicted both replicas of the billing API simultaneously and took it down. Every multi-replica service now requires a PodDisruptionBudget with maxUnavailable 1, checked by a CI policy on the manifests.",
+      "summary": "both replicas evicted in a drain; PDBs now mandatory",
+      "keywords": ["pdb", "disruption", "drain", "eviction", "replicas"],
+      "tags": ["ops", "kubernetes", "incident"],
+      "context": "node drain outage lesson",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "ops_dns_incident",
+      "content": "INC-501: 15 minutes of failures after an RDS failover because CoreDNS negative-cached the NXDOMAIN returned mid-failover and clients kept resolving nothing. Fix: negative-cache TTL lowered to 5s, ndots reduced to 2 to stop search-domain NXDOMAIN storms, and the runbook now includes a CoreDNS cache flush.",
+      "summary": "INC-501 NXDOMAIN negative caching extended the RDS failover; TTL and ndots tuned",
+      "keywords": ["dns", "coredns", "nxdomain", "failover", "rds", "ttl"],
+      "tags": ["ops", "incident", "kubernetes"],
+      "context": "INC-501 postmortem",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "ops_cost_tagging",
+      "content": "Every cloud resource carries team, service, and env tags; the weekly cost report flags untagged spend by account and the owning team gets the ticket. Tag enforcement is a Terraform validation, not an honor system.",
+      "summary": "mandatory team/service/env tags; enforcement in Terraform",
+      "keywords": ["cost", "tags", "tagging", "cloud"],
+      "tags": ["ops", "process"],
+      "context": "cost attribution policy",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "ops_log_retention",
+      "content": "Application logs: 30 days hot in the logging cluster, 13 months in cold object storage. Security and audit logs: 2 years, immutable bucket with object lock, per the compliance commitment.",
+      "summary": "app logs 30d hot/13mo cold; security logs 2y immutable",
+      "keywords": ["logs", "retention", "30", "days", "compliance"],
+      "tags": ["ops", "observability", "compliance"],
+      "context": "log retention configuration",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "ops_grafana_slo",
+      "content": "SLOs are defined as code with sloth; the generator produces the Grafana dashboards and multi-window burn-rate alerts. Hand-edited SLO dashboards drift and are overwritten by the next generation run.",
+      "summary": "SLOs as code (sloth) generate dashboards + burn-rate alerts",
+      "keywords": ["slo", "sloth", "grafana", "burn-rate"],
+      "tags": ["ops", "observability"],
+      "context": "SLO tooling",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "ops_image_signing",
+      "content": "Container images are signed with cosign in CI, and the cluster admission policy rejects unsigned images in prod namespaces. An unsigned emergency build does not bypass the policy; the break-glass path re-signs with the incident key and leaves an audit trail.",
+      "summary": "cosign-signed images; admission rejects unsigned in prod",
+      "keywords": ["cosign", "signing", "images", "admission", "unsigned"],
+      "tags": ["ops", "security", "kubernetes"],
+      "context": "supply chain enforcement",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "ops_graviton_arm",
+      "content": "CI runners and stateless services migrated to arm64 Graviton instances for roughly 30% compute cost reduction. Images must be multi-arch (buildx); an amd64-only image in the deploy path is the most common cause of CrashLoopBackOff after this migration.",
+      "summary": "arm64 Graviton migration (-30% cost); images must be multi-arch",
+      "keywords": ["arm64", "graviton", "multi-arch", "cost"],
+      "tags": ["ops", "infrastructure"],
+      "context": "compute cost migration",
+      "memory_type": "Insight",
+      "importance": 6
+    },
+    {
+      "key": "ops_postmortem_blameless",
+      "content": "Postmortems are blameless and due within 5 business days of incident close. Action items go to the team board with owners and dates; an action item that lives only in the postmortem doc does not exist.",
+      "summary": "blameless postmortems in 5 days; action items tracked on the board",
+      "keywords": ["postmortem", "blameless", "incident", "action"],
+      "tags": ["ops", "process"],
+      "context": "incident process",
+      "memory_type": "Preference",
+      "importance": 6
+    },
+    {
+      "key": "ops_rds_failover_drill",
+      "content": "A quarterly RDS failover drill runs in staging: trigger the failover, verify client reconnection behavior, and time the recovery. The meridian serializable-retry helper gets validated against the real failover as part of it.",
+      "summary": "quarterly staged RDS failover drill validates client behavior",
+      "keywords": ["rds", "failover", "drill", "staging"],
+      "tags": ["ops", "database", "process"],
+      "context": "failover preparedness",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "ops_vpn_split",
+      "content": "The VPN is split-tunnel and internal DNS zones only resolve on it; if an internal hostname fails to resolve, check VPN connectivity before debugging the service.",
+      "summary": "split-tunnel VPN; internal DNS only resolves on VPN",
+      "keywords": ["vpn", "split-tunnel", "dns", "internal"],
+      "tags": ["ops", "infrastructure"],
+      "context": "network access reference",
+      "memory_type": "Configuration",
+      "importance": 4
+    },
+    {
+      "key": "ops_ratelimit_edge",
+      "content": "Global rate limits live at the edge (per-IP and per-token) so abusive traffic is shed before it reaches services; per-service limits exist only as a backstop. Service teams tune their backstop, the edge limits belong to platform.",
+      "summary": "rate limiting at the edge; service limits are a backstop",
+      "keywords": ["rate", "limit", "edge", "backstop"],
+      "tags": ["ops", "architecture", "security"],
+      "context": "traffic shedding design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "ops_backup_restore_test",
+      "content": "Database backups are restore-tested monthly by actually restoring into an isolated VPC and running row-count plus checksum validation. An untested backup is treated as no backup; the test result posts to the compliance channel.",
+      "summary": "monthly real restore tests; untested backup = no backup",
+      "keywords": ["backup", "restore", "test", "monthly", "validation"],
+      "tags": ["ops", "database", "compliance"],
+      "context": "backup verification policy",
+      "memory_type": "Constraint",
+      "importance": 8
+    },
+    {
+      "key": "ops_incident_severity",
+      "content": "Severity ladder: SEV1 is customer-facing outage or data loss (page immediately, exec comms within 30 min); SEV2 is degraded customer experience (page business hours + on-call discretion); SEV3 is internal tooling degradation (ticket, business hours). The IC may upgrade severity but only the IC downgrades it.",
+      "summary": "SEV1/2/3 ladder; only the IC downgrades severity",
+      "keywords": ["severity", "sev1", "incident", "paging"],
+      "tags": ["ops", "process"],
+      "context": "incident severity reference",
+      "memory_type": "Reference",
+      "importance": 5
+    },
+    {
+      "key": "ops_session_dns_debug",
+      "content": "Session summary (claude-code): debugged INC-501 DNS failures. Commands: kubectl -n kube-system logs coredns, dig +trace, tcpdump on a node, kubectl edit configmap coredns-custom. Finding: negative cache TTL of 30s on NXDOMAIN responses returned during the RDS failover window. Files touched: coredns-custom configmap, runbooks/dns-failover.md.",
+      "summary": "hook capture: INC-501 debugging; negative cache TTL confirmed as amplifier",
+      "keywords": ["session", "dns", "coredns", "debug", "tcpdump"],
+      "tags": ["ops", "session-summary"],
+      "context": "hook-captured session summary",
+      "memory_type": "Insight",
+      "importance": 5,
+      "confidence": 0.85
+    },
+    {
+      "key": "ops_chaos_testing",
+      "content": "A monthly chaos experiment runs in staging (pod kill, AZ blackhole, dependency latency injection); findings feed PDB settings and retry budgets. Experiments are scheduled, announced, and never run in prod.",
+      "summary": "monthly staged chaos experiments feed PDBs and retry budgets",
+      "keywords": ["chaos", "experiment", "staging", "resilience"],
+      "tags": ["ops", "process", "resilience"],
+      "context": "chaos program",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "ops_runner_pool",
+      "content": "CI runs on a self-hosted runner pool with warm caches for trusted branches; PRs from forks get ephemeral isolated runners with no cache write access and no secrets. The split exists because cache write + untrusted code = the packrat INC-77 class of attack.",
+      "summary": "warm runners for trusted branches; ephemeral no-secret runners for forks",
+      "keywords": ["runners", "ci", "ephemeral", "forks", "isolation"],
+      "tags": ["ops", "ci", "security"],
+      "context": "CI trust boundary design",
+      "memory_type": "ArchitectureDecision",
+      "importance": 6
+    },
+    {
+      "key": "ops_waf_rules",
+      "content": "WAF runs the managed core rule set plus custom rules kept in Terraform; emergency blocks go through the break-glass rule with a mandatory 24-hour expiry so temporary blocks cannot quietly become permanent.",
+      "summary": "WAF rules in Terraform; break-glass blocks expire in 24h",
+      "keywords": ["waf", "rules", "break-glass", "terraform"],
+      "tags": ["ops", "security"],
+      "context": "edge protection configuration",
+      "memory_type": "Configuration",
+      "importance": 6
+    },
+    {
+      "key": "ops_deploy_freeze",
+      "content": "Production deploys freeze for Black Friday week and the December change-freeze window; exceptions require director approval and an attached rollback plan. The freeze calendar is published quarterly.",
+      "summary": "deploy freeze for Black Friday and December; director-approved exceptions",
+      "keywords": ["freeze", "deploy", "black", "friday", "change"],
+      "tags": ["ops", "process", "deploys"],
+      "context": "change freeze policy",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "ops_synthetic_checks",
+      "content": "Synthetic probes exercise the golden paths (login, charge, dashboard load) every 60 seconds from three regions; a synthetic failing in all regions pages immediately, single-region failures open a ticket.",
+      "summary": "60s synthetic probes from 3 regions on golden paths",
+      "keywords": ["synthetic", "probes", "monitoring", "regions"],
+      "tags": ["ops", "observability"],
+      "context": "synthetic monitoring setup",
+      "memory_type": "Configuration",
+      "importance": 5
+    },
+    {
+      "key": "ops_db_connection_limits",
+      "content": "INC-460: a fleet of Lambdas connected directly to Postgres and exhausted max_connections (500), starving the services. Rule: nothing connects to Postgres directly except pgbouncer; serverless workloads use the RDS proxy endpoint.",
+      "summary": "INC-460 connection exhaustion; only pgbouncer/RDS-proxy touch Postgres",
+      "keywords": ["connections", "max_connections", "pgbouncer", "lambda", "exhaustion"],
+      "tags": ["ops", "database", "incident"],
+      "context": "INC-460 postmortem",
+      "memory_type": "BugFix",
+      "importance": 7
+    },
+    {
+      "key": "team_adr_process",
+      "content": "Architecture decisions across all projects are recorded as ADRs in each repo's docs/adr directory using the lightweight template. A decision without an ADR is folklore: it can be relitigated or reversed without ceremony, and nobody may cite it as binding in review.",
+      "summary": "decisions live in docs/adr; no ADR means not binding",
+      "keywords": ["adr", "decisions", "records", "process"],
+      "tags": ["team", "process"],
+      "context": "cross-team decision process",
+      "memory_type": "Constraint",
+      "importance": 6
+    },
+    {
+      "key": "team_friday_deploys",
+      "content": "No production deploys after 15:00 local on Fridays except SEV fixes; the pipeline enforces the window. The rule exists because weekend rollbacks burn the on-call and nobody reviews carefully at 17:45 on a Friday.",
+      "summary": "no prod deploys after 15:00 Friday except SEV fixes",
+      "keywords": ["friday", "deploys", "freeze", "window"],
+      "tags": ["team", "process", "deploys"],
+      "context": "deploy window policy",
+      "memory_type": "Constraint",
+      "importance": 5
     }
   ],
 
   "golden_queries": [
-    {
-      "query": "writer writecommand",
-      "expected": ["single_writer", "writer_thread_dup"],
-      "k": 5
-    },
-    {
-      "query": "readers pool",
-      "expected": ["read_pool"],
-      "k": 5
-    },
-    {
-      "query": "checkpoint truncate",
-      "expected": ["wal_checkpoint"],
-      "k": 3
-    },
-    {
-      "query": "namespace isolation",
-      "expected": ["namespace_isolation", "namespace_isolation_dup"],
-      "k": 5
-    },
-    {
-      "query": "deterministic sha256",
-      "expected": ["deterministic_embed"],
-      "k": 3
-    },
-    {
-      "query": "voyage https",
-      "expected": ["voyage_embed"],
-      "k": 3
-    },
-    {
-      "query": "linear ranking",
-      "expected": ["linear_ranking"],
-      "k": 3
-    },
-    {
-      "query": "recency halflife",
-      "expected": ["recency_decay"],
-      "k": 3
-    },
-    {
-      "query": "migration checksum",
-      "expected": ["migration_additive"],
-      "k": 3
-    },
-    {
-      "query": "fts5 trigger",
-      "expected": ["fts_trigger"],
-      "k": 3
-    }
+    { "query": "writer writecommand", "expected": ["single_writer", "writer_thread_dup"], "grades": [3, 2], "k": 5 },
+    { "query": "readers pool", "expected": ["read_pool"], "grades": [3], "k": 5 },
+    { "query": "checkpoint truncate", "expected": ["wal_checkpoint"], "grades": [3], "k": 3 },
+    { "query": "namespace isolation", "expected": ["namespace_isolation", "namespace_isolation_dup"], "grades": [3, 3], "k": 5 },
+    { "query": "deterministic sha256", "expected": ["deterministic_embed"], "grades": [3], "k": 3 },
+    { "query": "voyage https", "expected": ["voyage_embed"], "grades": [3], "k": 3 },
+    { "query": "linear ranking", "expected": ["linear_ranking"], "grades": [3], "k": 3 },
+    { "query": "recency halflife", "expected": ["recency_decay"], "grades": [3], "k": 3 },
+    { "query": "migration checksum", "expected": ["migration_additive"], "grades": [3], "k": 3 },
+    { "query": "fts5 trigger", "expected": ["fts_trigger"], "grades": [3], "k": 3 },
+    { "query": "how is writing serialized?", "expected": ["readme_quickstart", "single_writer", "writer_thread_dup"], "grades": [3, 2, 2], "k": 5 },
+    { "query": "how do we prevent duplicate charges when a client retries a payment?", "expected": ["mer_idempotency_keys", "mer_idempotency_dup", "mer_double_charge_incident"], "grades": [3, 3, 2] },
+    { "query": "what happened in the double charge incident?", "expected": ["mer_double_charge_incident", "mer_idempotency_keys"], "grades": [3, 1] },
+    { "query": "why did we stop storing money as integer cents?", "expected": ["mer_money_numeric_reversal", "mer_money_integer_cents"], "grades": [3, 2] },
+    { "query": "can posted ledger entries be updated to fix a mistake?", "expected": ["mer_ledger_immutable", "mer_event_sourced_ledger"], "grades": [3, 2] },
+    { "query": "what is the policy on card numbers in logs?", "expected": ["mer_pci_no_pan_logs", "mer_pci_tokenization"], "grades": [3, 2] },
+    { "query": "how do we publish events to kafka without losing them?", "expected": ["mer_outbox_pattern", "mer_outbox_dup", "mer_ledger_drift_incident"], "grades": [3, 3, 1] },
+    { "query": "what should code do when postgres aborts a serializable transaction?", "expected": ["mer_serializable_retry"], "grades": [3] },
+    { "query": "why are prepared statements disabled in production?", "expected": ["mer_pgbouncer_prepared", "mer_session_pgbouncer"], "grades": [3, 2] },
+    { "query": "what rounding mode do we use for money?", "expected": ["mer_decimal_rounding", "mer_currency_minor_units"], "grades": [3, 2] },
+    { "query": "why did refunds break for japanese yen?", "expected": ["mer_currency_minor_units", "mer_session_jpy_hotfix"], "grades": [3, 2] },
+    { "query": "how long do idempotency keys live before they expire?", "expected": ["mer_idempotency_ttl_gotcha", "mer_idempotency_keys"], "grades": [3, 2] },
+    { "query": "how did we fix the kafka consumer rebalance storm?", "expected": ["mer_kafka_rebalance_storm"], "grades": [3] },
+    { "query": "can kafka consumers assume exactly-once delivery?", "expected": ["mer_idempotent_consumers"], "grades": [3] },
+    { "query": "how are refunds coordinated across the payment services?", "expected": ["mer_saga_orchestration", "mer_session_refund_saga"], "grades": [3, 2] },
+    { "query": "what time is the settlement cutoff now?", "expected": ["mer_settlement_cutoff_change", "mer_settlement_cutoff"], "grades": [3, 2] },
+    { "query": "which sql library do the payment services use and why?", "expected": ["mer_sqlx_over_diesel"], "grades": [3] },
+    { "query": "how should list endpoints paginate large tables?", "expected": ["mer_api_pagination"], "grades": [3] },
+    { "query": "how are outbound webhooks signed?", "expected": ["mer_webhook_signing", "mer_clock_skew_webhooks"], "grades": [3, 2] },
+    { "query": "why did charge inserts get faster after we changed id format?", "expected": ["mer_uuid_v7_ids"], "grades": [3] },
+    { "query": "where must EU merchant data stay?", "expected": ["mer_eu_data_residency"], "grades": [3] },
+    { "query": "is blocking IO allowed in async request handlers?", "expected": ["mer_no_sync_io_handlers"], "grades": [3] },
+    { "query": "how is the ledger events table partitioned?", "expected": ["mer_db_partitioning"], "grades": [3] },
+    { "query": "how long is the public API deprecation window?", "expected": ["mer_api_backwards_compat"], "grades": [3] },
+    { "query": "every ledger transaction has to balance, where is that enforced?", "expected": ["mer_double_entry"], "grades": [3] },
+    { "query": "what is the javascript bundle size budget per route?", "expected": ["sky_bundle_budget", "sky_bundle_budget_dup", "sky_lighthouse_ci_budget"], "grades": [3, 3, 2] },
+    { "query": "why did we remove redux from the dashboard?", "expected": ["sky_redux_removed", "sky_redux_decision"], "grades": [3, 2] },
+    { "query": "how should api responses be validated in the frontend?", "expected": ["sky_zod_boundaries", "sky_zod_boundaries_dup", "sky_openapi_codegen"], "grades": [3, 3, 2] },
+    { "query": "what caused a user to see another user's dashboard?", "expected": ["sky_cdn_cache_incident"], "grades": [3] },
+    { "query": "how do we avoid hydration mismatches with locale dates?", "expected": ["sky_hydration_mismatch", "sky_timezone_chart"], "grades": [3, 1] },
+    { "query": "where do auth tokens live in the browser?", "expected": ["sky_auth_session_cookie", "sky_no_secrets_client"], "grades": [3, 2] },
+    { "query": "is fetching data inside useEffect acceptable?", "expected": ["sky_use_effect_fetch", "sky_react_query"], "grades": [3, 2] },
+    { "query": "which test runner does the dashboard use now?", "expected": ["sky_vitest", "sky_jest_decision"], "grades": [3, 2] },
+    { "query": "what accessibility standard do new components have to meet?", "expected": ["sky_a11y_wcag", "sky_session_a11y_audit"], "grades": [3, 2] },
+    { "query": "why is there no client side feature flag sdk?", "expected": ["sky_feature_flag_client"], "grades": [3] },
+    { "query": "did the team ever evaluate graphql?", "expected": ["sky_graphql_rejected"], "grades": [3] },
+    { "query": "are NEXT_PUBLIC environment variables safe for secrets?", "expected": ["sky_no_secrets_client"], "grades": [3] },
+    { "query": "how did we stop playwright tests from flaking on animations?", "expected": ["sky_playwright_flake"], "grades": [3] },
+    { "query": "how does the content security policy handle inline scripts?", "expected": ["sky_csp_inline", "sky_session_csp"], "grades": [3, 2] },
+    { "query": "when does a table need virtualization?", "expected": ["sky_table_virtualization", "sky_session_billing_table"], "grades": [3, 2] },
+    { "query": "why did date parsing fail only in safari?", "expected": ["sky_safari_date_parse"], "grades": [3] },
+    { "query": "how are build artifacts stored in the cache service?", "expected": ["pk_s3_content_addressed", "pk_presigned_urls"], "grades": [3, 2] },
+    { "query": "can an existing cache entry ever be overwritten?", "expected": ["pk_cache_immutable", "pk_immutable_dup"], "grades": [3, 3] },
+    { "query": "what happened when a pull request poisoned the build cache?", "expected": ["pk_cache_poisoning_incident", "pk_cache_immutable"], "grades": [3, 1] },
+    { "query": "how do we make zip archives reproducible across CI runs?", "expected": ["pk_zip_timestamps"], "grades": [3] },
+    { "query": "which python package manager replaced pip?", "expected": ["pk_uv_package_manager", "pk_session_uv_migration"], "grades": [3, 2] },
+    { "query": "why did the retention job delete artifacts that were still fresh?", "expected": ["pk_tz_naive_datetime", "pk_retention_90d"], "grades": [3, 2] },
+    { "query": "do we still pin transitive python dependencies?", "expected": ["pk_pin_direct_only", "pk_pin_all_transitives"], "grades": [3, 2] },
+    { "query": "what do the packrat CLI exit codes mean?", "expected": ["pk_cli_exit_codes"], "grades": [3] },
+    { "query": "how are releases published to pypi?", "expected": ["pk_release_tags"], "grades": [3] },
+    { "query": "why did concurrent uploads run out of memory?", "expected": ["pk_concurrent_uploads"], "grades": [3] },
+    { "query": "can we use s3 etags to verify artifact integrity?", "expected": ["pk_multipart_etag"], "grades": [3] },
+    { "query": "how do deploys roll out now, blue green or canary?", "expected": ["ops_canary_reversal", "ops_blue_green"], "grades": [3, 2] },
+    { "query": "where do kubernetes secrets come from?", "expected": ["ops_secrets_external", "ops_secrets_external_dup"], "grades": [3, 3] },
+    { "query": "what caused the dns outage after the database failover?", "expected": ["ops_dns_incident", "ops_session_dns_debug"], "grades": [3, 2] },
+    { "query": "are unsigned container images allowed in production?", "expected": ["ops_image_signing"], "grades": [3] },
+    { "query": "how often do we test that backups actually restore?", "expected": ["ops_backup_restore_test"], "grades": [3] },
+    { "query": "can I run terraform apply locally against prod?", "expected": ["ops_terraform_atlantis"], "grades": [3] },
+    { "query": "when are production deploys frozen?", "expected": ["ops_deploy_freeze", "team_friday_deploys"], "grades": [3, 2] },
+    { "query": "why do multi replica services need pod disruption budgets?", "expected": ["ops_pod_disruption"], "grades": [3] },
+    { "query": "how does hook capture keep secrets out of stored memories?", "expected": ["rb_hooks_redaction"], "grades": [3] },
+    { "query": "what permissions does the daemon set on the database file?", "expected": ["rb_db_permissions"], "grades": [3] }
   ],
 
   "dedup_clusters": [
-    {
-      "members": ["single_writer", "writer_thread_dup"]
-    },
-    {
-      "members": ["namespace_isolation", "namespace_isolation_dup"]
-    }
+    { "members": ["single_writer", "writer_thread_dup", "readme_quickstart"] },
+    { "members": ["namespace_isolation", "namespace_isolation_dup"] },
+    { "members": ["mer_outbox_pattern", "mer_outbox_dup"] },
+    { "members": ["mer_idempotency_keys", "mer_idempotency_dup"] },
+    { "members": ["sky_zod_boundaries", "sky_zod_boundaries_dup"] },
+    { "members": ["sky_bundle_budget", "sky_bundle_budget_dup"] },
+    { "members": ["pk_cache_immutable", "pk_immutable_dup"] },
+    { "members": ["ops_secrets_external", "ops_secrets_external_dup"] }
   ]
 }
