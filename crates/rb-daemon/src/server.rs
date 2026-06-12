@@ -95,8 +95,7 @@ impl Daemon {
         let dim = embedder.dim();
 
         if let Some(parent) = config.db_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("create db dir {}: {e}", parent.display())))?;
+            prepare_db_dir(parent)?;
         }
 
         prepare_socket_dir(&config.socket_path)?;
@@ -245,6 +244,22 @@ impl Daemon {
         info!("daemon shut down cleanly");
         Ok(())
     }
+}
+
+/// Create the DB's parent dir private (0700) when the daemon creates it —
+/// parity with the socket dir (W0.5). Unlike the socket dir, an EXISTING dir is
+/// accepted as-is: the daemon only owns dirs it created itself (the default
+/// data dir), while `RUSTY_BRAIN_DB` overrides and tests point into
+/// caller-owned dirs we must not chmod or reject. The DB file itself is always
+/// tightened to 0600 by rb-store at open, so the file stays private either way.
+fn prepare_db_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        return Ok(());
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| Error::Io(format!("create db dir {}: {e}", dir.display())))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", dir.display())))
 }
 
 fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
@@ -660,6 +675,24 @@ mod tests {
         let parent = socket.parent().unwrap();
         let mode = fs::metadata(parent).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[test]
+    fn prepare_db_dir_creates_missing_dir_private_and_leaves_existing_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("data").join("rusty-brain");
+        prepare_db_dir(&created).unwrap();
+        let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "daemon-created db dir must be private");
+
+        // An existing caller-owned dir is accepted untouched (the DB file is
+        // still 0600 via rb-store; only daemon-created dirs are tightened).
+        let existing = dir.path().join("caller-owned");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_db_dir(&existing).unwrap();
+        let mode = fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "daemon must not chmod caller-owned db dirs");
     }
 
     #[test]
