@@ -145,9 +145,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "poll_changes",
             description: "Drain buffered change notifications for the current \
-                          namespace since the last poll. Returns up to `max` events \
-                          plus a count of events dropped (the buffer is bounded and \
-                          lossy under heavy write load).",
+                          namespace since the last poll. Returns up to `max` events, \
+                          a count of events dropped (the buffer is bounded and lossy \
+                          under heavy write load), and the subscriber health: status \
+                          'disconnected' means events may be missed, not that \
+                          nothing changed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {

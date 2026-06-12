@@ -17,6 +17,10 @@ pub const JOBS_CONFIG_ENV: &str = "RB_JOBS_CONFIG";
 /// `--accept-model-change` serve flag; used by auto-start, where no flag can
 /// be passed). Truthy = non-empty and not `0`/`false`.
 pub const ACCEPT_MODEL_CHANGE_ENV: &str = "RB_ACCEPT_MODEL_CHANGE";
+/// Env var that overrides the daemon's per-connection request idle timeout in
+/// whole seconds (default 60). Parse failures fall back to the default; mainly
+/// for tests, which need the idle/reconnect path to run in seconds.
+pub const IDLE_TIMEOUT_ENV: &str = "RUSTY_BRAIN_IDLE_TIMEOUT_SECS";
 
 /// The exact set of parent env vars an auto-start daemon child may inherit.
 /// Everything else is cleared before spawn (no parent-env leak into a
@@ -35,6 +39,8 @@ pub const FORWARD_ENV: &[&str] = &[
     "RB_JOBS_CONFIG",
     // Explicit opt-in to an embedding-model swap (corpus re-embed).
     "RB_ACCEPT_MODEL_CHANGE",
+    // Request idle timeout override; safe to forward (defaulted when unset).
+    "RUSTY_BRAIN_IDLE_TIMEOUT_SECS",
     // Path resolution inside the child.
     "HOME",
     "PATH",
@@ -201,6 +207,13 @@ mod tests {
         for var in ["RB_EMBED_BACKEND", "RB_LOCAL_MODEL", "RB_JOBS_CONFIG"] {
             assert!(FORWARD_ENV.contains(&var), "FORWARD_ENV must include {var}");
         }
+    }
+
+    // W0.1: an auto-started daemon must honor the injected idle timeout, or the
+    // idle/reconnect e2e cannot shrink the 60s default down to test scale.
+    #[test]
+    fn forward_env_includes_the_idle_timeout_override() {
+        assert!(FORWARD_ENV.contains(&IDLE_TIMEOUT_ENV));
     }
 
     #[test]

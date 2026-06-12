@@ -41,8 +41,10 @@ const REEMBED_MAX_LIMIT: usize = 10_000;
 const MAX_CONNECTIONS: usize = 256;
 /// Idle deadline for the initial handshake read (fail fast on stalled connects).
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Idle deadline between consecutive request frames from an established client.
-const REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default idle deadline between consecutive request frames from an established
+/// client; overridable via `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` (see
+/// [`parse_idle_timeout`]) so the idle/reconnect e2e runs in seconds.
+const DEFAULT_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Static configuration for a daemon instance.
 #[derive(Clone, Debug)]
@@ -63,6 +65,18 @@ pub struct Daemon {
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
     jobs_config: JobsConfig,
+    request_idle_timeout: std::time::Duration,
+}
+
+/// Resolve the request idle timeout from an env value. Fail-safe: absent,
+/// empty, non-numeric, or zero values all use the default — a misconfigured
+/// override must never produce an instantly-dying or never-dying connection.
+fn parse_idle_timeout(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT)
 }
 
 impl std::fmt::Debug for Daemon {
@@ -135,6 +149,10 @@ impl Daemon {
             }
         };
 
+        // Read once at bind so every connection of this daemon instance agrees.
+        let request_idle_timeout =
+            parse_idle_timeout(std::env::var(rb_config::IDLE_TIMEOUT_ENV).ok().as_deref());
+
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
             listener,
@@ -145,6 +163,7 @@ impl Daemon {
             pidfile_path,
             bind_guard,
             jobs_config: config.jobs_config,
+            request_idle_timeout,
         })
     }
 
@@ -159,6 +178,7 @@ impl Daemon {
             pidfile_path: _pidfile_path,
             mut bind_guard,
             jobs_config,
+            request_idle_timeout,
         } = self;
         tokio::pin!(shutdown);
         let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
@@ -193,8 +213,15 @@ impl Daemon {
                             };
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
-                                if let Err(e) =
-                                    handle_connection(stream, store, embedder, enricher, jobs_config).await
+                                if let Err(e) = handle_connection(
+                                    stream,
+                                    store,
+                                    embedder,
+                                    enricher,
+                                    jobs_config,
+                                    request_idle_timeout,
+                                )
+                                .await
                                 {
                                     warn!(error = %e, "connection ended with error");
                                 }
@@ -372,6 +399,7 @@ async fn handle_connection(
     embedder: SharedEmbedder,
     enricher: Option<Arc<dyn Enricher>>,
     jobs_config: JobsConfig,
+    request_idle_timeout: std::time::Duration,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -425,7 +453,7 @@ async fn handle_connection(
     };
     loop {
         // Break the loop if the client is idle for too long between requests.
-        let req: Request = match timeout(REQUEST_IDLE_TIMEOUT, read_frame(&mut framed)).await {
+        let req: Request = match timeout(request_idle_timeout, read_frame(&mut framed)).await {
             Ok(Ok(req)) => req,
             Ok(Err(_)) => break, // parse error or clean close
             Err(_) => {
@@ -649,6 +677,37 @@ mod tests {
         );
         let mode = fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "daemon must not chmod caller-owned dirs");
+    }
+
+    #[test]
+    fn parse_idle_timeout_honors_valid_seconds() {
+        assert_eq!(
+            parse_idle_timeout(Some("1")),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse_idle_timeout(Some(" 120 ")),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn parse_idle_timeout_falls_back_to_default_on_garbage() {
+        // Fail-safe: absent, empty, non-numeric, negative, and zero all default.
+        for bad in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("-5"),
+            Some("0"),
+            Some("1.5"),
+        ] {
+            assert_eq!(
+                parse_idle_timeout(bad),
+                DEFAULT_REQUEST_IDLE_TIMEOUT,
+                "value {bad:?} must fall back to the default"
+            );
+        }
     }
 
     #[test]

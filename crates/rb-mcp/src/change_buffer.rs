@@ -5,6 +5,18 @@
 
 use rb_types::MemoryChanged;
 use std::collections::VecDeque;
+use std::time::Instant;
+
+/// Health of the background daemon subscriber feeding this ring, surfaced in
+/// `poll_changes` so a consumer can tell a quiet corpus (connected, no events)
+/// from a deaf one (disconnected — events may be happening unseen).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubscriberStatus {
+    /// A live subscription is streaming into the ring.
+    Connected,
+    /// No live subscription since `since` (including "never connected yet").
+    Disconnected { since: Instant },
+}
 
 /// A bounded ring of buffered change events with a since-last-drain dropped
 /// counter. Cheap to clone via `Arc<Mutex<ChangeBuffer>>` at the call site.
@@ -15,6 +27,9 @@ pub struct ChangeBuffer {
     /// Events dropped (evicted on overflow, or reported by broadcast `Lagged`)
     /// since the last `drain`. Reset to 0 by `drain`.
     dropped: u64,
+    /// Subscriber health. Starts `Disconnected` (fail closed: a ring nobody
+    /// feeds must read as deaf, not quiet) until the subscriber reports in.
+    status: SubscriberStatus,
 }
 
 /// The result of draining the ring: up to `max` events plus the number of
@@ -32,7 +47,32 @@ impl ChangeBuffer {
             events: VecDeque::new(),
             capacity: capacity.max(1),
             dropped: 0,
+            status: SubscriberStatus::Disconnected {
+                since: Instant::now(),
+            },
         }
+    }
+
+    /// Mark the feeding subscriber as live (called on each successful
+    /// resubscribe).
+    pub fn set_connected(&mut self) {
+        self.status = SubscriberStatus::Connected;
+    }
+
+    /// Mark the feeding subscriber as down. Idempotent: repeated failed
+    /// reconnect attempts keep the ORIGINAL disconnect instant so the reported
+    /// outage duration stays truthful.
+    pub fn set_disconnected(&mut self) {
+        if !matches!(self.status, SubscriberStatus::Disconnected { .. }) {
+            self.status = SubscriberStatus::Disconnected {
+                since: Instant::now(),
+            };
+        }
+    }
+
+    /// Current subscriber health.
+    pub fn subscriber_status(&self) -> SubscriberStatus {
+        self.status
     }
 
     /// Push one event, evicting (and counting) the oldest if at capacity.
@@ -145,6 +185,40 @@ mod tests {
         let next = b.drain(10);
         assert_eq!(next.dropped, 0);
         assert!(next.events.is_empty());
+    }
+
+    #[test]
+    fn subscriber_status_starts_disconnected_and_tracks_transitions() {
+        let mut b = ChangeBuffer::new(4);
+        // Fail closed: until the subscriber reports in, the ring is deaf.
+        assert!(matches!(
+            b.subscriber_status(),
+            SubscriberStatus::Disconnected { .. }
+        ));
+        b.set_connected();
+        assert_eq!(b.subscriber_status(), SubscriberStatus::Connected);
+        b.set_disconnected();
+        assert!(matches!(
+            b.subscriber_status(),
+            SubscriberStatus::Disconnected { .. }
+        ));
+    }
+
+    #[test]
+    fn repeated_disconnects_keep_the_original_since_instant() {
+        let mut b = ChangeBuffer::new(4);
+        b.set_connected();
+        b.set_disconnected();
+        let SubscriberStatus::Disconnected { since: first } = b.subscriber_status() else {
+            panic!("expected disconnected");
+        };
+        // A later redundant set_disconnected (failed reconnect attempt) must not
+        // reset the outage clock.
+        b.set_disconnected();
+        let SubscriberStatus::Disconnected { since: second } = b.subscriber_status() else {
+            panic!("expected disconnected");
+        };
+        assert_eq!(first, second, "outage start must be preserved");
     }
 
     #[test]

@@ -61,11 +61,27 @@ impl Client {
         Ok(Client { framed })
     }
 
+    /// Send one request frame WITHOUT reading the response. Split from
+    /// [`request`](Self::request) so retrying callers can distinguish the two
+    /// failure phases: a SEND failure means the daemon never received the frame
+    /// (a Unix-socket write fails immediately once the peer has closed), so a
+    /// retry on a fresh connection is safe for any op; a RECV failure after a
+    /// successful send means the daemon may have executed the request and only
+    /// the response was lost, so only idempotent ops may be retried.
+    pub async fn send_request(&mut self, req: &Request) -> Result<()> {
+        write_frame(&mut self.framed, req).await
+    }
+
+    /// Read one response frame for a request previously sent with
+    /// [`send_request`](Self::send_request).
+    pub async fn recv_response(&mut self) -> Result<Response> {
+        read_frame(&mut self.framed).await
+    }
+
     /// Send one request and read one response.
     pub async fn request(&mut self, req: Request) -> Result<Response> {
-        write_frame(&mut self.framed, &req).await?;
-        let resp: Response = read_frame(&mut self.framed).await?;
-        Ok(resp)
+        self.send_request(&req).await?;
+        self.recv_response().await
     }
 
     /// Open a live change-notification stream on this connection. After this
@@ -333,6 +349,26 @@ mod tests {
             .unwrap();
         let resp = client.request(Request::Ping).await.unwrap();
         match resp {
+            Response::Pong { contract_version } => {
+                assert_eq!(contract_version, CONTRACT_VERSION);
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    // The split send/recv phases must compose to the same round trip as
+    // `request` — they exist so retrying callers can tell a dead-on-send
+    // connection from a lost response.
+    #[tokio::test]
+    async fn send_request_then_recv_response_round_trips() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(run_responder(listener, CONTRACT_VERSION, true));
+
+        let mut client = Client::connect(&path, Namespace::Global).await.unwrap();
+        client.send_request(&Request::Ping).await.unwrap();
+        match client.recv_response().await.unwrap() {
             Response::Pong { contract_version } => {
                 assert_eq!(contract_version, CONTRACT_VERSION);
             }
