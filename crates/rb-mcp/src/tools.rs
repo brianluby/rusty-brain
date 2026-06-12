@@ -110,7 +110,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Memory id (UUID)." },
-                    "content": { "type": "string" },
+                    "content": { "type": "string",
+                                 "description": "Content updates are not supported yet — \
+                                                 delete and re-remember instead (keeps \
+                                                 embeddings consistent). Sending content \
+                                                 returns a validation error." },
                     "summary": { "type": "string" },
                     "importance": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "tags": { "type": "array", "items": { "type": "string" } },
@@ -246,6 +250,28 @@ mod tests {
                 "remember should accept optional {opt}"
             );
         }
+    }
+
+    #[test]
+    fn update_content_property_documents_the_limitation() {
+        // F55: the schema must not advertise a bare `content` property — the
+        // engine rejects content updates, so the description has to say so and
+        // point at the workaround (delete + re-remember).
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "update")
+            .unwrap();
+        let desc = t.input_schema["properties"]["content"]["description"]
+            .as_str()
+            .expect("update.content needs a description documenting the limitation");
+        assert!(
+            desc.contains("not supported"),
+            "description must state the limitation: {desc}"
+        );
+        assert!(
+            desc.contains("delete and re-remember"),
+            "description must point at the workaround: {desc}"
+        );
     }
 
     #[test]

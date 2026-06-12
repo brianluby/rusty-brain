@@ -155,12 +155,28 @@ mod tests {
         } else {
             panic!("expected error response");
         }
+
+        // InvalidArgument is validation-class: its message IS the guidance the
+        // client needs (e.g. the content-update rejection) and must pass verbatim.
+        let guidance = "content updates are not supported; create a new memory so \
+                        embeddings stay consistent";
+        let r = error_to_response(Error::InvalidArgument(guidance.into()));
+        if let Response::Error { message, kind } = r {
+            assert_eq!(kind, "invalid_argument");
+            assert_eq!(
+                message,
+                format!("invalid argument: {guidance}"),
+                "validation message must be forwarded verbatim"
+            );
+        } else {
+            panic!("expected error response");
+        }
     }
 
     #[test]
     fn client_safe_errors_pass_through_message() {
         // NotFound, InvalidNamespace, InvalidMemoryType, InvalidLinkType,
-        // and DimensionMismatch are safe to forward verbatim.
+        // DimensionMismatch, and InvalidArgument are safe to forward verbatim.
         let id = MemoryId::new();
         let cases: Vec<Error> = vec![
             Error::NotFound(id),
@@ -171,6 +187,7 @@ mod tests {
                 expected: 512,
                 got: 768,
             },
+            Error::InvalidArgument("importance 0 is out of range 1..=10".into()),
         ];
         for err in cases {
             let display = err.to_string();

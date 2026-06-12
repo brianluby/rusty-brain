@@ -553,7 +553,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         updates: rb_types::MemoryUpdates,
     ) -> rb_types::Result<()> {
         if updates.content.is_some() {
-            return Err(rb_types::Error::Storage(
+            // Validation-class error: error_map forwards the message verbatim so
+            // MCP clients see actionable guidance instead of "internal error".
+            return Err(rb_types::Error::InvalidArgument(
                 "content updates are not supported; create a new memory so embeddings stay consistent"
                     .to_string(),
             ));
@@ -1380,7 +1382,12 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("content updates"));
+        // Must be the validation-class variant: error_map forwards its message
+        // verbatim, so the client sees the guidance instead of "internal error".
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
+        assert!(err
+            .to_string()
+            .contains("content updates are not supported"));
         let note = eng.get(id).await.unwrap().unwrap();
         assert_eq!(note.content, "old body");
     }

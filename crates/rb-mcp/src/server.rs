@@ -236,6 +236,16 @@ mod tests {
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],
                 },
+                // Mirrors the daemon: the engine rejects content updates with
+                // InvalidArgument and error_map forwards the message verbatim.
+                Request::Update { ref updates, .. } if updates.content.is_some() => {
+                    Response::Error {
+                        kind: "invalid_argument".into(),
+                        message: "invalid argument: content updates are not supported; \
+                                  create a new memory so embeddings stay consistent"
+                            .into(),
+                    }
+                }
                 Request::Update { .. } => Response::Updated,
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
@@ -385,6 +395,35 @@ mod tests {
             result["isError"],
             json!(true),
             "daemon error -> isError result"
+        );
+        // The transport itself stays successful (result, not error).
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
+    async fn tools_call_update_with_content_surfaces_guidance_not_internal_error() {
+        // F55: a content update must come back as an isError tool result whose
+        // text carries the actionable guidance, not an opaque internal fault.
+        let mut proxy = fake();
+        let r = req(
+            "tools/call",
+            Some(8),
+            json!({ "name": "update", "arguments": {
+                "id": MemoryId::new().to_string(),
+                "content": "rewritten body"
+            } }),
+        );
+        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("content updates are not supported"),
+            "guidance must reach the client verbatim: {text}"
+        );
+        assert!(
+            !text.contains("internal error"),
+            "rejection must be distinguishable from a real fault: {text}"
         );
         // The transport itself stays successful (result, not error).
         assert!(resp.error.is_none());
