@@ -27,6 +27,71 @@ fn continue_only() -> HookResult {
     }
 }
 
+/// Minimal capture-time secret redaction (W0.5; the full benchmarked set is
+/// W2.4). `(pattern, replacement)` pairs applied in order to every external
+/// text the hook persists (tool summaries, tool-response context, pre-compact
+/// snapshots) BEFORE truncation, so a secret split by head/tail truncation can
+/// never survive. Conservative by design: false positives are acceptable,
+/// leaked plaintext secrets are not.
+const REDACT_RULES: &[(&str, &str)] = &[
+    // PEM private-key blocks, including an unterminated block (e.g. a key cut
+    // off mid-response): redact through the END marker or to end-of-text.
+    (
+        r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
+        "[REDACTED:private-key]",
+    ),
+    // AWS access key ids.
+    (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED:aws-key]"),
+    // HTTP Authorization headers (any scheme: Bearer, Basic, token, ...).
+    (
+        r"(?i)\bauthorization\s*:\s*\S+(?:[ \t]+\S+)?",
+        "[REDACTED:authorization]",
+    ),
+    // Bare bearer tokens outside a header context.
+    (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+", "[REDACTED:bearer]"),
+    // key=value / key: value where the key CONTAINS a credential word
+    // (covers GITHUB_TOKEN=..., my_api_key: ..., passwd=...). The key and
+    // separator are kept; only the value is replaced.
+    (
+        r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_-]?key|authorization)[A-Za-z0-9_\-]*)(\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"']+)"#,
+        "${1}${2}[REDACTED:credential]",
+    ),
+];
+
+/// Rules compiled once per process. `None` if any pattern fails to compile
+/// (a programmer error, pinned by `all_redaction_rules_compile`).
+static REDACTIONS: std::sync::OnceLock<Option<Vec<(regex::Regex, &'static str)>>> =
+    std::sync::OnceLock::new();
+
+fn redactions() -> Option<&'static [(regex::Regex, &'static str)]> {
+    REDACTIONS
+        .get_or_init(|| {
+            REDACT_RULES
+                .iter()
+                .map(|(pattern, replacement)| {
+                    regex::Regex::new(pattern).ok().map(|re| (re, *replacement))
+                })
+                .collect()
+        })
+        .as_deref()
+}
+
+/// Replace recognizable secrets in `text` with `[REDACTED:kind]` markers.
+/// Fail-closed: if the rule set is unavailable, the WHOLE text is replaced —
+/// a hook capture is best-effort and must never persist a known-shape secret.
+fn redact(text: &str) -> String {
+    let Some(rules) = redactions() else {
+        return "[REDACTED:unavailable]".to_string();
+    };
+    let mut out = text.to_string();
+    for (re, replacement) in rules {
+        if let std::borrow::Cow::Owned(replaced) = re.replace_all(&out, *replacement) {
+            out = replaced;
+        }
+    }
+    out
+}
+
 /// Normalize a CLI-reported tool name to its canonical capitalized form.
 ///
 /// Each CLI names the same handful of mutations differently, so this single
@@ -153,13 +218,15 @@ pub async fn post_tool_use(
     if !is_mutation_tool(tool_name) {
         return continue_only();
     }
-    let summary = summarize_post_tool_use(tool_name, tool_input);
+    // Redact BEFORE dedup so the recorded key matches the stored summary, and
+    // BEFORE truncation so a secret can never be split around the marker.
+    let summary = redact(&summarize_post_tool_use(tool_name, tool_input));
     if dedup.is_duplicate(tool_name, &summary) {
         return continue_only();
     }
 
     let memory_type = classify_tool(tool_name);
-    let raw = extract_response_text(tool_response);
+    let raw = redact(&extract_response_text(tool_response));
     let context = if raw.trim().is_empty() {
         None
     } else {
@@ -348,7 +415,7 @@ pub async fn pre_compact(
     if let Some(client) = client {
         let _ = client
             .remember(
-                format!("Pre-compaction decision snapshot: {}", text.trim()),
+                format!("Pre-compaction decision snapshot: {}", redact(text.trim())),
                 None,
                 MemoryType::ArchitectureDecision,
                 8,
@@ -364,6 +431,103 @@ pub async fn pre_compact(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn all_redaction_rules_compile() {
+        // The fail-closed posture in `redact` ("[REDACTED:unavailable]" for the
+        // whole text) must never trigger in a shipped build: every static
+        // pattern compiles.
+        assert!(
+            redactions().is_some_and(|rules| rules.len() == REDACT_RULES.len()),
+            "every redaction rule must compile"
+        );
+    }
+
+    #[test]
+    fn redact_replaces_aws_access_keys() {
+        let out = redact("creds: AKIAABCDEFGHIJKLMNOP region us-east-1");
+        assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got {out}");
+        assert!(out.contains("[REDACTED:aws-key]"));
+        assert!(out.contains("us-east-1"), "non-secret text survives");
+    }
+
+    #[test]
+    fn redact_replaces_authorization_headers_and_bearer_tokens() {
+        let out = redact("curl -H 'Authorization: Bearer sk-live-deadbeef' https://x");
+        assert!(!out.contains("sk-live-deadbeef"), "got {out}");
+        assert!(out.contains("[REDACTED:"));
+
+        let out = redact("sent bearer abc.def-ghi to the api");
+        assert!(!out.contains("abc.def-ghi"), "got {out}");
+        assert!(out.contains("[REDACTED:bearer]"));
+    }
+
+    #[test]
+    fn redact_replaces_credential_key_value_pairs() {
+        for (input, secret) in [
+            ("password=hunter2", "hunter2"),
+            ("passwd: swordfish", "swordfish"),
+            ("export GITHUB_TOKEN=ghp_abc123", "ghp_abc123"),
+            ("api_key: \"k-123 456\"", "k-123 456"),
+            ("API-KEY='q w e'", "q w e"),
+            ("my_secret = ssshhh", "ssshhh"),
+            ("authorization=basic-xyz", "basic-xyz"),
+        ] {
+            let out = redact(input);
+            assert!(!out.contains(secret), "{input:?} leaked: {out}");
+            assert!(
+                out.contains("[REDACTED:"),
+                "{input:?} must carry a marker: {out}"
+            );
+        }
+    }
+
+    #[test]
+    fn redact_replaces_pem_blocks_even_unterminated() {
+        let pem =
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n-----END RSA PRIVATE KEY-----";
+        let out = redact(&format!("before\n{pem}\nafter"));
+        assert!(!out.contains("MIIfakekeymaterial"), "got {out}");
+        assert!(out.contains("[REDACTED:private-key]"));
+        assert!(out.contains("before") && out.contains("after"));
+
+        // A block truncated before its END marker (the exact shape head/tail
+        // truncation could produce upstream) is redacted to end-of-text.
+        let cut = "log line\n-----BEGIN PRIVATE KEY-----\nMIIcutshort";
+        let out = redact(cut);
+        assert!(!out.contains("MIIcutshort"), "got {out}");
+        assert!(out.contains("[REDACTED:private-key]"));
+    }
+
+    #[test]
+    fn redact_leaves_ordinary_text_untouched() {
+        let text = "Edited /src/main.rs; cargo test passed with 42 tests";
+        assert_eq!(redact(text), text);
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_redacts_summary_before_dedup_and_store() {
+        // A Bash command carrying a secret: the canonical summary (which is
+        // both stored and used as the dedup key) must be the REDACTED form.
+        let tmp = tempfile::tempdir().unwrap();
+        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let result = post_tool_use(
+            None,
+            &dedup,
+            "Bash",
+            &serde_json::json!({"command": "export AWS_SECRET_KEY=AKIAABCDEFGHIJKLMNOP"}),
+            &serde_json::json!("ok"),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(
+            dedup.is_duplicate(
+                "Bash",
+                "Ran command: export AWS_SECRET_KEY=[REDACTED:credential]"
+            ),
+            "the redacted summary is the recorded canonical form"
+        );
+    }
 
     #[test]
     fn mutation_tools_are_recognized() {

@@ -2603,6 +2603,7 @@ dependencies = [
  "rb-daemon",
  "rb-proto",
  "rb-types",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
