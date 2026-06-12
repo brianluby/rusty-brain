@@ -1,0 +1,2133 @@
+{
+  "_comment": "Pre-Phase-1 retrieval baseline (W1.0). FROZEN measurement artifact: later Phase 1 workstreams report before/after against these numbers. It is NOT a CI gate (thresholds come in W4.1) and must never be edited; re-capture under a new dated filename only if the corpus or fixture is re-recorded. Regenerate: cargo run -p rb-eval --example capture_baseline",
+  "captured_at": "2026-06-12",
+  "corpus": {
+    "dedup_clusters": 8,
+    "golden_queries": 72,
+    "holdout_queries": 20,
+    "memories": 205
+  },
+  "deterministic_reference": {
+    "_comment": "Same goldens under DeterministicProvider — the regression-gate context that crates/rb-eval/baselines.json tracks.",
+    "report": {
+      "channels": {
+        "fts_hit_share": 0.004166666666666667,
+        "fts_query_rate": 0.041666666666666664,
+        "graph_hit_share": 0.0,
+        "graph_query_rate": 0.0,
+        "vector_hit_share": 0.9958333333333333,
+        "vector_query_rate": 1.0
+      },
+      "dedup_precision": 1.0,
+      "mean_recall_at_k": 0.04861111111111111,
+      "mrr": 0.0517526455026455,
+      "ndcg": 0.04526013644772177,
+      "p50_latency_us": 5141,
+      "p99_latency_us": 6106
+    }
+  },
+  "embedding": {
+    "dim": 384,
+    "fixture": "crates/rb-eval/fixtures/embeddings/all-MiniLM-L6-v2.json",
+    "mode": "replay (committed real-model vectors, zero network)",
+    "model_id": "all-MiniLM-L6-v2",
+    "recorded_vectors": 297
+  },
+  "fusion_mode": "Linear",
+  "golden": {
+    "per_query": [
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.6,
+        "expected_keys": [
+          "single_writer",
+          "writer_thread_dup"
+        ],
+        "ndcg": 0.7309292742059024,
+        "query": "writer writecommand",
+        "ranked_keys": [
+          "writer_thread_dup",
+          "readme_quickstart",
+          "single_writer",
+          "read_pool",
+          "pk_cache_poisoning_incident",
+          "sky_a11y_wcag",
+          "mer_ledger_immutable",
+          "migration_additive",
+          "mer_outbox_pattern",
+          "ops_terraform_atlantis"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.6,
+        "expected_keys": [
+          "read_pool"
+        ],
+        "ndcg": 1.0,
+        "query": "readers pool",
+        "ranked_keys": [
+          "read_pool",
+          "single_writer",
+          "readme_quickstart",
+          "mer_kafka_partition_by_account",
+          "writer_thread_dup",
+          "mer_ledger_drift_incident",
+          "pk_cache_poisoning_incident",
+          "linear_ranking",
+          "sky_a11y_wcag",
+          "mer_decimal_rounding"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 1,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "wal_checkpoint"
+        ],
+        "ndcg": 1.0,
+        "query": "checkpoint truncate",
+        "ranked_keys": [
+          "wal_checkpoint",
+          "mer_ledger_drift_incident",
+          "mer_serializable_retry",
+          "ops_pod_disruption",
+          "pk_cache_poisoning_incident",
+          "mer_double_entry",
+          "mer_audit_log_append",
+          "mer_decimal_rounding",
+          "mer_db_partitioning",
+          "ops_backup_restore_test"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 2,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "namespace_isolation",
+          "namespace_isolation_dup"
+        ],
+        "ndcg": 1.0,
+        "query": "namespace isolation",
+        "ranked_keys": [
+          "namespace_isolation_dup",
+          "namespace_isolation",
+          "sky_no_secrets_client",
+          "mer_pci_tokenization",
+          "mer_workspace_layout",
+          "sky_eslint_boundaries",
+          "sky_e2e_test_data",
+          "mer_no_unwrap_prod",
+          "ops_runner_pool",
+          "sky_cdn_cache_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "deterministic_embed"
+        ],
+        "ndcg": 1.0,
+        "query": "deterministic sha256",
+        "ranked_keys": [
+          "deterministic_embed",
+          "pk_zip_timestamps",
+          "mer_ledger_immutable",
+          "mer_webhook_signing",
+          "pk_s3_content_addressed",
+          "mer_pci_no_pan_logs",
+          "pk_multipart_etag",
+          "mer_double_entry",
+          "sky_no_secrets_client",
+          "pk_cache_poisoning_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "voyage_embed"
+        ],
+        "ndcg": 1.0,
+        "query": "voyage https",
+        "ranked_keys": [
+          "voyage_embed",
+          "mer_eu_data_residency",
+          "sky_cdn_cache_incident",
+          "mer_webhook_signing",
+          "sky_edge_runtime_auth",
+          "sky_auth_session_cookie",
+          "mer_tls_cert_incident",
+          "mer_api_backwards_compat",
+          "ops_image_signing",
+          "pk_presigned_urls"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "linear_ranking"
+        ],
+        "ndcg": 1.0,
+        "query": "linear ranking",
+        "ranked_keys": [
+          "linear_ranking",
+          "recency_decay",
+          "mer_eu_data_residency",
+          "sky_a11y_wcag",
+          "mer_kafka_partition_by_account",
+          "mer_review_sql_binds",
+          "mer_uuid_v7_ids",
+          "sky_lcp_slo",
+          "deterministic_embed",
+          "voyage_embed"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "recency_decay"
+        ],
+        "ndcg": 1.0,
+        "query": "recency halflife",
+        "ranked_keys": [
+          "recency_decay",
+          "mer_idempotency_keys",
+          "mer_idempotency_ttl_gotcha",
+          "mer_double_charge_incident",
+          "mer_decimal_rounding",
+          "pk_retention_90d",
+          "mer_double_entry",
+          "mer_money_numeric_reversal",
+          "mer_saga_orchestration",
+          "mer_idempotency_dup"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "migration_additive"
+        ],
+        "ndcg": 1.0,
+        "query": "migration checksum",
+        "ranked_keys": [
+          "migration_additive",
+          "mer_migration_review",
+          "mer_ledger_immutable",
+          "mer_double_entry",
+          "mer_money_numeric_reversal",
+          "ops_backup_restore_test",
+          "pk_cache_poisoning_incident",
+          "pk_s3_content_addressed",
+          "mer_sqlx_over_diesel",
+          "pk_immutable_dup"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 1,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "fts_trigger"
+        ],
+        "ndcg": 1.0,
+        "query": "fts5 trigger",
+        "ranked_keys": [
+          "fts_trigger",
+          "pk_cache_poisoning_incident",
+          "migration_additive",
+          "readme_quickstart",
+          "mer_ledger_drift_incident",
+          "sky_a11y_wcag",
+          "mer_sqlx_over_diesel",
+          "rb_hooks_redaction",
+          "mer_kafka_rebalance_storm",
+          "sky_lcp_slo"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.6,
+        "expected_keys": [
+          "readme_quickstart",
+          "single_writer",
+          "writer_thread_dup"
+        ],
+        "ndcg": 0.7313492769537508,
+        "query": "how is writing serialized?",
+        "ranked_keys": [
+          "writer_thread_dup",
+          "single_writer",
+          "mer_pci_tokenization",
+          "mer_serializable_retry",
+          "readme_quickstart",
+          "mer_ledger_immutable",
+          "mer_eu_data_residency",
+          "mer_event_sourced_ledger",
+          "mer_idempotency_keys",
+          "pk_zip_timestamps"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "mer_double_charge_incident"
+        ],
+        "ndcg": 1.0,
+        "query": "how do we prevent duplicate charges when a client retries a payment?",
+        "ranked_keys": [
+          "mer_idempotency_dup",
+          "mer_idempotency_keys",
+          "mer_double_charge_incident",
+          "mer_double_entry",
+          "mer_chargeback_flow",
+          "mer_pci_tokenization",
+          "mer_saga_orchestration",
+          "mer_decimal_rounding",
+          "mer_ledger_immutable",
+          "mer_serializable_retry"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_double_charge_incident",
+          "mer_idempotency_keys"
+        ],
+        "ndcg": 0.9737576937588317,
+        "query": "what happened in the double charge incident?",
+        "ranked_keys": [
+          "mer_double_charge_incident",
+          "pk_cache_poisoning_incident",
+          "mer_double_entry",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "mer_money_numeric_reversal",
+          "mer_ledger_drift_incident",
+          "ops_postmortem_blameless",
+          "mer_decimal_rounding",
+          "sky_cdn_cache_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_money_numeric_reversal",
+          "mer_money_integer_cents"
+        ],
+        "ndcg": 0.8339912323981488,
+        "query": "why did we stop storing money as integer cents?",
+        "ranked_keys": [
+          "mer_money_integer_cents",
+          "mer_money_numeric_reversal",
+          "mer_currency_minor_units",
+          "mer_decimal_rounding",
+          "mer_double_entry",
+          "mer_pci_no_pan_logs",
+          "mer_ledger_immutable",
+          "mer_event_sourced_ledger",
+          "mer_eu_data_residency",
+          "mer_idempotency_keys"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_ledger_immutable",
+          "mer_event_sourced_ledger"
+        ],
+        "ndcg": 1.0,
+        "query": "can posted ledger entries be updated to fix a mistake?",
+        "ranked_keys": [
+          "mer_ledger_immutable",
+          "mer_event_sourced_ledger",
+          "mer_double_entry",
+          "mer_pci_no_pan_logs",
+          "mer_serializable_retry",
+          "sky_cdn_cache_incident",
+          "mer_money_numeric_reversal",
+          "pk_cache_immutable",
+          "mer_db_partitioning",
+          "mer_double_charge_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_pci_no_pan_logs",
+          "mer_pci_tokenization"
+        ],
+        "ndcg": 1.0,
+        "query": "what is the policy on card numbers in logs?",
+        "ranked_keys": [
+          "mer_pci_no_pan_logs",
+          "mer_pci_tokenization",
+          "mer_eu_data_residency",
+          "ops_log_retention",
+          "mer_ledger_immutable",
+          "mer_double_entry",
+          "mer_money_numeric_reversal",
+          "mer_money_integer_cents",
+          "mer_event_sourced_ledger",
+          "mer_idempotency_keys"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_outbox_pattern",
+          "mer_outbox_dup",
+          "mer_ledger_drift_incident"
+        ],
+        "ndcg": 0.8823671887655843,
+        "query": "how do we publish events to kafka without losing them?",
+        "ranked_keys": [
+          "mer_outbox_pattern",
+          "mer_idempotent_consumers",
+          "mer_ledger_drift_incident",
+          "mer_outbox_dup",
+          "mer_kafka_partition_by_account",
+          "mer_kafka_rebalance_storm",
+          "mer_event_sourced_ledger",
+          "mer_hot_partition",
+          "mer_idempotency_keys",
+          "readme_quickstart"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_serializable_retry"
+        ],
+        "ndcg": 1.0,
+        "query": "what should code do when postgres aborts a serializable transaction?",
+        "ranked_keys": [
+          "mer_serializable_retry",
+          "mer_double_charge_incident",
+          "mer_idempotency_keys",
+          "mer_double_entry",
+          "readme_quickstart",
+          "mer_idempotency_dup",
+          "ops_db_connection_limits",
+          "mer_idempotency_ttl_gotcha",
+          "mer_idempotent_consumers",
+          "single_writer"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_pgbouncer_prepared",
+          "mer_session_pgbouncer"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "why are prepared statements disabled in production?",
+        "ranked_keys": [
+          "mer_pgbouncer_prepared",
+          "single_writer",
+          "namespace_isolation",
+          "mer_sqlx_over_diesel",
+          "pk_cache_poisoning_incident",
+          "mer_review_sql_binds",
+          "sky_e2e_test_data",
+          "sky_react_query",
+          "ops_backup_restore_test",
+          "sky_csp_inline"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_decimal_rounding",
+          "mer_currency_minor_units"
+        ],
+        "ndcg": 0.6419288461539238,
+        "query": "what rounding mode do we use for money?",
+        "ranked_keys": [
+          "mer_money_integer_cents",
+          "mer_decimal_rounding",
+          "mer_money_numeric_reversal",
+          "mer_currency_minor_units",
+          "mer_double_entry",
+          "mer_pci_no_pan_logs",
+          "sky_lcp_slo",
+          "mer_eu_data_residency",
+          "mer_fx_rates_cache",
+          "mer_webhook_signing"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 0.5
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_currency_minor_units",
+          "mer_session_jpy_hotfix"
+        ],
+        "ndcg": 0.9324441894571632,
+        "query": "why did refunds break for japanese yen?",
+        "ranked_keys": [
+          "mer_currency_minor_units",
+          "mer_decimal_rounding",
+          "mer_money_numeric_reversal",
+          "mer_session_jpy_hotfix",
+          "mer_money_integer_cents",
+          "mer_saga_orchestration",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "mer_double_entry",
+          "sky_swr_stale_token"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_idempotency_ttl_gotcha",
+          "mer_idempotency_keys"
+        ],
+        "ndcg": 1.0,
+        "query": "how long do idempotency keys live before they expire?",
+        "ranked_keys": [
+          "mer_idempotency_ttl_gotcha",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "pk_api_tokens_scoped",
+          "pk_cache_immutable",
+          "mer_double_charge_incident",
+          "mer_idempotent_consumers",
+          "pk_retention_90d",
+          "mer_pci_tokenization",
+          "ops_secrets_external"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_kafka_rebalance_storm"
+        ],
+        "ndcg": 1.0,
+        "query": "how did we fix the kafka consumer rebalance storm?",
+        "ranked_keys": [
+          "mer_kafka_rebalance_storm",
+          "mer_ledger_drift_incident",
+          "mer_idempotent_consumers",
+          "mer_hot_partition",
+          "mer_kafka_partition_by_account",
+          "mer_outbox_pattern",
+          "mer_retry_budget",
+          "mer_double_charge_incident",
+          "mer_decimal_rounding",
+          "ops_pod_disruption"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_idempotent_consumers"
+        ],
+        "ndcg": 1.0,
+        "query": "can kafka consumers assume exactly-once delivery?",
+        "ranked_keys": [
+          "mer_idempotent_consumers",
+          "mer_outbox_pattern",
+          "mer_kafka_rebalance_storm",
+          "mer_kafka_partition_by_account",
+          "mer_hot_partition",
+          "mer_outbox_dup",
+          "mer_ledger_drift_incident",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "ops_pod_disruption"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_saga_orchestration",
+          "mer_session_refund_saga"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "how are refunds coordinated across the payment services?",
+        "ranked_keys": [
+          "mer_saga_orchestration",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "mer_decimal_rounding",
+          "mer_currency_minor_units",
+          "mer_chargeback_flow",
+          "mer_double_charge_incident",
+          "mer_pci_tokenization",
+          "mer_event_sourced_ledger",
+          "mer_double_entry"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_settlement_cutoff_change",
+          "mer_settlement_cutoff"
+        ],
+        "ndcg": 0.8339912323981488,
+        "query": "what time is the settlement cutoff now?",
+        "ranked_keys": [
+          "mer_settlement_cutoff",
+          "mer_settlement_cutoff_change",
+          "mer_api_backwards_compat",
+          "sky_redux_removed",
+          "mer_double_charge_incident",
+          "mer_serializable_retry",
+          "mer_saga_orchestration",
+          "mer_ledger_drift_incident",
+          "mer_idempotency_ttl_gotcha",
+          "mer_retry_budget"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_sqlx_over_diesel"
+        ],
+        "ndcg": 1.0,
+        "query": "which sql library do the payment services use and why?",
+        "ranked_keys": [
+          "mer_sqlx_over_diesel",
+          "mer_eu_data_residency",
+          "single_writer",
+          "mer_double_entry",
+          "readme_quickstart",
+          "mer_idempotency_dup",
+          "mer_idempotency_keys",
+          "mer_money_integer_cents",
+          "mer_event_sourced_ledger",
+          "namespace_isolation"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_api_pagination"
+        ],
+        "ndcg": 1.0,
+        "query": "how should list endpoints paginate large tables?",
+        "ranked_keys": [
+          "mer_api_pagination",
+          "mer_db_partitioning",
+          "sky_app_router",
+          "sky_table_virtualization",
+          "readme_quickstart",
+          "mer_migration_review",
+          "fts_trigger",
+          "mer_serializable_retry",
+          "sky_lcp_slo",
+          "sky_bundle_budget_dup"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_webhook_signing",
+          "mer_clock_skew_webhooks"
+        ],
+        "ndcg": 1.0,
+        "query": "how are outbound webhooks signed?",
+        "ranked_keys": [
+          "mer_webhook_signing",
+          "mer_clock_skew_webhooks",
+          "ops_secrets_external",
+          "sky_no_secrets_client",
+          "ops_image_signing",
+          "mer_chargeback_flow",
+          "namespace_isolation",
+          "mer_outbox_pattern",
+          "mer_ledger_immutable",
+          "pk_no_creds_in_artifacts"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_uuid_v7_ids"
+        ],
+        "ndcg": 1.0,
+        "query": "why did charge inserts get faster after we changed id format?",
+        "ranked_keys": [
+          "mer_uuid_v7_ids",
+          "mer_double_charge_incident",
+          "mer_pci_no_pan_logs",
+          "mer_pci_tokenization",
+          "mer_idempotency_keys",
+          "mer_idempotency_dup",
+          "mer_ledger_immutable",
+          "mer_money_integer_cents",
+          "mer_money_numeric_reversal",
+          "pk_zip_timestamps"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_eu_data_residency"
+        ],
+        "ndcg": 1.0,
+        "query": "where must EU merchant data stay?",
+        "ranked_keys": [
+          "mer_eu_data_residency",
+          "mer_pci_tokenization",
+          "mer_settlement_cutoff_change",
+          "namespace_isolation",
+          "mer_event_sourced_ledger",
+          "mer_pci_no_pan_logs",
+          "mer_api_backwards_compat",
+          "mer_money_integer_cents",
+          "mer_idempotency_keys",
+          "pk_s3_content_addressed"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "mer_no_sync_io_handlers"
+        ],
+        "ndcg": 1.0,
+        "query": "is blocking IO allowed in async request handlers?",
+        "ranked_keys": [
+          "mer_no_sync_io_handlers",
+          "namespace_isolation",
+          "single_writer",
+          "read_pool",
+          "readme_quickstart",
+          "pk_asyncio_subprocess",
+          "sky_zod_boundaries",
+          "mer_outbox_dup",
+          "mer_idempotency_dup",
+          "mer_error_taxonomy"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_db_partitioning"
+        ],
+        "ndcg": 1.0,
+        "query": "how is the ledger events table partitioned?",
+        "ranked_keys": [
+          "mer_db_partitioning",
+          "mer_event_sourced_ledger",
+          "mer_ledger_immutable",
+          "mer_vacuum_bloat",
+          "mer_double_entry",
+          "mer_kafka_partition_by_account",
+          "mer_pci_tokenization",
+          "mer_pci_no_pan_logs",
+          "mer_serializable_retry",
+          "mer_money_numeric_reversal"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_api_backwards_compat"
+        ],
+        "ndcg": 1.0,
+        "query": "how long is the public API deprecation window?",
+        "ranked_keys": [
+          "mer_api_backwards_compat",
+          "pk_api_tokens_scoped",
+          "mer_idempotency_ttl_gotcha",
+          "sky_no_secrets_client",
+          "mer_rate_limit_429",
+          "sky_cdn_cache_incident",
+          "mer_idempotency_keys",
+          "pk_cache_immutable",
+          "sky_openapi_codegen",
+          "sky_bundle_budget"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "mer_double_entry"
+        ],
+        "ndcg": 1.0,
+        "query": "every ledger transaction has to balance, where is that enforced?",
+        "ranked_keys": [
+          "mer_double_entry",
+          "mer_event_sourced_ledger",
+          "mer_ledger_immutable",
+          "mer_money_numeric_reversal",
+          "mer_serializable_retry",
+          "mer_pci_no_pan_logs",
+          "mer_money_integer_cents",
+          "mer_db_partitioning",
+          "mer_decimal_rounding",
+          "mer_pci_tokenization"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "sky_bundle_budget",
+          "sky_bundle_budget_dup",
+          "sky_lighthouse_ci_budget"
+        ],
+        "ndcg": 0.8838695436828513,
+        "query": "what is the javascript bundle size budget per route?",
+        "ranked_keys": [
+          "sky_bundle_budget",
+          "sky_bundle_budget_dup",
+          "sky_app_router",
+          "sky_no_secrets_client",
+          "sky_lcp_slo",
+          "mer_api_backwards_compat",
+          "mer_rate_limit_429",
+          "sky_feature_flag_client",
+          "ops_canary_reversal",
+          "sky_openapi_codegen"
+        ],
+        "recall_at_k": 0.6666666666666666,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_redux_removed",
+          "sky_redux_decision"
+        ],
+        "ndcg": 1.0,
+        "query": "why did we remove redux from the dashboard?",
+        "ranked_keys": [
+          "sky_redux_removed",
+          "sky_redux_decision",
+          "sky_cdn_cache_incident",
+          "sky_react_query",
+          "mer_saga_orchestration",
+          "sky_app_router",
+          "sky_auth_session_cookie",
+          "sky_swr_stale_token",
+          "sky_memory_leak_ws",
+          "mer_api_backwards_compat"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "sky_zod_boundaries",
+          "sky_zod_boundaries_dup",
+          "sky_openapi_codegen"
+        ],
+        "ndcg": 0.7753439004794501,
+        "query": "how should api responses be validated in the frontend?",
+        "ranked_keys": [
+          "sky_zod_boundaries",
+          "mer_idempotency_keys",
+          "mer_error_taxonomy",
+          "sky_zod_boundaries_dup",
+          "mer_webhook_signing",
+          "mer_idempotency_dup",
+          "ops_backup_restore_test",
+          "mer_grpc_internal",
+          "sky_openapi_codegen",
+          "pk_presigned_urls"
+        ],
+        "recall_at_k": 0.6666666666666666,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_cdn_cache_incident"
+        ],
+        "ndcg": 1.0,
+        "query": "what caused a user to see another user's dashboard?",
+        "ranked_keys": [
+          "sky_cdn_cache_incident",
+          "sky_auth_session_cookie",
+          "sky_no_secrets_client",
+          "sky_memory_leak_ws",
+          "sky_redux_removed",
+          "sky_swr_stale_token",
+          "mer_audit_log_append",
+          "sky_react_query",
+          "sky_lcp_slo",
+          "sky_timezone_chart"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_hydration_mismatch",
+          "sky_timezone_chart"
+        ],
+        "ndcg": 0.9173194127129571,
+        "query": "how do we avoid hydration mismatches with locale dates?",
+        "ranked_keys": [
+          "sky_hydration_mismatch",
+          "mer_money_integer_cents",
+          "mer_money_numeric_reversal",
+          "pk_zip_timestamps",
+          "pk_tz_naive_datetime",
+          "mer_decimal_rounding",
+          "mer_settlement_cutoff_change",
+          "mer_ledger_immutable",
+          "mer_currency_minor_units",
+          "mer_fx_rates_cache"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_auth_session_cookie",
+          "sky_no_secrets_client"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "where do auth tokens live in the browser?",
+        "ranked_keys": [
+          "sky_auth_session_cookie",
+          "mer_pci_tokenization",
+          "mer_webhook_signing",
+          "sky_cdn_cache_incident",
+          "pk_api_tokens_scoped",
+          "mer_eu_data_residency",
+          "ops_secrets_external",
+          "mer_money_integer_cents",
+          "sky_no_secrets_client",
+          "namespace_isolation"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "sky_use_effect_fetch",
+          "sky_react_query"
+        ],
+        "ndcg": 1.0,
+        "query": "is fetching data inside useEffect acceptable?",
+        "ranked_keys": [
+          "sky_use_effect_fetch",
+          "sky_react_query",
+          "pk_cache_immutable",
+          "namespace_isolation",
+          "namespace_isolation_dup",
+          "sky_cdn_cache_incident",
+          "sky_app_router",
+          "sky_zod_boundaries",
+          "read_pool",
+          "sky_swr_stale_token"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_vitest",
+          "sky_jest_decision"
+        ],
+        "ndcg": 0.3935773014954859,
+        "query": "which test runner does the dashboard use now?",
+        "ranked_keys": [
+          "sky_cdn_cache_incident",
+          "sky_lcp_slo",
+          "sky_vitest",
+          "ops_blue_green",
+          "sky_graphql_rejected",
+          "ops_synthetic_checks",
+          "pk_perf_regression_check",
+          "sky_auth_session_cookie",
+          "sky_jest_decision",
+          "ops_grafana_slo"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 0.3333333333333333
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_a11y_wcag",
+          "sky_session_a11y_audit"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "what accessibility standard do new components have to meet?",
+        "ranked_keys": [
+          "sky_a11y_wcag",
+          "mer_pci_tokenization",
+          "sky_lcp_slo",
+          "namespace_isolation",
+          "sky_app_router",
+          "sky_no_secrets_client",
+          "ops_terraform_atlantis",
+          "ops_image_signing",
+          "mer_api_backwards_compat",
+          "sky_bundle_budget"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_feature_flag_client"
+        ],
+        "ndcg": 1.0,
+        "query": "why is there no client side feature flag sdk?",
+        "ranked_keys": [
+          "sky_feature_flag_client",
+          "mer_feature_flags_unleash",
+          "sky_no_secrets_client",
+          "sky_openapi_codegen",
+          "mer_api_backwards_compat",
+          "mer_webhook_signing",
+          "mer_outbox_pattern",
+          "sky_redux_decision",
+          "pk_s3_content_addressed",
+          "sky_eslint_boundaries"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_graphql_rejected"
+        ],
+        "ndcg": 1.0,
+        "query": "did the team ever evaluate graphql?",
+        "ranked_keys": [
+          "sky_graphql_rejected",
+          "mer_sqlx_over_diesel",
+          "ops_db_connection_limits",
+          "linear_ranking",
+          "sky_openapi_codegen",
+          "sky_react_query",
+          "sky_a11y_wcag",
+          "sky_timezone_chart",
+          "sky_lcp_slo",
+          "sky_zod_boundaries_dup"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "sky_no_secrets_client"
+        ],
+        "ndcg": 1.0,
+        "query": "are NEXT_PUBLIC environment variables safe for secrets?",
+        "ranked_keys": [
+          "sky_no_secrets_client",
+          "ops_secrets_external_dup",
+          "ops_secrets_external",
+          "namespace_isolation",
+          "mer_pci_tokenization",
+          "pk_cache_poisoning_incident",
+          "pk_cache_immutable",
+          "namespace_isolation_dup",
+          "ops_image_signing",
+          "ops_runner_pool"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_playwright_flake"
+        ],
+        "ndcg": 1.0,
+        "query": "how did we stop playwright tests from flaking on animations?",
+        "ranked_keys": [
+          "sky_playwright_flake",
+          "sky_e2e_test_data",
+          "sky_a11y_wcag",
+          "sky_vitest",
+          "sky_csp_inline",
+          "pk_no_creds_in_artifacts",
+          "sky_cdn_cache_incident",
+          "mer_testcontainers",
+          "pk_cache_immutable",
+          "read_pool"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_csp_inline",
+          "sky_session_csp"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "how does the content security policy handle inline scripts?",
+        "ranked_keys": [
+          "sky_csp_inline",
+          "namespace_isolation",
+          "rb_hooks_redaction",
+          "pk_no_creds_in_artifacts",
+          "sky_cdn_cache_incident",
+          "sky_no_secrets_client",
+          "sky_auth_session_cookie",
+          "ops_image_signing",
+          "ops_secrets_external_dup",
+          "mer_no_unwrap_prod"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "sky_table_virtualization",
+          "sky_session_billing_table"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "when does a table need virtualization?",
+        "ranked_keys": [
+          "sky_table_virtualization",
+          "single_writer",
+          "ops_backup_restore_test",
+          "readme_quickstart",
+          "namespace_isolation",
+          "mer_event_sourced_ledger",
+          "mer_serializable_retry",
+          "ops_eks_clusters",
+          "migration_additive",
+          "mer_sqlx_over_diesel"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "sky_safari_date_parse"
+        ],
+        "ndcg": 1.0,
+        "query": "why did date parsing fail only in safari?",
+        "ranked_keys": [
+          "sky_safari_date_parse",
+          "sky_hydration_mismatch",
+          "mer_money_numeric_reversal",
+          "mer_money_integer_cents",
+          "mer_double_entry",
+          "sky_cdn_cache_incident",
+          "mer_api_backwards_compat",
+          "sky_zod_boundaries",
+          "mer_settlement_cutoff_change",
+          "sky_auth_session_cookie"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "pk_s3_content_addressed",
+          "pk_presigned_urls"
+        ],
+        "ndcg": 0.9324441894571632,
+        "query": "how are build artifacts stored in the cache service?",
+        "ranked_keys": [
+          "pk_s3_content_addressed",
+          "pk_immutable_dup",
+          "pk_cache_immutable",
+          "pk_presigned_urls",
+          "pk_no_creds_in_artifacts",
+          "mer_event_sourced_ledger",
+          "sky_cdn_cache_incident",
+          "sky_react_query",
+          "pk_retention_90d",
+          "ops_blue_green"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "pk_cache_immutable",
+          "pk_immutable_dup"
+        ],
+        "ndcg": 1.0,
+        "query": "can an existing cache entry ever be overwritten?",
+        "ranked_keys": [
+          "pk_immutable_dup",
+          "pk_cache_immutable",
+          "mer_ledger_immutable",
+          "sky_cdn_cache_incident",
+          "pk_cache_poisoning_incident",
+          "mer_event_sourced_ledger",
+          "mer_pci_no_pan_logs",
+          "mer_idempotency_keys",
+          "sky_react_query",
+          "single_writer"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "pk_cache_poisoning_incident",
+          "pk_cache_immutable"
+        ],
+        "ndcg": 1.0,
+        "query": "what happened when a pull request poisoned the build cache?",
+        "ranked_keys": [
+          "pk_cache_poisoning_incident",
+          "pk_cache_immutable",
+          "sky_cdn_cache_incident",
+          "pk_bazel_rejected",
+          "pk_immutable_dup",
+          "pk_disk_full_incident",
+          "sky_memory_leak_ws",
+          "sky_csp_inline",
+          "sky_swr_stale_token",
+          "ops_runner_pool"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_zip_timestamps"
+        ],
+        "ndcg": 1.0,
+        "query": "how do we make zip archives reproducible across CI runs?",
+        "ranked_keys": [
+          "pk_zip_timestamps",
+          "sky_bundle_budget",
+          "pk_cache_immutable",
+          "pk_s3_content_addressed",
+          "pk_cache_poisoning_incident",
+          "pk_perf_regression_check",
+          "pk_immutable_dup",
+          "pk_presigned_urls",
+          "pk_resumable_downloads",
+          "pk_release_tags"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_uv_package_manager",
+          "pk_session_uv_migration"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "which python package manager replaced pip?",
+        "ranked_keys": [
+          "pk_uv_package_manager",
+          "pk_pin_all_transitives",
+          "pk_fastapi_service",
+          "pk_mypy_strict",
+          "pk_python_312",
+          "ops_secrets_external",
+          "pk_session_uv_migration",
+          "mer_api_backwards_compat",
+          "pk_pin_direct_only",
+          "sky_pnpm_phantom"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_tz_naive_datetime",
+          "pk_retention_90d"
+        ],
+        "ndcg": 0.8339912323981488,
+        "query": "why did the retention job delete artifacts that were still fresh?",
+        "ranked_keys": [
+          "pk_retention_90d",
+          "pk_tz_naive_datetime",
+          "pk_no_creds_in_artifacts",
+          "pk_s3_content_addressed",
+          "mer_idempotency_keys",
+          "ops_backup_restore_test",
+          "pk_immutable_dup",
+          "pk_cache_immutable",
+          "mer_idempotency_ttl_gotcha",
+          "mer_db_partitioning"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_pin_direct_only",
+          "pk_pin_all_transitives"
+        ],
+        "ndcg": 0.8339912323981488,
+        "query": "do we still pin transitive python dependencies?",
+        "ranked_keys": [
+          "pk_pin_all_transitives",
+          "pk_pin_direct_only",
+          "pk_uv_package_manager",
+          "pk_mypy_strict",
+          "sky_no_secrets_client",
+          "pk_python_312",
+          "sky_pnpm_phantom",
+          "pk_fastapi_service",
+          "pk_pytest_fixtures",
+          "pk_asyncio_subprocess"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_cli_exit_codes"
+        ],
+        "ndcg": 1.0,
+        "query": "what do the packrat CLI exit codes mean?",
+        "ranked_keys": [
+          "pk_cli_exit_codes",
+          "pk_cache_immutable",
+          "sky_no_secrets_client",
+          "pk_cache_poisoning_incident",
+          "pk_api_tokens_scoped",
+          "pk_release_tags",
+          "ops_secrets_external",
+          "pk_s3_content_addressed",
+          "pk_sbom_generation",
+          "ops_image_signing"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_release_tags"
+        ],
+        "ndcg": 1.0,
+        "query": "how are releases published to pypi?",
+        "ranked_keys": [
+          "pk_release_tags",
+          "sky_no_secrets_client",
+          "ops_secrets_external",
+          "pk_pin_direct_only",
+          "pk_fastapi_service",
+          "mer_outbox_pattern",
+          "mer_load_test_gate",
+          "ops_secrets_external_dup",
+          "pk_zip_timestamps",
+          "pk_uv_package_manager"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_concurrent_uploads"
+        ],
+        "ndcg": 1.0,
+        "query": "why did concurrent uploads run out of memory?",
+        "ranked_keys": [
+          "pk_concurrent_uploads",
+          "single_writer",
+          "read_pool",
+          "mer_double_charge_incident",
+          "sky_cdn_cache_incident",
+          "pk_no_creds_in_artifacts",
+          "readme_quickstart",
+          "sky_next_image_oom",
+          "mer_idempotency_keys",
+          "mer_serializable_retry"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "pk_multipart_etag"
+        ],
+        "ndcg": 1.0,
+        "query": "can we use s3 etags to verify artifact integrity?",
+        "ranked_keys": [
+          "pk_multipart_etag",
+          "pk_s3_content_addressed",
+          "pk_presigned_urls",
+          "pk_no_creds_in_artifacts",
+          "mer_ledger_immutable",
+          "ops_terraform_atlantis",
+          "rb_hooks_redaction",
+          "pk_cache_immutable",
+          "pk_immutable_dup",
+          "migration_additive"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_canary_reversal",
+          "ops_blue_green"
+        ],
+        "ndcg": 0.8339912323981488,
+        "query": "how do deploys roll out now, blue green or canary?",
+        "ranked_keys": [
+          "ops_blue_green",
+          "ops_canary_reversal",
+          "ops_secrets_external",
+          "ops_deploy_freeze",
+          "pk_no_creds_in_artifacts",
+          "mer_kafka_rebalance_storm",
+          "ops_terraform_atlantis",
+          "pk_cache_immutable",
+          "team_friday_deploys",
+          "mer_migration_review"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "ops_secrets_external",
+          "ops_secrets_external_dup"
+        ],
+        "ndcg": 1.0,
+        "query": "where do kubernetes secrets come from?",
+        "ranked_keys": [
+          "ops_secrets_external",
+          "ops_secrets_external_dup",
+          "ops_image_signing",
+          "sky_no_secrets_client",
+          "ops_eks_clusters",
+          "mer_pci_tokenization",
+          "ops_pod_disruption",
+          "pk_no_creds_in_artifacts",
+          "pk_s3_content_addressed",
+          "namespace_isolation"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_dns_incident",
+          "ops_session_dns_debug"
+        ],
+        "ndcg": 0.7871546029909718,
+        "query": "what caused the dns outage after the database failover?",
+        "ranked_keys": [
+          "ops_dns_incident",
+          "mer_double_charge_incident",
+          "ops_db_connection_limits",
+          "namespace_isolation",
+          "mer_ledger_drift_incident",
+          "sky_cdn_cache_incident",
+          "mer_retry_budget",
+          "mer_serializable_retry",
+          "ops_pod_disruption",
+          "mer_pgbouncer_prepared"
+        ],
+        "recall_at_k": 0.5,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_image_signing"
+        ],
+        "ndcg": 1.0,
+        "query": "are unsigned container images allowed in production?",
+        "ranked_keys": [
+          "ops_image_signing",
+          "mer_pci_tokenization",
+          "pk_no_creds_in_artifacts",
+          "ops_secrets_external",
+          "pk_s3_content_addressed",
+          "pk_cache_immutable",
+          "deterministic_embed",
+          "mer_money_integer_cents",
+          "ops_secrets_external_dup",
+          "pk_zip_timestamps"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_backup_restore_test"
+        ],
+        "ndcg": 1.0,
+        "query": "how often do we test that backups actually restore?",
+        "ranked_keys": [
+          "ops_backup_restore_test",
+          "mer_idempotency_keys",
+          "pk_tz_naive_datetime",
+          "pk_zip_timestamps",
+          "recency_decay",
+          "mer_saga_orchestration",
+          "pk_retention_90d",
+          "mer_idempotency_ttl_gotcha",
+          "pk_cache_immutable",
+          "ops_log_retention"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_terraform_atlantis"
+        ],
+        "ndcg": 1.0,
+        "query": "can I run terraform apply locally against prod?",
+        "ranked_keys": [
+          "ops_terraform_atlantis",
+          "ops_waf_rules",
+          "ops_eks_clusters",
+          "sky_e2e_test_data",
+          "ops_cost_tagging",
+          "mer_eu_data_residency",
+          "ops_secrets_external_dup",
+          "ops_image_signing",
+          "sky_hydration_mismatch",
+          "ops_canary_reversal"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_deploy_freeze",
+          "team_friday_deploys"
+        ],
+        "ndcg": 1.0,
+        "query": "when are production deploys frozen?",
+        "ranked_keys": [
+          "ops_deploy_freeze",
+          "team_friday_deploys",
+          "ops_canary_reversal",
+          "mer_kafka_rebalance_storm",
+          "ops_eks_clusters",
+          "ops_blue_green",
+          "pk_cache_immutable",
+          "ops_terraform_atlantis",
+          "ops_image_signing",
+          "pk_retention_90d"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 1.0,
+        "expected_keys": [
+          "ops_pod_disruption"
+        ],
+        "ndcg": 1.0,
+        "query": "why do multi replica services need pod disruption budgets?",
+        "ranked_keys": [
+          "ops_pod_disruption",
+          "ops_eks_clusters",
+          "ops_image_signing",
+          "ops_secrets_external",
+          "mer_event_sourced_ledger",
+          "mer_idempotency_keys",
+          "readme_quickstart",
+          "ops_canary_reversal",
+          "pk_s3_content_addressed",
+          "mer_ledger_drift_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "rb_hooks_redaction"
+        ],
+        "ndcg": 1.0,
+        "query": "how does hook capture keep secrets out of stored memories?",
+        "ranked_keys": [
+          "rb_hooks_redaction",
+          "mer_pci_tokenization",
+          "ops_secrets_external",
+          "pk_cache_immutable",
+          "ops_secrets_external_dup",
+          "namespace_isolation",
+          "single_writer",
+          "mer_pci_no_pan_logs",
+          "mer_idempotency_keys",
+          "pk_cache_poisoning_incident"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      },
+      {
+        "channels": {
+          "fts": 0,
+          "graph": 0,
+          "returned": 10,
+          "vector": 10
+        },
+        "dedup_precision": 0.8,
+        "expected_keys": [
+          "rb_db_permissions"
+        ],
+        "ndcg": 1.0,
+        "query": "what permissions does the daemon set on the database file?",
+        "ranked_keys": [
+          "rb_db_permissions",
+          "single_writer",
+          "readme_quickstart",
+          "read_pool",
+          "wal_checkpoint",
+          "pk_no_creds_in_artifacts",
+          "sky_cdn_cache_incident",
+          "ops_secrets_external",
+          "writer_thread_dup",
+          "sky_no_secrets_client"
+        ],
+        "recall_at_k": 1.0,
+        "reciprocal_rank": 1.0
+      }
+    ],
+    "report": {
+      "channels": {
+        "fts_hit_share": 0.005555555555555556,
+        "fts_query_rate": 0.041666666666666664,
+        "graph_hit_share": 0.0,
+        "graph_query_rate": 0.0,
+        "vector_hit_share": 1.0,
+        "vector_query_rate": 1.0
+      },
+      "dedup_precision": 0.9305555555555551,
+      "mean_recall_at_k": 0.9212962962962963,
+      "mrr": 0.9837962962962964,
+      "ndcg": 0.9342017194866885,
+      "p50_latency_us": 5243,
+      "p99_latency_us": 8509
+    }
+  },
+  "holdout": {
+    "_comment": "Aggregates only by design: the held-out set is reserved for the W4.1 CI gate and must never be used for tuning.",
+    "report": {
+      "channels": {
+        "fts_hit_share": 0.0,
+        "fts_query_rate": 0.0,
+        "graph_hit_share": 0.0,
+        "graph_query_rate": 0.0,
+        "vector_hit_share": 1.0,
+        "vector_query_rate": 1.0
+      },
+      "dedup_precision": 0.96,
+      "mean_recall_at_k": 0.95,
+      "mrr": 0.9666666666666668,
+      "ndcg": 0.9348568092118844,
+      "p50_latency_us": 5271,
+      "p99_latency_us": 5511
+    }
+  }
+}

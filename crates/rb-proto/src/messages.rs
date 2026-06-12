@@ -121,6 +121,23 @@ fn default_confidence() -> f32 {
     1.0
 }
 
+/// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
+/// the daemon status path (`Ping` -> `Pong`). Counts are cumulative since
+/// daemon start and cheap: `recalls` is the number of recall requests served;
+/// the per-channel fields count returned results that channel contributed (a
+/// result surfaced by several channels increments each of them).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecallChannelTotals {
+    #[serde(default)]
+    pub recalls: u64,
+    #[serde(default)]
+    pub fts_hits: u64,
+    #[serde(default)]
+    pub vector_hits: u64,
+    #[serde(default)]
+    pub graph_hits: u64,
+}
+
 /// One response per request. Internally tagged on `result`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -150,6 +167,15 @@ pub enum Response {
     },
     Pong {
         contract_version: u32,
+        /// Aggregate per-channel recall hit-contribution counters since daemon
+        /// start (W1.0). Additive + `#[serde(default)]`: an old daemon omits it
+        /// (`None`) and an old client ignores it, so NO contract-version bump
+        /// is needed — the `Handshake.identity` precedent. Only the daemon's
+        /// real Ping path populates it; internal pseudo-Pongs leave it `None`.
+        /// `skip_serializing_if` keeps a `None` Pong byte-identical to the
+        /// pre-W1.0 frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recall_channels: Option<RecallChannelTotals>,
     },
     JobRan {
         scanned: u64,
@@ -381,6 +407,7 @@ mod tests {
                 results: vec![SearchResult {
                     memory: note(),
                     score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
                 }],
             },
             Response::Got {
@@ -402,6 +429,16 @@ mod tests {
             },
             Response::Pong {
                 contract_version: CONTRACT_VERSION,
+                recall_channels: None,
+            },
+            Response::Pong {
+                contract_version: CONTRACT_VERSION,
+                recall_channels: Some(RecallChannelTotals {
+                    recalls: 4,
+                    fts_hits: 9,
+                    vector_hits: 11,
+                    graph_hits: 2,
+                }),
             },
             Response::Error {
                 kind: "not_found".into(),
@@ -437,9 +474,51 @@ mod tests {
         assert_eq!(json, r#"{"result":"Updated"}"#);
         let json = serde_json::to_string(&Response::Pong {
             contract_version: 1,
+            recall_channels: None,
         })
         .unwrap();
+        // A `None` recall_channels keeps the pre-W1.0 byte shape (additive,
+        // skip-serializing field), so old clients see an unchanged frame.
         assert_eq!(json, r#"{"result":"Pong","contract_version":1}"#);
+    }
+
+    #[test]
+    fn pong_without_recall_channels_field_decodes_to_none() {
+        // Wire compat: a pre-W1.0 Pong (no recall_channels key) must decode.
+        let back: Response =
+            serde_json::from_str(r#"{"result":"Pong","contract_version":2}"#).unwrap();
+        match back {
+            Response::Pong {
+                contract_version,
+                recall_channels,
+            } => {
+                assert_eq!(contract_version, 2);
+                assert!(recall_channels.is_none());
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pong_recall_channel_totals_round_trip() {
+        let totals = RecallChannelTotals {
+            recalls: 4,
+            fts_hits: 9,
+            vector_hits: 11,
+            graph_hits: 2,
+        };
+        let json = serde_json::to_string(&Response::Pong {
+            contract_version: CONTRACT_VERSION,
+            recall_channels: Some(totals),
+        })
+        .unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::Pong {
+                recall_channels, ..
+            } => assert_eq!(recall_channels, Some(totals)),
+            other => panic!("expected Pong, got {other:?}"),
+        }
     }
 
     #[test]

@@ -275,9 +275,21 @@ impl Client {
 
     /// Round-trip ping; returns the daemon's contract version.
     pub async fn ping(&mut self) -> Result<u32> {
+        Ok(self.ping_stats().await?.0)
+    }
+
+    /// Round-trip ping; returns the daemon's contract version plus the
+    /// aggregate per-channel recall hit counters (W1.0). `None` from a daemon
+    /// predating the counters.
+    pub async fn ping_stats(
+        &mut self,
+    ) -> Result<(u32, Option<crate::messages::RecallChannelTotals>)> {
         let resp = self.request(Request::Ping).await?;
         match resp {
-            Resp::Pong { contract_version } => Ok(contract_version),
+            Resp::Pong {
+                contract_version,
+                recall_channels,
+            } => Ok((contract_version, recall_channels)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -359,6 +371,7 @@ mod tests {
         let _req: Request = read_frame(&mut framed).await.unwrap();
         let resp = Response::Pong {
             contract_version: CONTRACT_VERSION,
+            recall_channels: None,
         };
         write_frame(&mut framed, &resp).await.unwrap();
     }
@@ -374,7 +387,9 @@ mod tests {
             .unwrap();
         let resp = client.request(Request::Ping).await.unwrap();
         match resp {
-            Response::Pong { contract_version } => {
+            Response::Pong {
+                contract_version, ..
+            } => {
                 assert_eq!(contract_version, CONTRACT_VERSION);
             }
             other => panic!("expected Pong, got {other:?}"),
@@ -394,7 +409,9 @@ mod tests {
         let mut client = Client::connect(&path, Namespace::Global).await.unwrap();
         client.send_request(&Request::Ping).await.unwrap();
         match client.recv_response().await.unwrap() {
-            Response::Pong { contract_version } => {
+            Response::Pong {
+                contract_version, ..
+            } => {
                 assert_eq!(contract_version, CONTRACT_VERSION);
             }
             other => panic!("expected Pong, got {other:?}"),
@@ -528,6 +545,7 @@ mod wrapper_tests {
                     results: vec![SearchResult {
                         memory: note(),
                         score: 0.5,
+                        channels: rb_types::ChannelHits::default(),
                     }],
                 },
                 Request::Get { .. } => Response::Got {
@@ -548,9 +566,11 @@ mod wrapper_tests {
                 },
                 Request::Ping => Response::Pong {
                     contract_version: CONTRACT_VERSION,
+                    recall_channels: None,
                 },
                 Request::Subscribe => Response::Pong {
                     contract_version: CONTRACT_VERSION,
+                    recall_channels: None,
                 },
                 Request::RunJob { .. } => Response::JobRan {
                     scanned: 4,

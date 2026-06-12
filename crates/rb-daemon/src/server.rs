@@ -11,8 +11,8 @@ use rb_embed::EmbeddingProvider;
 use rb_engine::{Enricher, MemoryEngine, RememberInput};
 use rb_enrich::OpenAiCompatEnricher;
 use rb_proto::{
-    bounded_framed, read_frame, write_frame, Handshake, HandshakeAck, Request, Response,
-    CONTRACT_VERSION,
+    bounded_framed, read_frame, write_frame, Handshake, HandshakeAck, RecallChannelTotals, Request,
+    Response, CONTRACT_VERSION,
 };
 use rb_types::{Error, Result};
 use std::sync::Arc;
@@ -45,6 +45,49 @@ const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10
 /// client; overridable via `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` (see
 /// [`parse_idle_timeout`]) so the idle/reconnect e2e runs in seconds.
 const DEFAULT_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
+/// Daemon-lifetime per-channel recall hit-contribution counters (W1.0).
+///
+/// Cheap by construction: four relaxed atomic adds per served recall, no locks,
+/// no per-namespace cardinality. Shared across every connection task and
+/// snapshotted into `Response::Pong` on the status path (`Ping`). `Relaxed`
+/// ordering is sufficient — these are monotone observability counters with no
+/// cross-variable invariant.
+#[derive(Debug, Default)]
+pub struct RecallChannelCounters {
+    recalls: std::sync::atomic::AtomicU64,
+    fts_hits: std::sync::atomic::AtomicU64,
+    vector_hits: std::sync::atomic::AtomicU64,
+    graph_hits: std::sync::atomic::AtomicU64,
+}
+
+impl RecallChannelCounters {
+    /// Fold one served recall's results into the totals.
+    fn record(&self, results: &[rb_types::SearchResult]) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let (mut fts, mut vector, mut graph) = (0u64, 0u64, 0u64);
+        for r in results {
+            fts += u64::from(r.channels.fts);
+            vector += u64::from(r.channels.vector);
+            graph += u64::from(r.channels.graph);
+        }
+        self.recalls.fetch_add(1, Relaxed);
+        self.fts_hits.fetch_add(fts, Relaxed);
+        self.vector_hits.fetch_add(vector, Relaxed);
+        self.graph_hits.fetch_add(graph, Relaxed);
+    }
+
+    /// Snapshot the totals for the wire (`Pong.recall_channels`).
+    fn snapshot(&self) -> RecallChannelTotals {
+        use std::sync::atomic::Ordering::Relaxed;
+        RecallChannelTotals {
+            recalls: self.recalls.load(Relaxed),
+            fts_hits: self.fts_hits.load(Relaxed),
+            vector_hits: self.vector_hits.load(Relaxed),
+            graph_hits: self.graph_hits.load(Relaxed),
+        }
+    }
+}
 
 /// Static configuration for a daemon instance.
 #[derive(Clone, Debug)]
@@ -183,6 +226,8 @@ impl Daemon {
         let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
+        // Daemon-lifetime recall channel counters, shared by every connection.
+        let recall_counters = Arc::new(RecallChannelCounters::default());
 
         loop {
             tokio::select! {
@@ -198,6 +243,7 @@ impl Daemon {
                             let embedder = embedder.clone();
                             let enricher = enricher.clone();
                             let jobs_config = jobs_config.clone();
+                            let recall_counters = recall_counters.clone();
                             // Acquire a connection permit before spawning. If
                             // all permits are taken, drop the newly accepted
                             // stream immediately instead of queueing unbounded
@@ -219,6 +265,7 @@ impl Daemon {
                                     enricher,
                                     jobs_config,
                                     request_idle_timeout,
+                                    recall_counters,
                                 )
                                 .await
                                 {
@@ -419,6 +466,7 @@ async fn probe_live(path: &Path) -> bool {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
     store: StoreHandle,
@@ -426,6 +474,7 @@ async fn handle_connection(
     enricher: Option<Arc<dyn Enricher>>,
     jobs_config: JobsConfig,
     request_idle_timeout: std::time::Duration,
+    recall_counters: Arc<RecallChannelCounters>,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -507,7 +556,15 @@ async fn handle_connection(
             stream_changes(&mut framed, &store_for_stream, &namespace).await;
             break;
         }
-        let resp = dispatch(&engine, &job_store, &jobs_config, &provenance, req).await;
+        let resp = dispatch(
+            &engine,
+            &job_store,
+            &jobs_config,
+            &provenance,
+            &recall_counters,
+            req,
+        )
+        .await;
         write_frame(&mut framed, &resp).await?;
     }
 
@@ -575,6 +632,7 @@ async fn dispatch<P>(
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
     provenance: &rb_engine::Provenance,
+    recall_counters: &RecallChannelCounters,
     req: Request,
 ) -> Response
 where
@@ -583,6 +641,9 @@ where
     match req {
         Request::Ping => Response::Pong {
             contract_version: CONTRACT_VERSION,
+            // Status path (W1.0): surface the daemon-lifetime per-channel
+            // recall hit-contribution totals.
+            recall_channels: Some(recall_counters.snapshot()),
         },
         Request::Remember {
             content,
@@ -619,7 +680,12 @@ where
             .recall(&query, limit.min(MAX_LIMIT), memory_type, &tags)
             .await
         {
-            Ok(results) => Response::Recalled { results },
+            Ok(results) => {
+                // Per-channel hit-contribution counters (W1.0): four relaxed
+                // atomic adds per served recall — never a failure path.
+                recall_counters.record(&results);
+                Response::Recalled { results }
+            }
             Err(e) => error_to_response(e),
         },
         Request::Get { id } => match engine.get(id).await {
@@ -798,6 +864,37 @@ mod tests {
             }),
             Err(Error::InvalidNamespace(_))
         ));
+    }
+
+    #[test]
+    fn recall_channel_counters_accumulate_and_snapshot() {
+        use rb_types::{ChannelHits, MemoryNote, MemoryType, Namespace, SearchResult};
+
+        let mk = |fts: bool, vector: bool, graph: bool| SearchResult {
+            memory: MemoryNote::new(
+                Namespace::Project("rb".into()),
+                "note".into(),
+                MemoryType::Insight,
+                5,
+            ),
+            score: 0.5,
+            channels: ChannelHits { fts, vector, graph },
+        };
+
+        let counters = RecallChannelCounters::default();
+        assert_eq!(counters.snapshot(), RecallChannelTotals::default());
+
+        // Recall 1: one fts+vector hit, one vector-only hit.
+        counters.record(&[mk(true, true, false), mk(false, true, false)]);
+        // Recall 2: one graph-only hit. Empty results still count the recall.
+        counters.record(&[mk(false, false, true)]);
+        counters.record(&[]);
+
+        let snap = counters.snapshot();
+        assert_eq!(snap.recalls, 3);
+        assert_eq!(snap.fts_hits, 1);
+        assert_eq!(snap.vector_hits, 2);
+        assert_eq!(snap.graph_hits, 1);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

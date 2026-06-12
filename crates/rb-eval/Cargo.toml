@@ -15,6 +15,12 @@ publish = false
 [lints]
 workspace = true
 
+[features]
+# Pulls in rb-embed's local ONNX provider so the manual `#[ignore]` recording
+# test can capture real vectors. OFF by default: CI and the replay path never
+# compile fastembed/ort.
+record-local = ["rb-embed/local"]
+
 [dependencies]
 rb-engine = { path = "../rb-engine" }
 rb-store = { path = "../rb-store" }
@@ -25,6 +31,8 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+# Record/replay fixture keys are (model_id, input_kind, sha256(text)).
+sha2 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true }

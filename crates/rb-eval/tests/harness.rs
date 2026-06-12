@@ -208,6 +208,52 @@ async fn keyword_path_surfaces_exact_term_match() {
 }
 
 #[tokio::test]
+async fn report_carries_per_query_channel_attribution() {
+    // W1.0 per-channel hit-contribution counters in the eval report: an
+    // exact-term query must be FTS-attributed, the vector channel always
+    // surfaces candidates (KNN returns nearest neighbors regardless of
+    // semantics), and the aggregates fold the per-query flags into rates.
+    let corpus = Corpus::from_json(
+        r#"{
+            "memories": [
+                {"key": "target", "content": "the WAL checkpoint truncates the journal",
+                 "keywords": ["wal", "checkpoint"], "memory_type": "Insight", "importance": 6},
+                {"key": "noise", "content": "unrelated note about color themes",
+                 "keywords": ["color"], "memory_type": "Preference", "importance": 4}
+            ],
+            "golden_queries": [
+                {"query": "checkpoint", "expected": ["target"], "grades": [3], "k": 1}
+            ]
+        }"#,
+    )
+    .expect("corpus valid");
+
+    let run = run_corpus_detailed(&corpus).await.expect("run");
+    let d = &run.per_query[0];
+    assert!(d.channels.returned > 0, "results returned");
+    assert!(
+        d.channels.fts > 0,
+        "exact-term query must carry FTS attribution, got {:?}",
+        d.channels
+    );
+    assert!(
+        d.channels.vector > 0,
+        "vector KNN always contributes candidates, got {:?}",
+        d.channels
+    );
+    assert!(
+        run.report.channels.fts_query_rate > 0.0 && run.report.channels.vector_query_rate > 0.0,
+        "aggregate channel rates must reflect the per-query flags: {:?}",
+        run.report.channels
+    );
+    // The graded query also exercises NDCG end-to-end.
+    assert!(
+        run.report.ndcg > 0.0,
+        "graded golden must produce a non-zero ndcg"
+    );
+}
+
+#[tokio::test]
 async fn dedup_clusters_are_scored() {
     // Two near-duplicate memories form a cluster; a third is distinct. The
     // dedup metric is exercised (value asserted only to be in range — the

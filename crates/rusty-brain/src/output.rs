@@ -202,6 +202,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n.clone(),
             score: 0.91,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("0.91"), "score shown: {out}");
@@ -219,6 +220,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.8,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
@@ -231,6 +233,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.8,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -251,6 +254,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.5,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();

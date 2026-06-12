@@ -30,10 +30,46 @@ pub struct EvalReport {
     pub mrr: f64,
     /// Mean dedup precision across golden queries (top-`DEFAULT_K`).
     pub dedup_precision: f64,
+    /// Mean NDCG@k across golden queries (graded relevance; W1.0b). Ungraded
+    /// queries fall back to binary relevance. `#[serde(default)]` so reports
+    /// serialized before this field existed still parse.
+    #[serde(default)]
+    pub ndcg: f64,
+    /// Per-channel hit-contribution aggregates across golden queries (W1.0).
+    #[serde(default)]
+    pub channels: ChannelContribution,
     /// p50 recall latency in microseconds.
     pub p50_latency_us: u64,
     /// p99 recall latency in microseconds.
     pub p99_latency_us: u64,
+}
+
+/// Per-channel hit-contribution aggregates over a whole run (W1.0).
+///
+/// `*_query_rate` is the fraction of golden queries where that channel
+/// contributed at least one RETURNED result (the Phase 1 gate's "FTS channel
+/// contributes hits on >= 80% of natural-language goldens" reads
+/// `fts_query_rate`). `*_hit_share` is the channel's share of all returned
+/// results; a result surfaced by several channels counts toward each, so the
+/// shares need not sum to 1.0.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct ChannelContribution {
+    pub fts_query_rate: f64,
+    pub vector_query_rate: f64,
+    pub graph_query_rate: f64,
+    pub fts_hit_share: f64,
+    pub vector_hit_share: f64,
+    pub graph_hit_share: f64,
+}
+
+/// Per-query channel attribution: how many of the query's RETURNED results
+/// each channel contributed (multi-attributed results count for each channel).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct QueryChannelHits {
+    pub returned: usize,
+    pub fts: usize,
+    pub vector: usize,
+    pub graph: usize,
 }
 
 /// Committed baselines. The harness fails if a *quality* metric drops below its
@@ -178,8 +214,9 @@ pub async fn compare_modes_committed() -> rb_types::Result<ModeComparison> {
 
 /// Per-query detail produced by [`run_corpus_detailed`]. Lets a maintainer see
 /// exactly which fixture *keys* recall surfaced, in order — the readable diff a
-/// regression needs ("which result reordered?").
-#[derive(Debug, Clone)]
+/// regression needs ("which result reordered?"). `Serialize` so the baseline
+/// artifact can freeze per-query attribution.
+#[derive(Debug, Clone, Serialize)]
 pub struct QueryDetail {
     pub query: String,
     /// Fixture keys in recall order (ids resolved back to authored keys). Ids
@@ -190,6 +227,10 @@ pub struct QueryDetail {
     pub recall_at_k: f64,
     pub reciprocal_rank: f64,
     pub dedup_precision: f64,
+    /// NDCG@k over the query's authored grades (binary fallback when ungraded).
+    pub ndcg: f64,
+    /// Which channels contributed the returned results (W1.0 attribution).
+    pub channels: QueryChannelHits,
 }
 
 /// Full run output: the aggregate report plus per-query detail.
@@ -265,6 +306,15 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
         let recall = metrics::recall_at_k(&ranked, &expected, k);
         let rr = metrics::reciprocal_rank(&ranked, &expected);
         let dedup = metrics::dedup_precision(&ranked, &id_clusters, DEFAULT_K);
+        let ndcg = metrics::ndcg_at_k(&ranked, &expected, &q.grades, k);
+        // Per-channel attribution (W1.0): how many returned results each
+        // channel contributed, read off the engine's `SearchResult.channels`.
+        let channels = QueryChannelHits {
+            returned: results.len(),
+            fts: results.iter().filter(|r| r.channels.fts).count(),
+            vector: results.iter().filter(|r| r.channels.vector).count(),
+            graph: results.iter().filter(|r| r.channels.graph).count(),
+        };
         rr_inputs.push((ranked.clone(), expected));
 
         per_query.push(QueryDetail {
@@ -277,6 +327,8 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
             recall_at_k: recall,
             reciprocal_rank: rr,
             dedup_precision: dedup,
+            ndcg,
+            channels,
         });
     }
 
@@ -288,11 +340,15 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
             .map(|d| d.dedup_precision)
             .collect::<Vec<_>>(),
     );
+    let ndcg = mean(&per_query.iter().map(|d| d.ndcg).collect::<Vec<_>>());
+    let channels = aggregate_channels(&per_query);
 
     let report = EvalReport {
         mean_recall_at_k,
         mrr,
         dedup_precision,
+        ndcg,
+        channels,
         p50_latency_us: metrics::p50(&latencies_us),
         p99_latency_us: metrics::p99(&latencies_us),
     };
@@ -304,6 +360,33 @@ fn mean(xs: &[f64]) -> f64 {
         return 0.0;
     }
     xs.iter().sum::<f64>() / xs.len() as f64
+}
+
+/// Fold per-query channel attribution into run-level rates and shares (W1.0).
+fn aggregate_channels(per_query: &[QueryDetail]) -> ChannelContribution {
+    if per_query.is_empty() {
+        return ChannelContribution::default();
+    }
+    let queries = per_query.len() as f64;
+    let rate = |hit: fn(&QueryChannelHits) -> usize| {
+        per_query.iter().filter(|d| hit(&d.channels) > 0).count() as f64 / queries
+    };
+    let total_returned: usize = per_query.iter().map(|d| d.channels.returned).sum();
+    let share = |hit: fn(&QueryChannelHits) -> usize| {
+        if total_returned == 0 {
+            0.0
+        } else {
+            per_query.iter().map(|d| hit(&d.channels)).sum::<usize>() as f64 / total_returned as f64
+        }
+    };
+    ChannelContribution {
+        fts_query_rate: rate(|c| c.fts),
+        vector_query_rate: rate(|c| c.vector),
+        graph_query_rate: rate(|c| c.graph),
+        fts_hit_share: share(|c| c.fts),
+        vector_hit_share: share(|c| c.vector),
+        graph_hit_share: share(|c| c.graph),
+    }
 }
 
 /// Assert that a report meets the committed baselines, returning a readable

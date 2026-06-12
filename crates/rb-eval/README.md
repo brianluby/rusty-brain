@@ -37,10 +37,41 @@ choice has a precise, honest consequence:
 This mirrors the architecture spec's sqlite-vec scale honesty (§11): state the
 limit explicitly rather than overclaim.
 
-### Absolute semantic quality: the optional real-model mode
+### Absolute semantic quality: record/replay real vectors (W1.0)
 
-To spot-check *actual* semantic recall, run the optional, `#[ignore]`d real-model
-mode against a live embedding model (no CI, no live network in CI):
+CI's semantic-measurement path is **replay**: real model vectors recorded once
+(manually, with network/credentials) into a committed fixture, then served
+offline with zero network and zero keys. Each vector is keyed on
+`(model_id, input_kind, sha256(text))`; `input_kind` is `"document"` for every
+entry until W1.4 introduces query-kind embeddings (the key shape is
+future-proof for it). Replay **fails closed** on any text missing from the
+fixture, so corpus drift forces a re-recording instead of silently degrading.
+
+- `fixtures/embeddings/all-MiniLM-L6-v2.json` — the committed default fixture:
+  real all-MiniLM-L6-v2 (384-dim) vectors for every corpus document (composite
+  embedding input), golden query, and held-out query.
+- `tests/replay_model.rs` — runs in CI: replays the corpus + held-out queries
+  through the committed vectors and asserts sanity floors only (gating
+  thresholds come in W4.1).
+
+Re-record after any corpus change (single command per provider):
+
+```bash
+# local ONNX model (downloads ~90MB of weights on first use)
+cargo test -p rb-eval --features record-local --test record_embeddings \
+  -- --ignored record_local_model_fixture --nocapture
+
+# Voyage (preferred fixture source when a key is available)
+VOYAGE_API_KEY=... cargo test -p rb-eval --test record_embeddings \
+  -- --ignored record_voyage_fixture --nocapture
+```
+
+After recording a different model's fixture, point
+`rb_eval::replay::COMMITTED_FIXTURE_PATH` (and the `include_str!` in
+`ReplayProvider::committed`) at it and re-capture the baseline artifact.
+
+To spot-check semantic recall against the LIVE API instead, the older
+`#[ignore]`d real-model mode remains:
 
 ```bash
 VOYAGE_API_KEY=... cargo test -p rb-eval --test real_model -- --ignored --nocapture
@@ -48,6 +79,25 @@ VOYAGE_API_KEY=... cargo test -p rb-eval --test real_model -- --ignored --nocapt
 
 It runs the same fixtures through `VoyageProvider`, prints semantic metrics for a
 human to judge, and makes no assertion against the deterministic baselines.
+
+### The pre-Phase-1 baseline artifact
+
+`docs/eval/2026-06-12-pre-phase1-baseline.json` freezes the pre-Phase-1
+measurement: overall metrics (recall@k, MRR, NDCG over the authored grades,
+dedup precision) AND per-channel (FTS/vector/graph) hit-contribution stats,
+over both the golden and held-out query sets, under the committed real-vector
+replay fixture (plus the deterministic reference). It is **frozen** — later
+Phase 1 workstreams report before/after against it; never edit it. Regenerate
+under a new dated filename only if the corpus or fixture is re-recorded:
+
+```bash
+cargo run -p rb-eval --example capture_baseline > docs/eval/<date>-pre-phase1-baseline.json
+```
+
+Notable starting line it records: the FTS channel contributes hits on only
+~4% of natural-language goldens (`channels.fts_query_rate`) and the graph
+channel on 0% — the headroom W1.2 (FTS tokenization) and W1.5 (real graph
+hops) exist to close (Phase 1 gate: FTS ≥ 80%).
 
 The `composite_embedding_semantic_recall` case in `tests/real_model.rs` is the
 P5 Feature A check: the engine embeds the composite document representation
@@ -73,7 +123,7 @@ semantic gain.
   restatements (the dedup clusters) and six contradiction pairs (decision
   reversals). Golden queries are natural-language developer questions with
   **relevance grades** (`grades` aligns with `expected`; 3 = primary, 2 =
-  relevant, 1 = marginal — consumed by graded metrics later, W1.0b). The README
+  relevant, 1 = marginal — consumed by `ndcg_at_k`, W1.0b). The README
   quickstart query (`how is writing serialized?`) is committed verbatim with
   its verbatim target memory (`readme_quickstart`).
 - `fixtures/holdout_queries.json` — the **held-out** graded query set (20
@@ -86,7 +136,11 @@ semantic gain.
   (unknown memory type, out-of-range importance/confidence, duplicate keys,
   queries/clusters referencing unknown keys).
 - `metrics.rs` — pure, unit-tested functions: `recall_at_k`, `mrr`,
-  `dedup_precision`, and latency percentiles (`p50`/`p99`).
+  `dedup_precision`, `ndcg_at_k` (graded relevance, W1.0b), and latency
+  percentiles (`p50`/`p99`).
+- `replay.rs` — record/replay of real embedding vectors as committed fixtures
+  (see above); `RecordingProvider` wraps a real provider, `ReplayProvider`
+  serves the committed vectors offline and fails closed on misses.
 - `backend.rs` — a `MemoryBackend` over an in-memory `SqliteStore`, mirroring the
   daemon's namespace-scoping/active-only semantics, so the real FTS + sqlite-vec
   + graph paths run (not a mock map).

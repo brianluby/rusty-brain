@@ -249,6 +249,7 @@ mod tests {
                     results: vec![SearchResult {
                         memory: note(),
                         score: 0.9,
+                        channels: rb_types::ChannelHits::default(),
                     }],
                 },
                 Request::Get { .. } => Response::Got {
@@ -279,9 +280,11 @@ mod tests {
                 },
                 Request::Ping => Response::Pong {
                     contract_version: 1,
+                    recall_channels: None,
                 },
                 Request::Subscribe => Response::Pong {
                     contract_version: 1,
+                    recall_channels: None,
                 },
                 Request::RunJob { .. } => Response::JobRan {
                     scanned: 0,

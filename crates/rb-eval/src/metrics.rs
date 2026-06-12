@@ -97,6 +97,62 @@ pub fn dedup_precision(ranked: &[String], clusters: &[Vec<String>], k: usize) ->
     (n - redundant) as f64 / n as f64
 }
 
+/// Normalized Discounted Cumulative Gain at `k` over GRADED relevance (W1.0b —
+/// the consumer of the corpus's authored `grades`).
+///
+/// `expected` and `grades` are aligned index-for-index (grade `1..=3`, larger =
+/// more relevant); an empty `grades` treats every expected id as grade `1`
+/// (binary relevance, the legacy/hand-built-corpus case). Gain uses the
+/// standard exponential form `(2^grade - 1)`, discounted by `log2(position+1)`
+/// (1-based position). Normalized by the ideal DCG over the same grade
+/// multiset, so the result is in `[0.0, 1.0]`. An empty `expected` is `1.0`
+/// (nothing to rank); `k == 0` is `0.0`.
+pub fn ndcg_at_k(ranked: &[String], expected: &[String], grades: &[u8], k: usize) -> f64 {
+    if expected.is_empty() {
+        return 1.0;
+    }
+    if k == 0 {
+        return 0.0;
+    }
+    let grade_of = |id: &String| -> Option<u8> {
+        expected.iter().position(|e| e == id).map(|i| {
+            if grades.is_empty() {
+                1
+            } else {
+                grades.get(i).copied().unwrap_or(1)
+            }
+        })
+    };
+    let gain = |grade: u8| (2f64.powi(i32::from(grade))) - 1.0;
+
+    let dcg: f64 = ranked
+        .iter()
+        .take(k)
+        .enumerate()
+        .filter_map(|(idx, id)| grade_of(id).map(|g| gain(g) / ((idx as f64) + 2.0).log2()))
+        .sum();
+
+    // Ideal ordering: the same grade multiset sorted descending.
+    let mut ideal_grades: Vec<u8> = if grades.is_empty() {
+        vec![1; expected.len()]
+    } else {
+        grades.to_vec()
+    };
+    ideal_grades.sort_unstable_by(|a, b| b.cmp(a));
+    let idcg: f64 = ideal_grades
+        .iter()
+        .take(k)
+        .enumerate()
+        .map(|(idx, g)| gain(*g) / ((idx as f64) + 2.0).log2())
+        .sum();
+
+    if idcg <= 0.0 {
+        0.0
+    } else {
+        (dcg / idcg).clamp(0.0, 1.0)
+    }
+}
+
 /// Latency percentile (`p` in `[0.0, 100.0]`) over `samples` in microseconds.
 ///
 /// Uses the nearest-rank method on a sorted copy: deterministic, no
@@ -132,6 +188,62 @@ mod tests {
 
     fn ids(xs: &[&str]) -> Vec<String> {
         xs.iter().map(|s| s.to_string()).collect()
+    }
+
+    // ---- ndcg_at_k -----------------------------------------------------------
+
+    #[test]
+    fn ndcg_perfect_order_is_one() {
+        // Ranked exactly by grade desc -> DCG == IDCG.
+        let ranked = ids(&["primary", "secondary", "marginal"]);
+        let expected = ids(&["primary", "secondary", "marginal"]);
+        let grades = vec![3u8, 2, 1];
+        assert!((ndcg_at_k(&ranked, &expected, &grades, 5) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ndcg_penalizes_inverted_grade_order() {
+        // The marginal doc ranked first and the primary last must score < 1.
+        let ranked = ids(&["marginal", "secondary", "primary"]);
+        let expected = ids(&["primary", "secondary", "marginal"]);
+        let grades = vec![3u8, 2, 1];
+        let v = ndcg_at_k(&ranked, &expected, &grades, 5);
+        assert!(v < 1.0 - 1e-9, "inverted order must lose ndcg, got {v}");
+        assert!(v > 0.0, "all docs still present, ndcg stays > 0, got {v}");
+    }
+
+    #[test]
+    fn ndcg_zero_when_nothing_relevant_returned() {
+        let ranked = ids(&["x", "y"]);
+        let expected = ids(&["a"]);
+        let grades = vec![3u8];
+        assert!((ndcg_at_k(&ranked, &expected, &grades, 5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ndcg_empty_grades_falls_back_to_binary_relevance() {
+        // Ungraded queries treat every expected id as grade 1; a perfect
+        // ranking still scores 1.0.
+        let ranked = ids(&["a", "b"]);
+        let expected = ids(&["a", "b"]);
+        assert!((ndcg_at_k(&ranked, &expected, &[], 5) - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ndcg_edge_cases_match_recall_conventions() {
+        // Empty expected: vacuously perfect; k == 0: nothing measurable.
+        assert!((ndcg_at_k(&ids(&["a"]), &[], &[], 5) - 1.0).abs() < 1e-9);
+        assert!((ndcg_at_k(&ids(&["a"]), &ids(&["a"]), &[3], 0)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn ndcg_is_cut_off_at_k() {
+        // The primary answer below the k cutoff contributes nothing.
+        let ranked = ids(&["x", "y", "primary"]);
+        let expected = ids(&["primary"]);
+        let grades = vec![3u8];
+        assert!((ndcg_at_k(&ranked, &expected, &grades, 2)).abs() < 1e-9);
+        assert!(ndcg_at_k(&ranked, &expected, &grades, 3) > 0.0);
     }
 
     // ---- recall_at_k ---------------------------------------------------------

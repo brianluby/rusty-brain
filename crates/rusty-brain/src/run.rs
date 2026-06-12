@@ -171,11 +171,23 @@ async fn run_client(
             }
         }
         Command::Status => {
-            let version = client.ping().await.context("status/ping failed")?;
+            let (version, channels) = client.ping_stats().await.context("status/ping failed")?;
             if json {
-                println!("{{\"contract_version\":{version},\"ok\":true}}");
+                match channels {
+                    Some(c) => println!(
+                        "{{\"contract_version\":{version},\"ok\":true,\"recall_channels\":{{\"recalls\":{},\"fts_hits\":{},\"vector_hits\":{},\"graph_hits\":{}}}}}",
+                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+                    ),
+                    None => println!("{{\"contract_version\":{version},\"ok\":true}}"),
+                }
             } else {
-                println!("ok (contract v{version})");
+                match channels {
+                    Some(c) => println!(
+                        "ok (contract v{version}) recalls={} fts_hits={} vector_hits={} graph_hits={}",
+                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+                    ),
+                    None => println!("ok (contract v{version})"),
+                }
             }
         }
         Command::Evolve { job } => {

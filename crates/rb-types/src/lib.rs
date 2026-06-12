@@ -26,5 +26,5 @@ pub use memory::MemoryNote;
 pub use memory_id::MemoryId;
 pub use memory_type::MemoryType;
 pub use namespace::Namespace;
-pub use query::{MemoryUpdates, SearchQuery, SearchResult};
+pub use query::{ChannelHits, MemoryUpdates, SearchQuery, SearchResult};
 pub use validate::validate_importance;

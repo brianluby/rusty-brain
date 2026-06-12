@@ -165,9 +165,11 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
             },
             Request::Ping => Response::Pong {
                 contract_version: CONTRACT_VERSION,
+                recall_channels: None,
             },
             _ => Response::Pong {
                 contract_version: CONTRACT_VERSION,
+                recall_channels: None,
             },
         };
         if write_frame(&mut framed, &resp).await.is_err() {

@@ -371,6 +371,23 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         let signals =
             rb_search::build_signals(&filtered_keyword, &filtered_vector, &filtered_graph, &meta);
+        // Per-channel hit attribution (W1.0): which channels surfaced each
+        // candidate, read off the merged signals BEFORE ranking consumes them.
+        // A `Some` signal field means that channel's candidate set contained
+        // the id, so the flags record contribution, not rank.
+        let channel_map: HashMap<MemoryId, rb_types::ChannelHits> = signals
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    rb_types::ChannelHits {
+                        fts: s.keyword_rank.is_some(),
+                        vector: s.vector_distance.is_some(),
+                        graph: s.graph_hops.is_some(),
+                    },
+                )
+            })
+            .collect();
         // Dispatch on the configured fusion mode. `Linear` is the default and
         // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
         // hybrid (spec §7).
@@ -389,6 +406,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
+                channels: channel_map.get(&id).copied().unwrap_or_default(),
             });
             if results.len() == limit {
                 break;
@@ -1079,6 +1097,71 @@ mod tests {
         // scores are finite and sorted descending.
         assert!(results.iter().all(|r| r.score.is_finite()));
         assert!(results[0].score >= results[1].score);
+    }
+
+    #[tokio::test]
+    async fn recall_attributes_each_result_to_its_contributing_channels() {
+        // W1.0 per-channel hit attribution: pin each candidate to exactly one
+        // channel via the mock's overrides, then assert the returned flags.
+        let eng = engine();
+        let kw = seed(&eng, "keyword-only candidate", MemoryType::Insight, 5, &[]).await;
+        let vec_only = seed(&eng, "vector-only candidate", MemoryType::Insight, 5, &[]).await;
+        let graph_only = seed(&eng, "graph-only candidate", MemoryType::Insight, 5, &[]).await;
+
+        // fts surfaces only `kw`; vector surfaces only `vec_only`; the 1-hop
+        // graph expansion of the top keyword hit surfaces only `graph_only`.
+        eng.backend().set_keyword_results(vec![kw.clone()]);
+        eng.backend()
+            .set_vector_results(vec![(vec_only.clone(), 0.1)]);
+        eng.backend()
+            .set_graph_neighbors(kw.clone(), vec![graph_only.clone()]);
+
+        let results = eng.recall("candidate", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 3);
+        let channels_of = |id: &rb_types::MemoryId| {
+            results
+                .iter()
+                .find(|r| &r.memory.id == id)
+                .map(|r| r.channels)
+                .unwrap()
+        };
+
+        let kw_channels = channels_of(&kw);
+        assert!(kw_channels.fts, "keyword hit must be fts-attributed");
+        assert!(!kw_channels.vector);
+        // The graph walk is seeded at `kw` and the mock returns only its
+        // neighbors, so `kw` itself is not graph-attributed here.
+        assert!(!kw_channels.graph);
+
+        let vec_channels = channels_of(&vec_only);
+        assert!(vec_channels.vector, "vector hit must be vector-attributed");
+        assert!(!vec_channels.fts && !vec_channels.graph);
+
+        let graph_channels = channels_of(&graph_only);
+        assert!(
+            graph_channels.graph,
+            "graph-expanded hit must be graph-attributed"
+        );
+        assert!(!graph_channels.fts && !graph_channels.vector);
+    }
+
+    #[tokio::test]
+    async fn recall_attributes_multi_channel_hits_to_every_contributing_channel() {
+        // A candidate surfaced by several channels carries every flag —
+        // contribution, not exclusivity.
+        let eng = engine();
+        let id = seed(&eng, "everywhere candidate", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![id.clone()]);
+        eng.backend().set_vector_results(vec![(id.clone(), 0.0)]);
+        // Graph expansion seeds at the top keyword hit (`id`) and the mock
+        // returns its neighbor list, which includes the seed here.
+        eng.backend()
+            .set_graph_neighbors(id.clone(), vec![id.clone()]);
+
+        let results = eng.recall("everywhere", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let channels = results[0].channels;
+        assert!(channels.fts && channels.vector && channels.graph);
     }
 
     #[tokio::test]

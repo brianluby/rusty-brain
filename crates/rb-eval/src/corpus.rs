@@ -51,8 +51,8 @@ pub struct GoldenQuery {
     /// `3` = primary answer, `2` = substantially relevant, `1` = marginally
     /// relevant. Empty means ungraded (legacy / hand-built test corpora); when
     /// present there must be exactly one grade per expected key, each in
-    /// `1..=3`. Grades are authored *content* — the current runner's binary
-    /// recall@k / MRR ignore them; graded metrics consume them later (W1.0b).
+    /// `1..=3`. Consumed by `metrics::ndcg_at_k` (W1.0b); binary recall@k /
+    /// MRR ignore them.
     #[serde(default)]
     pub grades: Vec<u8>,
     /// Optional `k` for this query's recall (defaults applied by the runner).

@@ -197,7 +197,9 @@ pub fn response_to_content(resp: Response) -> Value {
             important,
             total,
         } => json!({ "recent": recent, "important": important, "total": total }),
-        Response::Pong { contract_version } => json!({ "contract_version": contract_version }),
+        Response::Pong {
+            contract_version, ..
+        } => json!({ "contract_version": contract_version }),
         Response::JobRan {
             scanned,
             changed,
@@ -541,6 +543,7 @@ mod tests {
             results: vec![SearchResult {
                 memory: note(),
                 score: 0.5,
+                channels: rb_types::ChannelHits::default(),
             }],
         });
         assert!(recalled["results"].is_array());
@@ -582,6 +585,7 @@ mod tests {
             results: vec![SearchResult {
                 memory: contested,
                 score: 0.9,
+                channels: rb_types::ChannelHits::default(),
             }],
         });
         assert_eq!(recalled["results"][0]["memory"]["contested"], true);
