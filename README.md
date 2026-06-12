@@ -123,6 +123,24 @@ ANN vector index for larger corpora. See [Roadmap](#roadmap).
 
 ## Quickstart
 
+### Install
+
+Tagged releases ship prebuilt, checksummed tarballs for macOS (Apple Silicon and
+Intel) and Linux x86_64 on the
+[releases page](https://github.com/brianluby/rusty-brain/releases). Each tarball
+contains the three binaries (`rusty-brain`, `rusty-brain-hooks`,
+`rusty-brain-install`); verify it before unpacking:
+
+```bash
+# download the tarball for your platform plus SHA256SUMS from the release, then:
+shasum -a 256 --check --ignore-missing SHA256SUMS      # sha256sum on Linux
+gh attestation verify rusty-brain-*.tar.gz --repo brianluby/rusty-brain  # optional: build provenance
+tar -xzf rusty-brain-*.tar.gz
+# move the binaries somewhere on your PATH
+```
+
+Or build from source:
+
 ### Prerequisites
 
 - Rust **stable** (pinned via `rust-toolchain.toml`). SQLite is bundled (no system
