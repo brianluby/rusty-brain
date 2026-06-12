@@ -254,6 +254,16 @@ impl Daemon {
 /// tightened to 0600 by rb-store at open, so the file stays private either way.
 fn prepare_db_dir(dir: &Path) -> Result<()> {
     if dir.exists() {
+        // Mirror prepare_socket_dir: a non-directory here would otherwise
+        // surface later as an opaque SQLite open failure.
+        let metadata = fs::metadata(dir)
+            .map_err(|e| Error::Io(format!("stat db dir {}: {e}", dir.display())))?;
+        if !metadata.is_dir() {
+            return Err(Error::Io(format!(
+                "db parent {} is not a directory",
+                dir.display()
+            )));
+        }
         return Ok(());
     }
     fs::create_dir_all(dir)
@@ -711,6 +721,18 @@ mod tests {
         prepare_db_dir(&existing).unwrap();
         let mode = fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "daemon must not chmod caller-owned db dirs");
+    }
+
+    #[test]
+    fn prepare_db_dir_rejects_a_non_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, b"x").unwrap();
+        let err = prepare_db_dir(&file).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {err}"
+        );
     }
 
     #[test]

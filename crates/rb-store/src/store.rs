@@ -1194,8 +1194,6 @@ impl Store for SqliteStore {
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
 
-            // One oplog row per mutation: links carried on the note ride along
-            // with this single `insert` op (they are part of the same write).
             append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
 
             if let Some(emb) = embedding {
@@ -1226,6 +1224,15 @@ impl Store for SqliteStore {
                         ],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
+                // One `link` oplog row per edge, same shape as `add_link`'s:
+                // a replay consumer could not reconstruct edges from the bare
+                // `insert` row alone.
+                let details = serde_json::json!({
+                    "type": link.link_type.as_str(),
+                    "target": link.target_id.to_string(),
+                })
+                .to_string();
+                append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
             }
             Ok(())
         })();
@@ -3941,6 +3948,40 @@ mod oplog_tests {
             "cached site_id must equal the meta seed"
         );
         assert_eq!(details, "");
+    }
+
+    #[test]
+    fn insert_with_links_appends_one_link_oplog_row_per_edge() {
+        // Links carried on the note must each produce a `link` oplog row (same
+        // shape as add_link's), or a replay consumer cannot reconstruct edges.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let target = node(&store, "target");
+        let mut n = MemoryNote::new(
+            Namespace::Project("oplog".into()),
+            "linked at insert".to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        n.links.push(MemoryLink {
+            source_id: n.id.clone(),
+            target_id: target.id.clone(),
+            link_type: LinkType::Extends,
+            strength: 0.8,
+            reason: "carried on the note".into(),
+            created_at: chrono::Utc::now(),
+        });
+        store.insert_memory(&n, None).unwrap();
+
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 3, "target insert + insert + one link row");
+        assert_eq!(rows[1].0, "insert");
+        assert_eq!(rows[1].1, n.id.to_string());
+        let (op, mid, _, _, details) = &rows[2];
+        assert_eq!(op, "link");
+        assert_eq!(mid, &n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], target.id.to_string());
     }
 
     #[test]

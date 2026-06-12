@@ -1,26 +1,44 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use rb_proto::{
-    error_to_response, read_frame, response_error_to_error, write_frame, Client, Handshake,
-    HandshakeAck, Request, Response, CONTRACT_VERSION,
+    error_to_response, read_frame, response_error_to_error, write_frame, Client, ClientIdentity,
+    Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION,
 };
-use rb_types::{Error, MemoryId, Namespace};
+use rb_types::{Error, MemoryId, MemoryType, Namespace};
 
 #[test]
 fn public_surface_is_reachable_and_stable() {
     // Constants and messages. v2 = P5 Feature C (additive `contested`).
     assert_eq!(CONTRACT_VERSION, 2);
+    // W0.5 additions are public surface: the handshake identity struct and the
+    // Remember confidence field are constructed literally to lock their shape.
+    let identity = ClientIdentity {
+        user: Some("u".into()),
+        host: Some("h".into()),
+        agent: Some("claude-code".into()),
+        session_id: Some("s-1".into()),
+        source: Some("cli".into()),
+    };
     let _hs = Handshake {
         contract_version: CONTRACT_VERSION,
         namespace: Namespace::Global,
-        identity: None,
+        identity: Some(identity),
     };
     let _ack = HandshakeAck {
         contract_version: CONTRACT_VERSION,
         ok: true,
         message: None,
     };
-    let _req = Request::Ping;
+    let _req = Request::Remember {
+        content: "c".into(),
+        context: None,
+        memory_type: MemoryType::Insight,
+        importance: 5,
+        keywords: vec![],
+        tags: vec![],
+        related_files: vec![],
+        confidence: 0.7,
+    };
 
     // Error mapping helpers, round-tripping through the wire form.
     let resp = error_to_response(&Error::NotFound(MemoryId::new()));

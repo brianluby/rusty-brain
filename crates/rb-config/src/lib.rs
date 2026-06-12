@@ -46,6 +46,11 @@ pub const FORWARD_ENV: &[&str] = &[
     "RB_ACCEPT_MODEL_CHANGE",
     // Request idle timeout override; safe to forward (defaulted when unset).
     "RUSTY_BRAIN_IDLE_TIMEOUT_SECS",
+    // Provenance fallback for clients that declare no identity (W0.5):
+    // `current_user()` reads USER/LOGNAME, so an env_clear'd auto-started
+    // daemon would otherwise stamp no origin user.
+    "USER",
+    "LOGNAME",
     // Path resolution inside the child.
     "HOME",
     "PATH",
@@ -161,16 +166,23 @@ pub fn default_db_path() -> Result<PathBuf> {
 /// non-empty wins; unset, empty, or whitespace-only falls back to the default.
 /// Hooks, CLI, and daemon all resolve through this single rule so a malformed
 /// override can never make them disagree (the F03/F12/F49 divergence class).
-fn env_override(name: &str) -> Option<String> {
-    std::env::var(name)
-        .ok()
-        .filter(|value| !value.trim().is_empty())
+/// These are raw filesystem paths, so a non-UTF-8 value is honored as-is when
+/// non-empty (the trim rule only applies where "whitespace" is well-defined,
+/// i.e. valid UTF-8) — `std::env::var` would silently drop it.
+fn env_override(name: &str) -> Option<PathBuf> {
+    let raw = std::env::var_os(name)?;
+    match raw.to_str() {
+        Some(value) if value.trim().is_empty() => None,
+        // Non-UTF-8 (`to_str() == None`) is necessarily non-empty: the empty
+        // string is valid UTF-8, so it lands in the arm above.
+        _ => Some(PathBuf::from(raw)),
+    }
 }
 
 /// Resolve the socket path: `RUSTY_BRAIN_SOCKET` override, else the default.
 pub fn socket_path_from_env() -> Result<PathBuf> {
     match env_override(SOCKET_ENV) {
-        Some(p) => Ok(PathBuf::from(p)),
+        Some(p) => Ok(p),
         None => default_socket_path(),
     }
 }
@@ -178,7 +190,7 @@ pub fn socket_path_from_env() -> Result<PathBuf> {
 /// Resolve the database path: `RUSTY_BRAIN_DB` override, else the default.
 pub fn db_path_from_env() -> Result<PathBuf> {
     match env_override(DB_ENV) {
-        Some(p) => Ok(PathBuf::from(p)),
+        Some(p) => Ok(p),
         None => default_db_path(),
     }
 }
@@ -322,6 +334,18 @@ mod tests {
         assert_eq!(db_path_from_env().unwrap(), default_db_path().unwrap());
     }
 
+    // Overrides are raw filesystem paths: a non-UTF-8 value must be honored
+    // verbatim, not silently dropped (std::env::var would error on it).
+    #[cfg(unix)]
+    #[test]
+    fn non_utf8_env_override_is_honored_as_a_path() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let _lock = ENV_LOCK.lock().unwrap();
+        let raw = std::ffi::OsStr::from_bytes(b"/tmp/rb-\xff-override.db");
+        let _g = EnvGuard::set(DB_ENV, std::path::Path::new(raw));
+        assert_eq!(db_path_from_env().unwrap(), PathBuf::from(raw));
+    }
+
     #[test]
     fn xdg_data_home_is_honored_for_db() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -349,6 +373,16 @@ mod tests {
     #[test]
     fn forward_env_includes_the_idle_timeout_override() {
         assert!(FORWARD_ENV.contains(&IDLE_TIMEOUT_ENV));
+    }
+
+    // W0.5 provenance fallback: the daemon stamps `current_user()` (USER then
+    // LOGNAME) on memories from identity-less clients; an env_clear'd
+    // auto-started daemon must keep seeing those vars or the fallback is lost.
+    #[test]
+    fn forward_env_includes_the_provenance_user_fallback_vars() {
+        for var in ["USER", "LOGNAME"] {
+            assert!(FORWARD_ENV.contains(&var), "FORWARD_ENV must include {var}");
+        }
     }
 
     #[test]

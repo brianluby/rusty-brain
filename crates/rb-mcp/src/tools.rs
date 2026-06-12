@@ -105,16 +105,16 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "update",
-            description: "Apply a partial update to a memory (only provided fields change).",
+            description: "Apply a partial update to a memory (only provided fields change). \
+                          Content cannot be updated — delete and re-remember so embeddings \
+                          stay consistent.",
+            // `content` is deliberately ABSENT from the schema: the runtime
+            // rejects it, and schema-driven clients would keep generating it.
+            // Re-introduce alongside W3.1 update-as-supersede.
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Memory id (UUID)." },
-                    "content": { "type": "string",
-                                 "description": "Content updates are not supported yet — \
-                                                 delete and re-remember instead (keeps \
-                                                 embeddings consistent). Sending content \
-                                                 returns a validation error." },
                     "summary": { "type": "string" },
                     "importance": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "tags": { "type": "array", "items": { "type": "string" } },
@@ -255,24 +255,29 @@ mod tests {
     }
 
     #[test]
-    fn update_content_property_documents_the_limitation() {
-        // F55: the schema must not advertise a bare `content` property — the
-        // engine rejects content updates, so the description has to say so and
-        // point at the workaround (delete + re-remember).
+    fn update_schema_omits_content_and_description_carries_the_guidance() {
+        // F55: the schema must not advertise a `content` property at all — the
+        // engine rejects content updates, and schema-driven clients generate
+        // whatever the schema offers. The tool DESCRIPTION carries the
+        // limitation and the workaround (delete + re-remember) instead.
         let t = tool_definitions()
             .into_iter()
             .find(|t| t.name == "update")
             .unwrap();
-        let desc = t.input_schema["properties"]["content"]["description"]
-            .as_str()
-            .expect("update.content needs a description documenting the limitation");
+        let props = t.input_schema["properties"].as_object().unwrap();
         assert!(
-            desc.contains("not supported"),
-            "description must state the limitation: {desc}"
+            !props.contains_key("content"),
+            "update schema must not advertise content: {props:?}"
         );
         assert!(
-            desc.contains("delete and re-remember"),
-            "description must point at the workaround: {desc}"
+            t.description.contains("Content cannot be updated"),
+            "description must state the limitation: {}",
+            t.description
+        );
+        assert!(
+            t.description.contains("delete and re-remember"),
+            "description must point at the workaround: {}",
+            t.description
         );
     }
 

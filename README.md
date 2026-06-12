@@ -243,7 +243,7 @@ honored.
 
 | Variable | Purpose |
 |---|---|
-| `RUSTY_BRAIN_DB` | SQLite database path (default under the user cache dir). |
+| `RUSTY_BRAIN_DB` | SQLite database path (default under the user data dir: `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or `~/.local/share` on Linux). |
 | `RUSTY_BRAIN_SOCKET` | Unix socket path for the daemon. |
 | `RUSTY_BRAIN_NAMESPACE` | Skip namespace detection and use this namespace (same precedence as the global `--namespace` flag). |
 | `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` | Per-connection request idle timeout for the daemon (default 60; mainly for tests). |

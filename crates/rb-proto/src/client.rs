@@ -144,7 +144,9 @@ impl Client {
     }
 
     /// Store a new memory; returns its id. `confidence` is the trust prior in
-    /// `0.0..=1.0` (1.0 = today's full-trust default; hook captures send 0.7).
+    /// `0.0..=1.0` (1.0 = today's full-trust default; hook captures send 0.7);
+    /// a non-finite or out-of-range value is rejected client-side with
+    /// [`Error::InvalidArgument`] before anything touches the wire.
     #[allow(clippy::too_many_arguments)]
     pub async fn remember(
         &mut self,
@@ -157,6 +159,13 @@ impl Client {
         related_files: Vec<String>,
         confidence: f32,
     ) -> Result<MemoryId> {
+        // Mirrors the engine-side check so a bad value fails fast and with the
+        // same error class the daemon would round-trip back.
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(Error::InvalidArgument(format!(
+                "confidence {confidence} out of range 0.0..=1.0"
+            )));
+        }
         let resp = self
             .request(Request::Remember {
                 content,
@@ -618,6 +627,38 @@ mod wrapper_tests {
         let (rs, rc, rk) = c.reembed(Some(10)).await.unwrap();
         assert_eq!((rs, rc, rk), (6, 5, 1));
 
+        drop(c);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_invalid_confidence_before_any_io() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        // `serve` answers ANY Remember with Remembered, so an Err here can only
+        // come from the client-side validation: the frame never hit the wire.
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut c = connect(&path).await;
+        for bad in [f32::NAN, 1.5] {
+            let err = c
+                .remember(
+                    "body".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    bad,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "confidence {bad} must be InvalidArgument, got {err:?}"
+            );
+        }
         drop(c);
         server.await.unwrap();
     }

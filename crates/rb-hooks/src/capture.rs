@@ -40,8 +40,8 @@ const REDACT_RULES: &[(&str, &str)] = &[
         r"(?s)-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----.*?(?:-----END [A-Z0-9 ]*PRIVATE KEY-----|\z)",
         "[REDACTED:private-key]",
     ),
-    // AWS access key ids.
-    (r"\bAKIA[0-9A-Z]{16}\b", "[REDACTED:aws-key]"),
+    // AWS access key ids (AKIA = long-lived, ASIA = STS temporary).
+    (r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b", "[REDACTED:aws-key]"),
     // HTTP Authorization headers (any scheme: Bearer, Basic, token, ...).
     (
         r"(?i)\bauthorization\s*:\s*\S+(?:[ \t]+\S+)?",
@@ -450,6 +450,14 @@ mod tests {
     fn redact_replaces_aws_access_keys() {
         let out = redact("creds: AKIAABCDEFGHIJKLMNOP region us-east-1");
         assert!(!out.contains("AKIAABCDEFGHIJKLMNOP"), "got {out}");
+        assert!(out.contains("[REDACTED:aws-key]"));
+        assert!(out.contains("us-east-1"), "non-secret text survives");
+    }
+
+    #[test]
+    fn redact_replaces_aws_sts_temporary_keys() {
+        let out = redact("creds: ASIAABCDEFGHIJKLMNOP region us-east-1");
+        assert!(!out.contains("ASIAABCDEFGHIJKLMNOP"), "got {out}");
         assert!(out.contains("[REDACTED:aws-key]"));
         assert!(out.contains("us-east-1"), "non-secret text survives");
     }

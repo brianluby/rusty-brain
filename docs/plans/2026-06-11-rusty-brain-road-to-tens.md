@@ -124,7 +124,7 @@ Target: teamfit →9.5+, security →9.5+. Design first: **P8 spec** precedes 5a
 
 ### Phase 5a — Team substrate
 - **W5a.1** Handshake identity finalized (consumes the W0.5 field; shape pinned by spike S2 so the contract bumps once); token auth (or mTLS/SSH-tunnel per S2).
-- **W5a.2** Oplog replay API: `Pull since seq` / `Push batch`, idempotent apply over the existing UUID + tombstone + supersede primitives; per-site seq tracking.
+- **W5a.2** Oplog replay API: `Pull since seq` / `Push batch`, idempotent apply over the existing UUID + tombstone + supersede primitives; per-site seq tracking; the hub assigns its own hub-local seq on ingest and preserves the origin (site_id, seq) as explicit columns — the local seq from migration 004 is a per-site cursor, never a cross-site identity (schema lands with 5a, additive migration).
 - **W5a.3** Transport genericization: `Client<S>`, listener seam (codec/framing already stream-generic; sized at ~a day).
 - **W5a.4** Protocol evolution policy doc: additive serde-default fields never bump CONTRACT_VERSION; breaking changes bump it and the hub supports N and N−1 for one release; CI handshakes an N−1 fixture client.
 - **Gate:** two daemons on two machines exchange a promoted memory, with replay after restart; N−1 client fixture connects.

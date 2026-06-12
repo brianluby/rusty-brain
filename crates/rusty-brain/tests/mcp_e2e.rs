@@ -68,11 +68,12 @@ fn spawn_line_reader(stdout: std::process::ChildStdout) -> Receiver<Value> {
 }
 
 /// Receive response frames until one with the given `id` is found, bounded by
-/// `RESPONSE_TIMEOUT` so a deadlock cannot hang CI. Panics on timeout or stream
-/// end before the match.
-fn read_until_id(rx: &Receiver<Value>, id: i64) -> Value {
+/// `timeout` so a deadlock cannot hang CI. Panics on timeout or stream end
+/// before the match. One-shot call sites pass `RESPONSE_TIMEOUT`; loops with
+/// their own deadline pass the remaining budget instead.
+fn read_until_id(rx: &Receiver<Value>, id: i64, timeout: Duration) -> Value {
     loop {
-        match rx.recv_timeout(RESPONSE_TIMEOUT) {
+        match rx.recv_timeout(timeout) {
             Ok(value) => {
                 if value.get("id").and_then(Value::as_i64) == Some(id) {
                     return value;
@@ -80,7 +81,7 @@ fn read_until_id(rx: &Receiver<Value>, id: i64) -> Value {
                 // Otherwise a notification/frame we don't expect; ignore.
             }
             Err(RecvTimeoutError::Timeout) => {
-                panic!("timed out after {RESPONSE_TIMEOUT:?} waiting for response id {id}")
+                panic!("timed out after {timeout:?} waiting for response id {id}")
             }
             Err(RecvTimeoutError::Disconnected) => {
                 panic!("stream ended before response id {id} arrived")
@@ -89,15 +90,16 @@ fn read_until_id(rx: &Receiver<Value>, id: i64) -> Value {
     }
 }
 
-/// Issue one `poll_changes` and return the parsed payload JSON.
-fn poll_changes(stdin: &mut ChildStdin, rx: &Receiver<Value>, id: i64) -> Value {
+/// Issue one `poll_changes` and return the parsed payload JSON, waiting up to
+/// `timeout` for the response.
+fn poll_changes(stdin: &mut ChildStdin, rx: &Receiver<Value>, id: i64, timeout: Duration) -> Value {
     send(
         stdin,
         &json!({"jsonrpc":"2.0","id":id,"method":"tools/call","params":{
             "name":"poll_changes","arguments":{}
         }}),
     );
-    let resp = read_until_id(rx, id);
+    let resp = read_until_id(rx, id, timeout);
     let text = resp["result"]["content"][0]["text"]
         .as_str()
         .expect("poll_changes tool text");
@@ -118,7 +120,11 @@ fn wait_for_subscriber_status(
     while Instant::now() < end {
         let id = *next_id;
         *next_id += 1;
-        last = poll_changes(stdin, rx, id);
+        // Cap each poll's read at the caller's REMAINING budget so the whole
+        // wait honors `deadline` instead of stretching to a fresh
+        // RESPONSE_TIMEOUT on the final iteration.
+        let remaining = end.saturating_duration_since(Instant::now());
+        last = poll_changes(stdin, rx, id, remaining.min(RESPONSE_TIMEOUT));
         if last["subscriber"]["status"] == want {
             return last;
         }
@@ -161,7 +167,7 @@ fn mcp_remember_then_recall_round_trips() {
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                 "params":{"protocolVersion":"2024-11-05"}}),
     );
-    let init = read_until_id(&rx, 1);
+    let init = read_until_id(&rx, 1, RESPONSE_TIMEOUT);
     assert_eq!(init["result"]["serverInfo"]["name"], "rusty-brain");
     assert_eq!(
         init["result"]["serverInfo"]["contractVersion"],
@@ -186,7 +192,7 @@ fn mcp_remember_then_recall_round_trips() {
             }
         }}),
     );
-    let remembered = read_until_id(&rx, 2);
+    let remembered = read_until_id(&rx, 2, RESPONSE_TIMEOUT);
     assert_ne!(
         remembered["result"]["isError"],
         json!(true),
@@ -210,7 +216,7 @@ fn mcp_remember_then_recall_round_trips() {
             "arguments":{ "query":"one database transaction", "limit":10 }
         }}),
     );
-    let recalled = read_until_id(&rx, 3);
+    let recalled = read_until_id(&rx, 3, RESPONSE_TIMEOUT);
     assert_ne!(
         recalled["result"]["isError"],
         json!(true),
@@ -264,7 +270,7 @@ fn mcp_call_succeeds_after_daemon_idle_timeout() {
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                 "params":{"protocolVersion":"2024-11-05"}}),
     );
-    read_until_id(&rx, 1);
+    read_until_id(&rx, 1, RESPONSE_TIMEOUT);
 
     send(
         &mut stdin,
@@ -273,7 +279,7 @@ fn mcp_call_succeeds_after_daemon_idle_timeout() {
             "arguments":{ "content":"idle survivors reconnect", "importance":7 }
         }}),
     );
-    let remembered = read_until_id(&rx, 2);
+    let remembered = read_until_id(&rx, 2, RESPONSE_TIMEOUT);
     assert_ne!(
         remembered["result"]["isError"],
         json!(true),
@@ -291,7 +297,7 @@ fn mcp_call_succeeds_after_daemon_idle_timeout() {
             "arguments":{ "query":"idle survivors", "limit":10 }
         }}),
     );
-    let recalled = read_until_id(&rx, 3);
+    let recalled = read_until_id(&rx, 3, RESPONSE_TIMEOUT);
     assert_ne!(
         recalled["result"]["isError"],
         json!(true),
@@ -343,7 +349,7 @@ fn subscriber_recovers_after_daemon_restart_and_reports_status() {
         &json!({"jsonrpc":"2.0","id":1,"method":"initialize",
                 "params":{"protocolVersion":"2024-11-05"}}),
     );
-    read_until_id(&rx, 1);
+    read_until_id(&rx, 1, RESPONSE_TIMEOUT);
 
     // The subscriber connects in the background; wait until it reports in
     // BEFORE writing, so the change event below cannot race the subscription.
@@ -400,7 +406,7 @@ fn subscriber_recovers_after_daemon_restart_and_reports_status() {
             "arguments":{ "content":"post-restart write", "importance":6 }
         }}),
     );
-    let remembered = read_until_id(&rx, 2);
+    let remembered = read_until_id(&rx, 2, RESPONSE_TIMEOUT);
     assert_ne!(
         remembered["result"]["isError"],
         json!(true),
@@ -419,7 +425,7 @@ fn subscriber_recovers_after_daemon_restart_and_reports_status() {
     loop {
         let id = next_id;
         next_id += 1;
-        let payload = poll_changes(&mut stdin, &rx, id);
+        let payload = poll_changes(&mut stdin, &rx, id, RESPONSE_TIMEOUT);
         let found = payload["events"]
             .as_array()
             .expect("events array")

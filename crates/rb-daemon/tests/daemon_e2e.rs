@@ -101,7 +101,9 @@ async fn full_round_trip_through_client() {
             vec!["sqlite".to_string()],
             vec!["design".to_string()],
             vec!["src/store.rs".to_string()],
-            1.0,
+            // Non-default on purpose: proves confidence round-trips through
+            // wire + store instead of riding the serde default (1.0).
+            0.4,
         )
         .await
         .unwrap();
@@ -111,6 +113,11 @@ async fn full_round_trip_through_client() {
     let note = got.unwrap();
     assert_eq!(note.content, "rusty-brain uses one db and one transaction");
     assert_eq!(note.namespace, ns, "stored under the handshake namespace");
+    assert!(
+        (note.confidence - 0.4).abs() < f32::EPSILON,
+        "confidence must round-trip through wire + store, got {}",
+        note.confidence
+    );
 
     let results = client
         .recall("rusty-brain db transaction".to_string(), None, vec![], 10)

@@ -89,10 +89,19 @@ done
 # SHORT socket path (default cache-dir sockets can exceed the 104-byte macOS
 # sun_path limit under a temp HOME). The DB stays on default resolution so the
 # real path + permission code runs.
+#
+# Hermetic: unset every config-bearing var the auto-started daemon could
+# inherit — the rb_config::FORWARD_ENV allowlist (crates/rb-config/src/lib.rs)
+# minus HOME/PATH/XDG_* — plus the path/namespace overrides, BEFORE re-exporting
+# our own. A developer's VOYAGE_API_KEY or RB_* settings must not leak into the
+# fresh-machine simulation.
 export HOME="$WORKDIR/home"
 mkdir -p "$HOME"
 unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
-unset RUSTY_BRAIN_DB RUSTY_BRAIN_NAMESPACE VOYAGE_API_KEY RB_EMBED_BACKEND RB_LOCAL_MODEL
+unset VOYAGE_API_KEY RB_EMBED_BACKEND RB_LOCAL_MODEL \
+      RB_ENRICH_BASE_URL RB_ENRICH_MODEL RB_ENRICH_API_KEY \
+      RB_JOBS_CONFIG RB_ACCEPT_MODEL_CHANGE RUSTY_BRAIN_IDLE_TIMEOUT_SECS
+unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE
 export RUSTY_BRAIN_SOCKET="$WORKDIR/rb/sock"
 export PATH="$BIN_DIR:$PATH"
 cd "$HOME"
@@ -116,15 +125,19 @@ DB_COUNT="$(find "$HOME" -name memory.db | wc -l | tr -d ' ')"
 DB="$(find "$HOME" -name memory.db)"
 MODE="$(mode_of "$DB")"
 [ "$MODE" = "600" ] || { echo "db must be 0600, got $MODE ($DB)" >&2; exit 1; }
+# Grep only the siblings that exist: under `set -euo pipefail`, grep's exit 2
+# on a missing $DB-wal would fail the marker gate spuriously.
+FILES=("$DB")
 for sibling in "$DB-wal" "$DB-shm"; do
   if [ -e "$sibling" ]; then
     MODE="$(mode_of "$sibling")"
     [ "$MODE" = "600" ] || { echo "${sibling##*/} must be 0600, got $MODE" >&2; exit 1; }
+    FILES+=("$sibling")
   fi
 done
-grep -a "REDACTED:credential" "$DB" "$DB-wal" 2>/dev/null | grep -q . \
+grep -aq "REDACTED:credential" "${FILES[@]}" \
   || { echo "hook capture did not land in the DB (no redaction marker found)" >&2; exit 1; }
-if grep -a "$PLANTED" "$DB" "$DB-wal" 2>/dev/null | grep -q .; then
+if grep -aq "$PLANTED" "${FILES[@]}"; then
   echo "planted secret found in plaintext in the DB" >&2
   exit 1
 fi
