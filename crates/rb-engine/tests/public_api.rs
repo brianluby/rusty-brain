@@ -130,7 +130,13 @@ impl MemoryBackend for VecBackend {
 
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
+        // Trait contract: duplicates within one call bump once (mirrors
+        // StoreHandle::buffer_accesses and the store's SQL IN-list dedup).
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
         for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             if let Some(note) = guard.get_mut(&id) {
                 note.access_count += 1;
                 note.last_accessed_at = Some(chrono::Utc::now());
