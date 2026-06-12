@@ -86,9 +86,11 @@ async fn readme_quickstart_query_returns_its_target_memory() {
     // keyword leg — the target's authored text ("single-writer daemon") has no
     // inflection of "serialize" and porter keeps writer != write, so it is
     // keyword-invisible for its own query while its cluster siblings gained
-    // keyword signal. Tightening this to verbatim-target-in-top-5 is expected
-    // from W1.4 (query-kind embeddings) or W4.1 weight tuning; see the W1.2
-    // commit body.
+    // keyword signal. W1.4 (query-kind embeddings) landed with NO effect here:
+    // the committed fixture's model is kind-blind, so replayed query vectors
+    // are unchanged — tightening this to verbatim-target-in-top-5 now waits on
+    // a Voyage fixture (true input_type=query vectors) or W4.1 weight tuning;
+    // see the W1.2 commit body.
     const QUICKSTART_QUERY: &str = "how is writing serialized?";
     const TARGET_KEY: &str = "readme_quickstart";
 

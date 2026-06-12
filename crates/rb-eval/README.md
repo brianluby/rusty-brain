@@ -42,10 +42,14 @@ limit explicitly rather than overclaim.
 CI's semantic-measurement path is **replay**: real model vectors recorded once
 (manually, with network/credentials) into a committed fixture, then served
 offline with zero network and zero keys. Each vector is keyed on
-`(model_id, input_kind, sha256(text))`; `input_kind` is `"document"` for every
-entry until W1.4 introduces query-kind embeddings (the key shape is
-future-proof for it). Replay **fails closed** on any text missing from the
-fixture, so corpus drift forces a re-recording instead of silently degrading.
+`(model_id, input_kind, sha256(text))`; since W1.4 (query-kind embeddings),
+recordings capture document inputs as `"document"` and query strings as
+`"query"`. The committed fixture predates W1.4 and holds only `"document"`
+entries, so replay serves query-kind lookups from the same text's document
+vector with a logged warning — exact for the kind-blind all-MiniLM-L6-v2
+model, and removed by the next re-recording. Replay otherwise **fails
+closed** on any text missing from the fixture, so corpus drift forces a
+re-recording instead of silently degrading.
 
 - `fixtures/embeddings/all-MiniLM-L6-v2.json` — the committed default fixture:
   real all-MiniLM-L6-v2 (384-dim) vectors for every corpus document (composite

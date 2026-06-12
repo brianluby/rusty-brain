@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use rb_embed::EmbeddingProvider;
+use rb_embed::{EmbedKind, EmbeddingProvider};
 use rb_types::Result;
 use tokio::sync::Semaphore;
 
@@ -42,13 +42,15 @@ impl EmbeddingProvider for SharedEmbedder {
         self.inner.dim()
     }
 
-    async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+    /// Pure delegation: the kind is forwarded untouched to the wrapped
+    /// provider (only the provider knows whether it differentiates).
+    async fn embed(&self, texts: &[String], kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
         let _permit = self
             .permits
             .acquire()
             .await
             .map_err(|_| rb_types::Error::Embedding("embedder semaphore closed".to_string()))?;
-        self.inner.embed(texts).await
+        self.inner.embed(texts, kind).await
     }
 }
 
@@ -75,13 +77,57 @@ mod tests {
             2
         }
 
-        async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>> {
+        // Test-only stub: the kind is irrelevant to concurrency accounting.
+        async fn embed(&self, texts: &[String], _kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
             self.max_seen.fetch_max(active, Ordering::SeqCst);
             sleep(Duration::from_millis(50)).await;
             self.active.fetch_sub(1, Ordering::SeqCst);
             Ok(vec![vec![1.0, 0.0]; texts.len()])
         }
+    }
+
+    /// Captures the kinds passed to `embed`, in call order, through a handle
+    /// that survives the provider moving into the SharedEmbedder's Arc (W1.4).
+    struct KindCapturingProvider {
+        kinds: Arc<std::sync::Mutex<Vec<EmbedKind>>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingProvider for KindCapturingProvider {
+        fn model_id(&self) -> &str {
+            "kind-capturing"
+        }
+
+        fn dim(&self) -> usize {
+            2
+        }
+
+        async fn embed(&self, texts: &[String], kind: EmbedKind) -> Result<Vec<Vec<f32>>> {
+            self.kinds
+                .lock()
+                .map_err(|_| rb_types::Error::Embedding("kind log poisoned".to_string()))?
+                .push(kind);
+            Ok(vec![vec![0.0, 0.0]; texts.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn shared_embedder_forwards_the_embed_kind_untouched() {
+        let kinds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let shared = SharedEmbedder::new(KindCapturingProvider {
+            kinds: Arc::clone(&kinds),
+        });
+        shared
+            .embed(&["q".to_string()], EmbedKind::Query)
+            .await
+            .unwrap();
+        shared
+            .embed(&["d".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
+        let seen = kinds.lock().unwrap().clone();
+        assert_eq!(seen, vec![EmbedKind::Query, EmbedKind::Document]);
     }
 
     #[tokio::test]
@@ -91,7 +137,10 @@ mod tests {
         let shared = SharedEmbedder::new(inner);
         assert_eq!(shared.dim(), 8);
         assert_eq!(shared.model_id(), model);
-        let out = shared.embed(&["hello".to_string()]).await.unwrap();
+        let out = shared
+            .embed(&["hello".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), 8);
     }
@@ -100,8 +149,14 @@ mod tests {
     async fn cloning_shares_one_instance() {
         let shared = SharedEmbedder::new(DeterministicProvider::new(8));
         let clone = shared.clone();
-        let a = shared.embed(&["same".to_string()]).await.unwrap();
-        let b = clone.embed(&["same".to_string()]).await.unwrap();
+        let a = shared
+            .embed(&["same".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
+        let b = clone
+            .embed(&["same".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         assert_eq!(a, b);
     }
 
@@ -119,8 +174,10 @@ mod tests {
 
         let a = shared.clone();
         let b = shared.clone();
-        let first = tokio::spawn(async move { a.embed(&["a".to_string()]).await });
-        let second = tokio::spawn(async move { b.embed(&["b".to_string()]).await });
+        let first =
+            tokio::spawn(async move { a.embed(&["a".to_string()], EmbedKind::Document).await });
+        let second =
+            tokio::spawn(async move { b.embed(&["b".to_string()], EmbedKind::Document).await });
 
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();

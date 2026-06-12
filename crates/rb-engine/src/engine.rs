@@ -2,7 +2,7 @@ use crate::backend::MemoryBackend;
 use crate::enrich::{default_summary, derive_keywords};
 use crate::enricher::Enricher;
 use crate::linker::{Linker, SimilarityLinker};
-use rb_embed::EmbeddingProvider;
+use rb_embed::{EmbedKind, EmbeddingProvider};
 use rb_search::{FusionMode, RrfConfig, Weights};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 use std::sync::Arc;
@@ -227,8 +227,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         // Embed the COMPOSITE document representation (content + keywords + tags
         // + context), not raw content (spec §8). The query stays embedded raw.
+        // Write path => EmbedKind::Document (W1.4).
         let input = crate::embed_input::embedding_input(&note);
-        let mut embeddings = self.embedder.embed(&[input]).await?;
+        let mut embeddings = self.embedder.embed(&[input], EmbedKind::Document).await?;
         let embedding = embeddings.pop();
 
         let id = note.id.clone();
@@ -307,7 +308,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // Over-fetch candidates so post-filtering still has enough to fill `limit`.
         let candidate_limit = limit.saturating_mul(4).max(limit);
 
-        let mut query_emb = self.embedder.embed(&[query.to_string()]).await?;
+        // Recall path => EmbedKind::Query (W1.4): asymmetric providers (Voyage
+        // input_type) condition the query vector for retrieval.
+        let mut query_emb = self
+            .embedder
+            .embed(&[query.to_string()], EmbedKind::Query)
+            .await?;
         let embedding = query_emb.pop().unwrap_or_default();
 
         let keyword = self
@@ -539,8 +545,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         for note in candidates {
             scanned += 1;
+            // Reembed converges stored vectors => EmbedKind::Document (W1.4).
             let input = crate::embed_input::embedding_input(&note);
-            let embedding = match self.embedder.embed(&[input]).await {
+            let embedding = match self.embedder.embed(&[input], EmbedKind::Document).await {
                 Ok(mut v) => match v.pop() {
                     Some(emb) => emb,
                     None => {
@@ -833,7 +840,7 @@ mod tests {
 
         let composite = crate::embed_input::embedding_input(&note);
         let expected = DeterministicProvider::new(16)
-            .embed(&[composite])
+            .embed(&[composite], EmbedKind::Document)
             .await
             .unwrap()
             .pop()
@@ -845,7 +852,7 @@ mod tests {
 
         // And it must NOT equal the raw-content embedding (composite added signal).
         let raw = DeterministicProvider::new(16)
-            .embed(std::slice::from_ref(&note.content))
+            .embed(std::slice::from_ref(&note.content), EmbedKind::Document)
             .await
             .unwrap()
             .pop()
@@ -983,10 +990,83 @@ mod tests {
             16
         }
 
-        async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+        // Counts calls only; the kind is irrelevant to this stub.
+        async fn embed(
+            &self,
+            texts: &[String],
+            _kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![vec![0.0; 16]; texts.len()])
         }
+    }
+
+    /// Records every kind passed to `embed`, in call order, behind an `Arc`
+    /// handle so the engine can own the provider while the test reads the log.
+    struct KindLoggingProvider {
+        kinds: Arc<std::sync::Mutex<Vec<EmbedKind>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for KindLoggingProvider {
+        fn model_id(&self) -> &str {
+            "kind-logging"
+        }
+
+        fn dim(&self) -> usize {
+            16
+        }
+
+        async fn embed(
+            &self,
+            texts: &[String],
+            kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
+            self.kinds
+                .lock()
+                .map_err(|_| rb_types::Error::Embedding("kind log poisoned".to_string()))?
+                .push(kind);
+            // Distinct unit vectors keep the vector leg functional.
+            Ok(vec![vec![1.0; 16]; texts.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_embeds_as_query_and_write_paths_embed_as_document() {
+        // W1.4 kind routing: remember and reembed are write paths (Document);
+        // recall embeds the user query (Query).
+        let kinds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            KindLoggingProvider {
+                kinds: Arc::clone(&kinds),
+            },
+            Namespace::Project("rb".into()),
+        );
+
+        eng.remember(input("kind routing note", 5)).await.unwrap();
+        eng.recall("kind routing", 5, None, &[]).await.unwrap();
+
+        // A stale row forces reembed to issue one Document-kind embed.
+        let mut stale = note(
+            Namespace::Project("rb".into()),
+            "stale row for kind routing",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        stale.embedding_model = "old-model".to_string();
+        stale.embedding_input_version = "v1-content-only".to_string();
+        eng.backend().insert_note(stale);
+        let (scanned, _, _) = eng.reembed(10).await.unwrap();
+        assert_eq!(scanned, 1, "the stale row must be scanned");
+
+        let seen = kinds.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![EmbedKind::Document, EmbedKind::Query, EmbedKind::Document],
+            "remember=Document, recall=Query, reembed=Document"
+        );
     }
 
     #[tokio::test]

@@ -7,13 +7,18 @@
 //! provider serves those committed vectors with zero network and zero keys —
 //! the mode CI and later workstreams use for semantic measurement.
 //!
-//! ## Key shape (W1.4-proof)
+//! ## Key shape (W1.4)
 //!
 //! Each recorded vector is keyed on `(model_id, input_kind, sha256(text))`.
-//! `input_kind` is `"document"` or `"query"`; every value is `"document"`
-//! today because the `EmbeddingProvider` trait has no kind parameter yet —
-//! when W1.4 lands query-kind embeddings, query vectors are recorded under
-//! `"query"` without invalidating the document fixtures.
+//! `input_kind` is `"document"` or `"query"` ([`rb_embed::EmbedKind::as_str`]):
+//! recordings made after W1.4 capture each text under the kind the engine
+//! embedded it with (corpus documents as `"document"`, golden/holdout query
+//! strings as `"query"`). Fixtures recorded BEFORE W1.4 hold only
+//! `"document"` entries; for those, [`ReplayProvider`] serves a query-kind
+//! lookup from the document-kind vector with a logged warning — exact for
+//! kind-blind models (the committed all-MiniLM-L6-v2 fixture), and the
+//! deterministic fallback the plan prescribes until a Voyage fixture with
+//! true query-side vectors is recorded.
 //!
 //! ## Commands
 //!
@@ -33,14 +38,17 @@
 //!
 //! Replay (offline, what CI runs): see `tests/replay_model.rs`.
 
-use rb_embed::EmbeddingProvider;
+use rb_embed::{EmbedKind, EmbeddingProvider};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-/// The only input kind recorded today (see module docs).
+/// Fixture key component for write-side (document) vectors.
 pub const INPUT_KIND_DOCUMENT: &str = "document";
+/// Fixture key component for recall-side (query) vectors (W1.4).
+pub const INPUT_KIND_QUERY: &str = "query";
 
 /// Crate-relative path of the committed default replay fixture. Re-point this
 /// (and the `include_str!` in [`ReplayProvider::committed`]) if a Voyage
@@ -183,8 +191,12 @@ impl<P: EmbeddingProvider> EmbeddingProvider for RecordingProvider<P> {
         self.inner.dim()
     }
 
-    async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
-        let vectors = self.inner.embed(texts).await?;
+    /// Delegates to the wrapped provider with the SAME kind, and records each
+    /// vector under that kind's fixture key (`kind.as_str()`, W1.4) — so a
+    /// recording run captures query vectors as `"query"` and document vectors
+    /// as `"document"`, exactly as replay will look them up.
+    async fn embed(&self, texts: &[String], kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
+        let vectors = self.inner.embed(texts, kind).await?;
         let mut recorded = self
             .recorded
             .lock()
@@ -192,7 +204,7 @@ impl<P: EmbeddingProvider> EmbeddingProvider for RecordingProvider<P> {
         for (text, vector) in texts.iter().zip(vectors.iter()) {
             let preview: String = text.chars().take(80).collect();
             recorded.insert(
-                (INPUT_KIND_DOCUMENT.to_string(), text_sha256(text)),
+                (kind.as_str().to_string(), text_sha256(text)),
                 (preview, vector.clone()),
             );
         }
@@ -203,11 +215,19 @@ impl<P: EmbeddingProvider> EmbeddingProvider for RecordingProvider<P> {
 /// Serves committed real-model vectors with zero network and zero keys.
 ///
 /// `embed` FAILS CLOSED on any text absent from the fixture: corpus drift must
-/// force a re-recording, never silently degrade to wrong vectors.
+/// force a re-recording, never silently degrade to wrong vectors. The single
+/// sanctioned exception (W1.4): a `Query`-kind lookup missing from the fixture
+/// is served from the same text's `"document"` entry, with a logged warning
+/// and a [`ReplayProvider::query_fallbacks`] count — pre-W1.4 fixtures hold
+/// only document vectors, and for kind-blind models the fallback is exact.
 pub struct ReplayProvider {
     model_id: String,
     dim: usize,
     vectors: HashMap<FixtureKey, Vec<f32>>,
+    /// How many query-kind lookups were served via the document fallback.
+    query_fallbacks: AtomicUsize,
+    /// Ensures the fallback warning is logged once per provider, not per query.
+    fallback_warned: AtomicUsize,
 }
 
 impl ReplayProvider {
@@ -242,6 +262,8 @@ impl ReplayProvider {
             model_id: fixture.model_id.clone(),
             dim: fixture.dim,
             vectors,
+            query_fallbacks: AtomicUsize::new(0),
+            fallback_warned: AtomicUsize::new(0),
         })
     }
 
@@ -267,6 +289,12 @@ impl ReplayProvider {
     pub fn is_empty(&self) -> bool {
         self.vectors.is_empty()
     }
+
+    /// How many `Query`-kind lookups were served from `"document"` entries
+    /// (W1.4 fallback). Zero once the fixture carries true query-kind vectors.
+    pub fn query_fallbacks(&self) -> usize {
+        self.query_fallbacks.load(Ordering::Relaxed)
+    }
 }
 
 #[async_trait::async_trait]
@@ -279,20 +307,43 @@ impl EmbeddingProvider for ReplayProvider {
         self.dim
     }
 
-    async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[String], kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
         texts
             .iter()
             .map(|text| {
-                let key = (INPUT_KIND_DOCUMENT.to_string(), text_sha256(text));
-                self.vectors.get(&key).cloned().ok_or_else(|| {
-                    let preview: String = text.chars().take(80).collect();
-                    rb_types::Error::Embedding(format!(
-                        "replay miss: no recorded '{INPUT_KIND_DOCUMENT}' vector for sha256 {} \
-                         (text preview: {preview:?}). The corpus drifted from the committed \
-                         fixture — re-record it (see rb-eval/src/replay.rs module docs)",
-                        key.1
-                    ))
-                })
+                let sha = text_sha256(text);
+                let key = (kind.as_str().to_string(), sha.clone());
+                if let Some(v) = self.vectors.get(&key) {
+                    return Ok(v.clone());
+                }
+                // W1.4 fallback: a query-kind miss may be served from the
+                // document-kind entry (pre-W1.4 fixtures recorded queries as
+                // documents; for kind-blind models the vectors are identical).
+                // Document-kind misses NEVER fall back — fail closed.
+                if kind == EmbedKind::Query {
+                    let doc_key = (INPUT_KIND_DOCUMENT.to_string(), sha.clone());
+                    if let Some(v) = self.vectors.get(&doc_key) {
+                        self.query_fallbacks.fetch_add(1, Ordering::Relaxed);
+                        if self.fallback_warned.swap(1, Ordering::Relaxed) == 0 {
+                            eprintln!(
+                                "rb-eval replay WARNING: fixture for model '{}' has no \
+                                 '{INPUT_KIND_QUERY}' vectors; serving query lookups from \
+                                 '{INPUT_KIND_DOCUMENT}' entries (exact for kind-blind models; \
+                                 re-record with a query-differentiating provider to remove \
+                                 this fallback)",
+                                self.model_id
+                            );
+                        }
+                        return Ok(v.clone());
+                    }
+                }
+                let preview: String = text.chars().take(80).collect();
+                Err(rb_types::Error::Embedding(format!(
+                    "replay miss: no recorded '{}' vector for sha256 {sha} \
+                     (text preview: {preview:?}). The corpus drifted from the committed \
+                     fixture — re-record it (see rb-eval/src/replay.rs module docs)",
+                    kind.as_str()
+                )))
             })
             .collect()
     }
@@ -332,7 +383,7 @@ mod tests {
     async fn record_then_replay_serves_identical_vectors() {
         let recorder = RecordingProvider::new(DeterministicProvider::new(8));
         let texts = vec!["alpha doc".to_string(), "beta doc".to_string()];
-        let original = recorder.embed(&texts).await.unwrap();
+        let original = recorder.embed(&texts, EmbedKind::Document).await.unwrap();
 
         let fixture = recorder.fixture("test fixture").unwrap();
         assert_eq!(fixture.model_id, "deterministic");
@@ -344,42 +395,96 @@ mod tests {
             .all(|v| v.input_kind == INPUT_KIND_DOCUMENT));
 
         let replay = ReplayProvider::from_fixture(&fixture).unwrap();
-        let replayed = replay.embed(&texts).await.unwrap();
+        let replayed = replay.embed(&texts, EmbedKind::Document).await.unwrap();
         assert_eq!(original, replayed, "replay must be bit-identical");
+    }
+
+    #[tokio::test]
+    async fn query_kind_vectors_are_recorded_and_replayed_under_query() {
+        // W1.4: a recording run embeds queries with EmbedKind::Query; the
+        // fixture entry is keyed "query" and replay serves it kind-for-kind
+        // with ZERO fallbacks.
+        let recorder = RecordingProvider::new(DeterministicProvider::new(8));
+        let queries = vec!["how is writing serialized?".to_string()];
+        let original = recorder.embed(&queries, EmbedKind::Query).await.unwrap();
+
+        let fixture = recorder.fixture("t").unwrap();
+        assert_eq!(fixture.vectors.len(), 1);
+        assert_eq!(fixture.vectors[0].input_kind, INPUT_KIND_QUERY);
+
+        let replay = ReplayProvider::from_fixture(&fixture).unwrap();
+        let replayed = replay.embed(&queries, EmbedKind::Query).await.unwrap();
+        assert_eq!(original, replayed, "query replay must be bit-identical");
+        assert_eq!(
+            replay.query_fallbacks(),
+            0,
+            "a true query-kind entry must not count as a fallback"
+        );
+    }
+
+    #[tokio::test]
+    async fn query_lookup_falls_back_to_document_vector_with_a_count() {
+        // Pre-W1.4 fixtures recorded query texts under "document". A Query
+        // lookup must be served from that entry (identical bytes) and counted,
+        // keeping eval deterministic until a query-side fixture is recorded.
+        let recorder = RecordingProvider::new(DeterministicProvider::new(8));
+        let texts = vec!["legacy recorded as document".to_string()];
+        let as_document = recorder.embed(&texts, EmbedKind::Document).await.unwrap();
+
+        let replay = ReplayProvider::from_fixture(&recorder.fixture("t").unwrap()).unwrap();
+        let as_query = replay.embed(&texts, EmbedKind::Query).await.unwrap();
+        assert_eq!(
+            as_document, as_query,
+            "the fallback must serve the document vector bytes"
+        );
+        assert_eq!(replay.query_fallbacks(), 1, "fallback must be counted");
     }
 
     #[tokio::test]
     async fn replay_fails_closed_on_unrecorded_text() {
         let recorder = RecordingProvider::new(DeterministicProvider::new(8));
-        recorder.embed(&["known".to_string()]).await.unwrap();
+        recorder
+            .embed(&["known".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         let replay = ReplayProvider::from_fixture(&recorder.fixture("t").unwrap()).unwrap();
 
-        let err = replay
-            .embed(&["never recorded".to_string()])
-            .await
-            .unwrap_err();
-        assert!(
-            matches!(err, rb_types::Error::Embedding(_)),
-            "replay miss must be Error::Embedding, got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("replay miss"),
-            "error names the failure mode: {err}"
-        );
+        // Unknown text fails closed for BOTH kinds (the query fallback only
+        // applies when a document vector for the same text exists).
+        for kind in [EmbedKind::Document, EmbedKind::Query] {
+            let err = replay
+                .embed(&["never recorded".to_string()], kind)
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, rb_types::Error::Embedding(_)),
+                "replay miss must be Error::Embedding, got {err:?}"
+            );
+            assert!(
+                err.to_string().contains("replay miss"),
+                "error names the failure mode: {err}"
+            );
+        }
+        assert_eq!(replay.query_fallbacks(), 0);
     }
 
     #[tokio::test]
-    async fn replay_key_is_kind_scoped_so_w14_query_vectors_can_coexist() {
-        // The fixture key includes input_kind: a vector recorded as "document"
-        // must NOT satisfy a "query" lookup. (All lookups are "document" until
-        // W1.4; this pins the key shape it relies on.)
+    async fn document_lookup_never_falls_back_to_a_query_entry() {
+        // The fixture key includes input_kind: a vector recorded as "query"
+        // must NOT satisfy a "document" lookup — persisted document vectors
+        // failing closed is what forces a re-record on corpus drift.
         let recorder = RecordingProvider::new(DeterministicProvider::new(8));
-        recorder.embed(&["text".to_string()]).await.unwrap();
-        let mut fixture = recorder.fixture("t").unwrap();
-        // Re-tag the recorded vector as a future query-kind entry.
-        fixture.vectors[0].input_kind = "query".to_string();
+        recorder
+            .embed(&["text".to_string()], EmbedKind::Query)
+            .await
+            .unwrap();
+        let fixture = recorder.fixture("t").unwrap();
+        assert_eq!(fixture.vectors[0].input_kind, INPUT_KIND_QUERY);
         let replay = ReplayProvider::from_fixture(&fixture).unwrap();
-        let err = replay.embed(&["text".to_string()]).await.unwrap_err();
+        let err = replay
+            .embed(&["text".to_string()], EmbedKind::Document)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, rb_types::Error::Embedding(_)),
             "a query-kind recording must not serve a document-kind lookup"

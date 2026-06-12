@@ -84,8 +84,9 @@ async fn record_local_model_fixture() {
     record_with(
         provider,
         "Real all-MiniLM-L6-v2 (384-dim) vectors for the committed corpus + held-out queries \
-         (W1.0). Keyed on (model_id, input_kind, sha256(text)); input_kind is 'document' for \
-         every entry until W1.4 adds query-kind embeddings. Regenerate: cargo test -p rb-eval \
+         (W1.0). Keyed on (model_id, input_kind, sha256(text)); since W1.4, composite document \
+         inputs record as 'document' and golden/holdout query strings as 'query' (identical \
+         bytes for this kind-blind model). Regenerate: cargo test -p rb-eval \
          --features record-local --test record_embeddings -- --ignored \
          record_local_model_fixture --nocapture",
         "all-MiniLM-L6-v2.json",
@@ -103,8 +104,10 @@ async fn record_voyage_fixture() {
     record_with(
         provider,
         "Real Voyage vectors for the committed corpus + held-out queries (W1.0). Keyed on \
-         (model_id, input_kind, sha256(text)); input_kind is 'document' for every entry until \
-         W1.4 adds query-kind embeddings. Regenerate: VOYAGE_API_KEY=... cargo test -p rb-eval \
+         (model_id, input_kind, sha256(text)); since W1.4, composite document inputs record \
+         with input_type=document and golden/holdout query strings with input_type=query \
+         (Voyage differentiates, so the kinds carry distinct vectors). Regenerate: \
+         VOYAGE_API_KEY=... cargo test -p rb-eval \
          --test record_embeddings -- --ignored record_voyage_fixture --nocapture",
         &file_name,
     )

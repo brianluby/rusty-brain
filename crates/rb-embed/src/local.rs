@@ -7,7 +7,7 @@
 //! first use into fastembed's cache directory; there is no network access in
 //! unit tests (the real-embedding test is `#[ignore]`).
 
-use crate::provider::EmbeddingProvider;
+use crate::provider::{EmbedKind, EmbeddingProvider};
 use async_trait::async_trait;
 use fastembed::{EmbeddingModel, InitOptions, TextEmbedding};
 use rb_types::Error;
@@ -100,7 +100,11 @@ impl EmbeddingProvider for LocalProvider {
         self.dim
     }
 
-    async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+    /// The kind is IGNORED by design (W1.4): all-MiniLM-L6-v2 is a symmetric
+    /// model with no query/document conditioning (no instruction prefixes), so
+    /// query vectors must stay in the same space as the persisted document
+    /// vectors — differentiating here would silently split the vector space.
+    async fn embed(&self, texts: &[String], _kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
@@ -186,7 +190,10 @@ mod tests {
         // The fixture provider has no model; calling embed must fail closed
         // with Error::Embedding rather than panicking.
         let p = LocalProvider::without_model("all-MiniLM-L6-v2", 384);
-        let err = p.embed(&["hello".to_string()]).await.unwrap_err();
+        let err = p
+            .embed(&["hello".to_string()], EmbedKind::Document)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, rb_types::Error::Embedding(_)),
             "expected Error::Embedding when no model is loaded, got {err:?}"
@@ -197,7 +204,7 @@ mod tests {
     async fn empty_input_yields_empty_output_without_loading_a_model() {
         // Empty input short-circuits: no model access, no error.
         let p = LocalProvider::without_model("all-MiniLM-L6-v2", 384);
-        let out = p.embed(&[]).await.unwrap();
+        let out = p.embed(&[], EmbedKind::Document).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -210,7 +217,10 @@ mod tests {
         let p = LocalProvider::load("all-MiniLM-L6-v2").unwrap();
         assert_eq!(p.dim(), 384);
         let out = p
-            .embed(&["hello world".to_string(), "second".to_string()])
+            .embed(
+                &["hello world".to_string(), "second".to_string()],
+                EmbedKind::Document,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 2);

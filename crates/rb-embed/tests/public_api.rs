@@ -1,6 +1,6 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rb_embed::{DeterministicProvider, EmbeddingProvider, VoyageProvider};
+use rb_embed::{DeterministicProvider, EmbedKind, EmbeddingProvider, VoyageProvider};
 
 #[tokio::test(flavor = "multi_thread")]
 async fn deterministic_provider_satisfies_trait_contract_via_dyn() {
@@ -15,7 +15,7 @@ async fn deterministic_provider_satisfies_trait_contract_via_dyn() {
         "single writer thread".to_string(),
         "namespace isolation".to_string(),
     ];
-    let out = provider.embed(&inputs).await.unwrap();
+    let out = provider.embed(&inputs, EmbedKind::Document).await.unwrap();
 
     // One vector per input, each of length dim().
     assert_eq!(out.len(), inputs.len());
@@ -24,8 +24,13 @@ async fn deterministic_provider_satisfies_trait_contract_via_dyn() {
     }
 
     // Determinism: re-embedding yields identical vectors.
-    let out2 = provider.embed(&inputs).await.unwrap();
+    let out2 = provider.embed(&inputs, EmbedKind::Document).await.unwrap();
     assert_eq!(out, out2);
+
+    // Kind-blindness (W1.4): the deterministic provider must ignore the kind,
+    // also when called through the trait object.
+    let as_query = provider.embed(&inputs, EmbedKind::Query).await.unwrap();
+    assert_eq!(out, as_query);
 
     // Distinctness: different inputs produce different vectors.
     assert_ne!(out[0], out[1]);
