@@ -1,25 +1,53 @@
-//! Importance recalibration job: recompute `importance` from access_count and
-//! last_accessed_at (recency), clamped to the validated 1..=10 range.
+//! Importance recalibration job: modulate EFFECTIVE `importance` around the
+//! immutable author-set prior (`base_importance`), within a bounded ±2 delta,
+//! from access_count and last_accessed_at (recency). W1.9 (F33): author intent
+//! is the anchor — access signals may nudge a memory, never re-author it.
+//!
+//! Disabled by default (and intended to STAY disabled until the W3.7
+//! usefulness signal exists): today `access_count` counts
+//! returned-from-recall, which is "retrieved", not "useful". The bounded
+//! formula below is implemented and ready, so enabling the job once a real
+//! usefulness signal feeds it is a config flip, not a code change.
 
 use crate::jobs::config::ImportanceConfig;
 use crate::jobs::JobSummary;
 use crate::StoreHandle;
-use rb_engine::MemoryBackend;
-use rb_types::{MemoryUpdates, Result};
+use rb_types::Result;
 
-/// Recompute an importance value from access frequency and recency.
+/// Hard bound on how far recalibration may move the effective importance from
+/// the author-set prior, in either direction (the W1.9 author-intent
+/// guarantee: an importance-10 memory can never fall below 8 from access
+/// signals alone). Deliberately NOT configurable — a tunable bound would let a
+/// config typo erase author intent.
+const MAX_DELTA: f64 = 2.0;
+
+/// Recompute an effective importance from the author-set prior and the access
+/// signals, bounded to the prior's ±[`MAX_DELTA`] band.
 ///
-/// Deterministic, monotonic in access, and a FIXED POINT (idempotent): for a
-/// touched memory the result depends only on the access signals, never on the
-/// current importance, so re-running over unchanged access data is a no-op.
-/// `now` and `last_accessed_at` are unix seconds.
+/// `base` is the AUTHOR-SET PRIOR (`base_importance`), never the current
+/// effective importance. Because the prior is immutable (only an explicit
+/// user update re-stamps it), this is a pure function of stable inputs: the
+/// job is idempotent across runs by construction — recomputing over unchanged
+/// access data re-derives the same target, and repeated runs can never ratchet
+/// a memory out of its author band. `now` and `last_accessed_at` are unix
+/// seconds.
 ///
-/// Formula (documented contract):
+/// Formula (documented contract; cf. plan W1.9 `clamp(base + k·tanh(signal) −
+/// decay, base−2, base+2)` with `k = MAX_DELTA`):
 ///   recency = last_accessed_at.map(|t| 0.5^(((now - t).max(0)/86400)/half_life_days)).unwrap_or(0.0)
 ///   access  = ln(1 + access_count.max(0))
 ///   signal  = access_weight*access + recency_weight*recency
-///   if signal <= 0 => new = clamp(round(base))                  // untouched: keep author's value
-///   else           => new = clamp(round(1 + 9*tanh(signal)))    // touched: pure access target
+///   if signal <= 0 => new = clamp(base, 1, 10)        // untouched: author's prior verbatim
+///   else:
+///     boost = MAX_DELTA * tanh(signal)                // (0, 2): diminishing returns
+///     decay = MAX_DELTA * (1 - recency)               // [0, 2]: staleness penalty
+///     new   = clamp(round(base + boost - decay), max(base-2, 1), min(base+2, 10))
+///
+/// Properties: monotone in `access_count` at fixed recency; bounded to
+/// `[base-2, base+2]` (then 1..=10) for ALL signals. Note the staleness
+/// asymmetry is intentional: a memory accessed once long ago carries
+/// EVIDENCE of abandonment and may land below the prior, while a
+/// never-accessed memory carries no evidence and keeps the prior exactly.
 pub fn recalibrate(
     base: u8,
     access_count: i64,
@@ -48,35 +76,43 @@ pub fn recalibrate(
     // 0.5^121 is a subnormal ~1e-37), so a negligible signal must still be
     // treated as untouched. The documented contract is "decayed-to-zero signal
     // matches never-accessed": any real access keeps the signal far above this
-    // epsilon (the smallest touched-branch signal in practice is ~0.5).
+    // epsilon (the smallest touched-branch signal in practice is ~0.35,
+    // one fully-decayed access at the default access_weight of 0.5).
     const SIGNAL_EPS: f64 = 1e-9;
 
-    let value = if signal <= SIGNAL_EPS {
-        // Untouched memory: keep the author's importance (still clamped for safety).
-        base as f64
-    } else {
-        // Touched memory: target is a PURE function of the access signal on the
-        // full 1..=10 band, independent of `base`. This is what makes the job a
-        // fixed point — re-running re-derives the same target, so nothing changes.
-        const FLOOR: f64 = 1.0;
-        const SPAN: f64 = 9.0; // 10.0 - 1.0
-        FLOOR + SPAN * signal.tanh()
-    };
+    if signal <= SIGNAL_EPS {
+        // Untouched memory: the author's prior verbatim (clamped for safety).
+        return (base as f64).clamp(1.0, 10.0) as u8;
+    }
 
-    // Always a valid importance (1..=10): the clamp is the single source of truth
-    // that keeps the output inside validate_importance's range.
-    value.round().clamp(1.0, 10.0) as u8
+    // Touched memory: nudge the author's prior, never re-author it. The boost
+    // saturates (tanh) so heavy access cannot exceed +MAX_DELTA; the decay
+    // penalizes staleness (recency 1.0 => none, fully decayed => -MAX_DELTA).
+    let prior = base as f64;
+    let boost = MAX_DELTA * signal.tanh();
+    let decay = MAX_DELTA * (1.0 - recency);
+
+    // The band clamp is the author-intent guarantee (W1.9): whatever the
+    // signals do, the result stays within ±MAX_DELTA of the prior — and inside
+    // validate_importance's 1..=10 range.
+    let floor = (prior - MAX_DELTA).max(1.0);
+    let ceil = (prior + MAX_DELTA).min(10.0);
+    (prior + boost - decay).round().clamp(floor, ceil) as u8
 }
 
 /// Run one bounded, idempotent recalibration pass.
 ///
 /// Reads up to `cfg.batch_limit` active memories via the read pool, recomputes
-/// each importance with [`recalibrate`], and — only when the value actually
-/// changes — writes it back through the single-writer `update` path using the
-/// row's OWN namespace. Idempotent: a second pass over unchanged access data
-/// recomputes the same values and writes nothing. Fail-safe: each update is its
-/// own writer transaction; a single failed update aborts the pass with an error
-/// rather than leaving a half-applied batch.
+/// each EFFECTIVE importance with [`recalibrate`] from the row's immutable
+/// `base_importance` author prior, and — only when the value actually changes —
+/// writes it back through the single-writer `set_recalibrated_importance` path
+/// (which never touches the prior) using the row's OWN namespace. Idempotent:
+/// the target is a pure function of the prior and the access signals, so a
+/// second pass over unchanged access data recomputes the same values and
+/// writes nothing — and repeated runs can never drift a memory out of its
+/// author band. Fail-safe: each update is its own writer transaction; a single
+/// failed update aborts the pass with an error rather than leaving a
+/// half-applied batch.
 pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSummary> {
     let now = chrono::Utc::now().timestamp();
     let rows = store.memories_for_recalibration(cfg.batch_limit).await?;
@@ -85,7 +121,7 @@ pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSumma
     for row in rows {
         summary.scanned += 1;
         let new = recalibrate(
-            row.importance,
+            row.base_importance,
             row.access_count,
             row.last_accessed_at,
             now,
@@ -96,14 +132,7 @@ pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSumma
             continue;
         }
         store
-            .update(
-                row.namespace.clone(),
-                row.id.clone(),
-                MemoryUpdates {
-                    importance: Some(new),
-                    ..Default::default()
-                },
-            )
+            .set_recalibrated_importance(row.namespace.clone(), row.id.clone(), new)
             .await?;
         summary.changed += 1;
     }
@@ -129,45 +158,99 @@ mod tests {
     const NOW: i64 = 1_700_000_000;
     const DAY: i64 = 86_400;
 
+    /// Wide signal sweep shared by the property tests below: access counts
+    /// (including pathological negatives) crossed with ages from "never" to
+    /// "a decade stale" to "clock-skewed future".
+    fn signal_sweep() -> Vec<(i64, Option<i64>)> {
+        let accesses = [0i64, 1, 2, 5, 10, 100, 10_000, 1_000_000, -5];
+        let lasts = [
+            None,
+            Some(NOW),
+            Some(NOW - DAY),
+            Some(NOW - 7 * DAY),
+            Some(NOW - 30 * DAY),
+            Some(NOW - 90 * DAY),
+            Some(NOW - 365 * DAY),
+            Some(NOW - 3650 * DAY),
+            Some(0),
+            Some(NOW + DAY),
+        ];
+        let mut sweep = Vec::new();
+        for access in accesses {
+            for last in lasts {
+                sweep.push((access, last));
+            }
+        }
+        sweep
+    }
+
     #[test]
     fn output_is_always_a_valid_importance() {
-        // Every output must pass the 1..=10 validator, for a wide input sweep.
+        // Property: every output must pass the 1..=10 validator, for the full
+        // base x signal sweep.
         for base in 1u8..=10 {
-            for access in [0i64, 1, 10, 100, 10_000, -5] {
-                for last in [
-                    None,
-                    Some(NOW),
-                    Some(NOW - 365 * DAY),
-                    Some(0),
-                    Some(NOW + DAY),
-                ] {
-                    let out = recalibrate(base, access, last, NOW, &cfg());
-                    assert!(
-                        rb_types::validate_importance(out).is_ok(),
-                        "recalibrate({base},{access},{last:?}) = {out} must be 1..=10"
-                    );
-                }
+            for (access, last) in signal_sweep() {
+                let out = recalibrate(base, access, last, NOW, &cfg());
+                assert!(
+                    rb_types::validate_importance(out).is_ok(),
+                    "recalibrate({base},{access},{last:?}) = {out} must be 1..=10"
+                );
             }
         }
     }
 
     #[test]
-    fn is_a_fixed_point_for_touched_and_untouched() {
-        // Idempotency: feeding the output back in as `base` must yield the same
-        // value, both for a touched memory (access-derived target) and an
-        // untouched one (author's base preserved).
+    fn recalibration_never_leaves_the_author_band() {
+        // Property (W1.9 author-intent guarantee): for EVERY combination of
+        // author prior and access signals, the effective importance stays
+        // within ±2 of the prior.
+        for base in 1u8..=10 {
+            let floor = base.saturating_sub(2).max(1);
+            let ceil = base.saturating_add(2).min(10);
+            for (access, last) in signal_sweep() {
+                let out = recalibrate(base, access, last, NOW, &cfg());
+                assert!(
+                    (floor..=ceil).contains(&out),
+                    "recalibrate({base},{access},{last:?}) = {out} escaped the \
+                     author band [{floor},{ceil}]"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn importance_ten_never_falls_below_eight_from_access_signals_alone() {
+        // Property (spec W1.9, verbatim): importance-10 never falls below 8
+        // from access signals alone — no combination of access count and
+        // staleness may demote a memory its author marked critical below 8.
+        for (access, last) in signal_sweep() {
+            let out = recalibrate(10, access, last, NOW, &cfg());
+            assert!(
+                out >= 8,
+                "recalibrate(10,{access},{last:?}) = {out} fell below 8"
+            );
+        }
+    }
+
+    #[test]
+    fn is_a_fixed_point_over_the_immutable_prior() {
+        // Idempotency: the target is a pure function of the AUTHOR PRIOR and
+        // the access signals. The prior never changes (only the effective
+        // value is written), so recomputing with unchanged inputs re-derives
+        // the same target — the job-level no-op on a second pass.
         for (access, last) in [
-            (50i64, Some(NOW)),        // touched: heavy + fresh
-            (3, Some(NOW - 10 * DAY)), // touched: light + slightly stale
-            (0, None),                 // untouched
+            (50i64, Some(NOW)),         // touched: heavy + fresh
+            (3, Some(NOW - 10 * DAY)),  // touched: light + slightly stale
+            (1, Some(NOW - 365 * DAY)), // touched: stale (negative delta)
+            (0, None),                  // untouched
         ] {
             for base in 1u8..=10 {
                 let once = recalibrate(base, access, last, NOW, &cfg());
-                let twice = recalibrate(once, access, last, NOW, &cfg());
+                let twice = recalibrate(base, access, last, NOW, &cfg());
                 assert_eq!(
                     once, twice,
-                    "recalibrate must be a fixed point: base={base}, access={access}, \
-                     last={last:?}, once={once}, twice={twice}"
+                    "recalibrate must be deterministic over the prior: base={base}, \
+                     access={access}, last={last:?}, once={once}, twice={twice}"
                 );
             }
         }
@@ -188,14 +271,34 @@ mod tests {
     }
 
     #[test]
-    fn more_access_never_lowers_importance() {
-        // Monotonic in access_count: more accesses => importance >= fewer accesses.
-        let few = recalibrate(5, 1, Some(NOW), NOW, &cfg());
-        let many = recalibrate(5, 10_000, Some(NOW), NOW, &cfg());
-        assert!(
-            many >= few,
-            "more access must not lower importance: few={few}, many={many}"
-        );
+    fn more_access_never_lowers_importance_at_fixed_recency() {
+        // Property: monotone in access_count at fixed recency (the decay term
+        // depends only on recency, the boost only grows with access). Checked
+        // across every prior and a spread of ages. NB: monotonicity is scoped
+        // to fixed recency by design — an untouched memory keeps its prior,
+        // which may sit ABOVE a stale once-touched one's target (staleness is
+        // evidence of abandonment; absence of access is no evidence).
+        for base in 1u8..=10 {
+            for last in [
+                Some(NOW),
+                Some(NOW - 7 * DAY),
+                Some(NOW - 90 * DAY),
+                Some(NOW - 3650 * DAY),
+            ] {
+                let mut prev: Option<u8> = None;
+                for access in [1i64, 2, 5, 10, 100, 10_000] {
+                    let out = recalibrate(base, access, last, NOW, &cfg());
+                    if let Some(p) = prev {
+                        assert!(
+                            out >= p,
+                            "more access lowered importance: base={base}, last={last:?}, \
+                             access={access}: {out} < {p}"
+                        );
+                    }
+                    prev = Some(out);
+                }
+            }
+        }
     }
 
     #[test]
@@ -236,21 +339,26 @@ mod tests {
 
     #[test]
     fn touched_target_matches_documented_formula() {
-        // access_count=1, fresh: access=ln(2)=0.6931, recency=1.0,
-        // signal = 0.5*0.6931 + 0.5*1.0 = 0.84657; tanh(0.84657)=0.68915;
-        // target = 1 + 9*0.68915 = 7.2024 => round => 7. base is irrelevant here.
+        // Fresh single access: access=ln(2)=0.69315, recency=1.0,
+        // signal = 0.5*0.69315 + 0.5*1.0 = 0.84657; boost = 2*tanh(0.84657)
+        // = 2*0.68915 = 1.37830; decay = 2*(1-1.0) = 0.
+        // target = round(base + 1.37830) = base + 1 (band permitting).
         let out = recalibrate(3, 1, Some(NOW), NOW, &cfg());
+        assert_eq!(out, 4, "fresh access nudges the prior up by the boost");
+        // The SAME signals move a different prior to a different target — the
+        // prior is the anchor (contrast with the pre-W1.9 pure-access target).
+        let out_high = recalibrate(9, 1, Some(NOW), NOW, &cfg());
         assert_eq!(
-            out, 7,
-            "touched target is a pure function of access, not base"
+            out_high, 10,
+            "round(9 + 1.378) = 10, capped by the band/range"
         );
-        // Same access signal with a different base yields the SAME touched target
-        // (proves base does not enter the touched branch — the fixed-point property).
-        let out_other_base = recalibrate(9, 1, Some(NOW), NOW, &cfg());
-        assert_eq!(
-            out, out_other_base,
-            "touched target ignores base: {out} vs {out_other_base}"
-        );
+
+        // Stale single access (90 days, half-life 30): recency = 0.5^3 = 0.125,
+        // access = 0.69315, signal = 0.5*0.69315 + 0.5*0.125 = 0.40907;
+        // boost = 2*tanh(0.40907) = 0.77536; decay = 2*(1-0.125) = 1.75.
+        // target = round(5 + 0.77536 - 1.75) = round(4.02536) = 4.
+        let stale = recalibrate(5, 1, Some(NOW - 90 * DAY), NOW, &cfg());
+        assert_eq!(stale, 4, "staleness decays the prior within the band");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -277,6 +385,8 @@ mod tests {
         for _ in 0..50 {
             handle.record_access(hot_id.clone()).await.unwrap();
         }
+        // record_access buffers (W1.8); flush so the job's scan sees the counts.
+        handle.flush_accesses().await.unwrap();
 
         let cfg = ImportanceConfig {
             enabled: true,
@@ -298,14 +408,30 @@ mod tests {
             .await
             .unwrap()
             .expect("hot memory present");
+        assert_eq!(
+            hot_after.importance, 5,
+            "50 fresh accesses saturate the boost: round(3 + 2*tanh(big)) = 5"
+        );
         assert!(
-            hot_after.importance > 3,
-            "accessed memory's importance must rise above base 3, got {}",
-            hot_after.importance
+            hot_after.importance <= 3 + 2,
+            "the effective value must stay within the author band (base 3 + 2)"
         );
         assert_eq!(
             hot_after.namespace, ns,
             "update must preserve the row's own namespace"
+        );
+        // The author prior is untouched by the job write (W1.9): the bound
+        // stays anchored at 3 forever, however many passes run.
+        let hot_row = handle
+            .memories_for_recalibration(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == hot_id)
+            .expect("hot row present");
+        assert_eq!(
+            hot_row.base_importance, 3,
+            "the job must never re-stamp the author prior"
         );
 
         let cold_after = handle

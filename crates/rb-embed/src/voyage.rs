@@ -1,4 +1,4 @@
-use crate::provider::EmbeddingProvider;
+use crate::provider::{EmbedKind, EmbeddingProvider};
 use async_trait::async_trait;
 use rb_types::Error;
 use secrecy::{ExposeSecret, SecretString};
@@ -130,19 +130,31 @@ impl VoyageProvider {
         })
     }
 
-    fn embeddings_request<'a>(&'a self, texts: &'a [String]) -> EmbeddingsRequest<'a> {
+    /// Voyage is the one provider that actually differentiates on the kind:
+    /// `input_type` is `"query"` for recall-side embeds and `"document"` for
+    /// write-side embeds (W1.4), conditioning the vector for asymmetric
+    /// retrieval.
+    fn embeddings_request<'a>(
+        &'a self,
+        texts: &'a [String],
+        kind: EmbedKind,
+    ) -> EmbeddingsRequest<'a> {
         EmbeddingsRequest {
             model: &self.model,
             input: texts,
-            input_type: "document",
+            input_type: kind.as_str(),
             output_dimension: self.output_dimension,
         }
     }
 
     /// POST a single chunk of inputs and return their embeddings in order.
-    async fn embed_chunk(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+    async fn embed_chunk(
+        &self,
+        texts: &[String],
+        kind: EmbedKind,
+    ) -> rb_types::Result<Vec<Vec<f32>>> {
         let url = format!("{}/embeddings", self.base_url);
-        let body = self.embeddings_request(texts);
+        let body = self.embeddings_request(texts, kind);
 
         let resp = self
             .client
@@ -232,14 +244,14 @@ impl EmbeddingProvider for VoyageProvider {
         self.dim
     }
 
-    async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+    async fn embed(&self, texts: &[String], kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
         if texts.is_empty() {
             return Ok(Vec::new());
         }
 
         let mut out = Vec::with_capacity(texts.len());
         for chunk in texts.chunks(MAX_BATCH) {
-            let mut embeddings = self.embed_chunk(chunk).await?;
+            let mut embeddings = self.embed_chunk(chunk, kind).await?;
             out.append(&mut embeddings);
         }
         Ok(out)
@@ -297,7 +309,10 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let out = p
-            .embed(&["first".to_string(), "second".to_string()])
+            .embed(
+                &["first".to_string(), "second".to_string()],
+                EmbedKind::Document,
+            )
             .await
             .unwrap();
 
@@ -310,11 +325,58 @@ mod tests {
     fn default_model_request_omits_output_dimension() {
         let p = VoyageProvider::for_test_default("test-key", "http://127.0.0.1:1/v1");
         let inputs = vec!["first".to_string(), "second".to_string()];
-        let body = serde_json::to_value(p.embeddings_request(&inputs)).unwrap();
+        let body =
+            serde_json::to_value(p.embeddings_request(&inputs, EmbedKind::Document)).unwrap();
 
         assert_eq!(body["model"], "voyage-3-lite");
         assert_eq!(body["input_type"], "document");
         assert!(body.get("output_dimension").is_none());
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn query_kind_sends_input_type_query_and_document_kind_sends_document() {
+        // W1.4: the recall path embeds with EmbedKind::Query, which must reach
+        // the wire as input_type="query"; write paths use EmbedKind::Document,
+        // which must stay input_type="document". One mock per input_type — a
+        // request with the wrong value matches neither and fails the test.
+        let server = MockServer::start().await;
+        let query_response = serde_json::json!({
+            "data": [ { "index": 0, "embedding": [1.0, 0.0, 0.0, 0.0] } ]
+        });
+        let document_response = serde_json::json!({
+            "data": [ { "index": 0, "embedding": [0.0, 1.0, 0.0, 0.0] } ]
+        });
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "input_type": "query" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&query_response))
+            .expect(1)
+            .mount(&server)
+            .await;
+        Mock::given(method("POST"))
+            .and(path("/v1/embeddings"))
+            .and(body_partial_json(
+                serde_json::json!({ "input_type": "document" }),
+            ))
+            .respond_with(ResponseTemplate::new(200).set_body_json(&document_response))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let base = format!("{}/v1", server.uri());
+        let p = provider_for(&base, 4);
+        let as_query = p
+            .embed(&["what changed?".to_string()], EmbedKind::Query)
+            .await
+            .unwrap();
+        let as_document = p
+            .embed(&["what changed?".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
+        assert_eq!(as_query[0], vec![1.0, 0.0, 0.0, 0.0]);
+        assert_eq!(as_document[0], vec![0.0, 1.0, 0.0, 0.0]);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -332,7 +394,10 @@ mod tests {
 
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
-        let err = p.embed(&["x".to_string()]).await.unwrap_err();
+        let err = p
+            .embed(&["x".to_string()], EmbedKind::Document)
+            .await
+            .unwrap_err();
         assert!(
             matches!(err, rb_types::Error::Embedding(_)),
             "expected Error::Embedding, got {err:?}"
@@ -355,7 +420,7 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let err = p
-            .embed(&["a".to_string(), "b".to_string()])
+            .embed(&["a".to_string(), "b".to_string()], EmbedKind::Document)
             .await
             .unwrap_err();
         assert!(matches!(err, rb_types::Error::Embedding(_)));
@@ -372,7 +437,10 @@ mod tests {
 
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
-        let err = p.embed(&["x".to_string()]).await.unwrap_err();
+        let err = p
+            .embed(&["x".to_string()], EmbedKind::Document)
+            .await
+            .unwrap_err();
         assert!(matches!(err, rb_types::Error::Embedding(_)));
     }
 
@@ -382,7 +450,7 @@ mod tests {
         let server = MockServer::start().await;
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
-        let out = p.embed(&[]).await.unwrap();
+        let out = p.embed(&[], EmbedKind::Document).await.unwrap();
         assert!(out.is_empty());
     }
 
@@ -409,7 +477,7 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let inputs: Vec<String> = (0..200).map(|i| format!("item-{i}")).collect();
-        let out = p.embed(&inputs).await.unwrap();
+        let out = p.embed(&inputs, EmbedKind::Document).await.unwrap();
         assert_eq!(out.len(), 200);
         for v in &out {
             assert_eq!(v, &vec![1.0, 0.0, 0.0, 0.0]);
@@ -448,7 +516,10 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let out = p
-            .embed(&["first".to_string(), "second".to_string()])
+            .embed(
+                &["first".to_string(), "second".to_string()],
+                EmbedKind::Document,
+            )
             .await
             .unwrap();
 
@@ -486,7 +557,7 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let err = p
-            .embed(&["a".to_string(), "b".to_string()])
+            .embed(&["a".to_string(), "b".to_string()], EmbedKind::Document)
             .await
             .unwrap_err();
         assert!(
@@ -514,7 +585,7 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let err = p
-            .embed(&["a".to_string(), "b".to_string()])
+            .embed(&["a".to_string(), "b".to_string()], EmbedKind::Document)
             .await
             .unwrap_err();
         assert!(
@@ -544,7 +615,10 @@ mod tests {
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
         let err = p
-            .embed(&["first".to_string(), "second".to_string()])
+            .embed(
+                &["first".to_string(), "second".to_string()],
+                EmbedKind::Document,
+            )
             .await
             .unwrap_err();
         // Assert it is an Embedding error whose message names the failure mode.
@@ -574,7 +648,10 @@ mod tests {
 
         let base = format!("{}/v1", server.uri());
         let p = provider_for(&base, 4);
-        let out = p.embed(&["only".to_string()]).await.unwrap();
+        let out = p
+            .embed(&["only".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0], vec![0.1, 0.2, 0.3, 0.4]);
     }
@@ -585,7 +662,10 @@ mod tests {
     #[ignore = "requires VOYAGE_API_KEY and network access"]
     async fn voyage_real_api_smoke() {
         let p = VoyageProvider::from_env().unwrap();
-        let out = p.embed(&["hello world".to_string()]).await.unwrap();
+        let out = p
+            .embed(&["hello world".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].len(), p.dim());
     }

@@ -11,7 +11,9 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
         });
     }
     if results.is_empty() {
-        return "No memories matched.".to_string();
+        // W1.3 empty state: recall may legitimately return nothing (score
+        // floor / empty corpus); mirror the rb-mcp hint wording.
+        return "No stored memories match.".to_string();
     }
     let mut out = String::new();
     for r in results {
@@ -202,6 +204,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n.clone(),
             score: 0.91,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("0.91"), "score shown: {out}");
@@ -219,6 +222,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.8,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
@@ -231,6 +235,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.8,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -251,6 +256,7 @@ mod tests {
         let results = vec![SearchResult {
             memory: n,
             score: 0.5,
+            channels: rb_types::ChannelHits::default(),
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -260,11 +266,13 @@ mod tests {
 
     #[test]
     fn human_recall_empty_has_guidance() {
+        // W1.3: the CLI empty state mirrors the rb-mcp hint wording.
         let out = render_recall(&[], false);
-        assert!(
-            out.to_lowercase().contains("no memories"),
-            "empty guidance: {out}"
-        );
+        assert_eq!(out, "No stored memories match.");
+        // JSON mode keeps the raw wire shape: an empty array, no hint object.
+        let json_out = render_recall(&[], true);
+        let parsed: serde_json::Value = serde_json::from_str(&json_out).unwrap();
+        assert!(parsed.as_array().map(Vec::is_empty).unwrap_or(false));
     }
 
     #[test]

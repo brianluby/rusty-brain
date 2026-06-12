@@ -5,6 +5,24 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — C1 user config file (W0.2 carryover)
+
+- **`~/.config/rusty-brain/config.toml`** (or under `$XDG_CONFIG_HOME`):
+  daemon knobs — `socket_path`, `db_path`, `idle_timeout_secs`, `jobs_config`,
+  `[embed] backend`/`local_model`, `[enrich] base_url`/`model` — now live in a
+  user config file with precedence **CLI flag > env var > config file >
+  default**. Every binary (CLI, hooks, daemon) re-reads the file from disk
+  itself, so a file-set knob reaches **auto-started** daemons with no env
+  forwarding — retiring the F20 bug *class*. Unknown keys warn (forward
+  compat); malformed TOML fails closed naming the file; secrets
+  (`VOYAGE_API_KEY`, `RB_ENRICH_API_KEY`) stay env-only; `accept_model_change`
+  is deliberately not a file knob (consent is per-change).
+- **`FORWARD_ENV` shrunk to secrets + identity + XDG/HOME** (9 entries). The
+  seven pre-existing knob env vars keep working (env wins over the file,
+  including through auto-start) via a frozen `LEGACY_KNOB_ENV` compat list
+  that must never grow. The repo-committed `.rusty-brain.toml` remains
+  namespace-identity-ONLY and is never a configuration source.
+
 ### Added — P4 agent surface
 
 - **`rusty-brain-hooks` binary** (crate `rb-hooks`): a fail-open, capture-only

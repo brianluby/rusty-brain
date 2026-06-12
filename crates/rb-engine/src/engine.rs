@@ -2,7 +2,7 @@ use crate::backend::MemoryBackend;
 use crate::enrich::{default_summary, derive_keywords};
 use crate::enricher::Enricher;
 use crate::linker::{Linker, SimilarityLinker};
-use rb_embed::EmbeddingProvider;
+use rb_embed::{EmbedKind, EmbeddingProvider};
 use rb_search::{FusionMode, RrfConfig, Weights};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 use std::sync::Arc;
@@ -21,6 +21,16 @@ pub struct RememberInput {
     /// the pre-W0.5 hardwired value; hook captures send 0.7).
     pub confidence: f32,
     pub provenance: Provenance,
+}
+
+/// What `recall_with_status` returns (W1.6d): the ranked results plus whether
+/// retrieval DEGRADED to keyword + graph because the embedder errored. The
+/// daemon forwards `degraded` on the wire so clients can warn instead of
+/// silently serving vector-blind results.
+#[derive(Debug, Clone)]
+pub struct RecallOutcome {
+    pub results: Vec<rb_types::SearchResult>,
+    pub degraded: bool,
 }
 
 /// Who/where/what produced a write (W0.5): the connection's handshake identity
@@ -48,6 +58,12 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     namespace: Namespace,
     linker: Box<dyn Linker>,
     enricher: Option<Arc<dyn Enricher>>,
+    /// Minimum `Linear` recall score a result must reach to be returned (W1.3).
+    /// Below-floor results are dropped, so recall may return fewer than `limit`
+    /// — or nothing. Applies to `Linear` only: `Rrf` scores live on a different
+    /// scale and stay unfloored until RRF is reachable and calibrated
+    /// (W2.2/W4.1). See `rb_search::SCORE_FLOOR` for the derivation.
+    score_floor: f32,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -65,6 +81,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             namespace,
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
+            score_floor: rb_search::SCORE_FLOOR,
         }
     }
 
@@ -108,6 +125,19 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// heuristic path (enrichment never fails a remember).
     pub fn with_enricher(mut self, enricher: Arc<dyn Enricher>) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// The recall score floor applied under `Linear` fusion (W1.3).
+    pub fn score_floor(&self) -> f32 {
+        self.score_floor
+    }
+
+    /// Override the recall score floor (tests and eval recalibration only —
+    /// production keeps the derived `rb_search::SCORE_FLOOR` default). A
+    /// non-finite floor is sanitized to 0.0 (floor disabled, fail-open).
+    pub fn with_score_floor(mut self, floor: f32) -> Self {
+        self.score_floor = if floor.is_finite() { floor } else { 0.0 };
         self
     }
 
@@ -207,8 +237,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         // Embed the COMPOSITE document representation (content + keywords + tags
         // + context), not raw content (spec §8). The query stays embedded raw.
+        // Write path => EmbedKind::Document (W1.4).
         let input = crate::embed_input::embedding_input(&note);
-        let mut embeddings = self.embedder.embed(&[input]).await?;
+        let mut embeddings = self.embedder.embed(&[input], EmbedKind::Document).await?;
         let embedding = embeddings.pop();
 
         let id = note.id.clone();
@@ -275,6 +306,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
     /// candidates scoped to the engine namespace, rank with `rb_search`, then
     /// return ranked `SearchResult`s after applying type/tag filters.
+    ///
+    /// Thin wrapper over [`MemoryEngine::recall_with_status`] that drops the
+    /// degraded flag; callers that surface degradation (the daemon's Recall
+    /// dispatch) use the `_with_status` form.
     pub async fn recall(
         &self,
         query: &str,
@@ -282,22 +317,58 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         type_filter: Option<MemoryType>,
         tags: &[String],
     ) -> rb_types::Result<Vec<rb_types::SearchResult>> {
+        Ok(self
+            .recall_with_status(query, limit, type_filter, tags)
+            .await?
+            .results)
+    }
+
+    /// [`MemoryEngine::recall`] plus a degradation flag (W1.6d / F19): when the
+    /// embedder errors, recall DEGRADES to the keyword + graph channels instead
+    /// of failing outright — an embedding-API outage must not take retrieval
+    /// down with it — and `degraded` is set so the response can carry a
+    /// warning. The vector channel is skipped entirely in that case; ranking
+    /// proceeds on the surviving signals.
+    pub async fn recall_with_status(
+        &self,
+        query: &str,
+        limit: usize,
+        type_filter: Option<MemoryType>,
+        tags: &[String],
+    ) -> rb_types::Result<RecallOutcome> {
         use std::collections::HashMap;
 
         // Over-fetch candidates so post-filtering still has enough to fill `limit`.
         let candidate_limit = limit.saturating_mul(4).max(limit);
 
-        let mut query_emb = self.embedder.embed(&[query.to_string()]).await?;
-        let embedding = query_emb.pop().unwrap_or_default();
+        // Recall path => EmbedKind::Query (W1.4): asymmetric providers (Voyage
+        // input_type) condition the query vector for retrieval.
+        let (embedding, degraded) = match self
+            .embedder
+            .embed(&[query.to_string()], EmbedKind::Query)
+            .await
+        {
+            Ok(mut query_emb) => (query_emb.pop().unwrap_or_default(), false),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "query embedding failed; recall degrades to keyword+graph"
+                );
+                (Vec::new(), true)
+            }
+        };
 
         let keyword = self
             .backend
             .keyword(self.namespace.clone(), query.to_string(), candidate_limit)
             .await?;
-        let vector = self
-            .backend
-            .vector(self.namespace.clone(), embedding, candidate_limit)
-            .await?;
+        let vector = if degraded {
+            Vec::new()
+        } else {
+            self.backend
+                .vector(self.namespace.clone(), embedding, candidate_limit)
+                .await?
+        };
 
         // Bounded 1-hop graph expansion of the top active in-namespace keyword hit only.
         let mut graph_seed = None;
@@ -312,6 +383,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 break;
             }
         }
+        // `(id, hops)` pairs with REAL minimum hop distances (W1.5); hops feed
+        // the graph ranking signal through `build_signals`.
         let graph = match graph_seed {
             Some(top) => self.backend.graph(self.namespace.clone(), top, 1).await?,
             None => Vec::new(),
@@ -323,7 +396,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         for id in keyword
             .iter()
             .chain(vector.iter().map(|(id, _)| id))
-            .chain(graph.iter())
+            .chain(graph.iter().map(|(id, _)| id))
         {
             if seen.insert(id.clone()) {
                 order.push(id.clone());
@@ -363,14 +436,31 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .filter(|(id, _)| notes.contains_key(id))
             .cloned()
             .collect();
-        let filtered_graph: Vec<MemoryId> = graph
+        let filtered_graph: Vec<(MemoryId, u8)> = graph
             .iter()
-            .filter(|id| notes.contains_key(*id))
+            .filter(|(id, _)| notes.contains_key(id))
             .cloned()
             .collect();
 
         let signals =
             rb_search::build_signals(&filtered_keyword, &filtered_vector, &filtered_graph, &meta);
+        // Per-channel hit attribution (W1.0): which channels surfaced each
+        // candidate, read off the merged signals BEFORE ranking consumes them.
+        // A `Some` signal field means that channel's candidate set contained
+        // the id, so the flags record contribution, not rank.
+        let channel_map: HashMap<MemoryId, rb_types::ChannelHits> = signals
+            .iter()
+            .map(|s| {
+                (
+                    s.id.clone(),
+                    rb_types::ChannelHits {
+                        fts: s.keyword_rank.is_some(),
+                        vector: s.vector_distance.is_some(),
+                        graph: s.graph_hops.is_some(),
+                    },
+                )
+            })
+            .collect();
         // Dispatch on the configured fusion mode. `Linear` is the default and
         // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
         // hybrid (spec §7).
@@ -380,15 +470,29 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
         };
 
-        // Assemble results in ranked order, truncating to limit.
+        // Assemble results in ranked order, truncating to limit. Under `Linear`
+        // the score floor (W1.3) drops below-floor candidates: `ranked` is
+        // sorted descending, so the first below-floor score ends assembly and
+        // recall may return fewer than `limit` — or nothing — instead of
+        // padding with junk the KNN leg surfaced by construction (F30). `Rrf`
+        // scores live on a different scale and stay unfloored until calibrated
+        // (W2.2/W4.1).
+        let floor = match self.fusion_mode {
+            FusionMode::Linear => self.score_floor,
+            FusionMode::Rrf => f32::NEG_INFINITY,
+        };
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
         for (id, score) in ranked {
+            if score < floor {
+                break;
+            }
             let Some(note) = notes.get(&id) else {
                 continue;
             };
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
+                channels: channel_map.get(&id).copied().unwrap_or_default(),
             });
             if results.len() == limit {
                 break;
@@ -406,13 +510,16 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             r.memory.contested = contested.contains(&r.memory.id);
         }
 
-        // Best-effort batch access tracking: single writer round-trip for all results.
+        // Best-effort batch access tracking. W1.8: the daemon backend BUFFERS
+        // these bumps and flushes them off the recall path, so this call costs
+        // recall zero writer-thread ops (and, under migration 006, the eventual
+        // flush costs zero FTS writes).
         if !returned_ids.is_empty() {
             if let Err(e) = self.backend.record_accesses(returned_ids).await {
                 tracing::debug!(error = %e, "record_accesses failed; ignoring");
             }
         }
-        Ok(results)
+        Ok(RecallOutcome { results, degraded })
     }
 
     /// Batch-load the subset of `ids` that have an active `contradicts` link
@@ -488,8 +595,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         for note in candidates {
             scanned += 1;
+            // Reembed converges stored vectors => EmbedKind::Document (W1.4).
             let input = crate::embed_input::embedding_input(&note);
-            let embedding = match self.embedder.embed(&[input]).await {
+            let embedding = match self.embedder.embed(&[input], EmbedKind::Document).await {
                 Ok(mut v) => match v.pop() {
                     Some(emb) => emb,
                     None => {
@@ -568,7 +676,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .graph(self.namespace.clone(), id, depth)
             .await?;
         let mut notes = Vec::with_capacity(ids.len());
-        for nid in ids {
+        for (nid, _hops) in ids {
             if let Some(note) = self.get_scoped(nid).await? {
                 if !self.active_in_namespace(&note) {
                     continue;
@@ -782,7 +890,7 @@ mod tests {
 
         let composite = crate::embed_input::embedding_input(&note);
         let expected = DeterministicProvider::new(16)
-            .embed(&[composite])
+            .embed(&[composite], EmbedKind::Document)
             .await
             .unwrap()
             .pop()
@@ -794,7 +902,7 @@ mod tests {
 
         // And it must NOT equal the raw-content embedding (composite added signal).
         let raw = DeterministicProvider::new(16)
-            .embed(std::slice::from_ref(&note.content))
+            .embed(std::slice::from_ref(&note.content), EmbedKind::Document)
             .await
             .unwrap()
             .pop()
@@ -932,10 +1040,164 @@ mod tests {
             16
         }
 
-        async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+        // Counts calls only; the kind is irrelevant to this stub.
+        async fn embed(
+            &self,
+            texts: &[String],
+            _kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Ok(vec![vec![0.0; 16]; texts.len()])
         }
+    }
+
+    /// Records every kind passed to `embed`, in call order, behind an `Arc`
+    /// handle so the engine can own the provider while the test reads the log.
+    struct KindLoggingProvider {
+        kinds: Arc<std::sync::Mutex<Vec<EmbedKind>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for KindLoggingProvider {
+        fn model_id(&self) -> &str {
+            "kind-logging"
+        }
+
+        fn dim(&self) -> usize {
+            16
+        }
+
+        async fn embed(
+            &self,
+            texts: &[String],
+            kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
+            self.kinds
+                .lock()
+                .map_err(|_| rb_types::Error::Embedding("kind log poisoned".to_string()))?
+                .push(kind);
+            // Distinct unit vectors keep the vector leg functional.
+            Ok(vec![vec![1.0; 16]; texts.len()])
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_embeds_as_query_and_write_paths_embed_as_document() {
+        // W1.4 kind routing: remember and reembed are write paths (Document);
+        // recall embeds the user query (Query).
+        let kinds = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            KindLoggingProvider {
+                kinds: Arc::clone(&kinds),
+            },
+            Namespace::Project("rb".into()),
+        );
+
+        eng.remember(input("kind routing note", 5)).await.unwrap();
+        eng.recall("kind routing", 5, None, &[]).await.unwrap();
+
+        // A stale row forces reembed to issue one Document-kind embed.
+        let mut stale = note(
+            Namespace::Project("rb".into()),
+            "stale row for kind routing",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        stale.embedding_model = "old-model".to_string();
+        stale.embedding_input_version = "v1-content-only".to_string();
+        eng.backend().insert_note(stale);
+        let (scanned, _, _) = eng.reembed(10).await.unwrap();
+        assert_eq!(scanned, 1, "the stale row must be scanned");
+
+        let seen = kinds.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![EmbedKind::Document, EmbedKind::Query, EmbedKind::Document],
+            "remember=Document, recall=Query, reembed=Document"
+        );
+    }
+
+    /// Document embeds succeed (so seeding via `remember` works); Query embeds
+    /// fail, simulating an embedding-API outage at recall time (W1.6d).
+    struct QueryFailingProvider;
+
+    #[async_trait::async_trait]
+    impl EmbeddingProvider for QueryFailingProvider {
+        fn model_id(&self) -> &str {
+            "query-failing"
+        }
+
+        fn dim(&self) -> usize {
+            16
+        }
+
+        async fn embed(
+            &self,
+            texts: &[String],
+            kind: EmbedKind,
+        ) -> rb_types::Result<Vec<Vec<f32>>> {
+            match kind {
+                EmbedKind::Document => Ok(vec![vec![1.0; 16]; texts.len()]),
+                EmbedKind::Query => {
+                    Err(rb_types::Error::Embedding("embedding API down".to_string()))
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn recall_degrades_to_keyword_and_graph_when_the_embedder_errors() {
+        // W1.6d / F19: an embedder error at recall time must DEGRADE retrieval
+        // to the keyword + graph channels (flagged), not fail the request.
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            QueryFailingProvider,
+            Namespace::Project("rb".into()),
+        );
+        eng.remember(input("sqlite wal checkpoint decision", 5))
+            .await
+            .unwrap();
+
+        let outcome = eng
+            .recall_with_status("sqlite checkpoint", 10, None, &[])
+            .await
+            .unwrap();
+        assert!(outcome.degraded, "embedder error must flag degradation");
+        assert!(
+            !outcome.results.is_empty(),
+            "the keyword channel must still serve the stored memory"
+        );
+        assert!(
+            outcome.results.iter().all(|r| !r.channels.vector),
+            "no result may claim a vector contribution while degraded"
+        );
+        assert!(
+            outcome.results.iter().any(|r| r.channels.fts),
+            "the surviving keyword channel attributes the hits"
+        );
+
+        // The thin recall() wrapper serves the same degraded results.
+        let results = eng
+            .recall("sqlite checkpoint", 10, None, &[])
+            .await
+            .unwrap();
+        assert_eq!(results.len(), outcome.results.len());
+    }
+
+    #[tokio::test]
+    async fn recall_with_status_is_not_degraded_under_a_healthy_embedder() {
+        let eng = engine();
+        eng.remember(input("healthy embedder note", 5))
+            .await
+            .unwrap();
+        let outcome = eng
+            .recall_with_status("healthy embedder", 10, None, &[])
+            .await
+            .unwrap();
+        assert!(!outcome.degraded, "a healthy embedder never degrades");
+        assert!(!outcome.results.is_empty());
     }
 
     #[tokio::test]
@@ -1082,6 +1344,71 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_attributes_each_result_to_its_contributing_channels() {
+        // W1.0 per-channel hit attribution: pin each candidate to exactly one
+        // channel via the mock's overrides, then assert the returned flags.
+        let eng = engine();
+        let kw = seed(&eng, "keyword-only candidate", MemoryType::Insight, 5, &[]).await;
+        let vec_only = seed(&eng, "vector-only candidate", MemoryType::Insight, 5, &[]).await;
+        let graph_only = seed(&eng, "graph-only candidate", MemoryType::Insight, 5, &[]).await;
+
+        // fts surfaces only `kw`; vector surfaces only `vec_only`; the 1-hop
+        // graph expansion of the top keyword hit surfaces only `graph_only`.
+        eng.backend().set_keyword_results(vec![kw.clone()]);
+        eng.backend()
+            .set_vector_results(vec![(vec_only.clone(), 0.1)]);
+        eng.backend()
+            .set_graph_neighbors(kw.clone(), vec![(graph_only.clone(), 1)]);
+
+        let results = eng.recall("candidate", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 3);
+        let channels_of = |id: &rb_types::MemoryId| {
+            results
+                .iter()
+                .find(|r| &r.memory.id == id)
+                .map(|r| r.channels)
+                .unwrap()
+        };
+
+        let kw_channels = channels_of(&kw);
+        assert!(kw_channels.fts, "keyword hit must be fts-attributed");
+        assert!(!kw_channels.vector);
+        // The graph walk is seeded at `kw` and the mock returns only its
+        // neighbors, so `kw` itself is not graph-attributed here.
+        assert!(!kw_channels.graph);
+
+        let vec_channels = channels_of(&vec_only);
+        assert!(vec_channels.vector, "vector hit must be vector-attributed");
+        assert!(!vec_channels.fts && !vec_channels.graph);
+
+        let graph_channels = channels_of(&graph_only);
+        assert!(
+            graph_channels.graph,
+            "graph-expanded hit must be graph-attributed"
+        );
+        assert!(!graph_channels.fts && !graph_channels.vector);
+    }
+
+    #[tokio::test]
+    async fn recall_attributes_multi_channel_hits_to_every_contributing_channel() {
+        // A candidate surfaced by several channels carries every flag —
+        // contribution, not exclusivity.
+        let eng = engine();
+        let id = seed(&eng, "everywhere candidate", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![id.clone()]);
+        eng.backend().set_vector_results(vec![(id.clone(), 0.0)]);
+        // Graph expansion seeds at the top keyword hit (`id`) and the mock
+        // returns its neighbor list, which includes the seed here.
+        eng.backend()
+            .set_graph_neighbors(id.clone(), vec![(id.clone(), 1)]);
+
+        let results = eng.recall("everywhere", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        let channels = results[0].channels;
+        assert!(channels.fts && channels.vector && channels.graph);
+    }
+
+    #[tokio::test]
     async fn recall_respects_limit() {
         let eng = engine();
         for i in 0..5 {
@@ -1096,6 +1423,60 @@ mod tests {
         }
         let results = eng.recall("doc", 2, None, &[]).await.unwrap();
         assert_eq!(results.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_returns_empty_when_every_candidate_is_below_the_floor() {
+        // W1.3 / F30: the KNN leg surfaces *something* by construction even for
+        // an unrelated query. Candidates whose only signal is priors (orthogonal
+        // vector, no keyword/graph hit) score <= 0.15 < SCORE_FLOOR and must be
+        // dropped — recall returns NOTHING instead of padding with junk.
+        let eng = engine();
+        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        // Cosine distance 1.0 = orthogonal = zero vector signal (W1.1 scale).
+        eng.backend()
+            .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "prior-only candidates must not be returned, got {} results",
+            results.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_returns_fewer_than_limit_keeping_only_above_floor_results() {
+        let eng = engine();
+        let strong = seed(&eng, "strong vector match", MemoryType::Insight, 5, &[]).await;
+        let junk = seed(&eng, "junk far candidate", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend()
+            .set_vector_results(vec![(strong.clone(), 0.0), (junk.clone(), 1.0)]);
+        let results = eng.recall("query", 10, None, &[]).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the above-floor result is returned (fewer than limit)"
+        );
+        assert_eq!(results[0].memory.id, strong);
+        assert!(results[0].score >= eng.score_floor());
+    }
+
+    #[tokio::test]
+    async fn recall_score_floor_override_disables_the_floor() {
+        // with_score_floor(0.0) restores pad-to-limit behavior: the same
+        // prior-only candidates ARE returned, proving the default floor (and
+        // nothing else) is what drops them.
+        let eng = engine().with_score_floor(0.0);
+        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend()
+            .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2, "floor disabled -> junk returned again");
     }
 
     #[tokio::test]
@@ -1162,8 +1543,12 @@ mod tests {
             })
             .collect();
         eng.backend().set_keyword_results(wrong_ids);
+        // Distance 0.5 (cosine sim 0.5): real-but-modest vector signal, so the
+        // matching candidates clear the W1.3 score floor while still carrying
+        // no keyword/graph signal — the test exercises filter-before-rank, not
+        // prior-only junk (which the floor now drops by design).
         eng.backend()
-            .set_vector_results(matching_ids.iter().cloned().map(|id| (id, 2.0)).collect());
+            .set_vector_results(matching_ids.iter().cloned().map(|id| (id, 0.5)).collect());
 
         let results = eng
             .recall(
@@ -1572,7 +1957,11 @@ mod tests {
         eng.backend().insert_note(archived);
         eng.backend().set_graph_neighbors(
             id.clone(),
-            vec![cross_id.clone(), archived_id.clone(), active_id.clone()],
+            vec![
+                (cross_id.clone(), 1),
+                (archived_id.clone(), 1),
+                (active_id.clone(), 2),
+            ],
         );
 
         let neighbors = eng.graph(id, 2).await.unwrap();
@@ -1580,7 +1969,7 @@ mod tests {
         assert_eq!(neighbors[0].id, active_id);
 
         eng.backend()
-            .set_graph_neighbors(cross_id.clone(), vec![active_id]);
+            .set_graph_neighbors(cross_id.clone(), vec![(active_id, 1)]);
         let cross_anchor_neighbors = eng.graph(cross_id, 2).await.unwrap();
         assert!(cross_anchor_neighbors.is_empty());
     }
@@ -1621,7 +2010,11 @@ mod tests {
         eng.backend().set_vector_results(Vec::new());
         eng.backend().set_graph_neighbors(
             anchor,
-            vec![cross_id.clone(), archived_id.clone(), active_id],
+            vec![
+                (cross_id.clone(), 1),
+                (archived_id.clone(), 1),
+                (active_id, 2),
+            ],
         );
 
         let results = eng.recall("topic", 10, None, &[]).await.unwrap();

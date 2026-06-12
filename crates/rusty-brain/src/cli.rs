@@ -143,6 +143,36 @@ pub enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Namespace administration (data-lifecycle helpers).
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum NamespaceCommand {
+    /// One-time rename: re-scope every memory (active and archived) from OLD
+    /// to NEW in one daemon transaction — memories, the vector-index partition
+    /// and a durable oplog record move together. Use after pinning a repo's
+    /// identity in `.rusty-brain.toml` to re-scope memories captured under the
+    /// heuristic directory-name namespace. Refuses a non-empty NEW namespace
+    /// unless `--merge` is passed. Restart any active agent sessions
+    /// afterwards: sessions resolve their namespace once at connect, so one
+    /// opened before the rename keeps writing to the old namespace (re-run
+    /// with `--merge` to sweep up stragglers).
+    Rename {
+        /// Source namespace: a bare project name (`my-proj`) or a full
+        /// namespace string (`project:my-proj`, `global`, `session:proj:sid`).
+        old: String,
+        /// Target namespace (same forms as OLD).
+        new: String,
+        /// Append into a NEW namespace that already has memories instead of
+        /// refusing; the combined counts are reported and logged.
+        #[arg(long)]
+        merge: bool,
+    },
 }
 
 #[cfg(test)]
@@ -203,6 +233,43 @@ mod tests {
         match cli.command {
             Command::Reembed { limit } => assert_eq!(limit, Some(250)),
             other => panic!("expected Reembed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_rename_parses_old_new_and_defaults_merge_off() {
+        let cli = Cli::parse_from(["rusty-brain", "namespace", "rename", "scratch", "rb"]);
+        match cli.command {
+            Command::Namespace {
+                command: NamespaceCommand::Rename { old, new, merge },
+            } => {
+                assert_eq!(old, "scratch");
+                assert_eq!(new, "rb");
+                assert!(!merge, "--merge defaults off (refuse-on-collision)");
+            }
+            other => panic!("expected Namespace Rename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_rename_accepts_merge_flag_and_db_string_forms() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "namespace",
+            "rename",
+            "project:scratch",
+            "global",
+            "--merge",
+        ]);
+        match cli.command {
+            Command::Namespace {
+                command: NamespaceCommand::Rename { old, new, merge },
+            } => {
+                assert_eq!(old, "project:scratch");
+                assert_eq!(new, "global");
+                assert!(merge);
+            }
+            other => panic!("expected Namespace Rename, got {other:?}"),
         }
     }
 

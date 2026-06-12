@@ -50,8 +50,10 @@ fn all_public_types_are_reachable_from_crate_root() {
     let res = SearchResult {
         memory: note,
         score: 1.0,
+        channels: rb_types::ChannelHits::default(),
     };
     assert!((res.score - 1.0).abs() < f32::EPSILON);
+    assert!(!res.channels.fts && !res.channels.vector && !res.channels.graph);
     let upd = MemoryUpdates {
         importance: Some(9),
         ..Default::default()

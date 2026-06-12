@@ -64,6 +64,24 @@ impl OpenAiCompatEnricher {
         Self::from_env_with(|key| std::env::var(key).ok())
     }
 
+    /// Build from explicit settings resolved by the caller (C1: env >
+    /// `~/.config/rusty-brain/config.toml`; the API key stays env-only — it is
+    /// a secret and never lives in the config file). Same activation rule as
+    /// [`Self::from_env`]: both `base_url` and `model` must be present and
+    /// non-empty, else `Ok(None)` (no LLM path, heuristic fallback).
+    pub fn from_settings(
+        base_url: Option<&str>,
+        model: Option<&str>,
+        api_key: Option<&str>,
+    ) -> rb_types::Result<Option<Self>> {
+        Self::from_env_with(|key| match key {
+            "RB_ENRICH_BASE_URL" => base_url.map(str::to_string),
+            "RB_ENRICH_MODEL" => model.map(str::to_string),
+            "RB_ENRICH_API_KEY" => api_key.map(str::to_string),
+            _ => None,
+        })
+    }
+
     /// Pure core: build from an injected config getter so tests can drive the
     /// opt-in logic without mutating process-global env (unsound under parallel
     /// `#[test]` on Rust 1.81+). The real `from_env` injects a closure over

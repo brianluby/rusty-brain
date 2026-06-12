@@ -233,29 +233,63 @@ coverage is still being expanded.
 
 ## Configuration
 
-Service configuration is via environment variables (there is no general config file
-for the core service yet). Two small files exist for namespace identity: a
-repo-committed `.rusty-brain.toml` at the git toplevel (`namespace = "..."`) pins a
-project's namespace across clones — it is read from the blob committed at `HEAD`
-(`git show HEAD:.rusty-brain.toml`), so untracked or uncommitted edits are ignored
-with a warning until committed — and a per-user pin store (`namespace-pins.toml`
-under the user state dir) records `CLAUDE.md` frontmatter overrides accepted via
-`rusty-brain --accept-namespace-override` — unpinned overrides are never silently
-honored.
+Daemon knobs live in a user config file: `~/.config/rusty-brain/config.toml`
+(or `$XDG_CONFIG_HOME/rusty-brain/config.toml`). Precedence, per knob:
 
-| Variable | Purpose |
-|---|---|
-| `RUSTY_BRAIN_DB` | SQLite database path (default under the user data dir: `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or `~/.local/share` on Linux). |
-| `RUSTY_BRAIN_SOCKET` | Unix socket path for the daemon. |
-| `RUSTY_BRAIN_NAMESPACE` | Skip namespace detection and use this namespace (same precedence as the global `--namespace` flag). |
-| `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` | Per-connection request idle timeout for the daemon (default 60; mainly for tests). |
-| `VOYAGE_API_KEY` | Selects the Voyage embedding provider when set. |
-| `RB_EMBED_BACKEND` | `local` forces the local ONNX provider (requires `--features local`). |
-| `RB_LOCAL_MODEL` | Local model name (implies local backend); defaults to `all-MiniLM-L6-v2`. |
-| `RB_ACCEPT_MODEL_CHANGE` | Opt in to an embedding-model swap on an existing DB (flag equivalent: `serve --accept-model-change`); follow with `rusty-brain reembed`. |
-| `RB_ENRICH_BASE_URL`, `RB_ENRICH_MODEL` | Optional LLM enrichment endpoint (off by default; heuristic enrichment is used otherwise). |
-| `RB_JOBS_CONFIG` | Path to an evolution-jobs TOML config for `serve` (jobs are disabled if absent). |
-| `RUST_LOG` | Log verbosity (logs go to stderr; stdout is reserved for results). |
+**CLI flag > environment variable > config file > built-in default.**
+
+Every binary — the CLI, the hooks, and the daemon — re-reads this file from
+disk itself, so a knob set here reaches **auto-started** daemons with no env
+forwarding. The auto-start env allowlist is therefore only secrets
+(`VOYAGE_API_KEY`, `RB_ENRICH_API_KEY`), identity fallback (`USER`/`LOGNAME`),
+and path resolution (`HOME`/`PATH`/`XDG_*`); the pre-existing knob env vars
+below stay supported for compatibility (env wins over the file), but new knobs
+are config-file-only. A missing file means all defaults; **unknown keys warn
+and are ignored** (forward compat); **malformed TOML fails closed** with a
+message naming the file. Secrets are deliberately env-only: the config file
+never holds credentials, and `accept_model_change` is deliberately not a file
+knob (consent must be explicit per model change).
+
+```toml
+# ~/.config/rusty-brain/config.toml — every key optional
+socket_path = "/run/user/1000/rusty-brain/sock"
+db_path = "/home/me/.local/share/rusty-brain/memory.db"
+idle_timeout_secs = 60
+jobs_config = "/home/me/.config/rusty-brain/jobs.toml"
+
+[embed]
+backend = "local"            # "local" forces the local ONNX provider
+local_model = "all-MiniLM-L6-v2"
+
+[enrich]
+base_url = "http://localhost:11434/v1"
+model = "llama3"             # both base_url and model required to activate
+```
+
+Two further small files exist for namespace identity (and identity ONLY — a
+repo-committed file must never be able to set sockets, paths, or backends): a
+repo-committed `.rusty-brain.toml` at the git toplevel (`namespace = "..."`)
+pins a project's namespace across clones — it is read from the blob committed
+at `HEAD` (`git show HEAD:.rusty-brain.toml`), so untracked or uncommitted
+edits are ignored with a warning until committed — and a per-user pin store
+(`namespace-pins.toml` under the user state dir) records `CLAUDE.md`
+frontmatter overrides accepted via `rusty-brain --accept-namespace-override` —
+unpinned overrides are never silently honored.
+
+| Variable | Config-file key | Purpose |
+|---|---|---|
+| `RUSTY_BRAIN_DB` | `db_path` | SQLite database path (default under the user data dir: `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or `~/.local/share` on Linux). |
+| `RUSTY_BRAIN_SOCKET` | `socket_path` | Unix socket path for the daemon. |
+| `RUSTY_BRAIN_NAMESPACE` | — | Skip namespace detection and use this namespace (same precedence as the global `--namespace` flag). |
+| `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` | `idle_timeout_secs` | Per-connection request idle timeout for the daemon (default 60; mainly for tests). |
+| `VOYAGE_API_KEY` | — (secret, env-only) | Selects the Voyage embedding provider when set. |
+| `RB_EMBED_BACKEND` | `embed.backend` | `local` forces the local ONNX provider (requires `--features local`). |
+| `RB_LOCAL_MODEL` | `embed.local_model` | Local model name (implies local backend); defaults to `all-MiniLM-L6-v2`. |
+| `RB_ACCEPT_MODEL_CHANGE` | — (deliberately env/flag-only) | Opt in to an embedding-model swap on an existing DB (flag equivalent: `serve --accept-model-change`); follow with `rusty-brain reembed`. |
+| `RB_ENRICH_BASE_URL`, `RB_ENRICH_MODEL` | `enrich.base_url`, `enrich.model` | Optional LLM enrichment endpoint (off by default; heuristic enrichment is used otherwise). |
+| `RB_ENRICH_API_KEY` | — (secret, env-only) | API key for the enrichment endpoint (optional, e.g. Ollama needs none). |
+| `RB_JOBS_CONFIG` | `jobs_config` | Path to an evolution-jobs TOML config for `serve` (jobs are disabled if absent). |
+| `RUST_LOG` | — | Log verbosity (logs go to stderr; stdout is reserved for results). |
 
 ## Workspace layout
 
@@ -311,6 +345,16 @@ The current test suite is about **correctness, not performance or quality**:
   deterministic (non-semantic) vectors. It guards **ranking determinism and
   relative-ordering regressions** — "did this change reorder results?" — and explicitly
   does **not** measure absolute semantic quality.
+- **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
+  scheduled macOS job drives a real headless Claude Code session (`claude -p`) against
+  freshly built binaries with hooks + MCP installed into an isolated `HOME`, then proves
+  capture → idle → recall against exactly one daemon and one `0600` database,
+  and greps the raw DB bytes for a planted fake AWS key (zero plaintext hits, redaction
+  marker present). It is scheduled-only — it never gates PRs — and on failure it opens
+  or updates a pinned issue titled "nightly claude smoke failing". It requires the
+  **`ANTHROPIC_API_KEY`** repository secret (small spend: the session runs
+  `--model haiku --max-budget-usd 1`). Run it locally with
+  `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
 
 **Not yet tested:** performance and latency, behavior at scale (large corpora, many
 concurrent clients), real-world semantic recall quality with a production embedding

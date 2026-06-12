@@ -15,7 +15,7 @@ mod voyage;
 pub use deterministic::DeterministicProvider;
 #[cfg(feature = "local")]
 pub use local::LocalProvider;
-pub use provider::EmbeddingProvider;
+pub use provider::{EmbedKind, EmbeddingProvider};
 pub use voyage::VoyageProvider;
 
 #[cfg(all(test, feature = "local"))]

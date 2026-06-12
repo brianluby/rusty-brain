@@ -1,4 +1,4 @@
-use crate::provider::EmbeddingProvider;
+use crate::provider::{EmbedKind, EmbeddingProvider};
 use async_trait::async_trait;
 use sha2::{Digest, Sha256};
 
@@ -57,7 +57,10 @@ impl EmbeddingProvider for DeterministicProvider {
         self.dim
     }
 
-    async fn embed(&self, texts: &[String]) -> rb_types::Result<Vec<Vec<f32>>> {
+    /// The kind is IGNORED by design (W1.4): deterministic vectors are a pure
+    /// function of the text, so persisted corpora and the committed eval
+    /// baselines stay valid — `embed(t, Query) == embed(t, Document)` always.
+    async fn embed(&self, texts: &[String], _kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
         Ok(texts.iter().map(|t| self.embed_one(t)).collect())
     }
 }
@@ -79,7 +82,7 @@ mod tests {
     async fn embed_returns_one_vector_per_input_of_correct_length() {
         let p = DeterministicProvider::new(8);
         let inputs = vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()];
-        let out = p.embed(&inputs).await.unwrap();
+        let out = p.embed(&inputs, EmbedKind::Document).await.unwrap();
         assert_eq!(out.len(), 3);
         for v in &out {
             assert_eq!(v.len(), 8);
@@ -89,16 +92,39 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn same_text_yields_same_vector() {
         let p = DeterministicProvider::new(16);
-        let a = p.embed(&["repeatable".to_string()]).await.unwrap();
-        let b = p.embed(&["repeatable".to_string()]).await.unwrap();
+        let a = p
+            .embed(&["repeatable".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
+        let b = p
+            .embed(&["repeatable".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         assert_eq!(a, b);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn kind_blindness_query_equals_document_for_identical_text() {
+        // W1.4 invariant: DeterministicProvider MUST ignore the EmbedKind so
+        // persisted corpora and the committed eval baselines stay valid.
+        let p = DeterministicProvider::new(16);
+        let texts = vec!["identical text".to_string(), "another one".to_string()];
+        let as_query = p.embed(&texts, EmbedKind::Query).await.unwrap();
+        let as_document = p.embed(&texts, EmbedKind::Document).await.unwrap();
+        assert_eq!(
+            as_query, as_document,
+            "deterministic embed must be kind-blind: embed_query == embed_document"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn vector_values_are_stable_for_persisted_embeddings() {
         let p = DeterministicProvider::new(4);
         let out = p
-            .embed(&["stable persisted vector".to_string()])
+            .embed(
+                &["stable persisted vector".to_string()],
+                EmbedKind::Document,
+            )
             .await
             .unwrap();
         let expected = [
@@ -120,7 +146,7 @@ mod tests {
     async fn different_text_yields_different_vector() {
         let p = DeterministicProvider::new(16);
         let out = p
-            .embed(&["one".to_string(), "two".to_string()])
+            .embed(&["one".to_string(), "two".to_string()], EmbedKind::Document)
             .await
             .unwrap();
         assert_ne!(out[0], out[1]);
@@ -131,10 +157,15 @@ mod tests {
         let p = DeterministicProvider::new(16);
         let inputs = vec!["x".to_string(), "y".to_string(), "z".to_string()];
         // Embedding the list at once must equal embedding each item alone, in order.
-        let batched = p.embed(&inputs).await.unwrap();
+        let batched = p.embed(&inputs, EmbedKind::Document).await.unwrap();
         let mut individually = Vec::new();
         for t in &inputs {
-            individually.push(p.embed(std::slice::from_ref(t)).await.unwrap()[0].clone());
+            individually.push(
+                p.embed(std::slice::from_ref(t), EmbedKind::Document)
+                    .await
+                    .unwrap()[0]
+                    .clone(),
+            );
         }
         assert_eq!(batched, individually);
     }
@@ -142,14 +173,17 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn empty_input_yields_empty_output() {
         let p = DeterministicProvider::new(4);
-        let out = p.embed(&[]).await.unwrap();
+        let out = p.embed(&[], EmbedKind::Document).await.unwrap();
         assert!(out.is_empty());
     }
 
     #[tokio::test(flavor = "multi_thread")]
     async fn vectors_are_unit_length() {
         let p = DeterministicProvider::new(32);
-        let out = p.embed(&["normalize me".to_string()]).await.unwrap();
+        let out = p
+            .embed(&["normalize me".to_string()], EmbedKind::Document)
+            .await
+            .unwrap();
         let norm: f32 = out[0].iter().map(|x| x * x).sum::<f32>().sqrt();
         assert!(
             (norm - 1.0).abs() < 1e-5,

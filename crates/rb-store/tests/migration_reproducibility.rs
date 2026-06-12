@@ -101,8 +101,8 @@ fn fresh_db_exercises_every_query_path() {
 
     let neighbors = store.graph_neighbors(&a.id, 1).unwrap();
     assert!(
-        neighbors.contains(&b.id),
-        "graph_neighbors must reach b from a at depth 1"
+        neighbors.contains(&(b.id.clone(), 1)),
+        "graph_neighbors must reach b from a at hop distance 1"
     );
 
     // --- list: active only, ORDER BY created_at DESC

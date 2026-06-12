@@ -1,12 +1,26 @@
 //! `rb_config`: the single source of truth for cross-crate configuration
-//! contracts — default socket/db paths, config-bearing env-var names, and the
-//! auto-start env allowlist. Every binary (daemon, CLI, hooks) resolves through
-//! this crate so they can never disagree on where the daemon lives.
+//! contracts — default socket/db paths, config-bearing env-var names, the
+//! user config file (`~/.config/rusty-brain/config.toml`, see [`file`]), and
+//! the auto-start env allowlist. Every binary (daemon, CLI, hooks) resolves
+//! through this crate so they can never disagree on where the daemon lives.
+//!
+//! Knob precedence everywhere: CLI flag > env var > user config file >
+//! built-in default ([`EffectiveConfig::resolve`]). The env allowlist for
+//! auto-started daemon children is now **secrets + identity + XDG/HOME only**
+//! ([`FORWARD_ENV`]); daemon knobs reach auto-started daemons through the
+//! config file, which each process re-reads from disk itself (the C1/F20-class
+//! fix). The pre-C1 knob env vars stay supported via [`LEGACY_KNOB_ENV`] —
+//! frozen, never extended.
 
+pub mod file;
 pub mod namespace;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+pub use file::{
+    config_file_path, load_file_config, parse_file_config, EmbedFileConfig, EnrichFileConfig,
+    FileConfig, LoadedFileConfig,
+};
 use rb_types::{Error, Result};
 
 /// Env var that overrides the daemon socket path.
@@ -26,38 +40,74 @@ pub const ACCEPT_MODEL_CHANGE_ENV: &str = "RB_ACCEPT_MODEL_CHANGE";
 /// whole seconds (default 60). Parse failures fall back to the default; mainly
 /// for tests, which need the idle/reconnect path to run in seconds.
 pub const IDLE_TIMEOUT_ENV: &str = "RUSTY_BRAIN_IDLE_TIMEOUT_SECS";
+/// Env var that selects the embedding backend (`local` forces the local ONNX
+/// provider). Config-file equivalent: `embed.backend`.
+pub const EMBED_BACKEND_ENV: &str = "RB_EMBED_BACKEND";
+/// Env var naming the local embedding model (implies the local backend).
+/// Config-file equivalent: `embed.local_model`.
+pub const LOCAL_MODEL_ENV: &str = "RB_LOCAL_MODEL";
+/// Env var for the opt-in LLM-enrichment base URL. Config-file equivalent:
+/// `enrich.base_url`.
+pub const ENRICH_BASE_URL_ENV: &str = "RB_ENRICH_BASE_URL";
+/// Env var for the opt-in LLM-enrichment model. Config-file equivalent:
+/// `enrich.model`.
+pub const ENRICH_MODEL_ENV: &str = "RB_ENRICH_MODEL";
 
 /// The exact set of parent env vars an auto-start daemon child may inherit.
 /// Everything else is cleared before spawn (no parent-env leak into a
-/// long-lived detached process). Keep this list minimal — adding a var widens
-/// the leak surface and must fail the allowlist tests in every spawner.
+/// long-lived detached process).
+///
+/// C1 contract: this list is **secrets + provenance identity + path/config
+/// resolution only** and must never grow a daemon knob again. Knobs live in
+/// the user config file (see [`file`]), which the child re-reads from disk
+/// itself — that is how config reaches an auto-started daemon without env
+/// forwarding (the F20-class fix). The pre-C1 knob vars remain forwarded for
+/// compatibility via [`LEGACY_KNOB_ENV`], which is frozen.
 pub const FORWARD_ENV: &[&str] = &[
-    // Embedding provider selection + credentials.
+    // Secrets (env-only by design; the config file never holds credentials).
     "VOYAGE_API_KEY",
-    "RB_EMBED_BACKEND",
-    "RB_LOCAL_MODEL",
-    // Opt-in LLM enrichment.
-    "RB_ENRICH_BASE_URL",
-    "RB_ENRICH_MODEL",
     "RB_ENRICH_API_KEY",
-    // Evolution-jobs config file.
-    "RB_JOBS_CONFIG",
-    // Explicit opt-in to an embedding-model swap (corpus re-embed).
-    "RB_ACCEPT_MODEL_CHANGE",
-    // Request idle timeout override; safe to forward (defaulted when unset).
-    "RUSTY_BRAIN_IDLE_TIMEOUT_SECS",
     // Provenance fallback for clients that declare no identity (W0.5):
     // `current_user()` reads USER/LOGNAME, so an env_clear'd auto-started
     // daemon would otherwise stamp no origin user.
     "USER",
     "LOGNAME",
-    // Path resolution inside the child.
+    // Path + config-file resolution inside the child: the child re-reads
+    // `config.toml` itself, so HOME / XDG_CONFIG_HOME must survive the spawn.
     "HOME",
     "PATH",
     "XDG_RUNTIME_DIR",
     "XDG_DATA_HOME",
     "XDG_CONFIG_HOME",
 ];
+
+/// Pre-C1 daemon-knob env vars, kept working for compatibility (env still
+/// wins over the config file). Spawners forward these only when explicitly
+/// set in the parent, so existing env-based setups keep reaching auto-started
+/// daemons.
+///
+/// FROZEN: never add to this list. A new daemon knob goes in the config file
+/// (and optionally gets an env override read by the daemon process itself);
+/// it must NOT need spawn-time forwarding — that requirement is exactly the
+/// F20 bug class this crate retired. The freeze is pinned by
+/// `legacy_knob_env_is_frozen`.
+pub const LEGACY_KNOB_ENV: &[&str] = &[
+    EMBED_BACKEND_ENV,
+    LOCAL_MODEL_ENV,
+    ENRICH_BASE_URL_ENV,
+    ENRICH_MODEL_ENV,
+    JOBS_CONFIG_ENV,
+    ACCEPT_MODEL_CHANGE_ENV,
+    IDLE_TIMEOUT_ENV,
+];
+
+/// Every env var a spawner forwards into an auto-started daemon child:
+/// [`FORWARD_ENV`] (secrets + identity + XDG/HOME) plus the frozen
+/// [`LEGACY_KNOB_ENV`] compatibility knobs. Both spawners (CLI and hooks)
+/// iterate this so they can never disagree.
+pub fn spawn_forward_env() -> impl Iterator<Item = &'static str> {
+    FORWARD_ENV.iter().chain(LEGACY_KNOB_ENV.iter()).copied()
+}
 
 fn nonempty_env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name)
@@ -179,19 +229,147 @@ fn env_override(name: &str) -> Option<PathBuf> {
     }
 }
 
-/// Resolve the socket path: `RUSTY_BRAIN_SOCKET` override, else the default.
-pub fn socket_path_from_env() -> Result<PathBuf> {
-    match env_override(SOCKET_ENV) {
-        Some(p) => Ok(p),
-        None => default_socket_path(),
+/// A config-file string knob: trimmed, empty treated as unset (same spirit as
+/// [`env_override`] — `backend = ""` is not a selection).
+fn file_string(value: &Option<String>) -> Option<String> {
+    value
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+/// A config-file path knob: whitespace-only treated as unset (TOML strings are
+/// always UTF-8, so the trim rule is total here).
+fn file_path(value: &Option<PathBuf>) -> Option<PathBuf> {
+    value
+        .as_deref()
+        .filter(|p| p.to_str().is_none_or(|s| !s.trim().is_empty()))
+        .map(Path::to_path_buf)
+}
+
+/// An env string knob: trimmed, empty/whitespace-only/unset treated as unset.
+fn env_string(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .map(|v| v.trim().to_string())
+        .filter(|v| !v.is_empty())
+}
+
+/// Resolve the socket path: `RUSTY_BRAIN_SOCKET` override, else the config
+/// file, else the default. Fails closed on a malformed config file even when
+/// the env override is set — a broken file is fixed, not silently bypassed.
+pub fn resolve_socket_path() -> Result<PathBuf> {
+    let loaded = file::load_file_config()?;
+    socket_path_with(&loaded.config)
+}
+
+/// Resolve the database path: `RUSTY_BRAIN_DB` override, else the config file,
+/// else the default. Same fail-closed rule as [`resolve_socket_path`].
+pub fn resolve_db_path() -> Result<PathBuf> {
+    let loaded = file::load_file_config()?;
+    db_path_with(&loaded.config)
+}
+
+fn socket_path_with(config: &FileConfig) -> Result<PathBuf> {
+    if let Some(p) = env_override(SOCKET_ENV) {
+        return Ok(p);
+    }
+    if let Some(p) = file_path(&config.socket_path) {
+        return Ok(p);
+    }
+    default_socket_path()
+}
+
+fn db_path_with(config: &FileConfig) -> Result<PathBuf> {
+    if let Some(p) = env_override(DB_ENV) {
+        return Ok(p);
+    }
+    if let Some(p) = file_path(&config.db_path) {
+        return Ok(p);
+    }
+    default_db_path()
+}
+
+/// The idle timeout: env (must parse as whole seconds > 0; anything else
+/// warns and is ignored) > config file (`0` warns and is ignored) > `None`
+/// (the daemon's built-in 60s default).
+fn resolve_idle_timeout_secs(file_value: Option<u64>, warnings: &mut Vec<String>) -> Option<u64> {
+    if let Ok(raw) = std::env::var(IDLE_TIMEOUT_ENV) {
+        let trimmed = raw.trim();
+        if !trimmed.is_empty() {
+            match trimmed.parse::<u64>() {
+                Ok(secs) if secs > 0 => return Some(secs),
+                _ => warnings.push(format!(
+                    "ignoring invalid {IDLE_TIMEOUT_ENV}={trimmed:?} (want whole seconds > 0)"
+                )),
+            }
+        }
+    }
+    match file_value {
+        Some(0) => {
+            warnings.push("ignoring idle_timeout_secs = 0 in config file (want > 0)".to_string());
+            None
+        }
+        other => other,
     }
 }
 
-/// Resolve the database path: `RUSTY_BRAIN_DB` override, else the default.
-pub fn db_path_from_env() -> Result<PathBuf> {
-    match env_override(DB_ENV) {
-        Some(p) => Ok(p),
-        None => default_db_path(),
+/// The fully resolved per-process configuration: env var > user config file >
+/// built-in default, per knob (CLI flags are applied above this by the
+/// binaries). Resolved identically by the CLI, the hooks, and the daemon —
+/// which re-reads the config file from disk itself, so a file-set knob reaches
+/// an auto-started daemon with no env forwarding (C1, the F20-class fix).
+///
+/// Secrets (`VOYAGE_API_KEY`, `RB_ENRICH_API_KEY`) are deliberately absent:
+/// they are env-only and never pass through this struct (it derives `Debug`).
+#[derive(Debug, Clone)]
+pub struct EffectiveConfig {
+    /// Daemon Unix-socket path.
+    pub socket_path: PathBuf,
+    /// SQLite database path.
+    pub db_path: PathBuf,
+    /// Embedding backend selector (`"local"` forces the local provider).
+    pub embed_backend: Option<String>,
+    /// Local embedding model name (implies the local backend).
+    pub local_model: Option<String>,
+    /// LLM-enrichment base URL (active only together with `enrich_model`).
+    pub enrich_base_url: Option<String>,
+    /// LLM-enrichment model name.
+    pub enrich_model: Option<String>,
+    /// Evolution-jobs TOML path.
+    pub jobs_config: Option<PathBuf>,
+    /// Per-connection request idle timeout in seconds; `None` = daemon default.
+    pub idle_timeout_secs: Option<u64>,
+    /// Non-fatal findings (unknown config keys, ignored invalid values).
+    /// Callers surface these (`tracing::warn!`); they never fail resolution.
+    pub warnings: Vec<String>,
+}
+
+impl EffectiveConfig {
+    /// Resolve every knob from the process env and the user config file.
+    /// Fails closed on a malformed config file (message names the file) and
+    /// when neither HOME nor XDG vars can ground the default paths.
+    pub fn resolve() -> Result<Self> {
+        let loaded = file::load_file_config()?;
+        let mut warnings = loaded.warnings;
+        let config = loaded.config;
+        let idle_timeout_secs = resolve_idle_timeout_secs(config.idle_timeout_secs, &mut warnings);
+        Ok(Self {
+            socket_path: socket_path_with(&config)?,
+            db_path: db_path_with(&config)?,
+            embed_backend: env_string(EMBED_BACKEND_ENV)
+                .or_else(|| file_string(&config.embed.backend)),
+            local_model: env_string(LOCAL_MODEL_ENV)
+                .or_else(|| file_string(&config.embed.local_model)),
+            enrich_base_url: env_string(ENRICH_BASE_URL_ENV)
+                .or_else(|| file_string(&config.enrich.base_url)),
+            enrich_model: env_string(ENRICH_MODEL_ENV)
+                .or_else(|| file_string(&config.enrich.model)),
+            jobs_config: env_override(JOBS_CONFIG_ENV).or_else(|| file_path(&config.jobs_config)),
+            idle_timeout_secs,
+            warnings,
+        })
     }
 }
 
@@ -248,6 +426,41 @@ mod tests {
             std::env::set_var(name, value);
             Self { name, previous }
         }
+
+        fn remove(name: &'static str) -> Self {
+            let previous = std::env::var_os(name);
+            std::env::remove_var(name);
+            Self { name, previous }
+        }
+    }
+
+    /// Point config-file resolution at an isolated tempdir (so a developer's
+    /// real `~/.config/rusty-brain/config.toml` can never leak into tests) and
+    /// clear every knob env var. Returns the guards plus the config dir.
+    fn isolated_config_env() -> (Vec<EnvGuard>, tempfile::TempDir) {
+        let confdir = tempfile::tempdir().unwrap();
+        let mut guards = vec![EnvGuard::set("XDG_CONFIG_HOME", confdir.path())];
+        for name in [
+            SOCKET_ENV,
+            DB_ENV,
+            JOBS_CONFIG_ENV,
+            IDLE_TIMEOUT_ENV,
+            EMBED_BACKEND_ENV,
+            LOCAL_MODEL_ENV,
+            ENRICH_BASE_URL_ENV,
+            ENRICH_MODEL_ENV,
+        ] {
+            guards.push(EnvGuard::remove(name));
+        }
+        (guards, confdir)
+    }
+
+    /// Write `text` as the user config file under `confdir` (which is the
+    /// XDG_CONFIG_HOME the guards point at).
+    fn write_config(confdir: &tempfile::TempDir, text: &str) {
+        let dir = confdir.path().join("rusty-brain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), text).unwrap();
     }
 
     impl Drop for EnvGuard {
@@ -311,13 +524,14 @@ mod tests {
     #[test]
     fn env_overrides_win_when_set_to_a_real_path() {
         let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, _confdir) = isolated_config_env();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("override.sock");
         let db = dir.path().join("override.db");
         let _g1 = EnvGuard::set(SOCKET_ENV, &sock);
         let _g2 = EnvGuard::set(DB_ENV, &db);
-        assert_eq!(socket_path_from_env().unwrap(), sock);
-        assert_eq!(db_path_from_env().unwrap(), db);
+        assert_eq!(resolve_socket_path().unwrap(), sock);
+        assert_eq!(resolve_db_path().unwrap(), db);
     }
 
     // W0.2: a whitespace-only override is not a path. Every binary must fall
@@ -325,13 +539,14 @@ mod tests {
     #[test]
     fn whitespace_only_env_overrides_fall_back_to_defaults() {
         let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, _confdir) = isolated_config_env();
         let _g1 = EnvGuard::set(SOCKET_ENV, std::path::Path::new("  "));
         let _g2 = EnvGuard::set(DB_ENV, std::path::Path::new("  "));
         assert_eq!(
-            socket_path_from_env().unwrap(),
+            resolve_socket_path().unwrap(),
             default_socket_path().unwrap()
         );
-        assert_eq!(db_path_from_env().unwrap(), default_db_path().unwrap());
+        assert_eq!(resolve_db_path().unwrap(), default_db_path().unwrap());
     }
 
     // Overrides are raw filesystem paths: a non-UTF-8 value must be honored
@@ -341,9 +556,155 @@ mod tests {
     fn non_utf8_env_override_is_honored_as_a_path() {
         use std::os::unix::ffi::OsStrExt as _;
         let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, _confdir) = isolated_config_env();
         let raw = std::ffi::OsStr::from_bytes(b"/tmp/rb-\xff-override.db");
         let _g = EnvGuard::set(DB_ENV, std::path::Path::new(raw));
-        assert_eq!(db_path_from_env().unwrap(), PathBuf::from(raw));
+        assert_eq!(resolve_db_path().unwrap(), PathBuf::from(raw));
+    }
+
+    // C1 precedence matrix, per knob: env var > config file > built-in
+    // default. Asserted for the four agreement-test knobs (socket, db, embed
+    // backend, idle timeout).
+    #[test]
+    fn precedence_is_env_then_file_then_default() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            socket_path = "/file/rb.sock"
+            db_path = "/file/rb.db"
+            idle_timeout_secs = 30
+
+            [embed]
+            backend = "local"
+            "#,
+        );
+
+        // File over default (no env set).
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.socket_path, PathBuf::from("/file/rb.sock"));
+        assert_eq!(effective.db_path, PathBuf::from("/file/rb.db"));
+        assert_eq!(effective.embed_backend.as_deref(), Some("local"));
+        assert_eq!(effective.idle_timeout_secs, Some(30));
+
+        // Env over file.
+        let _e1 = EnvGuard::set(SOCKET_ENV, std::path::Path::new("/env/rb.sock"));
+        let _e2 = EnvGuard::set(DB_ENV, std::path::Path::new("/env/rb.db"));
+        let _e3 = EnvGuard::set(EMBED_BACKEND_ENV, std::path::Path::new("voyage"));
+        let _e4 = EnvGuard::set(IDLE_TIMEOUT_ENV, std::path::Path::new("5"));
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.socket_path, PathBuf::from("/env/rb.sock"));
+        assert_eq!(effective.db_path, PathBuf::from("/env/rb.db"));
+        assert_eq!(effective.embed_backend.as_deref(), Some("voyage"));
+        assert_eq!(effective.idle_timeout_secs, Some(5));
+    }
+
+    #[test]
+    fn defaults_apply_when_neither_env_nor_file_set_a_knob() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "");
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.socket_path, default_socket_path().unwrap());
+        assert_eq!(effective.db_path, default_db_path().unwrap());
+        assert_eq!(effective.embed_backend, None);
+        assert_eq!(effective.local_model, None);
+        assert_eq!(effective.enrich_base_url, None);
+        assert_eq!(effective.enrich_model, None);
+        assert_eq!(effective.jobs_config, None);
+        assert_eq!(effective.idle_timeout_secs, None);
+        assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    // C1 agreement: with the config file as the ONLY source, the path
+    // resolvers used by the hooks (`resolve_socket_path`/`resolve_db_path`)
+    // and the full resolution used by CLI + daemon (`EffectiveConfig`) yield
+    // the identical values — one truth for every binary.
+    #[test]
+    fn hook_resolvers_agree_with_effective_config_from_file_only() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            socket_path = "/file-only/rb.sock"
+            db_path = "/file-only/rb.db"
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(resolve_socket_path().unwrap(), effective.socket_path);
+        assert_eq!(resolve_db_path().unwrap(), effective.db_path);
+        assert_eq!(effective.socket_path, PathBuf::from("/file-only/rb.sock"));
+        assert_eq!(effective.db_path, PathBuf::from("/file-only/rb.db"));
+    }
+
+    // The config file is found via XDG_CONFIG_HOME (and that var is on
+    // FORWARD_ENV, so an auto-started daemon re-reads the same file).
+    #[test]
+    fn xdg_config_home_locates_the_config_file() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        assert_eq!(
+            config_file_path().unwrap(),
+            confdir.path().join("rusty-brain").join("config.toml")
+        );
+    }
+
+    // Malformed TOML fails closed with the file path in the message — even
+    // when env overrides are set. A broken config file is fixed, not silently
+    // bypassed (half-env, half-broken-file resolution is the divergence trap).
+    #[test]
+    fn malformed_config_file_fails_closed_even_with_env_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "socket_path = [broken");
+        let _g = EnvGuard::set(SOCKET_ENV, std::path::Path::new("/env/rb.sock"));
+        let err = resolve_socket_path().unwrap_err();
+        assert!(
+            err.to_string().contains("config.toml"),
+            "error must name the config file: {err}"
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(err.to_string().contains("config.toml"), "{err}");
+    }
+
+    // Unknown keys warn (forward compat) but never fail resolution.
+    #[test]
+    fn unknown_config_keys_surface_as_warnings_not_errors() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "future_knob = 1\n");
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.warnings.len(), 1, "{:?}", effective.warnings);
+        assert!(effective.warnings[0].contains("future_knob"));
+    }
+
+    // An invalid idle override (env or file) warns and falls through instead
+    // of producing an instantly-dying or never-dying connection.
+    #[test]
+    fn invalid_idle_timeout_values_warn_and_fall_through() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "idle_timeout_secs = 30\n");
+        let _g = EnvGuard::set(IDLE_TIMEOUT_ENV, std::path::Path::new("soon"));
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(
+            effective.idle_timeout_secs,
+            Some(30),
+            "garbage env must fall through to the file value"
+        );
+        assert!(
+            effective.warnings.iter().any(|w| w.contains("soon")),
+            "{:?}",
+            effective.warnings
+        );
+
+        write_config(&confdir, "idle_timeout_secs = 0\n");
+        let _g0 = EnvGuard::remove(IDLE_TIMEOUT_ENV);
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.idle_timeout_secs, None, "0 is not a timeout");
+        assert!(!effective.warnings.is_empty());
     }
 
     #[test]
@@ -358,21 +719,63 @@ mod tests {
         );
     }
 
-    // Regression for the F20 allowlist gap: an auto-started daemon must see the
-    // embedding-backend selection, the local-model choice, and the jobs config —
-    // otherwise it silently degrades to defaults the user never chose.
+    // C1: the allowlist is secrets + provenance identity + path/config
+    // resolution ONLY. Daemon knobs must never re-enter it — they reach
+    // auto-started daemons through the config file the child reads itself.
     #[test]
-    fn forward_env_includes_the_previously_missing_config_vars() {
-        for var in ["RB_EMBED_BACKEND", "RB_LOCAL_MODEL", "RB_JOBS_CONFIG"] {
-            assert!(FORWARD_ENV.contains(&var), "FORWARD_ENV must include {var}");
+    fn forward_env_is_secrets_identity_and_path_resolution_only() {
+        assert_eq!(
+            FORWARD_ENV,
+            &[
+                "VOYAGE_API_KEY",
+                "RB_ENRICH_API_KEY",
+                "USER",
+                "LOGNAME",
+                "HOME",
+                "PATH",
+                "XDG_RUNTIME_DIR",
+                "XDG_DATA_HOME",
+                "XDG_CONFIG_HOME",
+            ],
+            "FORWARD_ENV must stay secrets + identity + XDG/HOME; \
+             a new daemon knob goes in config.toml, never here (F20 class)"
+        );
+        for knob in LEGACY_KNOB_ENV {
+            assert!(
+                !FORWARD_ENV.contains(knob),
+                "knob {knob} must not be on FORWARD_ENV"
+            );
         }
     }
 
-    // W0.1: an auto-started daemon must honor the injected idle timeout, or the
-    // idle/reconnect e2e cannot shrink the 60s default down to test scale.
+    // C1 freeze: the compatibility knob list never grows. New knobs are
+    // config-file knobs; if you are editing this test to add a var, you are
+    // reintroducing the F20 bug class — stop and put it in FileConfig instead.
     #[test]
-    fn forward_env_includes_the_idle_timeout_override() {
-        assert!(FORWARD_ENV.contains(&IDLE_TIMEOUT_ENV));
+    fn legacy_knob_env_is_frozen() {
+        assert_eq!(
+            LEGACY_KNOB_ENV,
+            &[
+                "RB_EMBED_BACKEND",
+                "RB_LOCAL_MODEL",
+                "RB_ENRICH_BASE_URL",
+                "RB_ENRICH_MODEL",
+                "RB_JOBS_CONFIG",
+                "RB_ACCEPT_MODEL_CHANGE",
+                "RUSTY_BRAIN_IDLE_TIMEOUT_SECS",
+            ]
+        );
+    }
+
+    // Compat: every pre-C1 env knob still reaches an auto-started daemon when
+    // explicitly set in the parent (env wins over file), via the spawn union.
+    #[test]
+    fn spawn_forward_env_is_the_union_of_allowlist_and_legacy_knobs() {
+        let spawned: Vec<&str> = spawn_forward_env().collect();
+        for var in FORWARD_ENV.iter().chain(LEGACY_KNOB_ENV) {
+            assert!(spawned.contains(var), "spawn list must include {var}");
+        }
+        assert_eq!(spawned.len(), FORWARD_ENV.len() + LEGACY_KNOB_ENV.len());
     }
 
     // W0.5 provenance fallback: the daemon stamps `current_user()` (USER then
@@ -389,7 +792,8 @@ mod tests {
     fn forward_env_never_forwards_socket_or_db_overrides() {
         // Spawners pass the RESOLVED socket/db explicitly; forwarding the raw
         // override vars too would let a stale parent value shadow them.
-        assert!(!FORWARD_ENV.contains(&SOCKET_ENV));
-        assert!(!FORWARD_ENV.contains(&DB_ENV));
+        let spawned: Vec<&str> = spawn_forward_env().collect();
+        assert!(!spawned.contains(&SOCKET_ENV));
+        assert!(!spawned.contains(&DB_ENV));
     }
 }

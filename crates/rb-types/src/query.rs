@@ -14,11 +14,33 @@ pub struct SearchQuery {
     pub limit: usize,
 }
 
+/// Which retrieval channels surfaced a recall hit (W1.0 hit-contribution
+/// attribution). A result can be multi-attributed: each flag is `true` when
+/// that channel's candidate set contained the memory *before* fusion, so the
+/// flags describe contribution, not exclusivity. `Default` (all `false`) is
+/// the wire-compat value for frames produced before this field existed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelHits {
+    /// The FTS keyword channel surfaced this candidate.
+    #[serde(default)]
+    pub fts: bool,
+    /// The vector (embedding KNN) channel surfaced this candidate.
+    #[serde(default)]
+    pub vector: bool,
+    /// The graph-expansion channel surfaced this candidate.
+    #[serde(default)]
+    pub graph: bool,
+}
+
 /// A single ranked search hit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
     pub memory: MemoryNote,
     pub score: f32,
+    /// Per-channel hit attribution (W1.0). `#[serde(default)]` (all-`false`)
+    /// keeps old frames decodable — the `contested` additive-field precedent.
+    #[serde(default)]
+    pub channels: ChannelHits,
 }
 
 /// Partial update for a memory; `None` fields are left unchanged.
@@ -78,11 +100,41 @@ mod tests {
         let result = SearchResult {
             memory: memory.clone(),
             score: 0.9,
+            channels: ChannelHits {
+                fts: true,
+                vector: true,
+                graph: false,
+            },
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: SearchResult = serde_json::from_str(&json).unwrap();
         assert_eq!(back.memory, memory);
         assert!((back.score - 0.9).abs() < f32::EPSILON);
+        assert!(back.channels.fts);
+        assert!(back.channels.vector);
+        assert!(!back.channels.graph);
+    }
+
+    #[test]
+    fn search_result_without_channels_field_decodes_to_default() {
+        // Wire compat: a frame serialized before `channels` existed must still
+        // decode, with all-false attribution (the additive-field precedent).
+        let memory = MemoryNote::new(
+            Namespace::Global,
+            "content".to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        let mut value = serde_json::to_value(SearchResult {
+            memory,
+            score: 0.5,
+            channels: ChannelHits::default(),
+        })
+        .unwrap();
+        value.as_object_mut().unwrap().remove("channels").unwrap();
+        let back: SearchResult = serde_json::from_value(value).unwrap();
+        assert_eq!(back.channels, ChannelHits::default());
+        assert!(!back.channels.fts && !back.channels.vector && !back.channels.graph);
     }
 
     #[test]

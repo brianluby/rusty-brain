@@ -113,12 +113,41 @@ pub enum Request {
     /// The stream is scoped to the connection's handshake namespace, filtered
     /// server-side.
     Subscribe,
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory row
+    /// from `old` to `new` in ONE writer transaction (memories, vec0 partition
+    /// rows, one oplog entry). Refuses a non-empty `new` unless `merge` is set.
+    /// Additive variant per the `Handshake.identity` precedent: an old daemon
+    /// fails to decode it and closes the connection (no CONTRACT_VERSION
+    /// bump); `merge` is `#[serde(default)]` so its absence decodes to false.
+    NamespaceRename {
+        old: Namespace,
+        new: Namespace,
+        #[serde(default)]
+        merge: bool,
+    },
 }
 
 /// Serde default for `Request::Remember::confidence`: full trust, the
 /// pre-W0.5 hardwired value.
 fn default_confidence() -> f32 {
     1.0
+}
+
+/// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
+/// the daemon status path (`Ping` -> `Pong`). Counts are cumulative since
+/// daemon start and cheap: `recalls` is the number of recall requests served;
+/// the per-channel fields count returned results that channel contributed (a
+/// result surfaced by several channels increments each of them).
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct RecallChannelTotals {
+    #[serde(default)]
+    pub recalls: u64,
+    #[serde(default)]
+    pub fts_hits: u64,
+    #[serde(default)]
+    pub vector_hits: u64,
+    #[serde(default)]
+    pub graph_hits: u64,
 }
 
 /// One response per request. Internally tagged on `result`.
@@ -131,6 +160,14 @@ pub enum Response {
     },
     Recalled {
         results: Vec<SearchResult>,
+        /// `true` when recall DEGRADED to keyword+graph because the embedder
+        /// errored (W1.6d / F19). Additive + `#[serde(default)]`: an old
+        /// daemon omits it (`false`) and an old client ignores it, so NO
+        /// contract-version bump is needed — the `Pong.recall_channels`
+        /// precedent. `skip_serializing_if` keeps a non-degraded Recalled
+        /// frame byte-identical to the pre-W1.6 shape.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        degraded: bool,
     },
     Got {
         memory: Option<MemoryNote>,
@@ -150,11 +187,28 @@ pub enum Response {
     },
     Pong {
         contract_version: u32,
+        /// Aggregate per-channel recall hit-contribution counters since daemon
+        /// start (W1.0). Additive + `#[serde(default)]`: an old daemon omits it
+        /// (`None`) and an old client ignores it, so NO contract-version bump
+        /// is needed — the `Handshake.identity` precedent. Only the daemon's
+        /// real Ping path populates it; internal pseudo-Pongs leave it `None`.
+        /// `skip_serializing_if` keeps a `None` Pong byte-identical to the
+        /// pre-W1.0 frame.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        recall_channels: Option<RecallChannelTotals>,
     },
     JobRan {
         scanned: u64,
         changed: u64,
         skipped: u64,
+    },
+    /// Reply to `Request::NamespaceRename`: `moved` memories rows were
+    /// re-scoped and `vectors` vec0 rows were re-inserted under the new
+    /// partition key. Additive variant; old clients never see it because they
+    /// never send the request.
+    NamespaceRenamed {
+        moved: u64,
+        vectors: u64,
     },
     Error {
         kind: String,
@@ -351,6 +405,16 @@ mod tests {
             },
             Request::Reembed { limit: Some(100) },
             Request::Reembed { limit: None },
+            Request::NamespaceRename {
+                old: Namespace::Project("scratch-dir".into()),
+                new: Namespace::Project("rusty-brain".into()),
+                merge: false,
+            },
+            Request::NamespaceRename {
+                old: Namespace::Project("scratch-dir".into()),
+                new: Namespace::Project("rusty-brain".into()),
+                merge: true,
+            },
         ]
     }
 
@@ -381,7 +445,13 @@ mod tests {
                 results: vec![SearchResult {
                     memory: note(),
                     score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
                 }],
+                degraded: false,
+            },
+            Response::Recalled {
+                results: Vec::new(),
+                degraded: true,
             },
             Response::Got {
                 memory: Some(note()),
@@ -402,6 +472,16 @@ mod tests {
             },
             Response::Pong {
                 contract_version: CONTRACT_VERSION,
+                recall_channels: None,
+            },
+            Response::Pong {
+                contract_version: CONTRACT_VERSION,
+                recall_channels: Some(RecallChannelTotals {
+                    recalls: 4,
+                    fts_hits: 9,
+                    vector_hits: 11,
+                    graph_hits: 2,
+                }),
             },
             Response::Error {
                 kind: "not_found".into(),
@@ -418,6 +498,10 @@ mod tests {
                 scanned: 10,
                 changed: 3,
                 skipped: 7,
+            },
+            Response::NamespaceRenamed {
+                moved: 12,
+                vectors: 9,
             },
         ]
     }
@@ -437,9 +521,87 @@ mod tests {
         assert_eq!(json, r#"{"result":"Updated"}"#);
         let json = serde_json::to_string(&Response::Pong {
             contract_version: 1,
+            recall_channels: None,
         })
         .unwrap();
+        // A `None` recall_channels keeps the pre-W1.0 byte shape (additive,
+        // skip-serializing field), so old clients see an unchanged frame.
         assert_eq!(json, r#"{"result":"Pong","contract_version":1}"#);
+    }
+
+    #[test]
+    fn recalled_without_degraded_field_decodes_to_false() {
+        // Wire compat: a pre-W1.6 Recalled frame (no `degraded` key) must
+        // decode, defaulting the flag off.
+        let back: Response = serde_json::from_str(r#"{"result":"Recalled","results":[]}"#).unwrap();
+        match back {
+            Response::Recalled { results, degraded } => {
+                assert!(results.is_empty());
+                assert!(!degraded, "absent degraded key must default to false");
+            }
+            other => panic!("expected Recalled, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn non_degraded_recalled_keeps_the_pre_w16_byte_shape() {
+        // `degraded: false` is skip-serialized, so old clients see an
+        // unchanged frame; `degraded: true` rides along explicitly.
+        let json = serde_json::to_string(&Response::Recalled {
+            results: Vec::new(),
+            degraded: false,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"result":"Recalled","results":[]}"#);
+
+        let json = serde_json::to_string(&Response::Recalled {
+            results: Vec::new(),
+            degraded: true,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"Recalled","results":[],"degraded":true}"#
+        );
+    }
+
+    #[test]
+    fn pong_without_recall_channels_field_decodes_to_none() {
+        // Wire compat: a pre-W1.0 Pong (no recall_channels key) must decode.
+        let back: Response =
+            serde_json::from_str(r#"{"result":"Pong","contract_version":2}"#).unwrap();
+        match back {
+            Response::Pong {
+                contract_version,
+                recall_channels,
+            } => {
+                assert_eq!(contract_version, 2);
+                assert!(recall_channels.is_none());
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn pong_recall_channel_totals_round_trip() {
+        let totals = RecallChannelTotals {
+            recalls: 4,
+            fts_hits: 9,
+            vector_hits: 11,
+            graph_hits: 2,
+        };
+        let json = serde_json::to_string(&Response::Pong {
+            contract_version: CONTRACT_VERSION,
+            recall_channels: Some(totals),
+        })
+        .unwrap();
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::Pong {
+                recall_channels, ..
+            } => assert_eq!(recall_channels, Some(totals)),
+            other => panic!("expected Pong, got {other:?}"),
+        }
     }
 
     #[test]
@@ -487,6 +649,46 @@ mod tests {
         assert_eq!(json, r#"{"op":"Reembed","limit":50}"#);
         let json = serde_json::to_string(&Request::Reembed { limit: None }).unwrap();
         assert_eq!(json, r#"{"op":"Reembed","limit":null}"#);
+    }
+
+    #[test]
+    fn namespace_rename_uses_op_tag_and_merge_defaults_off() {
+        // Wire shape is pinned: internally tagged on `op`, Namespace enum JSON.
+        let req = Request::NamespaceRename {
+            old: Namespace::Project("scratch".into()),
+            new: Namespace::Project("rusty-brain".into()),
+            merge: false,
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["op"], "NamespaceRename");
+        assert_eq!(value["merge"], false);
+
+        // A payload WITHOUT the merge key must decode to merge=false (the
+        // serde-default additive pattern, mirroring Remember.confidence).
+        let mut stripped = value;
+        stripped.as_object_mut().unwrap().remove("merge");
+        let back: Request = serde_json::from_value(stripped).unwrap();
+        match back {
+            Request::NamespaceRename { merge, old, new } => {
+                assert!(!merge, "absent merge key must default to false");
+                assert_eq!(old, Namespace::Project("scratch".into()));
+                assert_eq!(new, Namespace::Project("rusty-brain".into()));
+            }
+            other => panic!("expected NamespaceRename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_renamed_uses_result_tag_with_counts() {
+        let json = serde_json::to_string(&Response::NamespaceRenamed {
+            moved: 5,
+            vectors: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"NamespaceRenamed","moved":5,"vectors":3}"#
+        );
     }
 
     #[test]

@@ -8,8 +8,10 @@ use std::process::{Command, Stdio};
 use std::time::Duration;
 
 // Auto-start env allowlist + override var names are owned by rb-config so the
-// hooks spawner and the CLI spawner can never disagree.
-use rb_config::{DB_ENV, FORWARD_ENV, SOCKET_ENV};
+// hooks spawner and the CLI spawner can never disagree. The forwarded set is
+// secrets + identity + XDG/HOME plus the frozen legacy knobs (C1): config-file
+// knobs need no forwarding — the spawned daemon re-reads config.toml itself.
+use rb_config::{spawn_forward_env, DB_ENV, SOCKET_ENV};
 use rb_proto::{Client, ClientIdentity};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 
@@ -122,7 +124,7 @@ fn spawn_daemon(self_exe: &Path, socket: &Path, db: &Path) -> std::io::Result<()
     cmd.env_clear();
     cmd.env(SOCKET_ENV, socket);
     cmd.env(DB_ENV, db);
-    for key in FORWARD_ENV {
+    for key in spawn_forward_env() {
         if let Ok(value) = std::env::var(key) {
             cmd.env(key, value);
         }
@@ -168,6 +170,8 @@ mod tests {
             db_path: db,
             read_pool_size: 2,
             jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(config, embedder).await.unwrap();

@@ -24,6 +24,17 @@ pub struct LinkRow {
     pub created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Outcome of a one-time namespace rename (W0.3 carryover): how many
+/// `memories` rows were re-scoped, how many vec0 rows were re-inserted under
+/// the new partition key, and how many rows the target namespace already had
+/// before the rename (non-zero only under `merge`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceRenameOutcome {
+    pub memories: u64,
+    pub vectors: u64,
+    pub merged_into: u64,
+}
+
 /// The synchronous storage trait. The daemon wraps this on blocking threads.
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
@@ -35,7 +46,12 @@ pub trait Store {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>>;
-    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>>;
+    /// Walk the link graph out from `id` up to `depth` hops, returning each
+    /// reachable node ONCE with its MINIMUM hop distance (1 = direct neighbor;
+    /// the anchor itself is excluded), ordered by hops ascending then id so the
+    /// output is deterministic. (W1.5: real hop distances feed the graph
+    /// ranking signal instead of incidental walk-order indices.)
+    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>>;
     fn list(
         &self,
         ns: &Namespace,
@@ -54,6 +70,14 @@ pub trait Store {
     /// once regardless of how many times it appears in `ids`). Best-effort: an empty
     /// slice or all-missing ids returns `Ok(())` without touching the DB.
     fn record_accesses(&self, ids: &[MemoryId]) -> Result<()>;
+    /// Apply BUFFERED access-tracking bumps in one transaction (W1.8): each
+    /// entry adds `count` to `access_count` and advances `last_accessed_at`
+    /// monotonically to `last_accessed_at` (an already-newer stamp is kept, so
+    /// out-of-order flushes never move the clock backwards). Missing ids are
+    /// silently skipped and an empty slice is a no-op (best-effort access
+    /// tracking never errors on absence). Under migration 006 these updates
+    /// assign no FTS-indexed column, so a flush triggers zero FTS writes.
+    fn record_access_bumps(&self, bumps: &[AccessBump]) -> Result<()>;
     /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
     /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
@@ -89,8 +113,10 @@ pub trait Store {
     /// Replace `id`'s stored vector and stamp the row's
     /// `(embedding_model, embedding_input_version)` to the current pair, in one
     /// transaction. This is the ONLY vector-UPDATE path (insert is write-once).
-    /// A missing memory id is `Error::NotFound`. The embedding dimension is
-    /// validated fail-closed before the write.
+    /// A missing OR archived memory id is `Error::NotFound` — an archived row
+    /// must never get its vector resurrected (live-only vec0 partition
+    /// invariant; the reembed loop treats it as a per-row skip). The embedding
+    /// dimension is validated fail-closed before the write.
     fn update_vector(
         &self,
         id: &MemoryId,
@@ -118,6 +144,17 @@ impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteStore").finish_non_exhaustive()
     }
+}
+
+/// One buffered access-tracking bump (W1.8): `count` recorded accesses for
+/// `id`, the most recent at `last_accessed_at` (unix seconds). The daemon
+/// accumulates these off the recall path and flushes them in batches through
+/// [`Store::record_access_bumps`], so recall itself issues zero writer ops.
+#[derive(Clone, Debug)]
+pub struct AccessBump {
+    pub id: MemoryId,
+    pub count: u64,
+    pub last_accessed_at: i64,
 }
 
 /// A minimal projection of a memory row for the consolidation scan: only the
@@ -251,16 +288,17 @@ impl SqliteStore {
 
         run_migrations(&conn)?;
 
-        // Dynamic-dimension vector table. vec0 needs the literal dim baked in.
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(\
-               memory_id TEXT PRIMARY KEY,\
-               embedding float[{embedding_dim}]\
-             );"
-        ))
-        .map_err(storage_err)?;
-
+        // Verify the dimension invariant BEFORE touching the vector table: the
+        // schema rebuild below re-creates the vec0 table with the configured
+        // dim baked into the DDL, so a dim mismatch must fail closed first
+        // (rebuilding under a wrong dim would commit a malformed table).
         seed_or_verify_dim(&conn, embedding_dim)?;
+
+        // Dynamic-dimension vector table (vec0 needs the literal dim baked in),
+        // created at the current vector schema version — or rebuilt in place
+        // from a previous version (W1.1 cosine metric + W1.7 namespace
+        // partition, one combined rebuild).
+        ensure_vector_schema(&conn, embedding_dim)?;
         if let Some(model) = embedding_model {
             seed_or_verify_model(&conn, model)?;
         }
@@ -279,6 +317,32 @@ impl SqliteStore {
         &self.site_id
     }
 
+    /// Whether the connection is in autocommit mode (no open transaction).
+    ///
+    /// `false` after a COMPLETED writer op means the op leaked a transaction —
+    /// e.g. a failed COMMIT whose drop-rollback also failed — and every later
+    /// op on this connection would die with "cannot start a transaction within
+    /// a transaction". The daemon's writer checks this after any op that
+    /// returns `Err` and drops + reopens the connection instead of letting the
+    /// poison spread (W1.6b, F07/F16).
+    pub fn is_autocommit(&self) -> bool {
+        self.conn.is_autocommit()
+    }
+
+    /// Test-only seam (W1.6b): open a transaction and LEAVE it open, simulating
+    /// a writer op that errored out mid-transaction without rolling back (the
+    /// failed-COMMIT-then-failed-ROLLBACK poison case, which cannot be induced
+    /// through the public write API now that every op rolls back via RAII).
+    ///
+    /// This method is `pub` only to be reachable from the daemon's writer
+    /// tests. Do NOT call it in production code.
+    #[doc(hidden)]
+    pub fn leave_transaction_open_for_test(&self) -> Result<()> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(storage_err)
+    }
+
     /// Explicit opt-in for an embedding-model swap: atomically point
     /// `meta.embedding_model` at `new_model` and stale every row's
     /// `embedding_input_version` to the `''` sentinel so the existing reembed
@@ -289,11 +353,7 @@ impl SqliteStore {
     /// recorded yet (legacy/fresh DB — it is seeded without staling, because
     /// the per-row `embedding_model` stamps already drive reembed there).
     pub fn accept_model_change(&self, new_model: &str) -> Result<bool> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<bool> {
+        immediate_tx(&self.conn, || {
             let stored = meta_value(&self.conn, "embedding_model")?;
             if stored.as_deref() == Some(new_model) {
                 return Ok(false);
@@ -312,20 +372,7 @@ impl SqliteStore {
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             Ok(swapping)
-        })();
-
-        match result {
-            Ok(changed) => {
-                self.conn
-                    .execute_batch("COMMIT;")
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                Ok(changed)
-            }
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Fold the WAL back into the main database file and truncate it to zero.
@@ -345,6 +392,168 @@ impl SqliteStore {
             .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
             .map_err(storage_err)?;
         Ok(())
+    }
+
+    /// One-time namespace rename (W0.3 carryover): re-scope EVERY memory row
+    /// (active and archived) from `old` to `new` in ONE transaction. The
+    /// dogfood-data lifecycle (plan §11) depends on this: memories captured
+    /// before a repo pins identity via `.rusty-brain.toml` land under the
+    /// heuristic directory-name namespace and need re-scoping once.
+    ///
+    /// What moves, table by table:
+    /// - `memories.namespace` — plain UPDATE. Under migration 006 the `mem_au`
+    ///   trigger fires only on content/summary/keywords/tags, and namespace is
+    ///   not an FTS-indexed column (`keyword_search` scopes via a JOIN on
+    ///   `memories`), so this rewrites ZERO FTS rows.
+    /// - `memory_vectors` — namespace is the vec0 PARTITION KEY (W1.7) and
+    ///   vec0 supports no partition-key UPDATE, so each moving row is
+    ///   point-DELETEd and re-INSERTed under the new key (the two mutation
+    ///   patterns the archive and insert paths already prove). Archived rows
+    ///   have no vector (W1.7 hygiene), so `vectors <= memories`.
+    /// - `memory_links` — carries no namespace column; edges key on memory ids
+    ///   and survive untouched.
+    /// - `memory_oplog` — ONE `namespace_rename` row recording old, new and
+    ///   the row counts; historical oplog rows keep their original namespace
+    ///   (the log is history, not state).
+    ///
+    /// Collision policy: a non-empty `new` is refused with a validation-class
+    /// error unless `merge` is set; under `merge` the old rows are appended
+    /// and the pre-existing target count is reported in the outcome + oplog.
+    /// Exact-string semantics: renaming `project:foo` does NOT touch
+    /// `session:foo:*` namespaces. Not on the `Store` trait — like
+    /// `accept_model_change` it is a cross-namespace admin op, not an engine
+    /// operation.
+    pub fn rename_namespace(
+        &self,
+        old: &Namespace,
+        new: &Namespace,
+        merge: bool,
+    ) -> Result<NamespaceRenameOutcome> {
+        let old_str = old.as_db_string();
+        let new_str = new.as_db_string();
+        if old_str == new_str {
+            return Err(Error::InvalidArgument(format!(
+                "cannot rename namespace `{old_str}` to itself"
+            )));
+        }
+
+        immediate_tx(&self.conn, || {
+            let count_rows = |ns: &str| -> Result<i64> {
+                self.conn
+                    .query_row(
+                        "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                        rusqlite::params![ns],
+                        |r| r.get(0),
+                    )
+                    .map_err(storage_err)
+            };
+
+            let target_rows = count_rows(&new_str)?;
+            if target_rows > 0 && !merge {
+                return Err(Error::InvalidArgument(format!(
+                    "target namespace `{new_str}` already has {target_rows} memories; \
+                     pass --merge to combine them"
+                )));
+            }
+            let source_rows = count_rows(&old_str)?;
+            if source_rows == 0 {
+                return Err(Error::InvalidArgument(format!(
+                    "namespace `{old_str}` has no memories to rename"
+                )));
+            }
+
+            // Collect the moving vectors BEFORE the memories UPDATE, while the
+            // old namespace still identifies them. vec0 fullscan + JOIN is the
+            // access pattern `rebuild_vector_table` already proves; the blobs
+            // are held in memory for the duration of the transaction, which is
+            // acceptable for a one-time helper (dim x 4 bytes per row).
+            let moving: Vec<(String, Vec<u8>)> = {
+                let mut stmt = self
+                    .conn
+                    .prepare(
+                        "SELECT v.memory_id, v.embedding
+                         FROM memory_vectors v
+                         JOIN memories m ON m.memory_id = v.memory_id
+                         WHERE m.namespace = ?1",
+                    )
+                    .map_err(storage_err)?;
+                let rows = stmt
+                    .query_map(rusqlite::params![old_str], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+                    })
+                    .map_err(storage_err)?;
+                let mut out = Vec::new();
+                for r in rows {
+                    out.push(r.map_err(storage_err)?);
+                }
+                out
+            };
+
+            // Re-scope the memories rows. `updated_at` is deliberately NOT
+            // bumped: a rename is administrative and must not distort recency
+            // ranking or reembed staleness.
+            let moved = self
+                .conn
+                .execute(
+                    "UPDATE memories SET namespace = ?1 WHERE namespace = ?2",
+                    rusqlite::params![new_str, old_str],
+                )
+                .map_err(storage_err)?;
+
+            // Re-key the vec0 partition rows: point DELETE + INSERT per row,
+            // unchanged embedding bytes.
+            let mut vectors: u64 = 0;
+            {
+                let mut del = self
+                    .conn
+                    .prepare("DELETE FROM memory_vectors WHERE memory_id = ?1")
+                    .map_err(storage_err)?;
+                let mut ins = self
+                    .conn
+                    .prepare(
+                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         VALUES (?1, ?2, ?3)",
+                    )
+                    .map_err(storage_err)?;
+                for (id, embedding) in &moving {
+                    del.execute(rusqlite::params![id]).map_err(storage_err)?;
+                    ins.execute(rusqlite::params![id, new_str, embedding])
+                        .map_err(storage_err)?;
+                    vectors += 1;
+                }
+            }
+
+            // One oplog row for the whole bulk op, committed with it. The
+            // per-memory `append_oplog` helper does not fit (no single memory
+            // id); `memory_id` is the empty sentinel and the payload rides in
+            // `details`.
+            let details = serde_json::json!({
+                "old": old_str,
+                "new": new_str,
+                "moved": moved,
+                "vectors": vectors,
+                "merged_into": target_rows,
+            })
+            .to_string();
+            self.conn
+                .execute(
+                    "INSERT INTO memory_oplog (site_id, op, memory_id, namespace, at, details)
+                     VALUES (?1, 'namespace_rename', '', ?2, ?3, ?4)",
+                    rusqlite::params![
+                        self.site_id,
+                        new_str,
+                        chrono::Utc::now().timestamp(),
+                        details
+                    ],
+                )
+                .map_err(storage_err)?;
+
+            Ok(NamespaceRenameOutcome {
+                memories: moved as u64,
+                vectors,
+                merged_into: target_rows as u64,
+            })
+        })
     }
 
     // One link edge selected for decay. `created_at` is decoded fail-closed.
@@ -409,11 +618,7 @@ impl SqliteStore {
     ) -> Result<()> {
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — link strength is durable graph state replay must reproduce.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -443,18 +648,40 @@ impl SqliteStore {
                 )?;
             }
             Ok(())
-        })();
+        })
+    }
 
-        match result {
-            Ok(()) => self
+    /// Set the EFFECTIVE `importance` of a single memory WITHOUT touching its
+    /// `base_importance` author prior (W1.9). This is the importance
+    /// recalibration job's only write path; the user-facing `update_memory`
+    /// path is the only writer of `base_importance`. Validates the `1..=10`
+    /// range fail-closed (matching the insert path). A missing id is a no-op
+    /// (0 rows), mirroring `set_confidence`/`set_link_strength`.
+    ///
+    /// `updated_at` is intentionally NOT bumped: recalibration is a background
+    /// maintenance write, not an authorial edit — the same rule `update_vector`
+    /// and `rename_namespace` follow. Bumping it would make every nudged memory
+    /// look freshly user-modified to list/context, recency ranking, and any
+    /// updated_at-based sync each time the job runs. The oplog row below
+    /// records the change durably for replay.
+    pub fn set_recalibrated_importance(&self, id: &MemoryId, importance: u8) -> Result<()> {
+        rb_types::validate_importance(importance)?;
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — importance is durable ranking state replay must reproduce.
+        immediate_tx(&self.conn, || {
+            let affected = self
                 .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
+                .execute(
+                    "UPDATE memories SET importance = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![importance as i64, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({ "importance": importance }).to_string();
+                append_oplog(&self.conn, &self.site_id, "set_importance", id, &details)?;
             }
-        }
+            Ok(())
+        })
     }
 
     /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
@@ -469,11 +696,7 @@ impl SqliteStore {
         }
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — confidence is durable ranking state replay must reproduce.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -486,18 +709,7 @@ impl SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "set_confidence", id, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Read a value from the key/value `meta` table (e.g. the
@@ -518,11 +730,7 @@ impl SqliteStore {
     ) -> Result<()> {
         // Transaction: the DELETE and its oplog row commit (or roll back)
         // together — a pruned edge must be reproducible from the log.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -540,24 +748,19 @@ impl SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "unlink", source, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     /// Find active memories in `ns` whose stored vector is near-identical to the
-    /// vector of `id` (cosine similarity `>= threshold`), excluding `id` itself.
+    /// vector of `id` (similarity `>= threshold`), excluding `id` itself.
     ///
-    /// Namespace-isolated by construction: candidates are filtered to `ns` and
+    /// UNIT: `threshold` and the returned similarities are RAW cosine
+    /// similarity clamped to `[0, 1]` (`1 - cosine_distance`, negatives clamp
+    /// to 0; see [`distance_to_similarity`]) — a threshold of `0.95` admits
+    /// candidates with cosine similarity `>= 0.95` (cosine distance `<= 0.05`).
+    ///
+    /// Namespace-isolated by construction: the KNN scan is scoped to `ns` via
+    /// the vec0 partition key, and candidates are re-checked for namespace +
     /// active (`archived_at IS NULL`) in Rust, exactly as `vector_search` does,
     /// so a near-identical memory in another namespace is NEVER returned. Reads
     /// the anchor's OWN stored embedding from `memory_vectors` and runs the same
@@ -595,8 +798,8 @@ impl SqliteStore {
         }
 
         // sqlite-vec accepts the query vector as a JSON array string (same as
-        // vector_search). vec0 cannot filter on namespace/active inside KNN, so
-        // we over-fetch a candidate pool and filter in Rust.
+        // vector_search). The namespace PARTITION KEY scopes the KNN scan in
+        // SQL; the Rust-side active re-check below is defense-in-depth.
         let query_json =
             serde_json::to_string(&anchor_vec).map_err(|e| Error::Serialization(e.to_string()))?;
 
@@ -610,24 +813,25 @@ impl SqliteStore {
             .max(limit_i64)
             .min(VEC0_KNN_MAX);
 
+        let ns_str = ns.as_db_string();
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT memory_id, distance
                  FROM memory_vectors
                  WHERE embedding MATCH ?1
+                   AND namespace = ?2
                  ORDER BY distance
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![query_json, k_budget], |row| {
+            .query_map(rusqlite::params![query_json, ns_str, k_budget], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let ns_str = ns.as_db_string();
         let self_str = id.to_string();
         let mut out: Vec<(MemoryId, f32)> = Vec::new();
         for r in rows {
@@ -724,7 +928,14 @@ impl SqliteStore {
 pub struct RecalRow {
     pub namespace: Namespace,
     pub id: MemoryId,
+    /// Current EFFECTIVE importance (what ranking reads). The job uses it only
+    /// for change detection — never as a formula input.
     pub importance: u8,
+    /// Author-set importance prior (W1.9). The recalibration target is a pure
+    /// function of THIS value plus the access signals, bounded to its ±2 band,
+    /// which is what makes the job idempotent and author-intent-preserving.
+    /// Reads COALESCE to `importance` should the column ever be NULL.
+    pub base_importance: u8,
     pub access_count: i64,
     pub last_accessed_at: Option<i64>,
 }
@@ -738,7 +949,9 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT namespace, memory_id, importance, access_count, last_accessed_at
+                "SELECT namespace, memory_id, importance,
+                        COALESCE(base_importance, importance) AS base_importance,
+                        access_count, last_accessed_at
                  FROM memories
                  WHERE archived_at IS NULL
                  ORDER BY created_at DESC
@@ -763,6 +976,9 @@ impl SqliteStore {
             let importance = row
                 .get::<_, i64>("importance")
                 .map_err(|e| Error::Storage(e.to_string()))? as u8;
+            let base_importance =
+                row.get::<_, i64>("base_importance")
+                    .map_err(|e| Error::Storage(e.to_string()))? as u8;
             let access_count = row
                 .get::<_, i64>("access_count")
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -773,6 +989,7 @@ impl SqliteStore {
                 namespace,
                 id,
                 importance,
+                base_importance,
                 access_count,
                 last_accessed_at,
             });
@@ -827,6 +1044,214 @@ fn meta_value(conn: &rusqlite::Connection, key: &str) -> Result<Option<String>> 
         rusqlite::Error::QueryReturnedNoRows => Ok(None),
         other => Err(storage_err(other)),
     })
+}
+
+/// Current vector-table layout, recorded at `meta.vector_schema_version`.
+///
+/// Version 2 (W1.1 + W1.7, one combined rebuild) = cosine `distance_metric`
+/// AND a `namespace` PARTITION KEY. A DB missing the marker carries the
+/// version-1 layout (implicit L2 metric, no partition column) and is rebuilt
+/// in place exactly once at open; a fresh DB is created directly in final
+/// form. One marker covers both properties so the rebuild matrix stays
+/// two-state: marker present (current) or absent (full rebuild + cleanup).
+const VECTOR_SCHEMA_VERSION: &str = "2";
+
+/// Meta key where one-shot vector-rebuild statistics are recorded (JSON:
+/// pruned/reinserted vector counts, similarity links rescored/dropped).
+const VECTOR_REBUILD_STATS_KEY: &str = "vector_rebuild_v2";
+
+/// The version-2 vec0 DDL. The dimension is baked into the column type (vec0
+/// requirement); `namespace TEXT PARTITION KEY` shards the index so KNN scopes
+/// per namespace (sqlite-vec 0.1.9 supports both `partition key` columns and
+/// `distance_metric=cosine`).
+fn vector_table_ddl(embedding_dim: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
+           memory_id TEXT PRIMARY KEY,\
+           namespace TEXT PARTITION KEY,\
+           embedding float[{embedding_dim}] distance_metric=cosine\
+         );"
+    )
+}
+
+/// Run `body` inside one `BEGIN IMMEDIATE` transaction with RAII drop-rollback
+/// (W1.6a).
+///
+/// On a body error the `Transaction` guard drops and rolls the transaction
+/// back. On a failed COMMIT the guard (consumed by `commit`) still drops and
+/// attempts ROLLBACK, because rusqlite's drop path only skips rollback when the
+/// connection is already back in autocommit. The manual BEGIN/COMMIT/ROLLBACK
+/// pattern this replaces left the connection mid-transaction in exactly the
+/// failed-COMMIT case, poisoning every later writer op with "cannot start a
+/// transaction within a transaction" (F07/F16). A leaked transaction that even
+/// the drop-rollback cannot clear is caught by the writer's post-op
+/// `is_autocommit` check (W1.6b).
+///
+/// Statements inside `body` run on the same connection, so they participate in
+/// the transaction without touching the guard.
+fn immediate_tx<T>(conn: &rusqlite::Connection, body: impl FnOnce() -> Result<T>) -> Result<T> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(storage_err)?;
+    let value = body()?;
+    tx.commit().map_err(storage_err)?;
+    Ok(value)
+}
+
+/// Upsert one `meta` key.
+fn upsert_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )
+    .map_err(storage_err)?;
+    Ok(())
+}
+
+/// Ensure `memory_vectors` exists at [`VECTOR_SCHEMA_VERSION`], rebuilding a
+/// previous-version table in place when needed (W1.1 cosine metric + W1.7
+/// namespace partition + archived-vector cleanup, folded into ONE rebuild).
+///
+/// This is an open-time code rebuild, not a SQL migration: the vec0 table is
+/// created in code with a runtime dim and vec0 implements no `xRename`, so a
+/// stash/drop/recreate/re-insert inside one `BEGIN IMMEDIATE` is the only
+/// rename-free path. It MUST run on the writer's open path before any read
+/// connection opens (single-flight by construction; `StoreHandle::start_inner`
+/// sequences the writer open before the read pool spins up) so a large-corpus
+/// rebuild cannot starve concurrent opens past `busy_timeout`.
+///
+/// State matrix:
+/// - marker == 2: current layout, nothing to do;
+/// - no `memory_vectors` table (fresh DB): create directly in final form;
+/// - table without marker (v1 layout, OR a half-created fresh DB after a
+///   crash between CREATE and marker): full rebuild — idempotent because the
+///   stash SELECT reads only columns both layouts expose.
+fn ensure_vector_schema(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
+    if meta_value(conn, "vector_schema_version")?.as_deref() == Some(VECTOR_SCHEMA_VERSION) {
+        return Ok(());
+    }
+
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(storage_err)?;
+
+    // One transaction for create-or-rebuild + marker: a crash mid-way rolls
+    // everything back and the next open retries from the same state.
+    immediate_tx(conn, || {
+        if table_exists > 0 {
+            rebuild_vector_table(conn, embedding_dim)?;
+        } else {
+            conn.execute_batch(&vector_table_ddl(embedding_dim))
+                .map_err(storage_err)?;
+        }
+        upsert_meta(conn, "vector_schema_version", VECTOR_SCHEMA_VERSION)?;
+        // Human-legible companion marker (the version gate above is canonical).
+        upsert_meta(conn, "vector_metric", "cosine")?;
+        Ok(())
+    })
+}
+
+/// Rebuild `memory_vectors` from a previous layout into the version-2 layout.
+/// MUST be called inside an open transaction (see [`ensure_vector_schema`]).
+///
+/// Folded W1.7 cleanup: the stash JOIN keeps only vectors whose owning memory
+/// row exists AND is active (`archived_at IS NULL` — supersede also archives),
+/// so vectors for archived/superseded/orphaned rows never enter the new table.
+/// Vector bytes are copied unchanged: cosine vs L2 is a query-time metric, no
+/// re-embed is needed.
+///
+/// One-shot link revalidation (W1.1): links produced by the similarity linker
+/// (`reason = 'similar'`) were created under the L2 threshold; every such link
+/// whose endpoints both still have live vectors is re-scored with
+/// `vec_distance_cosine` and DROPPED when above
+/// [`rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE`] (links the recalibrated
+/// linker would not create today). Links with a pruned/missing endpoint vector
+/// cannot be re-scored and are left in place (they are inert in recall:
+/// archived endpoints are filtered out). Counts are recorded durably at
+/// [`VECTOR_REBUILD_STATS_KEY`].
+fn rebuild_vector_table(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+        .map_err(storage_err)?;
+
+    // Stash (memory_id, namespace, embedding) for LIVE rows via vec0 fullscan.
+    // A plain table created and dropped inside this transaction never survives
+    // it (commit drops it; rollback undoes its creation) — no side files, no
+    // schema residue.
+    conn.execute_batch(
+        "CREATE TABLE _vector_rebuild_stash AS
+           SELECT v.memory_id AS memory_id,
+                  m.namespace AS namespace,
+                  v.embedding AS embedding
+           FROM memory_vectors v
+           JOIN memories m ON m.memory_id = v.memory_id
+           WHERE m.archived_at IS NULL;",
+    )
+    .map_err(storage_err)?;
+
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _vector_rebuild_stash", [], |r| {
+            r.get(0)
+        })
+        .map_err(storage_err)?;
+
+    // Re-score similarity-produced links while both endpoint vectors are
+    // available in the plain stash (cheaper than KNN; vec_distance_cosine is
+    // sqlite-vec's scalar distance over two float32 blobs).
+    let max_dist = f64::from(rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE);
+    let rescored: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_links l
+               JOIN _vector_rebuild_stash s ON s.memory_id = l.source_id
+               JOIN _vector_rebuild_stash t ON t.memory_id = l.target_id
+             WHERE l.reason = 'similar'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(storage_err)?;
+    let dropped = conn
+        .execute(
+            "DELETE FROM memory_links WHERE rowid IN (
+               SELECT l.rowid FROM memory_links l
+                 JOIN _vector_rebuild_stash s ON s.memory_id = l.source_id
+                 JOIN _vector_rebuild_stash t ON t.memory_id = l.target_id
+               WHERE l.reason = 'similar'
+                 AND vec_distance_cosine(s.embedding, t.embedding) > ?1
+             )",
+            rusqlite::params![max_dist],
+        )
+        .map_err(storage_err)?;
+
+    // Drop + recreate at the new layout, then re-insert the live vectors
+    // (unchanged bytes) with their owning namespace as the partition key.
+    conn.execute_batch("DROP TABLE memory_vectors;")
+        .map_err(storage_err)?;
+    conn.execute_batch(&vector_table_ddl(embedding_dim))
+        .map_err(storage_err)?;
+    conn.execute(
+        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+         SELECT memory_id, namespace, embedding FROM _vector_rebuild_stash",
+        [],
+    )
+    .map_err(storage_err)?;
+    conn.execute_batch("DROP TABLE _vector_rebuild_stash;")
+        .map_err(storage_err)?;
+
+    // Durable rebuild log: rb-store carries no logging facility, so the
+    // one-shot counts live in meta where an operator (or test) can read them.
+    let stats = serde_json::json!({
+        "pruned_vectors": before - kept,
+        "reinserted_vectors": kept,
+        "similar_links_rescored": rescored,
+        "similar_links_dropped": dropped,
+        "at": chrono::Utc::now().timestamp(),
+    })
+    .to_string();
+    upsert_meta(conn, VECTOR_REBUILD_STATS_KEY, &stats)
 }
 
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
@@ -972,12 +1397,15 @@ fn decode_embedding_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Convert a vec0 cosine `distance` (range `[0, 2]`) into a similarity in
-/// `[0, 1]`, matching the exact convention used by `rb-search::rank::score_one`
-/// (`1.0 - (d / 2.0).clamp(0.0, 1.0)`). A non-finite distance yields `0.0`.
+/// Convert a vec0 cosine `distance` (`1 - cosine_similarity`, range `[0, 2]`)
+/// into RAW cosine similarity clamped to `[0, 1]` (`(1 - d).clamp(0, 1)` —
+/// anti-correlated vectors, cos < 0, clamp to 0). Matches the convention used
+/// by `rb-search::rank::score_one` since the W1.1 cosine rebuild, and makes
+/// `near_duplicates`' threshold a true cosine-similarity bound (0.95 means
+/// cos >= 0.95, i.e. cosine distance <= 0.05). A non-finite distance yields `0.0`.
 fn distance_to_similarity(distance: f32) -> f32 {
     if distance.is_finite() {
-        1.0 - (distance / 2.0).clamp(0.0, 1.0)
+        (1.0 - distance).clamp(0.0, 1.0)
     } else {
         0.0
     }
@@ -1120,11 +1548,58 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
     })
 }
 
-/// Wrap the user query as a single FTS5 phrase so operators (-, OR, NEAR, *, ")
-/// are treated as literal text. Internal double-quotes are doubled per FTS5 rules.
+/// Build a safe FTS5 MATCH expression from raw user text (W1.2).
+///
+/// The query is split on non-alphanumeric boundaries — the same separator rule
+/// as the `unicode61` tokenizer family the index uses — and each token is
+/// individually double-quoted so FTS5 operators (`-`, `OR`, `NEAR`, `*`, `"`,
+/// parens) are always literal text, never syntax. The quoted tokens are then
+/// joined with `OR` and ranked by bm25 (`ORDER BY rank` at the call site), so
+/// rare query terms dominate and stopword-only matches sink.
+///
+/// Decision record (W1.2, full-pipeline numbers on the W1.0 eval goldens with
+/// the committed all-MiniLM-L6-v2 replay vectors; det = DeterministicProvider):
+///
+/// | construction        | replay r@5 / MRR  | det r@5 / MRR     | fts_query_rate |
+/// |---------------------|-------------------|-------------------|----------------|
+/// | whole-query phrase  | 0.9560 / 0.9931   | 0.0486 / 0.0505   | 0.042          |
+/// | AND of tokens       | 0.9560 / 0.9931   | 0.1389 / 0.1477   | 0.139          |
+/// | OR of tokens (this) | 0.9630 / 0.9838   | 0.7847 / 0.9611   | 1.000          |
+///
+/// The plan spec hypothesized AND-of-quoted-tokens, but measurement showed AND
+/// caps the FTS channel at 13.9% of natural-language goldens (29% with a
+/// stopword list) — question words ("how", "is") rarely appear in memory text,
+/// so the conjunction fails before content terms can match. The Phase 1 gate
+/// requires FTS contribution on >= 80% of goldens; OR-of-tokens reaches 100%
+/// and lifts recall@5 and the deterministic gate metrics sharply, at a small
+/// replay-MRR cost. Injection safety is identical under either operator: every
+/// token is a quoted phrase of length one, so user text is never FTS5 syntax.
+/// A trailing-token prefix match (`"tok"*`) was measured under both operators
+/// and both tokenizers: no metric moved under AND/unicode61, and it *hurt*
+/// under porter (prefix queries bypass the stemmer: replay MRR 0.9838 ->
+/// 0.9769), so it is deliberately not emitted.
+///
+/// A query with no indexable tokens (operators/punctuation only) returns the
+/// empty phrase `""`, which FTS5 parses fine and which matches nothing.
 fn escape_fts5_query(query: &str) -> String {
-    let escaped = query.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+    let mut expr = String::new();
+    for token in query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        if !expr.is_empty() {
+            expr.push_str(" OR ");
+        }
+        expr.push('"');
+        expr.push_str(token);
+        expr.push('"');
+    }
+    if expr.is_empty() {
+        // An empty MATCH string is an FTS5 syntax error; an empty quoted
+        // phrase is valid and simply matches nothing.
+        return "\"\"".to_string();
+    }
+    expr
 }
 
 // ---------------------------------------------------------------------------
@@ -1148,11 +1623,7 @@ impl Store for SqliteStore {
         // writer mid-transaction; the busy_timeout above makes a contended BEGIN
         // wait rather than fail immediately. Atomicity is unchanged: all writes
         // commit together, and any error rolls the whole transaction back.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             self.conn
                 .execute(
                     "INSERT INTO memories (
@@ -1160,10 +1631,11 @@ impl Store for SqliteStore {
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id
+                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        base_importance
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
                      )",
                     rusqlite::params![
                         note.id.to_string(),
@@ -1190,6 +1662,10 @@ impl Store for SqliteStore {
                         note.origin_agent,
                         note.origin_source,
                         note.session_id,
+                        // W1.9: the author-set importance prior. Stamped once at
+                        // insert; the recalibration job never writes it, so the
+                        // bounded-delta formula stays anchored to author intent.
+                        note.importance as i64,
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1197,10 +1673,21 @@ impl Store for SqliteStore {
             append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
 
             if let Some(emb) = embedding {
+                // The namespace partition key MUST mirror memories.namespace
+                // (vector_search scopes KNN on it). Any path that mutates a
+                // memory's namespace MUST re-key its memory_vectors row in the
+                // same transaction or vectors strand under the old partition
+                // key — `rename_namespace` (the only such path today) does the
+                // DELETE+INSERT re-key for exactly this reason.
                 self.conn
                     .execute(
-                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![note.id.to_string(), embedding_bytes(emb)],
+                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![
+                            note.id.to_string(),
+                            note.namespace.as_db_string(),
+                            embedding_bytes(emb)
+                        ],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
@@ -1235,19 +1722,7 @@ impl Store for SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                // Best-effort rollback; surface the original error.
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>> {
@@ -1308,13 +1783,12 @@ impl Store for SqliteStore {
         Ok(ids)
     }
 
-    /// Scale limitation: vec0 KNN cannot filter on namespace/active inside the
-    /// query, so we over-fetch a candidate pool of `10 * limit` nearest vectors
-    /// and filter by namespace + active state in Rust. If those nearest `10*N`
-    /// vectors are dominated by other namespaces or archived rows, FEWER than
-    /// `limit` results may be returned. This is acceptable at P0's brute-force
-    /// scale; a namespace-aware ANN index (or partitioned vec0 table) is a future
-    /// option if recall at the tail becomes a problem.
+    /// KNN over the version-2 vec0 table: the `namespace` PARTITION KEY scopes
+    /// the scan (and the 4096 hard cap) to in-namespace vectors, and vector
+    /// hygiene (archive/supersede delete the vector row; the open-time rebuild
+    /// pruned pre-existing archived vectors) keeps the partition live-only — so
+    /// a namespace holding <1% of all vectors still fills `limit`. The Rust-side
+    /// active/namespace re-check below is defense-in-depth, not load-bearing.
     fn vector_search(
         &self,
         ns: &Namespace,
@@ -1332,19 +1806,21 @@ impl Store for SqliteStore {
         let query_json =
             serde_json::to_string(embedding).map_err(|e| Error::Serialization(e.to_string()))?;
 
-        // Over-fetch: we can't filter by namespace inside vec0's KNN query (adding
-        // WHERE on auxiliary columns is not supported in KNN mode). Instead we
-        // over-fetch a candidate pool large enough to still yield `limit` in-scope
-        // neighbors after filtering, then filter by namespace + active in Rust.
+        // The namespace partition key scopes the KNN scan in SQL; the modest
+        // over-fetch below only buys headroom for the Rust-side
+        // defense-in-depth active re-check (the table should contain live
+        // vectors only — archive/supersede delete them transactionally).
         //
         // Deviation from the plan: the plan used a CTE with `k = ?` plus an outer
         // `LIMIT`. That would cause a sqlite-vec error: "Only LIMIT or 'k =?' can be
         // provided, not both" (the query planner sees both when it pushes the outer
         // LIMIT into the CTE scan). We instead use a single-level query with LIMIT
-        // only, then filter candidates in Rust.
+        // only, then re-check candidates in Rust.
         //
-        // vec0 returns min(LIMIT, total_rows) without error.
-        // sqlite-vec enforces a hard KNN cap of 4096; k_budget must not exceed it.
+        // vec0 returns min(LIMIT, partition_rows) without error.
+        // sqlite-vec enforces a hard KNN cap of 4096; k_budget must not exceed
+        // it. With the partition key the cap now applies to LIVE, IN-NAMESPACE
+        // candidates rather than the whole corpus (W1.7).
         const VEC0_KNN_MAX: i64 = 4096;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let k_budget = limit_i64
@@ -1352,25 +1828,26 @@ impl Store for SqliteStore {
             .max(limit_i64)
             .min(VEC0_KNN_MAX);
 
+        let ns_str = ns.as_db_string();
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT memory_id, distance
                  FROM memory_vectors
                  WHERE embedding MATCH ?1
+                   AND namespace = ?2
                  ORDER BY distance
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![query_json, k_budget], |row| {
+            .query_map(rusqlite::params![query_json, ns_str, k_budget], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        // Collect raw candidates, then filter by namespace + active status.
-        let ns_str = ns.as_db_string();
+        // Defense-in-depth: re-check namespace + active status per candidate.
         let mut out = Vec::new();
         for r in rows {
             let (id_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
@@ -1402,8 +1879,13 @@ impl Store for SqliteStore {
 
     /// The recursive CTE `UNION` dedups on (node, depth) pairs, so a cycle can
     /// accumulate O(depth x cycle_length) intermediate rows before the outer
-    /// `SELECT DISTINCT` flattens them — fine at P0's bounded depth.
-    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
+    /// `GROUP BY` flattens them — fine at P0's bounded depth.
+    ///
+    /// W1.5: the UNION keeps EVERY distinct `(node, d)` pair a multi-path walk
+    /// produces, so exposing `d` directly would emit one row per path length.
+    /// `MIN(d) ... GROUP BY node` collapses each node to its shortest hop
+    /// distance (diamond shapes: the shorter path wins).
+    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>> {
         if depth == 0 {
             return Ok(Vec::new());
         }
@@ -1420,24 +1902,29 @@ impl Store for SqliteStore {
                      JOIN walk w ON l.source_id = w.node
                      WHERE w.d < ?2
                  )
-                 SELECT DISTINCT node
+                 SELECT node, MIN(d) AS hops
                  FROM walk
-                 WHERE node <> ?1",
+                 WHERE node <> ?1
+                 GROUP BY node
+                 ORDER BY MIN(d), node",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
             .query_map(rusqlite::params![id.to_string(), depth as i64], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let mut ids = Vec::new();
+        let mut out = Vec::new();
         for r in rows {
-            let s = r.map_err(|e| Error::Storage(e.to_string()))?;
-            ids.push(s.parse::<MemoryId>()?);
+            let (s, d) = r.map_err(|e| Error::Storage(e.to_string()))?;
+            // d is bounded by `depth` (a u8), so the cast is lossless; clamp
+            // defensively rather than trusting the SQL invariant.
+            let hops = u8::try_from(d).unwrap_or(u8::MAX);
+            out.push((s.parse::<MemoryId>()?, hops));
         }
-        Ok(ids)
+        Ok(out)
     }
 
     fn list(
@@ -1500,6 +1987,12 @@ impl Store for SqliteStore {
         if let Some(importance) = updates.importance {
             sets.push(format!("importance = ?{}", params.len() + 1));
             params.push(Box::new(importance as i64));
+            // W1.9: an explicit importance update is the author RE-DECLARING
+            // intent, so the prior moves with it. Only this user-facing path
+            // re-stamps `base_importance`; the recalibration job writes through
+            // `set_recalibrated_importance`, which leaves the prior untouched.
+            sets.push(format!("base_importance = ?{}", params.len() + 1));
+            params.push(Box::new(importance as i64));
         }
         if let Some(tags) = &updates.tags {
             sets.push(format!("tags = ?{}", params.len() + 1));
@@ -1545,11 +2038,7 @@ impl Store for SqliteStore {
         );
 
         // Transaction: the UPDATE and its oplog row commit (or roll back) together.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
             let affected = self
                 .conn
@@ -1561,27 +2050,12 @@ impl Store for SqliteStore {
                 append_oplog(&self.conn, &self.site_id, "update", id, "")?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn archive_memory(&self, id: &MemoryId) -> Result<()> {
         // Transaction: the archive and its oplog row commit (or roll back) together.
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
@@ -1593,31 +2067,26 @@ impl Store for SqliteStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             // Missing or already-archived ids are Ok no-ops and log nothing.
             if affected > 0 {
+                // Vector hygiene (W1.7): an archived memory must not occupy
+                // KNN candidate slots. Same transaction as the archive so the
+                // row and its vector commit — or roll back — together. A row
+                // stored without an embedding simply deletes nothing.
+                self.conn
+                    .execute(
+                        "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                        rusqlite::params![id.to_string()],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
                 append_oplog(&self.conn, &self.site_id, "archive", id, "")?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
         // Transaction: the link INSERT and its oplog row commit (or roll back)
         // together (an FK failure on a missing endpoint rolls back both).
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             self.conn
                 .execute(
                     "INSERT INTO memory_links
@@ -1642,18 +2111,7 @@ impl Store for SqliteStore {
             })
             .to_string();
             append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn record_access(&self, id: &MemoryId) -> Result<()> {
@@ -1702,13 +2160,41 @@ impl Store for SqliteStore {
         Ok(())
     }
 
-    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
+    fn record_access_bumps(&self, bumps: &[AccessBump]) -> Result<()> {
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        immediate_tx(&self.conn, || {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    // Assigns NO FTS-indexed column, so under migration 006 the
+                    // mem_au trigger does not fire: a flush is zero FTS writes.
+                    "UPDATE memories
+                     SET access_count = access_count + ?1,
+                         last_accessed_at = CASE
+                           WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
+                           ELSE last_accessed_at
+                         END
+                     WHERE memory_id = ?3",
+                )
+                .map_err(storage_err)?;
+            for bump in bumps {
+                // 0 rows affected = missing id: silently skipped (best-effort).
+                stmt.execute(rusqlite::params![
+                    bump.count,
+                    bump.last_accessed_at,
+                    bump.id.to_string()
+                ])
+                .map_err(storage_err)?;
+            }
+            Ok(())
+        })
+    }
 
+    fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
-        let result = (|| -> Result<()> {
+        immediate_tx(&self.conn, || {
             // Point old -> new. FK on superseded_by makes a missing `new` fail here,
             // rolling back the whole transaction (old stays unarchived).
             let affected = self
@@ -1731,22 +2217,20 @@ impl Store for SqliteStore {
                     rusqlite::params![now, old.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
+            // Vector hygiene (W1.7): the superseded (now archived) memory's
+            // vector leaves the KNN index in the same transaction. Idempotent:
+            // a vectorless or already-cleaned row deletes nothing.
+            self.conn
+                .execute(
+                    "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                    rusqlite::params![old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
             // One `supersede` oplog row covers the whole compound mutation
             // (pointer + archive); the replacement id rides in `details`.
             let details = serde_json::json!({ "new": new.to_string() }).to_string();
             append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 
     fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>> {
@@ -1928,14 +2412,23 @@ impl Store for SqliteStore {
             });
         }
 
-        self.conn
-            .execute_batch("BEGIN IMMEDIATE;")
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        let result = (|| -> Result<()> {
-            // Stamp the memory row. 0 rows updated means the id does not exist:
-            // fail closed (NotFound) so the whole transaction rolls back rather
-            // than leaving a vector update with no owning row.
+        immediate_tx(&self.conn, || {
+            // Stamp the memory row. 0 rows updated means the id does not exist
+            // OR the row is archived: fail closed (NotFound) so the whole
+            // transaction rolls back rather than leaving a vector update with
+            // no owning LIVE row. The `archived_at IS NULL` guard closes the
+            // reembed-vs-archive race: the reembed job reads its candidate set
+            // (active rows only) on the read pool, then spends seconds on
+            // embedding-API calls before this write reaches the single writer —
+            // an Archive/Supersede processed in that window deletes the vec0
+            // row, and without the guard the fallback INSERT below would
+            // resurrect a vector for the archived row, permanently violating
+            // the live-only-partition invariant `vector_search` documents
+            // (nothing prunes it again: archive only deletes the vector on the
+            // active->archived transition, and the W1.1/W1.7 rebuild is
+            // one-shot). The caller (engine reembed loop) counts the error as a
+            // per-row skip, and the next candidate scan excludes archived rows,
+            // so there is no retry loop.
             // `updated_at` is intentionally NOT bumped: re-embed is a maintenance-only
             // path that refreshes the search vector, leaving the note's user-visible
             // content unchanged. The daemon writer emits no MemoryChanged event for the
@@ -1946,7 +2439,7 @@ impl Store for SqliteStore {
                 .execute(
                     "UPDATE memories
                      SET embedding_model = ?1, embedding_input_version = ?2
-                     WHERE memory_id = ?3",
+                     WHERE memory_id = ?3 AND archived_at IS NULL",
                     rusqlite::params![model, input_version, id.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1966,26 +2459,22 @@ impl Store for SqliteStore {
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if updated == 0 {
+                // Resolve the namespace partition key from the owning memories
+                // row (proven present AND live by `affected > 0` above, in this
+                // same transaction). The `archived_at IS NULL` filter is
+                // defense-in-depth on top of the stamp guard: this INSERT must
+                // never re-add a vec0 row for an archived memory.
                 self.conn
                     .execute(
-                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![id.to_string(), embedding_bytes(embedding)],
+                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         SELECT memory_id, namespace, ?2 FROM memories
+                         WHERE memory_id = ?1 AND archived_at IS NULL",
+                        rusqlite::params![id.to_string(), bytes],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
             Ok(())
-        })();
-
-        match result {
-            Ok(()) => self
-                .conn
-                .execute_batch("COMMIT;")
-                .map_err(|e| Error::Storage(e.to_string())),
-            Err(e) => {
-                let _ = self.conn.execute_batch("ROLLBACK;");
-                Err(e)
-            }
-        }
+        })
     }
 }
 
@@ -2641,6 +3130,18 @@ mod keyword_tests {
     }
 
     #[test]
+    fn porter_stemming_unifies_inflections() {
+        // Migration 005 layers the porter stemmer over unicode61: a query in
+        // one inflection must match a document in another ("retries" ->
+        // "retri" <- "retry"). Under bare unicode61 this returned nothing.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "we retry failed jobs");
+        let found = store.keyword_search(&proj, "retries", 10).unwrap();
+        assert_eq!(found, vec![hit]);
+    }
+
+    #[test]
     fn finds_matching_and_scopes_to_namespace() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let proj = Namespace::Project("rb".into());
@@ -2653,52 +3154,110 @@ mod keyword_tests {
     }
 
     #[test]
+    fn or_of_tokens_matches_natural_language_queries() {
+        // W1.2: the keyword leg must be alive for multi-word natural-language
+        // queries. The old whole-query-phrase form required every token to be
+        // adjacent and in order, so a question never matched; OR-of-tokens
+        // matches on any content term and lets bm25 rank by rarity.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "all writes go through tokio channels");
+        let _other = insert(&store, proj.clone(), "completely unrelated topic");
+
+        let found = store
+            .keyword_search(&proj, "how do we use tokio for writes?", 10)
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![hit],
+            "a question must match on its content tokens"
+        );
+    }
+
+    #[test]
     fn escapes_special_query_chars() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let proj = Namespace::Project("rb".into());
         let hit = insert(&store, proj.clone(), "config flag enable-cache value");
 
-        // The '-' would be an FTS5 operator (NOT) if unescaped. After escaping, the
-        // query is treated as the literal phrase "enable cache" (unicode61 splits on
-        // '-'), which matches the adjacent tokens in the document.
+        // The '-' would be an FTS5 operator (NOT) if unescaped. Tokenized and
+        // quoted, the query becomes `"enable" OR "cache"` and matches the
+        // document's tokens (unicode61 splits the document on '-' too).
         let found = store.keyword_search(&proj, "enable-cache", 10).unwrap();
         assert_eq!(found, vec![hit.clone()]);
 
-        // A query that is nothing but FTS5 operators must NOT raise a syntax error;
-        // escaped, it becomes an empty/operator-free phrase that simply matches nothing.
+        // A query that is nothing but FTS5 operator words/punctuation must NOT
+        // raise a syntax error. Quoted per-token it is `"OR" OR "AND"` — the
+        // literal words, which this document does not contain.
         let none = store.keyword_search(&proj, "OR AND (", 10).unwrap();
         assert!(none.is_empty());
 
-        // A double-quote is the FTS5 phrase delimiter. Unescaped it would either
-        // break the query or let a user inject phrase syntax. escape_fts5_query
-        // doubles internal quotes, so this runs safely (no error) and matches
-        // nothing here (the document has no literal quote token).
-        let quoted = store
+        // A double-quote is the FTS5 phrase delimiter. It is a token separator
+        // here, never syntax: the input becomes `"value" OR "OR" OR "config"`,
+        // which matches this document on its literal `value`/`config` tokens —
+        // exactly what the same input WITHOUT the embedded quote would match.
+        // Equivalence is the no-injection property: the quote changed nothing.
+        let with_quote = store
             .keyword_search(&proj, "value\" OR config", 10)
             .unwrap();
-        assert!(
-            quoted.is_empty(),
-            "double-quote input must not inject phrase syntax, got {quoted:?}"
+        let without_quote = store.keyword_search(&proj, "value OR config", 10).unwrap();
+        assert_eq!(with_quote, vec![hit.clone()]);
+        assert_eq!(
+            with_quote, without_quote,
+            "an embedded double-quote must not alter query semantics"
         );
 
-        // A bare double-quote alone must also be safe (no panic, no syntax error).
+        // A bare double-quote alone must also be safe (no panic, no syntax
+        // error): no indexable tokens -> the empty phrase, which matches nothing.
         let lone_quote = store.keyword_search(&proj, "\"", 10).unwrap();
         assert!(lone_quote.is_empty());
 
-        // An asterisk is the FTS5 prefix operator. After escaping (`"enable*"`) the
-        // query is a well-formed phrase-with-prefix that FTS5 accepts safely (no
-        // syntax error, no injection). It may legitimately match `enable` in the
-        // document via prefix; the requirement is only that it runs safely, so we
-        // assert it does not error and does not match unrelated rows.
+        // An asterisk is the FTS5 prefix operator. As a separator it vanishes:
+        // `enable*` becomes the literal token query `"enable"`, which matches
+        // the document (NOT via prefix expansion — see the decision record on
+        // escape_fts5_query: trailing prefix match measured as a regression).
         let star = store.keyword_search(&proj, "enable*", 10).unwrap();
-        assert!(
-            star == vec![hit.clone()] || star.is_empty(),
-            "asterisk input must run safely without injection, got {star:?}"
-        );
+        assert_eq!(star, vec![hit.clone()]);
 
         // A lone asterisk must also be safe (no panic, no syntax error).
         let lone_star = store.keyword_search(&proj, "*", 10).unwrap();
         assert!(lone_star.is_empty());
+
+        // An empty query must be safe and match nothing.
+        let empty = store.keyword_search(&proj, "", 10).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn operator_words_are_literal_not_syntax() {
+        // NOT/NEAR injection: if `NOT` were parsed as the FTS5 operator,
+        // "config NOT value" would EXCLUDE this document (it contains `value`).
+        // Tokenized and quoted it is `"config" OR "NOT" OR "value"`, which
+        // matches it. Same for a NEAR() construction attempt.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "config flag enable-cache value");
+
+        let not_attempt = store.keyword_search(&proj, "config NOT value", 10).unwrap();
+        assert_eq!(
+            not_attempt,
+            vec![hit.clone()],
+            "NOT must be a literal token, not an exclusion operator"
+        );
+
+        let near_attempt = store
+            .keyword_search(&proj, "NEAR(config value, 2)", 10)
+            .unwrap();
+        assert_eq!(
+            near_attempt,
+            vec![hit.clone()],
+            "NEAR(...) must be literal tokens, not proximity syntax"
+        );
+
+        // Column-filter injection: `summary:config` must not become a
+        // column-scoped query; `summary` is just another OR'd token.
+        let col_attempt = store.keyword_search(&proj, "summary:config", 10).unwrap();
+        assert_eq!(col_attempt, vec![hit]);
     }
 
     #[test]
@@ -2780,6 +3339,255 @@ mod vector_tests {
 }
 
 #[cfg(test)]
+mod namespace_rename_tests {
+    #![allow(clippy::panic)]
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
+
+    fn insert_vec(store: &SqliteStore, ns: &Namespace, content: &str, v: [f32; 8]) -> MemoryNote {
+        let m = MemoryNote::new(ns.clone(), content.into(), MemoryType::Insight, 5);
+        store.insert_memory(&m, Some(&v)).unwrap();
+        m
+    }
+
+    fn count_in(store: &SqliteStore, ns: &Namespace) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memories WHERE namespace = ?1",
+                rusqlite::params![ns.as_db_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    fn rename_oplog_rows(store: &SqliteStore) -> Vec<(String, String)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT namespace, details FROM memory_oplog
+                 WHERE op = 'namespace_rename' ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn rename_moves_memories_vectors_links_and_logs_one_oplog_row() {
+        // The spec fixture: vectors + FTS + links across two namespaces, plus
+        // an archived (vectorless) row, then rename ONE namespace.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = Namespace::Project("scratch-dir".into());
+        let new = Namespace::Project("rusty-brain".into());
+        let other = Namespace::Project("untouched".into());
+
+        let a = insert_vec(
+            &store,
+            &old,
+            "single writer owns the sqlite connection",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let b = insert_vec(
+            &store,
+            &old,
+            "vec0 partitions knn by namespace",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Archived row: vector pruned by archive (W1.7), but the memories row
+        // must still move to the new namespace.
+        let archived = insert_vec(
+            &store,
+            &old,
+            "archived rows move too",
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        store.archive_memory(&archived.id).unwrap();
+        // A graph edge inside the renamed namespace.
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: LinkType::References,
+                strength: 1.0,
+                reason: String::new(),
+                created_at: a.created_at,
+            })
+            .unwrap();
+        // A bystander namespace that must not move.
+        let bystander = insert_vec(
+            &store,
+            &other,
+            "single writer in another namespace",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let outcome = store.rename_namespace(&old, &new, false).unwrap();
+        assert_eq!(outcome.memories, 3, "active + archived rows all move");
+        assert_eq!(outcome.vectors, 2, "only live rows still have vectors");
+        assert_eq!(outcome.merged_into, 0, "target was empty");
+
+        // Old namespace is empty; the new one holds the corpus.
+        assert_eq!(count_in(&store, &old), 0);
+        assert_eq!(count_in(&store, &new), 3);
+        assert!(store.list(&old, None, 10).unwrap().is_empty());
+        let listed: Vec<_> = store
+            .list(&new, None, 10)
+            .unwrap()
+            .into_iter()
+            .map(|m| m.id)
+            .collect();
+        assert!(listed.contains(&a.id) && listed.contains(&b.id));
+
+        // FTS leg follows the rename: keyword_search scopes via the memories
+        // JOIN, so the same query flips namespaces with the rows.
+        let kw_new = store.keyword_search(&new, "writer", 10).unwrap();
+        assert!(kw_new.contains(&a.id), "FTS finds the row in the NEW ns");
+        assert!(
+            store.keyword_search(&old, "writer", 10).unwrap().is_empty(),
+            "FTS finds nothing under the OLD ns"
+        );
+
+        // vec0 partition keys were re-inserted under the new namespace: KNN
+        // under NEW returns both live vectors nearest-first; KNN under OLD is
+        // empty (the partition no longer holds rows).
+        let query = [0.9, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let knn_new = store.vector_search(&new, &query, 10).unwrap();
+        let knn_ids: Vec<_> = knn_new.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(knn_ids, vec![a.id.clone(), b.id.clone()]);
+        assert!(store.vector_search(&old, &query, 10).unwrap().is_empty());
+
+        // Graph edges key on memory ids: the link survives untouched.
+        assert_eq!(
+            store.graph_neighbors(&a.id, 1).unwrap(),
+            vec![(b.id.clone(), 1)]
+        );
+
+        // The bystander namespace is untouched, in rows and in KNN.
+        assert_eq!(count_in(&store, &other), 1);
+        let knn_other = store.vector_search(&other, &query, 10).unwrap();
+        assert_eq!(knn_other[0].0, bystander.id);
+
+        // Exactly one namespace_rename oplog row, under the NEW namespace,
+        // with old/new/counts in details.
+        let rows = rename_oplog_rows(&store);
+        assert_eq!(rows.len(), 1);
+        let (ns, details) = &rows[0];
+        assert_eq!(ns, &new.as_db_string());
+        let v: serde_json::Value = serde_json::from_str(details).unwrap();
+        assert_eq!(v["old"], old.as_db_string());
+        assert_eq!(v["new"], new.as_db_string());
+        assert_eq!(v["moved"], 3);
+        assert_eq!(v["vectors"], 2);
+        assert_eq!(v["merged_into"], 0);
+    }
+
+    #[test]
+    fn rename_refuses_non_empty_target_without_merge_and_changes_nothing() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = Namespace::Project("a".into());
+        let b = Namespace::Project("b".into());
+        let in_a = insert_vec(&store, &a, "row in a", [1.0; 8]);
+        insert_vec(&store, &b, "row in b", [0.5; 8]);
+
+        let err = store.rename_namespace(&a, &b, false).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "collision must be validation-class, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("--merge"),
+            "refusal carries the remediation hint: {err}"
+        );
+
+        // Rolled back: nothing moved, no oplog row.
+        assert_eq!(count_in(&store, &a), 1);
+        assert_eq!(count_in(&store, &b), 1);
+        assert!(store
+            .keyword_search(&a, "row", 10)
+            .unwrap()
+            .contains(&in_a.id));
+        assert!(rename_oplog_rows(&store).is_empty());
+    }
+
+    #[test]
+    fn rename_with_merge_appends_and_reports_pre_existing_count() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = Namespace::Project("a".into());
+        let b = Namespace::Project("b".into());
+        let m1 = insert_vec(
+            &store,
+            &a,
+            "merge one",
+            [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let m2 = insert_vec(
+            &store,
+            &a,
+            "merge two",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let pre = insert_vec(
+            &store,
+            &b,
+            "already here",
+            [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let outcome = store.rename_namespace(&a, &b, true).unwrap();
+        assert_eq!(outcome.memories, 2);
+        assert_eq!(outcome.vectors, 2);
+        assert_eq!(outcome.merged_into, 1, "pre-existing target rows counted");
+
+        assert_eq!(count_in(&store, &a), 0);
+        assert_eq!(count_in(&store, &b), 3);
+
+        // The merged partition serves KNN over old AND pre-existing vectors.
+        let knn: std::collections::HashSet<_> = store
+            .vector_search(&b, &[0.5, 0.5, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0], 10)
+            .unwrap()
+            .into_iter()
+            .map(|(id, _)| id)
+            .collect();
+        assert!(knn.contains(&m1.id) && knn.contains(&m2.id) && knn.contains(&pre.id));
+
+        let rows = rename_oplog_rows(&store);
+        assert_eq!(rows.len(), 1);
+        let v: serde_json::Value = serde_json::from_str(&rows[0].1).unwrap();
+        assert_eq!(v["merged_into"], 1);
+    }
+
+    #[test]
+    fn rename_of_empty_source_is_a_validation_error() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let err = store
+            .rename_namespace(
+                &Namespace::Project("nothing-here".into()),
+                &Namespace::Project("target".into()),
+                false,
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+        assert!(err.to_string().contains("no memories"), "{err}");
+    }
+
+    #[test]
+    fn rename_to_the_same_namespace_is_a_validation_error() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("same".into());
+        insert_vec(&store, &ns, "row", [1.0; 8]);
+        let err = store.rename_namespace(&ns, &ns, false).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+        assert!(err.to_string().contains("itself"), "{err}");
+        assert_eq!(count_in(&store, &ns), 1, "nothing changed");
+    }
+}
+
+#[cfg(test)]
 mod graph_tests {
     use super::*;
     use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, Namespace};
@@ -2809,7 +3617,8 @@ mod graph_tests {
     }
 
     #[test]
-    fn traverses_up_to_depth() {
+    fn traverses_up_to_depth_with_real_hop_distances() {
+        // 3-deep chain a -> b -> c -> d: hop values must be 1, 2, 3 (W1.5).
         let store = SqliteStore::open_in_memory(8).unwrap();
         let a = node(&store, "a");
         let b = node(&store, "b");
@@ -2819,17 +3628,58 @@ mod graph_tests {
         link(&store, &b, &c); // b -> c
         link(&store, &c, &d); // c -> d
 
-        let mut depth1 = store.graph_neighbors(&a.id, 1).unwrap();
-        depth1.sort_by_key(|id| id.to_string());
-        let mut want1 = vec![b.id.clone()];
-        want1.sort_by_key(|id| id.to_string());
-        assert_eq!(depth1, want1);
+        let depth1 = store.graph_neighbors(&a.id, 1).unwrap();
+        assert_eq!(depth1, vec![(b.id.clone(), 1)]);
 
-        let mut depth2 = store.graph_neighbors(&a.id, 2).unwrap();
-        depth2.sort_by_key(|id| id.to_string());
-        let mut want2 = vec![b.id.clone(), c.id.clone()];
-        want2.sort_by_key(|id| id.to_string());
-        assert_eq!(depth2, want2);
+        let depth2 = store.graph_neighbors(&a.id, 2).unwrap();
+        assert_eq!(depth2, vec![(b.id.clone(), 1), (c.id.clone(), 2)]);
+
+        let depth3 = store.graph_neighbors(&a.id, 3).unwrap();
+        assert_eq!(
+            depth3,
+            vec![(b.id.clone(), 1), (c.id.clone(), 2), (d.id.clone(), 3)],
+            "chain hops must be the real distances 1, 2, 3 in ascending order"
+        );
+    }
+
+    #[test]
+    fn diamond_multiple_paths_keep_minimum_hops() {
+        // Two paths from a to d: a -> b -> d (2 hops) and a -> c -> e -> d
+        // (3 hops). The recursive UNION dedups (node, depth) PAIRS, so the walk
+        // holds both (d, 2) and (d, 3); MIN ... GROUP BY must collapse d to its
+        // SHORTEST distance, 2, and return it exactly once (W1.5).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        let c = node(&store, "c");
+        let d = node(&store, "d");
+        let e = node(&store, "e");
+        link(&store, &a, &b); // a -> b
+        link(&store, &b, &d); // b -> d   (d at 2 hops)
+        link(&store, &a, &c); // a -> c
+        link(&store, &c, &e); // c -> e
+        link(&store, &e, &d); // e -> d   (d at 3 hops via the long arm)
+
+        let got = store.graph_neighbors(&a.id, 4).unwrap();
+        let d_rows: Vec<&(rb_types::MemoryId, u8)> =
+            got.iter().filter(|(id, _)| *id == d.id).collect();
+        assert_eq!(d_rows.len(), 1, "each node appears exactly once: {got:?}");
+        assert_eq!(
+            d_rows[0].1, 2,
+            "the shorter of the two paths to d must win: {got:?}"
+        );
+
+        // Full picture: b and c are direct neighbors (1), e is 2, d is min(2, 3) = 2.
+        let mut by_id: Vec<(String, u8)> = got.iter().map(|(id, h)| (id.to_string(), *h)).collect();
+        by_id.sort();
+        let mut want = vec![
+            (b.id.to_string(), 1u8),
+            (c.id.to_string(), 1u8),
+            (e.id.to_string(), 2u8),
+            (d.id.to_string(), 2u8),
+        ];
+        want.sort();
+        assert_eq!(by_id, want);
     }
 
     #[test]
@@ -2851,13 +3701,15 @@ mod graph_tests {
 
         // depth >= 2 forces the recursion to revisit `a` via b -> a; it must not
         // hang and must exclude the start node `a` and dedup `b`.
-        let mut got = store.graph_neighbors(&a.id, 3).unwrap();
-        got.sort_by_key(|id| id.to_string());
-        // Neighbors of `a`: b (depth 1). `a` itself is reachable at depth 2 via the
-        // back-edge but is excluded by `node <> ?1`. Result is exactly [b].
-        let mut want = vec![b.id.clone()];
-        want.sort_by_key(|id| id.to_string());
-        assert_eq!(got, want, "cycle must terminate with a deduplicated set");
+        let got = store.graph_neighbors(&a.id, 3).unwrap();
+        // Neighbors of `a`: b at hop 1 (b reappears at depth 3 via the cycle,
+        // but MIN-GROUP-BY keeps the shortest). `a` itself is reachable at
+        // depth 2 via the back-edge but is excluded by `node <> ?1`.
+        assert_eq!(
+            got,
+            vec![(b.id.clone(), 1)],
+            "cycle must terminate with a deduplicated set at minimum hops"
+        );
     }
 }
 
@@ -3345,6 +4197,86 @@ mod access_tests {
     }
 
     #[test]
+    fn record_access_bumps_applies_counts_and_monotonic_timestamps() {
+        // W1.8 batched-bump semantics: each entry adds its accumulated count
+        // and advances last_accessed_at monotonically (an older flush can
+        // never move the clock backwards).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "bump_a");
+        let b = node(&store, "bump_b");
+
+        store
+            .record_access_bumps(&[
+                AccessBump {
+                    id: a.id.clone(),
+                    count: 3,
+                    last_accessed_at: 100,
+                },
+                AccessBump {
+                    id: b.id.clone(),
+                    count: 1,
+                    last_accessed_at: 50,
+                },
+            ])
+            .unwrap();
+
+        let got_a = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got_a.access_count, 3, "count accumulates, not +1");
+        assert_eq!(
+            got_a.last_accessed_at.map(|t| t.timestamp()),
+            Some(100),
+            "stamp is the buffered access time"
+        );
+        let got_b = store.get_memory(&b.id).unwrap().unwrap();
+        assert_eq!(got_b.access_count, 1);
+        assert_eq!(got_b.last_accessed_at.map(|t| t.timestamp()), Some(50));
+
+        // A later flush carrying an OLDER timestamp adds its count but keeps
+        // the newer stamp.
+        store
+            .record_access_bumps(&[AccessBump {
+                id: a.id.clone(),
+                count: 2,
+                last_accessed_at: 40,
+            }])
+            .unwrap();
+        let again = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(again.access_count, 5, "3 + 2 across two flushes");
+        assert_eq!(
+            again.last_accessed_at.map(|t| t.timestamp()),
+            Some(100),
+            "last_accessed_at is monotonic"
+        );
+    }
+
+    #[test]
+    fn record_access_bumps_missing_id_skipped_and_empty_is_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "bump_present");
+
+        // Empty slice: no transaction, no error.
+        store.record_access_bumps(&[]).unwrap();
+
+        // A missing id is silently skipped; present ids in the same batch land.
+        store
+            .record_access_bumps(&[
+                AccessBump {
+                    id: MemoryId::new(),
+                    count: 7,
+                    last_accessed_at: 100,
+                },
+                AccessBump {
+                    id: a.id.clone(),
+                    count: 1,
+                    last_accessed_at: 100,
+                },
+            ])
+            .unwrap();
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got.access_count, 1);
+    }
+
+    #[test]
     fn supersede_sets_superseded_by_and_archives_old() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let old = node(&store, "old decision");
@@ -3581,7 +4513,7 @@ mod near_duplicates_tests {
             "twin",
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
-        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.5).
+        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.0).
         let _different = insert_vec(
             &store,
             proj_a.clone(),
@@ -3608,7 +4540,7 @@ mod near_duplicates_tests {
             !ids.contains(&foreign),
             "a near-identical memory in another namespace must NEVER be returned"
         );
-        // The orthogonal vector has similarity ~0.5, well below the 0.95 threshold.
+        // The orthogonal vector has similarity ~0.0, well below the 0.95 threshold.
         assert_eq!(ids, vec![twin], "only the above-threshold twin is returned");
         // Reported similarity for an identical vector is at/near 1.0.
         assert!(
@@ -3708,6 +4640,7 @@ mod near_duplicates_tests {
             .expect("active row a must be present");
         assert_eq!(row_a.namespace, Namespace::Global);
         assert_eq!(row_a.importance, 5);
+        assert_eq!(row_a.base_importance, 5, "insert stamps the author prior");
         assert_eq!(row_a.access_count, 7);
         assert_eq!(row_a.last_accessed_at, Some(1_700_000_000));
 
@@ -3717,8 +4650,96 @@ mod near_duplicates_tests {
             .expect("active row b must be present");
         assert_eq!(row_b.namespace, Namespace::Project("rb".into()));
         assert_eq!(row_b.importance, 3);
+        assert_eq!(row_b.base_importance, 3, "insert stamps the author prior");
         assert_eq!(row_b.access_count, 0);
         assert_eq!(row_b.last_accessed_at, None);
+    }
+
+    #[test]
+    fn set_recalibrated_importance_moves_effective_but_never_the_author_prior() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(Namespace::Global, "anchored".into(), MemoryType::Insight, 4);
+        store.insert_memory(&m, None).unwrap();
+        let stored_before = store.get_memory(&m.id).unwrap().expect("note present");
+
+        store.set_recalibrated_importance(&m.id, 6).unwrap();
+
+        let row = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("row present");
+        assert_eq!(row.importance, 6, "effective importance moved");
+        assert_eq!(
+            row.base_importance, 4,
+            "author prior must survive the job write"
+        );
+
+        let note = store.get_memory(&m.id).unwrap().expect("note present");
+        assert_eq!(note.importance, 6, "ranking reads the effective value");
+        assert_eq!(
+            note.updated_at, stored_before.updated_at,
+            "a maintenance write must NOT bump updated_at (the \
+             update_vector/rename_namespace rule): recalibrated rows must not \
+             look freshly user-modified"
+        );
+    }
+
+    #[test]
+    fn set_recalibrated_importance_validates_range_and_ignores_missing_id() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Out-of-range importance fails closed (matching the insert path).
+        let err = store
+            .set_recalibrated_importance(&MemoryId::new(), 11)
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "11 must be rejected, got {err:?}"
+        );
+        // Missing id with a valid value is a best-effort no-op.
+        store
+            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .unwrap();
+    }
+
+    #[test]
+    fn explicit_importance_update_redeclares_the_author_prior() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(
+            Namespace::Global,
+            "re-declared".into(),
+            MemoryType::Insight,
+            3,
+        );
+        store.insert_memory(&m, None).unwrap();
+
+        // Simulate a prior recalibration: effective drifts, prior anchored.
+        store.set_recalibrated_importance(&m.id, 5).unwrap();
+
+        // The USER explicitly sets importance: both effective AND prior move —
+        // an explicit update is the author re-declaring intent.
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    importance: Some(9),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let row = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("row present");
+        assert_eq!(row.importance, 9);
+        assert_eq!(
+            row.base_importance, 9,
+            "an explicit user update re-anchors the author prior"
+        );
     }
 
     #[test]
@@ -3982,6 +5003,29 @@ mod oplog_tests {
         let details: serde_json::Value = serde_json::from_str(details).unwrap();
         assert_eq!(details["type"], "extends");
         assert_eq!(details["target"], target.id.to_string());
+    }
+
+    #[test]
+    fn set_recalibrated_importance_appends_oplog_only_on_real_change() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to recalibrate");
+
+        // Missing-id write: best-effort no-op, no oplog row.
+        store
+            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .unwrap();
+        assert_eq!(oplog_rows(&store).len(), 1, "only the insert is logged");
+
+        // A real job write logs a `set_importance` row a replay consumer can
+        // reproduce (importance is durable ranking state).
+        store.set_recalibrated_importance(&n.id, 7).unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2);
+        let (op, mid, _, _, details) = &rows[1];
+        assert_eq!(op, "set_importance");
+        assert_eq!(mid, &n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        assert_eq!(details["importance"], 7);
     }
 
     #[test]
@@ -4271,6 +5315,327 @@ mod provenance_tests {
 }
 
 #[cfg(test)]
+mod fts_tokenizer_migration_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn migration_005_rebuilds_fts_on_populated_pre_porter_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 004-schema DB
+        // (file-discovered migrations 001..004: bare-unicode61 FTS index),
+        // populate it through the old index's insert trigger, then open via
+        // SqliteStore (which applies 005). The porter rebuild must re-index
+        // the pre-existing rows, and the sync triggers must survive the
+        // virtual-table swap.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 4).unwrap();
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+                 VALUES ('00000000-0000-4000-8000-000000000005','project:legacy',0,0,\
+                 'we retry failed jobs','s','[]','[]','insight',5,1.0,'')",
+                [],
+            )
+            .unwrap();
+            // Sanity precondition: the OLD index does not stem, so the
+            // inflected query has nothing to match yet.
+            let pre: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"retries\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre, 0, "pre-005 unicode61 index must not stem");
+        }
+
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("legacy".into());
+        let id: MemoryId = "00000000-0000-4000-8000-000000000005".parse().unwrap();
+
+        // The 'rebuild' step re-indexed the OLD row under porter: an inflected
+        // query now matches it.
+        let hits = store.keyword_search(&ns, "retries", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "old row re-indexed under porter");
+
+        // Exactly the populated rows are indexed (no loss, no duplication).
+        let fts_rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1, "rebuild preserves the row count");
+
+        // The recreated table carries the new tokenizer in its DDL.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='memories_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("porter"),
+            "memories_fts DDL must record the porter tokenizer, got {ddl:?}"
+        );
+
+        // mem_ai survived the swap: a post-migration insert is searchable.
+        let fresh = MemoryNote::new(
+            ns.clone(),
+            "daemon reconnects after restarts".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&fresh, None).unwrap();
+        let found = store.keyword_search(&ns, "reconnecting", 10).unwrap();
+        assert_eq!(found, vec![fresh.id.clone()], "insert trigger still syncs");
+
+        // mem_au survived the swap: an update re-syncs the index.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'writer thread serializes mutations' \
+                 WHERE memory_id = ?1",
+                rusqlite::params![fresh.id.to_string()],
+            )
+            .unwrap();
+        let updated = store
+            .keyword_search(&ns, "serializing mutation", 10)
+            .unwrap();
+        assert_eq!(updated, vec![fresh.id], "update trigger still syncs");
+        let stale = store.keyword_search(&ns, "reconnecting", 10).unwrap();
+        assert!(stale.is_empty(), "old content must leave the index");
+    }
+}
+
+#[cfg(test)]
+mod mem_au_narrowing_migration_tests {
+    use super::*;
+    use rb_types::Namespace;
+
+    /// FTS row-version probe (W1.8): fts5 appends new inverted-index segment
+    /// rows to the `memories_fts_data` shadow table on EVERY index write —
+    /// including the delete+reinsert cycle the old broad `mem_au` ran on
+    /// metadata-only updates — so `(count, max id)` moves iff the index was
+    /// written. The pre-006 half of the test below proves the probe detects
+    /// churn (it is not vacuously stable).
+    fn fts_index_state(conn: &rusqlite::Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT count(*), coalesce(max(id), 0) FROM memories_fts_data",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_006_narrows_mem_au_on_populated_pre_006_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 005-schema DB,
+        // demonstrate the F08 write amplification the old trigger caused
+        // (access bump => FTS churn), then open via SqliteStore (006 applies)
+        // and prove the same bumps are now ZERO FTS writes while indexed-column
+        // edits still re-sync the index.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 5).unwrap();
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+                 VALUES ('00000000-0000-4000-8000-000000000006','project:legacy',0,0,\
+                 'recall must not rewrite the index','s','[]','[]','insight',5,1.0,'')",
+                [],
+            )
+            .unwrap();
+
+            // Pre-006 churn proof: a metadata-only access bump fires the broad
+            // AFTER UPDATE trigger and rewrites the row's index entries.
+            let before = fts_index_state(&conn);
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = 1 \
+                 WHERE memory_id = '00000000-0000-4000-8000-000000000006'",
+                [],
+            )
+            .unwrap();
+            assert_ne!(
+                before,
+                fts_index_state(&conn),
+                "pre-006 the broad trigger churns FTS on a pure access bump \
+                 (this also proves the probe detects index writes)"
+            );
+        }
+
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("legacy".into());
+        let id: MemoryId = "00000000-0000-4000-8000-000000000006".parse().unwrap();
+
+        // The narrowed trigger is live and names exactly the indexed columns.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mem_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("AFTER UPDATE OF"),
+            "mem_au must be column-scoped post-006, got {ddl:?}"
+        );
+        for col in ["content", "summary", "keywords", "tags"] {
+            assert!(ddl.contains(col), "mem_au OF-list must keep {col}: {ddl:?}");
+        }
+
+        // The trigger swap never touched the index: the old row still matches.
+        let hits = store.keyword_search(&ns, "recall", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "index survives the migration");
+
+        // Post-006: access bumps — both the single and the batched (W1.8
+        // flush) paths — trigger ZERO FTS writes.
+        let before = fts_index_state(&store.conn);
+        store.record_access(&id).unwrap();
+        store
+            .record_access_bumps(&[AccessBump {
+                id: id.clone(),
+                count: 2,
+                last_accessed_at: 123,
+            }])
+            .unwrap();
+        assert_eq!(
+            fts_index_state(&store.conn),
+            before,
+            "access bumps must not write FTS"
+        );
+        // The bumps themselves landed (the trigger narrowing lost no writes).
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert_eq!(got.access_count, 4, "1 (pre-006) + 1 + 2");
+
+        // An indexed-column edit STILL re-syncs the index.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'porter stems serialized mutations' \
+                 WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+            )
+            .unwrap();
+        let after_edit = fts_index_state(&store.conn);
+        assert_ne!(after_edit, before, "content edits still write the index");
+        let hits = store.keyword_search(&ns, "serialized", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "new content searchable");
+        let stale = store.keyword_search(&ns, "recall", 10).unwrap();
+        assert!(stale.is_empty(), "old content left the index");
+
+        // Archive (archived_at/updated_at only) is churn-free too.
+        store.archive_memory(&id).unwrap();
+        assert_eq!(
+            fts_index_state(&store.conn),
+            after_edit,
+            "archive must not write FTS"
+        );
+    }
+}
+
+#[cfg(test)]
+mod base_importance_migration_tests {
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn migration_007_backfills_base_importance_on_populated_pre_007_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 006-schema DB
+        // with rows across the importance range, open via SqliteStore (007
+        // applies), and prove every row's author prior was backfilled from
+        // its pre-007 importance and that post-migration writes keep the
+        // prior/effective split intact.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 6).unwrap();
+            // The pre-007 schema must genuinely lack the column, or this test
+            // would not be exercising the ALTER + backfill at all.
+            let has: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM pragma_table_info('memories') \
+                     WHERE name='base_importance'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(has, 0, "pre-007 schema must lack base_importance");
+            for (suffix, importance) in [(1, 1i64), (2, 7), (3, 10)] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO memories (memory_id, namespace, created_at, updated_at, \
+                         content, summary, keywords, tags, memory_type, importance, confidence, \
+                         embedding_model) \
+                         VALUES ('00000000-0000-4000-8000-00000000000{suffix}','project:legacy',\
+                         {suffix},0,'legacy row {suffix}','s','[]','[]','insight',{importance},\
+                         1.0,'')"
+                    ),
+                    [],
+                )
+                .unwrap();
+            }
+        }
+
+        // Open via SqliteStore: 007 applies on top of the populated DB.
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let rows = store.memories_for_recalibration(10).unwrap();
+        assert_eq!(rows.len(), 3, "all legacy rows survive the migration");
+        for row in &rows {
+            assert_eq!(
+                row.base_importance, row.importance,
+                "backfill must anchor the prior at the pre-007 importance ({})",
+                row.id
+            );
+        }
+
+        // FTS untouched by the migration (mem_au is column-scoped post-006 and
+        // the backfill assigns no indexed column): legacy content still matches.
+        let ns = Namespace::Project("legacy".into());
+        let hits = store.keyword_search(&ns, "legacy", 10).unwrap();
+        assert_eq!(hits.len(), 3, "index survives the migration");
+
+        // A post-migration insert stamps the prior...
+        let m = MemoryNote::new(ns.clone(), "fresh row".into(), MemoryType::Insight, 8);
+        store.insert_memory(&m, None).unwrap();
+        let fresh = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == m.id)
+            .expect("fresh row present");
+        assert_eq!(fresh.base_importance, 8, "insert stamps the author prior");
+
+        // ...and a job write on a MIGRATED row moves only the effective value,
+        // leaving the backfilled prior anchored.
+        let legacy_id: MemoryId = "00000000-0000-4000-8000-000000000003".parse().unwrap();
+        store.set_recalibrated_importance(&legacy_id, 8).unwrap();
+        let legacy = store
+            .memories_for_recalibration(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == legacy_id)
+            .expect("legacy row present");
+        assert_eq!(legacy.importance, 8, "job write moved the effective value");
+        assert_eq!(
+            legacy.base_importance, 10,
+            "backfilled prior survives a job write"
+        );
+    }
+}
+
+#[cfg(test)]
 #[cfg(unix)]
 mod db_perms_tests {
     use super::*;
@@ -4337,6 +5702,636 @@ mod db_perms_tests {
             mode_of(&wal),
             0o600,
             "open must tighten a loose pre-existing -wal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vector_schema_tests {
+    //! W1.1 (cosine metric) + W1.7 (namespace partition + vector hygiene):
+    //! the open-time rebuild, the recalibrated metric, and the live-only
+    //! partitioned KNN behavior.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    const DIM: usize = 8;
+
+    fn insert_vec(store: &SqliteStore, ns: &Namespace, content: &str, v: &[f32]) -> MemoryId {
+        let m = MemoryNote::new(ns.clone(), content.into(), MemoryType::Insight, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, Some(v)).unwrap();
+        id
+    }
+
+    fn vector_row_count(store: &SqliteStore, id: &MemoryId) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The L2-vs-cosine distinguishing test (spec W1.1), with NON-UNIT vectors
+    /// through the store API. Candidate `aligned` points exactly along the
+    /// query direction but with magnitude 10 (L2 distance 9.0 from the query);
+    /// candidate `close_l2` sits a short straight-line hop away (L2 ~0.894)
+    /// but 36.87 degrees off in angle (cosine distance 0.4). L2 ordering
+    /// returns `close_l2` first; cosine MUST return `aligned` first.
+    #[test]
+    fn cosine_metric_ranks_by_angle_not_magnitude() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("cosine".into());
+
+        let aligned = insert_vec(
+            &store,
+            &ns,
+            "aligned big magnitude",
+            &[10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let close_l2 = insert_vec(
+            &store,
+            &ns,
+            "close in euclidean terms",
+            &[0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&ns, &query, 10).unwrap();
+        let ids: Vec<MemoryId> = res.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![aligned, close_l2],
+            "cosine must rank the angle-aligned non-unit vector first; \
+             L2 would rank the short-straight-line candidate first"
+        );
+        // Distances are cosine distances: 0.0 for the aligned vector, 0.4 for
+        // the 0.6/0.8 one (cos = 0.6).
+        assert!(res[0].1.abs() < 1e-5, "aligned cosine distance ~0");
+        assert!(
+            (res[1].1 - 0.4).abs() < 1e-5,
+            "off-angle cosine distance ~0.4, got {}",
+            res[1].1
+        );
+    }
+
+    /// The FROZEN pre-W1.1 in-code vec0 DDL (L2 metric, no partition key).
+    /// Shared by every v1-fixture builder so the replicated legacy schema
+    /// cannot drift between tests.
+    ///
+    /// CONVENTION (accepted interpretation of the W1.1 "committed populated
+    /// previous-schema DB fixtures" standing rule): prior-version DBs are
+    /// CONSTRUCTED at test time from (a) the committed, immutable migration
+    /// SQL files via `run_migrations` and (b) — for the vec0 virtual table,
+    /// which migrations never owned — this FROZEN replica of the exact
+    /// pre-W1.1 in-code DDL (verified byte-equal to the deleted ensure-schema
+    /// DDL at the time W1.1 landed). Do NOT "modernize" this string: its whole
+    /// value is that it matches what real pre-Phase-1 dogfood DBs actually
+    /// contain. A committed binary .db fixture was considered and rejected:
+    /// sqlite-vec shadow-table bytes are version-sensitive and unreviewable in
+    /// diffs, while this builder is reviewable and runs on every platform in
+    /// CI.
+    const V1_VEC0_DDL: &str = "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
+           memory_id TEXT PRIMARY KEY,\
+           embedding float[8]\
+         );";
+
+    /// Open a fresh v1-schema DB at `path`: committed migrations + the frozen
+    /// pre-W1.1 vec0 DDL + the `embedding_dim` meta seed.
+    fn open_v1_schema(path: &std::path::Path) -> rusqlite::Connection {
+        register_vec().unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(V1_VEC0_DDL).unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_dim', '8')",
+            [],
+        )
+        .unwrap();
+        conn
+    }
+
+    /// Build a POPULATED version-1 schema DB (old vec0 DDL: L2 metric, no
+    /// partition key; vectors for archived rows; L2-era similarity links)
+    /// exactly as pre-W1.1 code would have, using the committed migrations
+    /// plus the frozen old in-code DDL (see `V1_VEC0_DDL`).
+    fn build_v1_fixture(
+        path: &std::path::Path,
+    ) -> (MemoryId, MemoryId, MemoryId, MemoryId, MemoryId) {
+        let conn = open_v1_schema(path);
+
+        let raw_mem = |id: &MemoryId, ns: &str, archived: bool| {
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content,
+                    summary, keywords, tags, memory_type, importance, confidence,
+                    embedding_model, archived_at)
+                 VALUES (?1, ?2, 0, 0, ?3, 's', '[]', '[]', 'insight', 5, 1.0, '', ?4)",
+                rusqlite::params![
+                    id.to_string(),
+                    ns,
+                    format!("content {id}"),
+                    if archived { Some(1i64) } else { None }
+                ],
+            )
+            .unwrap();
+        };
+        let raw_vec = |id: &MemoryId, v: &[f32]| {
+            conn.execute(
+                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id.to_string(), embedding_bytes(v)],
+            )
+            .unwrap();
+        };
+        let raw_link = |src: &MemoryId, tgt: &MemoryId, reason: &str| {
+            conn.execute(
+                "INSERT INTO memory_links
+                    (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                 VALUES (?1, ?2, 'references', 0.8, 0.8, ?3, 0)",
+                rusqlite::params![src.to_string(), tgt.to_string(), reason],
+            )
+            .unwrap();
+        };
+
+        let m1 = MemoryId::new(); // ns a, active, NON-UNIT vector (byte-identity probe)
+        let m2 = MemoryId::new(); // ns a, active, same direction as m1
+        let m3 = MemoryId::new(); // ns a, active, orthogonal to m1
+        let m4 = MemoryId::new(); // ns a, ARCHIVED with a leftover vector (prune target)
+        let m5 = MemoryId::new(); // ns b, active
+
+        raw_mem(&m1, "project:a", false);
+        raw_mem(&m2, "project:a", false);
+        raw_mem(&m3, "project:a", false);
+        raw_mem(&m4, "project:a", true);
+        raw_mem(&m5, "project:b", false);
+
+        raw_vec(&m1, &[3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m2, &[6.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // Orthogonal to m1 but a SHORT L2 hop from small vectors: the exact
+        // bug class the revalidation targets (L2 said "near", cosine says
+        // "unrelated").
+        raw_vec(&m3, &[0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m4, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m5, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // Orphan vector with NO owning memories row (vec0 enforces no FK):
+        // must be pruned by the rebuild's JOIN.
+        let orphan = MemoryId::new();
+        raw_vec(&orphan, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // L2-era links:
+        //  - m1 -> m2 'similar': cosine distance 0 (same direction) => KEPT.
+        //  - m1 -> m3 'similar': cosine distance 1.0 > 0.18 => DROPPED.
+        //  - m2 -> m3 'llm': not similarity-produced => KEPT regardless.
+        //  - m1 -> m4 'similar': endpoint archived (vector pruned) => cannot
+        //    be re-scored => KEPT.
+        raw_link(&m1, &m2, "similar");
+        raw_link(&m1, &m3, "similar");
+        raw_link(&m2, &m3, "llm");
+        raw_link(&m1, &m4, "similar");
+
+        (m1, m2, m3, m4, m5)
+    }
+
+    fn link_exists(store: &SqliteStore, src: &MemoryId, tgt: &MemoryId) -> bool {
+        let n: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                rusqlite::params![src.to_string(), tgt.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    #[test]
+    fn v1_db_rebuilds_once_to_cosine_partitioned_prunes_and_revalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let (m1, m2, m3, m4, m5) = build_v1_fixture(&path);
+
+        // The open path performs the one-shot rebuild.
+        let store = SqliteStore::open(&path, DIM).unwrap();
+
+        // Markers set.
+        assert_eq!(
+            store
+                .meta_value("vector_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            store.meta_value("vector_metric").unwrap().as_deref(),
+            Some("cosine")
+        );
+
+        // New DDL really carries the partition key + cosine metric.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ddl.contains("PARTITION KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("distance_metric=cosine"), "ddl: {ddl}");
+
+        // Cleanup: archived (m4) + orphan vectors pruned; live ones kept.
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 4, "m1, m2, m3, m5 survive; archived + orphan pruned");
+        assert_eq!(vector_row_count(&store, &m4), 0, "archived vector pruned");
+
+        // Vector BYTES are unchanged (no re-embed): the stored blob for the
+        // non-unit m1 round-trips bit-for-bit through the rebuild.
+        let blob: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![m1.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blob,
+            embedding_bytes(&[3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            "rebuild must copy vector bytes unchanged"
+        );
+
+        // Revalidation: the L2-era 'similar' link to an orthogonal vector is
+        // dropped; the same-direction 'similar' link, the non-similarity
+        // ('llm') link, and the unscoreable archived-endpoint link survive.
+        assert!(link_exists(&store, &m1, &m2), "near similar link kept");
+        assert!(!link_exists(&store, &m1, &m3), "far similar link dropped");
+        assert!(link_exists(&store, &m2, &m3), "non-similarity link kept");
+        assert!(link_exists(&store, &m1, &m4), "unscoreable link kept");
+
+        // Durable rebuild stats.
+        let stats_raw = store.meta_value("vector_rebuild_v2").unwrap().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+        assert_eq!(stats["pruned_vectors"], 2, "stats: {stats}");
+        assert_eq!(stats["reinserted_vectors"], 4, "stats: {stats}");
+        assert_eq!(stats["similar_links_rescored"], 2, "stats: {stats}");
+        assert_eq!(stats["similar_links_dropped"], 1, "stats: {stats}");
+
+        // KNN is namespace-partitioned and cosine-ordered after the rebuild.
+        let ns_a = Namespace::Project("a".into());
+        let ns_b = Namespace::Project("b".into());
+        let query = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let in_a = store.vector_search(&ns_a, &query, 10).unwrap();
+        let a_ids: Vec<MemoryId> = in_a.iter().map(|(id, _)| id.clone()).collect();
+        assert!(a_ids.contains(&m1) && a_ids.contains(&m2) && a_ids.contains(&m3));
+        assert!(!a_ids.contains(&m4), "archived row not searchable");
+        assert!(!a_ids.contains(&m5), "ns-b row never leaks into ns-a KNN");
+        let in_b = store.vector_search(&ns_b, &query, 10).unwrap();
+        let b_ids: Vec<MemoryId> = in_b.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(b_ids, vec![m5.clone()]);
+
+        // Reopen: the marker short-circuits — no second rebuild, stats and
+        // contents identical.
+        drop(store);
+        let store2 = SqliteStore::open(&path, DIM).unwrap();
+        assert_eq!(
+            store2.meta_value("vector_rebuild_v2").unwrap().unwrap(),
+            stats_raw,
+            "second open must not rebuild again"
+        );
+        let total2: i64 = store2
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total2, 4);
+    }
+
+    #[test]
+    fn fresh_db_is_created_in_final_form_without_rebuild_stats() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        assert_eq!(
+            store
+                .meta_value("vector_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        // No rebuild ran on a fresh DB: the stats key is absent.
+        assert!(store.meta_value("vector_rebuild_v2").unwrap().is_none());
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ddl.contains("PARTITION KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("distance_metric=cosine"), "ddl: {ddl}");
+    }
+
+    /// W1.7 acceptance: a namespace whose live rows are <1% of all vectors
+    /// still fills `limit`. 1000 near-query vectors live in a big namespace;
+    /// 5 (~0.5%) live in a small one. The pre-partition code over-fetched
+    /// `10 * limit = 50` GLOBAL candidates — all from the big namespace — and
+    /// returned nothing for the small one; the partition key scopes the scan.
+    #[test]
+    fn sub_one_percent_namespace_still_fills_limit() {
+        let store = SqliteStore::open_in_memory(4).unwrap();
+        let big = Namespace::Project("big".into());
+        let small = Namespace::Project("small".into());
+
+        for i in 0..1000u32 {
+            // All big-namespace vectors are nearly query-aligned (cosine
+            // distance ~0), i.e. globally nearer than every small-ns vector.
+            let v = [1.0, 1e-4 * (i as f32 + 1.0), 0.0, 0.0];
+            let m = MemoryNote::new(big.clone(), format!("big {i}"), MemoryType::Insight, 5);
+            store.insert_memory(&m, Some(&v)).unwrap();
+        }
+        let mut small_ids = Vec::new();
+        for i in 0..5u32 {
+            // 60 degrees off the query: cosine distance 0.5, far behind every
+            // big-namespace vector in global order.
+            let v = [0.5, 0.0, 0.866, 1e-4 * (i as f32 + 1.0)];
+            let m = MemoryNote::new(small.clone(), format!("small {i}"), MemoryType::Insight, 5);
+            small_ids.push(m.id.clone());
+            store.insert_memory(&m, Some(&v)).unwrap();
+        }
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&small, &query, 5).unwrap();
+        assert_eq!(
+            res.len(),
+            5,
+            "a <1% namespace must still fill limit under the partitioned index"
+        );
+        let got: std::collections::HashSet<String> =
+            res.iter().map(|(id, _)| id.to_string()).collect();
+        let want: std::collections::HashSet<String> =
+            small_ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(got, want, "exactly the small-namespace rows are returned");
+    }
+
+    /// Phase 1 gate (plan §4): "a 10k-archived-vector scenario still returns
+    /// correct live-namespace results". A v1-schema DB carries 10_000 leftover
+    /// vectors for ARCHIVED rows (pre-W1.7 archive never pruned vec0) in the
+    /// SAME namespace as 5 live rows — and every archived vector is nearly
+    /// query-aligned, i.e. strictly CLOSER to the query than any live vector,
+    /// so a pruning failure would crowd the live rows out of the KNN entirely.
+    /// The W1.1/W1.7 open-time rebuild must prune all 10k, after which
+    /// live-namespace search fills `limit` with exactly the live rows. (At
+    /// steady state the scenario is structurally impossible: archive/supersede
+    /// delete the vec0 row in-transaction and `update_vector` refuses archived
+    /// rows — this exercises the legacy-DB path the gate names.)
+    #[test]
+    fn ten_k_archived_vector_scenario_returns_correct_live_namespace_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-10k.db");
+
+        let mut live_ids: Vec<MemoryId> = Vec::new();
+        {
+            let conn = open_v1_schema(&path);
+            // One transaction + prepared statements: 10_005 rows stay fast.
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            {
+                let mut mem_stmt = conn
+                    .prepare(
+                        "INSERT INTO memories (memory_id, namespace, created_at, updated_at,
+                            content, summary, keywords, tags, memory_type, importance,
+                            confidence, embedding_model, archived_at)
+                         VALUES (?1, 'project:live', 0, 0, ?2, 's', '[]', '[]', 'insight', 5,
+                                 1.0, '', ?3)",
+                    )
+                    .unwrap();
+                let mut vec_stmt = conn
+                    .prepare("INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)")
+                    .unwrap();
+                for i in 0..10_000u32 {
+                    let id = MemoryId::new();
+                    // Nearly query-aligned (cosine distance ~0 from [1,0,..]).
+                    let v = [1.0, 1e-4 * (i as f32 + 1.0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    mem_stmt
+                        .execute(rusqlite::params![
+                            id.to_string(),
+                            format!("archived {i}"),
+                            Some(1i64)
+                        ])
+                        .unwrap();
+                    vec_stmt
+                        .execute(rusqlite::params![id.to_string(), embedding_bytes(&v)])
+                        .unwrap();
+                }
+                for i in 0..5u32 {
+                    let id = MemoryId::new();
+                    // 60 degrees off the query (cosine distance 0.5): strictly
+                    // FARTHER than every archived vector.
+                    let v = [0.5, 0.0, 0.866, 1e-4 * (i as f32 + 1.0), 0.0, 0.0, 0.0, 0.0];
+                    mem_stmt
+                        .execute(rusqlite::params![
+                            id.to_string(),
+                            format!("live {i}"),
+                            None::<i64>
+                        ])
+                        .unwrap();
+                    vec_stmt
+                        .execute(rusqlite::params![id.to_string(), embedding_bytes(&v)])
+                        .unwrap();
+                    live_ids.push(id);
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        // Open through SqliteStore: the one-shot W1.1/W1.7 rebuild runs.
+        let store = SqliteStore::open(&path, DIM).unwrap();
+
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5, "all 10k archived-row vectors must be pruned");
+        let stats_raw = store.meta_value("vector_rebuild_v2").unwrap().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+        assert_eq!(stats["pruned_vectors"], 10_000, "stats: {stats}");
+        assert_eq!(stats["reinserted_vectors"], 5, "stats: {stats}");
+
+        let ns = Namespace::Project("live".into());
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&ns, &query, 5).unwrap();
+        assert_eq!(
+            res.len(),
+            5,
+            "live-namespace search must fill limit after the 10k prune"
+        );
+        let got: std::collections::HashSet<String> =
+            res.iter().map(|(id, _)| id.to_string()).collect();
+        let want: std::collections::HashSet<String> =
+            live_ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(got, want, "exactly the live rows are returned");
+    }
+
+    #[test]
+    fn archive_deletes_vector_row_in_same_transaction() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("hygiene".into());
+        let id = insert_vec(&store, &ns, "to archive", &[1.0; DIM]);
+        assert_eq!(vector_row_count(&store, &id), 1);
+
+        store.archive_memory(&id).unwrap();
+        assert_eq!(
+            vector_row_count(&store, &id),
+            0,
+            "archive must delete the vec0 row"
+        );
+        // The memory row itself survives (soft delete).
+        assert!(store
+            .get_memory(&id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+    }
+
+    #[test]
+    fn supersede_deletes_old_vector_row_and_rolls_back_atomically() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("hygiene".into());
+        let old = insert_vec(&store, &ns, "old", &[1.0; DIM]);
+        let new = insert_vec(&store, &ns, "new", &[0.5; DIM]);
+
+        // Failure path FIRST: superseding by a missing id fails the FK and the
+        // whole transaction (including the vector DELETE) rolls back.
+        let ghost = MemoryId::new();
+        assert!(store.supersede(&old, &ghost).is_err());
+        assert_eq!(
+            vector_row_count(&store, &old),
+            1,
+            "rolled-back supersede must NOT delete the vector"
+        );
+
+        // Success path: old's vector leaves with the same transaction.
+        store.supersede(&old, &new).unwrap();
+        assert_eq!(
+            vector_row_count(&store, &old),
+            0,
+            "supersede must delete the superseded memory's vec0 row"
+        );
+        assert_eq!(vector_row_count(&store, &new), 1, "successor vector kept");
+    }
+
+    #[test]
+    fn update_vector_insert_fallback_lands_in_owning_namespace_partition() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("fallback".into());
+        let other = Namespace::Project("elsewhere".into());
+
+        // Stored WITHOUT an embedding: update_vector takes the INSERT path and
+        // must resolve the partition key from the owning memories row.
+        let m = MemoryNote::new(
+            ns.clone(),
+            "vectorless at first".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        store.update_vector(&m.id, &v, "det", "v2").unwrap();
+
+        let hits = store.vector_search(&ns, &v, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, m.id, "found in its own namespace partition");
+        assert!(
+            store.vector_search(&other, &v, 5).unwrap().is_empty(),
+            "absent from every other partition"
+        );
+    }
+
+    /// The reembed-vs-archive race (Phase 1 review): `update_vector` must NOT
+    /// resurrect a KNN vector for a memory archived after the reembed job read
+    /// its candidate set but before the write reached the single writer. The
+    /// stamp UPDATE skips archived rows fail-closed (`NotFound` — the engine
+    /// counts it as a per-row skip and the next scan excludes archived rows),
+    /// and the fallback INSERT's SELECT is guarded too, preserving the
+    /// live-only vec0 partition invariant `vector_search` documents.
+    #[test]
+    fn update_vector_does_not_resurrect_archived_memory_vector() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("race".into());
+        let id = insert_vec(&store, &ns, "soon archived", &[1.0; DIM]);
+
+        // W1.7: archive deletes the vec0 row in the same transaction...
+        store.archive_memory(&id).unwrap();
+        assert_eq!(vector_row_count(&store, &id), 0);
+
+        // ...and a reembed write that raced past the candidate scan fails
+        // closed instead of re-INSERTing the vector via the fallback path.
+        let err = store
+            .update_vector(&id, &[0.5; DIM], "det", "v2")
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+        assert_eq!(
+            vector_row_count(&store, &id),
+            0,
+            "update_vector must not resurrect a vec0 row for an archived memory"
+        );
+        // The whole transaction rolled back: the stamp did not move either.
+        let note = store.get_memory(&id).unwrap().unwrap();
+        assert_ne!(
+            note.embedding_model, "det",
+            "the embedding stamp must not be updated on an archived row"
+        );
+    }
+
+    #[test]
+    fn failed_mid_transaction_insert_rolls_back_and_restores_autocommit() {
+        // W1.6a: a constraint violation AFTER the transaction opened (the
+        // memories INSERT succeeded; the link INSERT hits the FK on a missing
+        // target) must roll the whole op back via the RAII guard and leave the
+        // connection in autocommit, so the next write runs cleanly.
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("raii".into());
+
+        let mut bad = MemoryNote::new(ns.clone(), "doomed insert".into(), MemoryType::Insight, 5);
+        bad.links.push(MemoryLink {
+            source_id: bad.id.clone(),
+            target_id: MemoryId::new(), // does not exist -> FK violation
+            link_type: rb_types::LinkType::References,
+            strength: 0.5,
+            reason: "ghost target".into(),
+            created_at: chrono::Utc::now(),
+        });
+        let err = store.insert_memory(&bad, Some(&[0.1; DIM])).unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+
+        assert!(
+            store.is_autocommit(),
+            "the failed op must not leave an open transaction"
+        );
+        assert!(
+            store.get_memory(&bad.id).unwrap().is_none(),
+            "the partial memories INSERT must roll back with the failed link"
+        );
+
+        // The same connection accepts the next write (no transaction poison).
+        let ok = MemoryNote::new(ns, "clean follow-up".into(), MemoryType::Insight, 5);
+        store.insert_memory(&ok, Some(&[0.2; DIM])).unwrap();
+        assert!(store.get_memory(&ok.id).unwrap().is_some());
+    }
+
+    #[test]
+    fn is_autocommit_reflects_a_leaked_transaction() {
+        // The W1.6b poison probe: the writer uses `is_autocommit` to detect a
+        // connection stranded mid-transaction; the test seam strands one.
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        assert!(store.is_autocommit(), "fresh connection is in autocommit");
+        store.leave_transaction_open_for_test().unwrap();
+        assert!(
+            !store.is_autocommit(),
+            "an open transaction must be visible to the poison probe"
         );
     }
 }

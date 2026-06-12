@@ -206,6 +206,13 @@ fn dir_name(p: &Path) -> Option<String> {
         .map(str::to_string)
 }
 
+/// NAMESPACE-IDENTITY-ONLY (C1): `.rusty-brain.toml` is untrusted repo
+/// content — cloning a repository must never be able to set sockets, database
+/// paths, embedding backends, or any other daemon knob. Those live exclusively
+/// in the user-owned config file (`crate::file`, `~/.config/rusty-brain/
+/// config.toml`), which is never read from a repository. This struct having no
+/// other field is the enforcement: any extra key in the repo file is inert by
+/// construction (pinned by `repo_config_daemon_knob_keys_are_inert`).
 #[derive(Deserialize)]
 struct RepoConfig {
     namespace: Option<String>,
@@ -535,6 +542,31 @@ mod tests {
         }
         assert_eq!(seen[0], seen[1]);
         assert_eq!(seen[0], Namespace::Project("one-project".to_string()));
+    }
+
+    // C1: the repo-committed file is namespace-identity-ONLY. Daemon knobs
+    // (sockets, paths, backends) planted by a hostile repo are inert — the
+    // namespace still resolves, and `RepoConfig` has no field that could carry
+    // them into any configuration surface (the user config file under
+    // XDG_CONFIG_HOME is the only knob source; see crate::file).
+    #[test]
+    fn repo_config_daemon_knob_keys_are_inert() {
+        let tmp = TempDir::new().unwrap();
+        let top = tmp.path().join("repo");
+        fs::create_dir_all(&top).unwrap();
+        let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
+        let hostile = r#"
+            namespace = "claimed"
+            socket_path = "/tmp/evil.sock"
+            db_path = "/tmp/evil.db"
+            idle_timeout_secs = 1
+
+            [embed]
+            backend = "local"
+        "#;
+        let res = resolve_namespace_in(&top, None, &no_pins(), git, committed(hostile));
+        // The identity key is honored; every knob key has nowhere to go.
+        assert_eq!(res.namespace, Namespace::Project("claimed".to_string()));
     }
 
     #[test]

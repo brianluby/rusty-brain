@@ -70,10 +70,11 @@ async fn committed_fixtures_meet_baselines() {
 
     // Print the report so a maintainer updating baselines sees the live numbers.
     println!(
-        "rb-eval report: recall@k={:.4} mrr={:.4} dedup={:.4} p50={}us p99={}us",
+        "rb-eval report: recall@k={:.4} mrr={:.4} dedup={:.4} ndcg={:.4} p50={}us p99={}us",
         report.mean_recall_at_k,
         report.mrr,
         report.dedup_precision,
+        report.ndcg,
         report.p50_latency_us,
         report.p99_latency_us
     );
@@ -113,6 +114,7 @@ async fn fixtures_run_under_both_modes_and_report_metric_delta() {
         assert!((0.0..=1.0).contains(&r.mean_recall_at_k));
         assert!((0.0..=1.0).contains(&r.mrr));
         assert!((0.0..=1.0).contains(&r.dedup_precision));
+        assert!((0.0..=1.0).contains(&r.ndcg));
     }
     assert!(cmp.recall_at_k_delta.is_finite());
     assert!(cmp.mrr_delta.is_finite());
@@ -140,6 +142,10 @@ async fn linear_mode_matches_default_eval_quality_metrics() {
         (default.dedup_precision - linear.dedup_precision).abs() < 1e-12,
         "explicit Linear dedup must equal the default eval"
     );
+    assert!(
+        (default.ndcg - linear.ndcg).abs() < 1e-12,
+        "explicit Linear ndcg must equal the default eval"
+    );
 }
 
 #[tokio::test]
@@ -160,6 +166,10 @@ async fn rrf_mode_is_deterministic_across_runs() {
         (a.dedup_precision - b.dedup_precision).abs() < 1e-12,
         "rrf dedup drifted between runs"
     );
+    assert!(
+        (a.ndcg - b.ndcg).abs() < 1e-12,
+        "rrf ndcg drifted between runs"
+    );
 }
 
 #[tokio::test]
@@ -178,6 +188,7 @@ async fn report_is_deterministic_across_runs() {
         (a.dedup_precision - b.dedup_precision).abs() < 1e-12,
         "dedup_precision drifted between runs"
     );
+    assert!((a.ndcg - b.ndcg).abs() < 1e-12, "ndcg drifted between runs");
 }
 
 #[tokio::test]
@@ -208,6 +219,52 @@ async fn keyword_path_surfaces_exact_term_match() {
 }
 
 #[tokio::test]
+async fn report_carries_per_query_channel_attribution() {
+    // W1.0 per-channel hit-contribution counters in the eval report: an
+    // exact-term query must be FTS-attributed, the vector channel always
+    // surfaces candidates (KNN returns nearest neighbors regardless of
+    // semantics), and the aggregates fold the per-query flags into rates.
+    let corpus = Corpus::from_json(
+        r#"{
+            "memories": [
+                {"key": "target", "content": "the WAL checkpoint truncates the journal",
+                 "keywords": ["wal", "checkpoint"], "memory_type": "Insight", "importance": 6},
+                {"key": "noise", "content": "unrelated note about color themes",
+                 "keywords": ["color"], "memory_type": "Preference", "importance": 4}
+            ],
+            "golden_queries": [
+                {"query": "checkpoint", "expected": ["target"], "grades": [3], "k": 1}
+            ]
+        }"#,
+    )
+    .expect("corpus valid");
+
+    let run = run_corpus_detailed(&corpus).await.expect("run");
+    let d = &run.per_query[0];
+    assert!(d.channels.returned > 0, "results returned");
+    assert!(
+        d.channels.fts > 0,
+        "exact-term query must carry FTS attribution, got {:?}",
+        d.channels
+    );
+    assert!(
+        d.channels.vector > 0,
+        "vector KNN always contributes candidates, got {:?}",
+        d.channels
+    );
+    assert!(
+        run.report.channels.fts_query_rate > 0.0 && run.report.channels.vector_query_rate > 0.0,
+        "aggregate channel rates must reflect the per-query flags: {:?}",
+        run.report.channels
+    );
+    // The graded query also exercises NDCG end-to-end.
+    assert!(
+        run.report.ndcg > 0.0,
+        "graded golden must produce a non-zero ndcg"
+    );
+}
+
+#[tokio::test]
 async fn dedup_clusters_are_scored() {
     // Two near-duplicate memories form a cluster; a third is distinct. The
     // dedup metric is exercised (value asserted only to be in range — the
@@ -230,6 +287,7 @@ async fn dedup_clusters_are_scored() {
         golden_queries: vec![GoldenQuery {
             query: "writer".into(),
             expected: vec!["dup_a".into()],
+            grades: vec![3],
             k: Some(5),
         }],
         dedup_clusters: vec![DedupCluster {
@@ -243,6 +301,71 @@ async fn dedup_clusters_are_scored() {
         "dedup precision must be a valid fraction, got {}",
         report.dedup_precision
     );
+}
+
+#[tokio::test]
+async fn eval_runs_with_evolution_jobs_off() {
+    // W1.9: rb-eval must measure retrieval with the evolution jobs OFF, so
+    // baselines never depend on importance recalibration / link decay /
+    // consolidation. That is structural — rb-eval does not depend on
+    // rb-daemon, where the jobs live — and this test pins it behaviorally:
+    // recall during a run records access signals (the recalibration job's
+    // only input), yet no memory's importance moves from its authored value.
+    use rb_engine::MemoryBackend;
+    use rb_eval::backend::{eval_namespace, EVAL_DIM};
+
+    let memories = vec![
+        mem(
+            "critical",
+            "the writer thread owns every sqlite mutation",
+            10,
+        ),
+        mem("minor", "the read pool serves recall lookups", 3),
+    ];
+    let corpus = Corpus {
+        memories,
+        golden_queries: vec![GoldenQuery {
+            query: "writer thread mutation".into(),
+            expected: vec!["critical".into()],
+            grades: vec![3],
+            k: Some(5),
+        }],
+        dedup_clusters: Vec::new(),
+    };
+
+    let engine =
+        rb_eval::build_engine_with(rb_embed::DeterministicProvider::new(EVAL_DIM)).expect("engine");
+    let run = rb_eval::run_corpus_with(&engine, &corpus)
+        .await
+        .expect("run");
+    assert!(
+        run.per_query[0].channels.returned > 0,
+        "the golden query must return results so accesses get recorded"
+    );
+
+    let stored = engine
+        .backend()
+        .list(eval_namespace(), None, 100)
+        .await
+        .expect("list");
+    assert_eq!(stored.len(), 2, "both fixtures stored");
+    assert!(
+        stored.iter().any(|m| m.access_count > 0),
+        "recall must have recorded access signals during the run"
+    );
+    for note in &stored {
+        let authored = corpus
+            .memories
+            .iter()
+            .find(|f| f.content == note.content)
+            .expect("stored note maps back to a fixture");
+        assert_eq!(
+            note.importance, authored.importance,
+            "evolution jobs are off in eval: importance must stay authored \
+             (fixture {})",
+            authored.key
+        );
+    }
 }
 
 fn mem(key: &str, content: &str, importance: u8) -> FixtureMemory {

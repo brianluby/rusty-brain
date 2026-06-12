@@ -11,29 +11,53 @@ pub fn parse_id(s: &str) -> rb_types::Result<MemoryId> {
     MemoryId::from_str(s)
 }
 
+/// Parse a namespace CLI argument. Full db strings (`global`, `project:NAME`,
+/// `session:PROJECT:SID`) parse exactly (fail closed on malformed ones, e.g.
+/// `project:`); anything else is a bare project name, matching the
+/// `--namespace` flag convention.
+pub fn parse_namespace_arg(s: &str) -> rb_types::Result<rb_types::Namespace> {
+    let trimmed = s.trim();
+    if trimmed.is_empty() {
+        return Err(rb_types::Error::InvalidNamespace(s.to_string()));
+    }
+    if trimmed == "global" || trimmed.starts_with("project:") || trimmed.starts_with("session:") {
+        return rb_types::Namespace::parse_db_string(trimmed);
+    }
+    Ok(rb_types::Namespace::Project(trimmed.to_string()))
+}
+
 /// Execute the parsed CLI with a pre-resolved `namespace` (resolved OFF the
 /// async runtime by `main`, since detection shells out to git and reads files).
 /// `serve` blocks until Ctrl-C; client commands connect (auto-starting the
 /// daemon), issue one request, print to stdout, and return.
 pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()> {
-    let socket_path = paths::socket_path_from_env().context("resolving daemon socket path")?;
-    let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
+    // One resolution for every subcommand: env > ~/.config/rusty-brain/
+    // config.toml > defaults (C1). A malformed config file fails closed here
+    // with the file path in the message; unknown keys only warn.
+    let effective = rb_config::EffectiveConfig::resolve().context("resolving configuration")?;
+    for warning in &effective.warnings {
+        tracing::warn!("{warning}");
+    }
+    let socket_path = effective.socket_path.clone();
+    let db_path = effective.db_path.clone();
 
     match cli.command {
         Command::Serve {
             jobs_config,
             accept_model_change,
         } => {
+            // Flag > env > config file (effective.jobs_config already encodes
+            // env > file, so the flag/env composition stays authoritative).
             let jobs_config_path = paths::resolve_jobs_config_path(
                 jobs_config,
                 std::env::var(paths::JOBS_CONFIG_ENV).ok(),
-            );
+            )
+            .or_else(|| effective.jobs_config.clone());
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
             serve::run_serve(
-                socket_path,
-                db_path,
+                effective,
                 4,
                 jobs_config_path,
                 accept_model_change,
@@ -101,10 +125,19 @@ async fn run_client(
             memory_type,
             tags,
         } => {
-            let results = client
-                .recall(query, memory_type, tags, limit)
+            let (results, degraded) = client
+                .recall_with_status(query, memory_type, tags, limit)
                 .await
                 .context("recall failed")?;
+            if degraded {
+                // stderr so `--json` stdout stays machine-parseable. Mirrors
+                // the rb-mcp warning: without it a CLI user during an embedder
+                // outage sees ordinary-looking, vector-blind results (W1.6d).
+                eprintln!(
+                    "warning: vector search unavailable (embedding provider \
+                     error); results from keyword and graph channels only"
+                );
+            }
             println!("{}", output::render_recall(&results, json));
         }
         Command::Get { id } => {
@@ -171,11 +204,23 @@ async fn run_client(
             }
         }
         Command::Status => {
-            let version = client.ping().await.context("status/ping failed")?;
+            let (version, channels) = client.ping_stats().await.context("status/ping failed")?;
             if json {
-                println!("{{\"contract_version\":{version},\"ok\":true}}");
+                match channels {
+                    Some(c) => println!(
+                        "{{\"contract_version\":{version},\"ok\":true,\"recall_channels\":{{\"recalls\":{},\"fts_hits\":{},\"vector_hits\":{},\"graph_hits\":{}}}}}",
+                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+                    ),
+                    None => println!("{{\"contract_version\":{version},\"ok\":true}}"),
+                }
             } else {
-                println!("ok (contract v{version})");
+                match channels {
+                    Some(c) => println!(
+                        "ok (contract v{version}) recalls={} fts_hits={} vector_hits={} graph_hits={}",
+                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+                    ),
+                    None => println!("ok (contract v{version})"),
+                }
             }
         }
         Command::Evolve { job } => {
@@ -197,6 +242,34 @@ async fn run_client(
             } else {
                 println!("reembed: scanned={scanned} changed={changed} skipped={skipped}");
             }
+        }
+        Command::Namespace {
+            command: crate::cli::NamespaceCommand::Rename { old, new, merge },
+        } => {
+            let old_ns = parse_namespace_arg(&old).context("invalid OLD namespace")?;
+            let new_ns = parse_namespace_arg(&new).context("invalid NEW namespace")?;
+            let (moved, vectors) = client
+                .rename_namespace(old_ns.clone(), new_ns.clone(), merge)
+                .await
+                .context("namespace rename failed")?;
+            if json {
+                println!("{{\"moved\":{moved},\"vectors\":{vectors}}}");
+            } else {
+                println!(
+                    "renamed namespace {} -> {}: moved {moved} memories ({vectors} vectors)",
+                    old_ns.as_db_string(),
+                    new_ns.as_db_string()
+                );
+            }
+            // stderr so `--json` stdout stays machine-parseable. Sessions
+            // resolve their namespace once at handshake (the MCP server at
+            // startup), so an agent session that was already open keeps
+            // writing under the now-emptied OLD namespace until restarted.
+            eprintln!(
+                "note: restart any active agent sessions; sessions started \
+                 before the rename keep writing to the old namespace (re-run \
+                 `namespace rename --merge` to sweep up any stragglers)"
+            );
         }
     }
     Ok(())
@@ -239,6 +312,49 @@ mod tests {
             msg.contains("not-a-uuid") || msg.to_lowercase().contains("invalid"),
             "{msg}"
         );
+    }
+
+    #[test]
+    fn parse_namespace_arg_bare_name_is_a_project() {
+        // The `--namespace` flag convention: a bare name means project:NAME.
+        assert_eq!(
+            parse_namespace_arg("my-proj").unwrap(),
+            rb_types::Namespace::Project("my-proj".to_string())
+        );
+        // Whitespace is trimmed like the flag/env paths do.
+        assert_eq!(
+            parse_namespace_arg("  my-proj  ").unwrap(),
+            rb_types::Namespace::Project("my-proj".to_string())
+        );
+    }
+
+    #[test]
+    fn parse_namespace_arg_accepts_full_db_strings() {
+        assert_eq!(
+            parse_namespace_arg("global").unwrap(),
+            rb_types::Namespace::Global
+        );
+        assert_eq!(
+            parse_namespace_arg("project:rusty-brain").unwrap(),
+            rb_types::Namespace::Project("rusty-brain".to_string())
+        );
+        assert_eq!(
+            parse_namespace_arg("session:rb:abc").unwrap(),
+            rb_types::Namespace::Session {
+                project: "rb".to_string(),
+                session_id: "abc".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parse_namespace_arg_fails_closed_on_malformed_prefixed_forms() {
+        // A recognized prefix with a malformed remainder must error, NOT fall
+        // back to a literal project named "project:".
+        assert!(parse_namespace_arg("project:").is_err());
+        assert!(parse_namespace_arg("session:onlyproject").is_err());
+        assert!(parse_namespace_arg("").is_err());
+        assert!(parse_namespace_arg("   ").is_err());
     }
 
     #[test]

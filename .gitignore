@@ -6,3 +6,5 @@ Cargo.lock.orig
 *.db-wal
 *.db-shm
 .serena/
+# fastembed ONNX model cache (created by rb-eval recording / rb-embed local smoke tests)
+.fastembed_cache/

@@ -5,6 +5,37 @@ use rb_types::MemoryId;
 /// on the recency term. Documented, fixed constant for deterministic ranking.
 pub const HALF_LIFE: f32 = 30.0;
 
+/// Minimum `Linear` score a recall result must reach to be returned (W1.3,
+/// F30 "junk default recall"). Results scoring below this are dropped so
+/// recall may return fewer than `limit` — or nothing — instead of padding
+/// with junk; callers render an explicit empty state.
+///
+/// Derivation (recorded per the W1.3 spec; recalibrate if `Weights::default`
+/// or the W1.1 cosine scale changes):
+/// 1. Prior-only ceiling: with default weights a candidate carrying ZERO
+///    retrieval signal (no keyword hit, no graph hit, vector cosine sim <= 0)
+///    scores at most `importance (0.10) + recency (0.05) = 0.15`. The floor
+///    must exceed 0.15 so priors alone can never surface a memory.
+/// 2. Graph-channel preservation: a fresh default-importance (5) graph-only
+///    DIRECT neighbor (1 hop = full graph weight under the W1.5 `1/hops`
+///    decay) scores `0.10 + 0.05 + ~0.05 ~= 0.1999`; the floor must stay
+///    below that or the graph channel goes dark for default-importance
+///    memories (fights W1.5).
+/// 3. Harness upper bound: the weakest golden counted by recall@5 scores
+///    0.2724 (real-vector replay) / 0.2800 (deterministic gate); the floor
+///    sweep showed recall@5/MRR bit-identical through 0.25 and degrading at
+///    0.30, and the floor needs >= 0.05 headroom below the weakest golden
+///    (the full recency-aging swing) so aged true hits do not fall through.
+/// 4. 0.18 is the midpoint of the admissible (0.15, 0.1999) band: every
+///    returned result must carry genuine retrieval signal (vector sim >
+///    ~0.067 at default importance, any top-3 keyword rank, or a graph hop),
+///    while staying 0.09+ under the weakest golden.
+///
+/// Applies to `Linear` scores only — `Rrf` scores live on a different scale
+/// (`~1/(k + rank)` sums) and stay unfloored until RRF is reachable and
+/// calibrated (W2.2/W4.1).
+pub const SCORE_FLOOR: f32 = 0.18;
+
 /// Floor for the confidence dampener (Feature C, spec §9). The final score is
 /// multiplied by `CONFIDENCE_FLOOR + (1 - CONFIDENCE_FLOOR) * confidence`, so a
 /// confidence-1.0 memory is unchanged (no-op) and a confidence-0.0 memory keeps
@@ -56,7 +87,9 @@ pub struct Signals {
     pub keyword_rank: Option<usize>,
     /// Cosine distance, smaller = closer. `None` if not a vector hit.
     pub vector_distance: Option<f32>,
-    /// Graph hops from a seed, 0 = the seed itself. `None` if not graph-reached.
+    /// Minimum link-graph hop distance from the walk anchor (W1.5): 1 = direct
+    /// neighbor; the anchor itself is excluded upstream, so 0 never occurs on
+    /// the store path (a defensive 0 scores like 1). `None` if not graph-reached.
     pub graph_hops: Option<u8>,
     /// Importance 0..=10.
     pub importance: u8,
@@ -69,9 +102,15 @@ pub struct Signals {
 
 /// Normalize a single candidate's signals into a weighted score in `[0, 1]`.
 fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f32 {
-    // Vector similarity: cosine distance in [0, 2] -> similarity in [0, 1].
+    // Vector similarity: RAW cosine similarity `1 - d` (cosine distance d in
+    // [0, 2]), with anti-correlated candidates (d > 1, cos < 0) clamped to 0.
+    // W1.1 recalibration: the store's vec0 index now really measures cosine
+    // distance, and an orthogonal — semantically unrelated — candidate (d = 1)
+    // must contribute 0 vector signal. The previous `1 - d/2` mapping was
+    // calibrated for L2 distances; applied to cosine distances it would award
+    // unrelated candidates half the vector weight, drowning keyword-only hits.
     let vector_sim = match s.vector_distance {
-        Some(d) if d.is_finite() => 1.0 - (d / 2.0).clamp(0.0, 1.0),
+        Some(d) if d.is_finite() => (1.0 - d).clamp(0.0, 1.0),
         None => 0.0,
         Some(_) => 0.0,
     };
@@ -80,9 +119,14 @@ fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f3
         Some(r) => 1.0 / (1.0 + r as f32),
         None => 0.0,
     };
-    // Graph proximity: reciprocal hops, 0 hops -> 1.0.
+    // Graph proximity (W1.5): reciprocal of the REAL hop distance, `1 / hops`.
+    // A direct neighbor (1 hop) earns the FULL graph weight — required by the
+    // SCORE_FLOOR derivation (clause 2): a fresh default-importance direct
+    // neighbor must clear the floor or the graph channel goes dark. 2 hops ->
+    // 1/2, 3 hops -> 1/3. The store never emits hops = 0 (the anchor is
+    // excluded); a defensive 0 clamps to 1 instead of dividing by zero.
     let graph = match s.graph_hops {
-        Some(h) => 1.0 / (1.0 + h as f32),
+        Some(h) => 1.0 / (h.max(1) as f32),
         None => 0.0,
     };
     // Importance normalized to [0, 1].
@@ -213,7 +257,7 @@ mod tests {
             id: id.clone(),
             keyword_rank: None,
             vector_distance: None,
-            graph_hops: Some(0), // adjacent -> graph proximity 1.0
+            graph_hops: Some(1), // direct neighbor -> graph proximity 1.0 (W1.5)
             importance: 0,
             created_at: n - Duration::days(10_000), // ancient -> recency ~0
             confidence: 1.0,
@@ -223,6 +267,47 @@ mod tests {
         assert_eq!(ranked[0].0, id);
         // graph weight (0.10) * proximity (1.0) dominates; score strictly > 0.
         assert!(ranked[0].1 > 0.0, "graph-only candidate must score > 0");
+    }
+
+    #[test]
+    fn graph_proximity_decays_with_real_hop_distance() {
+        // W1.5: the graph term is 1/hops of the REAL hop distance. With every
+        // other signal identical, 1 hop > 2 hops > 3 hops; a defensive 0
+        // (never emitted by the store) clamps to the 1-hop proximity.
+        let n = now();
+        let mk = |hops: u8| Signals {
+            id: MemoryId::new(),
+            keyword_rank: None,
+            vector_distance: None,
+            graph_hops: Some(hops),
+            importance: 5,
+            created_at: n,
+            confidence: 1.0,
+        };
+        let one = mk(1);
+        let two = mk(2);
+        let three = mk(3);
+        let (one_id, two_id, three_id) = (one.id.clone(), two.id.clone(), three.id.clone());
+        let ranked = rank(vec![three, one, two], Weights::default(), n, 10);
+        let order: Vec<MemoryId> = ranked.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            order,
+            vec![one_id, two_id, three_id],
+            "closer in the graph must outrank farther"
+        );
+        assert!(
+            ranked[0].1 > ranked[1].1 && ranked[1].1 > ranked[2].1,
+            "scores must strictly decay with hop distance: {ranked:?}"
+        );
+
+        // Defensive clamp: hops 0 scores exactly like hops 1.
+        let zero = mk(0);
+        let one_again = mk(1);
+        let scored = rank(vec![zero, one_again], Weights::default(), n, 10);
+        assert!(
+            (scored[0].1 - scored[1].1).abs() < f32::EPSILON,
+            "hops 0 must clamp to the 1-hop proximity: {scored:?}"
+        );
     }
 
     #[test]
@@ -393,7 +478,7 @@ mod tests {
             id: id.clone(),
             keyword_rank: Some(0),
             vector_distance: Some(0.0),
-            graph_hops: Some(0),
+            graph_hops: Some(1),
             importance: 10,
             created_at: n,
             confidence: 1.0,
@@ -483,6 +568,60 @@ mod tests {
         let ranked = rank(signals, weights, n, 10);
         assert_eq!(ranked, vec![(id, 1.0)]);
         assert!(ranked[0].1.is_finite());
+    }
+
+    #[test]
+    fn zero_retrieval_signal_never_clears_the_score_floor() {
+        // W1.3 derivation pin (clause 1 of the SCORE_FLOOR docs): the BEST
+        // possible candidate with zero retrieval signal — importance 10, brand
+        // new, full confidence, no keyword/graph hit, orthogonal vector — caps
+        // at importance (0.10) + recency (0.05) = 0.15 < SCORE_FLOOR. Priors
+        // alone can never surface a memory.
+        let n = now();
+        let id = MemoryId::new();
+        let signals = vec![Signals {
+            id,
+            keyword_rank: None,
+            vector_distance: Some(1.0), // orthogonal -> cosine sim 0
+            graph_hops: None,
+            importance: 10,
+            created_at: n, // age 0 -> recency 1.0
+            confidence: 1.0,
+        }];
+        let ranked = rank(signals, Weights::default(), n, 10);
+        assert!(
+            ranked[0].1 < SCORE_FLOOR,
+            "prior-only ceiling {} must sit below SCORE_FLOOR {SCORE_FLOOR}",
+            ranked[0].1
+        );
+        // The ceiling itself is exactly 0.15 under default weights.
+        assert!((ranked[0].1 - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn graph_only_default_importance_hit_clears_the_score_floor() {
+        // W1.3 derivation pin (clause 2): a fresh, default-importance (5)
+        // graph-only DIRECT neighbor (1 hop = full graph weight under the
+        // W1.5 1/hops decay) scores ~0.1999 and must stay ABOVE the floor —
+        // otherwise the graph channel goes dark for default-importance
+        // memories (fights W1.5).
+        let n = now();
+        let id = MemoryId::new();
+        let signals = vec![Signals {
+            id,
+            keyword_rank: None,
+            vector_distance: None,
+            graph_hops: Some(1),
+            importance: 5,
+            created_at: n,
+            confidence: 1.0,
+        }];
+        let ranked = rank(signals, Weights::default(), n, 10);
+        assert!(
+            ranked[0].1 > SCORE_FLOOR,
+            "graph-only imp-5 fresh hit {} must clear SCORE_FLOOR {SCORE_FLOOR}",
+            ranked[0].1
+        );
     }
 
     #[test]

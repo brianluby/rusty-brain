@@ -14,6 +14,10 @@
 //!
 //! It makes NO assertion against committed baselines (those are deterministic);
 //! it prints the semantic metrics for a human to judge.
+//!
+//! Since W1.4 these runs exercise Voyage's asymmetric retrieval for real:
+//! recall embeds the query with `input_type="query"` while documents embed
+//! with `input_type="document"`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rb_embed::VoyageProvider;

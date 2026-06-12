@@ -47,11 +47,23 @@ impl Default for LinkDecayConfig {
 pub struct ConsolidationConfig {
     pub enabled: bool,
     pub interval_secs: u64,
+    /// Near-duplicate gate in `near_duplicates`' similarity unit: RAW cosine
+    /// similarity clamped to `[0, 1]` (`1 - cosine_distance`). See [`Default`]
+    /// for the W1.1 re-derivation.
     pub similarity_threshold: f32,
     pub batch_limit: usize,
 }
 
 impl Default for ConsolidationConfig {
+    /// `similarity_threshold` re-derived for the W1.1 cosine-metric rebuild.
+    ///
+    /// The documented intent was always "near-identical: cosine similarity
+    /// at least 0.95", and since W1.1 the store's similarity unit IS raw
+    /// cosine similarity (`1 - cosine_distance`), so 0.95 now means exactly
+    /// that (cosine distance at most 0.05). Before the rebuild the same
+    /// number was compared against `1 - L2/2`, where it meant `L2 <= 0.1` —
+    /// cosine similarity 0.995+ on unit vectors, effectively inert. The
+    /// numeral is unchanged; its unit finally matches the documentation.
     fn default() -> Self {
         Self {
             enabled: false,
@@ -64,6 +76,12 @@ impl Default for ConsolidationConfig {
 
 /// Importance-recalibration tuning (used by Part T). Declared here for a stable
 /// config schema; the job itself lands in Part T.
+///
+/// W1.9 (F33): the job modulates EFFECTIVE importance within ±2 of the
+/// immutable author-set prior (`base_importance`) — author intent is the
+/// anchor. It ships `enabled: false` and is intended to STAY disabled until
+/// the W3.7 usefulness signal exists, because today's only access signal
+/// (`access_count`) counts returned-from-recall, not actually-useful.
 #[derive(Clone, Debug, Deserialize)]
 #[serde(default)]
 pub struct ImportanceConfig {
@@ -126,6 +144,7 @@ mod tests {
 
         assert!(!cfg.consolidation.enabled);
         assert_eq!(cfg.consolidation.interval_secs, 86_400);
+        // W1.1 re-derivation: 0.95 is now RAW cosine similarity (distance <= 0.05).
         assert!((cfg.consolidation.similarity_threshold - 0.95).abs() < f32::EPSILON);
         assert_eq!(cfg.consolidation.batch_limit, 200);
 

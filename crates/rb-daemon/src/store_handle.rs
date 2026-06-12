@@ -10,12 +10,18 @@ use async_trait::async_trait;
 use rb_engine::MemoryBackend;
 use rb_store::{RecalRow, SqliteStore, Store};
 use rb_types::{Error, MemoryId, MemoryNote, MemoryUpdates, Namespace, Result};
-use tokio::sync::{broadcast, mpsc, oneshot, Mutex, Semaphore};
+use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Semaphore};
 
 use crate::change::{ChangeKind, MemoryChanged};
 
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
+
+/// How often the background flusher drains buffered access bumps into one
+/// batched writer op (W1.8). Read paths only ever touch the in-memory buffer;
+/// the buffer is bounded in practice by the distinct ids recalled within one
+/// interval (entries are tens of bytes each).
+const ACCESS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Count of `MemoryChanged` broadcasts that could not be delivered (no live
 /// receivers). Best-effort notification only — a non-zero value is
@@ -63,12 +69,11 @@ enum WriteCommand {
         link: Box<rb_types::MemoryLink>,
         reply: oneshot::Sender<Result<()>>,
     },
-    RecordAccess {
-        id: MemoryId,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    RecordAccesses {
-        ids: Vec<MemoryId>,
+    /// Apply a batch of BUFFERED access bumps (W1.8). Recall and `get` never
+    /// enqueue a writer command for access tracking — they accumulate into
+    /// [`AccessBuffer`]; this command carries the periodic/shutdown flush.
+    FlushAccesses {
+        bumps: Vec<rb_store::AccessBump>,
         reply: oneshot::Sender<Result<()>>,
     },
     SetLinkStrength {
@@ -76,6 +81,15 @@ enum WriteCommand {
         target: MemoryId,
         link_type: rb_types::LinkType,
         strength: f32,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Set one memory's EFFECTIVE importance without touching its
+    /// `base_importance` author prior (W1.9). The importance-recalibration
+    /// job's only write path; namespace-verified like `Update`.
+    SetRecalibratedImportance {
+        namespace: Namespace,
+        id: MemoryId,
+        importance: u8,
         reply: oneshot::Sender<Result<()>>,
     },
     DeleteLink {
@@ -101,8 +115,31 @@ enum WriteCommand {
         input_version: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory row
+    /// from `old` to `new` in ONE store transaction (memories + vec0 partition
+    /// re-key + one oplog row). Cross-namespace admin op, so unlike
+    /// Update/Archive it carries no handshake-namespace verification — the
+    /// server validates both namespaces before enqueueing.
+    RenameNamespace {
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+        reply: oneshot::Sender<Result<rb_store::NamespaceRenameOutcome>>,
+    },
     #[cfg(test)]
     PanicForTest {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Test-only: run an op that opens a transaction and returns `Err` WITHOUT
+    /// rolling back, exercising the W1.6b post-op `is_autocommit` poison check.
+    #[cfg(test)]
+    PoisonForTest {
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Test-only: exit the writer loop abnormally (death guard left armed),
+    /// simulating an unrecoverable writer failure such as a failed reopen.
+    #[cfg(test)]
+    DieForTest {
         reply: oneshot::Sender<Result<()>>,
     },
     Shutdown {
@@ -118,6 +155,47 @@ pub struct StoreHandle {
     events: broadcast::Sender<MemoryChanged>,
     writer_join: Arc<Mutex<Option<std::thread::JoinHandle<()>>>>,
     shutting_down: Arc<AtomicBool>,
+    /// Becomes `true` when the writer thread dies ABNORMALLY (W1.6c). Graceful
+    /// shutdown never flips it; see [`StoreHandle::writer_died`].
+    writer_death: watch::Receiver<bool>,
+    /// In-memory accumulator for access-tracking bumps (W1.8): recall/`get`
+    /// buffer here instead of enqueueing writer ops; a background task flushes
+    /// batches every [`ACCESS_FLUSH_INTERVAL`], and `shutdown` drains the rest.
+    access_buf: Arc<AccessBuffer>,
+    /// Count of write commands the writer thread has received (excluding
+    /// `Shutdown`). Observability + the W1.8 zero-writer-ops-on-recall proof.
+    writer_ops: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Buffered access-tracking state shared by every [`StoreHandle`] clone.
+struct AccessBuffer {
+    /// id -> (accumulated count, latest access unix seconds). Drained whole on
+    /// each flush; `tokio::sync::Mutex` so the async paths never block a
+    /// runtime worker and there is no poisoning to reason about.
+    pending: Mutex<std::collections::HashMap<MemoryId, PendingAccess>>,
+    /// Set once by whichever handle buffers the first access; the flusher task
+    /// is spawned lazily from an async context so construction never requires
+    /// a Tokio runtime.
+    flusher_started: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAccess {
+    count: u64,
+    last_accessed_at: i64,
+}
+
+/// Drain ALL buffered bumps, returning them as store-level [`rb_store::AccessBump`]s.
+async fn drain_access_buffer(buf: &AccessBuffer) -> Vec<rb_store::AccessBump> {
+    let mut pending = buf.pending.lock().await;
+    pending
+        .drain()
+        .map(|(id, p)| rb_store::AccessBump {
+            id,
+            count: p.count,
+            last_accessed_at: p.last_accessed_at,
+        })
+        .collect()
 }
 
 struct ReadPool {
@@ -204,28 +282,36 @@ impl StoreHandle {
         embedding_model: Option<String>,
         read_pool_size: usize,
     ) -> Result<Self> {
-        let pool = Arc::new(ReadPool::open(
-            &db_path,
-            embedding_dim,
-            embedding_model.as_deref(),
-            read_pool_size.max(1),
-        )?);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
+        // Writer-death signal (W1.6c): the writer thread owns the sender via a
+        // drop guard; the daemon races the receiver in `Server::run`'s select!.
+        let (death_tx, death_rx) = watch::channel(false);
 
+        // The WRITER opens first; the read pool only after its ready signal.
+        // `SqliteStore::init` runs the one-shot vector-schema rebuild
+        // (W1.1/W1.7) at open, and sequencing it on the single writer
+        // connection makes the rebuild single-flight by construction — a
+        // large-corpus rebuild cannot race N pool opens into busy_timeout
+        // failures.
         let writer_events = events.clone();
-        let writer_path = db_path;
+        let writer_path = db_path.clone();
+        let writer_model = embedding_model.clone();
+        let writer_ops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_ops_counter = Arc::clone(&writer_ops);
         let writer_join = std::thread::Builder::new()
             .name("rb-writer".to_string())
             .spawn(move || {
                 writer_loop(
                     writer_path,
                     embedding_dim,
-                    embedding_model,
+                    writer_model,
                     writer_rx,
                     writer_events,
                     ready_tx,
+                    death_tx,
+                    writer_ops_counter,
                 );
             })
             .map_err(|e| Error::Io(format!("spawn writer thread: {e}")))?;
@@ -244,13 +330,74 @@ impl StoreHandle {
             }
         }
 
+        let pool = match ReadPool::open(
+            &db_path,
+            embedding_dim,
+            embedding_model.as_deref(),
+            read_pool_size.max(1),
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                // The writer is already running: drop its only sender so its
+                // recv loop ends, then join — never leak a live writer thread
+                // from a failed construction.
+                drop(writer_tx);
+                let _ = writer_join.join();
+                return Err(e);
+            }
+        };
+
         Ok(Self {
             writer_tx,
             pool,
             events,
             writer_join: Arc::new(Mutex::new(Some(writer_join))),
             shutting_down: Arc::new(AtomicBool::new(false)),
+            writer_death: death_rx,
+            access_buf: Arc::new(AccessBuffer {
+                pending: Mutex::new(std::collections::HashMap::new()),
+                flusher_started: AtomicBool::new(false),
+            }),
+            writer_ops,
         })
+    }
+
+    /// Resolves when the writer thread has died ABNORMALLY — it exited its
+    /// loop without a graceful shutdown (e.g. a failed reopen after a panic or
+    /// after a poisoned connection). NEVER resolves on graceful shutdown.
+    ///
+    /// `Server::run` races this future in its `select!` so a dead writer shuts
+    /// the daemon down instead of leaving a zombie that pongs `Ping` while
+    /// every write fails (W1.6c / F17). The returned future is `'static`: it
+    /// owns a clone of the watch receiver, so it can be pinned across the
+    /// accept loop without borrowing the handle.
+    pub fn writer_died(&self) -> impl std::future::Future<Output = ()> + Send + 'static {
+        let mut rx = self.writer_death.clone();
+        async move {
+            loop {
+                if *rx.borrow_and_update() {
+                    return;
+                }
+                if rx.changed().await.is_err() {
+                    // Sender dropped without ever signaling: the writer exited
+                    // gracefully. Park forever — a graceful exit must not trip
+                    // the daemon's writer-death arm.
+                    std::future::pending::<()>().await;
+                }
+            }
+        }
+    }
+
+    /// Test-only: make the writer thread exit abnormally (death guard armed),
+    /// as if an unrecoverable failure stopped it.
+    #[cfg(test)]
+    pub(crate) async fn kill_writer_for_test(&self) {
+        let (reply, rx) = oneshot::channel();
+        let _ = self
+            .writer_tx
+            .send(WriteCommand::DieForTest { reply })
+            .await;
+        let _ = rx.await;
     }
 
     /// Subscribe to best-effort memory change notifications.
@@ -261,7 +408,8 @@ impl StoreHandle {
     /// Read up to `limit` active memories with the fields the importance job
     /// needs. Goes through the bounded read pool (never the writer). Used only by
     /// the cross-namespace maintenance jobs, which then issue any importance
-    /// changes back through `update` (the single writer).
+    /// changes back through `set_recalibrated_importance` (the single writer,
+    /// W1.9: effective importance only — never the author prior).
     pub async fn memories_for_recalibration(&self, limit: usize) -> Result<Vec<RecalRow>> {
         self.with_read(move |store| store.memories_for_recalibration(limit))
             .await
@@ -269,12 +417,21 @@ impl StoreHandle {
 
     /// Gracefully close the write queue and join the dedicated writer thread.
     pub async fn shutdown(self) {
+        // Final access flush (W1.8): persist whatever the interval flusher has
+        // not yet drained, BEFORE the shutdown flag closes the write path.
+        // Best-effort — a dead writer must not block shutdown.
+        if let Err(e) = self.flush_accesses().await {
+            tracing::debug!(error = %e, "final access flush on shutdown failed; bumps dropped");
+        }
         let StoreHandle {
             writer_tx,
             pool,
             events,
             writer_join,
             shutting_down,
+            writer_death: _writer_death,
+            access_buf: _access_buf,
+            writer_ops: _writer_ops,
         } = self;
 
         if !shutting_down.swap(true, Ordering::SeqCst) {
@@ -296,6 +453,107 @@ impl StoreHandle {
         if let Some(handle) = join {
             let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
+    }
+
+    /// Accumulate access bumps for `ids` into the in-memory buffer (W1.8).
+    /// NEVER touches the writer thread: recall/`get` call this and return.
+    /// Duplicate ids within one call bump once (mirrors the old
+    /// `record_accesses` semantics where one UPDATE touched each row once).
+    async fn buffer_accesses(&self, ids: Vec<MemoryId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut pending = self.access_buf.pending.lock().await;
+            let mut seen: std::collections::HashSet<MemoryId> =
+                std::collections::HashSet::with_capacity(ids.len());
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let entry = pending.entry(id).or_insert(PendingAccess {
+                    count: 0,
+                    last_accessed_at: now,
+                });
+                entry.count += 1;
+                entry.last_accessed_at = now;
+            }
+        }
+        self.ensure_access_flusher();
+    }
+
+    /// Spawn the interval flusher exactly once (lazily, from the first
+    /// buffered access, so we are guaranteed to be inside a Tokio runtime).
+    ///
+    /// The task holds only WEAK references to the writer channel and the
+    /// buffer: it can never keep the writer thread alive after every handle is
+    /// gone, and it exits on its next tick once the handles drop or shutdown
+    /// begins (`shutdown` performs its own final drain).
+    fn ensure_access_flusher(&self) {
+        if self.access_buf.flusher_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let buf = Arc::downgrade(&self.access_buf);
+        let writer_tx = self.writer_tx.downgrade();
+        let shutting_down = Arc::clone(&self.shutting_down);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ACCESS_FLUSH_INTERVAL).await;
+                if shutting_down.load(Ordering::SeqCst) {
+                    return; // shutdown() drains the buffer itself
+                }
+                let Some(buf) = buf.upgrade() else {
+                    return; // every StoreHandle dropped
+                };
+                let bumps = drain_access_buffer(&buf).await;
+                drop(buf);
+                if bumps.is_empty() {
+                    continue;
+                }
+                let Some(tx) = writer_tx.upgrade() else {
+                    return; // writer channel closed
+                };
+                let (reply, rx) = oneshot::channel();
+                if tx
+                    .send(WriteCommand::FlushAccesses { bumps, reply })
+                    .await
+                    .is_err()
+                {
+                    return; // writer gone; bumps dropped (best-effort)
+                }
+                drop(tx);
+                match rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "access flush failed; bumps dropped");
+                    }
+                    Err(_) => return, // writer dropped the reply: it is exiting
+                }
+            }
+        });
+    }
+
+    /// Drain ALL buffered access bumps into one batched writer op, awaiting
+    /// the result. Used by `shutdown` (final drain) and by tests that need
+    /// deterministic visibility; the steady-state path is the interval flusher.
+    #[doc(hidden)]
+    pub async fn flush_accesses(&self) -> Result<()> {
+        let bumps = drain_access_buffer(&self.access_buf).await;
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send_write(WriteCommand::FlushAccesses { bumps, reply }, rx)
+            .await
+    }
+
+    /// Count of write commands the writer thread has received so far
+    /// (excluding `Shutdown`). Exposed for observability and for the W1.8
+    /// proof that recall issues zero writer-thread ops.
+    #[doc(hidden)]
+    pub fn writer_ops_count(&self) -> u64 {
+        self.writer_ops.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
@@ -378,6 +636,16 @@ impl StoreHandle {
         self.pool.stores.lock().await.len()
     }
 
+    /// Test-only helper: how many distinct memory ids currently have buffered
+    /// (unflushed) access bumps. Proves recall BUFFERED instead of writing.
+    ///
+    /// This method is `pub` only to be reachable from `tests/`. Do NOT call
+    /// it in production code.
+    #[doc(hidden)]
+    pub async fn pending_access_len_for_test(&self) -> usize {
+        self.access_buf.pending.lock().await.len()
+    }
+
     /// Read up to `limit` link edges (cross-namespace) via the read pool, for
     /// the link-decay job. Reads never go through the writer.
     pub async fn links_for_decay(&self, limit: usize) -> Result<Vec<rb_store::LinkRow>> {
@@ -399,6 +667,26 @@ impl StoreHandle {
             target,
             link_type,
             strength,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Set one memory's EFFECTIVE importance through the single writer,
+    /// leaving its `base_importance` author prior untouched (W1.9). The
+    /// importance-recalibration job's only write path. Namespace-verified:
+    /// a missing or cross-namespace id fails closed with `NotFound`.
+    pub async fn set_recalibrated_importance(
+        &self,
+        namespace: Namespace,
+        id: MemoryId,
+        importance: u8,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::SetRecalibratedImportance {
+            namespace,
+            id,
+            importance,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -453,6 +741,36 @@ impl StoreHandle {
             reply,
         };
         self.send_write(cmd, rx).await
+    }
+
+    /// One-time namespace rename through the single writer (W0.3 carryover):
+    /// re-scope every memory from `old` to `new` in one store transaction.
+    /// Refuses a non-empty target unless `merge` is set (validation-class
+    /// error). No `MemoryChanged` events are published: the bulk admin op has
+    /// no per-memory change identity, and subscribers are namespace-scoped
+    /// snapshots of a pre-rename world — the oplog row is the durable record.
+    pub async fn rename_namespace(
+        &self,
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+    ) -> Result<rb_store::NamespaceRenameOutcome> {
+        // Mirrors `send_write`, with a typed reply payload.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::RenameNamespace {
+                old,
+                new,
+                merge,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
     }
 
     /// Enumerate up to `limit` active, non-superseded memories across ALL
@@ -535,10 +853,44 @@ where
     };
 
     match outcome {
-        StoreOpOutcome::Completed(result) => StoreOpReport {
-            result,
-            writer_usable: true,
-        },
+        StoreOpOutcome::Completed(result) => {
+            // W1.6b poison check: a COMPLETED op that returned Err while
+            // leaving the connection mid-transaction (e.g. a failed COMMIT
+            // whose drop-rollback also failed) would make every later op die
+            // with "cannot start a transaction within a transaction". Reuse
+            // the panic path's drop+reopen machinery; the caller still gets
+            // the op's own error.
+            let poisoned = result.is_err() && store.as_ref().is_some_and(|s| !s.is_autocommit());
+            if !poisoned {
+                return StoreOpReport {
+                    result,
+                    writer_usable: true,
+                };
+            }
+            tracing::error!(
+                "writer op failed and left an open transaction; reopening writer connection"
+            );
+            drop(store.take());
+            match open_store(db_path, embedding_dim, embedding_model) {
+                Ok(reopened) => {
+                    *store = Some(reopened);
+                    StoreOpReport {
+                        result,
+                        writer_usable: true,
+                    }
+                }
+                Err(e) => {
+                    tracing::error!(
+                        error = %e,
+                        "failed to reopen writer connection after poisoned op; writer exiting"
+                    );
+                    StoreOpReport {
+                        result,
+                        writer_usable: false,
+                    }
+                }
+            }
+        }
         StoreOpOutcome::Panicked(msg) => {
             tracing::error!(
                 panic = %msg,
@@ -581,6 +933,43 @@ fn panic_for_test_store_op(_store: &SqliteStore) -> Result<()> {
     panic!("deliberate writer test panic");
 }
 
+/// Test-only op for the W1.6b poison check: open a transaction, then complete
+/// with `Err` WITHOUT rolling back — the failed-COMMIT-then-failed-ROLLBACK
+/// shape no public write path can produce now that every op is RAII-guarded.
+#[cfg(test)]
+fn poison_for_test_store_op(store: &SqliteStore) -> Result<()> {
+    store.leave_transaction_open_for_test()?;
+    Err(Error::Storage(
+        "deliberate poisoned writer op for test".to_string(),
+    ))
+}
+
+/// Arms the writer-death signal (W1.6c). Dropped ARMED — including on a panic
+/// unwinding out of the writer loop — it flips the watch to `true`, which
+/// resolves [`StoreHandle::writer_died`] and shuts the daemon down. The loop
+/// disarms it only on the graceful exits (a `Shutdown` command, or every
+/// handle dropping the command channel), so a writer that stops serving writes
+/// for any other reason can never leave a zombie daemon behind.
+struct WriterDeathGuard {
+    tx: watch::Sender<bool>,
+    graceful: bool,
+}
+
+impl WriterDeathGuard {
+    fn disarm(&mut self) {
+        self.graceful = true;
+    }
+}
+
+impl Drop for WriterDeathGuard {
+    fn drop(&mut self) {
+        if !self.graceful {
+            let _ = self.tx.send(true);
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     db_path: PathBuf,
     embedding_dim: usize,
@@ -588,19 +977,42 @@ fn writer_loop(
     mut rx: mpsc::Receiver<WriteCommand>,
     events: broadcast::Sender<MemoryChanged>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
+    death_tx: watch::Sender<bool>,
+    ops: Arc<std::sync::atomic::AtomicU64>,
 ) {
+    let mut death = WriterDeathGuard {
+        tx: death_tx,
+        graceful: false,
+    };
+
     let mut store = match open_store(&db_path, embedding_dim, embedding_model.as_deref()) {
         Ok(store) => {
             let _ = ready_tx.send(Ok(()));
             Some(store)
         }
         Err(e) => {
+            // The open failure is surfaced to `start_inner` via the ready
+            // channel and no handle ever exists: a construction failure, not
+            // a writer death.
+            death.disarm();
             let _ = ready_tx.send(Err(e));
             return;
         }
     };
 
-    while let Some(cmd) = rx.blocking_recv() {
+    loop {
+        let Some(cmd) = rx.blocking_recv() else {
+            // Every sender dropped (a failed construction's cleanup, or a
+            // shutdown path that skipped the Shutdown command): deliberate
+            // teardown, not a writer death.
+            death.disarm();
+            break;
+        };
+        // Count every write op received (Shutdown is lifecycle, not an op).
+        // The W1.8 gate test reads this to prove recall enqueues nothing.
+        if !matches!(cmd, WriteCommand::Shutdown { .. }) {
+            ops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         match cmd {
             WriteCommand::Insert {
                 note,
@@ -716,28 +1128,14 @@ fn writer_loop(
                     break;
                 }
             }
-            WriteCommand::RecordAccess { id, reply } => {
-                let report = run_store_op(
-                    &mut store,
-                    &db_path,
-                    embedding_dim,
-                    embedding_model.as_deref(),
-                    |s| s.record_access(&id),
-                );
-                let writer_usable = report.writer_usable;
-                let _ = reply.send(report.result);
-                if !writer_usable {
-                    break;
-                }
-            }
-            WriteCommand::RecordAccesses { ids, reply } => {
+            WriteCommand::FlushAccesses { bumps, reply } => {
                 // No MemoryChanged event: access tracking is observability-only.
                 let report = run_store_op(
                     &mut store,
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    |s| s.record_accesses(&ids),
+                    |s| s.record_access_bumps(&bumps),
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -761,6 +1159,45 @@ fn writer_loop(
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::SetRecalibratedImportance {
+                namespace,
+                id,
+                importance,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    // Mirror the Update arm: verify the row lives in the
+                    // caller's namespace before mutating, fail closed
+                    // (NotFound) on a missing or cross-namespace id.
+                    |s| match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => {
+                            s.set_recalibrated_importance(&id, importance)
+                        }
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    },
+                );
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if changed {
+                    publish_change(
+                        &events,
+                        MemoryChanged {
+                            id,
+                            namespace,
+                            kind: ChangeKind::Updated,
+                        },
+                    );
+                }
                 if !writer_usable {
                     break;
                 }
@@ -853,6 +1290,37 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::RenameNamespace {
+                old,
+                new,
+                merge,
+                reply,
+            } => {
+                // No MemoryChanged events for the bulk rename (see the
+                // StoreHandle method doc); the store writes the durable
+                // `namespace_rename` oplog row inside the same transaction.
+                let mut outcome = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        outcome = Some(s.rename_namespace(&old, &new, merge)?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    outcome.ok_or_else(|| {
+                        Error::Storage("namespace rename completed without an outcome".to_string())
+                    })
+                });
+                let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
             #[cfg(test)]
             WriteCommand::PanicForTest { reply } => {
                 let report = run_store_op(
@@ -868,6 +1336,28 @@ fn writer_loop(
                     break;
                 }
             }
+            #[cfg(test)]
+            WriteCommand::PoisonForTest { reply } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    poison_for_test_store_op,
+                );
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            #[cfg(test)]
+            WriteCommand::DieForTest { reply } => {
+                // Exit WITHOUT disarming the death guard: the abnormal-exit
+                // shape (e.g. a failed reopen) the daemon must react to.
+                let _ = reply.send(Err(Error::Storage("writer killed for test".to_string())));
+                break;
+            }
             WriteCommand::Shutdown { reply } => {
                 // Fold the WAL back into the main file before the connection is
                 // dropped, so the on-disk DB is a clean single file. Best-effort:
@@ -877,6 +1367,7 @@ fn writer_loop(
                         tracing::warn!(error = %e, "WAL checkpoint on shutdown failed");
                     }
                 }
+                death.disarm();
                 let _ = reply.send(());
                 break;
             }
@@ -918,7 +1409,7 @@ impl MemoryBackend for StoreHandle {
             .await
     }
 
-    async fn graph(&self, ns: Namespace, id: MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
+    async fn graph(&self, ns: Namespace, id: MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>> {
         self.with_read(move |store| {
             let Some(anchor) = store.get_memory(&id)? else {
                 return Ok(Vec::new());
@@ -927,14 +1418,17 @@ impl MemoryBackend for StoreHandle {
                 return Ok(Vec::new());
             }
 
-            let ids = store.graph_neighbors(&id, depth)?;
-            let mut filtered = Vec::with_capacity(ids.len());
-            for graph_id in ids {
+            // (id, hops) pairs with real minimum hop distances (W1.5). The
+            // namespace/active filter drops pairs but preserves each survivor's
+            // hop value — hops measure link-graph distance, not list position.
+            let pairs = store.graph_neighbors(&id, depth)?;
+            let mut filtered = Vec::with_capacity(pairs.len());
+            for (graph_id, hops) in pairs {
                 let Some(note) = store.get_memory(&graph_id)? else {
                     continue;
                 };
                 if note.namespace == ns && note.archived_at.is_none() {
-                    filtered.push(graph_id);
+                    filtered.push((graph_id, hops));
                 }
             }
             Ok(filtered)
@@ -983,15 +1477,17 @@ impl MemoryBackend for StoreHandle {
     }
 
     async fn record_access(&self, id: MemoryId) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::RecordAccess { id, reply };
-        self.send_write(cmd, rx).await
+        // W1.8: buffered, not written — recall/`get` issue ZERO writer ops.
+        // The interval flusher (or shutdown) batches the bump to the writer.
+        self.buffer_accesses(vec![id]).await;
+        Ok(())
     }
 
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::RecordAccesses { ids, reply };
-        self.send_write(cmd, rx).await
+        // W1.8: buffered, not written — recall/`get` issue ZERO writer ops.
+        // The interval flusher (or shutdown) batches the bump to the writer.
+        self.buffer_accesses(ids).await;
+        Ok(())
     }
 
     async fn get_many(&self, ns: Namespace, ids: Vec<MemoryId>) -> Result<Vec<MemoryNote>> {
@@ -1125,8 +1621,10 @@ mod tests {
         assert_eq!(got.links.len(), 1);
         assert_eq!(got.links[0].target_id, bid);
 
-        // record_access goes through the writer and bumps the count.
+        // record_access buffers (W1.8); the flush applies the bump in one
+        // batched writer op.
         handle.record_access(aid.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
         let after = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
         assert_eq!(after.access_count, 1);
 
@@ -1248,6 +1746,99 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_recovers_after_an_op_leaves_an_open_transaction() {
+        // W1.6b: a completed-with-Err op that strands the connection inside a
+        // transaction (failed COMMIT + failed ROLLBACK shape) must trigger the
+        // drop+reopen path, so subsequent writes commit on a clean connection
+        // instead of dying with "cannot start a transaction within a
+        // transaction".
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("txn-poison".to_string());
+
+        // 1. A successful write before the poisoned op.
+        let before = note(&ns, "written before the poison");
+        let before_id = before.id.clone();
+        handle.write(before, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // 2. Inject the mid-transaction failure via the test-only command.
+        let (reply, rx) = oneshot::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::PoisonForTest { reply })
+            .await
+            .unwrap();
+        let err = rx.await.unwrap().unwrap_err();
+        assert!(
+            matches!(err, Error::Storage(_)),
+            "the poisoned op's own error reaches the caller, got {err:?}"
+        );
+
+        // 3. The next write commits: the writer detected !is_autocommit and
+        //    reopened its connection rather than running inside the leftover
+        //    transaction.
+        let after = note(&ns, "written after the poison");
+        let after_id = after.id.clone();
+        handle.write(after, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        assert!(
+            handle.get(ns.clone(), before_id).await.unwrap().is_some(),
+            "pre-poison write must survive"
+        );
+        assert!(
+            handle.get(ns.clone(), after_id).await.unwrap().is_some(),
+            "post-poison write must commit on the reopened connection"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn abnormal_writer_death_resolves_writer_died() {
+        // W1.6c: an abnormal writer exit must resolve the death signal the
+        // daemon races in its accept loop.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+
+        let died = handle.writer_died();
+        handle.kill_writer_for_test().await;
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), died)
+            .await
+            .expect("writer_died must resolve after an abnormal writer exit");
+
+        // The dead writer rejects further writes (no silent acceptance).
+        let ns = Namespace::Project("dead-writer".to_string());
+        let err = handle
+            .write(note(&ns, "after death"), Some(vec![0.1f32; DIM]))
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn graceful_shutdown_does_not_resolve_writer_died() {
+        // The death signal is for ABNORMAL exits only: a clean shutdown must
+        // never trip the daemon's writer-death arm.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+
+        let died = handle.writer_died();
+        handle.shutdown().await;
+
+        let raced = tokio::time::timeout(std::time::Duration::from_millis(300), died).await;
+        assert!(
+            raced.is_err(),
+            "writer_died must stay pending across a graceful shutdown"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1656,8 +2247,10 @@ mod tests {
         handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
 
         // Two accesses bump access_count to 2 and stamp last_accessed_at.
+        // Buffered (W1.8): both accumulate in memory, one flush persists them.
         handle.record_access(id.clone()).await.unwrap();
         handle.record_access(id.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
 
         let rows = handle.memories_for_recalibration(100).await.unwrap();
         let row = rows
@@ -1669,6 +2262,210 @@ mod tests {
         assert!(
             row.last_accessed_at.is_some(),
             "last_accessed_at must be stamped after record_access"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_set_recalibrated_importance_is_namespace_scoped_and_keeps_prior() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("recal-write".to_string());
+
+        let m = note(&ns, "anchored to its author prior");
+        let id = m.id.clone();
+        let base = m.importance;
+        handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // Cross-namespace write fails closed, exactly like Update.
+        let err = handle
+            .set_recalibrated_importance(Namespace::Global, id.clone(), 7)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "cross-namespace job write must be NotFound, got {err:?}"
+        );
+
+        // In-namespace write moves the EFFECTIVE importance only (W1.9).
+        handle
+            .set_recalibrated_importance(ns.clone(), id.clone(), 7)
+            .await
+            .unwrap();
+        let after = handle
+            .get(ns.clone(), id.clone())
+            .await
+            .unwrap()
+            .expect("memory present");
+        assert_eq!(after.importance, 7, "effective importance moved");
+        let row = handle
+            .memories_for_recalibration(10)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|r| r.id == id)
+            .expect("recal row present");
+        assert_eq!(
+            row.base_importance, base,
+            "the author prior must survive the job write"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recall_issues_zero_writer_ops_and_defers_access_bumps() {
+        // W1.8 / Phase 1 gate: a full hybrid recall through the real engine
+        // over the real StoreHandle must enqueue NOTHING on the writer thread.
+        // Access bumps are buffered in memory and applied later as ONE batched
+        // writer op.
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("zero-writer-recall".to_string());
+
+        let a = note(&ns, "writer thread serializes mutations");
+        let b = note(&ns, "writer thread accepts mutations");
+        let (aid, _bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let engine = rb_engine::MemoryEngine::new(
+            handle.clone(),
+            crate::SharedEmbedder::new(DeterministicProvider::new(DIM)),
+            ns.clone(),
+        );
+
+        let ops_before = handle.writer_ops_count();
+        let results = engine
+            .recall("writer thread mutations", 5, None, &[])
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "keyword overlap must return results");
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before,
+            "recall must issue ZERO writer-thread ops"
+        );
+
+        // The bumps were buffered (one entry per returned id), not persisted.
+        assert_eq!(
+            handle.pending_access_len_for_test().await,
+            results.len(),
+            "every returned id buffers exactly one pending bump"
+        );
+        let unflushed = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(unflushed.access_count, 0, "bump not yet visible in the DB");
+
+        // One flush persists ALL bumps in a single batched writer op.
+        handle.flush_accesses().await.unwrap();
+        let flushed = handle.get(ns.clone(), aid).await.unwrap().unwrap();
+        assert_eq!(flushed.access_count, 1, "flush applied the buffered bump");
+        assert!(flushed.last_accessed_at.is_some());
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before + 1,
+            "the whole recall's access tracking costs exactly one writer op"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_flusher_persists_buffered_bumps_without_explicit_flush() {
+        // The interval flusher (spawned lazily on the first buffered access)
+        // must persist access stats on its own — eventual consistency, no
+        // caller-driven flush.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("bg-flush".to_string());
+
+        let n = note(&ns, "eventually counted");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        handle.record_access(id.clone()).await.unwrap();
+
+        // Poll until the background flush lands (interval is 2s; allow ample
+        // slack for slow CI schedulers before declaring failure).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut seen = 0;
+        while std::time::Instant::now() < deadline {
+            seen = handle
+                .get(ns.clone(), id.clone())
+                .await
+                .unwrap()
+                .map(|n| n.access_count)
+                .unwrap_or(0);
+            if seen == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen, 1, "interval flusher must persist the buffered bump");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flushes_pending_access_bumps() {
+        // Buffered bumps must survive a graceful shutdown: the final drain in
+        // `shutdown` persists them before the write queue closes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let ns = Namespace::Project("shutdown-flush".to_string());
+
+        let id;
+        {
+            let handle = StoreHandle::start(db.clone(), DIM, 1).unwrap();
+            let n = note(&ns, "counted across shutdown");
+            id = n.id.clone();
+            handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+            // Two buffered accesses accumulate count=2 for the id.
+            handle.record_access(id.clone()).await.unwrap();
+            handle.record_access(id.clone()).await.unwrap();
+            handle.shutdown().await;
+        }
+
+        let reopened = StoreHandle::start(db, DIM, 1).unwrap();
+        let got = reopened.get(ns, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 2,
+            "shutdown must flush accumulated bumps (count preserved, not 1)"
+        );
+        assert!(got.last_accessed_at.is_some());
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_accesses_dedups_within_call_and_accumulates_across_calls() {
+        // Mirrors the old single-UPDATE semantics: duplicates within ONE call
+        // bump once; separate calls accumulate.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("dedup".to_string());
+
+        let n = note(&ns, "dedup target");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        handle
+            .record_accesses(vec![id.clone(), id.clone()])
+            .await
+            .unwrap();
+        handle.record_access(id.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
+
+        let got = handle.get(ns, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 2,
+            "within-call duplicate bumps once; the second call adds one more"
         );
 
         handle.shutdown().await;

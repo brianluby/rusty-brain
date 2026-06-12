@@ -13,8 +13,9 @@ use crate::event::{HookContext, HookEvent, HookResult};
 
 /// Claude Code hook adapter. Field names follow the Claude Code hook protocol
 /// (`hook_event_name`, `tool_name`, `tool_input`, `tool_response`,
-/// `last_assistant_message`, `custom_instructions`, `source`, `cwd`,
-/// `session_id`).
+/// `last_assistant_message`, `stop_hook_active`, `custom_instructions`,
+/// `source`, `cwd`, `session_id`, `transcript_path`), verified against the
+/// REAL recorded payloads in `rb-hooks/tests/fixtures/claude_code/`.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ClaudeCodeCli;
 
@@ -54,6 +55,11 @@ impl AgentCli for ClaudeCodeCli {
             },
             "Stop" => HookEvent::Stop {
                 last_assistant_message: opt_str(raw, "last_assistant_message"),
+                // Real payloads carry this; absent / non-bool degrades to false.
+                stop_hook_active: raw
+                    .get("stop_hook_active")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false),
             },
             "PreCompact" => HookEvent::PreCompact {
                 custom_instructions: opt_str(raw, "custom_instructions"),
@@ -64,6 +70,8 @@ impl AgentCli for ClaudeCodeCli {
             event,
             cwd,
             session_id,
+            // Claude Code sends `transcript_path` on every hook event.
+            transcript_path: opt_str(raw, "transcript_path").map(PathBuf::from),
         }
     }
 
@@ -158,15 +166,54 @@ mod tests {
         let raw = serde_json::json!({
             "hook_event_name": "Stop",
             "last_assistant_message": "done.",
+            "stop_hook_active": true,
             "cwd": "/p"
         });
         let ctx = cli().parse_input(&raw);
         assert_eq!(
             ctx.event,
             HookEvent::Stop {
-                last_assistant_message: Some("done.".to_string())
+                last_assistant_message: Some("done.".to_string()),
+                stop_hook_active: true,
             }
         );
+    }
+
+    #[test]
+    fn stop_without_stop_hook_active_defaults_to_false() {
+        // Synthetic edge case: a Stop missing the field (or with a non-bool
+        // value) must degrade to false, never error.
+        let raw = serde_json::json!({
+            "hook_event_name": "Stop",
+            "stop_hook_active": "yes",
+            "cwd": "/p"
+        });
+        let ctx = cli().parse_input(&raw);
+        assert_eq!(
+            ctx.event,
+            HookEvent::Stop {
+                last_assistant_message: None,
+                stop_hook_active: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_transcript_path_when_present_and_none_when_absent() {
+        let raw = serde_json::json!({
+            "hook_event_name": "SessionStart",
+            "source": "startup",
+            "cwd": "/p",
+            "transcript_path": "/home/user/.claude/projects/p/abc.jsonl"
+        });
+        let ctx = cli().parse_input(&raw);
+        assert_eq!(
+            ctx.transcript_path,
+            Some(PathBuf::from("/home/user/.claude/projects/p/abc.jsonl"))
+        );
+
+        let raw = serde_json::json!({ "hook_event_name": "SessionStart", "cwd": "/p" });
+        assert_eq!(cli().parse_input(&raw).transcript_path, None);
     }
 
     #[test]

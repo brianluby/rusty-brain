@@ -15,7 +15,7 @@ use std::sync::Mutex;
 pub(crate) struct MockBackend {
     pub notes: Mutex<HashMap<MemoryId, MemoryNote>>,
     pub embeddings: Mutex<HashMap<MemoryId, Vec<f32>>>,
-    graph: Mutex<HashMap<MemoryId, Vec<MemoryId>>>,
+    graph: Mutex<HashMap<MemoryId, Vec<(MemoryId, u8)>>>,
     keyword_results: Mutex<Option<Vec<MemoryId>>>,
     vector_results: Mutex<Option<Vec<(MemoryId, f32)>>>,
     record_access_calls: std::sync::atomic::AtomicUsize,
@@ -43,7 +43,9 @@ impl MockBackend {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
     }
 
-    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<MemoryId>) {
+    /// Stub the graph expansion for `id` as `(neighbor, hops)` pairs, mirroring
+    /// the store's real-hop-distance contract (W1.5).
+    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<(MemoryId, u8)>) {
         self.graph.lock().unwrap().insert(id, neighbors);
     }
 
@@ -170,7 +172,7 @@ impl MemoryBackend for MockBackend {
         ns: Namespace,
         id: MemoryId,
         _depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>> {
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
         let has_anchor = self
             .notes
             .lock()
@@ -286,7 +288,13 @@ impl MemoryBackend for MockBackend {
             ));
         }
         let mut guard = self.notes.lock().unwrap();
+        // Trait contract: duplicates within one call bump once (mirrors
+        // StoreHandle::buffer_accesses and the store's SQL IN-list dedup).
+        let mut seen = std::collections::HashSet::with_capacity(ids.len());
         for id in ids {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
             if let Some(note) = guard.get_mut(&id) {
                 note.access_count += 1;
                 note.last_accessed_at = Some(chrono::Utc::now());

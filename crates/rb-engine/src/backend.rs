@@ -20,12 +20,17 @@ pub trait MemoryBackend: Send + Sync {
         embedding: Vec<f32>,
         limit: usize,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>>;
+    /// Expand the link graph around `id` up to `depth` hops, returning each
+    /// reachable id with its MINIMUM hop distance (1 = direct neighbor; the
+    /// anchor is excluded), ordered by hops ascending (W1.5). The hop value
+    /// feeds the graph ranking signal, so implementors must preserve it when
+    /// filtering (namespace/active checks drop pairs, never renumber them).
     async fn graph(
         &self,
         ns: Namespace,
         id: MemoryId,
         depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>>;
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>>;
     async fn list(
         &self,
         ns: Namespace,
@@ -43,10 +48,15 @@ pub trait MemoryBackend: Send + Sync {
     async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()>;
     /// Persist a directed link (write path).
     async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()>;
-    /// Bump access metadata for `id` (write path; best-effort at call sites).
+    /// Bump access metadata for `id` (best-effort at call sites). W1.8:
+    /// implementations MAY defer the bump — the daemon buffers it in memory
+    /// and flushes batches off the read path, so recall/`get` issue zero
+    /// writer-thread ops and access stats are eventually consistent.
     async fn record_access(&self, id: MemoryId) -> rb_types::Result<()>;
-    /// Bump access metadata for all `ids` in a single writer round-trip
-    /// (write path; best-effort at call sites). Missing ids are silently skipped.
+    /// Bump access metadata for all `ids` (best-effort at call sites; missing
+    /// ids silently skipped, duplicates within one call bump once). W1.8: same
+    /// deferral contract as [`MemoryBackend::record_access`] — the daemon
+    /// buffers and batch-flushes, so this never costs recall a writer op.
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()>;
     /// Batch-fetch `ids` scoped to `ns`, in request order (read path).
     async fn get_many(
@@ -165,7 +175,7 @@ mod tests {
             _ns: Namespace,
             _id: MemoryId,
             _depth: u8,
-        ) -> rb_types::Result<Vec<MemoryId>> {
+        ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
             Ok(Vec::new())
         }
         async fn list(
@@ -232,7 +242,13 @@ mod tests {
         }
         async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
             let mut guard = self.notes.lock().unwrap();
+            // Trait contract: duplicates within one call bump once (mirrors
+            // StoreHandle::buffer_accesses and the store's SQL IN-list dedup).
+            let mut seen = std::collections::HashSet::with_capacity(ids.len());
             for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
                 if let Some(note) = guard.get_mut(&id) {
                     note.access_count += 1;
                     note.last_accessed_at = Some(chrono::Utc::now());
@@ -375,5 +391,24 @@ mod tests {
             .unwrap();
         let ids: Vec<rb_types::MemoryId> = many.iter().map(|n| n.id.clone()).collect();
         assert_eq!(ids, vec![bid, aid]);
+    }
+
+    #[tokio::test]
+    async fn mock_backend_record_accesses_duplicate_ids_bump_once() {
+        // Trait contract (`record_accesses` doc): duplicates within one call
+        // bump once. Mirrors store.rs's record_accesses_duplicate_ids_bump_once.
+        let backend = MockBackend::default();
+        let note = MemoryNote::new(Namespace::Global, "dup".to_string(), MemoryType::Insight, 5);
+        let id = note.id.clone();
+        backend.write(note, None).await.unwrap();
+        backend
+            .record_accesses(vec![id.clone(), id.clone()])
+            .await
+            .unwrap();
+        let got = backend.get(Namespace::Global, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 1,
+            "duplicate ids in one call must not double-bump"
+        );
     }
 }

@@ -256,12 +256,20 @@ pub async fn post_tool_use(
 
 /// Pure: format recent + important memories into a markdown system message.
 /// `important` is split into critical (`importance >= 8`) and important
-/// (`importance == 7`). Returns a header-only message when everything is empty.
+/// (`importance == 7`).
+///
+/// W1.3 empty-corpus rule: a fully empty corpus (zero total, nothing to list)
+/// returns `None` — SessionStart must inject literally nothing (zero tokens,
+/// no headers) on a first session instead of an empty scaffold. A non-zero
+/// total with empty lists still gets the header (the count is informative).
 fn format_session_start(
     recent: &[rb_types::MemoryNote],
     important: &[rb_types::MemoryNote],
     total: usize,
-) -> String {
+) -> Option<String> {
+    if total == 0 && recent.is_empty() && important.is_empty() {
+        return None;
+    }
     let mut out = String::new();
     out.push_str("# Rusty Brain — Memory Active\n");
     out.push_str(&format!("Total memories in scope: {total}\n"));
@@ -289,7 +297,7 @@ fn format_session_start(
             out.push_str(&format!("- {}\n", memory_line(m)));
         }
     }
-    out
+    Some(out)
 }
 
 /// One-line rendering of a memory: prefer its summary, else its content.
@@ -304,16 +312,20 @@ fn memory_line(memory: &rb_types::MemoryNote) -> String {
 
 /// SessionStart flow: fetch context and inject a markdown system message.
 /// Always continues. With no client (degraded), continues with no message.
+/// On a fully empty corpus (first session, W1.3) it also continues with no
+/// message: zero tokens injected, not even a header.
 pub async fn session_start(client: Option<&mut DaemonClient>) -> HookResult {
     let Some(client) = client else {
         return continue_only();
     };
     match client.context().await {
         Some((recent, important, total)) => {
-            let message = format_session_start(&recent, &important, total);
-            HookResult {
-                system_message: Some(message),
-                continue_execution: true,
+            match format_session_start(&recent, &important, total) {
+                Some(message) => HookResult {
+                    system_message: Some(message),
+                    continue_execution: true,
+                },
+                None => continue_only(),
             }
         }
         None => continue_only(),
@@ -853,9 +865,19 @@ mod tests {
     }
 
     #[test]
-    fn format_session_start_empty_has_header_and_no_sections() {
-        let msg = format_session_start(&[], &[], 0);
+    fn format_session_start_empty_corpus_injects_nothing() {
+        // W1.3: a first session over an empty corpus injects literally zero
+        // tokens — no header, no scaffold, no message at all.
+        assert_eq!(format_session_start(&[], &[], 0), None);
+    }
+
+    #[test]
+    fn format_session_start_nonzero_total_with_empty_lists_keeps_header() {
+        // A populated corpus whose context lists are empty still announces the
+        // count (informative); only the fully empty corpus goes silent.
+        let msg = format_session_start(&[], &[], 3).expect("header for non-empty corpus");
         assert!(msg.contains("# Rusty Brain"));
+        assert!(msg.contains('3'), "total shown: {msg}");
         assert!(!msg.contains("## Critical"));
         assert!(!msg.contains("## Recent"));
     }
@@ -863,7 +885,7 @@ mod tests {
     #[test]
     fn format_session_start_splits_critical_and_important() {
         let important = vec![sample_note("crit decision", 9), sample_note("imp note", 7)];
-        let msg = format_session_start(&[], &important, 2);
+        let msg = format_session_start(&[], &important, 2).expect("non-empty corpus");
         assert!(msg.contains("## Critical"));
         assert!(msg.contains("crit decision"));
         assert!(msg.contains("## Important"));
@@ -873,7 +895,7 @@ mod tests {
     #[test]
     fn format_session_start_lists_recent_and_total() {
         let recent = vec![sample_note("did a thing", 5)];
-        let msg = format_session_start(&recent, &[], 12);
+        let msg = format_session_start(&recent, &[], 12).expect("non-empty corpus");
         assert!(msg.contains("## Recent"));
         assert!(msg.contains("did a thing"));
         assert!(msg.contains("12"), "should mention the total count");

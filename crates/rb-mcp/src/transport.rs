@@ -229,6 +229,7 @@ mod tests {
                 },
                 _ => Response::Pong {
                     contract_version: rb_proto::CONTRACT_VERSION,
+                    recall_channels: None,
                 },
             })
         }

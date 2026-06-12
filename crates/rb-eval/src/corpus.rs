@@ -47,6 +47,14 @@ pub struct GoldenQuery {
     pub query: String,
     /// Fixture keys expected among the top results, best-relevance unordered.
     pub expected: Vec<String>,
+    /// Relevance grades aligned index-for-index with `expected`:
+    /// `3` = primary answer, `2` = substantially relevant, `1` = marginally
+    /// relevant. Empty means ungraded (legacy / hand-built test corpora); when
+    /// present there must be exactly one grade per expected key, each in
+    /// `1..=3`. Consumed by `metrics::ndcg_at_k` (W1.0b); binary recall@k /
+    /// MRR ignore them.
+    #[serde(default)]
+    pub grades: Vec<u8>,
     /// Optional `k` for this query's recall (defaults applied by the runner).
     #[serde(default)]
     pub k: Option<usize>,
@@ -164,6 +172,22 @@ impl Corpus {
                     )));
                 }
             }
+            if !q.grades.is_empty() {
+                if q.grades.len() != q.expected.len() {
+                    return Err(CorpusError::Invalid(format!(
+                        "golden query '{}' has {} grades for {} expected keys",
+                        q.query,
+                        q.grades.len(),
+                        q.expected.len()
+                    )));
+                }
+                if let Some(bad) = q.grades.iter().find(|g| !(1..=3).contains(*g)) {
+                    return Err(CorpusError::Invalid(format!(
+                        "golden query '{}' has grade {bad} out of range 1..=3",
+                        q.query
+                    )));
+                }
+            }
             let mut expected_seen: HashSet<&str> = HashSet::new();
             for key in &q.expected {
                 if !expected_seen.insert(key.as_str()) {
@@ -213,6 +237,30 @@ impl Corpus {
 pub fn load_committed_corpus() -> Result<Corpus, CorpusError> {
     const RAW: &str = include_str!("../fixtures/corpus.json");
     Corpus::from_json(RAW)
+}
+
+/// Load and validate the committed **held-out** query set.
+///
+/// The held-out queries live in `fixtures/holdout_queries.json`, are graded
+/// exactly like golden queries, and reference the committed corpus's memory
+/// keys. **They must never be used for weight tuning or threshold selection**
+/// — they exist so Phase 4 (W4.1) can gate CI on queries no tuning loop has
+/// ever seen. Validation substitutes them into the committed corpus so every
+/// key reference and grade obeys the same invariants as the tuning goldens.
+pub fn load_committed_holdout_queries() -> Result<Vec<GoldenQuery>, CorpusError> {
+    const RAW: &str = include_str!("../fixtures/holdout_queries.json");
+
+    #[derive(Deserialize)]
+    struct HoldoutFile {
+        golden_queries: Vec<GoldenQuery>,
+    }
+
+    let parsed: HoldoutFile =
+        serde_json::from_str(RAW).map_err(|e| CorpusError::Parse(e.to_string()))?;
+    let mut shadow = load_committed_corpus()?;
+    shadow.golden_queries = parsed.golden_queries;
+    shadow.validate()?;
+    Ok(shadow.golden_queries)
 }
 
 #[cfg(test)]
@@ -329,11 +377,125 @@ mod tests {
     }
 
     #[test]
+    fn rejects_grade_count_mismatch() {
+        let bad = MINIMAL.replace(
+            "\"expected\": [\"a\"]",
+            "\"expected\": [\"a\"], \"grades\": [3, 2]",
+        );
+        let err = Corpus::from_json(&bad).unwrap_err();
+        assert!(matches!(err, CorpusError::Invalid(_)));
+    }
+
+    #[test]
+    fn rejects_out_of_range_grade() {
+        for bad_grade in ["0", "4"] {
+            let bad = MINIMAL.replace(
+                "\"expected\": [\"a\"]",
+                &format!("\"expected\": [\"a\"], \"grades\": [{bad_grade}]"),
+            );
+            let err = Corpus::from_json(&bad).unwrap_err();
+            assert!(matches!(err, CorpusError::Invalid(_)));
+        }
+    }
+
+    #[test]
+    fn accepts_graded_golden_query() {
+        let graded = MINIMAL.replace(
+            "\"expected\": [\"a\"]",
+            "\"expected\": [\"a\"], \"grades\": [3]",
+        );
+        let c = Corpus::from_json(&graded).unwrap();
+        assert_eq!(c.golden_queries[0].grades, vec![3]);
+        // Ungraded legacy corpora still parse (grades default to empty).
+        let legacy = Corpus::from_json(MINIMAL).unwrap();
+        assert!(legacy.golden_queries[0].grades.is_empty());
+    }
+
+    #[test]
     fn committed_corpus_loads_and_validates() {
-        // The shipped fixtures must always be well-formed.
+        // The shipped fixtures must always be well-formed, and the Phase 1
+        // corpus must meet the W1.0 size floor: >= 200 memories and >= 50
+        // graded natural-language golden queries.
         let c = load_committed_corpus().unwrap();
-        assert!(c.memories.len() >= 8, "corpus should be non-trivial");
-        assert!(!c.golden_queries.is_empty());
+        assert!(
+            c.memories.len() >= 200,
+            "phase-1 corpus needs >= 200 memories, got {}",
+            c.memories.len()
+        );
+        assert!(
+            c.golden_queries.len() >= 50,
+            "phase-1 corpus needs >= 50 golden queries, got {}",
+            c.golden_queries.len()
+        );
+        let graded = c
+            .golden_queries
+            .iter()
+            .filter(|q| !q.grades.is_empty())
+            .count();
+        assert!(
+            graded >= 50,
+            "phase-1 corpus needs >= 50 GRADED golden queries, got {graded}"
+        );
         assert!(!c.dedup_clusters.is_empty());
+    }
+
+    #[test]
+    fn committed_corpus_contains_readme_quickstart_golden() {
+        // Phase 1 gate (plan section 4): "the README quickstart query returns
+        // its target memory". The corpus must therefore carry the quickstart
+        // query VERBATIM as a golden, and its target memory verbatim from the
+        // README's `remember` example. Retrieval quality on it is gated later
+        // (after W1.2/W1.4); this test pins the *content* contract.
+        let c = load_committed_corpus().unwrap();
+        let golden = c
+            .golden_queries
+            .iter()
+            .find(|q| q.query == "how is writing serialized?")
+            .expect("README quickstart query must be a committed golden");
+        assert!(
+            golden.expected.iter().any(|k| k == "readme_quickstart"),
+            "quickstart golden must expect its README target memory"
+        );
+        let target = c
+            .memories
+            .iter()
+            .find(|m| m.key == "readme_quickstart")
+            .expect("README quickstart target memory must exist");
+        assert_eq!(
+            target.content,
+            "We use a single-writer daemon over SQLite WAL"
+        );
+    }
+
+    #[test]
+    fn committed_holdout_set_loads_and_stays_disjoint() {
+        // The held-out set (>= 15 graded queries, separate file) must always
+        // validate against the committed corpus and must never overlap the
+        // tuning goldens — it is reserved for the W4.1 CI gate and MUST NOT
+        // be used for weight tuning.
+        let holdout = load_committed_holdout_queries().unwrap();
+        assert!(
+            holdout.len() >= 15,
+            "held-out set needs >= 15 queries, got {}",
+            holdout.len()
+        );
+        assert!(
+            holdout.iter().all(|q| !q.grades.is_empty()),
+            "every held-out query must be graded"
+        );
+
+        let tuning = load_committed_corpus().unwrap();
+        let tuning_texts: HashSet<&str> = tuning
+            .golden_queries
+            .iter()
+            .map(|q| q.query.as_str())
+            .collect();
+        for q in &holdout {
+            assert!(
+                !tuning_texts.contains(q.query.as_str()),
+                "held-out query '{}' duplicates a tuning golden",
+                q.query
+            );
+        }
     }
 }

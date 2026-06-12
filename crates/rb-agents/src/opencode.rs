@@ -91,6 +91,8 @@ impl AgentCli for OpenCodeCli {
             },
             Some("session.idle") => HookEvent::Stop {
                 last_assistant_message: first_str(raw, &["last_assistant_message"]),
+                // OpenCode has no stop-hook-forced-continuation equivalent.
+                stop_hook_active: false,
             },
             Some("session.compacted") => HookEvent::PreCompact {
                 custom_instructions: first_str(raw, &["custom_instructions"]),
@@ -105,6 +107,8 @@ impl AgentCli for OpenCodeCli {
             event,
             cwd,
             session_id,
+            // OpenCode's event payloads do not document a transcript-path field.
+            transcript_path: None,
         }
     }
 
@@ -201,7 +205,8 @@ mod tests {
         assert_eq!(
             ctx.event,
             HookEvent::Stop {
-                last_assistant_message: Some("done".to_string())
+                last_assistant_message: Some("done".to_string()),
+                stop_hook_active: false,
             }
         );
     }

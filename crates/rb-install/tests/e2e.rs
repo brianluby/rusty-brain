@@ -3,6 +3,11 @@
 //! observation reached the in-process daemon, then uninstall and prove the
 //! sentinel block is removed. Offline: the daemon uses DeterministicProvider so
 //! no embedding API is contacted (VOYAGE_API_KEY is cleared for the child).
+//!
+//! Also home to the C4 planted-secret DB-grep test: the per-PR proof that a
+//! secret planted through the real hook path is absent from the raw DB FILE
+//! bytes (not just the wire payload) — see
+//! `planted_secrets_never_reach_the_db_file_bytes`.
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::{Path, PathBuf};
@@ -40,6 +45,8 @@ impl RunningDaemon {
             db_path: db.clone(),
             read_pool_size: 2,
             jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -77,13 +84,17 @@ impl RunningDaemon {
         }
     }
 
-    async fn stop(mut self) {
+    /// Shut the daemon down and hand back the temp-dir guard so callers can
+    /// inspect on-disk artifacts (DB/WAL bytes) after the close; dropping the
+    /// returned guard deletes the directory.
+    async fn stop(mut self) -> tempfile::TempDir {
         if let Some(tx) = self.shutdown.take() {
             let _ = tx.send(());
         }
         if let Some(task) = self.task.take() {
             let _ = tokio::time::timeout(Duration::from_secs(5), task).await;
         }
+        self._dir
     }
 }
 
@@ -304,5 +315,156 @@ async fn install_capture_uninstall_round_trip() {
     );
 
     daemon.stop().await;
+    drop(proj_dir);
+}
+
+/// True if `needle` occurs as a contiguous byte substring of `haystack`.
+/// SQLite stores small TEXT payloads contiguously in cell bodies (and WAL
+/// frames are raw page images), so a byte-level grep is a faithful
+/// plaintext-at-rest check for short strings like the planted secrets below.
+fn contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
+    haystack
+        .windows(needle.len())
+        .any(|window| window == needle)
+}
+
+/// C4 / gate tier (b) per-PR complement: the planted-secret proof at the DB
+/// FILE, not the wire. `rb-hooks/tests/integration.rs` already asserts the
+/// Remember payload is redacted in flight; this test drives the same secret
+/// shapes through the REAL `rusty-brain-hooks` binary into a REAL daemon
+/// writing a REAL SQLite file, then greps the raw db/WAL/SHM bytes at rest:
+/// zero plaintext hits, redaction markers present. A unique NON-secret
+/// sentinel in the same captured command must be recallable AND present in
+/// the DB bytes, so the zero-hit greps can never pass vacuously (e.g. because
+/// the capture silently failed to land).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn planted_secrets_never_reach_the_db_file_bytes() {
+    let proj_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let project = proj_dir.path().to_path_buf();
+    let namespace = Namespace::Project("rb-c4-db-grep".to_string());
+
+    let daemon = RunningDaemon::start().await;
+    let hooks_bin = hooks_bin();
+
+    // The same planted shapes rb-hooks' wire-level test uses (every rule of
+    // the W0.5 minimal redaction set), plus the non-secret sentinel.
+    const SENTINEL: &str = "db-grep-sentinel-7c4f";
+    const PLANTED: [&str; 5] = [
+        "hunter2",
+        "AKIAABCDEFGHIJKLMNOP",
+        "sk-live-deadbeef",
+        "ghp_secret123",
+        "MIIfakekeymaterial",
+    ];
+    // NOTE: the Bash summary truncates the command at 80 chars BEFORE the
+    // stored summary is built, so both the password and the sentinel must sit
+    // inside that window (this command is 56 chars).
+    let event = serde_json::json!({
+        "session_id": "rb-c4-db-grep",
+        "transcript_path": "/dev/null",
+        "cwd": project.to_string_lossy(),
+        "hook_event_name": "PostToolUse",
+        "tool_name": "Bash",
+        "tool_input": {
+            "command": format!("deploy --password={} && echo {SENTINEL}", PLANTED[0]),
+        },
+        "tool_response": format!(
+            "key {}\nAuthorization: Bearer {}\nGITHUB_TOKEN={}\n\
+             -----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\ndone",
+            PLANTED[1], PLANTED[2], PLANTED[3], PLANTED[4]
+        ),
+    })
+    .to_string();
+
+    let hook_out = Command::new(&hooks_bin)
+        .args(["--agent", "claude-code"])
+        .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
+        .env("RUSTY_BRAIN_DB", &daemon.db)
+        // Explicit namespace (W0.3 rule 1) so the hook capture and the recall
+        // below agree on identity without a git repo in the fixture.
+        .env("RUSTY_BRAIN_NAMESPACE", "rb-c4-db-grep")
+        // Isolate the dedup cache so a prior run cannot suppress this capture.
+        .env("XDG_CACHE_HOME", &project)
+        .env_remove("VOYAGE_API_KEY")
+        .current_dir(&project)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(event.as_bytes())?;
+            }
+            child.wait_with_output()
+        })
+        .expect("run rusty-brain-hooks post-tool-use");
+    assert!(
+        hook_out.status.success(),
+        "rusty-brain-hooks must exit 0 (fail-open); stderr={:?}",
+        String::from_utf8_lossy(&hook_out.stderr)
+    );
+
+    // Vacuousness guard: the capture must actually land before we assert
+    // anything is ABSENT from the DB.
+    let mut client = Client::connect(&daemon.socket, namespace)
+        .await
+        .expect("connect to in-process daemon for recall");
+    let mut found = false;
+    for _ in 0..80 {
+        let results = client
+            .recall("Ran command deploy sentinel".to_string(), None, vec![], 10)
+            .await
+            .expect("recall");
+        if results.iter().any(|r| r.memory.content.contains(SENTINEL)) {
+            found = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        found,
+        "the planted-secret capture must be stored and recallable (sentinel {SENTINEL})"
+    );
+
+    // Stop the daemon FIRST: closing the last SQLite connection checkpoints
+    // the WAL into the main file, so the at-rest grep sees the final state.
+    // Any straggler -wal/-shm files are grepped too. `stop` hands back the
+    // temp-dir guard so the DB files outlive the daemon for the read below.
+    let db_path = daemon.db.clone();
+    let db_dir = daemon.stop().await;
+
+    let base = db_path.to_string_lossy().to_string();
+    let mut at_rest: Vec<u8> = Vec::new();
+    let mut read_files: Vec<String> = Vec::new();
+    for path in [base.clone(), format!("{base}-wal"), format!("{base}-shm")] {
+        if let Ok(bytes) = std::fs::read(&path) {
+            read_files.push(path);
+            at_rest.extend_from_slice(&bytes);
+            // Separator so a needle can never falsely match across files.
+            at_rest.push(0);
+        }
+    }
+    assert!(
+        read_files.contains(&base),
+        "the main DB file must exist and be readable at {base}"
+    );
+
+    assert!(
+        contains_bytes(&at_rest, SENTINEL.as_bytes()),
+        "the non-secret sentinel must be present in the DB bytes (files: {read_files:?})"
+    );
+    assert!(
+        contains_bytes(&at_rest, b"[REDACTED:"),
+        "redaction markers must be present in the DB bytes (files: {read_files:?})"
+    );
+    for secret in PLANTED {
+        assert!(
+            !contains_bytes(&at_rest, secret.as_bytes()),
+            "planted secret {secret:?} found in PLAINTEXT in the DB bytes (files: {read_files:?})"
+        );
+    }
+
+    drop(db_dir);
     drop(proj_dir);
 }

@@ -12,5 +12,5 @@ mod weights;
 
 pub use fusion::{rank_rrf, FusionMode, RrfConfig};
 pub use merge::build_signals;
-pub use rank::{rank, Signals, CONFIDENCE_FLOOR, HALF_LIFE};
+pub use rank::{rank, Signals, CONFIDENCE_FLOOR, HALF_LIFE, SCORE_FLOOR};
 pub use weights::Weights;

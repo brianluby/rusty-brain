@@ -47,6 +47,7 @@ mod tests {
             event,
             cwd: PathBuf::from("/tmp"),
             session_id: Some("s1".to_string()),
+            transcript_path: None,
         }
     }
 
@@ -80,6 +81,7 @@ mod tests {
         let dedup = DedupCache::at(tmp.path().join("d.json"));
         let event = HookEvent::Stop {
             last_assistant_message: Some("done".to_string()),
+            stop_hook_active: false,
         };
         let result = dispatch(None, &dedup, &ctx(event)).await;
         assert!(result.continue_execution);

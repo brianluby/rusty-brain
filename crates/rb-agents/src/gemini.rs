@@ -66,6 +66,8 @@ impl AgentCli for GeminiCli {
             },
             Some("SessionEnd") => HookEvent::Stop {
                 last_assistant_message: str_field(raw, "last_assistant_message"),
+                // Gemini has no stop-hook-forced-continuation equivalent.
+                stop_hook_active: false,
             },
             Some("PreCompress") => HookEvent::PreCompact {
                 custom_instructions: str_field(raw, "custom_instructions"),
@@ -79,6 +81,8 @@ impl AgentCli for GeminiCli {
             event,
             cwd,
             session_id,
+            // Gemini's hook payloads do not document a transcript-path field.
+            transcript_path: None,
         }
     }
 
@@ -171,7 +175,8 @@ mod tests {
         assert_eq!(
             ctx.event,
             HookEvent::Stop {
-                last_assistant_message: Some("finished".to_string())
+                last_assistant_message: Some("finished".to_string()),
+                stop_hook_active: false,
             }
         );
     }

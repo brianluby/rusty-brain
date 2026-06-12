@@ -249,7 +249,9 @@ mod tests {
                     results: vec![SearchResult {
                         memory: note(),
                         score: 0.9,
+                        channels: rb_types::ChannelHits::default(),
                     }],
+                    degraded: false,
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),
@@ -279,9 +281,11 @@ mod tests {
                 },
                 Request::Ping => Response::Pong {
                     contract_version: 1,
+                    recall_channels: None,
                 },
                 Request::Subscribe => Response::Pong {
                     contract_version: 1,
+                    recall_channels: None,
                 },
                 Request::RunJob { .. } => Response::JobRan {
                     scanned: 0,
@@ -292,6 +296,12 @@ mod tests {
                     scanned: 0,
                     changed: 0,
                     skipped: 0,
+                },
+                // No MCP tool maps to the namespace-rename admin op; the arm
+                // exists only to keep this fake total over `Request`.
+                Request::NamespaceRename { .. } => Response::NamespaceRenamed {
+                    moved: 0,
+                    vectors: 0,
                 },
             })
         }

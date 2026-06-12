@@ -184,7 +184,9 @@ impl Client {
         }
     }
 
-    /// Hybrid recall; returns ranked results.
+    /// Hybrid recall; returns ranked results. Callers that surface the W1.6d
+    /// degraded flag should use [`Client::recall_with_status`] (the
+    /// `ping`/`ping_stats` pattern); this convenience wrapper drops it.
     pub async fn recall(
         &mut self,
         query: String,
@@ -192,6 +194,23 @@ impl Client {
         tags: Vec<String>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        Ok(self
+            .recall_with_status(query, memory_type, tags, limit)
+            .await?
+            .0)
+    }
+
+    /// Hybrid recall; returns ranked results plus the W1.6d `degraded` flag —
+    /// `true` when recall fell back to keyword+graph because the embedding
+    /// provider errored, so the caller can warn that results are vector-blind
+    /// (rb-mcp consumes the raw `Response` frame for the same purpose).
+    pub async fn recall_with_status(
+        &mut self,
+        query: String,
+        memory_type: Option<MemoryType>,
+        tags: Vec<String>,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, bool)> {
         let resp = self
             .request(Request::Recall {
                 query,
@@ -201,7 +220,7 @@ impl Client {
             })
             .await?;
         match resp {
-            Resp::Recalled { results } => Ok(results),
+            Resp::Recalled { results, degraded } => Ok((results, degraded)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -275,9 +294,21 @@ impl Client {
 
     /// Round-trip ping; returns the daemon's contract version.
     pub async fn ping(&mut self) -> Result<u32> {
+        Ok(self.ping_stats().await?.0)
+    }
+
+    /// Round-trip ping; returns the daemon's contract version plus the
+    /// aggregate per-channel recall hit counters (W1.0). `None` from a daemon
+    /// predating the counters.
+    pub async fn ping_stats(
+        &mut self,
+    ) -> Result<(u32, Option<crate::messages::RecallChannelTotals>)> {
         let resp = self.request(Request::Ping).await?;
         match resp {
-            Resp::Pong { contract_version } => Ok(contract_version),
+            Resp::Pong {
+                contract_version,
+                recall_channels,
+            } => Ok((contract_version, recall_channels)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -309,6 +340,25 @@ impl Client {
                 changed,
                 skipped,
             } => Ok((scanned, changed, skipped)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory from
+    /// `old` to `new` in one daemon writer transaction. Refused with
+    /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
+    /// set. Returns `(moved_memories, moved_vectors)`.
+    pub async fn rename_namespace(
+        &mut self,
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+    ) -> Result<(u64, u64)> {
+        let resp = self
+            .request(Request::NamespaceRename { old, new, merge })
+            .await?;
+        match resp {
+            Resp::NamespaceRenamed { moved, vectors } => Ok((moved, vectors)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -359,6 +409,7 @@ mod tests {
         let _req: Request = read_frame(&mut framed).await.unwrap();
         let resp = Response::Pong {
             contract_version: CONTRACT_VERSION,
+            recall_channels: None,
         };
         write_frame(&mut framed, &resp).await.unwrap();
     }
@@ -374,7 +425,9 @@ mod tests {
             .unwrap();
         let resp = client.request(Request::Ping).await.unwrap();
         match resp {
-            Response::Pong { contract_version } => {
+            Response::Pong {
+                contract_version, ..
+            } => {
                 assert_eq!(contract_version, CONTRACT_VERSION);
             }
             other => panic!("expected Pong, got {other:?}"),
@@ -394,7 +447,9 @@ mod tests {
         let mut client = Client::connect(&path, Namespace::Global).await.unwrap();
         client.send_request(&Request::Ping).await.unwrap();
         match client.recv_response().await.unwrap() {
-            Response::Pong { contract_version } => {
+            Response::Pong {
+                contract_version, ..
+            } => {
                 assert_eq!(contract_version, CONTRACT_VERSION);
             }
             other => panic!("expected Pong, got {other:?}"),
@@ -524,11 +579,15 @@ mod wrapper_tests {
                 Request::Remember { .. } => Response::Remembered {
                     id: fixed_id.clone(),
                 },
-                Request::Recall { .. } => Response::Recalled {
+                Request::Recall { query, .. } => Response::Recalled {
                     results: vec![SearchResult {
                         memory: note(),
                         score: 0.5,
+                        channels: rb_types::ChannelHits::default(),
                     }],
+                    // Keyed on the query so the typed-wrapper test can prove
+                    // the W1.6d flag rides the wire to `recall_with_status`.
+                    degraded: query == "degraded",
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),
@@ -548,9 +607,11 @@ mod wrapper_tests {
                 },
                 Request::Ping => Response::Pong {
                     contract_version: CONTRACT_VERSION,
+                    recall_channels: None,
                 },
                 Request::Subscribe => Response::Pong {
                     contract_version: CONTRACT_VERSION,
+                    recall_channels: None,
                 },
                 Request::RunJob { .. } => Response::JobRan {
                     scanned: 4,
@@ -561,6 +622,12 @@ mod wrapper_tests {
                     scanned: 6,
                     changed: 5,
                     skipped: 1,
+                },
+                Request::NamespaceRename { merge, .. } => Response::NamespaceRenamed {
+                    // Canned counts keyed on `merge` so the typed-wrapper test
+                    // can prove the flag rides the wire.
+                    moved: if merge { 7 } else { 3 },
+                    vectors: 2,
                 },
             };
             write_frame(&mut framed, &resp).await.unwrap();
@@ -599,6 +666,20 @@ mod wrapper_tests {
         assert_eq!(results.len(), 1);
         assert!((results[0].score - 0.5).abs() < f32::EPSILON);
 
+        // The W1.6d degraded flag reaches the typed client (mock keys it on
+        // the query string).
+        let (results, degraded) = c
+            .recall_with_status("q".into(), None, vec![], 5)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!degraded, "ordinary recall is not degraded");
+        let (_, degraded) = c
+            .recall_with_status("degraded".into(), None, vec![], 5)
+            .await
+            .unwrap();
+        assert!(degraded, "the degraded flag must ride the wire");
+
         let got = c.get(fixed_id.clone()).await.unwrap();
         assert!(got.is_some());
 
@@ -626,6 +707,27 @@ mod wrapper_tests {
 
         let (rs, rc, rk) = c.reembed(Some(10)).await.unwrap();
         assert_eq!((rs, rc, rk), (6, 5, 1));
+
+        // The fake server keys `moved` on the merge flag, proving the flag
+        // (and both namespaces) ride the wire and the counts come back typed.
+        let (moved, vectors) = c
+            .rename_namespace(
+                Namespace::Project("scratch".into()),
+                Namespace::Project("rb".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!((moved, vectors), (3, 2));
+        let (moved, vectors) = c
+            .rename_namespace(
+                Namespace::Project("scratch".into()),
+                Namespace::Project("rb".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!((moved, vectors), (7, 2));
 
         drop(c);
         server.await.unwrap();
