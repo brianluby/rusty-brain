@@ -254,8 +254,11 @@ The CLI and hooks resolve the current namespace off the async runtime before any
 begins, through one shared implementation (`rb-config`), first hit wins:
 
 1. an explicit `--namespace` flag or `RUSTY_BRAIN_NAMESPACE` env override;
-2. a repo-committed `.rusty-brain.toml` (`namespace = "..."`) at the git toplevel —
-   identity survives cloning under any directory name;
+2. a repo-committed `.rusty-brain.toml` (`namespace = "..."`), read from the blob
+   committed at `HEAD` (`git show HEAD:.rusty-brain.toml`) — identity survives cloning
+   under any directory name, and only the committed content counts: an untracked or
+   locally-modified worktree file cannot redirect the namespace and is ignored with a
+   warning (commit it to take effect);
 3. a `CLAUDE.md` front-matter `project:` key, walking from the working directory up to
    and *including* the git toplevel, never past it (there is no first-H1 fallback). A
    `project:` that differs from the toplevel name is never silently trusted: the CLI

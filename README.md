@@ -236,7 +236,9 @@ coverage is still being expanded.
 Service configuration is via environment variables (there is no general config file
 for the core service yet). Two small files exist for namespace identity: a
 repo-committed `.rusty-brain.toml` at the git toplevel (`namespace = "..."`) pins a
-project's namespace across clones, and a per-user pin store (`namespace-pins.toml`
+project's namespace across clones — it is read from the blob committed at `HEAD`
+(`git show HEAD:.rusty-brain.toml`), so untracked or uncommitted edits are ignored
+with a warning until committed — and a per-user pin store (`namespace-pins.toml`
 under the user state dir) records `CLAUDE.md` frontmatter overrides accepted via
 `rusty-brain --accept-namespace-override` — unpinned overrides are never silently
 honored.

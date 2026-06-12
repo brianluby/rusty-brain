@@ -4,8 +4,12 @@
 //!
 //! Resolution order (first hit wins):
 //!   1. explicit override — `--namespace` flag or [`crate::NAMESPACE_ENV`];
-//!   2. repo-committed [`REPO_CONFIG_FILE`] (`namespace = "..."`) at the git
-//!      toplevel — identity survives cloning under any directory name;
+//!   2. repo-committed [`REPO_CONFIG_FILE`] (`namespace = "..."`), read from
+//!      the blob committed at `HEAD` (`git show HEAD:.rusty-brain.toml`), so
+//!      identity survives cloning under any directory name. ONLY the committed
+//!      content counts: an untracked or locally-modified worktree file can
+//!      never redirect the namespace — divergence is surfaced via
+//!      [`NamespaceResolution::repo_config_divergence`] so callers can warn;
 //!   3. `CLAUDE.md` frontmatter `project:` — nearest file walking from the
 //!      start dir up to and INCLUDING the git toplevel, never past it (F54),
 //!      honored only when it equals the toplevel name or is pinned (F22).
@@ -35,13 +39,15 @@ use serde::{Deserialize, Serialize};
 /// Repo-committed identity file, read from the git toplevel only.
 pub const REPO_CONFIG_FILE: &str = ".rusty-brain.toml";
 
-/// Outcome of resolution: the namespace to use, plus any frontmatter override
-/// that was found but NOT honored (unpinned and differing from the toplevel
-/// name) so callers can warn in their own channel.
+/// Outcome of resolution: the namespace to use, plus anything found but NOT
+/// honored — a frontmatter override (unpinned and differing from the toplevel
+/// name) or a diverging worktree [`REPO_CONFIG_FILE`] — so callers can warn
+/// in their own channel.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NamespaceResolution {
     pub namespace: Namespace,
     pub unpinned_override: Option<UnpinnedOverride>,
+    pub repo_config_divergence: Option<RepoConfigDivergence>,
 }
 
 /// A `CLAUDE.md` frontmatter `project:` that differs from the git-toplevel
@@ -57,10 +63,40 @@ pub struct UnpinnedOverride {
     pub toplevel: PathBuf,
 }
 
+/// A worktree [`REPO_CONFIG_FILE`] that diverges from the blob committed at
+/// `HEAD`. Only the committed content is ever honored; this is surfaced so
+/// callers can warn in their own channel (CLI stderr / hook tracing), like
+/// [`NamespaceResolution::unpinned_override`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoConfigDivergence {
+    /// The git toplevel whose worktree file diverges.
+    pub toplevel: PathBuf,
+    /// How the worktree file diverges from `HEAD`.
+    pub kind: RepoConfigDivergenceKind,
+}
+
+/// How a worktree [`REPO_CONFIG_FILE`] diverges from `HEAD`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RepoConfigDivergenceKind {
+    /// No committed counterpart at `HEAD` (untracked file, or `HEAD` is
+    /// unborn): the worktree file is ignored entirely.
+    Untracked,
+    /// Tracked, but the worktree content differs: the committed content wins.
+    Modified,
+}
+
 fn resolved(namespace: Namespace) -> NamespaceResolution {
+    resolved_with(namespace, None)
+}
+
+fn resolved_with(
+    namespace: Namespace,
+    repo_config_divergence: Option<RepoConfigDivergence>,
+) -> NamespaceResolution {
     NamespaceResolution {
         namespace,
         unpinned_override: None,
+        repo_config_divergence,
     }
 }
 
@@ -73,7 +109,13 @@ pub fn resolve_namespace(flag: Option<&str>) -> NamespaceResolution {
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
         .or_else(explicit_namespace_from_env);
-    resolve_namespace_in(&cwd, explicit, &NamespacePins::load(), git_toplevel)
+    resolve_namespace_in(
+        &cwd,
+        explicit,
+        &NamespacePins::load(),
+        git_toplevel,
+        head_repo_config,
+    )
 }
 
 /// The explicit namespace from [`crate::NAMESPACE_ENV`], if set non-empty.
@@ -84,17 +126,20 @@ pub fn explicit_namespace_from_env() -> Option<String> {
         .filter(|s| !s.is_empty())
 }
 
-/// Pure-ish core, parameterized over the git-root resolver (callers supply
-/// their own process bounds) and an in-memory pin set, so every branch is
-/// testable against temp trees without the real state file.
-pub fn resolve_namespace_in<G>(
+/// Pure-ish core, parameterized over the git-root resolver and the committed
+/// [`REPO_CONFIG_FILE`]-at-`HEAD` reader (callers supply their own process
+/// bounds) and an in-memory pin set, so every branch is testable against temp
+/// trees without the real state file.
+pub fn resolve_namespace_in<G, B>(
     start: &Path,
     explicit: Option<String>,
     pins: &NamespacePins,
     git_root: G,
+    head_config: B,
 ) -> NamespaceResolution
 where
     G: Fn(&Path) -> Option<PathBuf>,
+    B: Fn(&Path) -> Option<String>,
 {
     // (1) explicit always wins: no detection, nothing to warn about.
     if let Some(name) = explicit
@@ -103,21 +148,28 @@ where
     {
         return resolved(Namespace::Project(name));
     }
+    // Set when the worktree REPO_CONFIG_FILE diverges from HEAD; carried on
+    // whichever resolution wins so callers can warn in their own channel.
+    let mut divergence = None;
     if let Some(top) = git_root(start).as_deref() {
         // (2) repo-committed identity: same namespace under any clone name.
-        if let Some(name) = repo_committed_namespace(top) {
-            return resolved(Namespace::Project(name));
+        // ONLY the blob at HEAD counts — an untracked or locally-modified
+        // worktree file must never redirect the namespace.
+        let committed = head_config(top);
+        divergence = repo_config_divergence(top, committed.as_deref());
+        if let Some(name) = committed.as_deref().and_then(repo_config_namespace) {
+            return resolved_with(Namespace::Project(name), divergence);
         }
         // (3) CLAUDE.md frontmatter, bounded at the toplevel, pin-gated.
         let top_name = dir_name(top);
         match (frontmatter_project_within(start, top), top_name) {
             (Some(claimed), Some(used)) if claimed == used => {
                 // Not an override: frontmatter agrees with the toplevel name.
-                return resolved(Namespace::Project(claimed));
+                return resolved_with(Namespace::Project(claimed), divergence);
             }
             (Some(claimed), Some(used)) => {
                 if pins.pinned(top) == Some(claimed.as_str()) {
-                    return resolved(Namespace::Project(claimed));
+                    return resolved_with(Namespace::Project(claimed), divergence);
                 }
                 // Unpinned differing override: fail safe to the toplevel name
                 // (F22) and report it so the caller can warn/pin.
@@ -128,18 +180,19 @@ where
                         used,
                         toplevel: top.to_path_buf(),
                     }),
+                    repo_config_divergence: divergence,
                 };
             }
             // (4) toplevel directory name.
-            (None, Some(used)) => return resolved(Namespace::Project(used)),
+            (None, Some(used)) => return resolved_with(Namespace::Project(used), divergence),
             // Toplevel has no usable utf8 name (e.g. `/`): fall through.
             (_, None) => {}
         }
     }
     // (5) start (cwd) directory name; else Global.
     match dir_name(start) {
-        Some(name) => resolved(Namespace::Project(name)),
-        None => resolved(Namespace::Global),
+        Some(name) => resolved_with(Namespace::Project(name), divergence),
+        None => resolved_with(Namespace::Global, divergence),
     }
 }
 
@@ -158,14 +211,53 @@ struct RepoConfig {
     namespace: Option<String>,
 }
 
-/// Read `namespace = "..."` from [`REPO_CONFIG_FILE`] at the git toplevel.
-/// Missing file, parse failure, and empty values all degrade to `None`.
-fn repo_committed_namespace(toplevel: &Path) -> Option<String> {
-    let text = std::fs::read_to_string(toplevel.join(REPO_CONFIG_FILE)).ok()?;
-    let cfg: RepoConfig = toml::from_str(&text).ok()?;
+/// The committed content of [`REPO_CONFIG_FILE`] at `HEAD`, read via
+/// `git -C <toplevel> show HEAD:.rusty-brain.toml` so a worktree-only file can
+/// never redirect the namespace. File not committed at `HEAD`, an unborn
+/// `HEAD` (fresh repo with no commits), and a missing git all degrade to
+/// `None` — "no committed identity". Callers needing a process bound (hooks)
+/// supply their own reader to [`resolve_namespace_in`].
+pub fn head_repo_config(toplevel: &Path) -> Option<String> {
+    let spec = format!("HEAD:{REPO_CONFIG_FILE}");
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(toplevel)
+        .args(["show", &spec])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    String::from_utf8(output.stdout).ok()
+}
+
+/// Parse `namespace = "..."` from committed [`REPO_CONFIG_FILE`] content.
+/// Parse failure and empty values degrade to `None`.
+fn repo_config_namespace(text: &str) -> Option<String> {
+    let cfg: RepoConfig = toml::from_str(text).ok()?;
     cfg.namespace
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
+}
+
+/// Compare the worktree [`REPO_CONFIG_FILE`] (if present) against the
+/// committed blob so callers can warn that only the committed content takes
+/// effect. An absent or unreadable worktree file reports nothing — a locally
+/// DELETED tracked file still resolves from `HEAD`, silently.
+fn repo_config_divergence(
+    toplevel: &Path,
+    committed: Option<&str>,
+) -> Option<RepoConfigDivergence> {
+    let worktree = std::fs::read_to_string(toplevel.join(REPO_CONFIG_FILE)).ok()?;
+    let kind = match committed {
+        None => RepoConfigDivergenceKind::Untracked,
+        Some(blob) if blob != worktree => RepoConfigDivergenceKind::Modified,
+        Some(_) => return None,
+    };
+    Some(RepoConfigDivergence {
+        toplevel: toplevel.to_path_buf(),
+        kind,
+    })
 }
 
 /// Nearest `CLAUDE.md` frontmatter `project:` walking `start` up to and
@@ -321,6 +413,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use std::fs;
+    use std::process::Stdio;
     use std::sync::Mutex;
     use tempfile::TempDir;
 
@@ -330,6 +423,16 @@ mod tests {
 
     fn no_git(_: &Path) -> Option<PathBuf> {
         None
+    }
+
+    /// No committed [`REPO_CONFIG_FILE`] at HEAD (untracked, unborn HEAD, …).
+    fn no_head_config(_: &Path) -> Option<String> {
+        None
+    }
+
+    /// A committed [`REPO_CONFIG_FILE`] blob with the given content.
+    fn committed(text: &str) -> impl Fn(&Path) -> Option<String> + '_ {
+        move |_| Some(text.to_string())
     }
 
     // --- project_from_frontmatter (pure text parsing) ---
@@ -358,18 +461,19 @@ mod tests {
 
     #[test]
     fn explicit_beats_everything() {
-        // (e): even with a repo config AND a pinned frontmatter override
-        // available, an explicit namespace short-circuits detection.
+        // (e): even with a committed repo config AND a pinned frontmatter
+        // override available, an explicit namespace short-circuits detection.
         let tmp = TempDir::new().unwrap();
         let top = tmp.path().join("repo");
         fs::create_dir_all(&top).unwrap();
-        fs::write(
-            top.join(REPO_CONFIG_FILE),
-            "namespace = \"from-repo-config\"\n",
-        )
-        .unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, Some("explicit".to_string()), &no_pins(), git);
+        let res = resolve_namespace_in(
+            &top,
+            Some("explicit".to_string()),
+            &no_pins(),
+            git,
+            committed("namespace = \"from-repo-config\"\n"),
+        );
         assert_eq!(res.namespace, Namespace::Project("explicit".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
@@ -391,30 +495,43 @@ mod tests {
 
     #[test]
     fn repo_config_beats_directory_name_and_frontmatter() {
-        // (b): `.rusty-brain.toml` outranks both the toplevel dir name and a
-        // CLAUDE.md frontmatter project (even one that would need a pin).
+        // (b): a committed `.rusty-brain.toml` outranks both the toplevel dir
+        // name and a CLAUDE.md frontmatter project (even one needing a pin).
         let tmp = TempDir::new().unwrap();
         let top = tmp.path().join("some-clone-name");
         fs::create_dir_all(&top).unwrap();
-        fs::write(top.join(REPO_CONFIG_FILE), "namespace = \"canonical\"\n").unwrap();
         fs::write(top.join("CLAUDE.md"), "---\nproject: pretender\n---\n").unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &no_pins(), git);
+        let res = resolve_namespace_in(
+            &top,
+            None,
+            &no_pins(),
+            git,
+            committed("namespace = \"canonical\"\n"),
+        );
         assert_eq!(res.namespace, Namespace::Project("canonical".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
 
     #[test]
     fn same_repo_under_two_clone_names_resolves_identically() {
-        // (d): identity travels with the committed file, not the directory.
+        // (d): identity travels with the committed blob, not the directory.
         let tmp = TempDir::new().unwrap();
         let mut seen = Vec::new();
         for clone in ["clone-a", "work-checkout-b"] {
             let top = tmp.path().join(clone);
             fs::create_dir_all(&top).unwrap();
-            fs::write(top.join(REPO_CONFIG_FILE), "namespace = \"one-project\"\n").unwrap();
             let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-            seen.push(resolve_namespace_in(&top, None, &no_pins(), git).namespace);
+            seen.push(
+                resolve_namespace_in(
+                    &top,
+                    None,
+                    &no_pins(),
+                    git,
+                    committed("namespace = \"one-project\"\n"),
+                )
+                .namespace,
+            );
         }
         assert_eq!(seen[0], seen[1]);
         assert_eq!(seen[0], Namespace::Project("one-project".to_string()));
@@ -425,10 +542,67 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let top = tmp.path().join("repo");
         fs::create_dir_all(&top).unwrap();
-        fs::write(top.join(REPO_CONFIG_FILE), "namespace = [not toml\n").unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &no_pins(), git);
+        let res = resolve_namespace_in(
+            &top,
+            None,
+            &no_pins(),
+            git,
+            committed("namespace = [not toml\n"),
+        );
         assert_eq!(res.namespace, Namespace::Project("repo".to_string()));
+    }
+
+    #[test]
+    fn untracked_worktree_toml_is_ignored_and_reported() {
+        // INVERSE regression for the namespace-hijack fix: a worktree
+        // `.rusty-brain.toml` with no committed counterpart at HEAD must NOT
+        // redirect the namespace — resolution falls through to the git-root
+        // name, and the divergence is surfaced so callers can warn.
+        let tmp = TempDir::new().unwrap();
+        let top = tmp.path().join("host-repo");
+        fs::create_dir_all(&top).unwrap();
+        fs::write(top.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
+        let res = resolve_namespace_in(&top, None, &no_pins(), git, no_head_config);
+        assert_eq!(res.namespace, Namespace::Project("host-repo".to_string()));
+        let d = res.repo_config_divergence.expect("divergence is surfaced");
+        assert_eq!(d.kind, RepoConfigDivergenceKind::Untracked);
+        assert_eq!(d.toplevel, top);
+    }
+
+    #[test]
+    fn locally_modified_toml_head_blob_wins() {
+        // (c): tracked but locally modified — the committed content is used
+        // and the modification is surfaced.
+        let tmp = TempDir::new().unwrap();
+        let top = tmp.path().join("repo");
+        fs::create_dir_all(&top).unwrap();
+        fs::write(top.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
+        let res = resolve_namespace_in(
+            &top,
+            None,
+            &no_pins(),
+            git,
+            committed("namespace = \"canonical\"\n"),
+        );
+        assert_eq!(res.namespace, Namespace::Project("canonical".to_string()));
+        let d = res.repo_config_divergence.expect("divergence is surfaced");
+        assert_eq!(d.kind, RepoConfigDivergenceKind::Modified);
+    }
+
+    #[test]
+    fn worktree_matching_committed_toml_reports_no_divergence() {
+        let tmp = TempDir::new().unwrap();
+        let top = tmp.path().join("repo");
+        fs::create_dir_all(&top).unwrap();
+        let text = "namespace = \"canonical\"\n";
+        fs::write(top.join(REPO_CONFIG_FILE), text).unwrap();
+        let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
+        let res = resolve_namespace_in(&top, None, &no_pins(), git, committed(text));
+        assert_eq!(res.namespace, Namespace::Project("canonical".to_string()));
+        assert_eq!(res.repo_config_divergence, None);
     }
 
     #[test]
@@ -447,7 +621,7 @@ mod tests {
         let nested = top.join("src").join("deep");
         fs::create_dir_all(&nested).unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&nested, None, &no_pins(), git);
+        let res = resolve_namespace_in(&nested, None, &no_pins(), git, no_head_config);
         assert_eq!(res.namespace, Namespace::Project("inner-repo".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
@@ -461,7 +635,7 @@ mod tests {
         fs::create_dir_all(&top).unwrap();
         fs::write(top.join("CLAUDE.md"), "---\nproject: victim\n---\n").unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &no_pins(), git);
+        let res = resolve_namespace_in(&top, None, &no_pins(), git, no_head_config);
         assert_eq!(
             res.namespace,
             Namespace::Project("malicious-repo".to_string())
@@ -481,7 +655,7 @@ mod tests {
         let mut pins = NamespacePins::default();
         pins.insert(&top, "real-name");
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &pins, git);
+        let res = resolve_namespace_in(&top, None, &pins, git, no_head_config);
         assert_eq!(res.namespace, Namespace::Project("real-name".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
@@ -496,7 +670,7 @@ mod tests {
         let mut pins = NamespacePins::default();
         pins.insert(&top, "old-accepted");
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &pins, git);
+        let res = resolve_namespace_in(&top, None, &pins, git, no_head_config);
         assert_eq!(res.namespace, Namespace::Project("dir-name".to_string()));
         assert_eq!(
             res.unpinned_override.map(|o| o.claimed),
@@ -511,7 +685,7 @@ mod tests {
         fs::create_dir_all(&top).unwrap();
         fs::write(top.join("CLAUDE.md"), "---\nproject: same-name\n---\n").unwrap();
         let git = |_: &Path| -> Option<PathBuf> { Some(top.clone()) };
-        let res = resolve_namespace_in(&top, None, &no_pins(), git);
+        let res = resolve_namespace_in(&top, None, &no_pins(), git, no_head_config);
         assert_eq!(res.namespace, Namespace::Project("same-name".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
@@ -524,15 +698,113 @@ mod tests {
         let dir = tmp.path().join("plain-dir");
         fs::create_dir_all(&dir).unwrap();
         fs::write(dir.join("CLAUDE.md"), "---\nproject: ignored\n---\n").unwrap();
-        let res = resolve_namespace_in(&dir, None, &no_pins(), no_git);
+        let res = resolve_namespace_in(&dir, None, &no_pins(), no_git, no_head_config);
         assert_eq!(res.namespace, Namespace::Project("plain-dir".to_string()));
         assert_eq!(res.unpinned_override, None);
     }
 
     #[test]
     fn root_dir_without_repo_degrades_to_global() {
-        let res = resolve_namespace_in(Path::new("/"), None, &no_pins(), no_git);
+        let res = resolve_namespace_in(Path::new("/"), None, &no_pins(), no_git, no_head_config);
         assert_eq!(res.namespace, Namespace::Global);
+    }
+
+    // --- head_repo_config (real git) ---
+
+    /// Run `git <args>` in `dir`; false (test skips) when git is unavailable.
+    fn git_run(dir: &Path, args: &[&str]) -> bool {
+        Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false)
+    }
+
+    /// `git init` with a repo-local identity so commits work everywhere.
+    fn git_init(dir: &Path) -> bool {
+        git_run(dir, &["init", "-q"])
+            && git_run(dir, &["config", "user.email", "test@example.com"])
+            && git_run(dir, &["config", "user.name", "Test"])
+    }
+
+    /// Stage everything and commit.
+    fn git_commit_all(dir: &Path) -> bool {
+        git_run(dir, &["add", "-A"])
+            && git_run(dir, &["commit", "-q", "-m", "init", "--no-gpg-sign"])
+    }
+
+    #[test]
+    fn head_repo_config_reads_the_committed_blob_not_the_worktree() {
+        // (a)+(c) against real git: the blob at HEAD is returned even after a
+        // local (uncommitted) modification to the worktree file.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"canonical\"\n").unwrap();
+        if !git_init(&repo) || !git_commit_all(&repo) {
+            return; // git unavailable; skip
+        }
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(
+            head_repo_config(&repo).as_deref(),
+            Some("namespace = \"canonical\"\n")
+        );
+    }
+
+    #[test]
+    fn head_repo_config_is_none_for_untracked_file() {
+        // (b): a worktree-only file has no blob at HEAD.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "x\n").unwrap();
+        if !git_init(&repo) || !git_commit_all(&repo) {
+            return; // git unavailable; skip
+        }
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(head_repo_config(&repo), None);
+    }
+
+    #[test]
+    fn head_repo_config_is_none_for_unborn_head_and_non_repo() {
+        // (d): a fresh `git init` repo has no HEAD to read from — degrade to
+        // "no committed identity", never an error. Same for a plain dir.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("fresh");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        if !git_init(&repo) {
+            return; // git unavailable; skip
+        }
+        assert_eq!(head_repo_config(&repo), None);
+        let plain = tmp.path().join("plain");
+        fs::create_dir_all(&plain).unwrap();
+        assert_eq!(head_repo_config(&plain), None);
+    }
+
+    #[test]
+    fn untracked_toml_falls_through_to_git_root_name_end_to_end() {
+        // The owner-requested inverse regression test against real git: an
+        // untracked `.rusty-brain.toml` claiming another namespace is ignored
+        // and resolution uses the git-root name.
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("host-repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("README.md"), "x\n").unwrap();
+        if !git_init(&repo) || !git_commit_all(&repo) {
+            return; // git unavailable; skip
+        }
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        let res = resolve_namespace_in(&repo, None, &no_pins(), git_toplevel, head_repo_config);
+        assert_eq!(res.namespace, Namespace::Project("host-repo".to_string()));
+        assert_eq!(
+            res.repo_config_divergence.map(|d| d.kind),
+            Some(RepoConfigDivergenceKind::Untracked)
+        );
     }
 
     // --- pin store ---
