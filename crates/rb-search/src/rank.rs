@@ -5,6 +5,36 @@ use rb_types::MemoryId;
 /// on the recency term. Documented, fixed constant for deterministic ranking.
 pub const HALF_LIFE: f32 = 30.0;
 
+/// Minimum `Linear` score a recall result must reach to be returned (W1.3,
+/// F30 "junk default recall"). Results scoring below this are dropped so
+/// recall may return fewer than `limit` — or nothing — instead of padding
+/// with junk; callers render an explicit empty state.
+///
+/// Derivation (recorded per the W1.3 spec; recalibrate if `Weights::default`
+/// or the W1.1 cosine scale changes):
+/// 1. Prior-only ceiling: with default weights a candidate carrying ZERO
+///    retrieval signal (no keyword hit, no graph hit, vector cosine sim <= 0)
+///    scores at most `importance (0.10) + recency (0.05) = 0.15`. The floor
+///    must exceed 0.15 so priors alone can never surface a memory.
+/// 2. Graph-channel preservation: a fresh default-importance (5) graph-only
+///    neighbor scores `0.10 + 0.05 + ~0.05 ~= 0.1999`; the floor must stay
+///    below that or the graph channel goes dark for default-importance
+///    memories (fights W1.5).
+/// 3. Harness upper bound: the weakest golden counted by recall@5 scores
+///    0.2724 (real-vector replay) / 0.2800 (deterministic gate); the floor
+///    sweep showed recall@5/MRR bit-identical through 0.25 and degrading at
+///    0.30, and the floor needs >= 0.05 headroom below the weakest golden
+///    (the full recency-aging swing) so aged true hits do not fall through.
+/// 4. 0.18 is the midpoint of the admissible (0.15, 0.1999) band: every
+///    returned result must carry genuine retrieval signal (vector sim >
+///    ~0.067 at default importance, any top-3 keyword rank, or a graph hop),
+///    while staying 0.09+ under the weakest golden.
+///
+/// Applies to `Linear` scores only — `Rrf` scores live on a different scale
+/// (`~1/(k + rank)` sums) and stay unfloored until RRF is reachable and
+/// calibrated (W2.2/W4.1).
+pub const SCORE_FLOOR: f32 = 0.18;
+
 /// Floor for the confidence dampener (Feature C, spec §9). The final score is
 /// multiplied by `CONFIDENCE_FLOOR + (1 - CONFIDENCE_FLOOR) * confidence`, so a
 /// confidence-1.0 memory is unchanged (no-op) and a confidence-0.0 memory keeps
@@ -489,6 +519,59 @@ mod tests {
         let ranked = rank(signals, weights, n, 10);
         assert_eq!(ranked, vec![(id, 1.0)]);
         assert!(ranked[0].1.is_finite());
+    }
+
+    #[test]
+    fn zero_retrieval_signal_never_clears_the_score_floor() {
+        // W1.3 derivation pin (clause 1 of the SCORE_FLOOR docs): the BEST
+        // possible candidate with zero retrieval signal — importance 10, brand
+        // new, full confidence, no keyword/graph hit, orthogonal vector — caps
+        // at importance (0.10) + recency (0.05) = 0.15 < SCORE_FLOOR. Priors
+        // alone can never surface a memory.
+        let n = now();
+        let id = MemoryId::new();
+        let signals = vec![Signals {
+            id,
+            keyword_rank: None,
+            vector_distance: Some(1.0), // orthogonal -> cosine sim 0
+            graph_hops: None,
+            importance: 10,
+            created_at: n, // age 0 -> recency 1.0
+            confidence: 1.0,
+        }];
+        let ranked = rank(signals, Weights::default(), n, 10);
+        assert!(
+            ranked[0].1 < SCORE_FLOOR,
+            "prior-only ceiling {} must sit below SCORE_FLOOR {SCORE_FLOOR}",
+            ranked[0].1
+        );
+        // The ceiling itself is exactly 0.15 under default weights.
+        assert!((ranked[0].1 - 0.15).abs() < 1e-6);
+    }
+
+    #[test]
+    fn graph_only_default_importance_hit_clears_the_score_floor() {
+        // W1.3 derivation pin (clause 2): a fresh, default-importance (5)
+        // graph-only neighbor scores ~0.1999 and must stay ABOVE the floor —
+        // otherwise the graph channel goes dark for default-importance
+        // memories (fights W1.5).
+        let n = now();
+        let id = MemoryId::new();
+        let signals = vec![Signals {
+            id,
+            keyword_rank: None,
+            vector_distance: None,
+            graph_hops: Some(0),
+            importance: 5,
+            created_at: n,
+            confidence: 1.0,
+        }];
+        let ranked = rank(signals, Weights::default(), n, 10);
+        assert!(
+            ranked[0].1 > SCORE_FLOOR,
+            "graph-only imp-5 fresh hit {} must clear SCORE_FLOOR {SCORE_FLOOR}",
+            ranked[0].1
+        );
     }
 
     #[test]

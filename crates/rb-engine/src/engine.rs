@@ -48,6 +48,12 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     namespace: Namespace,
     linker: Box<dyn Linker>,
     enricher: Option<Arc<dyn Enricher>>,
+    /// Minimum `Linear` recall score a result must reach to be returned (W1.3).
+    /// Below-floor results are dropped, so recall may return fewer than `limit`
+    /// — or nothing. Applies to `Linear` only: `Rrf` scores live on a different
+    /// scale and stay unfloored until RRF is reachable and calibrated
+    /// (W2.2/W4.1). See `rb_search::SCORE_FLOOR` for the derivation.
+    score_floor: f32,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -65,6 +71,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             namespace,
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
+            score_floor: rb_search::SCORE_FLOOR,
         }
     }
 
@@ -108,6 +115,19 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// heuristic path (enrichment never fails a remember).
     pub fn with_enricher(mut self, enricher: Arc<dyn Enricher>) -> Self {
         self.enricher = Some(enricher);
+        self
+    }
+
+    /// The recall score floor applied under `Linear` fusion (W1.3).
+    pub fn score_floor(&self) -> f32 {
+        self.score_floor
+    }
+
+    /// Override the recall score floor (tests and eval recalibration only —
+    /// production keeps the derived `rb_search::SCORE_FLOOR` default). A
+    /// non-finite floor is sanitized to 0.0 (floor disabled, fail-open).
+    pub fn with_score_floor(mut self, floor: f32) -> Self {
+        self.score_floor = if floor.is_finite() { floor } else { 0.0 };
         self
     }
 
@@ -397,9 +417,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
         };
 
-        // Assemble results in ranked order, truncating to limit.
+        // Assemble results in ranked order, truncating to limit. Under `Linear`
+        // the score floor (W1.3) drops below-floor candidates: `ranked` is
+        // sorted descending, so the first below-floor score ends assembly and
+        // recall may return fewer than `limit` — or nothing — instead of
+        // padding with junk the KNN leg surfaced by construction (F30). `Rrf`
+        // scores live on a different scale and stay unfloored until calibrated
+        // (W2.2/W4.1).
+        let floor = match self.fusion_mode {
+            FusionMode::Linear => self.score_floor,
+            FusionMode::Rrf => f32::NEG_INFINITY,
+        };
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
         for (id, score) in ranked {
+            if score < floor {
+                break;
+            }
             let Some(note) = notes.get(&id) else {
                 continue;
             };
@@ -1182,6 +1215,60 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_returns_empty_when_every_candidate_is_below_the_floor() {
+        // W1.3 / F30: the KNN leg surfaces *something* by construction even for
+        // an unrelated query. Candidates whose only signal is priors (orthogonal
+        // vector, no keyword/graph hit) score <= 0.15 < SCORE_FLOOR and must be
+        // dropped — recall returns NOTHING instead of padding with junk.
+        let eng = engine();
+        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        // Cosine distance 1.0 = orthogonal = zero vector signal (W1.1 scale).
+        eng.backend()
+            .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        assert!(
+            results.is_empty(),
+            "prior-only candidates must not be returned, got {} results",
+            results.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_returns_fewer_than_limit_keeping_only_above_floor_results() {
+        let eng = engine();
+        let strong = seed(&eng, "strong vector match", MemoryType::Insight, 5, &[]).await;
+        let junk = seed(&eng, "junk far candidate", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend()
+            .set_vector_results(vec![(strong.clone(), 0.0), (junk.clone(), 1.0)]);
+        let results = eng.recall("query", 10, None, &[]).await.unwrap();
+        assert_eq!(
+            results.len(),
+            1,
+            "only the above-floor result is returned (fewer than limit)"
+        );
+        assert_eq!(results[0].memory.id, strong);
+        assert!(results[0].score >= eng.score_floor());
+    }
+
+    #[tokio::test]
+    async fn recall_score_floor_override_disables_the_floor() {
+        // with_score_floor(0.0) restores pad-to-limit behavior: the same
+        // prior-only candidates ARE returned, proving the default floor (and
+        // nothing else) is what drops them.
+        let eng = engine().with_score_floor(0.0);
+        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend()
+            .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
+        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        assert_eq!(results.len(), 2, "floor disabled -> junk returned again");
+    }
+
+    #[tokio::test]
     async fn recall_type_filter_excludes_other_types() {
         let eng = engine();
         seed(&eng, "a bug fix note", MemoryType::BugFix, 5, &[]).await;
@@ -1245,8 +1332,12 @@ mod tests {
             })
             .collect();
         eng.backend().set_keyword_results(wrong_ids);
+        // Distance 0.5 (cosine sim 0.5): real-but-modest vector signal, so the
+        // matching candidates clear the W1.3 score floor while still carrying
+        // no keyword/graph signal — the test exercises filter-before-rank, not
+        // prior-only junk (which the floor now drops by design).
         eng.backend()
-            .set_vector_results(matching_ids.iter().cloned().map(|id| (id, 2.0)).collect());
+            .set_vector_results(matching_ids.iter().cloned().map(|id| (id, 0.5)).collect());
 
         let results = eng
             .recall(

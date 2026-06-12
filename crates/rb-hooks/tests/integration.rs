@@ -180,10 +180,10 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
 }
 
 /// Run the hooks binary against an in-process mock daemon, feeding `stdin`,
-/// and return what the daemon observed. The dedup cache is isolated to a fresh
-/// tempdir so a previously-persisted entry within the 60s TTL cannot suppress
-/// the Remember under test as a duplicate.
-fn observe_against_mock_daemon(stdin: &str) -> Observed {
+/// and return what the daemon observed plus the hook's stdout. The dedup cache
+/// is isolated to a fresh tempdir so a previously-persisted entry within the
+/// 60s TTL cannot suppress the Remember under test as a duplicate.
+fn observe_against_mock_daemon(stdin: &str) -> (Observed, String) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("live.sock");
     let socket_str = socket.to_string_lossy().to_string();
@@ -231,13 +231,16 @@ fn observe_against_mock_daemon(stdin: &str) -> Observed {
         .unwrap_or_default();
     let _ = server.join();
     let _: PathBuf = socket; // keep tempdir alive until here
-    observed
+    (
+        observed,
+        String::from_utf8_lossy(&output.stdout).to_string(),
+    )
 }
 
 #[test]
 fn post_tool_use_against_live_daemon_remembers() {
     let stdin = r#"{"hook_event_name":"PostToolUse","cwd":"/tmp","session_id":"s1","tool_name":"Edit","tool_input":{"file_path":"/src/uniqueW9.rs"},"tool_response":"ok"}"#;
-    let observed = observe_against_mock_daemon(stdin);
+    let (observed, _stdout) = observe_against_mock_daemon(stdin);
     assert!(
         observed.saw_remember,
         "the daemon should have observed a Remember"
@@ -264,7 +267,7 @@ fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
         r#"GITHUB_TOKEN=ghp_secret123\n-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n"#,
         r#"-----END RSA PRIVATE KEY-----\ndone"}"#
     );
-    let observed = observe_against_mock_daemon(stdin);
+    let (observed, _stdout) = observe_against_mock_daemon(stdin);
     assert!(observed.saw_remember, "the Remember must reach the daemon");
 
     let payload = format!(
@@ -291,5 +294,32 @@ fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
     assert!(
         payload.contains("done"),
         "non-secret response text must survive: {payload}"
+    );
+}
+
+#[test]
+fn session_start_on_empty_corpus_injects_zero_tokens() {
+    // W1.3 / F30 first-session scenario: the mock daemon answers Context with
+    // ZERO memories, so SessionStart must inject literally nothing — no
+    // `hookSpecificOutput.additionalContext`, no `systemMessage`, not even a
+    // header. The hook still continues. (The full Claude Code session-lifecycle
+    // version of this scenario lands in the W3.4 fixture harness.)
+    let stdin =
+        r#"{"hook_event_name":"SessionStart","cwd":"/tmp","session_id":"s1","source":"startup"}"#;
+    let (_observed, stdout) = observe_against_mock_daemon(stdin);
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    assert_eq!(
+        value.get("continue").and_then(|v| v.as_bool()),
+        Some(true),
+        "must continue: {stdout}"
+    );
+    assert!(
+        value.get("hookSpecificOutput").is_none(),
+        "empty corpus must inject zero context tokens, got {stdout}"
+    );
+    assert!(
+        value.get("systemMessage").is_none(),
+        "empty corpus must not emit a user-facing message either, got {stdout}"
     );
 }

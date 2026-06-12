@@ -186,6 +186,13 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
 pub fn response_to_content(resp: Response) -> Value {
     match resp {
         Response::Remembered { id } => json!({ "id": id.to_string() }),
+        // W1.3 empty state: below-floor/empty recall returns a compact,
+        // model-legible hint instead of a bare empty array, so the model knows
+        // "nothing is stored" rather than suspecting a tool failure. Projection
+        // only — the wire `Response` is unchanged (no CONTRACT_VERSION bump).
+        Response::Recalled { results } if results.is_empty() => {
+            json!({ "results": [], "hint": "no stored memories match" })
+        }
         Response::Recalled { results } => json!({ "results": results }),
         Response::Got { memory } => json!({ "memory": memory }),
         Response::Listed { memories } => json!({ "memories": memories }),
@@ -589,5 +596,33 @@ mod tests {
             }],
         });
         assert_eq!(recalled["results"][0]["memory"]["contested"], true);
+    }
+
+    #[test]
+    fn empty_recall_returns_model_legible_empty_state() {
+        use rb_proto::Response;
+        // W1.3: below-floor/empty recall renders `{results: [], hint: ...}` so
+        // the model can tell "nothing stored matches" from a tool failure.
+        let recalled = response_to_content(Response::Recalled {
+            results: Vec::new(),
+        });
+        assert!(recalled["results"].is_array());
+        assert_eq!(recalled["results"].as_array().map(Vec::len), Some(0));
+        assert_eq!(recalled["hint"], "no stored memories match");
+    }
+
+    #[test]
+    fn non_empty_recall_carries_no_hint() {
+        use rb_proto::Response;
+        // The hint is the EMPTY state only — a populated recall keeps its
+        // pre-W1.3 shape byte-for-byte.
+        let recalled = response_to_content(Response::Recalled {
+            results: vec![SearchResult {
+                memory: note(),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+            }],
+        });
+        assert!(recalled.get("hint").is_none(), "hint only on empty results");
     }
 }
