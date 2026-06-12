@@ -135,7 +135,12 @@ semantic gain.
   or tokenizer choice; it is reserved for the Phase 4 (W4.1) CI gate so that
   gate runs on queries no tuning loop has seen. `corpus.rs` validates it
   against the committed corpus, and the harness asserts it stays disjoint from
-  the tuning goldens.
+  the tuning goldens. **Measurement cadence:** holdout aggregates are computed
+  only at frozen-artifact captures (`examples/capture_baseline.rs`) and by the
+  future W4.1 gate — never per-workstream, and never in the default test suite
+  (the holdout replay test is `#[ignore]`d; default CI proves only fixture
+  coverage of the holdout texts). Iterating ranking changes while watching
+  holdout deltas is itself a tuning loop.
 - `corpus.rs` — fixture loader + validation; fails fast on any malformed fixture
   (unknown memory type, out-of-range importance/confidence, duplicate keys,
   queries/clusters referencing unknown keys).

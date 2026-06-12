@@ -70,10 +70,11 @@ async fn committed_fixtures_meet_baselines() {
 
     // Print the report so a maintainer updating baselines sees the live numbers.
     println!(
-        "rb-eval report: recall@k={:.4} mrr={:.4} dedup={:.4} p50={}us p99={}us",
+        "rb-eval report: recall@k={:.4} mrr={:.4} dedup={:.4} ndcg={:.4} p50={}us p99={}us",
         report.mean_recall_at_k,
         report.mrr,
         report.dedup_precision,
+        report.ndcg,
         report.p50_latency_us,
         report.p99_latency_us
     );

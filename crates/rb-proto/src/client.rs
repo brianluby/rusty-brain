@@ -184,7 +184,9 @@ impl Client {
         }
     }
 
-    /// Hybrid recall; returns ranked results.
+    /// Hybrid recall; returns ranked results. Callers that surface the W1.6d
+    /// degraded flag should use [`Client::recall_with_status`] (the
+    /// `ping`/`ping_stats` pattern); this convenience wrapper drops it.
     pub async fn recall(
         &mut self,
         query: String,
@@ -192,6 +194,23 @@ impl Client {
         tags: Vec<String>,
         limit: usize,
     ) -> Result<Vec<SearchResult>> {
+        Ok(self
+            .recall_with_status(query, memory_type, tags, limit)
+            .await?
+            .0)
+    }
+
+    /// Hybrid recall; returns ranked results plus the W1.6d `degraded` flag —
+    /// `true` when recall fell back to keyword+graph because the embedding
+    /// provider errored, so the caller can warn that results are vector-blind
+    /// (rb-mcp consumes the raw `Response` frame for the same purpose).
+    pub async fn recall_with_status(
+        &mut self,
+        query: String,
+        memory_type: Option<MemoryType>,
+        tags: Vec<String>,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, bool)> {
         let resp = self
             .request(Request::Recall {
                 query,
@@ -201,10 +220,7 @@ impl Client {
             })
             .await?;
         match resp {
-            // The typed client keeps its results-only shape; callers that
-            // surface the W1.6d degraded flag (rb-mcp) consume the raw
-            // `Response` frame instead.
-            Resp::Recalled { results, .. } => Ok(results),
+            Resp::Recalled { results, degraded } => Ok((results, degraded)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -563,13 +579,15 @@ mod wrapper_tests {
                 Request::Remember { .. } => Response::Remembered {
                     id: fixed_id.clone(),
                 },
-                Request::Recall { .. } => Response::Recalled {
+                Request::Recall { query, .. } => Response::Recalled {
                     results: vec![SearchResult {
                         memory: note(),
                         score: 0.5,
                         channels: rb_types::ChannelHits::default(),
                     }],
-                    degraded: false,
+                    // Keyed on the query so the typed-wrapper test can prove
+                    // the W1.6d flag rides the wire to `recall_with_status`.
+                    degraded: query == "degraded",
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),
@@ -647,6 +665,20 @@ mod wrapper_tests {
         let results = c.recall("q".into(), None, vec![], 5).await.unwrap();
         assert_eq!(results.len(), 1);
         assert!((results[0].score - 0.5).abs() < f32::EPSILON);
+
+        // The W1.6d degraded flag reaches the typed client (mock keys it on
+        // the query string).
+        let (results, degraded) = c
+            .recall_with_status("q".into(), None, vec![], 5)
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1);
+        assert!(!degraded, "ordinary recall is not degraded");
+        let (_, degraded) = c
+            .recall_with_status("degraded".into(), None, vec![], 5)
+            .await
+            .unwrap();
+        assert!(degraded, "the degraded flag must ride the wire");
 
         let got = c.get(fixed_id.clone()).await.unwrap();
         assert!(got.is_some());

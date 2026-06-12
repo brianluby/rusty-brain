@@ -62,6 +62,13 @@ jobs:
       - name: Build release binaries
         run: cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
 
+      # DELIBERATELY UNPINNED (recorded trade-off): tracking whatever version
+      # npm serves is the point of a smoke against the real CLI — a pinned
+      # version would stop catching the breakage class this job exists for
+      # (Claude Code changing hook/headless behavior under us). The exposure
+      # (a compromised release runs with the spend-capped key in env) is
+      # bounded by the $1 budget and the log scrub below; revisit if the
+      # supply-chain calculus changes.
       - name: Install Claude Code CLI
         run: |
           npm install -g @anthropic-ai/claude-code
@@ -72,6 +79,29 @@ jobs:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           SMOKE_WORKDIR: ${{ runner.temp }}/claude-smoke
         run: scripts/nightly-claude-smoke.sh --bin-dir target/release
+
+      # GitHub's automatic secret masking covers step logs ONLY — not artifact
+      # file contents. The smoke runs a real model session with unrestricted
+      # Bash and the API key in env, and captures everything it prints; if the
+      # session (or a compromised CLI release) ever echoes the key, it must
+      # not land in a downloadable artifact. Scrub fail-closed before upload.
+      - name: Scrub any leaked API key from logs before upload
+        if: always()
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          dir="${RUNNER_TEMP}/claude-smoke"
+          [ -d "$dir" ] || exit 0
+          for f in "$dir"/*.log; do
+            [ -e "$f" ] || continue
+            if grep -Fq "$ANTHROPIC_API_KEY" "$f"; then
+              # perl with \Q..\E: literal replacement, no sed-metacharacter
+              # escaping pitfalls; -i is portable across GNU/BSD perl.
+              KEY="$ANTHROPIC_API_KEY" perl -pi -e 's/\Q$ENV{KEY}\E/[CI-REDACTED]/g' "$f"
+              echo "::warning::ANTHROPIC_API_KEY found in $(basename "$f"); redacted before artifact upload"
+            fi
+          done
 
       # The uploaded logs (claude transcript output + recall output) are the
       # recorded-run evidence S1 asks for: hook events demonstrably arrived.

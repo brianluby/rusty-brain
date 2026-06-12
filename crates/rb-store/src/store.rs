@@ -113,8 +113,10 @@ pub trait Store {
     /// Replace `id`'s stored vector and stamp the row's
     /// `(embedding_model, embedding_input_version)` to the current pair, in one
     /// transaction. This is the ONLY vector-UPDATE path (insert is write-once).
-    /// A missing memory id is `Error::NotFound`. The embedding dimension is
-    /// validated fail-closed before the write.
+    /// A missing OR archived memory id is `Error::NotFound` — an archived row
+    /// must never get its vector resurrected (live-only vec0 partition
+    /// invariant; the reembed loop treats it as a per-row skip). The embedding
+    /// dimension is validated fail-closed before the write.
     fn update_vector(
         &self,
         id: &MemoryId,
@@ -655,6 +657,13 @@ impl SqliteStore {
     /// path is the only writer of `base_importance`. Validates the `1..=10`
     /// range fail-closed (matching the insert path). A missing id is a no-op
     /// (0 rows), mirroring `set_confidence`/`set_link_strength`.
+    ///
+    /// `updated_at` is intentionally NOT bumped: recalibration is a background
+    /// maintenance write, not an authorial edit — the same rule `update_vector`
+    /// and `rename_namespace` follow. Bumping it would make every nudged memory
+    /// look freshly user-modified to list/context, recency ranking, and any
+    /// updated_at-based sync each time the job runs. The oplog row below
+    /// records the change durably for replay.
     pub fn set_recalibrated_importance(&self, id: &MemoryId, importance: u8) -> Result<()> {
         rb_types::validate_importance(importance)?;
         // Transaction: the UPDATE and its oplog row commit (or roll back)
@@ -663,12 +672,8 @@ impl SqliteStore {
             let affected = self
                 .conn
                 .execute(
-                    "UPDATE memories SET importance = ?1, updated_at = ?2 WHERE memory_id = ?3",
-                    rusqlite::params![
-                        importance as i64,
-                        chrono::Utc::now().timestamp(),
-                        id.to_string()
-                    ],
+                    "UPDATE memories SET importance = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![importance as i64, id.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if affected > 0 {
@@ -1668,9 +1673,12 @@ impl Store for SqliteStore {
             append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
 
             if let Some(emb) = embedding {
-                // The namespace partition key MUST mirror the memories row
-                // (vector_search scopes KNN on it). Namespace is immutable on
-                // a memory, so the key never goes stale.
+                // The namespace partition key MUST mirror memories.namespace
+                // (vector_search scopes KNN on it). Any path that mutates a
+                // memory's namespace MUST re-key its memory_vectors row in the
+                // same transaction or vectors strand under the old partition
+                // key — `rename_namespace` (the only such path today) does the
+                // DELETE+INSERT re-key for exactly this reason.
                 self.conn
                     .execute(
                         "INSERT INTO memory_vectors (memory_id, namespace, embedding)
@@ -2405,9 +2413,22 @@ impl Store for SqliteStore {
         }
 
         immediate_tx(&self.conn, || {
-            // Stamp the memory row. 0 rows updated means the id does not exist:
-            // fail closed (NotFound) so the whole transaction rolls back rather
-            // than leaving a vector update with no owning row.
+            // Stamp the memory row. 0 rows updated means the id does not exist
+            // OR the row is archived: fail closed (NotFound) so the whole
+            // transaction rolls back rather than leaving a vector update with
+            // no owning LIVE row. The `archived_at IS NULL` guard closes the
+            // reembed-vs-archive race: the reembed job reads its candidate set
+            // (active rows only) on the read pool, then spends seconds on
+            // embedding-API calls before this write reaches the single writer —
+            // an Archive/Supersede processed in that window deletes the vec0
+            // row, and without the guard the fallback INSERT below would
+            // resurrect a vector for the archived row, permanently violating
+            // the live-only-partition invariant `vector_search` documents
+            // (nothing prunes it again: archive only deletes the vector on the
+            // active->archived transition, and the W1.1/W1.7 rebuild is
+            // one-shot). The caller (engine reembed loop) counts the error as a
+            // per-row skip, and the next candidate scan excludes archived rows,
+            // so there is no retry loop.
             // `updated_at` is intentionally NOT bumped: re-embed is a maintenance-only
             // path that refreshes the search vector, leaving the note's user-visible
             // content unchanged. The daemon writer emits no MemoryChanged event for the
@@ -2418,7 +2439,7 @@ impl Store for SqliteStore {
                 .execute(
                     "UPDATE memories
                      SET embedding_model = ?1, embedding_input_version = ?2
-                     WHERE memory_id = ?3",
+                     WHERE memory_id = ?3 AND archived_at IS NULL",
                     rusqlite::params![model, input_version, id.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -2439,12 +2460,15 @@ impl Store for SqliteStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if updated == 0 {
                 // Resolve the namespace partition key from the owning memories
-                // row (proven present by `affected > 0` above, in this same
-                // transaction).
+                // row (proven present AND live by `affected > 0` above, in this
+                // same transaction). The `archived_at IS NULL` filter is
+                // defense-in-depth on top of the stamp guard: this INSERT must
+                // never re-add a vec0 row for an archived memory.
                 self.conn
                     .execute(
                         "INSERT INTO memory_vectors (memory_id, namespace, embedding)
-                         SELECT memory_id, namespace, ?2 FROM memories WHERE memory_id = ?1",
+                         SELECT memory_id, namespace, ?2 FROM memories
+                         WHERE memory_id = ?1 AND archived_at IS NULL",
                         rusqlite::params![id.to_string(), bytes],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
@@ -4636,6 +4660,7 @@ mod near_duplicates_tests {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let m = MemoryNote::new(Namespace::Global, "anchored".into(), MemoryType::Insight, 4);
         store.insert_memory(&m, None).unwrap();
+        let stored_before = store.get_memory(&m.id).unwrap().expect("note present");
 
         store.set_recalibrated_importance(&m.id, 6).unwrap();
 
@@ -4653,9 +4678,11 @@ mod near_duplicates_tests {
 
         let note = store.get_memory(&m.id).unwrap().expect("note present");
         assert_eq!(note.importance, 6, "ranking reads the effective value");
-        assert!(
-            note.updated_at >= note.created_at,
-            "the job write bumps updated_at"
+        assert_eq!(
+            note.updated_at, stored_before.updated_at,
+            "a maintenance write must NOT bump updated_at (the \
+             update_vector/rename_namespace rule): recalibrated rows must not \
+             look freshly user-modified"
         );
     }
 
@@ -5751,28 +5778,50 @@ mod vector_schema_tests {
         );
     }
 
-    /// Build a POPULATED version-1 schema DB (old vec0 DDL: L2 metric, no
-    /// partition key; vectors for archived rows; L2-era similarity links)
-    /// exactly as pre-W1.1 code would have, using the committed migrations
-    /// plus the old in-code DDL.
-    fn build_v1_fixture(
-        path: &std::path::Path,
-    ) -> (MemoryId, MemoryId, MemoryId, MemoryId, MemoryId) {
+    /// The FROZEN pre-W1.1 in-code vec0 DDL (L2 metric, no partition key).
+    /// Shared by every v1-fixture builder so the replicated legacy schema
+    /// cannot drift between tests.
+    ///
+    /// CONVENTION (accepted interpretation of the W1.1 "committed populated
+    /// previous-schema DB fixtures" standing rule): prior-version DBs are
+    /// CONSTRUCTED at test time from (a) the committed, immutable migration
+    /// SQL files via `run_migrations` and (b) — for the vec0 virtual table,
+    /// which migrations never owned — this FROZEN replica of the exact
+    /// pre-W1.1 in-code DDL (verified byte-equal to the deleted ensure-schema
+    /// DDL at the time W1.1 landed). Do NOT "modernize" this string: its whole
+    /// value is that it matches what real pre-Phase-1 dogfood DBs actually
+    /// contain. A committed binary .db fixture was considered and rejected:
+    /// sqlite-vec shadow-table bytes are version-sensitive and unreviewable in
+    /// diffs, while this builder is reviewable and runs on every platform in
+    /// CI.
+    const V1_VEC0_DDL: &str = "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
+           memory_id TEXT PRIMARY KEY,\
+           embedding float[8]\
+         );";
+
+    /// Open a fresh v1-schema DB at `path`: committed migrations + the frozen
+    /// pre-W1.1 vec0 DDL + the `embedding_dim` meta seed.
+    fn open_v1_schema(path: &std::path::Path) -> rusqlite::Connection {
         register_vec().unwrap();
         let conn = rusqlite::Connection::open(path).unwrap();
         run_migrations(&conn).unwrap();
-        conn.execute_batch(
-            "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
-               memory_id TEXT PRIMARY KEY,\
-               embedding float[8]\
-             );",
-        )
-        .unwrap();
+        conn.execute_batch(V1_VEC0_DDL).unwrap();
         conn.execute(
             "INSERT INTO meta (key, value) VALUES ('embedding_dim', '8')",
             [],
         )
         .unwrap();
+        conn
+    }
+
+    /// Build a POPULATED version-1 schema DB (old vec0 DDL: L2 metric, no
+    /// partition key; vectors for archived rows; L2-era similarity links)
+    /// exactly as pre-W1.1 code would have, using the committed migrations
+    /// plus the frozen old in-code DDL (see `V1_VEC0_DDL`).
+    fn build_v1_fixture(
+        path: &std::path::Path,
+    ) -> (MemoryId, MemoryId, MemoryId, MemoryId, MemoryId) {
+        let conn = open_v1_schema(path);
 
         let raw_mem = |id: &MemoryId, ns: &str, archived: bool| {
             conn.execute(
@@ -6027,6 +6076,104 @@ mod vector_schema_tests {
         assert_eq!(got, want, "exactly the small-namespace rows are returned");
     }
 
+    /// Phase 1 gate (plan §4): "a 10k-archived-vector scenario still returns
+    /// correct live-namespace results". A v1-schema DB carries 10_000 leftover
+    /// vectors for ARCHIVED rows (pre-W1.7 archive never pruned vec0) in the
+    /// SAME namespace as 5 live rows — and every archived vector is nearly
+    /// query-aligned, i.e. strictly CLOSER to the query than any live vector,
+    /// so a pruning failure would crowd the live rows out of the KNN entirely.
+    /// The W1.1/W1.7 open-time rebuild must prune all 10k, after which
+    /// live-namespace search fills `limit` with exactly the live rows. (At
+    /// steady state the scenario is structurally impossible: archive/supersede
+    /// delete the vec0 row in-transaction and `update_vector` refuses archived
+    /// rows — this exercises the legacy-DB path the gate names.)
+    #[test]
+    fn ten_k_archived_vector_scenario_returns_correct_live_namespace_results() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1-10k.db");
+
+        let mut live_ids: Vec<MemoryId> = Vec::new();
+        {
+            let conn = open_v1_schema(&path);
+            // One transaction + prepared statements: 10_005 rows stay fast.
+            conn.execute_batch("BEGIN IMMEDIATE").unwrap();
+            {
+                let mut mem_stmt = conn
+                    .prepare(
+                        "INSERT INTO memories (memory_id, namespace, created_at, updated_at,
+                            content, summary, keywords, tags, memory_type, importance,
+                            confidence, embedding_model, archived_at)
+                         VALUES (?1, 'project:live', 0, 0, ?2, 's', '[]', '[]', 'insight', 5,
+                                 1.0, '', ?3)",
+                    )
+                    .unwrap();
+                let mut vec_stmt = conn
+                    .prepare("INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)")
+                    .unwrap();
+                for i in 0..10_000u32 {
+                    let id = MemoryId::new();
+                    // Nearly query-aligned (cosine distance ~0 from [1,0,..]).
+                    let v = [1.0, 1e-4 * (i as f32 + 1.0), 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+                    mem_stmt
+                        .execute(rusqlite::params![
+                            id.to_string(),
+                            format!("archived {i}"),
+                            Some(1i64)
+                        ])
+                        .unwrap();
+                    vec_stmt
+                        .execute(rusqlite::params![id.to_string(), embedding_bytes(&v)])
+                        .unwrap();
+                }
+                for i in 0..5u32 {
+                    let id = MemoryId::new();
+                    // 60 degrees off the query (cosine distance 0.5): strictly
+                    // FARTHER than every archived vector.
+                    let v = [0.5, 0.0, 0.866, 1e-4 * (i as f32 + 1.0), 0.0, 0.0, 0.0, 0.0];
+                    mem_stmt
+                        .execute(rusqlite::params![
+                            id.to_string(),
+                            format!("live {i}"),
+                            None::<i64>
+                        ])
+                        .unwrap();
+                    vec_stmt
+                        .execute(rusqlite::params![id.to_string(), embedding_bytes(&v)])
+                        .unwrap();
+                    live_ids.push(id);
+                }
+            }
+            conn.execute_batch("COMMIT").unwrap();
+        }
+
+        // Open through SqliteStore: the one-shot W1.1/W1.7 rebuild runs.
+        let store = SqliteStore::open(&path, DIM).unwrap();
+
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 5, "all 10k archived-row vectors must be pruned");
+        let stats_raw = store.meta_value("vector_rebuild_v2").unwrap().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+        assert_eq!(stats["pruned_vectors"], 10_000, "stats: {stats}");
+        assert_eq!(stats["reinserted_vectors"], 5, "stats: {stats}");
+
+        let ns = Namespace::Project("live".into());
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&ns, &query, 5).unwrap();
+        assert_eq!(
+            res.len(),
+            5,
+            "live-namespace search must fill limit after the 10k prune"
+        );
+        let got: std::collections::HashSet<String> =
+            res.iter().map(|(id, _)| id.to_string()).collect();
+        let want: std::collections::HashSet<String> =
+            live_ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(got, want, "exactly the live rows are returned");
+    }
+
     #[test]
     fn archive_deletes_vector_row_in_same_transaction() {
         let store = SqliteStore::open_in_memory(DIM).unwrap();
@@ -6100,6 +6247,42 @@ mod vector_schema_tests {
         assert!(
             store.vector_search(&other, &v, 5).unwrap().is_empty(),
             "absent from every other partition"
+        );
+    }
+
+    /// The reembed-vs-archive race (Phase 1 review): `update_vector` must NOT
+    /// resurrect a KNN vector for a memory archived after the reembed job read
+    /// its candidate set but before the write reached the single writer. The
+    /// stamp UPDATE skips archived rows fail-closed (`NotFound` — the engine
+    /// counts it as a per-row skip and the next scan excludes archived rows),
+    /// and the fallback INSERT's SELECT is guarded too, preserving the
+    /// live-only vec0 partition invariant `vector_search` documents.
+    #[test]
+    fn update_vector_does_not_resurrect_archived_memory_vector() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("race".into());
+        let id = insert_vec(&store, &ns, "soon archived", &[1.0; DIM]);
+
+        // W1.7: archive deletes the vec0 row in the same transaction...
+        store.archive_memory(&id).unwrap();
+        assert_eq!(vector_row_count(&store, &id), 0);
+
+        // ...and a reembed write that raced past the candidate scan fails
+        // closed instead of re-INSERTing the vector via the fallback path.
+        let err = store
+            .update_vector(&id, &[0.5; DIM], "det", "v2")
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+        assert_eq!(
+            vector_row_count(&store, &id),
+            0,
+            "update_vector must not resurrect a vec0 row for an archived memory"
+        );
+        // The whole transaction rolled back: the stamp did not move either.
+        let note = store.get_memory(&id).unwrap().unwrap();
+        assert_ne!(
+            note.embedding_model, "det",
+            "the embedding stamp must not be updated on an archived row"
         );
     }
 

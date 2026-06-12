@@ -158,7 +158,10 @@ pub enum NamespaceCommand {
     /// and a durable oplog record move together. Use after pinning a repo's
     /// identity in `.rusty-brain.toml` to re-scope memories captured under the
     /// heuristic directory-name namespace. Refuses a non-empty NEW namespace
-    /// unless `--merge` is passed.
+    /// unless `--merge` is passed. Restart any active agent sessions
+    /// afterwards: sessions resolve their namespace once at connect, so one
+    /// opened before the rename keeps writing to the old namespace (re-run
+    /// with `--merge` to sweep up stragglers).
     Rename {
         /// Source namespace: a bare project name (`my-proj`) or a full
         /// namespace string (`project:my-proj`, `global`, `session:proj:sid`).

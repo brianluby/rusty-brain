@@ -125,10 +125,19 @@ async fn run_client(
             memory_type,
             tags,
         } => {
-            let results = client
-                .recall(query, memory_type, tags, limit)
+            let (results, degraded) = client
+                .recall_with_status(query, memory_type, tags, limit)
                 .await
                 .context("recall failed")?;
+            if degraded {
+                // stderr so `--json` stdout stays machine-parseable. Mirrors
+                // the rb-mcp warning: without it a CLI user during an embedder
+                // outage sees ordinary-looking, vector-blind results (W1.6d).
+                eprintln!(
+                    "warning: vector search unavailable (embedding provider \
+                     error); results from keyword and graph channels only"
+                );
+            }
             println!("{}", output::render_recall(&results, json));
         }
         Command::Get { id } => {
@@ -252,6 +261,15 @@ async fn run_client(
                     new_ns.as_db_string()
                 );
             }
+            // stderr so `--json` stdout stays machine-parseable. Sessions
+            // resolve their namespace once at handshake (the MCP server at
+            // startup), so an agent session that was already open keeps
+            // writing under the now-emptied OLD namespace until restarted.
+            eprintln!(
+                "note: restart any active agent sessions; sessions started \
+                 before the rename keep writing to the old namespace (re-run \
+                 `namespace rename --merge` to sweep up any stragglers)"
+            );
         }
     }
     Ok(())

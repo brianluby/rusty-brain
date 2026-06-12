@@ -8,14 +8,14 @@
 //! gating thresholds on these numbers arrive in W4.1.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
-use rb_embed::EmbeddingProvider;
+use rb_embed::{EmbedKind, EmbeddingProvider};
 use rb_eval::{
     build_engine_with, load_committed_corpus, load_committed_holdout_queries, run_corpus_with,
     ReplayProvider,
 };
 
-#[test]
-fn committed_fixture_parses_and_covers_corpus_and_holdout_texts() {
+#[tokio::test]
+async fn committed_fixture_parses_and_covers_corpus_and_holdout_texts() {
     // Replay fails closed on any missing text, so a successful end-to-end run
     // (below) proves coverage; this cheaper check pins the fixture's shape.
     let replay = ReplayProvider::committed().expect("committed embedding fixture parses");
@@ -35,6 +35,17 @@ fn committed_fixture_parses_and_covers_corpus_and_holdout_texts() {
         !holdout.is_empty(),
         "held-out set must be non-empty for the baseline artifact"
     );
+    // COVERAGE-ONLY holdout check: every held-out query text must have a
+    // recorded vector (embed fails closed on a miss), WITHOUT running recall
+    // or computing any holdout metric — holdout aggregates are measured only
+    // at frozen-artifact captures and the W4.1 gate (see the #[ignore]d
+    // holdout replay test below).
+    for q in &holdout {
+        replay
+            .embed(std::slice::from_ref(&q.query), EmbedKind::Query)
+            .await
+            .expect("every held-out query text must be covered by the fixture");
+    }
 }
 
 #[tokio::test]
@@ -131,6 +142,13 @@ async fn readme_quickstart_query_returns_its_target_memory() {
 }
 
 #[tokio::test]
+#[ignore = "holdout aggregates are measured ONLY at frozen-artifact captures \
+            (examples/capture_baseline.rs) and by the future W4.1 CI gate. \
+            Running this in the default suite surfaced holdout metrics to \
+            every local/CI iteration on ranking changes, eroding the set's \
+            held-out status (Phase-1 review). Run explicitly with \
+            `cargo test -p rb-eval --test replay_model -- --ignored` only \
+            when capturing a frozen artifact or debugging a W4.1 gate failure."]
 async fn replayed_real_vectors_run_the_holdout_queries_offline() {
     // The held-out set is measurement-only (W4.1 gates on it later). This run
     // proves the committed fixture covers its query texts and the metrics are

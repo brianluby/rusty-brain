@@ -80,6 +80,12 @@ pub struct Baselines {
     pub mean_recall_at_k: f64,
     pub mrr: f64,
     pub dedup_precision: f64,
+    /// NDCG@k over the authored per-query grades (W1.0a/W1.0b). Gated like the
+    /// other quality metrics: the grades exist precisely to catch
+    /// grade-ordering regressions that keep the binary metrics intact (e.g. a
+    /// grade-3 primary answer swapping ranks with a grade-1 marginal one
+    /// inside the top-5).
+    pub ndcg: f64,
 }
 
 impl Baselines {
@@ -413,6 +419,7 @@ pub fn check_against_baselines(report: &EvalReport, baselines: &Baselines) -> Re
         report.dedup_precision,
         baselines.dedup_precision,
     );
+    gate("ndcg", report.ndcg, baselines.ndcg);
 
     if failures.is_empty() {
         Ok(())
