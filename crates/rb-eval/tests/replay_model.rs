@@ -71,6 +71,64 @@ async fn replayed_real_vectors_run_the_golden_queries_offline() {
 }
 
 #[tokio::test]
+async fn readme_quickstart_query_returns_its_target_memory() {
+    // Phase 1 gate (plan section 4): "the README quickstart query returns its
+    // target memory". The README's recall example is committed verbatim as a
+    // golden (`how is writing serialized?` -> graded answers
+    // `readme_quickstart` (3), `single_writer` (2), `writer_thread_dup` (2),
+    // W1.0a — the three are a committed near-duplicate cluster restating the
+    // same fact). This asserts the gate under the committed real-vector replay
+    // engine (W1.2): the TOP result must be one of the graded answers, and the
+    // verbatim README target must be among the returned results.
+    //
+    // Rank history of the verbatim target, recorded honestly: 5 in the frozen
+    // pre-Phase-1 artifact (pure vector signal), 7 under W1.2's revived
+    // keyword leg — the target's authored text ("single-writer daemon") has no
+    // inflection of "serialize" and porter keeps writer != write, so it is
+    // keyword-invisible for its own query while its cluster siblings gained
+    // keyword signal. Tightening this to verbatim-target-in-top-5 is expected
+    // from W1.4 (query-kind embeddings) or W4.1 weight tuning; see the W1.2
+    // commit body.
+    const QUICKSTART_QUERY: &str = "how is writing serialized?";
+    const TARGET_KEY: &str = "readme_quickstart";
+
+    let replay = ReplayProvider::committed().expect("committed embedding fixture parses");
+    let engine = build_engine_with(replay).expect("engine builds");
+    let corpus = load_committed_corpus().expect("corpus loads");
+    let run = run_corpus_with(&engine, &corpus)
+        .await
+        .expect("replay run succeeds");
+
+    let golden = corpus
+        .golden_queries
+        .iter()
+        .find(|q| q.query == QUICKSTART_QUERY)
+        .expect("README quickstart query must be a committed golden");
+    let detail = run
+        .per_query
+        .iter()
+        .find(|d| d.query == QUICKSTART_QUERY)
+        .expect("README quickstart query must have been run");
+
+    let top = detail
+        .ranked_keys
+        .first()
+        .expect("quickstart query must return results");
+    assert!(
+        golden.expected.contains(top),
+        "quickstart query's top result must be a graded answer, got {top:?} \
+         (expected one of {:?})",
+        golden.expected
+    );
+    assert!(
+        detail.ranked_keys.iter().any(|k| k == TARGET_KEY),
+        "quickstart query must return the verbatim README target {TARGET_KEY}, \
+         got {:?}",
+        detail.ranked_keys
+    );
+}
+
+#[tokio::test]
 async fn replayed_real_vectors_run_the_holdout_queries_offline() {
     // The held-out set is measurement-only (W4.1 gates on it later). This run
     // proves the committed fixture covers its query texts and the metrics are

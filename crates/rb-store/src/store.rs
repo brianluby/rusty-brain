@@ -1326,11 +1326,58 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
     })
 }
 
-/// Wrap the user query as a single FTS5 phrase so operators (-, OR, NEAR, *, ")
-/// are treated as literal text. Internal double-quotes are doubled per FTS5 rules.
+/// Build a safe FTS5 MATCH expression from raw user text (W1.2).
+///
+/// The query is split on non-alphanumeric boundaries — the same separator rule
+/// as the `unicode61` tokenizer family the index uses — and each token is
+/// individually double-quoted so FTS5 operators (`-`, `OR`, `NEAR`, `*`, `"`,
+/// parens) are always literal text, never syntax. The quoted tokens are then
+/// joined with `OR` and ranked by bm25 (`ORDER BY rank` at the call site), so
+/// rare query terms dominate and stopword-only matches sink.
+///
+/// Decision record (W1.2, full-pipeline numbers on the W1.0 eval goldens with
+/// the committed all-MiniLM-L6-v2 replay vectors; det = DeterministicProvider):
+///
+/// | construction        | replay r@5 / MRR  | det r@5 / MRR     | fts_query_rate |
+/// |---------------------|-------------------|-------------------|----------------|
+/// | whole-query phrase  | 0.9560 / 0.9931   | 0.0486 / 0.0505   | 0.042          |
+/// | AND of tokens       | 0.9560 / 0.9931   | 0.1389 / 0.1477   | 0.139          |
+/// | OR of tokens (this) | 0.9630 / 0.9838   | 0.7847 / 0.9611   | 1.000          |
+///
+/// The plan spec hypothesized AND-of-quoted-tokens, but measurement showed AND
+/// caps the FTS channel at 13.9% of natural-language goldens (29% with a
+/// stopword list) — question words ("how", "is") rarely appear in memory text,
+/// so the conjunction fails before content terms can match. The Phase 1 gate
+/// requires FTS contribution on >= 80% of goldens; OR-of-tokens reaches 100%
+/// and lifts recall@5 and the deterministic gate metrics sharply, at a small
+/// replay-MRR cost. Injection safety is identical under either operator: every
+/// token is a quoted phrase of length one, so user text is never FTS5 syntax.
+/// A trailing-token prefix match (`"tok"*`) was measured under both operators
+/// and both tokenizers: no metric moved under AND/unicode61, and it *hurt*
+/// under porter (prefix queries bypass the stemmer: replay MRR 0.9838 ->
+/// 0.9769), so it is deliberately not emitted.
+///
+/// A query with no indexable tokens (operators/punctuation only) returns the
+/// empty phrase `""`, which FTS5 parses fine and which matches nothing.
 fn escape_fts5_query(query: &str) -> String {
-    let escaped = query.replace('"', "\"\"");
-    format!("\"{escaped}\"")
+    let mut expr = String::new();
+    for token in query
+        .split(|c: char| !c.is_alphanumeric())
+        .filter(|t| !t.is_empty())
+    {
+        if !expr.is_empty() {
+            expr.push_str(" OR ");
+        }
+        expr.push('"');
+        expr.push_str(token);
+        expr.push('"');
+    }
+    if expr.is_empty() {
+        // An empty MATCH string is an FTS5 syntax error; an empty quoted
+        // phrase is valid and simply matches nothing.
+        return "\"\"".to_string();
+    }
+    expr
 }
 
 // ---------------------------------------------------------------------------
@@ -2880,6 +2927,18 @@ mod keyword_tests {
     }
 
     #[test]
+    fn porter_stemming_unifies_inflections() {
+        // Migration 005 layers the porter stemmer over unicode61: a query in
+        // one inflection must match a document in another ("retries" ->
+        // "retri" <- "retry"). Under bare unicode61 this returned nothing.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "we retry failed jobs");
+        let found = store.keyword_search(&proj, "retries", 10).unwrap();
+        assert_eq!(found, vec![hit]);
+    }
+
+    #[test]
     fn finds_matching_and_scopes_to_namespace() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let proj = Namespace::Project("rb".into());
@@ -2892,52 +2951,110 @@ mod keyword_tests {
     }
 
     #[test]
+    fn or_of_tokens_matches_natural_language_queries() {
+        // W1.2: the keyword leg must be alive for multi-word natural-language
+        // queries. The old whole-query-phrase form required every token to be
+        // adjacent and in order, so a question never matched; OR-of-tokens
+        // matches on any content term and lets bm25 rank by rarity.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "all writes go through tokio channels");
+        let _other = insert(&store, proj.clone(), "completely unrelated topic");
+
+        let found = store
+            .keyword_search(&proj, "how do we use tokio for writes?", 10)
+            .unwrap();
+        assert_eq!(
+            found,
+            vec![hit],
+            "a question must match on its content tokens"
+        );
+    }
+
+    #[test]
     fn escapes_special_query_chars() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let proj = Namespace::Project("rb".into());
         let hit = insert(&store, proj.clone(), "config flag enable-cache value");
 
-        // The '-' would be an FTS5 operator (NOT) if unescaped. After escaping, the
-        // query is treated as the literal phrase "enable cache" (unicode61 splits on
-        // '-'), which matches the adjacent tokens in the document.
+        // The '-' would be an FTS5 operator (NOT) if unescaped. Tokenized and
+        // quoted, the query becomes `"enable" OR "cache"` and matches the
+        // document's tokens (unicode61 splits the document on '-' too).
         let found = store.keyword_search(&proj, "enable-cache", 10).unwrap();
         assert_eq!(found, vec![hit.clone()]);
 
-        // A query that is nothing but FTS5 operators must NOT raise a syntax error;
-        // escaped, it becomes an empty/operator-free phrase that simply matches nothing.
+        // A query that is nothing but FTS5 operator words/punctuation must NOT
+        // raise a syntax error. Quoted per-token it is `"OR" OR "AND"` — the
+        // literal words, which this document does not contain.
         let none = store.keyword_search(&proj, "OR AND (", 10).unwrap();
         assert!(none.is_empty());
 
-        // A double-quote is the FTS5 phrase delimiter. Unescaped it would either
-        // break the query or let a user inject phrase syntax. escape_fts5_query
-        // doubles internal quotes, so this runs safely (no error) and matches
-        // nothing here (the document has no literal quote token).
-        let quoted = store
+        // A double-quote is the FTS5 phrase delimiter. It is a token separator
+        // here, never syntax: the input becomes `"value" OR "OR" OR "config"`,
+        // which matches this document on its literal `value`/`config` tokens —
+        // exactly what the same input WITHOUT the embedded quote would match.
+        // Equivalence is the no-injection property: the quote changed nothing.
+        let with_quote = store
             .keyword_search(&proj, "value\" OR config", 10)
             .unwrap();
-        assert!(
-            quoted.is_empty(),
-            "double-quote input must not inject phrase syntax, got {quoted:?}"
+        let without_quote = store.keyword_search(&proj, "value OR config", 10).unwrap();
+        assert_eq!(with_quote, vec![hit.clone()]);
+        assert_eq!(
+            with_quote, without_quote,
+            "an embedded double-quote must not alter query semantics"
         );
 
-        // A bare double-quote alone must also be safe (no panic, no syntax error).
+        // A bare double-quote alone must also be safe (no panic, no syntax
+        // error): no indexable tokens -> the empty phrase, which matches nothing.
         let lone_quote = store.keyword_search(&proj, "\"", 10).unwrap();
         assert!(lone_quote.is_empty());
 
-        // An asterisk is the FTS5 prefix operator. After escaping (`"enable*"`) the
-        // query is a well-formed phrase-with-prefix that FTS5 accepts safely (no
-        // syntax error, no injection). It may legitimately match `enable` in the
-        // document via prefix; the requirement is only that it runs safely, so we
-        // assert it does not error and does not match unrelated rows.
+        // An asterisk is the FTS5 prefix operator. As a separator it vanishes:
+        // `enable*` becomes the literal token query `"enable"`, which matches
+        // the document (NOT via prefix expansion — see the decision record on
+        // escape_fts5_query: trailing prefix match measured as a regression).
         let star = store.keyword_search(&proj, "enable*", 10).unwrap();
-        assert!(
-            star == vec![hit.clone()] || star.is_empty(),
-            "asterisk input must run safely without injection, got {star:?}"
-        );
+        assert_eq!(star, vec![hit.clone()]);
 
         // A lone asterisk must also be safe (no panic, no syntax error).
         let lone_star = store.keyword_search(&proj, "*", 10).unwrap();
         assert!(lone_star.is_empty());
+
+        // An empty query must be safe and match nothing.
+        let empty = store.keyword_search(&proj, "", 10).unwrap();
+        assert!(empty.is_empty());
+    }
+
+    #[test]
+    fn operator_words_are_literal_not_syntax() {
+        // NOT/NEAR injection: if `NOT` were parsed as the FTS5 operator,
+        // "config NOT value" would EXCLUDE this document (it contains `value`).
+        // Tokenized and quoted it is `"config" OR "NOT" OR "value"`, which
+        // matches it. Same for a NEAR() construction attempt.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let hit = insert(&store, proj.clone(), "config flag enable-cache value");
+
+        let not_attempt = store.keyword_search(&proj, "config NOT value", 10).unwrap();
+        assert_eq!(
+            not_attempt,
+            vec![hit.clone()],
+            "NOT must be a literal token, not an exclusion operator"
+        );
+
+        let near_attempt = store
+            .keyword_search(&proj, "NEAR(config value, 2)", 10)
+            .unwrap();
+        assert_eq!(
+            near_attempt,
+            vec![hit.clone()],
+            "NEAR(...) must be literal tokens, not proximity syntax"
+        );
+
+        // Column-filter injection: `summary:config` must not become a
+        // column-scoped query; `summary` is just another OR'd token.
+        let col_attempt = store.keyword_search(&proj, "summary:config", 10).unwrap();
+        assert_eq!(col_attempt, vec![hit]);
     }
 
     #[test]
@@ -4506,6 +4623,104 @@ mod provenance_tests {
             .query_row("SELECT COUNT(*) FROM memory_oplog", [], |r| r.get(0))
             .unwrap();
         assert_eq!(ops, 1, "post-migration mutation appends to the oplog");
+    }
+}
+
+#[cfg(test)]
+mod fts_tokenizer_migration_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn migration_005_rebuilds_fts_on_populated_pre_porter_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 004-schema DB
+        // (file-discovered migrations 001..004: bare-unicode61 FTS index),
+        // populate it through the old index's insert trigger, then open via
+        // SqliteStore (which applies 005). The porter rebuild must re-index
+        // the pre-existing rows, and the sync triggers must survive the
+        // virtual-table swap.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 4).unwrap();
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+                 VALUES ('00000000-0000-4000-8000-000000000005','project:legacy',0,0,\
+                 'we retry failed jobs','s','[]','[]','insight',5,1.0,'')",
+                [],
+            )
+            .unwrap();
+            // Sanity precondition: the OLD index does not stem, so the
+            // inflected query has nothing to match yet.
+            let pre: i64 = conn
+                .query_row(
+                    "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"retries\"'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(pre, 0, "pre-005 unicode61 index must not stem");
+        }
+
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("legacy".into());
+        let id: MemoryId = "00000000-0000-4000-8000-000000000005".parse().unwrap();
+
+        // The 'rebuild' step re-indexed the OLD row under porter: an inflected
+        // query now matches it.
+        let hits = store.keyword_search(&ns, "retries", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "old row re-indexed under porter");
+
+        // Exactly the populated rows are indexed (no loss, no duplication).
+        let fts_rows: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM memories_fts", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fts_rows, 1, "rebuild preserves the row count");
+
+        // The recreated table carries the new tokenizer in its DDL.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE name='memories_fts'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("porter"),
+            "memories_fts DDL must record the porter tokenizer, got {ddl:?}"
+        );
+
+        // mem_ai survived the swap: a post-migration insert is searchable.
+        let fresh = MemoryNote::new(
+            ns.clone(),
+            "daemon reconnects after restarts".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&fresh, None).unwrap();
+        let found = store.keyword_search(&ns, "reconnecting", 10).unwrap();
+        assert_eq!(found, vec![fresh.id.clone()], "insert trigger still syncs");
+
+        // mem_au survived the swap: an update re-syncs the index.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'writer thread serializes mutations' \
+                 WHERE memory_id = ?1",
+                rusqlite::params![fresh.id.to_string()],
+            )
+            .unwrap();
+        let updated = store
+            .keyword_search(&ns, "serializing mutation", 10)
+            .unwrap();
+        assert_eq!(updated, vec![fresh.id], "update trigger still syncs");
+        let stale = store.keyword_search(&ns, "reconnecting", 10).unwrap();
+        assert!(stale.is_empty(), "old content must leave the index");
     }
 }
 
