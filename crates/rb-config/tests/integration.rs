@@ -148,6 +148,7 @@ fn current_user_ignores_empty_user_and_uses_logname() {
 
 #[test]
 fn default_pins_path_ends_with_namespace_pins_toml_in_rusty_brain_dir() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
     let p = default_pins_path().unwrap();
     assert_eq!(
         p.file_name().and_then(|s| s.to_str()),
@@ -167,6 +168,7 @@ fn default_pins_path_ends_with_namespace_pins_toml_in_rusty_brain_dir() {
 
 #[test]
 fn default_db_path_ends_with_rusty_brain_memory_db() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
     let p = default_db_path().unwrap();
     assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("memory.db"));
     assert_eq!(
@@ -178,6 +180,7 @@ fn default_db_path_ends_with_rusty_brain_memory_db() {
 
 #[test]
 fn default_socket_path_is_named_sock() {
+    let _env_guard = ENV_LOCK.lock().unwrap();
     let p = default_socket_path().unwrap();
     assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("sock"));
 }
