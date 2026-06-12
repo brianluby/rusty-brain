@@ -10,4 +10,4 @@ mod migrations;
 mod store;
 
 pub use migrations::run_migrations;
-pub use store::{ConsolidationCandidate, LinkRow, RecalRow, SqliteStore, Store};
+pub use store::{AccessBump, ConsolidationCandidate, LinkRow, RecalRow, SqliteStore, Store};

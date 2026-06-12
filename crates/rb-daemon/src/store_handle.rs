@@ -17,6 +17,12 @@ use crate::change::{ChangeKind, MemoryChanged};
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
 
+/// How often the background flusher drains buffered access bumps into one
+/// batched writer op (W1.8). Read paths only ever touch the in-memory buffer;
+/// the buffer is bounded in practice by the distinct ids recalled within one
+/// interval (entries are tens of bytes each).
+const ACCESS_FLUSH_INTERVAL: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Count of `MemoryChanged` broadcasts that could not be delivered (no live
 /// receivers). Best-effort notification only — a non-zero value is
 /// observability, not an error.
@@ -63,12 +69,11 @@ enum WriteCommand {
         link: Box<rb_types::MemoryLink>,
         reply: oneshot::Sender<Result<()>>,
     },
-    RecordAccess {
-        id: MemoryId,
-        reply: oneshot::Sender<Result<()>>,
-    },
-    RecordAccesses {
-        ids: Vec<MemoryId>,
+    /// Apply a batch of BUFFERED access bumps (W1.8). Recall and `get` never
+    /// enqueue a writer command for access tracking — they accumulate into
+    /// [`AccessBuffer`]; this command carries the periodic/shutdown flush.
+    FlushAccesses {
+        bumps: Vec<rb_store::AccessBump>,
         reply: oneshot::Sender<Result<()>>,
     },
     SetLinkStrength {
@@ -133,6 +138,44 @@ pub struct StoreHandle {
     /// Becomes `true` when the writer thread dies ABNORMALLY (W1.6c). Graceful
     /// shutdown never flips it; see [`StoreHandle::writer_died`].
     writer_death: watch::Receiver<bool>,
+    /// In-memory accumulator for access-tracking bumps (W1.8): recall/`get`
+    /// buffer here instead of enqueueing writer ops; a background task flushes
+    /// batches every [`ACCESS_FLUSH_INTERVAL`], and `shutdown` drains the rest.
+    access_buf: Arc<AccessBuffer>,
+    /// Count of write commands the writer thread has received (excluding
+    /// `Shutdown`). Observability + the W1.8 zero-writer-ops-on-recall proof.
+    writer_ops: Arc<std::sync::atomic::AtomicU64>,
+}
+
+/// Buffered access-tracking state shared by every [`StoreHandle`] clone.
+struct AccessBuffer {
+    /// id -> (accumulated count, latest access unix seconds). Drained whole on
+    /// each flush; `tokio::sync::Mutex` so the async paths never block a
+    /// runtime worker and there is no poisoning to reason about.
+    pending: Mutex<std::collections::HashMap<MemoryId, PendingAccess>>,
+    /// Set once by whichever handle buffers the first access; the flusher task
+    /// is spawned lazily from an async context so construction never requires
+    /// a Tokio runtime.
+    flusher_started: AtomicBool,
+}
+
+#[derive(Clone, Copy)]
+struct PendingAccess {
+    count: u64,
+    last_accessed_at: i64,
+}
+
+/// Drain ALL buffered bumps, returning them as store-level [`rb_store::AccessBump`]s.
+async fn drain_access_buffer(buf: &AccessBuffer) -> Vec<rb_store::AccessBump> {
+    let mut pending = buf.pending.lock().await;
+    pending
+        .drain()
+        .map(|(id, p)| rb_store::AccessBump {
+            id,
+            count: p.count,
+            last_accessed_at: p.last_accessed_at,
+        })
+        .collect()
 }
 
 struct ReadPool {
@@ -235,6 +278,8 @@ impl StoreHandle {
         let writer_events = events.clone();
         let writer_path = db_path.clone();
         let writer_model = embedding_model.clone();
+        let writer_ops = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let writer_ops_counter = Arc::clone(&writer_ops);
         let writer_join = std::thread::Builder::new()
             .name("rb-writer".to_string())
             .spawn(move || {
@@ -246,6 +291,7 @@ impl StoreHandle {
                     writer_events,
                     ready_tx,
                     death_tx,
+                    writer_ops_counter,
                 );
             })
             .map_err(|e| Error::Io(format!("spawn writer thread: {e}")))?;
@@ -288,6 +334,11 @@ impl StoreHandle {
             writer_join: Arc::new(Mutex::new(Some(writer_join))),
             shutting_down: Arc::new(AtomicBool::new(false)),
             writer_death: death_rx,
+            access_buf: Arc::new(AccessBuffer {
+                pending: Mutex::new(std::collections::HashMap::new()),
+                flusher_started: AtomicBool::new(false),
+            }),
+            writer_ops,
         })
     }
 
@@ -345,6 +396,12 @@ impl StoreHandle {
 
     /// Gracefully close the write queue and join the dedicated writer thread.
     pub async fn shutdown(self) {
+        // Final access flush (W1.8): persist whatever the interval flusher has
+        // not yet drained, BEFORE the shutdown flag closes the write path.
+        // Best-effort — a dead writer must not block shutdown.
+        if let Err(e) = self.flush_accesses().await {
+            tracing::debug!(error = %e, "final access flush on shutdown failed; bumps dropped");
+        }
         let StoreHandle {
             writer_tx,
             pool,
@@ -352,6 +409,8 @@ impl StoreHandle {
             writer_join,
             shutting_down,
             writer_death: _writer_death,
+            access_buf: _access_buf,
+            writer_ops: _writer_ops,
         } = self;
 
         if !shutting_down.swap(true, Ordering::SeqCst) {
@@ -373,6 +432,107 @@ impl StoreHandle {
         if let Some(handle) = join {
             let _ = tokio::task::spawn_blocking(move || handle.join()).await;
         }
+    }
+
+    /// Accumulate access bumps for `ids` into the in-memory buffer (W1.8).
+    /// NEVER touches the writer thread: recall/`get` call this and return.
+    /// Duplicate ids within one call bump once (mirrors the old
+    /// `record_accesses` semantics where one UPDATE touched each row once).
+    async fn buffer_accesses(&self, ids: Vec<MemoryId>) {
+        if ids.is_empty() {
+            return;
+        }
+        let now = chrono::Utc::now().timestamp();
+        {
+            let mut pending = self.access_buf.pending.lock().await;
+            let mut seen: std::collections::HashSet<MemoryId> =
+                std::collections::HashSet::with_capacity(ids.len());
+            for id in ids {
+                if !seen.insert(id.clone()) {
+                    continue;
+                }
+                let entry = pending.entry(id).or_insert(PendingAccess {
+                    count: 0,
+                    last_accessed_at: now,
+                });
+                entry.count += 1;
+                entry.last_accessed_at = now;
+            }
+        }
+        self.ensure_access_flusher();
+    }
+
+    /// Spawn the interval flusher exactly once (lazily, from the first
+    /// buffered access, so we are guaranteed to be inside a Tokio runtime).
+    ///
+    /// The task holds only WEAK references to the writer channel and the
+    /// buffer: it can never keep the writer thread alive after every handle is
+    /// gone, and it exits on its next tick once the handles drop or shutdown
+    /// begins (`shutdown` performs its own final drain).
+    fn ensure_access_flusher(&self) {
+        if self.access_buf.flusher_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let buf = Arc::downgrade(&self.access_buf);
+        let writer_tx = self.writer_tx.downgrade();
+        let shutting_down = Arc::clone(&self.shutting_down);
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(ACCESS_FLUSH_INTERVAL).await;
+                if shutting_down.load(Ordering::SeqCst) {
+                    return; // shutdown() drains the buffer itself
+                }
+                let Some(buf) = buf.upgrade() else {
+                    return; // every StoreHandle dropped
+                };
+                let bumps = drain_access_buffer(&buf).await;
+                drop(buf);
+                if bumps.is_empty() {
+                    continue;
+                }
+                let Some(tx) = writer_tx.upgrade() else {
+                    return; // writer channel closed
+                };
+                let (reply, rx) = oneshot::channel();
+                if tx
+                    .send(WriteCommand::FlushAccesses { bumps, reply })
+                    .await
+                    .is_err()
+                {
+                    return; // writer gone; bumps dropped (best-effort)
+                }
+                drop(tx);
+                match rx.await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(e)) => {
+                        tracing::debug!(error = %e, "access flush failed; bumps dropped");
+                    }
+                    Err(_) => return, // writer dropped the reply: it is exiting
+                }
+            }
+        });
+    }
+
+    /// Drain ALL buffered access bumps into one batched writer op, awaiting
+    /// the result. Used by `shutdown` (final drain) and by tests that need
+    /// deterministic visibility; the steady-state path is the interval flusher.
+    #[doc(hidden)]
+    pub async fn flush_accesses(&self) -> Result<()> {
+        let bumps = drain_access_buffer(&self.access_buf).await;
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        let (reply, rx) = oneshot::channel();
+        self.send_write(WriteCommand::FlushAccesses { bumps, reply }, rx)
+            .await
+    }
+
+    /// Count of write commands the writer thread has received so far
+    /// (excluding `Shutdown`). Exposed for observability and for the W1.8
+    /// proof that recall issues zero writer-thread ops.
+    #[doc(hidden)]
+    pub fn writer_ops_count(&self) -> u64 {
+        self.writer_ops.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
@@ -453,6 +613,16 @@ impl StoreHandle {
     #[doc(hidden)]
     pub async fn read_pool_len_for_test(&self) -> usize {
         self.pool.stores.lock().await.len()
+    }
+
+    /// Test-only helper: how many distinct memory ids currently have buffered
+    /// (unflushed) access bumps. Proves recall BUFFERED instead of writing.
+    ///
+    /// This method is `pub` only to be reachable from `tests/`. Do NOT call
+    /// it in production code.
+    #[doc(hidden)]
+    pub async fn pending_access_len_for_test(&self) -> usize {
+        self.access_buf.pending.lock().await.len()
     }
 
     /// Read up to `limit` link edges (cross-namespace) via the read pool, for
@@ -728,6 +898,7 @@ impl Drop for WriterDeathGuard {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn writer_loop(
     db_path: PathBuf,
     embedding_dim: usize,
@@ -736,6 +907,7 @@ fn writer_loop(
     events: broadcast::Sender<MemoryChanged>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
     death_tx: watch::Sender<bool>,
+    ops: Arc<std::sync::atomic::AtomicU64>,
 ) {
     let mut death = WriterDeathGuard {
         tx: death_tx,
@@ -765,6 +937,11 @@ fn writer_loop(
             death.disarm();
             break;
         };
+        // Count every write op received (Shutdown is lifecycle, not an op).
+        // The W1.8 gate test reads this to prove recall enqueues nothing.
+        if !matches!(cmd, WriteCommand::Shutdown { .. }) {
+            ops.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
         match cmd {
             WriteCommand::Insert {
                 note,
@@ -880,28 +1057,14 @@ fn writer_loop(
                     break;
                 }
             }
-            WriteCommand::RecordAccess { id, reply } => {
-                let report = run_store_op(
-                    &mut store,
-                    &db_path,
-                    embedding_dim,
-                    embedding_model.as_deref(),
-                    |s| s.record_access(&id),
-                );
-                let writer_usable = report.writer_usable;
-                let _ = reply.send(report.result);
-                if !writer_usable {
-                    break;
-                }
-            }
-            WriteCommand::RecordAccesses { ids, reply } => {
+            WriteCommand::FlushAccesses { bumps, reply } => {
                 // No MemoryChanged event: access tracking is observability-only.
                 let report = run_store_op(
                     &mut store,
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    |s| s.record_accesses(&ids),
+                    |s| s.record_access_bumps(&bumps),
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -1173,15 +1336,17 @@ impl MemoryBackend for StoreHandle {
     }
 
     async fn record_access(&self, id: MemoryId) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::RecordAccess { id, reply };
-        self.send_write(cmd, rx).await
+        // W1.8: buffered, not written — recall/`get` issue ZERO writer ops.
+        // The interval flusher (or shutdown) batches the bump to the writer.
+        self.buffer_accesses(vec![id]).await;
+        Ok(())
     }
 
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::RecordAccesses { ids, reply };
-        self.send_write(cmd, rx).await
+        // W1.8: buffered, not written — recall/`get` issue ZERO writer ops.
+        // The interval flusher (or shutdown) batches the bump to the writer.
+        self.buffer_accesses(ids).await;
+        Ok(())
     }
 
     async fn get_many(&self, ns: Namespace, ids: Vec<MemoryId>) -> Result<Vec<MemoryNote>> {
@@ -1315,8 +1480,10 @@ mod tests {
         assert_eq!(got.links.len(), 1);
         assert_eq!(got.links[0].target_id, bid);
 
-        // record_access goes through the writer and bumps the count.
+        // record_access buffers (W1.8); the flush applies the bump in one
+        // batched writer op.
         handle.record_access(aid.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
         let after = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
         assert_eq!(after.access_count, 1);
 
@@ -1939,8 +2106,10 @@ mod tests {
         handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
 
         // Two accesses bump access_count to 2 and stamp last_accessed_at.
+        // Buffered (W1.8): both accumulate in memory, one flush persists them.
         handle.record_access(id.clone()).await.unwrap();
         handle.record_access(id.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
 
         let rows = handle.memories_for_recalibration(100).await.unwrap();
         let row = rows
@@ -1952,6 +2121,162 @@ mod tests {
         assert!(
             row.last_accessed_at.is_some(),
             "last_accessed_at must be stamped after record_access"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn recall_issues_zero_writer_ops_and_defers_access_bumps() {
+        // W1.8 / Phase 1 gate: a full hybrid recall through the real engine
+        // over the real StoreHandle must enqueue NOTHING on the writer thread.
+        // Access bumps are buffered in memory and applied later as ONE batched
+        // writer op.
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("zero-writer-recall".to_string());
+
+        let a = note(&ns, "writer thread serializes mutations");
+        let b = note(&ns, "writer thread accepts mutations");
+        let (aid, _bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+
+        let engine = rb_engine::MemoryEngine::new(
+            handle.clone(),
+            crate::SharedEmbedder::new(DeterministicProvider::new(DIM)),
+            ns.clone(),
+        );
+
+        let ops_before = handle.writer_ops_count();
+        let results = engine
+            .recall("writer thread mutations", 5, None, &[])
+            .await
+            .unwrap();
+        assert!(!results.is_empty(), "keyword overlap must return results");
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before,
+            "recall must issue ZERO writer-thread ops"
+        );
+
+        // The bumps were buffered (one entry per returned id), not persisted.
+        assert_eq!(
+            handle.pending_access_len_for_test().await,
+            results.len(),
+            "every returned id buffers exactly one pending bump"
+        );
+        let unflushed = handle.get(ns.clone(), aid.clone()).await.unwrap().unwrap();
+        assert_eq!(unflushed.access_count, 0, "bump not yet visible in the DB");
+
+        // One flush persists ALL bumps in a single batched writer op.
+        handle.flush_accesses().await.unwrap();
+        let flushed = handle.get(ns.clone(), aid).await.unwrap().unwrap();
+        assert_eq!(flushed.access_count, 1, "flush applied the buffered bump");
+        assert!(flushed.last_accessed_at.is_some());
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before + 1,
+            "the whole recall's access tracking costs exactly one writer op"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_flusher_persists_buffered_bumps_without_explicit_flush() {
+        // The interval flusher (spawned lazily on the first buffered access)
+        // must persist access stats on its own — eventual consistency, no
+        // caller-driven flush.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("bg-flush".to_string());
+
+        let n = note(&ns, "eventually counted");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        handle.record_access(id.clone()).await.unwrap();
+
+        // Poll until the background flush lands (interval is 2s; allow ample
+        // slack for slow CI schedulers before declaring failure).
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        let mut seen = 0;
+        while std::time::Instant::now() < deadline {
+            seen = handle
+                .get(ns.clone(), id.clone())
+                .await
+                .unwrap()
+                .map(|n| n.access_count)
+                .unwrap_or(0);
+            if seen == 1 {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        assert_eq!(seen, 1, "interval flusher must persist the buffered bump");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn shutdown_flushes_pending_access_bumps() {
+        // Buffered bumps must survive a graceful shutdown: the final drain in
+        // `shutdown` persists them before the write queue closes.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let ns = Namespace::Project("shutdown-flush".to_string());
+
+        let id;
+        {
+            let handle = StoreHandle::start(db.clone(), DIM, 1).unwrap();
+            let n = note(&ns, "counted across shutdown");
+            id = n.id.clone();
+            handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+            // Two buffered accesses accumulate count=2 for the id.
+            handle.record_access(id.clone()).await.unwrap();
+            handle.record_access(id.clone()).await.unwrap();
+            handle.shutdown().await;
+        }
+
+        let reopened = StoreHandle::start(db, DIM, 1).unwrap();
+        let got = reopened.get(ns, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 2,
+            "shutdown must flush accumulated bumps (count preserved, not 1)"
+        );
+        assert!(got.last_accessed_at.is_some());
+        reopened.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn record_accesses_dedups_within_call_and_accumulates_across_calls() {
+        // Mirrors the old single-UPDATE semantics: duplicates within ONE call
+        // bump once; separate calls accumulate.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let ns = Namespace::Project("dedup".to_string());
+
+        let n = note(&ns, "dedup target");
+        let id = n.id.clone();
+        handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        handle
+            .record_accesses(vec![id.clone(), id.clone()])
+            .await
+            .unwrap();
+        handle.record_access(id.clone()).await.unwrap();
+        handle.flush_accesses().await.unwrap();
+
+        let got = handle.get(ns, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.access_count, 2,
+            "within-call duplicate bumps once; the second call adds one more"
         );
 
         handle.shutdown().await;

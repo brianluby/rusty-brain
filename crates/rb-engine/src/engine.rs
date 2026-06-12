@@ -510,7 +510,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             r.memory.contested = contested.contains(&r.memory.id);
         }
 
-        // Best-effort batch access tracking: single writer round-trip for all results.
+        // Best-effort batch access tracking. W1.8: the daemon backend BUFFERS
+        // these bumps and flushes them off the recall path, so this call costs
+        // recall zero writer-thread ops (and, under migration 006, the eventual
+        // flush costs zero FTS writes).
         if !returned_ids.is_empty() {
             if let Err(e) = self.backend.record_accesses(returned_ids).await {
                 tracing::debug!(error = %e, "record_accesses failed; ignoring");

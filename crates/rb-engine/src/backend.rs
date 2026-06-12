@@ -48,10 +48,15 @@ pub trait MemoryBackend: Send + Sync {
     async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()>;
     /// Persist a directed link (write path).
     async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()>;
-    /// Bump access metadata for `id` (write path; best-effort at call sites).
+    /// Bump access metadata for `id` (best-effort at call sites). W1.8:
+    /// implementations MAY defer the bump — the daemon buffers it in memory
+    /// and flushes batches off the read path, so recall/`get` issue zero
+    /// writer-thread ops and access stats are eventually consistent.
     async fn record_access(&self, id: MemoryId) -> rb_types::Result<()>;
-    /// Bump access metadata for all `ids` in a single writer round-trip
-    /// (write path; best-effort at call sites). Missing ids are silently skipped.
+    /// Bump access metadata for all `ids` (best-effort at call sites; missing
+    /// ids silently skipped, duplicates within one call bump once). W1.8: same
+    /// deferral contract as [`MemoryBackend::record_access`] — the daemon
+    /// buffers and batch-flushes, so this never costs recall a writer op.
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()>;
     /// Batch-fetch `ids` scoped to `ns`, in request order (read path).
     async fn get_many(

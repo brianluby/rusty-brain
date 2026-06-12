@@ -277,6 +277,8 @@ mod tests {
         for _ in 0..50 {
             handle.record_access(hot_id.clone()).await.unwrap();
         }
+        // record_access buffers (W1.8); flush so the job's scan sees the counts.
+        handle.flush_accesses().await.unwrap();
 
         let cfg = ImportanceConfig {
             enabled: true,

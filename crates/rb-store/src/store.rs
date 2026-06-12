@@ -59,6 +59,14 @@ pub trait Store {
     /// once regardless of how many times it appears in `ids`). Best-effort: an empty
     /// slice or all-missing ids returns `Ok(())` without touching the DB.
     fn record_accesses(&self, ids: &[MemoryId]) -> Result<()>;
+    /// Apply BUFFERED access-tracking bumps in one transaction (W1.8): each
+    /// entry adds `count` to `access_count` and advances `last_accessed_at`
+    /// monotonically to `last_accessed_at` (an already-newer stamp is kept, so
+    /// out-of-order flushes never move the clock backwards). Missing ids are
+    /// silently skipped and an empty slice is a no-op (best-effort access
+    /// tracking never errors on absence). Under migration 006 these updates
+    /// assign no FTS-indexed column, so a flush triggers zero FTS writes.
+    fn record_access_bumps(&self, bumps: &[AccessBump]) -> Result<()>;
     /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
     /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
@@ -123,6 +131,17 @@ impl std::fmt::Debug for SqliteStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SqliteStore").finish_non_exhaustive()
     }
+}
+
+/// One buffered access-tracking bump (W1.8): `count` recorded accesses for
+/// `id`, the most recent at `last_accessed_at` (unix seconds). The daemon
+/// accumulates these off the recall path and flushes them in batches through
+/// [`Store::record_access_bumps`], so recall itself issues zero writer ops.
+#[derive(Clone, Debug)]
+pub struct AccessBump {
+    pub id: MemoryId,
+    pub count: u64,
+    pub last_accessed_at: i64,
 }
 
 /// A minimal projection of a memory row for the consolidation scan: only the
@@ -1906,6 +1925,38 @@ impl Store for SqliteStore {
         Ok(())
     }
 
+    fn record_access_bumps(&self, bumps: &[AccessBump]) -> Result<()> {
+        if bumps.is_empty() {
+            return Ok(());
+        }
+        immediate_tx(&self.conn, || {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    // Assigns NO FTS-indexed column, so under migration 006 the
+                    // mem_au trigger does not fire: a flush is zero FTS writes.
+                    "UPDATE memories
+                     SET access_count = access_count + ?1,
+                         last_accessed_at = CASE
+                           WHEN last_accessed_at IS NULL OR last_accessed_at < ?2 THEN ?2
+                           ELSE last_accessed_at
+                         END
+                     WHERE memory_id = ?3",
+                )
+                .map_err(storage_err)?;
+            for bump in bumps {
+                // 0 rows affected = missing id: silently skipped (best-effort).
+                stmt.execute(rusqlite::params![
+                    bump.count,
+                    bump.last_accessed_at,
+                    bump.id.to_string()
+                ])
+                .map_err(storage_err)?;
+            }
+            Ok(())
+        })
+    }
+
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
         let now = chrono::Utc::now().timestamp();
         immediate_tx(&self.conn, || {
@@ -3646,6 +3697,86 @@ mod access_tests {
     }
 
     #[test]
+    fn record_access_bumps_applies_counts_and_monotonic_timestamps() {
+        // W1.8 batched-bump semantics: each entry adds its accumulated count
+        // and advances last_accessed_at monotonically (an older flush can
+        // never move the clock backwards).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "bump_a");
+        let b = node(&store, "bump_b");
+
+        store
+            .record_access_bumps(&[
+                AccessBump {
+                    id: a.id.clone(),
+                    count: 3,
+                    last_accessed_at: 100,
+                },
+                AccessBump {
+                    id: b.id.clone(),
+                    count: 1,
+                    last_accessed_at: 50,
+                },
+            ])
+            .unwrap();
+
+        let got_a = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got_a.access_count, 3, "count accumulates, not +1");
+        assert_eq!(
+            got_a.last_accessed_at.map(|t| t.timestamp()),
+            Some(100),
+            "stamp is the buffered access time"
+        );
+        let got_b = store.get_memory(&b.id).unwrap().unwrap();
+        assert_eq!(got_b.access_count, 1);
+        assert_eq!(got_b.last_accessed_at.map(|t| t.timestamp()), Some(50));
+
+        // A later flush carrying an OLDER timestamp adds its count but keeps
+        // the newer stamp.
+        store
+            .record_access_bumps(&[AccessBump {
+                id: a.id.clone(),
+                count: 2,
+                last_accessed_at: 40,
+            }])
+            .unwrap();
+        let again = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(again.access_count, 5, "3 + 2 across two flushes");
+        assert_eq!(
+            again.last_accessed_at.map(|t| t.timestamp()),
+            Some(100),
+            "last_accessed_at is monotonic"
+        );
+    }
+
+    #[test]
+    fn record_access_bumps_missing_id_skipped_and_empty_is_noop() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "bump_present");
+
+        // Empty slice: no transaction, no error.
+        store.record_access_bumps(&[]).unwrap();
+
+        // A missing id is silently skipped; present ids in the same batch land.
+        store
+            .record_access_bumps(&[
+                AccessBump {
+                    id: MemoryId::new(),
+                    count: 7,
+                    last_accessed_at: 100,
+                },
+                AccessBump {
+                    id: a.id.clone(),
+                    count: 1,
+                    last_accessed_at: 100,
+                },
+            ])
+            .unwrap();
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got.access_count, 1);
+    }
+
+    #[test]
     fn supersede_sets_superseded_by_and_archives_old() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let old = node(&store, "old decision");
@@ -4666,6 +4797,136 @@ mod fts_tokenizer_migration_tests {
         assert_eq!(updated, vec![fresh.id], "update trigger still syncs");
         let stale = store.keyword_search(&ns, "reconnecting", 10).unwrap();
         assert!(stale.is_empty(), "old content must leave the index");
+    }
+}
+
+#[cfg(test)]
+mod mem_au_narrowing_migration_tests {
+    use super::*;
+    use rb_types::Namespace;
+
+    /// FTS row-version probe (W1.8): fts5 appends new inverted-index segment
+    /// rows to the `memories_fts_data` shadow table on EVERY index write —
+    /// including the delete+reinsert cycle the old broad `mem_au` ran on
+    /// metadata-only updates — so `(count, max id)` moves iff the index was
+    /// written. The pre-006 half of the test below proves the probe detects
+    /// churn (it is not vacuously stable).
+    fn fts_index_state(conn: &rusqlite::Connection) -> (i64, i64) {
+        conn.query_row(
+            "SELECT count(*), coalesce(max(id), 0) FROM memories_fts_data",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn migration_006_narrows_mem_au_on_populated_pre_006_db() {
+        // Standing rule (W1.1): every schema migration ships with a test
+        // against a POPULATED prior-version DB. Build a real 005-schema DB,
+        // demonstrate the F08 write amplification the old trigger caused
+        // (access bump => FTS churn), then open via SqliteStore (006 applies)
+        // and prove the same bumps are now ZERO FTS writes while indexed-column
+        // edits still re-sync the index.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 5).unwrap();
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+                 VALUES ('00000000-0000-4000-8000-000000000006','project:legacy',0,0,\
+                 'recall must not rewrite the index','s','[]','[]','insight',5,1.0,'')",
+                [],
+            )
+            .unwrap();
+
+            // Pre-006 churn proof: a metadata-only access bump fires the broad
+            // AFTER UPDATE trigger and rewrites the row's index entries.
+            let before = fts_index_state(&conn);
+            conn.execute(
+                "UPDATE memories SET access_count = access_count + 1, last_accessed_at = 1 \
+                 WHERE memory_id = '00000000-0000-4000-8000-000000000006'",
+                [],
+            )
+            .unwrap();
+            assert_ne!(
+                before,
+                fts_index_state(&conn),
+                "pre-006 the broad trigger churns FTS on a pure access bump \
+                 (this also proves the probe detects index writes)"
+            );
+        }
+
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let ns = Namespace::Project("legacy".into());
+        let id: MemoryId = "00000000-0000-4000-8000-000000000006".parse().unwrap();
+
+        // The narrowed trigger is live and names exactly the indexed columns.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='trigger' AND name='mem_au'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            ddl.contains("AFTER UPDATE OF"),
+            "mem_au must be column-scoped post-006, got {ddl:?}"
+        );
+        for col in ["content", "summary", "keywords", "tags"] {
+            assert!(ddl.contains(col), "mem_au OF-list must keep {col}: {ddl:?}");
+        }
+
+        // The trigger swap never touched the index: the old row still matches.
+        let hits = store.keyword_search(&ns, "recall", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "index survives the migration");
+
+        // Post-006: access bumps — both the single and the batched (W1.8
+        // flush) paths — trigger ZERO FTS writes.
+        let before = fts_index_state(&store.conn);
+        store.record_access(&id).unwrap();
+        store
+            .record_access_bumps(&[AccessBump {
+                id: id.clone(),
+                count: 2,
+                last_accessed_at: 123,
+            }])
+            .unwrap();
+        assert_eq!(
+            fts_index_state(&store.conn),
+            before,
+            "access bumps must not write FTS"
+        );
+        // The bumps themselves landed (the trigger narrowing lost no writes).
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert_eq!(got.access_count, 4, "1 (pre-006) + 1 + 2");
+
+        // An indexed-column edit STILL re-syncs the index.
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET content = 'porter stems serialized mutations' \
+                 WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+            )
+            .unwrap();
+        let after_edit = fts_index_state(&store.conn);
+        assert_ne!(after_edit, before, "content edits still write the index");
+        let hits = store.keyword_search(&ns, "serialized", 10).unwrap();
+        assert_eq!(hits, vec![id.clone()], "new content searchable");
+        let stale = store.keyword_search(&ns, "recall", 10).unwrap();
+        assert!(stale.is_empty(), "old content left the index");
+
+        // Archive (archived_at/updated_at only) is churn-free too.
+        store.archive_memory(&id).unwrap();
+        assert_eq!(
+            fts_index_state(&store.conn),
+            after_edit,
+            "archive must not write FTS"
+        );
     }
 }
 
