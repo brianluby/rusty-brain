@@ -43,6 +43,8 @@ impl RunningDaemon {
             db_path: db,
             read_pool_size: pool_size,
             jobs_config: rb_daemon::JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
         };
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
 
@@ -317,6 +319,8 @@ async fn second_bind_on_live_socket_fails_closed() {
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
         jobs_config: rb_daemon::JobsConfig::default(),
+        request_idle_timeout: None,
+        enrich: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -337,6 +341,8 @@ async fn second_bind_before_accept_loop_fails_closed() {
         db_path: dir.path().join("memory.db"),
         read_pool_size: 2,
         jobs_config: rb_daemon::JobsConfig::default(),
+        request_idle_timeout: None,
+        enrich: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -347,6 +353,8 @@ async fn second_bind_before_accept_loop_fails_closed() {
         db_path: dir2.path().join("memory.db"),
         read_pool_size: 2,
         jobs_config: rb_daemon::JobsConfig::default(),
+        request_idle_timeout: None,
+        enrich: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();

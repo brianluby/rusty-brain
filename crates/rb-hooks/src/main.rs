@@ -182,16 +182,19 @@ fn continue_result() -> HookResult {
 }
 
 /// Resolve the daemon socket path: `RUSTY_BRAIN_SOCKET` override, else the
-/// rb-config default. Delegates so hooks, CLI, and daemon share ONE override
-/// rule and can never resolve different sockets (F03/F12/F49).
+/// user `config.toml`, else the rb-config default (C1). Delegates so hooks,
+/// CLI, and daemon share ONE resolution rule and can never resolve different
+/// sockets (F03/F12/F49). A malformed config file is an `Err` here, which the
+/// caller fails open on (no daemon work) — never a guessed divergent path.
 fn socket_path() -> rb_types::Result<std::path::PathBuf> {
-    rb_config::socket_path_from_env()
+    rb_config::resolve_socket_path()
 }
 
-/// Resolve the daemon db path: `RUSTY_BRAIN_DB` override, else the rb-config
-/// default. Same single-rule delegation as [`socket_path`].
+/// Resolve the daemon db path: `RUSTY_BRAIN_DB` override, else the user
+/// `config.toml`, else the rb-config default. Same single-rule delegation as
+/// [`socket_path`].
 fn db_path() -> rb_types::Result<std::path::PathBuf> {
-    rb_config::db_path_from_env()
+    rb_config::resolve_db_path()
 }
 
 /// Resolve the `rusty-brain` DAEMON binary for auto-start.
@@ -262,6 +265,14 @@ mod tests {
         ]
     }
 
+    /// Point config-file resolution (C1) at an isolated empty tempdir so a
+    /// developer's real `~/.config/rusty-brain/config.toml` can never leak
+    /// into these tests. Returns the guard plus the dir (kept alive).
+    fn isolated_config() -> (EnvGuard, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        (EnvGuard::set("XDG_CONFIG_HOME", dir.path()), dir)
+    }
+
     // F03/F12/F49 regression: the hooks binary and the daemon MUST resolve the
     // same default socket/db paths, or capture writes to a daemon the CLI never
     // reads. rb_daemon re-exports rb-config, so these pin hooks == daemon.
@@ -269,6 +280,7 @@ mod tests {
     fn hook_default_paths_agree_with_daemon_when_xdg_vars_are_set() {
         let _lock = ENV_LOCK.lock().unwrap();
         let _overrides = without_overrides();
+        let (_conf_guard, _confdir) = isolated_config();
         let runtime = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let _g1 = EnvGuard::set("XDG_RUNTIME_DIR", runtime.path());
@@ -294,6 +306,9 @@ mod tests {
         let _g1 = EnvGuard::remove("XDG_RUNTIME_DIR");
         let _g2 = EnvGuard::remove("XDG_CACHE_HOME");
         let _g3 = EnvGuard::remove("XDG_DATA_HOME");
+        // The config file is HOME-derived too here (no XDG_CONFIG_HOME): the
+        // empty temp HOME has none, so defaults apply.
+        let _g5 = EnvGuard::remove("XDG_CONFIG_HOME");
         let _g4 = EnvGuard::set("HOME", home.path());
 
         let socket = socket_path().unwrap();
@@ -319,6 +334,7 @@ mod tests {
     #[test]
     fn explicit_env_overrides_win_over_defaults() {
         let _lock = ENV_LOCK.lock().unwrap();
+        let (_conf_guard, _confdir) = isolated_config();
         let dir = tempfile::tempdir().unwrap();
         let sock = dir.path().join("override.sock");
         let db = dir.path().join("override.db");
@@ -335,6 +351,7 @@ mod tests {
     #[test]
     fn whitespace_only_overrides_agree_with_daemon_defaults() {
         let _lock = ENV_LOCK.lock().unwrap();
+        let (_conf_guard, _confdir) = isolated_config();
         let _g1 = EnvGuard::set("RUSTY_BRAIN_SOCKET", std::path::Path::new("  "));
         let _g2 = EnvGuard::set("RUSTY_BRAIN_DB", std::path::Path::new("  "));
         assert_eq!(
@@ -346,6 +363,64 @@ mod tests {
             db_path().unwrap(),
             rb_daemon::default_db_path().unwrap(),
             "whitespace db override must fall back to the daemon default"
+        );
+    }
+
+    // C1 agreement (the F20-class fix at the resolver level): with the user
+    // config.toml as the ONLY source — no RUSTY_BRAIN_* env at all — the hooks
+    // resolve the exact paths the CLI and the daemon resolve through
+    // `rb_config::EffectiveConfig`. The daemon re-reads the same file itself
+    // at startup (XDG_CONFIG_HOME is on FORWARD_ENV), so no env forwarding of
+    // the knob is involved anywhere.
+    #[test]
+    fn config_file_paths_agree_with_cli_and_daemon_resolution() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _overrides = without_overrides();
+        let (_conf_guard, confdir) = isolated_config();
+        let dir = confdir.path().join("rusty-brain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("config.toml"),
+            "socket_path = \"/from-file/rb.sock\"\ndb_path = \"/from-file/rb.db\"\n",
+        )
+        .unwrap();
+
+        let effective = rb_config::EffectiveConfig::resolve().unwrap();
+        assert_eq!(
+            socket_path().unwrap(),
+            effective.socket_path,
+            "hooks and CLI/daemon must resolve the identical config-file socket"
+        );
+        assert_eq!(
+            db_path().unwrap(),
+            effective.db_path,
+            "hooks and CLI/daemon must resolve the identical config-file db"
+        );
+        assert_eq!(
+            socket_path().unwrap(),
+            std::path::PathBuf::from("/from-file/rb.sock")
+        );
+        assert_eq!(
+            db_path().unwrap(),
+            std::path::PathBuf::from("/from-file/rb.db")
+        );
+    }
+
+    // Malformed config: hooks get an Err (and fail open, doing no daemon
+    // work) rather than silently resolving a divergent default path.
+    #[test]
+    fn malformed_config_file_resolves_to_an_error_not_a_guessed_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _overrides = without_overrides();
+        let (_conf_guard, confdir) = isolated_config();
+        let dir = confdir.path().join("rusty-brain");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("config.toml"), "socket_path = [broken").unwrap();
+
+        let err = socket_path().unwrap_err();
+        assert!(
+            err.to_string().contains("config.toml"),
+            "error must name the config file: {err}"
         );
     }
 

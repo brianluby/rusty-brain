@@ -46,6 +46,8 @@ fn remember_then_recall_round_trips_through_the_binary() {
             .arg("serve")
             .env("RUSTY_BRAIN_SOCKET", &socket)
             .env("RUSTY_BRAIN_DB", &db)
+            // Isolate from any real user config file (C1): empty tempdir => defaults.
+            .env("XDG_CONFIG_HOME", dir.path())
             .env_remove("VOYAGE_API_KEY")
             .env("RUST_LOG", "warn")
             .stdin(Stdio::null())
@@ -66,6 +68,8 @@ fn remember_then_recall_round_trips_through_the_binary() {
         .args(["--type", "architecture_decision", "--importance", "9"])
         .env("RUSTY_BRAIN_SOCKET", &socket)
         .env("RUSTY_BRAIN_DB", &db)
+        // Isolate from any real user config file (C1): empty tempdir => defaults.
+        .env("XDG_CONFIG_HOME", dir.path())
         .env_remove("VOYAGE_API_KEY")
         .output()
         .expect("run remember");
@@ -80,6 +84,8 @@ fn remember_then_recall_round_trips_through_the_binary() {
         .args(["recall", "one database transaction", "--limit", "10"])
         .env("RUSTY_BRAIN_SOCKET", &socket)
         .env("RUSTY_BRAIN_DB", &db)
+        // Isolate from any real user config file (C1): empty tempdir => defaults.
+        .env("XDG_CONFIG_HOME", dir.path())
         .env_remove("VOYAGE_API_KEY")
         .output()
         .expect("run recall");

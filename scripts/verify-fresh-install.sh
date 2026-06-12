@@ -91,8 +91,9 @@ done
 # real path + permission code runs.
 #
 # Hermetic: unset every config-bearing var the auto-started daemon could
-# inherit — the rb_config::FORWARD_ENV allowlist (crates/rb-config/src/lib.rs)
-# minus HOME/PATH/XDG_* — plus the path/namespace overrides, BEFORE re-exporting
+# inherit — rb_config::FORWARD_ENV secrets plus the frozen LEGACY_KNOB_ENV
+# compat knobs (crates/rb-config/src/lib.rs) — plus the path/namespace
+# overrides, BEFORE re-exporting
 # our own. A developer's VOYAGE_API_KEY or RB_* settings must not leak into the
 # fresh-machine simulation.
 export HOME="$WORKDIR/home"

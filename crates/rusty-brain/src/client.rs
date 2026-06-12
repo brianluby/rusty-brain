@@ -2,8 +2,11 @@
 
 // The auto-start allowlist is owned by rb-config so every spawner (CLI, hooks)
 // forwards the identical set; adding a var there widens the leak surface and
-// must fail `daemon_command_forwards_only_allowlisted_vars`.
-use rb_config::FORWARD_ENV;
+// must fail `daemon_command_forwards_only_allowlisted_vars`. The set is
+// secrets + identity + XDG/HOME plus the frozen legacy knob vars (C1):
+// config-file knobs need no forwarding because the spawned daemon re-reads
+// `config.toml` from disk itself.
+use rb_config::spawn_forward_env;
 use rb_proto::{Client, ClientIdentity};
 use rb_types::{Error, Namespace, Result};
 use std::future::Future;
@@ -115,7 +118,7 @@ fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Comman
 ///
 /// Security: `env_clear()` is called BEFORE any `.env()`, so the child inherits
 /// nothing the parent had — only the two resolved paths plus the subset of
-/// [`FORWARD_ENV`] that `get_env` reports as present.
+/// [`spawn_forward_env`] that `get_env` reports as present.
 fn daemon_command_with<F>(
     self_exe: &Path,
     socket_path: &Path,
@@ -133,7 +136,7 @@ where
     cmd.env(crate::paths::SOCKET_ENV, socket_path);
     cmd.env(crate::paths::DB_ENV, db_path);
     // Forward each allowlisted var that is actually present in the source.
-    for key in FORWARD_ENV {
+    for key in spawn_forward_env() {
         if let Some(value) = get_env(key) {
             cmd.env(key, value);
         }
@@ -309,9 +312,12 @@ mod tests {
 
         // Injected, in-memory parent env — never touches process-global env, so
         // this test is sound under parallel execution. It carries one allowlisted
-        // var (VOYAGE_API_KEY) and one var that must NOT leak.
+        // secret (VOYAGE_API_KEY), one legacy knob (RB_EMBED_BACKEND — C1 compat:
+        // explicitly-set env knobs still reach auto-started daemons), and one
+        // var that must NOT leak.
         let source: HashMap<&str, &str> = HashMap::from([
             ("VOYAGE_API_KEY", "voyage-key"),
+            ("RB_EMBED_BACKEND", "local"),
             ("SECRET_SHOULD_NOT_LEAK", "secret"),
         ]);
 
@@ -338,10 +344,16 @@ mod tests {
             envs.get(std::ffi::OsStr::new(crate::paths::DB_ENV)),
             Some(&db.as_os_str().to_os_string())
         );
-        // Forwarded: the one allowlisted var present in the source.
+        // Forwarded: the allowlisted secret present in the source.
         assert_eq!(
             envs.get(std::ffi::OsStr::new("VOYAGE_API_KEY")),
             Some(&std::ffi::OsString::from("voyage-key"))
+        );
+        // Forwarded: an explicitly-set legacy knob (C1 compat — env still wins
+        // over the config file, including through auto-start).
+        assert_eq!(
+            envs.get(std::ffi::OsStr::new("RB_EMBED_BACKEND")),
+            Some(&std::ffi::OsString::from("local"))
         );
         // ABSENT: a non-allowlisted var present in the source must not leak.
         assert!(
@@ -350,13 +362,14 @@ mod tests {
         );
 
         // EXACT bound: the child env is precisely SOCKET + DB + the allowlisted
-        // vars present in the source (here just VOYAGE_API_KEY; the RB_ENRICH_*
-        // vars are absent from the source so they are not forwarded) — nothing
-        // more. A future stray `.env(...)` or added forward var fails this count.
+        // vars present in the source (here VOYAGE_API_KEY + RB_EMBED_BACKEND;
+        // the other allowlisted vars are absent from the source so they are
+        // not forwarded) — nothing more. A future stray `.env(...)` or added
+        // forward var fails this count.
         assert_eq!(
             envs.len(),
-            3,
-            "child env must be exactly {{SOCKET, DB, VOYAGE_API_KEY}}, got {envs:?}"
+            4,
+            "child env must be exactly {{SOCKET, DB, VOYAGE_API_KEY, RB_EMBED_BACKEND}}, got {envs:?}"
         );
     }
 }

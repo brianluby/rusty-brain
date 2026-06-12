@@ -6,10 +6,12 @@ use std::path::PathBuf;
 // re-exported so existing `crate::paths::*` consumers keep working.
 pub use rb_config::{DB_ENV, JOBS_CONFIG_ENV, SOCKET_ENV};
 
-// Env-override composition (one trim/non-empty rule for hooks, CLI, and
-// daemon) is owned by rb-config; re-exported so `crate::paths::*` callers keep
-// working and the CLI can never drift from the hooks' resolution.
-pub use rb_config::{db_path_from_env, socket_path_from_env};
+// Path resolution (env > user config.toml > default; one trim/non-empty rule
+// for hooks, CLI, and daemon) is owned by rb-config; re-exported so
+// `crate::paths::*` consumers keep working and the CLI can never drift from
+// the hooks' resolution. `run.rs` resolves every knob at once via
+// `rb_config::EffectiveConfig`.
+pub use rb_config::{resolve_db_path, resolve_socket_path};
 
 /// Resolve the jobs-config path: explicit override wins, else the env value,
 /// else `None` (meaning: load the all-disabled default). Blank strings are

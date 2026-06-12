@@ -21,6 +21,6 @@ pub use jobs::{
 // Path defaults live in rb-config (the single source of truth shared with the
 // CLI and hooks); re-exported here for existing consumers of the daemon API.
 pub use rb_config::{default_db_path, default_socket_path};
-pub use server::{Daemon, DaemonConfig};
+pub use server::{Daemon, DaemonConfig, EnrichEndpoint};
 pub use shared_embedder::SharedEmbedder;
 pub use store_handle::{accept_model_change, StoreHandle};

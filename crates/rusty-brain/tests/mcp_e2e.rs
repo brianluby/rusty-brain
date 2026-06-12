@@ -148,6 +148,8 @@ fn mcp_remember_then_recall_round_trips() {
         .arg("mcp")
         .env("RUSTY_BRAIN_SOCKET", &socket)
         .env("RUSTY_BRAIN_DB", &db)
+        // Isolate from any real user config file (C1): empty tempdir => defaults.
+        .env("XDG_CONFIG_HOME", dir.path())
         .env_remove("VOYAGE_API_KEY") // force offline DeterministicProvider
         .env("RUST_LOG", "warn")
         .stdin(Stdio::piped())
@@ -245,12 +247,16 @@ fn mcp_call_succeeds_after_daemon_idle_timeout() {
     let db = dir.path().join("rb.db");
     let exe = cargo_bin("rusty-brain");
 
-    // RUSTY_BRAIN_IDLE_TIMEOUT_SECS is on FORWARD_ENV, so the auto-started
-    // daemon inherits the 1s idle timeout.
+    // RUSTY_BRAIN_IDLE_TIMEOUT_SECS is on the frozen LEGACY_KNOB_ENV compat
+    // list (C1), so the auto-started daemon still inherits the 1s idle timeout
+    // when set as env. The config-file path for the same knob is proven in
+    // config_e2e.rs.
     let mut child = Command::new(&exe)
         .arg("mcp")
         .env("RUSTY_BRAIN_SOCKET", &socket)
         .env("RUSTY_BRAIN_DB", &db)
+        // Isolate from any real user config file (C1): empty tempdir => defaults.
+        .env("XDG_CONFIG_HOME", dir.path())
         .env("RUSTY_BRAIN_IDLE_TIMEOUT_SECS", "1")
         .env_remove("VOYAGE_API_KEY") // force offline DeterministicProvider
         .env("RUST_LOG", "warn")
@@ -330,6 +336,8 @@ fn subscriber_recovers_after_daemon_restart_and_reports_status() {
         .arg("mcp")
         .env("RUSTY_BRAIN_SOCKET", &socket)
         .env("RUSTY_BRAIN_DB", &db)
+        // Isolate from any real user config file (C1): empty tempdir => defaults.
+        .env("XDG_CONFIG_HOME", dir.path())
         .env_remove("VOYAGE_API_KEY") // force offline DeterministicProvider
         .env("RUST_LOG", "warn")
         .stdin(Stdio::piped())

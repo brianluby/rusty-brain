@@ -42,8 +42,9 @@ const MAX_CONNECTIONS: usize = 256;
 /// Idle deadline for the initial handshake read (fail fast on stalled connects).
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default idle deadline between consecutive request frames from an established
-/// client; overridable via `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` (see
-/// [`parse_idle_timeout`]) so the idle/reconnect e2e runs in seconds.
+/// client; overridable via [`DaemonConfig::request_idle_timeout`] (the serve
+/// binary resolves `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` / config-file
+/// `idle_timeout_secs` into it) so the idle/reconnect e2e runs in seconds.
 const DEFAULT_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Daemon-lifetime per-channel recall hit-contribution counters (W1.0).
@@ -90,12 +91,34 @@ impl RecallChannelCounters {
 }
 
 /// Static configuration for a daemon instance.
+///
+/// C1 hermeticity rule: this library NEVER reads env vars or the user config
+/// file for its knobs — the serve binary resolves them (CLI flag > env >
+/// `~/.config/rusty-brain/config.toml` > default via `rb_config`) and passes
+/// the result here, so embedded/test daemons cannot be steered by a
+/// developer's real environment or config file.
 #[derive(Clone, Debug)]
 pub struct DaemonConfig {
     pub socket_path: PathBuf,
     pub db_path: PathBuf,
     pub read_pool_size: usize,
     pub jobs_config: JobsConfig,
+    /// Per-connection request idle timeout between request frames; `None`
+    /// uses the built-in 60s default.
+    pub request_idle_timeout: Option<std::time::Duration>,
+    /// Opt-in LLM enrichment endpoint; `None` falls back to heuristic
+    /// enrichment. The API key (`RB_ENRICH_API_KEY`) is read from the daemon
+    /// process env at bind — secrets are env-only and kept out of this
+    /// `Debug`-printable struct.
+    pub enrich: Option<EnrichEndpoint>,
+}
+
+/// An OpenAI-compatible enrichment endpoint (no credentials here; see
+/// [`DaemonConfig::enrich`]).
+#[derive(Clone, Debug)]
+pub struct EnrichEndpoint {
+    pub base_url: String,
+    pub model: String,
 }
 
 /// A bound, ready-to-run daemon.
@@ -109,17 +132,6 @@ pub struct Daemon {
     bind_guard: BindGuard,
     jobs_config: JobsConfig,
     request_idle_timeout: std::time::Duration,
-}
-
-/// Resolve the request idle timeout from an env value. Fail-safe: absent,
-/// empty, non-numeric, or zero values all use the default — a misconfigured
-/// override must never produce an instantly-dying or never-dying connection.
-fn parse_idle_timeout(value: Option<&str>) -> std::time::Duration {
-    value
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .filter(|&secs| secs > 0)
-        .map(std::time::Duration::from_secs)
-        .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT)
 }
 
 impl std::fmt::Debug for Daemon {
@@ -177,23 +189,33 @@ impl Daemon {
         )?;
 
         // Build the opt-in LLM enricher once (reqwest client is reused across
-        // all connections). Activation requires RB_ENRICH_BASE_URL +
-        // RB_ENRICH_MODEL; falls back to heuristic when either is absent.
-        let enricher: Option<Arc<dyn Enricher>> = match OpenAiCompatEnricher::from_env() {
-            Ok(Some(e)) => {
-                info!("LLM enrichment active");
-                Some(Arc::new(e))
-            }
-            Ok(None) => None,
-            Err(e) => {
-                warn!(error = %e, "failed to build LLM enricher; falling back to heuristic");
-                None
-            }
+        // all connections). Activation requires an endpoint in the config
+        // (resolved by the serve binary from env > config.toml — C1); the API
+        // key alone stays env-only (secret). Falls back to heuristic when no
+        // endpoint is configured.
+        let enricher: Option<Arc<dyn Enricher>> = match config.enrich.as_ref() {
+            None => None,
+            Some(endpoint) => match OpenAiCompatEnricher::from_settings(
+                Some(endpoint.base_url.as_str()),
+                Some(endpoint.model.as_str()),
+                std::env::var("RB_ENRICH_API_KEY").ok().as_deref(),
+            ) {
+                Ok(Some(e)) => {
+                    info!("LLM enrichment active");
+                    Some(Arc::new(e))
+                }
+                Ok(None) => None,
+                Err(e) => {
+                    warn!(error = %e, "failed to build LLM enricher; falling back to heuristic");
+                    None
+                }
+            },
         };
 
-        // Read once at bind so every connection of this daemon instance agrees.
-        let request_idle_timeout =
-            parse_idle_timeout(std::env::var(rb_config::IDLE_TIMEOUT_ENV).ok().as_deref());
+        // Fixed at bind so every connection of this daemon instance agrees.
+        let request_idle_timeout = config
+            .request_idle_timeout
+            .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT);
 
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
@@ -837,34 +859,24 @@ mod tests {
     }
 
     #[test]
-    fn parse_idle_timeout_honors_valid_seconds() {
+    fn unset_request_idle_timeout_uses_the_60s_default() {
+        // C1: the daemon library takes the timeout from DaemonConfig only
+        // (validation/parsing of env + config-file values lives in rb-config);
+        // an unset field is the fail-safe 60s default.
+        let config = DaemonConfig {
+            socket_path: PathBuf::from("/unused/sock"),
+            db_path: PathBuf::from("/unused/db"),
+            read_pool_size: 1,
+            jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
+        };
         assert_eq!(
-            parse_idle_timeout(Some("1")),
-            std::time::Duration::from_secs(1)
+            config
+                .request_idle_timeout
+                .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT),
+            std::time::Duration::from_secs(60)
         );
-        assert_eq!(
-            parse_idle_timeout(Some(" 120 ")),
-            std::time::Duration::from_secs(120)
-        );
-    }
-
-    #[test]
-    fn parse_idle_timeout_falls_back_to_default_on_garbage() {
-        // Fail-safe: absent, empty, non-numeric, negative, and zero all default.
-        for bad in [
-            None,
-            Some(""),
-            Some("abc"),
-            Some("-5"),
-            Some("0"),
-            Some("1.5"),
-        ] {
-            assert_eq!(
-                parse_idle_timeout(bad),
-                DEFAULT_REQUEST_IDLE_TIMEOUT,
-                "value {bad:?} must fall back to the default"
-            );
-        }
     }
 
     #[test]
@@ -931,6 +943,8 @@ mod tests {
             db_path: dir.path().join("rb.db"),
             read_pool_size: 1,
             jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
         };
         let daemon = Daemon::bind(
             config,

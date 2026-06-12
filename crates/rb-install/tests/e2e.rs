@@ -40,6 +40,8 @@ impl RunningDaemon {
             db_path: db.clone(),
             read_pool_size: 2,
             jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();

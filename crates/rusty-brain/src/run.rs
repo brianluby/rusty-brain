@@ -16,24 +16,33 @@ pub fn parse_id(s: &str) -> rb_types::Result<MemoryId> {
 /// `serve` blocks until Ctrl-C; client commands connect (auto-starting the
 /// daemon), issue one request, print to stdout, and return.
 pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()> {
-    let socket_path = paths::socket_path_from_env().context("resolving daemon socket path")?;
-    let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
+    // One resolution for every subcommand: env > ~/.config/rusty-brain/
+    // config.toml > defaults (C1). A malformed config file fails closed here
+    // with the file path in the message; unknown keys only warn.
+    let effective = rb_config::EffectiveConfig::resolve().context("resolving configuration")?;
+    for warning in &effective.warnings {
+        tracing::warn!("{warning}");
+    }
+    let socket_path = effective.socket_path.clone();
+    let db_path = effective.db_path.clone();
 
     match cli.command {
         Command::Serve {
             jobs_config,
             accept_model_change,
         } => {
+            // Flag > env > config file (effective.jobs_config already encodes
+            // env > file, so the flag/env composition stays authoritative).
             let jobs_config_path = paths::resolve_jobs_config_path(
                 jobs_config,
                 std::env::var(paths::JOBS_CONFIG_ENV).ok(),
-            );
+            )
+            .or_else(|| effective.jobs_config.clone());
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
             serve::run_serve(
-                socket_path,
-                db_path,
+                effective,
                 4,
                 jobs_config_path,
                 accept_model_change,
