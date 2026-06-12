@@ -789,6 +789,22 @@ where
                 Err(e) => error_to_response(e),
             }
         }
+        Request::NamespaceRename { old, new, merge } => {
+            // One-time admin op (W0.3 carryover), cross-namespace by nature
+            // like RunJob/Reembed (admin-op gating arrives with W2.6). Both
+            // namespaces are round-trip validated before the writer sees them
+            // so a malformed encoding can never land in the namespace column.
+            match validate_namespace(old).and_then(|o| Ok((o, validate_namespace(new)?))) {
+                Ok((old, new)) => match job_store.rename_namespace(old, new, merge).await {
+                    Ok(outcome) => Response::NamespaceRenamed {
+                        moved: outcome.memories,
+                        vectors: outcome.vectors,
+                    },
+                    Err(e) => error_to_response(e),
+                },
+                Err(e) => error_to_response(e),
+            }
+        }
     }
 }
 

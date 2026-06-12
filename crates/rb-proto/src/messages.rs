@@ -113,6 +113,18 @@ pub enum Request {
     /// The stream is scoped to the connection's handshake namespace, filtered
     /// server-side.
     Subscribe,
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory row
+    /// from `old` to `new` in ONE writer transaction (memories, vec0 partition
+    /// rows, one oplog entry). Refuses a non-empty `new` unless `merge` is set.
+    /// Additive variant per the `Handshake.identity` precedent: an old daemon
+    /// fails to decode it and closes the connection (no CONTRACT_VERSION
+    /// bump); `merge` is `#[serde(default)]` so its absence decodes to false.
+    NamespaceRename {
+        old: Namespace,
+        new: Namespace,
+        #[serde(default)]
+        merge: bool,
+    },
 }
 
 /// Serde default for `Request::Remember::confidence`: full trust, the
@@ -189,6 +201,14 @@ pub enum Response {
         scanned: u64,
         changed: u64,
         skipped: u64,
+    },
+    /// Reply to `Request::NamespaceRename`: `moved` memories rows were
+    /// re-scoped and `vectors` vec0 rows were re-inserted under the new
+    /// partition key. Additive variant; old clients never see it because they
+    /// never send the request.
+    NamespaceRenamed {
+        moved: u64,
+        vectors: u64,
     },
     Error {
         kind: String,
@@ -385,6 +405,16 @@ mod tests {
             },
             Request::Reembed { limit: Some(100) },
             Request::Reembed { limit: None },
+            Request::NamespaceRename {
+                old: Namespace::Project("scratch-dir".into()),
+                new: Namespace::Project("rusty-brain".into()),
+                merge: false,
+            },
+            Request::NamespaceRename {
+                old: Namespace::Project("scratch-dir".into()),
+                new: Namespace::Project("rusty-brain".into()),
+                merge: true,
+            },
         ]
     }
 
@@ -468,6 +498,10 @@ mod tests {
                 scanned: 10,
                 changed: 3,
                 skipped: 7,
+            },
+            Response::NamespaceRenamed {
+                moved: 12,
+                vectors: 9,
             },
         ]
     }
@@ -615,6 +649,46 @@ mod tests {
         assert_eq!(json, r#"{"op":"Reembed","limit":50}"#);
         let json = serde_json::to_string(&Request::Reembed { limit: None }).unwrap();
         assert_eq!(json, r#"{"op":"Reembed","limit":null}"#);
+    }
+
+    #[test]
+    fn namespace_rename_uses_op_tag_and_merge_defaults_off() {
+        // Wire shape is pinned: internally tagged on `op`, Namespace enum JSON.
+        let req = Request::NamespaceRename {
+            old: Namespace::Project("scratch".into()),
+            new: Namespace::Project("rusty-brain".into()),
+            merge: false,
+        };
+        let value = serde_json::to_value(&req).unwrap();
+        assert_eq!(value["op"], "NamespaceRename");
+        assert_eq!(value["merge"], false);
+
+        // A payload WITHOUT the merge key must decode to merge=false (the
+        // serde-default additive pattern, mirroring Remember.confidence).
+        let mut stripped = value;
+        stripped.as_object_mut().unwrap().remove("merge");
+        let back: Request = serde_json::from_value(stripped).unwrap();
+        match back {
+            Request::NamespaceRename { merge, old, new } => {
+                assert!(!merge, "absent merge key must default to false");
+                assert_eq!(old, Namespace::Project("scratch".into()));
+                assert_eq!(new, Namespace::Project("rusty-brain".into()));
+            }
+            other => panic!("expected NamespaceRename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn namespace_renamed_uses_result_tag_with_counts() {
+        let json = serde_json::to_string(&Response::NamespaceRenamed {
+            moved: 5,
+            vectors: 3,
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"result":"NamespaceRenamed","moved":5,"vectors":3}"#
+        );
     }
 
     #[test]

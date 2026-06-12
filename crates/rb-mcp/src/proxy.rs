@@ -230,6 +230,11 @@ pub fn response_to_content(resp: Response) -> Value {
             changed,
             skipped,
         } => json!({ "scanned": scanned, "changed": changed, "skipped": skipped }),
+        // Namespace rename is a CLI admin op (W0.3 carryover) with no MCP tool
+        // surface; projected anyway so the mapping stays total.
+        Response::NamespaceRenamed { moved, vectors } => {
+            json!({ "moved": moved, "vectors": vectors })
+        }
         Response::Error { kind, message } => {
             json!({ "error": { "kind": kind, "message": message } })
         }

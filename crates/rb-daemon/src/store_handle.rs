@@ -115,6 +115,17 @@ enum WriteCommand {
         input_version: String,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory row
+    /// from `old` to `new` in ONE store transaction (memories + vec0 partition
+    /// re-key + one oplog row). Cross-namespace admin op, so unlike
+    /// Update/Archive it carries no handshake-namespace verification — the
+    /// server validates both namespaces before enqueueing.
+    RenameNamespace {
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+        reply: oneshot::Sender<Result<rb_store::NamespaceRenameOutcome>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -732,6 +743,36 @@ impl StoreHandle {
         self.send_write(cmd, rx).await
     }
 
+    /// One-time namespace rename through the single writer (W0.3 carryover):
+    /// re-scope every memory from `old` to `new` in one store transaction.
+    /// Refuses a non-empty target unless `merge` is set (validation-class
+    /// error). No `MemoryChanged` events are published: the bulk admin op has
+    /// no per-memory change identity, and subscribers are namespace-scoped
+    /// snapshots of a pre-rename world — the oplog row is the durable record.
+    pub async fn rename_namespace(
+        &self,
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+    ) -> Result<rb_store::NamespaceRenameOutcome> {
+        // Mirrors `send_write`, with a typed reply payload.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::RenameNamespace {
+                old,
+                new,
+                merge,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
     /// Enumerate up to `limit` active, non-superseded memories across ALL
     /// namespaces, oldest first then by id, for the consolidation job to scan.
     /// Each candidate carries the id/namespace/importance/created_at the job and
@@ -1245,6 +1286,37 @@ fn writer_loop(
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::RenameNamespace {
+                old,
+                new,
+                merge,
+                reply,
+            } => {
+                // No MemoryChanged events for the bulk rename (see the
+                // StoreHandle method doc); the store writes the durable
+                // `namespace_rename` oplog row inside the same transaction.
+                let mut outcome = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        outcome = Some(s.rename_namespace(&old, &new, merge)?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    outcome.ok_or_else(|| {
+                        Error::Storage("namespace rename completed without an outcome".to_string())
+                    })
+                });
+                let _ = reply.send(result);
                 if !writer_usable {
                     break;
                 }

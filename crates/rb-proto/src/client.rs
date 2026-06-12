@@ -327,6 +327,25 @@ impl Client {
             other => Err(Self::unexpected(other)),
         }
     }
+
+    /// One-time namespace rename (W0.3 carryover): re-scope every memory from
+    /// `old` to `new` in one daemon writer transaction. Refused with
+    /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
+    /// set. Returns `(moved_memories, moved_vectors)`.
+    pub async fn rename_namespace(
+        &mut self,
+        old: Namespace,
+        new: Namespace,
+        merge: bool,
+    ) -> Result<(u64, u64)> {
+        let resp = self
+            .request(Request::NamespaceRename { old, new, merge })
+            .await?;
+        match resp {
+            Resp::NamespaceRenamed { moved, vectors } => Ok((moved, vectors)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -586,6 +605,12 @@ mod wrapper_tests {
                     changed: 5,
                     skipped: 1,
                 },
+                Request::NamespaceRename { merge, .. } => Response::NamespaceRenamed {
+                    // Canned counts keyed on `merge` so the typed-wrapper test
+                    // can prove the flag rides the wire.
+                    moved: if merge { 7 } else { 3 },
+                    vectors: 2,
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -650,6 +675,27 @@ mod wrapper_tests {
 
         let (rs, rc, rk) = c.reembed(Some(10)).await.unwrap();
         assert_eq!((rs, rc, rk), (6, 5, 1));
+
+        // The fake server keys `moved` on the merge flag, proving the flag
+        // (and both namespaces) ride the wire and the counts come back typed.
+        let (moved, vectors) = c
+            .rename_namespace(
+                Namespace::Project("scratch".into()),
+                Namespace::Project("rb".into()),
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!((moved, vectors), (3, 2));
+        let (moved, vectors) = c
+            .rename_namespace(
+                Namespace::Project("scratch".into()),
+                Namespace::Project("rb".into()),
+                true,
+            )
+            .await
+            .unwrap();
+        assert_eq!((moved, vectors), (7, 2));
 
         drop(c);
         server.await.unwrap();

@@ -798,3 +798,152 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
 
     daemon.stop().await;
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn namespace_rename_round_trips_over_the_wire() {
+    // W0.3 carryover e2e: populate two namespaces (vectors + FTS via the
+    // engine's remember path), rename one over the wire, and prove recall —
+    // including the vec0 KNN partition — follows the rows to the new
+    // namespace while the old one is empty and the bystander is untouched.
+    let daemon = RunningDaemon::start(4).await;
+
+    let ns_old = Namespace::Project("scratch-dir".to_string());
+    let ns_new = Namespace::Project("rusty-brain".to_string());
+    let ns_other = Namespace::Project("bystander".to_string());
+
+    let mut client_old = Client::connect(&daemon.socket, ns_old.clone())
+        .await
+        .unwrap();
+    let id_a = client_old
+        .remember(
+            "the single writer owns the sqlite connection".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            1.0,
+        )
+        .await
+        .unwrap();
+    let id_b = client_old
+        .remember(
+            "vec0 partitions knn candidates by namespace".to_string(),
+            None,
+            MemoryType::Insight,
+            6,
+            vec![],
+            vec![],
+            vec![],
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    let mut client_other = Client::connect(&daemon.socket, ns_other.clone())
+        .await
+        .unwrap();
+    let id_other = client_other
+        .remember(
+            "bystander memory stays put".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            1.0,
+        )
+        .await
+        .unwrap();
+
+    // Rename over the wire. The handshake namespace does not scope the admin
+    // op; any connection may issue it (gating arrives with W2.6).
+    let (moved, vectors) = client_old
+        .rename_namespace(ns_old.clone(), ns_new.clone(), false)
+        .await
+        .unwrap();
+    assert_eq!(moved, 2, "both memories re-scoped");
+    assert_eq!(vectors, 2, "both vectors re-keyed");
+
+    // A client scoped to the NEW namespace recalls the rows — the vector
+    // channel runs a KNN under the new partition key (DeterministicProvider
+    // embeds query and corpus alike, so a hit requires the vec0 row).
+    let mut client_new = Client::connect(&daemon.socket, ns_new.clone())
+        .await
+        .unwrap();
+    let results = client_new
+        .recall(
+            "single writer sqlite connection".to_string(),
+            None,
+            vec![],
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(
+        results.iter().any(|r| r.memory.id == id_a),
+        "recall in the new namespace must surface the renamed memory"
+    );
+    let listed: Vec<_> = client_new
+        .list(None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(listed.contains(&id_a) && listed.contains(&id_b));
+
+    // The old namespace is empty for list AND recall.
+    let mut client_old_again = Client::connect(&daemon.socket, ns_old.clone())
+        .await
+        .unwrap();
+    assert!(client_old_again.list(None, 50).await.unwrap().is_empty());
+    assert!(client_old_again
+        .recall(
+            "single writer sqlite connection".to_string(),
+            None,
+            vec![],
+            10,
+        )
+        .await
+        .unwrap()
+        .is_empty());
+
+    // The bystander namespace is untouched.
+    let other_listed = client_other.list(None, 50).await.unwrap();
+    assert_eq!(other_listed.len(), 1);
+    assert_eq!(other_listed[0].id, id_other);
+
+    // Collision policy over the wire: renaming the bystander INTO the now
+    // populated namespace refuses without --merge (validation-class, message
+    // carries the remediation), then succeeds with merge and reports counts.
+    let err = client_other
+        .rename_namespace(ns_other.clone(), ns_new.clone(), false)
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "collision must surface as InvalidArgument over the wire, got {err:?}"
+    );
+    assert!(err.to_string().contains("--merge"), "{err}");
+
+    let (moved, vectors) = client_other
+        .rename_namespace(ns_other, ns_new, true)
+        .await
+        .unwrap();
+    assert_eq!(moved, 1);
+    assert_eq!(vectors, 1);
+    let merged: Vec<_> = client_new
+        .list(None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(merged.len(), 3, "merge appended the bystander row");
+    assert!(merged.contains(&id_other));
+
+    daemon.stop().await;
+}

@@ -297,6 +297,12 @@ mod tests {
                     changed: 0,
                     skipped: 0,
                 },
+                // No MCP tool maps to the namespace-rename admin op; the arm
+                // exists only to keep this fake total over `Request`.
+                Request::NamespaceRename { .. } => Response::NamespaceRenamed {
+                    moved: 0,
+                    vectors: 0,
+                },
             })
         }
     }
