@@ -2500,7 +2500,9 @@ name = "rb-config"
 version = "0.0.1"
 dependencies = [
  "rb-types",
+ "serde",
  "tempfile",
+ "toml",
 ]
 
 [[package]]

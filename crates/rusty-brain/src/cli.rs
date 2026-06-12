@@ -19,6 +19,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Use this namespace instead of detecting one (env equivalent:
+    /// `RUSTY_BRAIN_NAMESPACE`; explicit always wins).
+    #[arg(long, global = true)]
+    pub namespace: Option<String>,
+
+    /// Accept and pin this repo's `CLAUDE.md` frontmatter `project:` namespace
+    /// override (recorded per-directory in the local pin store; later runs
+    /// honor it without warning).
+    #[arg(long, global = true)]
+    pub accept_namespace_override: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -154,6 +165,22 @@ mod tests {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
         assert!(matches!(cli.command, Command::Subscribe));
+    }
+
+    #[test]
+    fn namespace_flag_is_global_and_defaults_off() {
+        let cli = Cli::parse_from(["rusty-brain", "status"]);
+        assert_eq!(cli.namespace, None);
+        assert!(!cli.accept_namespace_override);
+        // Global: accepted after the subcommand too.
+        let cli = Cli::parse_from(["rusty-brain", "status", "--namespace", "my-proj"]);
+        assert_eq!(cli.namespace.as_deref(), Some("my-proj"));
+    }
+
+    #[test]
+    fn accept_namespace_override_flag_parses() {
+        let cli = Cli::parse_from(["rusty-brain", "--accept-namespace-override", "status"]);
+        assert!(cli.accept_namespace_override);
     }
 
     #[test]

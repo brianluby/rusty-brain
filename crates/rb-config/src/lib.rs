@@ -3,12 +3,17 @@
 //! auto-start env allowlist. Every binary (daemon, CLI, hooks) resolves through
 //! this crate so they can never disagree on where the daemon lives.
 
+pub mod namespace;
+
 use std::path::PathBuf;
 
 use rb_types::{Error, Result};
 
 /// Env var that overrides the daemon socket path.
 pub const SOCKET_ENV: &str = "RUSTY_BRAIN_SOCKET";
+/// Env var that overrides namespace detection entirely (same precedence as the
+/// `--namespace` CLI flag: explicit always wins).
+pub const NAMESPACE_ENV: &str = "RUSTY_BRAIN_NAMESPACE";
 /// Env var that overrides the database path.
 pub const DB_ENV: &str = "RUSTY_BRAIN_DB";
 /// Env var that points at the evolution-jobs TOML config.
@@ -108,6 +113,33 @@ fn data_base_dir() -> Result<PathBuf> {
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     {
         Ok(home_dir()?.join(".local").join("share"))
+    }
+}
+
+/// Local mutable state (namespace pins). `~/.local/state` on Linux per XDG;
+/// macOS has no state-dir convention, so it shares the data location.
+pub(crate) fn state_base_dir() -> Result<PathBuf> {
+    if let Some(path) = nonempty_env_path("XDG_STATE_HOME") {
+        return Ok(path);
+    }
+
+    #[cfg(target_os = "macos")]
+    {
+        Ok(home_dir()?.join("Library").join("Application Support"))
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        if let Some(path) = nonempty_env_path("LOCALAPPDATA") {
+            Ok(path)
+        } else {
+            Ok(home_dir()?.join("AppData").join("Local"))
+        }
+    }
+
+    #[cfg(not(any(target_os = "macos", target_os = "windows")))]
+    {
+        Ok(home_dir()?.join(".local").join("state"))
     }
 }
 

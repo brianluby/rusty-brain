@@ -145,12 +145,9 @@ async fn install_capture_uninstall_round_trip() {
     // --- fixture project -----------------------------------------------------
     let proj_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
     let project = proj_dir.path().to_path_buf();
-    // Mark the project so namespace detection resolves to a stable Project name.
-    std::fs::write(
-        project.join("CLAUDE.md"),
-        "---\nproject: rb-e2e-fixture\n---\n# rb-e2e-fixture\n",
-    )
-    .unwrap();
+    // Pin the namespace explicitly (env on the hook invocation below): the
+    // fixture dir is not a git repo, and since W0.3 hooks never honor unpinned
+    // CLAUDE.md frontmatter, so the env override is the stable identity here.
     let namespace = Namespace::Project("rb-e2e-fixture".to_string());
 
     // --- in-process daemon ---------------------------------------------------
@@ -217,6 +214,9 @@ async fn install_capture_uninstall_round_trip() {
         .args(["--agent", "claude-code"])
         .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
         .env("RUSTY_BRAIN_DB", &daemon.db)
+        // Explicit namespace (W0.3 rule 1) so capture and the recall below
+        // agree on identity without a git repo in the fixture.
+        .env("RUSTY_BRAIN_NAMESPACE", "rb-e2e-fixture")
         // Isolate the dedup cache to the fixture tempdir so this test never reads
         // or writes the real ~/.cache and a prior run cannot suppress this edit as
         // a duplicate (mirrors crates/rb-hooks/tests/integration.rs).
