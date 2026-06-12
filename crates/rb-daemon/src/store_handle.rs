@@ -936,7 +936,7 @@ impl MemoryBackend for StoreHandle {
             .await
     }
 
-    async fn graph(&self, ns: Namespace, id: MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
+    async fn graph(&self, ns: Namespace, id: MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>> {
         self.with_read(move |store| {
             let Some(anchor) = store.get_memory(&id)? else {
                 return Ok(Vec::new());
@@ -945,14 +945,17 @@ impl MemoryBackend for StoreHandle {
                 return Ok(Vec::new());
             }
 
-            let ids = store.graph_neighbors(&id, depth)?;
-            let mut filtered = Vec::with_capacity(ids.len());
-            for graph_id in ids {
+            // (id, hops) pairs with real minimum hop distances (W1.5). The
+            // namespace/active filter drops pairs but preserves each survivor's
+            // hop value — hops measure link-graph distance, not list position.
+            let pairs = store.graph_neighbors(&id, depth)?;
+            let mut filtered = Vec::with_capacity(pairs.len());
+            for (graph_id, hops) in pairs {
                 let Some(note) = store.get_memory(&graph_id)? else {
                     continue;
                 };
                 if note.namespace == ns && note.archived_at.is_none() {
-                    filtered.push(graph_id);
+                    filtered.push((graph_id, hops));
                 }
             }
             Ok(filtered)

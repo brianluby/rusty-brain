@@ -86,24 +86,25 @@ impl MemoryBackend for SqliteBackend {
         ns: Namespace,
         id: MemoryId,
         depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>> {
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
         let store = self.lock()?;
         // Mirror StoreHandle::graph: anchor must be active + in namespace; each
-        // neighbor is re-checked for namespace + active status.
+        // neighbor is re-checked for namespace + active status, preserving its
+        // real minimum hop distance (W1.5) through the filter.
         let Some(anchor) = store.get_memory(&id)? else {
             return Ok(Vec::new());
         };
         if anchor.namespace != ns || anchor.archived_at.is_some() {
             return Ok(Vec::new());
         }
-        let ids = store.graph_neighbors(&id, depth)?;
-        let mut filtered = Vec::with_capacity(ids.len());
-        for graph_id in ids {
+        let pairs = store.graph_neighbors(&id, depth)?;
+        let mut filtered = Vec::with_capacity(pairs.len());
+        for (graph_id, hops) in pairs {
             let Some(note) = store.get_memory(&graph_id)? else {
                 continue;
             };
             if note.namespace == ns && note.archived_at.is_none() {
-                filtered.push(graph_id);
+                filtered.push((graph_id, hops));
             }
         }
         Ok(filtered)

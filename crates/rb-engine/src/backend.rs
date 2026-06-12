@@ -20,12 +20,17 @@ pub trait MemoryBackend: Send + Sync {
         embedding: Vec<f32>,
         limit: usize,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>>;
+    /// Expand the link graph around `id` up to `depth` hops, returning each
+    /// reachable id with its MINIMUM hop distance (1 = direct neighbor; the
+    /// anchor is excluded), ordered by hops ascending (W1.5). The hop value
+    /// feeds the graph ranking signal, so implementors must preserve it when
+    /// filtering (namespace/active checks drop pairs, never renumber them).
     async fn graph(
         &self,
         ns: Namespace,
         id: MemoryId,
         depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>>;
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>>;
     async fn list(
         &self,
         ns: Namespace,
@@ -165,7 +170,7 @@ mod tests {
             _ns: Namespace,
             _id: MemoryId,
             _depth: u8,
-        ) -> rb_types::Result<Vec<MemoryId>> {
+        ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
             Ok(Vec::new())
         }
         async fn list(

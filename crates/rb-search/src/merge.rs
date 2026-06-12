@@ -6,10 +6,21 @@ use std::collections::HashMap;
 ///
 /// - `keyword`: ids in rank order (index 0 = best keyword hit).
 /// - `vector`: `(id, cosine_distance)` pairs (smaller distance = closer).
-/// - `graph`: ids in hop order (index 0 = nearest in the graph walk).
+/// - `graph`: `(id, hops)` pairs with REAL minimum hop distances from the walk
+///   anchor (1 = direct neighbor; the anchor is excluded upstream). W1.5: the
+///   hop value is carried verbatim into `Signals.graph_hops` — previously the
+///   list INDEX stood in for hops, so the first-listed neighbor scored as if it
+///   were the anchor itself and every later one decayed by list position.
 /// - `meta`: per-id `(importance, confidence, created_at)`, the source of truth
 ///   for scoring/fetch. `confidence` (Feature C) flows into `Signals.confidence`
 ///   and is applied as a multiplicative dampener at rank time.
+///
+/// Chosen graph decay (W1.5): reciprocal of the real hop distance,
+/// `1 / hops` in `rank::score_one` — a direct neighbor (1 hop) earns the FULL
+/// graph weight (preserving the SCORE_FLOOR clause-2 invariant that a fresh
+/// default-importance direct neighbor clears the floor), 2 hops 1/2, 3 hops
+/// 1/3. RRF (`rank_rrf`) derives its graph rank from ascending hops, so
+/// closer-in-the-graph beats farther in both fusion modes.
 ///
 /// A candidate may appear in any subset of the three paths; each path fills only its
 /// own field, leaving the rest `None` so `rank` contributes 0 for absent signals.
@@ -19,7 +30,7 @@ use std::collections::HashMap;
 pub fn build_signals(
     keyword: &[MemoryId],
     vector: &[(MemoryId, f32)],
-    graph: &[MemoryId],
+    graph: &[(MemoryId, u8)],
     meta: &HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)>,
 ) -> Vec<Signals> {
     // Preserve first-seen order with a parallel index map into `out`.
@@ -68,11 +79,11 @@ pub fn build_signals(
             );
         }
     }
-    for (hop_idx, id) in graph.iter().enumerate() {
+    for (id, hops) in graph {
         if let Some(i) = slot(id, &mut index, &mut out) {
-            // hop index saturates into u8; graph depth is bounded well below 255.
-            let hops = hop_idx.min(u8::MAX as usize) as u8;
-            out[i].graph_hops = Some(out[i].graph_hops.map_or(hops, |h| h.min(hops)));
+            // Real hop distance from the walk anchor (W1.5). A duplicate entry
+            // keeps the MINIMUM — closest appearance wins, like the other paths.
+            out[i].graph_hops = Some(out[i].graph_hops.map_or(*hops, |h| h.min(*hops)));
         }
     }
 
@@ -102,7 +113,7 @@ mod tests {
 
         let keyword = vec![shared.clone(), kw_only.clone()];
         let vector = vec![(shared.clone(), 0.2), (vec_only.clone(), 0.9)];
-        let graph = vec![shared.clone(), graph_only.clone()];
+        let graph = vec![(shared.clone(), 1), (graph_only.clone(), 2)];
 
         let signals = build_signals(&keyword, &vector, &graph, &meta);
         // one Signals per distinct id (4 total).
@@ -111,11 +122,11 @@ mod tests {
         let by_id: HashMap<MemoryId, &Signals> =
             signals.iter().map(|s| (s.id.clone(), s)).collect();
 
-        // shared appears in all three paths: keyword_rank 0 (first), vector dist 0.2, graph hops 0 (first).
+        // shared appears in all three paths: keyword_rank 0 (first), vector dist 0.2, graph hops 1.
         let sh = by_id.get(&shared).unwrap();
         assert_eq!(sh.keyword_rank, Some(0));
         assert!((sh.vector_distance.unwrap() - 0.2).abs() < f32::EPSILON);
-        assert_eq!(sh.graph_hops, Some(0));
+        assert_eq!(sh.graph_hops, Some(1));
 
         // kw_only: keyword_rank 1, no vector, no graph.
         let k = by_id.get(&kw_only).unwrap();
@@ -129,15 +140,15 @@ mod tests {
         assert!((v.vector_distance.unwrap() - 0.9).abs() < f32::EPSILON);
         assert!(v.graph_hops.is_none());
 
-        // graph_only: graph hops 1 (second in graph order).
+        // graph_only: graph hops 2 (its real walk distance, not list position).
         let g = by_id.get(&graph_only).unwrap();
         assert!(g.keyword_rank.is_none());
         assert!(g.vector_distance.is_none());
-        assert_eq!(g.graph_hops, Some(1));
+        assert_eq!(g.graph_hops, Some(2));
     }
 
     #[test]
-    fn keyword_rank_and_graph_hops_follow_input_order() {
+    fn keyword_rank_follows_order_and_graph_hops_carry_real_distances() {
         let now = Utc::now();
         let a = MemoryId::new();
         let b = MemoryId::new();
@@ -147,7 +158,9 @@ mod tests {
             meta.insert(id.clone(), (5, 1.0, now));
         }
         let keyword = vec![a.clone(), b.clone(), c.clone()];
-        let graph = vec![c.clone(), b.clone(), a.clone()];
+        // A 3-deep chain seed -> c -> b -> a: hops are 1, 2, 3 (W1.5) and are
+        // taken from the PAIR, independent of list position.
+        let graph = vec![(c.clone(), 1), (b.clone(), 2), (a.clone(), 3)];
         let signals = build_signals(&keyword, &[], &graph, &meta);
         let by_id: HashMap<MemoryId, &Signals> =
             signals.iter().map(|s| (s.id.clone(), s)).collect();
@@ -155,10 +168,10 @@ mod tests {
         assert_eq!(by_id.get(&a).unwrap().keyword_rank, Some(0));
         assert_eq!(by_id.get(&b).unwrap().keyword_rank, Some(1));
         assert_eq!(by_id.get(&c).unwrap().keyword_rank, Some(2));
-        // graph hops = index in graph vec.
-        assert_eq!(by_id.get(&c).unwrap().graph_hops, Some(0));
-        assert_eq!(by_id.get(&b).unwrap().graph_hops, Some(1));
-        assert_eq!(by_id.get(&a).unwrap().graph_hops, Some(2));
+        // graph hops = the real distance carried in the pair.
+        assert_eq!(by_id.get(&c).unwrap().graph_hops, Some(1));
+        assert_eq!(by_id.get(&b).unwrap().graph_hops, Some(2));
+        assert_eq!(by_id.get(&a).unwrap().graph_hops, Some(3));
     }
 
     #[test]
@@ -193,7 +206,9 @@ mod tests {
     }
 
     #[test]
-    fn duplicate_graph_ids_keep_earliest_hop() {
+    fn duplicate_graph_ids_keep_minimum_hops() {
+        // Diamond shape: two paths reach the same node at different depths; the
+        // SHORTER distance must win regardless of list order (W1.5).
         let now = Utc::now();
         let duplicate = MemoryId::new();
         let other = MemoryId::new();
@@ -202,12 +217,12 @@ mod tests {
             meta.insert(id.clone(), (5, 1.0, now));
         }
 
-        let graph = vec![duplicate.clone(), other, duplicate.clone()];
+        let graph = vec![(duplicate.clone(), 3), (other, 1), (duplicate.clone(), 2)];
         let signals = build_signals(&[], &[], &graph, &meta);
         let by_id: HashMap<MemoryId, &Signals> =
             signals.iter().map(|s| (s.id.clone(), s)).collect();
 
-        assert_eq!(by_id.get(&duplicate).unwrap().graph_hops, Some(0));
+        assert_eq!(by_id.get(&duplicate).unwrap().graph_hops, Some(2));
     }
 
     #[test]

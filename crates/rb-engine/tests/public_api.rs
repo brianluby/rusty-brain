@@ -60,7 +60,7 @@ impl MemoryBackend for VecBackend {
         _ns: Namespace,
         _id: MemoryId,
         _depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>> {
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
         Ok(Vec::new())
     }
 

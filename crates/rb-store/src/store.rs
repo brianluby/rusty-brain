@@ -35,7 +35,12 @@ pub trait Store {
         embedding: &[f32],
         limit: usize,
     ) -> Result<Vec<(MemoryId, f32)>>;
-    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>>;
+    /// Walk the link graph out from `id` up to `depth` hops, returning each
+    /// reachable node ONCE with its MINIMUM hop distance (1 = direct neighbor;
+    /// the anchor itself is excluded), ordered by hops ascending then id so the
+    /// output is deterministic. (W1.5: real hop distances feed the graph
+    /// ranking signal instead of incidental walk-order indices.)
+    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>>;
     fn list(
         &self,
         ns: &Namespace,
@@ -1665,8 +1670,13 @@ impl Store for SqliteStore {
 
     /// The recursive CTE `UNION` dedups on (node, depth) pairs, so a cycle can
     /// accumulate O(depth x cycle_length) intermediate rows before the outer
-    /// `SELECT DISTINCT` flattens them — fine at P0's bounded depth.
-    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<MemoryId>> {
+    /// `GROUP BY` flattens them — fine at P0's bounded depth.
+    ///
+    /// W1.5: the UNION keeps EVERY distinct `(node, d)` pair a multi-path walk
+    /// produces, so exposing `d` directly would emit one row per path length.
+    /// `MIN(d) ... GROUP BY node` collapses each node to its shortest hop
+    /// distance (diamond shapes: the shorter path wins).
+    fn graph_neighbors(&self, id: &MemoryId, depth: u8) -> Result<Vec<(MemoryId, u8)>> {
         if depth == 0 {
             return Ok(Vec::new());
         }
@@ -1683,24 +1693,29 @@ impl Store for SqliteStore {
                      JOIN walk w ON l.source_id = w.node
                      WHERE w.d < ?2
                  )
-                 SELECT DISTINCT node
+                 SELECT node, MIN(d) AS hops
                  FROM walk
-                 WHERE node <> ?1",
+                 WHERE node <> ?1
+                 GROUP BY node
+                 ORDER BY MIN(d), node",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
             .query_map(rusqlite::params![id.to_string(), depth as i64], |row| {
-                row.get::<_, String>(0)
+                Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let mut ids = Vec::new();
+        let mut out = Vec::new();
         for r in rows {
-            let s = r.map_err(|e| Error::Storage(e.to_string()))?;
-            ids.push(s.parse::<MemoryId>()?);
+            let (s, d) = r.map_err(|e| Error::Storage(e.to_string()))?;
+            // d is bounded by `depth` (a u8), so the cast is lossless; clamp
+            // defensively rather than trusting the SQL invariant.
+            let hops = u8::try_from(d).unwrap_or(u8::MAX);
+            out.push((s.parse::<MemoryId>()?, hops));
         }
-        Ok(ids)
+        Ok(out)
     }
 
     fn list(
@@ -3165,7 +3180,8 @@ mod graph_tests {
     }
 
     #[test]
-    fn traverses_up_to_depth() {
+    fn traverses_up_to_depth_with_real_hop_distances() {
+        // 3-deep chain a -> b -> c -> d: hop values must be 1, 2, 3 (W1.5).
         let store = SqliteStore::open_in_memory(8).unwrap();
         let a = node(&store, "a");
         let b = node(&store, "b");
@@ -3175,17 +3191,58 @@ mod graph_tests {
         link(&store, &b, &c); // b -> c
         link(&store, &c, &d); // c -> d
 
-        let mut depth1 = store.graph_neighbors(&a.id, 1).unwrap();
-        depth1.sort_by_key(|id| id.to_string());
-        let mut want1 = vec![b.id.clone()];
-        want1.sort_by_key(|id| id.to_string());
-        assert_eq!(depth1, want1);
+        let depth1 = store.graph_neighbors(&a.id, 1).unwrap();
+        assert_eq!(depth1, vec![(b.id.clone(), 1)]);
 
-        let mut depth2 = store.graph_neighbors(&a.id, 2).unwrap();
-        depth2.sort_by_key(|id| id.to_string());
-        let mut want2 = vec![b.id.clone(), c.id.clone()];
-        want2.sort_by_key(|id| id.to_string());
-        assert_eq!(depth2, want2);
+        let depth2 = store.graph_neighbors(&a.id, 2).unwrap();
+        assert_eq!(depth2, vec![(b.id.clone(), 1), (c.id.clone(), 2)]);
+
+        let depth3 = store.graph_neighbors(&a.id, 3).unwrap();
+        assert_eq!(
+            depth3,
+            vec![(b.id.clone(), 1), (c.id.clone(), 2), (d.id.clone(), 3)],
+            "chain hops must be the real distances 1, 2, 3 in ascending order"
+        );
+    }
+
+    #[test]
+    fn diamond_multiple_paths_keep_minimum_hops() {
+        // Two paths from a to d: a -> b -> d (2 hops) and a -> c -> e -> d
+        // (3 hops). The recursive UNION dedups (node, depth) PAIRS, so the walk
+        // holds both (d, 2) and (d, 3); MIN ... GROUP BY must collapse d to its
+        // SHORTEST distance, 2, and return it exactly once (W1.5).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        let c = node(&store, "c");
+        let d = node(&store, "d");
+        let e = node(&store, "e");
+        link(&store, &a, &b); // a -> b
+        link(&store, &b, &d); // b -> d   (d at 2 hops)
+        link(&store, &a, &c); // a -> c
+        link(&store, &c, &e); // c -> e
+        link(&store, &e, &d); // e -> d   (d at 3 hops via the long arm)
+
+        let got = store.graph_neighbors(&a.id, 4).unwrap();
+        let d_rows: Vec<&(rb_types::MemoryId, u8)> =
+            got.iter().filter(|(id, _)| *id == d.id).collect();
+        assert_eq!(d_rows.len(), 1, "each node appears exactly once: {got:?}");
+        assert_eq!(
+            d_rows[0].1, 2,
+            "the shorter of the two paths to d must win: {got:?}"
+        );
+
+        // Full picture: b and c are direct neighbors (1), e is 2, d is min(2, 3) = 2.
+        let mut by_id: Vec<(String, u8)> = got.iter().map(|(id, h)| (id.to_string(), *h)).collect();
+        by_id.sort();
+        let mut want = vec![
+            (b.id.to_string(), 1u8),
+            (c.id.to_string(), 1u8),
+            (e.id.to_string(), 2u8),
+            (d.id.to_string(), 2u8),
+        ];
+        want.sort();
+        assert_eq!(by_id, want);
     }
 
     #[test]
@@ -3207,13 +3264,15 @@ mod graph_tests {
 
         // depth >= 2 forces the recursion to revisit `a` via b -> a; it must not
         // hang and must exclude the start node `a` and dedup `b`.
-        let mut got = store.graph_neighbors(&a.id, 3).unwrap();
-        got.sort_by_key(|id| id.to_string());
-        // Neighbors of `a`: b (depth 1). `a` itself is reachable at depth 2 via the
-        // back-edge but is excluded by `node <> ?1`. Result is exactly [b].
-        let mut want = vec![b.id.clone()];
-        want.sort_by_key(|id| id.to_string());
-        assert_eq!(got, want, "cycle must terminate with a deduplicated set");
+        let got = store.graph_neighbors(&a.id, 3).unwrap();
+        // Neighbors of `a`: b at hop 1 (b reappears at depth 3 via the cycle,
+        // but MIN-GROUP-BY keeps the shortest). `a` itself is reachable at
+        // depth 2 via the back-edge but is excluded by `node <> ?1`.
+        assert_eq!(
+            got,
+            vec![(b.id.clone(), 1)],
+            "cycle must terminate with a deduplicated set at minimum hops"
+        );
     }
 }
 

@@ -15,7 +15,7 @@ use std::sync::Mutex;
 pub(crate) struct MockBackend {
     pub notes: Mutex<HashMap<MemoryId, MemoryNote>>,
     pub embeddings: Mutex<HashMap<MemoryId, Vec<f32>>>,
-    graph: Mutex<HashMap<MemoryId, Vec<MemoryId>>>,
+    graph: Mutex<HashMap<MemoryId, Vec<(MemoryId, u8)>>>,
     keyword_results: Mutex<Option<Vec<MemoryId>>>,
     vector_results: Mutex<Option<Vec<(MemoryId, f32)>>>,
     record_access_calls: std::sync::atomic::AtomicUsize,
@@ -43,7 +43,9 @@ impl MockBackend {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
     }
 
-    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<MemoryId>) {
+    /// Stub the graph expansion for `id` as `(neighbor, hops)` pairs, mirroring
+    /// the store's real-hop-distance contract (W1.5).
+    pub fn set_graph_neighbors(&self, id: MemoryId, neighbors: Vec<(MemoryId, u8)>) {
         self.graph.lock().unwrap().insert(id, neighbors);
     }
 
@@ -170,7 +172,7 @@ impl MemoryBackend for MockBackend {
         ns: Namespace,
         id: MemoryId,
         _depth: u8,
-    ) -> rb_types::Result<Vec<MemoryId>> {
+    ) -> rb_types::Result<Vec<(MemoryId, u8)>> {
         let has_anchor = self
             .notes
             .lock()

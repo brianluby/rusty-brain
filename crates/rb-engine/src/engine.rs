@@ -338,6 +338,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 break;
             }
         }
+        // `(id, hops)` pairs with REAL minimum hop distances (W1.5); hops feed
+        // the graph ranking signal through `build_signals`.
         let graph = match graph_seed {
             Some(top) => self.backend.graph(self.namespace.clone(), top, 1).await?,
             None => Vec::new(),
@@ -349,7 +351,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         for id in keyword
             .iter()
             .chain(vector.iter().map(|(id, _)| id))
-            .chain(graph.iter())
+            .chain(graph.iter().map(|(id, _)| id))
         {
             if seen.insert(id.clone()) {
                 order.push(id.clone());
@@ -389,9 +391,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .filter(|(id, _)| notes.contains_key(id))
             .cloned()
             .collect();
-        let filtered_graph: Vec<MemoryId> = graph
+        let filtered_graph: Vec<(MemoryId, u8)> = graph
             .iter()
-            .filter(|id| notes.contains_key(*id))
+            .filter(|(id, _)| notes.contains_key(id))
             .cloned()
             .collect();
 
@@ -626,7 +628,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .graph(self.namespace.clone(), id, depth)
             .await?;
         let mut notes = Vec::with_capacity(ids.len());
-        for nid in ids {
+        for (nid, _hops) in ids {
             if let Some(note) = self.get_scoped(nid).await? {
                 if !self.active_in_namespace(&note) {
                     continue;
@@ -1227,7 +1229,7 @@ mod tests {
         eng.backend()
             .set_vector_results(vec![(vec_only.clone(), 0.1)]);
         eng.backend()
-            .set_graph_neighbors(kw.clone(), vec![graph_only.clone()]);
+            .set_graph_neighbors(kw.clone(), vec![(graph_only.clone(), 1)]);
 
         let results = eng.recall("candidate", 10, None, &[]).await.unwrap();
         assert_eq!(results.len(), 3);
@@ -1269,7 +1271,7 @@ mod tests {
         // Graph expansion seeds at the top keyword hit (`id`) and the mock
         // returns its neighbor list, which includes the seed here.
         eng.backend()
-            .set_graph_neighbors(id.clone(), vec![id.clone()]);
+            .set_graph_neighbors(id.clone(), vec![(id.clone(), 1)]);
 
         let results = eng.recall("everywhere", 10, None, &[]).await.unwrap();
         assert_eq!(results.len(), 1);
@@ -1826,7 +1828,11 @@ mod tests {
         eng.backend().insert_note(archived);
         eng.backend().set_graph_neighbors(
             id.clone(),
-            vec![cross_id.clone(), archived_id.clone(), active_id.clone()],
+            vec![
+                (cross_id.clone(), 1),
+                (archived_id.clone(), 1),
+                (active_id.clone(), 2),
+            ],
         );
 
         let neighbors = eng.graph(id, 2).await.unwrap();
@@ -1834,7 +1840,7 @@ mod tests {
         assert_eq!(neighbors[0].id, active_id);
 
         eng.backend()
-            .set_graph_neighbors(cross_id.clone(), vec![active_id]);
+            .set_graph_neighbors(cross_id.clone(), vec![(active_id, 1)]);
         let cross_anchor_neighbors = eng.graph(cross_id, 2).await.unwrap();
         assert!(cross_anchor_neighbors.is_empty());
     }
@@ -1875,7 +1881,11 @@ mod tests {
         eng.backend().set_vector_results(Vec::new());
         eng.backend().set_graph_neighbors(
             anchor,
-            vec![cross_id.clone(), archived_id.clone(), active_id],
+            vec![
+                (cross_id.clone(), 1),
+                (archived_id.clone(), 1),
+                (active_id, 2),
+            ],
         );
 
         let results = eng.recall("topic", 10, None, &[]).await.unwrap();
