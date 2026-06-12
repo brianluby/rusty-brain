@@ -365,7 +365,7 @@ mod tests {
         let handle = StoreHandle::start(db, DIM, 2).unwrap();
         let ns = Namespace::Project("a".to_string());
 
-        // Two orthogonal vectors: similarity ~0.5, far below 0.95 threshold.
+        // Two orthogonal vectors: raw cosine similarity ~0.0, far below 0.95 threshold.
         let x = vnote(&ns, "topic x", 5);
         let y = vnote(&ns, "topic y", 5);
         let (x_id, y_id) = (x.id.clone(), y.id.clone());

@@ -251,16 +251,17 @@ impl SqliteStore {
 
         run_migrations(&conn)?;
 
-        // Dynamic-dimension vector table. vec0 needs the literal dim baked in.
-        conn.execute_batch(&format!(
-            "CREATE VIRTUAL TABLE IF NOT EXISTS memory_vectors USING vec0(\
-               memory_id TEXT PRIMARY KEY,\
-               embedding float[{embedding_dim}]\
-             );"
-        ))
-        .map_err(storage_err)?;
-
+        // Verify the dimension invariant BEFORE touching the vector table: the
+        // schema rebuild below re-creates the vec0 table with the configured
+        // dim baked into the DDL, so a dim mismatch must fail closed first
+        // (rebuilding under a wrong dim would commit a malformed table).
         seed_or_verify_dim(&conn, embedding_dim)?;
+
+        // Dynamic-dimension vector table (vec0 needs the literal dim baked in),
+        // created at the current vector schema version — or rebuilt in place
+        // from a previous version (W1.1 cosine metric + W1.7 namespace
+        // partition, one combined rebuild).
+        ensure_vector_schema(&conn, embedding_dim)?;
         if let Some(model) = embedding_model {
             seed_or_verify_model(&conn, model)?;
         }
@@ -555,9 +556,15 @@ impl SqliteStore {
     }
 
     /// Find active memories in `ns` whose stored vector is near-identical to the
-    /// vector of `id` (cosine similarity `>= threshold`), excluding `id` itself.
+    /// vector of `id` (similarity `>= threshold`), excluding `id` itself.
     ///
-    /// Namespace-isolated by construction: candidates are filtered to `ns` and
+    /// UNIT: `threshold` and the returned similarities are RAW cosine
+    /// similarity clamped to `[0, 1]` (`1 - cosine_distance`, negatives clamp
+    /// to 0; see [`distance_to_similarity`]) — a threshold of `0.95` admits
+    /// candidates with cosine similarity `>= 0.95` (cosine distance `<= 0.05`).
+    ///
+    /// Namespace-isolated by construction: the KNN scan is scoped to `ns` via
+    /// the vec0 partition key, and candidates are re-checked for namespace +
     /// active (`archived_at IS NULL`) in Rust, exactly as `vector_search` does,
     /// so a near-identical memory in another namespace is NEVER returned. Reads
     /// the anchor's OWN stored embedding from `memory_vectors` and runs the same
@@ -595,8 +602,8 @@ impl SqliteStore {
         }
 
         // sqlite-vec accepts the query vector as a JSON array string (same as
-        // vector_search). vec0 cannot filter on namespace/active inside KNN, so
-        // we over-fetch a candidate pool and filter in Rust.
+        // vector_search). The namespace PARTITION KEY scopes the KNN scan in
+        // SQL; the Rust-side active re-check below is defense-in-depth.
         let query_json =
             serde_json::to_string(&anchor_vec).map_err(|e| Error::Serialization(e.to_string()))?;
 
@@ -610,24 +617,25 @@ impl SqliteStore {
             .max(limit_i64)
             .min(VEC0_KNN_MAX);
 
+        let ns_str = ns.as_db_string();
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT memory_id, distance
                  FROM memory_vectors
                  WHERE embedding MATCH ?1
+                   AND namespace = ?2
                  ORDER BY distance
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![query_json, k_budget], |row| {
+            .query_map(rusqlite::params![query_json, ns_str, k_budget], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let ns_str = ns.as_db_string();
         let self_str = id.to_string();
         let mut out: Vec<(MemoryId, f32)> = Vec::new();
         for r in rows {
@@ -829,6 +837,201 @@ fn meta_value(conn: &rusqlite::Connection, key: &str) -> Result<Option<String>> 
     })
 }
 
+/// Current vector-table layout, recorded at `meta.vector_schema_version`.
+///
+/// Version 2 (W1.1 + W1.7, one combined rebuild) = cosine `distance_metric`
+/// AND a `namespace` PARTITION KEY. A DB missing the marker carries the
+/// version-1 layout (implicit L2 metric, no partition column) and is rebuilt
+/// in place exactly once at open; a fresh DB is created directly in final
+/// form. One marker covers both properties so the rebuild matrix stays
+/// two-state: marker present (current) or absent (full rebuild + cleanup).
+const VECTOR_SCHEMA_VERSION: &str = "2";
+
+/// Meta key where one-shot vector-rebuild statistics are recorded (JSON:
+/// pruned/reinserted vector counts, similarity links rescored/dropped).
+const VECTOR_REBUILD_STATS_KEY: &str = "vector_rebuild_v2";
+
+/// The version-2 vec0 DDL. The dimension is baked into the column type (vec0
+/// requirement); `namespace TEXT PARTITION KEY` shards the index so KNN scopes
+/// per namespace (sqlite-vec 0.1.9 supports both `partition key` columns and
+/// `distance_metric=cosine`).
+fn vector_table_ddl(embedding_dim: usize) -> String {
+    format!(
+        "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
+           memory_id TEXT PRIMARY KEY,\
+           namespace TEXT PARTITION KEY,\
+           embedding float[{embedding_dim}] distance_metric=cosine\
+         );"
+    )
+}
+
+/// Upsert one `meta` key.
+fn upsert_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<()> {
+    conn.execute(
+        "INSERT INTO meta (key, value) VALUES (?1, ?2)
+         ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+        rusqlite::params![key, value],
+    )
+    .map_err(storage_err)?;
+    Ok(())
+}
+
+/// Ensure `memory_vectors` exists at [`VECTOR_SCHEMA_VERSION`], rebuilding a
+/// previous-version table in place when needed (W1.1 cosine metric + W1.7
+/// namespace partition + archived-vector cleanup, folded into ONE rebuild).
+///
+/// This is an open-time code rebuild, not a SQL migration: the vec0 table is
+/// created in code with a runtime dim and vec0 implements no `xRename`, so a
+/// stash/drop/recreate/re-insert inside one `BEGIN IMMEDIATE` is the only
+/// rename-free path. It MUST run on the writer's open path before any read
+/// connection opens (single-flight by construction; `StoreHandle::start_inner`
+/// sequences the writer open before the read pool spins up) so a large-corpus
+/// rebuild cannot starve concurrent opens past `busy_timeout`.
+///
+/// State matrix:
+/// - marker == 2: current layout, nothing to do;
+/// - no `memory_vectors` table (fresh DB): create directly in final form;
+/// - table without marker (v1 layout, OR a half-created fresh DB after a
+///   crash between CREATE and marker): full rebuild — idempotent because the
+///   stash SELECT reads only columns both layouts expose.
+fn ensure_vector_schema(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
+    if meta_value(conn, "vector_schema_version")?.as_deref() == Some(VECTOR_SCHEMA_VERSION) {
+        return Ok(());
+    }
+
+    let table_exists: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_vectors'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(storage_err)?;
+
+    // One transaction for create-or-rebuild + marker: a crash mid-way rolls
+    // everything back and the next open retries from the same state.
+    conn.execute_batch("BEGIN IMMEDIATE;")
+        .map_err(storage_err)?;
+    let result = (|| -> Result<()> {
+        if table_exists > 0 {
+            rebuild_vector_table(conn, embedding_dim)?;
+        } else {
+            conn.execute_batch(&vector_table_ddl(embedding_dim))
+                .map_err(storage_err)?;
+        }
+        upsert_meta(conn, "vector_schema_version", VECTOR_SCHEMA_VERSION)?;
+        // Human-legible companion marker (the version gate above is canonical).
+        upsert_meta(conn, "vector_metric", "cosine")?;
+        Ok(())
+    })();
+
+    match result {
+        Ok(()) => conn.execute_batch("COMMIT;").map_err(storage_err),
+        Err(e) => {
+            let _ = conn.execute_batch("ROLLBACK;");
+            Err(e)
+        }
+    }
+}
+
+/// Rebuild `memory_vectors` from a previous layout into the version-2 layout.
+/// MUST be called inside an open transaction (see [`ensure_vector_schema`]).
+///
+/// Folded W1.7 cleanup: the stash JOIN keeps only vectors whose owning memory
+/// row exists AND is active (`archived_at IS NULL` — supersede also archives),
+/// so vectors for archived/superseded/orphaned rows never enter the new table.
+/// Vector bytes are copied unchanged: cosine vs L2 is a query-time metric, no
+/// re-embed is needed.
+///
+/// One-shot link revalidation (W1.1): links produced by the similarity linker
+/// (`reason = 'similar'`) were created under the L2 threshold; every such link
+/// whose endpoints both still have live vectors is re-scored with
+/// `vec_distance_cosine` and DROPPED when above
+/// [`rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE`] (links the recalibrated
+/// linker would not create today). Links with a pruned/missing endpoint vector
+/// cannot be re-scored and are left in place (they are inert in recall:
+/// archived endpoints are filtered out). Counts are recorded durably at
+/// [`VECTOR_REBUILD_STATS_KEY`].
+fn rebuild_vector_table(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
+    let before: i64 = conn
+        .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+        .map_err(storage_err)?;
+
+    // Stash (memory_id, namespace, embedding) for LIVE rows via vec0 fullscan.
+    // A plain table created and dropped inside this transaction never survives
+    // it (commit drops it; rollback undoes its creation) — no side files, no
+    // schema residue.
+    conn.execute_batch(
+        "CREATE TABLE _vector_rebuild_stash AS
+           SELECT v.memory_id AS memory_id,
+                  m.namespace AS namespace,
+                  v.embedding AS embedding
+           FROM memory_vectors v
+           JOIN memories m ON m.memory_id = v.memory_id
+           WHERE m.archived_at IS NULL;",
+    )
+    .map_err(storage_err)?;
+
+    let kept: i64 = conn
+        .query_row("SELECT COUNT(*) FROM _vector_rebuild_stash", [], |r| {
+            r.get(0)
+        })
+        .map_err(storage_err)?;
+
+    // Re-score similarity-produced links while both endpoint vectors are
+    // available in the plain stash (cheaper than KNN; vec_distance_cosine is
+    // sqlite-vec's scalar distance over two float32 blobs).
+    let max_dist = f64::from(rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE);
+    let rescored: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM memory_links l
+               JOIN _vector_rebuild_stash s ON s.memory_id = l.source_id
+               JOIN _vector_rebuild_stash t ON t.memory_id = l.target_id
+             WHERE l.reason = 'similar'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(storage_err)?;
+    let dropped = conn
+        .execute(
+            "DELETE FROM memory_links WHERE rowid IN (
+               SELECT l.rowid FROM memory_links l
+                 JOIN _vector_rebuild_stash s ON s.memory_id = l.source_id
+                 JOIN _vector_rebuild_stash t ON t.memory_id = l.target_id
+               WHERE l.reason = 'similar'
+                 AND vec_distance_cosine(s.embedding, t.embedding) > ?1
+             )",
+            rusqlite::params![max_dist],
+        )
+        .map_err(storage_err)?;
+
+    // Drop + recreate at the new layout, then re-insert the live vectors
+    // (unchanged bytes) with their owning namespace as the partition key.
+    conn.execute_batch("DROP TABLE memory_vectors;")
+        .map_err(storage_err)?;
+    conn.execute_batch(&vector_table_ddl(embedding_dim))
+        .map_err(storage_err)?;
+    conn.execute(
+        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+         SELECT memory_id, namespace, embedding FROM _vector_rebuild_stash",
+        [],
+    )
+    .map_err(storage_err)?;
+    conn.execute_batch("DROP TABLE _vector_rebuild_stash;")
+        .map_err(storage_err)?;
+
+    // Durable rebuild log: rb-store carries no logging facility, so the
+    // one-shot counts live in meta where an operator (or test) can read them.
+    let stats = serde_json::json!({
+        "pruned_vectors": before - kept,
+        "reinserted_vectors": kept,
+        "similar_links_rescored": rescored,
+        "similar_links_dropped": dropped,
+        "at": chrono::Utc::now().timestamp(),
+    })
+    .to_string();
+    upsert_meta(conn, VECTOR_REBUILD_STATS_KEY, &stats)
+}
+
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
 /// Fails closed with `Error::DimensionMismatch` on disagreement.
 fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
@@ -972,12 +1175,15 @@ fn decode_embedding_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
     Ok(out)
 }
 
-/// Convert a vec0 cosine `distance` (range `[0, 2]`) into a similarity in
-/// `[0, 1]`, matching the exact convention used by `rb-search::rank::score_one`
-/// (`1.0 - (d / 2.0).clamp(0.0, 1.0)`). A non-finite distance yields `0.0`.
+/// Convert a vec0 cosine `distance` (`1 - cosine_similarity`, range `[0, 2]`)
+/// into RAW cosine similarity clamped to `[0, 1]` (`(1 - d).clamp(0, 1)` —
+/// anti-correlated vectors, cos < 0, clamp to 0). Matches the convention used
+/// by `rb-search::rank::score_one` since the W1.1 cosine rebuild, and makes
+/// `near_duplicates`' threshold a true cosine-similarity bound (0.95 means
+/// cos >= 0.95, i.e. cosine distance <= 0.05). A non-finite distance yields `0.0`.
 fn distance_to_similarity(distance: f32) -> f32 {
     if distance.is_finite() {
-        1.0 - (distance / 2.0).clamp(0.0, 1.0)
+        (1.0 - distance).clamp(0.0, 1.0)
     } else {
         0.0
     }
@@ -1197,10 +1403,18 @@ impl Store for SqliteStore {
             append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
 
             if let Some(emb) = embedding {
+                // The namespace partition key MUST mirror the memories row
+                // (vector_search scopes KNN on it). Namespace is immutable on
+                // a memory, so the key never goes stale.
                 self.conn
                     .execute(
-                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![note.id.to_string(), embedding_bytes(emb)],
+                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         VALUES (?1, ?2, ?3)",
+                        rusqlite::params![
+                            note.id.to_string(),
+                            note.namespace.as_db_string(),
+                            embedding_bytes(emb)
+                        ],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
@@ -1308,13 +1522,12 @@ impl Store for SqliteStore {
         Ok(ids)
     }
 
-    /// Scale limitation: vec0 KNN cannot filter on namespace/active inside the
-    /// query, so we over-fetch a candidate pool of `10 * limit` nearest vectors
-    /// and filter by namespace + active state in Rust. If those nearest `10*N`
-    /// vectors are dominated by other namespaces or archived rows, FEWER than
-    /// `limit` results may be returned. This is acceptable at P0's brute-force
-    /// scale; a namespace-aware ANN index (or partitioned vec0 table) is a future
-    /// option if recall at the tail becomes a problem.
+    /// KNN over the version-2 vec0 table: the `namespace` PARTITION KEY scopes
+    /// the scan (and the 4096 hard cap) to in-namespace vectors, and vector
+    /// hygiene (archive/supersede delete the vector row; the open-time rebuild
+    /// pruned pre-existing archived vectors) keeps the partition live-only — so
+    /// a namespace holding <1% of all vectors still fills `limit`. The Rust-side
+    /// active/namespace re-check below is defense-in-depth, not load-bearing.
     fn vector_search(
         &self,
         ns: &Namespace,
@@ -1332,19 +1545,21 @@ impl Store for SqliteStore {
         let query_json =
             serde_json::to_string(embedding).map_err(|e| Error::Serialization(e.to_string()))?;
 
-        // Over-fetch: we can't filter by namespace inside vec0's KNN query (adding
-        // WHERE on auxiliary columns is not supported in KNN mode). Instead we
-        // over-fetch a candidate pool large enough to still yield `limit` in-scope
-        // neighbors after filtering, then filter by namespace + active in Rust.
+        // The namespace partition key scopes the KNN scan in SQL; the modest
+        // over-fetch below only buys headroom for the Rust-side
+        // defense-in-depth active re-check (the table should contain live
+        // vectors only — archive/supersede delete them transactionally).
         //
         // Deviation from the plan: the plan used a CTE with `k = ?` plus an outer
         // `LIMIT`. That would cause a sqlite-vec error: "Only LIMIT or 'k =?' can be
         // provided, not both" (the query planner sees both when it pushes the outer
         // LIMIT into the CTE scan). We instead use a single-level query with LIMIT
-        // only, then filter candidates in Rust.
+        // only, then re-check candidates in Rust.
         //
-        // vec0 returns min(LIMIT, total_rows) without error.
-        // sqlite-vec enforces a hard KNN cap of 4096; k_budget must not exceed it.
+        // vec0 returns min(LIMIT, partition_rows) without error.
+        // sqlite-vec enforces a hard KNN cap of 4096; k_budget must not exceed
+        // it. With the partition key the cap now applies to LIVE, IN-NAMESPACE
+        // candidates rather than the whole corpus (W1.7).
         const VEC0_KNN_MAX: i64 = 4096;
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         let k_budget = limit_i64
@@ -1352,25 +1567,26 @@ impl Store for SqliteStore {
             .max(limit_i64)
             .min(VEC0_KNN_MAX);
 
+        let ns_str = ns.as_db_string();
         let mut stmt = self
             .conn
             .prepare(
                 "SELECT memory_id, distance
                  FROM memory_vectors
                  WHERE embedding MATCH ?1
+                   AND namespace = ?2
                  ORDER BY distance
-                 LIMIT ?2",
+                 LIMIT ?3",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
-            .query_map(rusqlite::params![query_json, k_budget], |row| {
+            .query_map(rusqlite::params![query_json, ns_str, k_budget], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, f64>(1)?))
             })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
-        // Collect raw candidates, then filter by namespace + active status.
-        let ns_str = ns.as_db_string();
+        // Defense-in-depth: re-check namespace + active status per candidate.
         let mut out = Vec::new();
         for r in rows {
             let (id_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
@@ -1593,6 +1809,16 @@ impl Store for SqliteStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
             // Missing or already-archived ids are Ok no-ops and log nothing.
             if affected > 0 {
+                // Vector hygiene (W1.7): an archived memory must not occupy
+                // KNN candidate slots. Same transaction as the archive so the
+                // row and its vector commit — or roll back — together. A row
+                // stored without an embedding simply deletes nothing.
+                self.conn
+                    .execute(
+                        "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                        rusqlite::params![id.to_string()],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
                 append_oplog(&self.conn, &self.site_id, "archive", id, "")?;
             }
             Ok(())
@@ -1729,6 +1955,15 @@ impl Store for SqliteStore {
                     "UPDATE memories SET archived_at = ?1, updated_at = ?1
                      WHERE memory_id = ?2 AND archived_at IS NULL",
                     rusqlite::params![now, old.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Vector hygiene (W1.7): the superseded (now archived) memory's
+            // vector leaves the KNN index in the same transaction. Idempotent:
+            // a vectorless or already-cleaned row deletes nothing.
+            self.conn
+                .execute(
+                    "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                    rusqlite::params![old.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             // One `supersede` oplog row covers the whole compound mutation
@@ -1966,10 +2201,14 @@ impl Store for SqliteStore {
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if updated == 0 {
+                // Resolve the namespace partition key from the owning memories
+                // row (proven present by `affected > 0` above, in this same
+                // transaction).
                 self.conn
                     .execute(
-                        "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
-                        rusqlite::params![id.to_string(), embedding_bytes(embedding)],
+                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         SELECT memory_id, namespace, ?2 FROM memories WHERE memory_id = ?1",
+                        rusqlite::params![id.to_string(), bytes],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
             }
@@ -3581,7 +3820,7 @@ mod near_duplicates_tests {
             "twin",
             [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
         );
-        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.5).
+        // A clearly different vector in A (orthogonal => cosine distance ~1 => sim ~0.0).
         let _different = insert_vec(
             &store,
             proj_a.clone(),
@@ -3608,7 +3847,7 @@ mod near_duplicates_tests {
             !ids.contains(&foreign),
             "a near-identical memory in another namespace must NEVER be returned"
         );
-        // The orthogonal vector has similarity ~0.5, well below the 0.95 threshold.
+        // The orthogonal vector has similarity ~0.0, well below the 0.95 threshold.
         assert_eq!(ids, vec![twin], "only the above-threshold twin is returned");
         // Reported similarity for an identical vector is at/near 1.0.
         assert!(
@@ -4337,6 +4576,431 @@ mod db_perms_tests {
             mode_of(&wal),
             0o600,
             "open must tighten a loose pre-existing -wal"
+        );
+    }
+}
+
+#[cfg(test)]
+mod vector_schema_tests {
+    //! W1.1 (cosine metric) + W1.7 (namespace partition + vector hygiene):
+    //! the open-time rebuild, the recalibrated metric, and the live-only
+    //! partitioned KNN behavior.
+    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    const DIM: usize = 8;
+
+    fn insert_vec(store: &SqliteStore, ns: &Namespace, content: &str, v: &[f32]) -> MemoryId {
+        let m = MemoryNote::new(ns.clone(), content.into(), MemoryType::Insight, 5);
+        let id = m.id.clone();
+        store.insert_memory(&m, Some(v)).unwrap();
+        id
+    }
+
+    fn vector_row_count(store: &SqliteStore, id: &MemoryId) -> i64 {
+        store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap()
+    }
+
+    /// The L2-vs-cosine distinguishing test (spec W1.1), with NON-UNIT vectors
+    /// through the store API. Candidate `aligned` points exactly along the
+    /// query direction but with magnitude 10 (L2 distance 9.0 from the query);
+    /// candidate `close_l2` sits a short straight-line hop away (L2 ~0.894)
+    /// but 36.87 degrees off in angle (cosine distance 0.4). L2 ordering
+    /// returns `close_l2` first; cosine MUST return `aligned` first.
+    #[test]
+    fn cosine_metric_ranks_by_angle_not_magnitude() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("cosine".into());
+
+        let aligned = insert_vec(
+            &store,
+            &ns,
+            "aligned big magnitude",
+            &[10.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let close_l2 = insert_vec(
+            &store,
+            &ns,
+            "close in euclidean terms",
+            &[0.6, 0.8, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+
+        let query = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&ns, &query, 10).unwrap();
+        let ids: Vec<MemoryId> = res.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![aligned, close_l2],
+            "cosine must rank the angle-aligned non-unit vector first; \
+             L2 would rank the short-straight-line candidate first"
+        );
+        // Distances are cosine distances: 0.0 for the aligned vector, 0.4 for
+        // the 0.6/0.8 one (cos = 0.6).
+        assert!(res[0].1.abs() < 1e-5, "aligned cosine distance ~0");
+        assert!(
+            (res[1].1 - 0.4).abs() < 1e-5,
+            "off-angle cosine distance ~0.4, got {}",
+            res[1].1
+        );
+    }
+
+    /// Build a POPULATED version-1 schema DB (old vec0 DDL: L2 metric, no
+    /// partition key; vectors for archived rows; L2-era similarity links)
+    /// exactly as pre-W1.1 code would have, using the committed migrations
+    /// plus the old in-code DDL.
+    fn build_v1_fixture(
+        path: &std::path::Path,
+    ) -> (MemoryId, MemoryId, MemoryId, MemoryId, MemoryId) {
+        register_vec().unwrap();
+        let conn = rusqlite::Connection::open(path).unwrap();
+        run_migrations(&conn).unwrap();
+        conn.execute_batch(
+            "CREATE VIRTUAL TABLE memory_vectors USING vec0(\
+               memory_id TEXT PRIMARY KEY,\
+               embedding float[8]\
+             );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_dim', '8')",
+            [],
+        )
+        .unwrap();
+
+        let raw_mem = |id: &MemoryId, ns: &str, archived: bool| {
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content,
+                    summary, keywords, tags, memory_type, importance, confidence,
+                    embedding_model, archived_at)
+                 VALUES (?1, ?2, 0, 0, ?3, 's', '[]', '[]', 'insight', 5, 1.0, '', ?4)",
+                rusqlite::params![
+                    id.to_string(),
+                    ns,
+                    format!("content {id}"),
+                    if archived { Some(1i64) } else { None }
+                ],
+            )
+            .unwrap();
+        };
+        let raw_vec = |id: &MemoryId, v: &[f32]| {
+            conn.execute(
+                "INSERT INTO memory_vectors (memory_id, embedding) VALUES (?1, ?2)",
+                rusqlite::params![id.to_string(), embedding_bytes(v)],
+            )
+            .unwrap();
+        };
+        let raw_link = |src: &MemoryId, tgt: &MemoryId, reason: &str| {
+            conn.execute(
+                "INSERT INTO memory_links
+                    (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                 VALUES (?1, ?2, 'references', 0.8, 0.8, ?3, 0)",
+                rusqlite::params![src.to_string(), tgt.to_string(), reason],
+            )
+            .unwrap();
+        };
+
+        let m1 = MemoryId::new(); // ns a, active, NON-UNIT vector (byte-identity probe)
+        let m2 = MemoryId::new(); // ns a, active, same direction as m1
+        let m3 = MemoryId::new(); // ns a, active, orthogonal to m1
+        let m4 = MemoryId::new(); // ns a, ARCHIVED with a leftover vector (prune target)
+        let m5 = MemoryId::new(); // ns b, active
+
+        raw_mem(&m1, "project:a", false);
+        raw_mem(&m2, "project:a", false);
+        raw_mem(&m3, "project:a", false);
+        raw_mem(&m4, "project:a", true);
+        raw_mem(&m5, "project:b", false);
+
+        raw_vec(&m1, &[3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m2, &[6.0, 8.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        // Orthogonal to m1 but a SHORT L2 hop from small vectors: the exact
+        // bug class the revalidation targets (L2 said "near", cosine says
+        // "unrelated").
+        raw_vec(&m3, &[0.0, 0.0, 0.1, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m4, &[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+        raw_vec(&m5, &[0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // Orphan vector with NO owning memories row (vec0 enforces no FK):
+        // must be pruned by the rebuild's JOIN.
+        let orphan = MemoryId::new();
+        raw_vec(&orphan, &[0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0]);
+
+        // L2-era links:
+        //  - m1 -> m2 'similar': cosine distance 0 (same direction) => KEPT.
+        //  - m1 -> m3 'similar': cosine distance 1.0 > 0.18 => DROPPED.
+        //  - m2 -> m3 'llm': not similarity-produced => KEPT regardless.
+        //  - m1 -> m4 'similar': endpoint archived (vector pruned) => cannot
+        //    be re-scored => KEPT.
+        raw_link(&m1, &m2, "similar");
+        raw_link(&m1, &m3, "similar");
+        raw_link(&m2, &m3, "llm");
+        raw_link(&m1, &m4, "similar");
+
+        (m1, m2, m3, m4, m5)
+    }
+
+    fn link_exists(store: &SqliteStore, src: &MemoryId, tgt: &MemoryId) -> bool {
+        let n: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                rusqlite::params![src.to_string(), tgt.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        n > 0
+    }
+
+    #[test]
+    fn v1_db_rebuilds_once_to_cosine_partitioned_prunes_and_revalidates() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("v1.db");
+        let (m1, m2, m3, m4, m5) = build_v1_fixture(&path);
+
+        // The open path performs the one-shot rebuild.
+        let store = SqliteStore::open(&path, DIM).unwrap();
+
+        // Markers set.
+        assert_eq!(
+            store
+                .meta_value("vector_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        assert_eq!(
+            store.meta_value("vector_metric").unwrap().as_deref(),
+            Some("cosine")
+        );
+
+        // New DDL really carries the partition key + cosine metric.
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ddl.contains("PARTITION KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("distance_metric=cosine"), "ddl: {ddl}");
+
+        // Cleanup: archived (m4) + orphan vectors pruned; live ones kept.
+        let total: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total, 4, "m1, m2, m3, m5 survive; archived + orphan pruned");
+        assert_eq!(vector_row_count(&store, &m4), 0, "archived vector pruned");
+
+        // Vector BYTES are unchanged (no re-embed): the stored blob for the
+        // non-unit m1 round-trips bit-for-bit through the rebuild.
+        let blob: Vec<u8> = store
+            .conn
+            .query_row(
+                "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![m1.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blob,
+            embedding_bytes(&[3.0, 4.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            "rebuild must copy vector bytes unchanged"
+        );
+
+        // Revalidation: the L2-era 'similar' link to an orthogonal vector is
+        // dropped; the same-direction 'similar' link, the non-similarity
+        // ('llm') link, and the unscoreable archived-endpoint link survive.
+        assert!(link_exists(&store, &m1, &m2), "near similar link kept");
+        assert!(!link_exists(&store, &m1, &m3), "far similar link dropped");
+        assert!(link_exists(&store, &m2, &m3), "non-similarity link kept");
+        assert!(link_exists(&store, &m1, &m4), "unscoreable link kept");
+
+        // Durable rebuild stats.
+        let stats_raw = store.meta_value("vector_rebuild_v2").unwrap().unwrap();
+        let stats: serde_json::Value = serde_json::from_str(&stats_raw).unwrap();
+        assert_eq!(stats["pruned_vectors"], 2, "stats: {stats}");
+        assert_eq!(stats["reinserted_vectors"], 4, "stats: {stats}");
+        assert_eq!(stats["similar_links_rescored"], 2, "stats: {stats}");
+        assert_eq!(stats["similar_links_dropped"], 1, "stats: {stats}");
+
+        // KNN is namespace-partitioned and cosine-ordered after the rebuild.
+        let ns_a = Namespace::Project("a".into());
+        let ns_b = Namespace::Project("b".into());
+        let query = [1.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let in_a = store.vector_search(&ns_a, &query, 10).unwrap();
+        let a_ids: Vec<MemoryId> = in_a.iter().map(|(id, _)| id.clone()).collect();
+        assert!(a_ids.contains(&m1) && a_ids.contains(&m2) && a_ids.contains(&m3));
+        assert!(!a_ids.contains(&m4), "archived row not searchable");
+        assert!(!a_ids.contains(&m5), "ns-b row never leaks into ns-a KNN");
+        let in_b = store.vector_search(&ns_b, &query, 10).unwrap();
+        let b_ids: Vec<MemoryId> = in_b.iter().map(|(id, _)| id.clone()).collect();
+        assert_eq!(b_ids, vec![m5.clone()]);
+
+        // Reopen: the marker short-circuits — no second rebuild, stats and
+        // contents identical.
+        drop(store);
+        let store2 = SqliteStore::open(&path, DIM).unwrap();
+        assert_eq!(
+            store2.meta_value("vector_rebuild_v2").unwrap().unwrap(),
+            stats_raw,
+            "second open must not rebuild again"
+        );
+        let total2: i64 = store2
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(total2, 4);
+    }
+
+    #[test]
+    fn fresh_db_is_created_in_final_form_without_rebuild_stats() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        assert_eq!(
+            store
+                .meta_value("vector_schema_version")
+                .unwrap()
+                .as_deref(),
+            Some("2")
+        );
+        // No rebuild ran on a fresh DB: the stats key is absent.
+        assert!(store.meta_value("vector_rebuild_v2").unwrap().is_none());
+        let ddl: String = store
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='table' AND name='memory_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ddl.contains("PARTITION KEY"), "ddl: {ddl}");
+        assert!(ddl.contains("distance_metric=cosine"), "ddl: {ddl}");
+    }
+
+    /// W1.7 acceptance: a namespace whose live rows are <1% of all vectors
+    /// still fills `limit`. 1000 near-query vectors live in a big namespace;
+    /// 5 (~0.5%) live in a small one. The pre-partition code over-fetched
+    /// `10 * limit = 50` GLOBAL candidates — all from the big namespace — and
+    /// returned nothing for the small one; the partition key scopes the scan.
+    #[test]
+    fn sub_one_percent_namespace_still_fills_limit() {
+        let store = SqliteStore::open_in_memory(4).unwrap();
+        let big = Namespace::Project("big".into());
+        let small = Namespace::Project("small".into());
+
+        for i in 0..1000u32 {
+            // All big-namespace vectors are nearly query-aligned (cosine
+            // distance ~0), i.e. globally nearer than every small-ns vector.
+            let v = [1.0, 1e-4 * (i as f32 + 1.0), 0.0, 0.0];
+            let m = MemoryNote::new(big.clone(), format!("big {i}"), MemoryType::Insight, 5);
+            store.insert_memory(&m, Some(&v)).unwrap();
+        }
+        let mut small_ids = Vec::new();
+        for i in 0..5u32 {
+            // 60 degrees off the query: cosine distance 0.5, far behind every
+            // big-namespace vector in global order.
+            let v = [0.5, 0.0, 0.866, 1e-4 * (i as f32 + 1.0)];
+            let m = MemoryNote::new(small.clone(), format!("small {i}"), MemoryType::Insight, 5);
+            small_ids.push(m.id.clone());
+            store.insert_memory(&m, Some(&v)).unwrap();
+        }
+
+        let query = [1.0, 0.0, 0.0, 0.0];
+        let res = store.vector_search(&small, &query, 5).unwrap();
+        assert_eq!(
+            res.len(),
+            5,
+            "a <1% namespace must still fill limit under the partitioned index"
+        );
+        let got: std::collections::HashSet<String> =
+            res.iter().map(|(id, _)| id.to_string()).collect();
+        let want: std::collections::HashSet<String> =
+            small_ids.iter().map(|id| id.to_string()).collect();
+        assert_eq!(got, want, "exactly the small-namespace rows are returned");
+    }
+
+    #[test]
+    fn archive_deletes_vector_row_in_same_transaction() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("hygiene".into());
+        let id = insert_vec(&store, &ns, "to archive", &[1.0; DIM]);
+        assert_eq!(vector_row_count(&store, &id), 1);
+
+        store.archive_memory(&id).unwrap();
+        assert_eq!(
+            vector_row_count(&store, &id),
+            0,
+            "archive must delete the vec0 row"
+        );
+        // The memory row itself survives (soft delete).
+        assert!(store
+            .get_memory(&id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_some());
+    }
+
+    #[test]
+    fn supersede_deletes_old_vector_row_and_rolls_back_atomically() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("hygiene".into());
+        let old = insert_vec(&store, &ns, "old", &[1.0; DIM]);
+        let new = insert_vec(&store, &ns, "new", &[0.5; DIM]);
+
+        // Failure path FIRST: superseding by a missing id fails the FK and the
+        // whole transaction (including the vector DELETE) rolls back.
+        let ghost = MemoryId::new();
+        assert!(store.supersede(&old, &ghost).is_err());
+        assert_eq!(
+            vector_row_count(&store, &old),
+            1,
+            "rolled-back supersede must NOT delete the vector"
+        );
+
+        // Success path: old's vector leaves with the same transaction.
+        store.supersede(&old, &new).unwrap();
+        assert_eq!(
+            vector_row_count(&store, &old),
+            0,
+            "supersede must delete the superseded memory's vec0 row"
+        );
+        assert_eq!(vector_row_count(&store, &new), 1, "successor vector kept");
+    }
+
+    #[test]
+    fn update_vector_insert_fallback_lands_in_owning_namespace_partition() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("fallback".into());
+        let other = Namespace::Project("elsewhere".into());
+
+        // Stored WITHOUT an embedding: update_vector takes the INSERT path and
+        // must resolve the partition key from the owning memories row.
+        let m = MemoryNote::new(
+            ns.clone(),
+            "vectorless at first".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&m, None).unwrap();
+        let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        store.update_vector(&m.id, &v, "det", "v2").unwrap();
+
+        let hits = store.vector_search(&ns, &v, 5).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].0, m.id, "found in its own namespace partition");
+        assert!(
+            store.vector_search(&other, &v, 5).unwrap().is_empty(),
+            "absent from every other partition"
         );
     }
 }

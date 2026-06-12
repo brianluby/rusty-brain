@@ -204,25 +204,26 @@ impl StoreHandle {
         embedding_model: Option<String>,
         read_pool_size: usize,
     ) -> Result<Self> {
-        let pool = Arc::new(ReadPool::open(
-            &db_path,
-            embedding_dim,
-            embedding_model.as_deref(),
-            read_pool_size.max(1),
-        )?);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
         let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<()>>();
 
+        // The WRITER opens first; the read pool only after its ready signal.
+        // `SqliteStore::init` runs the one-shot vector-schema rebuild
+        // (W1.1/W1.7) at open, and sequencing it on the single writer
+        // connection makes the rebuild single-flight by construction — a
+        // large-corpus rebuild cannot race N pool opens into busy_timeout
+        // failures.
         let writer_events = events.clone();
-        let writer_path = db_path;
+        let writer_path = db_path.clone();
+        let writer_model = embedding_model.clone();
         let writer_join = std::thread::Builder::new()
             .name("rb-writer".to_string())
             .spawn(move || {
                 writer_loop(
                     writer_path,
                     embedding_dim,
-                    embedding_model,
+                    writer_model,
                     writer_rx,
                     writer_events,
                     ready_tx,
@@ -243,6 +244,23 @@ impl StoreHandle {
                 ));
             }
         }
+
+        let pool = match ReadPool::open(
+            &db_path,
+            embedding_dim,
+            embedding_model.as_deref(),
+            read_pool_size.max(1),
+        ) {
+            Ok(pool) => Arc::new(pool),
+            Err(e) => {
+                // The writer is already running: drop its only sender so its
+                // recv loop ends, then join — never leak a live writer thread
+                // from a failed construction.
+                drop(writer_tx);
+                let _ = writer_join.join();
+                return Err(e);
+            }
+        };
 
         Ok(Self {
             writer_tx,

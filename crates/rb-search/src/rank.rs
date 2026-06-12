@@ -69,9 +69,15 @@ pub struct Signals {
 
 /// Normalize a single candidate's signals into a weighted score in `[0, 1]`.
 fn score_one(s: &Signals, w: &Weights, now: chrono::DateTime<chrono::Utc>) -> f32 {
-    // Vector similarity: cosine distance in [0, 2] -> similarity in [0, 1].
+    // Vector similarity: RAW cosine similarity `1 - d` (cosine distance d in
+    // [0, 2]), with anti-correlated candidates (d > 1, cos < 0) clamped to 0.
+    // W1.1 recalibration: the store's vec0 index now really measures cosine
+    // distance, and an orthogonal — semantically unrelated — candidate (d = 1)
+    // must contribute 0 vector signal. The previous `1 - d/2` mapping was
+    // calibrated for L2 distances; applied to cosine distances it would award
+    // unrelated candidates half the vector weight, drowning keyword-only hits.
     let vector_sim = match s.vector_distance {
-        Some(d) if d.is_finite() => 1.0 - (d / 2.0).clamp(0.0, 1.0),
+        Some(d) if d.is_finite() => (1.0 - d).clamp(0.0, 1.0),
         None => 0.0,
         Some(_) => 0.0,
     };

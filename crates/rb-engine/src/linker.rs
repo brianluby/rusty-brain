@@ -19,6 +19,10 @@ pub trait Linker: Send + Sync {
 /// Default linker: a `References` link to every candidate within
 /// `distance_threshold`, strength = `(1 - distance/2).clamp(0,1)`, capped at
 /// `max_links`, skipping the new note itself. Offline and deterministic.
+///
+/// Distances are vec0 COSINE distances (`1 - cosine_similarity`, range
+/// `[0, 2]`) since the W1.1 metric rebuild; the default threshold is
+/// recalibrated accordingly (see [`Default`]).
 pub struct SimilarityLinker {
     max_links: usize,
     distance_threshold: f32,
@@ -35,10 +39,19 @@ impl SimilarityLinker {
 
 impl Default for SimilarityLinker {
     /// Conservative defaults: at most 5 links, only fairly-similar candidates.
+    ///
+    /// The threshold is a cosine DISTANCE
+    /// ([`rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE`] = 0.18, i.e. raw
+    /// cosine similarity >= 0.82). Recalibrated for the W1.1 cosine-metric
+    /// rebuild: the previous value was an L2 distance of 0.6, and for unit
+    /// vectors `L2 <= 0.6` is exactly `cosine distance <= 0.6^2/2 = 0.18` —
+    /// so link creation stays at parity for normalized embeddings. The same
+    /// constant gates rb-store's one-shot revalidation of pre-rebuild
+    /// `reason = 'similar'` links.
     fn default() -> Self {
         Self {
             max_links: 5,
-            distance_threshold: 0.6,
+            distance_threshold: rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE,
         }
     }
 }
@@ -150,5 +163,23 @@ mod tests {
         let new = note("new");
         let linker = SimilarityLinker::new(5, 1.0);
         assert!(linker.link(&new, &[]).is_empty());
+    }
+
+    #[test]
+    fn default_threshold_is_recalibrated_cosine_distance() {
+        // W1.1: the default gate is the shared cosine-distance constant, not
+        // the old L2 0.6. A candidate just inside 0.18 links; just outside
+        // does not.
+        let new = note("new");
+        let near = note("near");
+        let far = note("far");
+        let linker = SimilarityLinker::default();
+        let links = linker.link(&new, &[(near.clone(), 0.17), (far, 0.19)]);
+        assert_eq!(links.len(), 1);
+        assert_eq!(links[0].target_id, near.id);
+        assert!(
+            (rb_types::SIMILARITY_LINK_MAX_COSINE_DISTANCE - 0.18).abs() < 1e-6,
+            "revalidation constant and linker default must stay at 0.18"
+        );
     }
 }

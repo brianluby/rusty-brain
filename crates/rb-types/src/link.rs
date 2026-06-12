@@ -2,6 +2,21 @@ use crate::link_type::LinkType;
 use crate::memory_id::MemoryId;
 use serde::{Deserialize, Serialize};
 
+/// Maximum cosine DISTANCE (`1 - cosine_similarity`, range `[0, 2]`) at which
+/// the similarity linker creates a `references` link (W1.1 recalibration).
+///
+/// Derivation: the pre-cosine linker threshold was an L2 distance of `0.6`.
+/// For unit vectors `L2 = sqrt(2 - 2*cos_sim)`, so `L2 <= 0.6` is exactly
+/// `cos_sim >= 1 - 0.6^2/2 = 0.82`, i.e. cosine distance `<= 0.18`. Using the
+/// equivalent value keeps link creation at parity with the old behavior for
+/// the normalized embeddings every shipped provider produces.
+///
+/// Single source of truth: `rb-engine`'s `SimilarityLinker::default` gates new
+/// links with it, and `rb-store`'s one-shot vector-schema rebuild re-scores
+/// existing `reason = 'similar'` links against it (dropping those above it).
+/// It lives here because rb-engine and rb-store do not depend on each other.
+pub const SIMILARITY_LINK_MAX_COSINE_DISTANCE: f32 = 0.18;
+
 /// A directed, typed relationship between two memories with a confidence/strength.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryLink {

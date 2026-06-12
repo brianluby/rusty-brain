@@ -20,7 +20,7 @@ mod validate;
 pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
 pub use job::JobKind;
-pub use link::MemoryLink;
+pub use link::{MemoryLink, SIMILARITY_LINK_MAX_COSINE_DISTANCE};
 pub use link_type::LinkType;
 pub use memory::MemoryNote;
 pub use memory_id::MemoryId;
