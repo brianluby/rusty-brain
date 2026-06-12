@@ -165,7 +165,7 @@ impl DaemonProxy for ClientProxy {
     // including Remember. A RECV failure after a successful send is ambiguous
     // for mutating ops (the daemon may have committed and only the response was
     // lost), so only read-only ops are retried; mutating ops return the error
-    // but the connection is rebuilt so the NEXT call succeeds.
+    // and the NEXT call rebuilds the connection lazily.
     async fn call(&mut self, request: Request) -> rb_types::Result<Response> {
         let failure = {
             let client = self.ensure_connected().await?;
@@ -183,10 +183,11 @@ impl DaemonProxy for ClientProxy {
             CallFailure::Recv(_) => retry_safe_after_send(&request),
         };
         if !retryable {
-            // Best-effort eager reconnect so the next call starts healthy.
-            if let Err(e) = self.reconnect().await {
-                tracing::warn!(error = %e, "mcp proxy reconnect after ambiguous failure failed");
-            }
+            // Surface the ambiguous failure immediately. An eager reconnect
+            // here can block ~20s (backoff attempts x auto-start retries) while
+            // serial stdio dispatch stalls every other tool call — and buys
+            // nothing: `self.client` is None, so the next call reconnects
+            // lazily via `ensure_connected`.
             return Err(failure.into_error());
         }
 

@@ -157,6 +157,32 @@ pub fn default_db_path() -> Result<PathBuf> {
     Ok(data_base_dir()?.join("rusty-brain").join("memory.db"))
 }
 
+/// One env-override rule for every binary: a set var whose trimmed value is
+/// non-empty wins; unset, empty, or whitespace-only falls back to the default.
+/// Hooks, CLI, and daemon all resolve through this single rule so a malformed
+/// override can never make them disagree (the F03/F12/F49 divergence class).
+fn env_override(name: &str) -> Option<String> {
+    std::env::var(name)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+}
+
+/// Resolve the socket path: `RUSTY_BRAIN_SOCKET` override, else the default.
+pub fn socket_path_from_env() -> Result<PathBuf> {
+    match env_override(SOCKET_ENV) {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => default_socket_path(),
+    }
+}
+
+/// Resolve the database path: `RUSTY_BRAIN_DB` override, else the default.
+pub fn db_path_from_env() -> Result<PathBuf> {
+    match env_override(DB_ENV) {
+        Some(p) => Ok(PathBuf::from(p)),
+        None => default_db_path(),
+    }
+}
+
 /// The current OS user, for provenance fallback (W0.5): `USER` then `LOGNAME`,
 /// `None` in a degenerate environment. The daemon stamps this onto memories
 /// written by clients that declared no identity (same-host UDS, so the
@@ -268,6 +294,32 @@ mod tests {
             p.starts_with(dir.path()),
             "socket must live under XDG_RUNTIME_DIR when set: {p:?}"
         );
+    }
+
+    #[test]
+    fn env_overrides_win_when_set_to_a_real_path() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("override.sock");
+        let db = dir.path().join("override.db");
+        let _g1 = EnvGuard::set(SOCKET_ENV, &sock);
+        let _g2 = EnvGuard::set(DB_ENV, &db);
+        assert_eq!(socket_path_from_env().unwrap(), sock);
+        assert_eq!(db_path_from_env().unwrap(), db);
+    }
+
+    // W0.2: a whitespace-only override is not a path. Every binary must fall
+    // back to the default here, or hooks and CLI resolve different sockets.
+    #[test]
+    fn whitespace_only_env_overrides_fall_back_to_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::set(SOCKET_ENV, std::path::Path::new("  "));
+        let _g2 = EnvGuard::set(DB_ENV, std::path::Path::new("  "));
+        assert_eq!(
+            socket_path_from_env().unwrap(),
+            default_socket_path().unwrap()
+        );
+        assert_eq!(db_path_from_env().unwrap(), default_db_path().unwrap());
     }
 
     #[test]

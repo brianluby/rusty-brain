@@ -251,34 +251,62 @@ flowchart TD
 ```
 
 The CLI and hooks resolve the current namespace off the async runtime before any work
-begins: they look for a project marker (a `CLAUDE.md` with a `project:` front-matter
-key or first H1), then the git top-level directory name, then the working directory,
-falling back to `global`. Detection shells out to git and reads files, so it runs
-synchronously off the runtime to respect the "no blocking I/O on async workers" rule.
+begins, through one shared implementation (`rb-config`), first hit wins:
+
+1. an explicit `--namespace` flag or `RUSTY_BRAIN_NAMESPACE` env override;
+2. a repo-committed `.rusty-brain.toml` (`namespace = "..."`) at the git toplevel —
+   identity survives cloning under any directory name;
+3. a `CLAUDE.md` front-matter `project:` key, walking from the working directory up to
+   and *including* the git toplevel, never past it (there is no first-H1 fallback). A
+   `project:` that differs from the toplevel name is never silently trusted: the CLI
+   warns and uses it only once pinned via `--accept-namespace-override` (known-hosts
+   style); hooks never honor an unpinned override — they log it and fall back — so a
+   malicious repo's own `CLAUDE.md` cannot claim another project's namespace;
+4. the git top-level directory name;
+5. the working directory name; else `global`.
+
+Detection shells out to git and reads files, so it runs synchronously off the runtime
+to respect the "no blocking I/O on async workers" rule.
 
 ## Storage layout
 
 A single SQLite file holds everything, opened in WAL mode:
 
 - **`memories`** — the note rows (content, enrichment, type, importance, confidence,
-  timestamps, archive/supersede state, and the embedding model + composition-version
-  stamps).
+  timestamps, archive/supersede state, the embedding model + composition-version
+  stamps, and provenance: `origin_user`, `origin_host`, `origin_agent`,
+  `origin_source`, `session_id` — nullable, never backfilled, so pre-provenance rows
+  keep `NULL`).
 - **`memory_vectors`** — a `sqlite-vec` virtual table of embeddings, one per memory.
 - **`memory_links`** — directed edges between memories (e.g. `references`,
   `contradicts`) with a decaying strength.
+- **`memory_oplog`** — a durable operation log: one row per mutation (insert, update,
+  archive, supersede, link/unlink, confidence and link-strength changes), appended in
+  the same transaction as the mutation itself, ordered by a site-local monotonic `seq`
+  and stamped with this database's `site_id`.
 - **full-text index** — an FTS5 index over content for keyword search.
-- **`meta`** — invariants seeded at init, including the embedding dimension and the
-  current embedding composition version.
+- **`meta`** — invariants seeded at init: the embedding dimension, the embedding model
+  identity, the current embedding composition version, and the `site_id` (uuid v4)
+  stamped onto oplog rows.
 
 Migrations are individual `NNN_*.sql` files discovered at build time, checksummed, and
 applied transactionally. A CI test builds a brand-new database from the committed SQL
 and runs every query path against it, so the schema the code expects and the schema the
 migrations produce cannot silently diverge.
 
-The embedding dimension is the load-bearing invariant: it is seeded on first init and
-verified on every startup, and every vector read is length-checked. A provider whose
-dimension disagrees with the stored value makes the daemon refuse to start rather than
-write mismatched vectors.
+Two open-time invariants are load-bearing and fail closed. The embedding dimension is
+seeded on first init and verified on every startup, and every vector read is
+length-checked: a provider whose dimension disagrees with the stored value makes the
+daemon refuse to start rather than write mismatched vectors. The embedding model
+identity (`meta.embedding_model`) is the second: a same-dimension provider swap also
+refuses to start — mixed vector spaces must be impossible — unless explicitly accepted
+via `serve --accept-model-change` (or `RB_ACCEPT_MODEL_CHANGE=1` for auto-started
+daemons) followed by a corpus `reembed`.
+
+The database file holds captured memory text, so it gets the same posture as the
+daemon socket: the file is created `0600` and tightened fail-closed on every open
+(including leftover `-wal`/`-shm` siblings from an unclean shutdown), and the daemon
+creates the data directory `0700` when it creates it.
 
 ## What is intentionally out of scope (for now)
 

@@ -50,10 +50,13 @@ const REDACT_RULES: &[(&str, &str)] = &[
     // Bare bearer tokens outside a header context.
     (r"(?i)\bbearer\s+[A-Za-z0-9._~+/=\-]+", "[REDACTED:bearer]"),
     // key=value / key: value where the key CONTAINS a credential word
-    // (covers GITHUB_TOKEN=..., my_api_key: ..., passwd=...). The key and
-    // separator are kept; only the value is replaced.
+    // (covers GITHUB_TOKEN=..., my_api_key: ..., passwd=...), including
+    // JSON-quoted keys ({"password":"..."}): the optional closing quote before
+    // the separator is matched too, or `extract_response_text`'s serialized
+    // object form would smuggle a structured credential past the rule. The key
+    // and separator are kept; only the value is replaced.
     (
-        r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_-]?key|authorization)[A-Za-z0-9_\-]*)(\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"']+)"#,
+        r#"(?i)\b([A-Za-z0-9_\-]*(?:password|passwd|secret|token|api[_-]?key|authorization)[A-Za-z0-9_\-]*)(["']?\s*[:=]\s*)("[^"\n]*"|'[^'\n]*'|[^\s"']+)"#,
         "${1}${2}[REDACTED:credential]",
     ),
 ];
@@ -479,6 +482,26 @@ mod tests {
                 out.contains("[REDACTED:"),
                 "{input:?} must carry a marker: {out}"
             );
+        }
+    }
+
+    #[test]
+    fn redact_catches_credentials_in_serialized_json_tool_responses() {
+        // The exact composition post_tool_use applies to an object-valued
+        // tool_response: serialize via extract_response_text, then redact. A
+        // JSON-quoted key must not slip past the kv rule (the closing quote
+        // sits between the key and the colon).
+        for (response, secret) in [
+            (serde_json::json!({"password": "hunter2"}), "hunter2"),
+            (serde_json::json!({"api_key": "k-123"}), "k-123"),
+            (
+                serde_json::json!({"nested": {"github_token": "ghp_abc"}}),
+                "ghp_abc",
+            ),
+        ] {
+            let out = redact(&extract_response_text(&response));
+            assert!(!out.contains(secret), "{response} leaked: {out}");
+            assert!(out.contains("[REDACTED:credential]"), "{response}: {out}");
         }
     }
 

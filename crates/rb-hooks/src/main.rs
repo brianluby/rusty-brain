@@ -182,25 +182,16 @@ fn continue_result() -> HookResult {
 }
 
 /// Resolve the daemon socket path: `RUSTY_BRAIN_SOCKET` override, else the
-/// rb-config default shared with the daemon and CLI.
+/// rb-config default. Delegates so hooks, CLI, and daemon share ONE override
+/// rule and can never resolve different sockets (F03/F12/F49).
 fn socket_path() -> rb_types::Result<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os(rb_config::SOCKET_ENV) {
-        if !p.is_empty() {
-            return Ok(std::path::PathBuf::from(p));
-        }
-    }
-    rb_config::default_socket_path()
+    rb_config::socket_path_from_env()
 }
 
 /// Resolve the daemon db path: `RUSTY_BRAIN_DB` override, else the rb-config
-/// default shared with the daemon and CLI.
+/// default. Same single-rule delegation as [`socket_path`].
 fn db_path() -> rb_types::Result<std::path::PathBuf> {
-    if let Some(p) = std::env::var_os(rb_config::DB_ENV) {
-        if !p.is_empty() {
-            return Ok(std::path::PathBuf::from(p));
-        }
-    }
-    rb_config::default_db_path()
+    rb_config::db_path_from_env()
 }
 
 /// Resolve the `rusty-brain` DAEMON binary for auto-start.
@@ -336,6 +327,26 @@ mod tests {
 
         assert_eq!(socket_path().unwrap(), sock);
         assert_eq!(db_path().unwrap(), db);
+    }
+
+    // A whitespace-only override is not a path: hooks must fall back to the
+    // daemon default exactly like the CLI does (both delegate to rb-config),
+    // not treat " " as a real socket — the W0.2 divergence class.
+    #[test]
+    fn whitespace_only_overrides_agree_with_daemon_defaults() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let _g1 = EnvGuard::set("RUSTY_BRAIN_SOCKET", std::path::Path::new("  "));
+        let _g2 = EnvGuard::set("RUSTY_BRAIN_DB", std::path::Path::new("  "));
+        assert_eq!(
+            socket_path().unwrap(),
+            rb_daemon::default_socket_path().unwrap(),
+            "whitespace socket override must fall back to the daemon default"
+        );
+        assert_eq!(
+            db_path().unwrap(),
+            rb_daemon::default_db_path().unwrap(),
+            "whitespace db override must fall back to the daemon default"
+        );
     }
 
     #[test]

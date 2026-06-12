@@ -46,6 +46,13 @@ Target: claudecode 3→6, correctness +1, teamfit +1. Everything here either unb
 **Phase 0 gate (three tiers, replacing "fresh macOS machine" as a manual ritual):**
 (a) **per-PR CI**: path-agreement tests + fixture-driven hook lifecycle e2e on ubuntu *and* macos runners, idle test with injected short timeout; (b) **nightly, allowed-to-fail with alerting**: real Claude Code headless (`claude -p`) smoke on macOS with an API-key secret — capture → idle → recall reaches **one** daemon and **one** 0600 DB; (c) **once per phase**: scripted fresh-machine checklist (`scripts/verify-fresh-install.sh`) using the W0.6 artifact. Plus: a hook-written memory carries author/source/seq/confidence; planted fake secret yields zero plaintext grep hits in the DB; two clones of the same repo resolve the same namespace.
 
+**Phase-0 carryover debt (recorded deferrals — must land before/with early Phase 1):**
+
+- **W0.2 config file.** `~/.config/rusty-brain/config.toml` was not introduced; the env allowlist grew to 13 entries (the three specified vars plus `RB_ACCEPT_MODEL_CHANGE` and `RUSTY_BRAIN_IDLE_TIMEOUT_SECS`) instead of shrinking to secrets + XDG/HOME. The F20 bug *class* (config reaching a foreground daemon but not auto-started ones) stays open — only known instances are fixed, and every new daemon knob must remember to extend `FORWARD_ENV` until the config file lands.
+- **W0.3 namespace-rename helper.** The one-time wire op + `rusty-brain namespace rename` was deferred. §11's dogfood-data lifecycle depends on it: memories captured before a repo pins identity via `.rusty-brain.toml` land under the heuristic directory-name namespace and cannot be re-scoped until it ships — land it pre-dogfood.
+- **W0.7 hook-event fixtures.** Only the real Claude Code `settings.json` was recorded; real hook-event payload fixtures (PostToolUse/SessionStart/Stop/PreCompact as Claude Code actually emits them) are still missing — rb-hooks integration tests run on hand-authored payloads. W3.4 and gate tier (a)'s "fixture-driven hook lifecycle e2e" assume the full set.
+- **Gate tiers (b)/(c).** The nightly real-Claude-Code smoke workflow does not exist (blocked on the S1 spike: prove `claude -p` fires hooks headlessly), and the planted-secret check is asserted at the wire (Remember payload), not by grepping a DB file.
+
 ---
 
 ## 4. Phase 1 — Measure, then fix retrieval semantics + hard robustness

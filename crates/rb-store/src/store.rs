@@ -163,29 +163,54 @@ impl SqliteStore {
         embedding_model: Option<&str>,
     ) -> Result<Self> {
         register_vec()?;
+        // The DB file holds captured memory text: owner-only (0600), parity with
+        // the daemon socket. Pre-create a missing file at 0600 so it is never
+        // observable at the umask-derived default (Connection::open would create
+        // it 0644 and leave a read window until the chmod below). Then chmod
+        // fail-closed on every open — tightening a loose pre-W0.5 DB — including
+        // any leftover `-wal`/`-shm` siblings: SQLite copies the main file's
+        // mode only when it CREATES a sibling, so a 0644 WAL surviving an
+        // unclean shutdown would otherwise keep collecting memory content at
+        // 0644 for the daemon's whole lifetime.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    io_err(std::io::Error::other(format!(
+                        "create 0600 {}: {e}",
+                        path.display()
+                    )))
+                })?;
+            for sibling in ["", "-wal", "-shm"] {
+                let mut os = path.as_os_str().to_os_string();
+                os.push(sibling);
+                let p = std::path::PathBuf::from(os);
+                match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    // Absent siblings are the common case; only NotFound passes.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(io_err(std::io::Error::other(format!(
+                            "chmod 0600 {}: {e}",
+                            p.display()
+                        ))))
+                    }
+                }
+            }
+        }
         let conn = rusqlite::Connection::open(path).map_err(|e| {
             io_err(std::io::Error::other(format!(
                 "open {}: {e}",
                 path.display()
             )))
         })?;
-        // The DB file holds captured memory text: owner-only (0600), parity with
-        // the daemon socket. Applied fail-closed on every open so a pre-W0.5 DB
-        // is tightened too. SQLite's unix VFS creates `-wal`/`-shm` siblings
-        // copying the main file's mode, and they appear only at first write —
-        // after this chmod — so they inherit 0600.
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).map_err(
-                |e| {
-                    io_err(std::io::Error::other(format!(
-                        "chmod 0600 {}: {e}",
-                        path.display()
-                    )))
-                },
-            )?;
-        }
         Self::init(conn, embedding_dim, embedding_model)
     }
 
@@ -382,19 +407,54 @@ impl SqliteStore {
         link_type: rb_types::LinkType,
         strength: f32,
     ) -> Result<()> {
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — link strength is durable graph state replay must reproduce.
         self.conn
-            .execute(
-                "UPDATE memory_links SET strength = ?1
-                 WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
-                rusqlite::params![
-                    strength as f64,
-                    source.to_string(),
-                    target.to_string(),
-                    link_type.as_str(),
-                ],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memory_links SET strength = ?1
+                     WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
+                    rusqlite::params![
+                        strength as f64,
+                        source.to_string(),
+                        target.to_string(),
+                        link_type.as_str(),
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({
+                    "type": link_type.as_str(),
+                    "target": target.to_string(),
+                    "strength": strength,
+                })
+                .to_string();
+                append_oplog(
+                    &self.conn,
+                    &self.site_id,
+                    "set_link_strength",
+                    source,
+                    &details,
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
@@ -407,13 +467,37 @@ impl SqliteStore {
                 "confidence {confidence} out of range 0.0..=1.0"
             )));
         }
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — confidence is durable ranking state replay must reproduce.
         self.conn
-            .execute(
-                "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
-                rusqlite::params![confidence as f64, id.to_string()],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![confidence as f64, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({ "confidence": confidence }).to_string();
+                append_oplog(&self.conn, &self.site_id, "set_confidence", id, &details)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Read a value from the key/value `meta` table (e.g. the
@@ -421,17 +505,7 @@ impl SqliteStore {
     /// key is absent. A small read helper for invariant checks and the migration
     /// reproducibility gate.
     pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                rusqlite::params![key],
-                |r| r.get::<_, String>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(Error::Storage(other.to_string())),
-            })
+        meta_value(&self.conn, key)
     }
 
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -442,14 +516,42 @@ impl SqliteStore {
         target: &MemoryId,
         link_type: rb_types::LinkType,
     ) -> Result<()> {
+        // Transaction: the DELETE and its oplog row commit (or roll back)
+        // together — a pruned edge must be reproducible from the log.
         self.conn
-            .execute(
-                "DELETE FROM memory_links
-                 WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
-                rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "DELETE FROM memory_links
+                     WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
+                    rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({
+                    "type": link_type.as_str(),
+                    "target": target.to_string(),
+                })
+                .to_string();
+                append_oplog(&self.conn, &self.site_id, "unlink", source, &details)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Find active memories in `ns` whose stored vector is near-identical to the
@@ -3928,6 +4030,70 @@ mod oplog_tests {
     }
 
     #[test]
+    fn set_confidence_appends_oplog_only_on_real_change() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to score");
+        store.set_confidence(&MemoryId::new(), 0.5).unwrap(); // missing no-op
+        store.set_confidence(&n.id, 0.4).unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2, "insert + exactly one set_confidence");
+        assert_eq!(rows[1].0, "set_confidence");
+        assert_eq!(rows[1].1, n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[1].4).unwrap();
+        let logged = details["confidence"].as_f64().unwrap();
+        assert!(
+            (logged - 0.4).abs() < 1e-6,
+            "confidence in details: {logged}"
+        );
+    }
+
+    #[test]
+    fn set_link_strength_and_delete_link_append_oplog_with_edge_details() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: LinkType::Extends,
+                strength: 0.9,
+                reason: "a extends b".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        store
+            .set_link_strength(&a.id, &b.id, LinkType::Extends, 0.5)
+            .unwrap();
+        // Missing-edge ops stay silent no-ops (decay is best-effort): no rows.
+        store
+            .set_link_strength(&a.id, &b.id, LinkType::Contradicts, 0.5)
+            .unwrap();
+        store
+            .delete_link(&a.id, &b.id, LinkType::Contradicts)
+            .unwrap();
+        store.delete_link(&a.id, &b.id, LinkType::Extends).unwrap();
+
+        let rows = oplog_rows(&store);
+        assert_eq!(
+            rows.len(),
+            5,
+            "two inserts + link + set_link_strength + unlink"
+        );
+        assert_eq!(rows[3].0, "set_link_strength");
+        assert_eq!(rows[3].1, a.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[3].4).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], b.id.to_string());
+        assert!((details["strength"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(rows[4].0, "unlink");
+        assert_eq!(rows[4].1, a.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[4].4).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], b.id.to_string());
+    }
+
+    #[test]
     fn failed_insert_rolls_back_memory_and_oplog_together() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         // A link to a missing target violates the FK AFTER both the memories row
@@ -4104,5 +4270,32 @@ mod db_perms_tests {
         std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(SqliteStore::open(&db, 8).unwrap());
         assert_eq!(mode_of(&db), 0o600, "open must tighten a loose pre-W0.5 DB");
+    }
+
+    #[test]
+    fn reopen_tightens_a_pre_existing_loose_wal_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loose-wal.db");
+        drop(SqliteStore::open(&db, 8).unwrap());
+        // An unclean daemon death leaves the -wal behind (it is only removed on
+        // a clean close); a pre-W0.5 install left it 0644 and SQLite reuses the
+        // file as-is on reopen, so open must tighten it too.
+        let wal = dir.path().join("loose-wal.db-wal");
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let n = MemoryNote::new(
+            Namespace::Project("perm".into()),
+            "wal probe".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&n, None).unwrap();
+        assert!(wal.exists(), "-wal must exist after a write");
+        assert_eq!(
+            mode_of(&wal),
+            0o600,
+            "open must tighten a loose pre-existing -wal"
+        );
     }
 }
