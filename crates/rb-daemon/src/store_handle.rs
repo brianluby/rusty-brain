@@ -126,16 +126,38 @@ struct ReadPool {
 }
 
 impl ReadPool {
-    fn open(db_path: &Path, dim: usize, size: usize) -> Result<Self> {
+    fn open(db_path: &Path, dim: usize, model: Option<&str>, size: usize) -> Result<Self> {
         let mut stores = Vec::with_capacity(size);
         for _ in 0..size {
-            stores.push(SqliteStore::open(db_path, dim)?);
+            stores.push(open_store(db_path, dim, model)?);
         }
         Ok(Self {
             permits: Arc::new(Semaphore::new(size)),
             stores: Arc::new(Mutex::new(stores)),
         })
     }
+}
+
+/// Open one store connection, enforcing the embedding-model invariant whenever
+/// a model identity is bound (the daemon path; tests may pass `None`).
+fn open_store(db_path: &Path, dim: usize, model: Option<&str>) -> Result<SqliteStore> {
+    match model {
+        Some(model) => SqliteStore::open_with_model(db_path, dim, model),
+        None => SqliteStore::open(db_path, dim),
+    }
+}
+
+/// Explicit opt-in for an embedding-model swap (`--accept-model-change` /
+/// `RB_ACCEPT_MODEL_CHANGE`): atomically adopt `new_model` and stale every
+/// row's embedding stamp so the reembed machinery converges the corpus. Runs
+/// BEFORE the daemon's model-verified opens; a missing DB is a no-op (a fresh
+/// DB seeds the model at first open). Returns `true` when a swap occurred.
+pub fn accept_model_change(db_path: &Path, embedding_dim: usize, new_model: &str) -> Result<bool> {
+    if !db_path.exists() {
+        return Ok(false);
+    }
+    let store = SqliteStore::open(db_path, embedding_dim)?;
+    store.accept_model_change(new_model)
 }
 
 /// RAII guard that holds a popped `SqliteStore` and pushes it back to the pool
@@ -154,11 +176,38 @@ impl Drop for PoolGuard {
 }
 
 impl StoreHandle {
-    /// Start the writer thread and open the read pool.
+    /// Start the writer thread and open the read pool without binding an
+    /// embedding-model identity (test seam; no model invariant enforced).
     pub fn start(db_path: PathBuf, embedding_dim: usize, read_pool_size: usize) -> Result<Self> {
+        Self::start_inner(db_path, embedding_dim, None, read_pool_size)
+    }
+
+    /// Start the writer thread and open the read pool, enforcing the
+    /// embedding-model invariant on every connection (the daemon path).
+    pub fn start_with_model(
+        db_path: PathBuf,
+        embedding_dim: usize,
+        embedding_model: String,
+        read_pool_size: usize,
+    ) -> Result<Self> {
+        Self::start_inner(
+            db_path,
+            embedding_dim,
+            Some(embedding_model),
+            read_pool_size,
+        )
+    }
+
+    fn start_inner(
+        db_path: PathBuf,
+        embedding_dim: usize,
+        embedding_model: Option<String>,
+        read_pool_size: usize,
+    ) -> Result<Self> {
         let pool = Arc::new(ReadPool::open(
             &db_path,
             embedding_dim,
+            embedding_model.as_deref(),
             read_pool_size.max(1),
         )?);
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
@@ -173,6 +222,7 @@ impl StoreHandle {
                 writer_loop(
                     writer_path,
                     embedding_dim,
+                    embedding_model,
                     writer_rx,
                     writer_events,
                     ready_tx,
@@ -468,6 +518,7 @@ fn run_store_op<F>(
     store: &mut Option<SqliteStore>,
     db_path: &Path,
     embedding_dim: usize,
+    embedding_model: Option<&str>,
     op: F,
 ) -> StoreOpReport
 where
@@ -499,7 +550,7 @@ where
             // transaction is closed before the replacement connection is opened.
             drop(store.take());
 
-            match SqliteStore::open(db_path, embedding_dim) {
+            match open_store(db_path, embedding_dim, embedding_model) {
                 Ok(reopened) => {
                     *store = Some(reopened);
                     StoreOpReport {
@@ -533,11 +584,12 @@ fn panic_for_test_store_op(_store: &SqliteStore) -> Result<()> {
 fn writer_loop(
     db_path: PathBuf,
     embedding_dim: usize,
+    embedding_model: Option<String>,
     mut rx: mpsc::Receiver<WriteCommand>,
     events: broadcast::Sender<MemoryChanged>,
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
 ) {
-    let mut store = match SqliteStore::open(&db_path, embedding_dim) {
+    let mut store = match open_store(&db_path, embedding_dim, embedding_model.as_deref()) {
         Ok(store) => {
             let _ = ready_tx.send(Ok(()));
             Some(store)
@@ -557,9 +609,13 @@ fn writer_loop(
             } => {
                 let namespace = note.namespace.clone();
                 let id = note.id.clone();
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.insert_memory(&note, embedding.as_deref())
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.insert_memory(&note, embedding.as_deref()),
+                );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -583,15 +639,19 @@ fn writer_loop(
                 updates,
                 reply,
             } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    match s.get_memory(&id) {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| match s.get_memory(&id) {
                         Ok(Some(note)) if note.namespace == namespace => {
                             s.update_memory(&id, &updates)
                         }
                         Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
                         Err(e) => Err(e),
-                    }
-                });
+                    },
+                );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -614,13 +674,17 @@ fn writer_loop(
                 id,
                 reply,
             } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    match s.get_memory(&id) {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| match s.get_memory(&id) {
                         Ok(Some(note)) if note.namespace == namespace => s.archive_memory(&id),
                         Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
                         Err(e) => Err(e),
-                    }
-                });
+                    },
+                );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -639,8 +703,13 @@ fn writer_loop(
                 }
             }
             WriteCommand::AddLink { link, reply } => {
-                let report =
-                    run_store_op(&mut store, &db_path, embedding_dim, |s| s.add_link(&link));
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.add_link(&link),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -648,9 +717,13 @@ fn writer_loop(
                 }
             }
             WriteCommand::RecordAccess { id, reply } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.record_access(&id)
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.record_access(&id),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -659,9 +732,13 @@ fn writer_loop(
             }
             WriteCommand::RecordAccesses { ids, reply } => {
                 // No MemoryChanged event: access tracking is observability-only.
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.record_accesses(&ids)
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.record_accesses(&ids),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -675,9 +752,13 @@ fn writer_loop(
                 strength,
                 reply,
             } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.set_link_strength(&source, &target, link_type, strength)
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.set_link_strength(&source, &target, link_type, strength),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -690,9 +771,13 @@ fn writer_loop(
                 link_type,
                 reply,
             } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.delete_link(&source, &target, link_type)
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.delete_link(&source, &target, link_type),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -705,22 +790,28 @@ fn writer_loop(
                 new,
                 reply,
             } => {
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    // Mirror the Update/Archive arms: verify BOTH memories live in
-                    // the caller's namespace before mutating, so the primitive can
-                    // never merge across namespaces and the Archived event below is
-                    // provably published under `old`'s real namespace. Fail closed
-                    // (NotFound) on a missing or cross-namespace target.
-                    match (s.get_memory(&old), s.get_memory(&new)) {
-                        (Ok(Some(o)), Ok(Some(n)))
-                            if o.namespace == namespace && n.namespace == namespace =>
-                        {
-                            s.supersede(&old, &new)
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        // Mirror the Update/Archive arms: verify BOTH memories live in
+                        // the caller's namespace before mutating, so the primitive can
+                        // never merge across namespaces and the Archived event below is
+                        // provably published under `old`'s real namespace. Fail closed
+                        // (NotFound) on a missing or cross-namespace target.
+                        match (s.get_memory(&old), s.get_memory(&new)) {
+                            (Ok(Some(o)), Ok(Some(n)))
+                                if o.namespace == namespace && n.namespace == namespace =>
+                            {
+                                s.supersede(&old, &new)
+                            }
+                            (Err(e), _) | (_, Err(e)) => Err(e),
+                            _ => Err(Error::NotFound(old.clone())),
                         }
-                        (Err(e), _) | (_, Err(e)) => Err(e),
-                        _ => Err(Error::NotFound(old.clone())),
-                    }
-                });
+                    },
+                );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -749,9 +840,13 @@ fn writer_loop(
             } => {
                 // No MemoryChanged event: re-embed only refreshes the vector for
                 // search quality; the note's user-visible content is unchanged.
-                let report = run_store_op(&mut store, &db_path, embedding_dim, |s| {
-                    s.update_vector(&id, &embedding, &model, &input_version)
-                });
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.update_vector(&id, &embedding, &model, &input_version),
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -760,8 +855,13 @@ fn writer_loop(
             }
             #[cfg(test)]
             WriteCommand::PanicForTest { reply } => {
-                let report =
-                    run_store_op(&mut store, &db_path, embedding_dim, panic_for_test_store_op);
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    panic_for_test_store_op,
+                );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if !writer_usable {
@@ -948,6 +1048,52 @@ mod tests {
 
     fn note(ns: &Namespace, body: &str) -> MemoryNote {
         MemoryNote::new(ns.clone(), body.to_string(), MemoryType::Insight, 5)
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn start_with_model_refuses_a_swapped_model_then_accept_recovers() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+
+        // Seed the DB under one model identity (a real write so rows exist).
+        let handle =
+            StoreHandle::start_with_model(db.clone(), DIM, "deterministic".into(), 1).unwrap();
+        let ns = Namespace::Project("model-swap".to_string());
+        let mut seeded = note(&ns, "seeded under deterministic");
+        seeded.embedding_input_version = "v2-composite".to_string();
+        let id = seeded.id.clone();
+        handle.write(seeded, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.shutdown().await;
+
+        // A same-dim model swap must fail closed with the remediation hint.
+        let err = StoreHandle::start_with_model(db.clone(), DIM, "voyage-3".into(), 1)
+            .map(|_| ())
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedding model changed") && msg.contains("--accept-model-change"),
+            "refusal must carry the hint: {msg}"
+        );
+
+        // Explicit opt-in: swap + stale, then the model-verified start succeeds.
+        let changed = accept_model_change(&db, DIM, "voyage-3").unwrap();
+        assert!(changed, "a real swap reports true");
+        let handle = StoreHandle::start_with_model(db, DIM, "voyage-3".into(), 1).unwrap();
+        let got = handle.get(ns, id).await.unwrap().unwrap();
+        assert_eq!(
+            got.embedding_input_version, "",
+            "accepted swap stales the row to the reembed sentinel"
+        );
+        handle.shutdown().await;
+    }
+
+    #[test]
+    fn accept_model_change_is_a_noop_for_a_missing_db() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("never-created.db");
+        let changed = accept_model_change(&db, DIM, "voyage-3").unwrap();
+        assert!(!changed, "nothing to accept on a fresh install");
+        assert!(!db.exists(), "the opt-in path must not create the DB");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

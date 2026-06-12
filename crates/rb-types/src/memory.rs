@@ -41,6 +41,22 @@ pub struct MemoryNote {
     /// `#[serde(default)]` so older payloads (and clients) default to `false`.
     #[serde(default)]
     pub contested: bool,
+    /// Provenance (W0.5): who/where/what wrote this memory. All optional and
+    /// `#[serde(default)]` (the `contested` precedent): rows written before the
+    /// 004 migration — and payloads from older clients — carry `None`.
+    /// `origin_user`/`origin_host` are filled daemon-side (whoami fallback);
+    /// `origin_agent`/`session_id` come from the client's handshake identity.
+    #[serde(default)]
+    pub origin_user: Option<String>,
+    #[serde(default)]
+    pub origin_host: Option<String>,
+    #[serde(default)]
+    pub origin_agent: Option<String>,
+    /// Producer surface that declared the write: `hook` | `mcp` | `cli` | `job`.
+    #[serde(default)]
+    pub origin_source: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 impl MemoryNote {
@@ -76,6 +92,11 @@ impl MemoryNote {
             embedding_input_version: String::new(),
             links: Vec::new(),
             contested: false,
+            origin_user: None,
+            origin_host: None,
+            origin_agent: None,
+            origin_source: None,
+            session_id: None,
         }
     }
 }
@@ -158,6 +179,30 @@ mod tests {
         let json = serde_json::to_string(&m).unwrap();
         let back: MemoryNote = serde_json::from_str(&json).unwrap();
         assert_eq!(m, back);
+    }
+
+    #[test]
+    fn deserializes_pre_w05_payload_missing_provenance_fields() {
+        // A pre-W0.5 MemoryNote JSON lacks the five provenance fields; they must
+        // deserialize to `None` (serde defaults), keeping old payloads valid.
+        let m = sample();
+        let mut value = serde_json::to_value(&m).unwrap();
+        let obj = value.as_object_mut().unwrap();
+        for key in [
+            "origin_user",
+            "origin_host",
+            "origin_agent",
+            "origin_source",
+            "session_id",
+        ] {
+            obj.remove(key);
+        }
+        let back: MemoryNote = serde_json::from_value(value).unwrap();
+        assert!(back.origin_user.is_none());
+        assert!(back.origin_host.is_none());
+        assert!(back.origin_agent.is_none());
+        assert!(back.origin_source.is_none());
+        assert!(back.session_id.is_none());
     }
 
     #[test]

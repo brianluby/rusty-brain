@@ -41,8 +41,10 @@ const REEMBED_MAX_LIMIT: usize = 10_000;
 const MAX_CONNECTIONS: usize = 256;
 /// Idle deadline for the initial handshake read (fail fast on stalled connects).
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
-/// Idle deadline between consecutive request frames from an established client.
-const REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+/// Default idle deadline between consecutive request frames from an established
+/// client; overridable via `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` (see
+/// [`parse_idle_timeout`]) so the idle/reconnect e2e runs in seconds.
+const DEFAULT_REQUEST_IDLE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// Static configuration for a daemon instance.
 #[derive(Clone, Debug)]
@@ -63,6 +65,18 @@ pub struct Daemon {
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
     jobs_config: JobsConfig,
+    request_idle_timeout: std::time::Duration,
+}
+
+/// Resolve the request idle timeout from an env value. Fail-safe: absent,
+/// empty, non-numeric, or zero values all use the default — a misconfigured
+/// override must never produce an instantly-dying or never-dying connection.
+fn parse_idle_timeout(value: Option<&str>) -> std::time::Duration {
+    value
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .filter(|&secs| secs > 0)
+        .map(std::time::Duration::from_secs)
+        .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT)
 }
 
 impl std::fmt::Debug for Daemon {
@@ -81,8 +95,7 @@ impl Daemon {
         let dim = embedder.dim();
 
         if let Some(parent) = config.db_path.parent() {
-            fs::create_dir_all(parent)
-                .map_err(|e| Error::Io(format!("create db dir {}: {e}", parent.display())))?;
+            prepare_db_dir(parent)?;
         }
 
         prepare_socket_dir(&config.socket_path)?;
@@ -111,7 +124,14 @@ impl Daemon {
             .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", config.socket_path.display())))?;
         bind_guard.mark_socket_bound();
 
-        let store = StoreHandle::start(config.db_path.clone(), dim, config.read_pool_size)?;
+        // Bind the embedder's model identity into every store open so a
+        // same-dim provider swap fails closed instead of mixing vector spaces.
+        let store = StoreHandle::start_with_model(
+            config.db_path.clone(),
+            dim,
+            embedder.model_id().to_string(),
+            config.read_pool_size,
+        )?;
 
         // Build the opt-in LLM enricher once (reqwest client is reused across
         // all connections). Activation requires RB_ENRICH_BASE_URL +
@@ -128,6 +148,10 @@ impl Daemon {
             }
         };
 
+        // Read once at bind so every connection of this daemon instance agrees.
+        let request_idle_timeout =
+            parse_idle_timeout(std::env::var(rb_config::IDLE_TIMEOUT_ENV).ok().as_deref());
+
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
             listener,
@@ -138,6 +162,7 @@ impl Daemon {
             pidfile_path,
             bind_guard,
             jobs_config: config.jobs_config,
+            request_idle_timeout,
         })
     }
 
@@ -152,6 +177,7 @@ impl Daemon {
             pidfile_path: _pidfile_path,
             mut bind_guard,
             jobs_config,
+            request_idle_timeout,
         } = self;
         tokio::pin!(shutdown);
         let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
@@ -186,8 +212,15 @@ impl Daemon {
                             };
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
-                                if let Err(e) =
-                                    handle_connection(stream, store, embedder, enricher, jobs_config).await
+                                if let Err(e) = handle_connection(
+                                    stream,
+                                    store,
+                                    embedder,
+                                    enricher,
+                                    jobs_config,
+                                    request_idle_timeout,
+                                )
+                                .await
                                 {
                                     warn!(error = %e, "connection ended with error");
                                 }
@@ -211,6 +244,32 @@ impl Daemon {
         info!("daemon shut down cleanly");
         Ok(())
     }
+}
+
+/// Create the DB's parent dir private (0700) when the daemon creates it —
+/// parity with the socket dir (W0.5). Unlike the socket dir, an EXISTING dir is
+/// accepted as-is: the daemon only owns dirs it created itself (the default
+/// data dir), while `RUSTY_BRAIN_DB` overrides and tests point into
+/// caller-owned dirs we must not chmod or reject. The DB file itself is always
+/// tightened to 0600 by rb-store at open, so the file stays private either way.
+fn prepare_db_dir(dir: &Path) -> Result<()> {
+    if dir.exists() {
+        // Mirror prepare_socket_dir: a non-directory here would otherwise
+        // surface later as an opaque SQLite open failure.
+        let metadata = fs::metadata(dir)
+            .map_err(|e| Error::Io(format!("stat db dir {}: {e}", dir.display())))?;
+        if !metadata.is_dir() {
+            return Err(Error::Io(format!(
+                "db parent {} is not a directory",
+                dir.display()
+            )));
+        }
+        return Ok(());
+    }
+    fs::create_dir_all(dir)
+        .map_err(|e| Error::Io(format!("create db dir {}: {e}", dir.display())))?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
+        .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", dir.display())))
 }
 
 fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
@@ -342,6 +401,7 @@ async fn probe_live(path: &Path) -> bool {
             let hs = Handshake {
                 contract_version: CONTRACT_VERSION,
                 namespace: rb_types::Namespace::Global,
+                identity: None,
             };
             if write_frame(&mut framed, &hs).await.is_err() {
                 return false;
@@ -365,6 +425,7 @@ async fn handle_connection(
     embedder: SharedEmbedder,
     enricher: Option<Arc<dyn Enricher>>,
     jobs_config: JobsConfig,
+    request_idle_timeout: std::time::Duration,
 ) -> Result<()> {
     let mut framed = bounded_framed(stream);
 
@@ -407,6 +468,19 @@ async fn handle_connection(
     };
     write_frame(&mut framed, &ack).await?;
 
+    // Connection-scoped provenance (W0.5): client-declared identity with a
+    // daemon-side whoami fallback for user/host (same-host UDS, so the daemon's
+    // view is authoritative when the client stays silent). agent/session/source
+    // are client knowledge only — an old client (no identity) leaves them None.
+    let identity = handshake.identity.unwrap_or_default();
+    let provenance = rb_engine::Provenance {
+        origin_user: identity.user.or_else(rb_config::current_user),
+        origin_host: identity.host.or_else(rb_config::current_hostname),
+        origin_agent: identity.agent,
+        origin_source: identity.source,
+        session_id: identity.session_id,
+    };
+
     let store_for_stream = store.clone();
     let job_store = store.clone();
     let engine = {
@@ -418,7 +492,7 @@ async fn handle_connection(
     };
     loop {
         // Break the loop if the client is idle for too long between requests.
-        let req: Request = match timeout(REQUEST_IDLE_TIMEOUT, read_frame(&mut framed)).await {
+        let req: Request = match timeout(request_idle_timeout, read_frame(&mut framed)).await {
             Ok(Ok(req)) => req,
             Ok(Err(_)) => break, // parse error or clean close
             Err(_) => {
@@ -433,7 +507,7 @@ async fn handle_connection(
             stream_changes(&mut framed, &store_for_stream, &namespace).await;
             break;
         }
-        let resp = dispatch(&engine, &job_store, &jobs_config, req).await;
+        let resp = dispatch(&engine, &job_store, &jobs_config, &provenance, req).await;
         write_frame(&mut framed, &resp).await?;
     }
 
@@ -500,6 +574,7 @@ async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
+    provenance: &rb_engine::Provenance,
     req: Request,
 ) -> Response
 where
@@ -517,6 +592,7 @@ where
             keywords,
             tags,
             related_files,
+            confidence,
         } => {
             let input = RememberInput {
                 content,
@@ -526,6 +602,8 @@ where
                 keywords,
                 tags,
                 related_files,
+                confidence,
+                provenance: provenance.clone(),
             };
             match engine.remember(input).await {
                 Ok(id) => Response::Remembered { id },
@@ -628,6 +706,36 @@ mod tests {
     }
 
     #[test]
+    fn prepare_db_dir_creates_missing_dir_private_and_leaves_existing_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let created = dir.path().join("data").join("rusty-brain");
+        prepare_db_dir(&created).unwrap();
+        let mode = fs::metadata(&created).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "daemon-created db dir must be private");
+
+        // An existing caller-owned dir is accepted untouched (the DB file is
+        // still 0600 via rb-store; only daemon-created dirs are tightened).
+        let existing = dir.path().join("caller-owned");
+        fs::create_dir(&existing).unwrap();
+        fs::set_permissions(&existing, fs::Permissions::from_mode(0o755)).unwrap();
+        prepare_db_dir(&existing).unwrap();
+        let mode = fs::metadata(&existing).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755, "daemon must not chmod caller-owned db dirs");
+    }
+
+    #[test]
+    fn prepare_db_dir_rejects_a_non_directory_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, b"x").unwrap();
+        let err = prepare_db_dir(&file).unwrap_err();
+        assert!(
+            err.to_string().contains("is not a directory"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
     fn prepare_socket_dir_rejects_public_existing_parent_without_chmod() {
         let dir = tempfile::tempdir().unwrap();
         let socket_dir = dir.path().join("public");
@@ -642,6 +750,37 @@ mod tests {
         );
         let mode = fs::metadata(&socket_dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o755, "daemon must not chmod caller-owned dirs");
+    }
+
+    #[test]
+    fn parse_idle_timeout_honors_valid_seconds() {
+        assert_eq!(
+            parse_idle_timeout(Some("1")),
+            std::time::Duration::from_secs(1)
+        );
+        assert_eq!(
+            parse_idle_timeout(Some(" 120 ")),
+            std::time::Duration::from_secs(120)
+        );
+    }
+
+    #[test]
+    fn parse_idle_timeout_falls_back_to_default_on_garbage() {
+        // Fail-safe: absent, empty, non-numeric, negative, and zero all default.
+        for bad in [
+            None,
+            Some(""),
+            Some("abc"),
+            Some("-5"),
+            Some("0"),
+            Some("1.5"),
+        ] {
+            assert_eq!(
+                parse_idle_timeout(bad),
+                DEFAULT_REQUEST_IDLE_TIMEOUT,
+                "value {bad:?} must fall back to the default"
+            );
+        }
     }
 
     #[test]

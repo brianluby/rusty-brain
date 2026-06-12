@@ -109,6 +109,9 @@ pub struct SqliteStore {
     /// Embedding dimension configured at open; used to fail-close dimension mismatches
     /// before touching the DB.
     pub(crate) embedding_dim: usize,
+    /// This database's `meta.site_id` (uuid v4, seeded at init), stamped on every
+    /// oplog row so logs from multiple machines stay distinguishable after a merge.
+    pub(crate) site_id: String,
 }
 
 impl std::fmt::Debug for SqliteStore {
@@ -133,26 +136,98 @@ impl SqliteStore {
     /// Registers sqlite-vec, enables WAL + foreign keys, runs migrations,
     /// creates the dynamic-dim `memory_vectors` table, and enforces the
     /// embedding-dimension invariant fail-closed.
+    ///
+    /// The embedding-MODEL invariant is NOT enforced here (no model is bound);
+    /// any path that serves a real embedding provider must open via
+    /// [`SqliteStore::open_with_model`] so a same-dim provider swap cannot
+    /// silently mix vector spaces.
     pub fn open(path: &Path, embedding_dim: usize) -> Result<Self> {
+        Self::open_inner(path, embedding_dim, None)
+    }
+
+    /// Open (or create) a store at `path`, enforcing BOTH embedding invariants:
+    /// the dimension and the model identity. Seeds `meta.embedding_model` on
+    /// first init; fails closed when the stored model differs from
+    /// `embedding_model` (remediation: [`SqliteStore::accept_model_change`]).
+    pub fn open_with_model(
+        path: &Path,
+        embedding_dim: usize,
+        embedding_model: &str,
+    ) -> Result<Self> {
+        Self::open_inner(path, embedding_dim, Some(embedding_model))
+    }
+
+    fn open_inner(
+        path: &Path,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+    ) -> Result<Self> {
         register_vec()?;
+        // The DB file holds captured memory text: owner-only (0600), parity with
+        // the daemon socket. Pre-create a missing file at 0600 so it is never
+        // observable at the umask-derived default (Connection::open would create
+        // it 0644 and leave a read window until the chmod below). Then chmod
+        // fail-closed on every open — tightening a loose pre-W0.5 DB — including
+        // any leftover `-wal`/`-shm` siblings: SQLite copies the main file's
+        // mode only when it CREATES a sibling, so a 0644 WAL surviving an
+        // unclean shutdown would otherwise keep collecting memory content at
+        // 0644 for the daemon's whole lifetime.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(false)
+                .mode(0o600)
+                .open(path)
+                .map_err(|e| {
+                    io_err(std::io::Error::other(format!(
+                        "create 0600 {}: {e}",
+                        path.display()
+                    )))
+                })?;
+            for sibling in ["", "-wal", "-shm"] {
+                let mut os = path.as_os_str().to_os_string();
+                os.push(sibling);
+                let p = std::path::PathBuf::from(os);
+                match std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o600)) {
+                    Ok(()) => {}
+                    // Absent siblings are the common case; only NotFound passes.
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        return Err(io_err(std::io::Error::other(format!(
+                            "chmod 0600 {}: {e}",
+                            p.display()
+                        ))))
+                    }
+                }
+            }
+        }
         let conn = rusqlite::Connection::open(path).map_err(|e| {
             io_err(std::io::Error::other(format!(
                 "open {}: {e}",
                 path.display()
             )))
         })?;
-        Self::init(conn, embedding_dim)
+        Self::init(conn, embedding_dim, embedding_model)
     }
 
     /// Open an ephemeral in-memory store with the given embedding dimension.
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self> {
         register_vec()?;
         let conn = rusqlite::Connection::open_in_memory().map_err(storage_err)?;
-        Self::init(conn, embedding_dim)
+        Self::init(conn, embedding_dim, None)
     }
 
-    /// Shared init path: pragmas, migrations, vectors table, dim invariant.
-    fn init(conn: rusqlite::Connection, embedding_dim: usize) -> Result<Self> {
+    /// Shared init path: pragmas, migrations, vectors table, dim invariant,
+    /// and (when a model is bound) the model-identity invariant.
+    fn init(
+        conn: rusqlite::Connection,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+    ) -> Result<Self> {
         // A zero-dimension embedding produces a malformed `float[0]` vec0 column.
         // Reject it up front rather than letting SQLite fail cryptically later.
         if embedding_dim == 0 {
@@ -186,11 +261,71 @@ impl SqliteStore {
         .map_err(storage_err)?;
 
         seed_or_verify_dim(&conn, embedding_dim)?;
+        if let Some(model) = embedding_model {
+            seed_or_verify_model(&conn, model)?;
+        }
+        let site_id = seed_or_get_site_id(&conn)?;
 
         Ok(Self {
             conn,
             embedding_dim,
+            site_id,
         })
+    }
+
+    /// This database's `meta.site_id` (uuid v4, seeded at init), stamped on
+    /// every `memory_oplog` row.
+    pub fn site_id(&self) -> &str {
+        &self.site_id
+    }
+
+    /// Explicit opt-in for an embedding-model swap: atomically point
+    /// `meta.embedding_model` at `new_model` and stale every row's
+    /// `embedding_input_version` to the `''` sentinel so the existing reembed
+    /// machinery converges the corpus onto the new vector space.
+    ///
+    /// Returns `true` when a swap occurred (rows were staled). Idempotent:
+    /// `false` when `new_model` is already current, or when no model was
+    /// recorded yet (legacy/fresh DB — it is seeded without staling, because
+    /// the per-row `embedding_model` stamps already drive reembed there).
+    pub fn accept_model_change(&self, new_model: &str) -> Result<bool> {
+        self.conn
+            .execute_batch("BEGIN IMMEDIATE;")
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        let result = (|| -> Result<bool> {
+            let stored = meta_value(&self.conn, "embedding_model")?;
+            if stored.as_deref() == Some(new_model) {
+                return Ok(false);
+            }
+            let swapping = stored.is_some();
+            self.conn
+                .execute(
+                    "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    rusqlite::params![new_model],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if swapping {
+                self.conn
+                    .execute("UPDATE memories SET embedding_input_version = ''", [])
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
+            Ok(swapping)
+        })();
+
+        match result {
+            Ok(changed) => {
+                self.conn
+                    .execute_batch("COMMIT;")
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                Ok(changed)
+            }
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Fold the WAL back into the main database file and truncate it to zero.
@@ -272,19 +407,54 @@ impl SqliteStore {
         link_type: rb_types::LinkType,
         strength: f32,
     ) -> Result<()> {
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — link strength is durable graph state replay must reproduce.
         self.conn
-            .execute(
-                "UPDATE memory_links SET strength = ?1
-                 WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
-                rusqlite::params![
-                    strength as f64,
-                    source.to_string(),
-                    target.to_string(),
-                    link_type.as_str(),
-                ],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memory_links SET strength = ?1
+                     WHERE source_id = ?2 AND target_id = ?3 AND link_type = ?4",
+                    rusqlite::params![
+                        strength as f64,
+                        source.to_string(),
+                        target.to_string(),
+                        link_type.as_str(),
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({
+                    "type": link_type.as_str(),
+                    "target": target.to_string(),
+                    "strength": strength,
+                })
+                .to_string();
+                append_oplog(
+                    &self.conn,
+                    &self.site_id,
+                    "set_link_strength",
+                    source,
+                    &details,
+                )?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
@@ -297,13 +467,37 @@ impl SqliteStore {
                 "confidence {confidence} out of range 0.0..=1.0"
             )));
         }
+        // Transaction: the UPDATE and its oplog row commit (or roll back)
+        // together — confidence is durable ranking state replay must reproduce.
         self.conn
-            .execute(
-                "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
-                rusqlite::params![confidence as f64, id.to_string()],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![confidence as f64, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({ "confidence": confidence }).to_string();
+                append_oplog(&self.conn, &self.site_id, "set_confidence", id, &details)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Read a value from the key/value `meta` table (e.g. the
@@ -311,17 +505,7 @@ impl SqliteStore {
     /// key is absent. A small read helper for invariant checks and the migration
     /// reproducibility gate.
     pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
-        self.conn
-            .query_row(
-                "SELECT value FROM meta WHERE key = ?1",
-                rusqlite::params![key],
-                |r| r.get::<_, String>(0),
-            )
-            .map(Some)
-            .or_else(|e| match e {
-                rusqlite::Error::QueryReturnedNoRows => Ok(None),
-                other => Err(Error::Storage(other.to_string())),
-            })
+        meta_value(&self.conn, key)
     }
 
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -332,14 +516,42 @@ impl SqliteStore {
         target: &MemoryId,
         link_type: rb_types::LinkType,
     ) -> Result<()> {
+        // Transaction: the DELETE and its oplog row commit (or roll back)
+        // together — a pruned edge must be reproducible from the log.
         self.conn
-            .execute(
-                "DELETE FROM memory_links
-                 WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
-                rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "DELETE FROM memory_links
+                     WHERE source_id = ?1 AND target_id = ?2 AND link_type = ?3",
+                    rusqlite::params![source.to_string(), target.to_string(), link_type.as_str(),],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            if affected > 0 {
+                let details = serde_json::json!({
+                    "type": link_type.as_str(),
+                    "target": target.to_string(),
+                })
+                .to_string();
+                append_oplog(&self.conn, &self.site_id, "unlink", source, &details)?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     /// Find active memories in `ns` whose stored vector is near-identical to the
@@ -603,20 +815,24 @@ fn register_vec() -> Result<()> {
     outcome.clone().map_err(Error::Storage)
 }
 
+/// Read one `meta` value; `None` when the key was never seeded.
+fn meta_value(conn: &rusqlite::Connection, key: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT value FROM meta WHERE key = ?1",
+        rusqlite::params![key],
+        |r| r.get::<_, String>(0),
+    )
+    .map(Some)
+    .or_else(|e| match e {
+        rusqlite::Error::QueryReturnedNoRows => Ok(None),
+        other => Err(storage_err(other)),
+    })
+}
+
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
 /// Fails closed with `Error::DimensionMismatch` on disagreement.
 fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
-    let existing: Option<String> = conn
-        .query_row(
-            "SELECT value FROM meta WHERE key='embedding_dim'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .map(Some)
-        .or_else(|e| match e {
-            rusqlite::Error::QueryReturnedNoRows => Ok(None),
-            other => Err(storage_err(other)),
-        })?;
+    let existing = meta_value(conn, "embedding_dim")?;
 
     match existing {
         Some(v) => {
@@ -638,6 +854,75 @@ fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Resu
             .map_err(storage_err)?;
         }
     }
+    Ok(())
+}
+
+/// Seed `meta.embedding_model` on first init (or on the first open of a DB
+/// created before the key existed), or verify it matches on re-open. A
+/// same-dim provider swap would silently mix vector spaces, so this fails
+/// closed with the explicit remediation.
+fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> Result<()> {
+    match meta_value(conn, "embedding_model")? {
+        Some(stored) => {
+            if stored != embedding_model {
+                return Err(Error::Storage(format!(
+                    "embedding model changed (stored: {stored}, configured: {embedding_model}); \
+                     run with --accept-model-change to mark the corpus for re-embedding"
+                )));
+            }
+        }
+        None => {
+            conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)",
+                rusqlite::params![embedding_model],
+            )
+            .map_err(storage_err)?;
+        }
+    }
+    Ok(())
+}
+
+/// Seed `meta.site_id` (uuid v4) on first init, or read it back on re-open.
+/// `INSERT OR IGNORE` + re-read: two connections racing the first open both
+/// end up with the single stored value.
+fn seed_or_get_site_id(conn: &rusqlite::Connection) -> Result<String> {
+    if let Some(existing) = meta_value(conn, "site_id")? {
+        return Ok(existing);
+    }
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('site_id', ?1)",
+        rusqlite::params![uuid::Uuid::new_v4().to_string()],
+    )
+    .map_err(storage_err)?;
+    meta_value(conn, "site_id")?
+        .ok_or_else(|| Error::Storage("meta.site_id missing after seed".to_string()))
+}
+
+/// Append one `memory_oplog` row for a mutation on `memory_id`, resolving the
+/// namespace from the memories row (already written within the same
+/// transaction for inserts). MUST be called inside the mutation's transaction
+/// so the log row commits — or rolls back — with the mutation itself. Callers
+/// gate on the mutation having actually changed a row, so the SELECT always
+/// resolves; `details` is a small JSON payload (e.g. link type) or empty.
+fn append_oplog(
+    conn: &rusqlite::Connection,
+    site_id: &str,
+    op: &str,
+    memory_id: &MemoryId,
+    details: &str,
+) -> Result<()> {
+    conn.execute(
+        "INSERT INTO memory_oplog (site_id, op, memory_id, namespace, at, details)
+         SELECT ?1, ?2, ?3, namespace, ?4, ?5 FROM memories WHERE memory_id = ?3",
+        rusqlite::params![
+            site_id,
+            op,
+            memory_id.to_string(),
+            chrono::Utc::now().timestamp(),
+            details
+        ],
+    )
+    .map_err(|e| Error::Storage(e.to_string()))?;
     Ok(())
 }
 
@@ -776,6 +1061,10 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         row.get::<_, i64>(c)
             .map_err(|e| Error::Storage(e.to_string()))
     };
+    let go = |c: &str| -> Result<Option<String>> {
+        row.get::<_, Option<String>>(c)
+            .map_err(|e| Error::Storage(e.to_string()))
+    };
     // TODO(P1): batch link loading (avoid N+1 load_links per row in list/get_memory).
     let links = load_links(conn, &id)?;
     Ok(MemoryNote {
@@ -821,6 +1110,13 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         // from `memory_links` after ranking; it is never stored, so loads default
         // it to false.
         contested: false,
+        // Provenance (W0.5): nullable by-name decode; rows written before the
+        // 004 migration carry NULL and surface as `None`.
+        origin_user: go("origin_user")?,
+        origin_host: go("origin_host")?,
+        origin_agent: go("origin_agent")?,
+        origin_source: go("origin_source")?,
+        session_id: go("session_id")?,
     })
 }
 
@@ -863,10 +1159,11 @@ impl Store for SqliteStore {
                         memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version
+                        superseded_by, embedding_model, embedding_input_version,
+                        origin_user, origin_host, origin_agent, origin_source, session_id
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24
                      )",
                     rusqlite::params![
                         note.id.to_string(),
@@ -888,9 +1185,16 @@ impl Store for SqliteStore {
                         note.superseded_by.as_ref().map(|id| id.to_string()),
                         note.embedding_model,
                         note.embedding_input_version,
+                        note.origin_user,
+                        note.origin_host,
+                        note.origin_agent,
+                        note.origin_source,
+                        note.session_id,
                     ],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
+
+            append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
 
             if let Some(emb) = embedding {
                 self.conn
@@ -920,6 +1224,15 @@ impl Store for SqliteStore {
                         ],
                     )
                     .map_err(|e| Error::Storage(e.to_string()))?;
+                // One `link` oplog row per edge, same shape as `add_link`'s:
+                // a replay consumer could not reconstruct edges from the bare
+                // `insert` row alone.
+                let details = serde_json::json!({
+                    "type": link.link_type.as_str(),
+                    "target": link.target_id.to_string(),
+                })
+                .to_string();
+                append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
             }
             Ok(())
         })();
@@ -944,7 +1257,8 @@ impl Store for SqliteStore {
                 "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version
+                        superseded_by, embedding_model, embedding_input_version,
+                        origin_user, origin_host, origin_agent, origin_source, session_id
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1139,7 +1453,8 @@ impl Store for SqliteStore {
                 "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version
+                        superseded_by, embedding_model, embedding_input_version,
+                        origin_user, origin_host, origin_agent, origin_source, session_id
                  FROM memories
                  WHERE namespace = ?1
                    AND archived_at IS NULL
@@ -1229,45 +1544,116 @@ impl Store for SqliteStore {
             id_pos
         );
 
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        // Transaction: the UPDATE and its oplog row commit (or roll back) together.
         self.conn
-            .execute(&sql, refs.as_slice())
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let affected = self
+                .conn
+                .execute(&sql, refs.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Oplog only on a real change: 0 rows means the id does not exist
+            // (a missing-id update stays an Ok no-op and logs nothing).
+            if affected > 0 {
+                append_oplog(&self.conn, &self.site_id, "update", id, "")?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn archive_memory(&self, id: &MemoryId) -> Result<()> {
+        // Transaction: the archive and its oplog row commit (or roll back) together.
         self.conn
-            .execute(
-                "UPDATE memories
-                 SET archived_at = ?1, updated_at = ?1
-                 WHERE memory_id = ?2 AND archived_at IS NULL",
-                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            let affected = self
+                .conn
+                .execute(
+                    "UPDATE memories
+                     SET archived_at = ?1, updated_at = ?1
+                     WHERE memory_id = ?2 AND archived_at IS NULL",
+                    rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Missing or already-archived ids are Ok no-ops and log nothing.
+            if affected > 0 {
+                append_oplog(&self.conn, &self.site_id, "archive", id, "")?;
+            }
+            Ok(())
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
+        // Transaction: the link INSERT and its oplog row commit (or roll back)
+        // together (an FK failure on a missing endpoint rolls back both).
         self.conn
-            .execute(
-                "INSERT INTO memory_links
-                    (source_id, target_id, link_type, strength, base_strength, reason, created_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                rusqlite::params![
-                    link.source_id.to_string(),
-                    link.target_id.to_string(),
-                    link.link_type.as_str(),
-                    link.strength as f64,
-                    // Baseline equals the created strength; decay never mutates
-                    // it, so the pass stays idempotent.
-                    link.strength as f64,
-                    link.reason,
-                    link.created_at.timestamp(),
-                ],
-            )
+            .execute_batch("BEGIN IMMEDIATE;")
             .map_err(|e| Error::Storage(e.to_string()))?;
-        Ok(())
+
+        let result = (|| -> Result<()> {
+            self.conn
+                .execute(
+                    "INSERT INTO memory_links
+                        (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        link.source_id.to_string(),
+                        link.target_id.to_string(),
+                        link.link_type.as_str(),
+                        link.strength as f64,
+                        // Baseline equals the created strength; decay never mutates
+                        // it, so the pass stays idempotent.
+                        link.strength as f64,
+                        link.reason,
+                        link.created_at.timestamp(),
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let details = serde_json::json!({
+                "type": link.link_type.as_str(),
+                "target": link.target_id.to_string(),
+            })
+            .to_string();
+            append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)
+        })();
+
+        match result {
+            Ok(()) => self
+                .conn
+                .execute_batch("COMMIT;")
+                .map_err(|e| Error::Storage(e.to_string())),
+            Err(e) => {
+                let _ = self.conn.execute_batch("ROLLBACK;");
+                Err(e)
+            }
+        }
     }
 
     fn record_access(&self, id: &MemoryId) -> Result<()> {
@@ -1345,7 +1731,10 @@ impl Store for SqliteStore {
                     rusqlite::params![now, old.to_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
-            Ok(())
+            // One `supersede` oplog row covers the whole compound mutation
+            // (pointer + archive); the replacement id rides in `details`.
+            let details = serde_json::json!({ "new": new.to_string() }).to_string();
+            append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
         })();
 
         match result {
@@ -1371,7 +1760,8 @@ impl Store for SqliteStore {
             "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                     keywords, tags, context, memory_type, importance, confidence,
                     related_files, access_count, last_accessed_at, archived_at,
-                    superseded_by, embedding_model, embedding_input_version
+                    superseded_by, embedding_model, embedding_input_version,
+                    origin_user, origin_host, origin_agent, origin_source, session_id
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -1497,7 +1887,8 @@ impl Store for SqliteStore {
                 "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version
+                        superseded_by, embedding_model, embedding_input_version,
+                        origin_user, origin_host, origin_agent, origin_source, session_id
                  FROM memories
                  WHERE archived_at IS NULL
                    AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
@@ -1683,6 +2074,146 @@ mod tests {
             }
             other => panic!("expected DimensionMismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_with_model_seeds_then_reopens_with_same_model() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        }
+        let s2 = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        let model: String = s2
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            model, "deterministic",
+            "embedding_model seeded at first init"
+        );
+    }
+
+    #[test]
+    fn open_with_a_different_model_refuses_with_remediation_hint() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        // Deterministic-seeded DB; a same-dim provider swap must fail closed.
+        {
+            let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        }
+        let err = SqliteStore::open_with_model(&path, 8, "voyage-3").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("embedding model changed"),
+            "refusal names the invariant: {msg}"
+        );
+        assert!(
+            msg.contains("stored: deterministic") && msg.contains("configured: voyage-3"),
+            "refusal names both models: {msg}"
+        );
+        assert!(
+            msg.contains("--accept-model-change"),
+            "refusal carries the remediation hint: {msg}"
+        );
+    }
+
+    #[test]
+    fn open_with_model_seeds_model_on_a_db_created_without_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        // Legacy shape: DB created without a bound model (no meta key).
+        {
+            let _s = SqliteStore::open(&path, 8).unwrap();
+        }
+        // First model-bound open adopts the configured model.
+        let _s = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        // ...and a later swap is then refused.
+        let err = SqliteStore::open_with_model(&path, 8, "other-model").unwrap_err();
+        assert!(err.to_string().contains("embedding model changed"), "{err}");
+    }
+
+    #[test]
+    fn accept_model_change_swaps_model_and_stales_every_row() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let ns = Namespace::Project("model-swap".to_string());
+
+        {
+            let store = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+            let mut note =
+                MemoryNote::new(ns.clone(), "stale me".to_string(), MemoryType::Insight, 5);
+            note.embedding_model = "deterministic".to_string();
+            note.embedding_input_version = "v2-composite".to_string();
+            store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+        }
+
+        // The model-bound open refuses; the opt-in path uses the unbound open.
+        let store = SqliteStore::open(&path, 8).unwrap();
+        let changed = store.accept_model_change("voyage-3").unwrap();
+        assert!(changed, "a real swap reports true");
+
+        let model: String = store
+            .conn
+            .query_row(
+                "SELECT value FROM meta WHERE key='embedding_model'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(model, "voyage-3", "meta points at the new model");
+
+        let stale: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories WHERE embedding_input_version = ''",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let total: i64 = store
+            .conn
+            .query_row("SELECT count(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(stale, total, "every row carries the reembed sentinel");
+        drop(store);
+
+        // The accepted model now opens cleanly.
+        let _reopened = SqliteStore::open_with_model(&path, 8, "voyage-3").unwrap();
+    }
+
+    #[test]
+    fn accept_model_change_with_current_model_is_a_noop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let ns = Namespace::Project("model-noop".to_string());
+
+        let store = SqliteStore::open_with_model(&path, 8, "deterministic").unwrap();
+        let mut note = MemoryNote::new(ns, "keep stamp".to_string(), MemoryType::Insight, 5);
+        note.embedding_model = "deterministic".to_string();
+        note.embedding_input_version = "v2-composite".to_string();
+        store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+
+        // Same model (e.g. a lingering RB_ACCEPT_MODEL_CHANGE on every restart):
+        // no swap, and crucially no corpus-wide re-stale.
+        let changed = store.accept_model_change("deterministic").unwrap();
+        assert!(!changed, "accepting the current model is a no-op");
+        let version: String = store
+            .conn
+            .query_row(
+                "SELECT embedding_input_version FROM memories LIMIT 1",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(version, "v2-composite", "stamps survive a no-op accept");
     }
 
     #[test]
@@ -3347,6 +3878,465 @@ mod contradiction_tests {
         assert!(
             in_other.is_empty(),
             "neither endpoint is flagged from either namespace's view"
+        );
+    }
+}
+
+#[cfg(test)]
+mod oplog_tests {
+    use super::*;
+    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace};
+
+    fn node(store: &SqliteStore, c: &str) -> MemoryNote {
+        let n = MemoryNote::new(
+            Namespace::Project("oplog".into()),
+            c.to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&n, None).unwrap();
+        n
+    }
+
+    /// All `(op, memory_id, namespace, site_id, details)` rows in seq order.
+    fn oplog_rows(store: &SqliteStore) -> Vec<(String, String, String, String, String)> {
+        let mut stmt = store
+            .conn
+            .prepare(
+                "SELECT op, memory_id, namespace, site_id, details
+                 FROM memory_oplog ORDER BY seq",
+            )
+            .unwrap();
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                ))
+            })
+            .unwrap();
+        rows.map(|r| r.unwrap()).collect()
+    }
+
+    #[test]
+    fn site_id_is_seeded_as_uuid_and_stable_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("site.db");
+        let first = SqliteStore::open(&db, 8).unwrap().site_id().to_string();
+        assert_eq!(first.len(), 36, "site_id is a uuid: {first}");
+        let second = SqliteStore::open(&db, 8).unwrap().site_id().to_string();
+        assert_eq!(first, second, "site_id must survive reopen");
+    }
+
+    #[test]
+    fn insert_appends_one_oplog_row_with_namespace_and_site_id() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "first");
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 1);
+        let (op, mid, ns, site, details) = &rows[0];
+        assert_eq!(op, "insert");
+        assert_eq!(mid, &n.id.to_string());
+        assert_eq!(ns, &n.namespace.as_db_string());
+        assert_eq!(site, store.site_id());
+        assert_eq!(
+            store.meta_value("site_id").unwrap().as_deref(),
+            Some(store.site_id()),
+            "cached site_id must equal the meta seed"
+        );
+        assert_eq!(details, "");
+    }
+
+    #[test]
+    fn insert_with_links_appends_one_link_oplog_row_per_edge() {
+        // Links carried on the note must each produce a `link` oplog row (same
+        // shape as add_link's), or a replay consumer cannot reconstruct edges.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let target = node(&store, "target");
+        let mut n = MemoryNote::new(
+            Namespace::Project("oplog".into()),
+            "linked at insert".to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        n.links.push(MemoryLink {
+            source_id: n.id.clone(),
+            target_id: target.id.clone(),
+            link_type: LinkType::Extends,
+            strength: 0.8,
+            reason: "carried on the note".into(),
+            created_at: chrono::Utc::now(),
+        });
+        store.insert_memory(&n, None).unwrap();
+
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 3, "target insert + insert + one link row");
+        assert_eq!(rows[1].0, "insert");
+        assert_eq!(rows[1].1, n.id.to_string());
+        let (op, mid, _, _, details) = &rows[2];
+        assert_eq!(op, "link");
+        assert_eq!(mid, &n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(details).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], target.id.to_string());
+    }
+
+    #[test]
+    fn update_appends_oplog_only_on_real_change() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to update");
+
+        // All-None update: true no-op, no oplog row.
+        store
+            .update_memory(&n.id, &MemoryUpdates::default())
+            .unwrap();
+        // Missing-id update: Ok no-op, no oplog row.
+        store
+            .update_memory(
+                &MemoryId::new(),
+                &MemoryUpdates {
+                    summary: Some("s".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(oplog_rows(&store).len(), 1, "only the insert is logged");
+
+        store
+            .update_memory(
+                &n.id,
+                &MemoryUpdates {
+                    summary: Some("new summary".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].0, "update");
+        assert_eq!(rows[1].1, n.id.to_string());
+    }
+
+    #[test]
+    fn archive_appends_oplog_once_and_rearchive_logs_nothing() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to archive");
+        store.archive_memory(&n.id).unwrap();
+        store.archive_memory(&n.id).unwrap(); // idempotent no-op
+        store.archive_memory(&MemoryId::new()).unwrap(); // missing no-op
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2, "insert + exactly one archive");
+        assert_eq!(rows[1].0, "archive");
+    }
+
+    #[test]
+    fn supersede_appends_oplog_with_replacement_id_in_details() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old");
+        let new = node(&store, "new");
+        store.supersede(&old.id, &new.id).unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 3, "two inserts + one supersede");
+        assert_eq!(rows[2].0, "supersede");
+        assert_eq!(rows[2].1, old.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[2].4).unwrap();
+        assert_eq!(details["new"], new.id.to_string());
+    }
+
+    #[test]
+    fn add_link_appends_oplog_with_type_and_target_in_details() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: LinkType::Extends,
+                strength: 0.9,
+                reason: "a extends b".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 3, "two inserts + one link");
+        assert_eq!(rows[2].0, "link");
+        assert_eq!(rows[2].1, a.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[2].4).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], b.id.to_string());
+    }
+
+    #[test]
+    fn set_confidence_appends_oplog_only_on_real_change() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = node(&store, "to score");
+        store.set_confidence(&MemoryId::new(), 0.5).unwrap(); // missing no-op
+        store.set_confidence(&n.id, 0.4).unwrap();
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 2, "insert + exactly one set_confidence");
+        assert_eq!(rows[1].0, "set_confidence");
+        assert_eq!(rows[1].1, n.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[1].4).unwrap();
+        let logged = details["confidence"].as_f64().unwrap();
+        assert!(
+            (logged - 0.4).abs() < 1e-6,
+            "confidence in details: {logged}"
+        );
+    }
+
+    #[test]
+    fn set_link_strength_and_delete_link_append_oplog_with_edge_details() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        store
+            .add_link(&MemoryLink {
+                source_id: a.id.clone(),
+                target_id: b.id.clone(),
+                link_type: LinkType::Extends,
+                strength: 0.9,
+                reason: "a extends b".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        store
+            .set_link_strength(&a.id, &b.id, LinkType::Extends, 0.5)
+            .unwrap();
+        // Missing-edge ops stay silent no-ops (decay is best-effort): no rows.
+        store
+            .set_link_strength(&a.id, &b.id, LinkType::Contradicts, 0.5)
+            .unwrap();
+        store
+            .delete_link(&a.id, &b.id, LinkType::Contradicts)
+            .unwrap();
+        store.delete_link(&a.id, &b.id, LinkType::Extends).unwrap();
+
+        let rows = oplog_rows(&store);
+        assert_eq!(
+            rows.len(),
+            5,
+            "two inserts + link + set_link_strength + unlink"
+        );
+        assert_eq!(rows[3].0, "set_link_strength");
+        assert_eq!(rows[3].1, a.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[3].4).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], b.id.to_string());
+        assert!((details["strength"].as_f64().unwrap() - 0.5).abs() < 1e-6);
+        assert_eq!(rows[4].0, "unlink");
+        assert_eq!(rows[4].1, a.id.to_string());
+        let details: serde_json::Value = serde_json::from_str(&rows[4].4).unwrap();
+        assert_eq!(details["type"], "extends");
+        assert_eq!(details["target"], b.id.to_string());
+    }
+
+    #[test]
+    fn failed_insert_rolls_back_memory_and_oplog_together() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // A link to a missing target violates the FK AFTER both the memories row
+        // and the oplog row were written inside the transaction: everything must
+        // roll back together.
+        let mut n = MemoryNote::new(
+            Namespace::Project("oplog".into()),
+            "doomed".into(),
+            MemoryType::Insight,
+            5,
+        );
+        n.links = vec![MemoryLink {
+            source_id: n.id.clone(),
+            target_id: MemoryId::new(), // does not exist
+            link_type: LinkType::References,
+            strength: 0.5,
+            reason: String::new(),
+            created_at: n.created_at,
+        }];
+        assert!(store.insert_memory(&n, None).is_err());
+
+        let memories: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(memories, 0, "memories insert rolled back");
+        assert!(
+            oplog_rows(&store).is_empty(),
+            "oplog row must roll back with the failed mutation"
+        );
+    }
+
+    #[test]
+    fn failed_add_link_rolls_back_oplog() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let err = store.add_link(&MemoryLink {
+            source_id: a.id.clone(),
+            target_id: MemoryId::new(), // missing target: FK failure
+            link_type: LinkType::References,
+            strength: 0.5,
+            reason: String::new(),
+            created_at: chrono::Utc::now(),
+        });
+        assert!(err.is_err());
+        let rows = oplog_rows(&store);
+        assert_eq!(rows.len(), 1, "only the insert is logged; no link row");
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    #[test]
+    fn provenance_fields_round_trip_through_insert_and_get() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut n = MemoryNote::new(
+            Namespace::Project("prov".into()),
+            "with provenance".into(),
+            MemoryType::Insight,
+            5,
+        );
+        n.origin_user = Some("alice".into());
+        n.origin_host = Some("devbox".into());
+        n.origin_agent = Some("claude-code".into());
+        n.origin_source = Some("hook".into());
+        n.session_id = Some("s-123".into());
+        store.insert_memory(&n, None).unwrap();
+
+        let got = store.get_memory(&n.id).unwrap().unwrap();
+        assert_eq!(got.origin_user.as_deref(), Some("alice"));
+        assert_eq!(got.origin_host.as_deref(), Some("devbox"));
+        assert_eq!(got.origin_agent.as_deref(), Some("claude-code"));
+        assert_eq!(got.origin_source.as_deref(), Some("hook"));
+        assert_eq!(got.session_id.as_deref(), Some("s-123"));
+
+        // The list projection decodes them too (same by-name path, explicit
+        // column list).
+        let listed = store.list(&n.namespace, None, 10).unwrap();
+        assert_eq!(listed[0].origin_source.as_deref(), Some("hook"));
+        // And get_many.
+        let many = store.get_many(&n.namespace, &[n.id.clone()]).unwrap();
+        assert_eq!(many[0].session_id.as_deref(), Some("s-123"));
+    }
+
+    #[test]
+    fn migration_004_applies_on_populated_pre_provenance_db() {
+        // Build a REAL 003-schema DB (file-discovered migrations 001..003 only),
+        // populate it, then open through SqliteStore (which applies 004). Old
+        // rows must decode with `None` provenance and the FTS index must be
+        // untouched (no backfill UPDATE may churn it).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("old.db");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            crate::migrations::run_migrations_up_to(&conn, 3).unwrap();
+            conn.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content, \
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model) \
+                 VALUES ('00000000-0000-4000-8000-000000000001','project:legacy',0,0,\
+                 'pre-provenance row','s','[]','[]','insight',5,1.0,'')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let id: MemoryId = "00000000-0000-4000-8000-000000000001".parse().unwrap();
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert_eq!(got.content, "pre-provenance row");
+        assert!(got.origin_user.is_none(), "old rows keep NULL provenance");
+        assert!(got.origin_host.is_none());
+        assert!(got.origin_agent.is_none());
+        assert!(got.origin_source.is_none());
+        assert!(got.session_id.is_none());
+
+        // FTS still matches the old row: 004 ran no UPDATE, so the mem_au
+        // trigger never fired and the index is exactly the insert-time one.
+        let hits = store
+            .keyword_search(&got.namespace, "pre-provenance", 10)
+            .unwrap();
+        assert!(hits.contains(&id), "FTS untouched by the migration");
+
+        // The oplog table now exists and new mutations log into it.
+        store.archive_memory(&id).unwrap();
+        let ops: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_oplog", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(ops, 1, "post-migration mutation appends to the oplog");
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod db_perms_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+    use std::os::unix::fs::PermissionsExt;
+
+    fn mode_of(path: &std::path::Path) -> u32 {
+        std::fs::metadata(path).unwrap().permissions().mode() & 0o777
+    }
+
+    #[test]
+    fn db_file_is_0600_after_create_and_wal_inherits() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("perm.db");
+        let store = SqliteStore::open(&db, 8).unwrap();
+        assert_eq!(mode_of(&db), 0o600, "db file must be owner-only");
+
+        // Force a write so the -wal sibling exists; SQLite creates it copying
+        // the main file's (already-tightened) mode.
+        let n = MemoryNote::new(
+            Namespace::Project("perm".into()),
+            "perm probe".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&n, None).unwrap();
+        let wal = dir.path().join("perm.db-wal");
+        if wal.exists() {
+            assert_eq!(mode_of(&wal), 0o600, "-wal must inherit owner-only");
+        }
+    }
+
+    #[test]
+    fn reopen_tightens_a_pre_existing_loose_db_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loose.db");
+        drop(SqliteStore::open(&db, 8).unwrap());
+        std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(SqliteStore::open(&db, 8).unwrap());
+        assert_eq!(mode_of(&db), 0o600, "open must tighten a loose pre-W0.5 DB");
+    }
+
+    #[test]
+    fn reopen_tightens_a_pre_existing_loose_wal_sibling() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("loose-wal.db");
+        drop(SqliteStore::open(&db, 8).unwrap());
+        // An unclean daemon death leaves the -wal behind (it is only removed on
+        // a clean close); a pre-W0.5 install left it 0644 and SQLite reuses the
+        // file as-is on reopen, so open must tighten it too.
+        let wal = dir.path().join("loose-wal.db-wal");
+        std::fs::write(&wal, b"").unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let store = SqliteStore::open(&db, 8).unwrap();
+        let n = MemoryNote::new(
+            Namespace::Project("perm".into()),
+            "wal probe".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&n, None).unwrap();
+        assert!(wal.exists(), "-wal must exist after a write");
+        assert_eq!(
+            mode_of(&wal),
+            0o600,
+            "open must tighten a loose pre-existing -wal"
         );
     }
 }

@@ -19,6 +19,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Use this namespace instead of detecting one (env equivalent:
+    /// `RUSTY_BRAIN_NAMESPACE`; explicit always wins).
+    #[arg(long, global = true)]
+    pub namespace: Option<String>,
+
+    /// Accept and pin this repo's `CLAUDE.md` frontmatter `project:` namespace
+    /// override (recorded per-directory in the local pin store; later runs
+    /// honor it without warning).
+    #[arg(long, global = true)]
+    pub accept_namespace_override: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }
@@ -31,6 +42,13 @@ pub enum Command {
         /// all jobs disabled).
         #[arg(long = "jobs-config", env = "RB_JOBS_CONFIG")]
         jobs_config: Option<String>,
+
+        /// Accept a changed embedding model: adopt the configured model and
+        /// mark the whole corpus for re-embedding (run `rusty-brain reembed`
+        /// until changed=0). Without this, a model swap refuses to start.
+        /// Env equivalent (for auto-start): `RB_ACCEPT_MODEL_CHANGE`.
+        #[arg(long = "accept-model-change")]
+        accept_model_change: bool,
     },
 
     /// Run the MCP (Model Context Protocol) stdio server for agents.
@@ -150,6 +168,22 @@ mod tests {
     }
 
     #[test]
+    fn namespace_flag_is_global_and_defaults_off() {
+        let cli = Cli::parse_from(["rusty-brain", "status"]);
+        assert_eq!(cli.namespace, None);
+        assert!(!cli.accept_namespace_override);
+        // Global: accepted after the subcommand too.
+        let cli = Cli::parse_from(["rusty-brain", "status", "--namespace", "my-proj"]);
+        assert_eq!(cli.namespace.as_deref(), Some("my-proj"));
+    }
+
+    #[test]
+    fn accept_namespace_override_flag_parses() {
+        let cli = Cli::parse_from(["rusty-brain", "--accept-namespace-override", "status"]);
+        assert!(cli.accept_namespace_override);
+    }
+
+    #[test]
     fn evolve_parses_link_decay_job() {
         let cli = Cli::parse_from(["rusty-brain", "evolve", "link_decay"]);
         match cli.command {
@@ -176,9 +210,25 @@ mod tests {
     fn serve_accepts_jobs_config_flag() {
         let cli = Cli::parse_from(["rusty-brain", "serve", "--jobs-config", "/tmp/jobs.toml"]);
         match cli.command {
-            Command::Serve { jobs_config } => {
+            Command::Serve {
+                jobs_config,
+                accept_model_change,
+            } => {
                 assert_eq!(jobs_config.as_deref(), Some("/tmp/jobs.toml"));
+                assert!(!accept_model_change, "opt-in flag defaults to off");
             }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn serve_accepts_the_accept_model_change_flag() {
+        let cli = Cli::parse_from(["rusty-brain", "serve", "--accept-model-change"]);
+        match cli.command {
+            Command::Serve {
+                accept_model_change,
+                ..
+            } => assert!(accept_model_change),
             other => panic!("expected Serve, got {other:?}"),
         }
     }

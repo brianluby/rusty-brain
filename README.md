@@ -123,6 +123,28 @@ ANN vector index for larger corpora. See [Roadmap](#roadmap).
 
 ## Quickstart
 
+### Install
+
+Tagged releases ship prebuilt, checksummed tarballs for macOS (Apple Silicon and
+Intel) and Linux x86_64 on the
+[releases page](https://github.com/brianluby/rusty-brain/releases). Each tarball
+contains the three binaries (`rusty-brain`, `rusty-brain-hooks`,
+`rusty-brain-install`). One-line install (needs the `gh` CLI; pick your target):
+
+```bash
+TARGET=aarch64-apple-darwin   # or x86_64-apple-darwin / x86_64-unknown-linux-gnu
+gh release download --repo brianluby/rusty-brain --pattern "*-${TARGET}.tar.gz" --pattern SHA256SUMS && shasum -a 256 --check --ignore-missing SHA256SUMS && mkdir -p ~/.local/bin && tar -xzf rusty-brain-*-"${TARGET}".tar.gz --strip-components=1 -C ~/.local/bin
+```
+
+(`sha256sum` on Linux; make sure `~/.local/bin` is on your `PATH`. Optionally verify
+build provenance first: `gh attestation verify rusty-brain-*.tar.gz --repo
+brianluby/rusty-brain`.)
+
+Or manually: download the tarball for your platform plus `SHA256SUMS` from the
+release, check it, and unpack the binaries somewhere on your `PATH`.
+
+Or build from source:
+
 ### Prerequisites
 
 - Rust **stable** (pinned via `rust-toolchain.toml`). SQLite is bundled (no system
@@ -177,9 +199,13 @@ good real-world recall. For meaningful semantic recall, configure a real provide
 | Voyage API | set `VOYAGE_API_KEY` | Remote HTTP embeddings (`voyage-3-lite`, dim 512). |
 | Local ONNX | build `--features local`, then set `RB_EMBED_BACKEND=local` | Downloads `all-MiniLM-L6-v2` (dim 384) on first use via `fastembed`. |
 
-The embedding dimension is fixed at first daemon init and checked fail-closed on
-every startup and read; switching providers to a different dimension against an
-existing database will refuse to run rather than silently corrupt vectors.
+The embedding dimension AND model identity are fixed at first daemon init and checked
+fail-closed on every startup (vector reads are length-checked too); switching
+providers — or models, even at the same dimension — against an existing database
+refuses to run rather than silently mix vector spaces. To accept a deliberate model
+swap, restart with `rusty-brain serve --accept-model-change` (or set
+`RB_ACCEPT_MODEL_CHANGE=1` for auto-started daemons) and re-embed the corpus with
+`rusty-brain reembed`.
 
 ### Wire the MCP server into an agent
 
@@ -207,16 +233,26 @@ coverage is still being expanded.
 
 ## Configuration
 
-All configuration is via environment variables (there is no config file for the core
-service today):
+Service configuration is via environment variables (there is no general config file
+for the core service yet). Two small files exist for namespace identity: a
+repo-committed `.rusty-brain.toml` at the git toplevel (`namespace = "..."`) pins a
+project's namespace across clones — it is read from the blob committed at `HEAD`
+(`git show HEAD:.rusty-brain.toml`), so untracked or uncommitted edits are ignored
+with a warning until committed — and a per-user pin store (`namespace-pins.toml`
+under the user state dir) records `CLAUDE.md` frontmatter overrides accepted via
+`rusty-brain --accept-namespace-override` — unpinned overrides are never silently
+honored.
 
 | Variable | Purpose |
 |---|---|
-| `RUSTY_BRAIN_DB` | SQLite database path (default under the user cache dir). |
+| `RUSTY_BRAIN_DB` | SQLite database path (default under the user data dir: `~/Library/Application Support` on macOS, `$XDG_DATA_HOME` or `~/.local/share` on Linux). |
 | `RUSTY_BRAIN_SOCKET` | Unix socket path for the daemon. |
+| `RUSTY_BRAIN_NAMESPACE` | Skip namespace detection and use this namespace (same precedence as the global `--namespace` flag). |
+| `RUSTY_BRAIN_IDLE_TIMEOUT_SECS` | Per-connection request idle timeout for the daemon (default 60; mainly for tests). |
 | `VOYAGE_API_KEY` | Selects the Voyage embedding provider when set. |
 | `RB_EMBED_BACKEND` | `local` forces the local ONNX provider (requires `--features local`). |
 | `RB_LOCAL_MODEL` | Local model name (implies local backend); defaults to `all-MiniLM-L6-v2`. |
+| `RB_ACCEPT_MODEL_CHANGE` | Opt in to an embedding-model swap on an existing DB (flag equivalent: `serve --accept-model-change`); follow with `rusty-brain reembed`. |
 | `RB_ENRICH_BASE_URL`, `RB_ENRICH_MODEL` | Optional LLM enrichment endpoint (off by default; heuristic enrichment is used otherwise). |
 | `RB_JOBS_CONFIG` | Path to an evolution-jobs TOML config for `serve` (jobs are disabled if absent). |
 | `RUST_LOG` | Log verbosity (logs go to stderr; stdout is reserved for results). |

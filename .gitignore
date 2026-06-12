@@ -5,3 +5,4 @@ Cargo.lock.orig
 *.db
 *.db-wal
 *.db-shm
+.serena/

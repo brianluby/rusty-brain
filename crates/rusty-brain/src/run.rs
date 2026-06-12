@@ -20,7 +20,10 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     let db_path = paths::db_path_from_env().context("resolving daemon database path")?;
 
     match cli.command {
-        Command::Serve { jobs_config } => {
+        Command::Serve {
+            jobs_config,
+            accept_model_change,
+        } => {
             let jobs_config_path = paths::resolve_jobs_config_path(
                 jobs_config,
                 std::env::var(paths::JOBS_CONFIG_ENV).ok(),
@@ -28,9 +31,16 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
             let shutdown = async {
                 let _ = tokio::signal::ctrl_c().await;
             };
-            serve::run_serve(socket_path, db_path, 4, jobs_config_path, shutdown)
-                .await
-                .context("daemon failed")?;
+            serve::run_serve(
+                socket_path,
+                db_path,
+                4,
+                jobs_config_path,
+                accept_model_change,
+                shutdown,
+            )
+            .await
+            .context("daemon failed")?;
             Ok(())
         }
         Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)
@@ -50,9 +60,15 @@ async fn run_client(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
-    let mut client = client::connect_or_start(socket_path, db_path, namespace, self_exe)
-        .await
-        .context("connecting to daemon")?;
+    let mut client = client::connect_or_start(
+        socket_path,
+        db_path,
+        namespace,
+        self_exe,
+        Some(client::client_identity("cli")),
+    )
+    .await
+    .context("connecting to daemon")?;
 
     match command {
         Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
@@ -73,6 +89,7 @@ async fn run_client(
                     Vec::new(),
                     tags,
                     Vec::new(),
+                    1.0,
                 )
                 .await
                 .context("remember failed")?;
@@ -254,7 +271,7 @@ mod tests {
 
         let ns = Namespace::Project("injected".to_string());
         let started = Instant::now();
-        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe).await;
+        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe, None).await;
         let elapsed = started.elapsed();
 
         // Returns an Err quickly (no 50-retry backoff, no daemon spawn).

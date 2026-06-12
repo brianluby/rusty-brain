@@ -105,12 +105,16 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "update",
-            description: "Apply a partial update to a memory (only provided fields change).",
+            description: "Apply a partial update to a memory (only provided fields change). \
+                          Content cannot be updated — delete and re-remember so embeddings \
+                          stay consistent.",
+            // `content` is deliberately ABSENT from the schema: the runtime
+            // rejects it, and schema-driven clients would keep generating it.
+            // Re-introduce alongside W3.1 update-as-supersede.
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "id": { "type": "string", "description": "Memory id (UUID)." },
-                    "content": { "type": "string" },
                     "summary": { "type": "string" },
                     "importance": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "tags": { "type": "array", "items": { "type": "string" } },
@@ -141,9 +145,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "poll_changes",
             description: "Drain buffered change notifications for the current \
-                          namespace since the last poll. Returns up to `max` events \
-                          plus a count of events dropped (the buffer is bounded and \
-                          lossy under heavy write load).",
+                          namespace since the last poll. Returns up to `max` events, \
+                          a count of events dropped (the buffer is bounded and lossy \
+                          under heavy write load), and the subscriber health: status \
+                          'disconnected' means events may be missed, not that \
+                          nothing changed.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -246,6 +252,33 @@ mod tests {
                 "remember should accept optional {opt}"
             );
         }
+    }
+
+    #[test]
+    fn update_schema_omits_content_and_description_carries_the_guidance() {
+        // F55: the schema must not advertise a `content` property at all — the
+        // engine rejects content updates, and schema-driven clients generate
+        // whatever the schema offers. The tool DESCRIPTION carries the
+        // limitation and the workaround (delete + re-remember) instead.
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "update")
+            .unwrap();
+        let props = t.input_schema["properties"].as_object().unwrap();
+        assert!(
+            !props.contains_key("content"),
+            "update schema must not advertise content: {props:?}"
+        );
+        assert!(
+            t.description.contains("Content cannot be updated"),
+            "description must state the limitation: {}",
+            t.description
+        );
+        assert!(
+            t.description.contains("delete and re-remember"),
+            "description must point at the workaround: {}",
+            t.description
+        );
     }
 
     #[test]

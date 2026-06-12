@@ -40,44 +40,32 @@ pub(crate) const GEMINI_EVENTS: [&str; 4] =
 /// Codex's hook event names. The tool event is `PostToolUse`.
 pub(crate) const CODEX_EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
 
-/// Build one command-hook entry, tagged with the sentinel marker, in the form
-/// required by the target CLI.
+/// Build one command-hook entry in the documented shape shared by all three
+/// CLIs: `{"type": "command", "command": "<single shell string>"}`.
 ///
-/// Two command forms exist because the CLIs differ in whether they support a
-/// separate `args` array:
+/// `command` is ONE shell-interpreted string — none of the CLIs honor a
+/// separate `args` array (Claude Code's documented hooks schema has no `args`
+/// field, verified against a recorded real `settings.json`; an `args` array
+/// would be silently dropped and run `rusty-brain-hooks` WITHOUT `--agent`).
+/// The binary path is SHELL-QUOTED via [`shell_quote`] so spaces AND
+/// metacharacters survive the CLI's shell re-tokenization, followed by
+/// `--agent <id>`.
 ///
-/// - `exec_args == true` (Claude Code): EXEC form — `command` is the raw binary
-///   path (its own JSON string) and the flags live in a separate `args` array.
-///   A shell-form string would be re-tokenized by the shell, splitting a binary
-///   path that contains spaces (common in macOS/Windows home dirs) mid-path and
-///   failing to launch.
-/// - `exec_args == false` (Gemini, Codex): INLINE form — these CLIs have **no**
-///   `args` field, so a separate `args` array is silently dropped (which would
-///   run `rusty-brain-hooks` WITHOUT `--agent`). The whole invocation is one
-///   shell string: the binary path SHELL-QUOTED via [`shell_quote`] (so spaces
-///   AND metacharacters survive the CLI's shell re-tokenization) followed by
-///   `--agent <id>`. No `args` key is emitted.
-fn command_entry(hooks_bin: &str, agent_id: &str, exec_args: bool) -> serde_json::Value {
-    if exec_args {
-        serde_json::json!({
-            "type": "command",
-            "command": hooks_bin,
-            "args": ["--agent", agent_id],
-            SENTINEL: true,
-        })
-    } else {
-        serde_json::json!({
-            "type": "command",
-            "command": format!("{} --agent {agent_id}", shell_quote(hooks_bin)),
-            SENTINEL: true,
-        })
-    }
+/// No keys beyond the documented `type`/`command` are emitted — the sentinel
+/// marker lives on the enclosing matcher group (see [`command_group`]), which
+/// is wholly ours, so uninstall scoping is preserved without putting an
+/// unknown key inside the entry the CLI validates.
+fn command_entry(hooks_bin: &str, agent_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "type": "command",
+        "command": format!("{} --agent {agent_id}", shell_quote(hooks_bin)),
+    })
 }
 
-/// Quote a binary path for the INLINE-form `command` string so it survives the
+/// Quote a binary path for the single-string `command` so it survives the
 /// target CLI's shell re-tokenization intact.
 ///
-/// The INLINE form (Gemini, Codex) embeds the path in a single shell string that
+/// The `command` string embeds the path in a single shell string that
 /// the CLI runs through a shell. A naive double-quote wrap tolerates spaces but
 /// still lets a POSIX shell expand `$`, backticks, and embedded quotes inside the
 /// path — a correctness hole and, because the string is persisted to user config
@@ -103,17 +91,17 @@ fn shell_quote(path: &str) -> String {
 }
 
 /// Build one matcher-group for `event`, wrapping the [`command_entry`] for this
-/// CLI. The group carries the sentinel marker; the tool event (`tool_event`)
-/// additionally carries `"matcher": "*"`, while the non-tool events omit it to
-/// match each CLI's schema.
+/// CLI. The group carries the sentinel marker (it is created wholly by us, so
+/// stripping the group removes exactly our entries); the tool event
+/// (`tool_event`) additionally carries `"matcher": "*"`, while the non-tool
+/// events omit it to match each CLI's schema.
 pub(crate) fn command_group(
     hooks_bin: &str,
     agent_id: &str,
     event: &str,
     tool_event: &str,
-    exec_args: bool,
 ) -> serde_json::Value {
-    let entry = command_entry(hooks_bin, agent_id, exec_args);
+    let entry = command_entry(hooks_bin, agent_id);
     if event == tool_event {
         serde_json::json!({
             "matcher": "*",
@@ -131,23 +119,20 @@ pub(crate) fn command_group(
 /// Build the full `{ "hooks": { <event>: [group], ... } }` block for a CLI whose
 /// config nests hooks under a top-level `hooks` key (Claude Code, Gemini, Codex).
 ///
-/// `events` is that CLI's native event-name set, `tool_event` is the member of
-/// `events` that gets the `"matcher": "*"` group, and `exec_args` selects the
-/// EXEC (`true`) vs INLINE (`false`) command form (see [`command_entry`]).
+/// `events` is that CLI's native event-name set and `tool_event` is the member
+/// of `events` that gets the `"matcher": "*"` group (see [`command_entry`] for
+/// the shared single-shell-string command form).
 pub(crate) fn hooks_block(
     hooks_bin: &str,
     agent_id: &str,
     events: &[&str],
     tool_event: &str,
-    exec_args: bool,
 ) -> serde_json::Value {
     let mut hooks = serde_json::Map::new();
     for event in events {
         hooks.insert(
             (*event).to_string(),
-            serde_json::Value::Array(vec![command_group(
-                hooks_bin, agent_id, event, tool_event, exec_args,
-            )]),
+            serde_json::Value::Array(vec![command_group(hooks_bin, agent_id, event, tool_event)]),
         );
     }
     serde_json::json!({ "hooks": serde_json::Value::Object(hooks) })
@@ -175,37 +160,49 @@ mod tests {
     }
 
     #[test]
-    fn exec_form_keeps_raw_path_and_separate_args() {
-        // EXEC form (Claude Code): the raw path is its own JSON string and flags
-        // live in a separate `args` array — never re-tokenized, never quoted.
-        let entry = command_entry(
-            "/Users/jo bloggs/.local/bin/rusty-brain-hooks",
-            "claude-code",
-            true,
-        );
+    fn entry_has_exactly_the_documented_keys() {
+        // Documented hook-entry shape for every CLI: {"type": "command",
+        // "command": "<shell string>"} — no `args` array (it would be silently
+        // dropped) and no unknown keys (the sentinel lives on the group, not in
+        // the entry the CLI validates).
+        let entry = command_entry("/bin/rusty-brain-hooks", "claude-code");
+        let keys: Vec<&str> = entry
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
         assert_eq!(
-            command_of(&entry),
-            "/Users/jo bloggs/.local/bin/rusty-brain-hooks"
+            keys,
+            ["command", "type"],
+            "exactly type+command, nothing else"
         );
-        assert_eq!(
-            entry.get("args").unwrap(),
-            &serde_json::json!(["--agent", "claude-code"])
-        );
+        assert_eq!(entry.get("type").unwrap(), &serde_json::json!("command"));
+        assert!(command_of(&entry).ends_with("--agent claude-code"));
     }
 
     #[test]
-    fn inline_form_has_no_args_array() {
-        // INLINE form (Gemini/Codex): a separate `args` array would be dropped, so
-        // the flag must be inside the single command string and no `args` emitted.
-        let entry = command_entry("/bin/rusty-brain-hooks", "gemini", false);
-        assert!(entry.get("args").is_none());
-        assert!(command_of(&entry).ends_with("--agent gemini"));
+    fn group_carries_sentinel_for_uninstall_scoping() {
+        // The matcher group is created wholly by us, so the sentinel marker on
+        // the group (not the entry) is what uninstall strips.
+        let group = command_group(
+            "/bin/rusty-brain-hooks",
+            "claude-code",
+            "Stop",
+            "PostToolUse",
+        );
+        assert_eq!(group.get(SENTINEL).unwrap(), &serde_json::json!(true));
+        let inner = group.get("hooks").unwrap().as_array().unwrap();
+        assert!(
+            inner[0].get(SENTINEL).is_none(),
+            "entry must stay documented-shape"
+        );
     }
 
     #[cfg(not(windows))]
     #[test]
-    fn inline_clean_path_is_single_quoted_posix() {
-        let entry = command_entry("/usr/local/bin/rusty-brain-hooks", "gemini", false);
+    fn clean_path_is_single_quoted_posix() {
+        let entry = command_entry("/usr/local/bin/rusty-brain-hooks", "gemini");
         assert_eq!(
             command_of(&entry),
             "'/usr/local/bin/rusty-brain-hooks' --agent gemini"
@@ -214,12 +211,8 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn inline_path_with_space_is_quoted_posix() {
-        let entry = command_entry(
-            "/Users/jo bloggs/.local/bin/rusty-brain-hooks",
-            "codex",
-            false,
-        );
+    fn path_with_space_is_quoted_posix() {
+        let entry = command_entry("/Users/jo bloggs/.local/bin/rusty-brain-hooks", "codex");
         assert_eq!(
             command_of(&entry),
             "'/Users/jo bloggs/.local/bin/rusty-brain-hooks' --agent codex"
@@ -228,12 +221,12 @@ mod tests {
 
     #[cfg(not(windows))]
     #[test]
-    fn inline_path_metacharacters_are_neutralized_posix() {
+    fn path_metacharacters_are_neutralized_posix() {
         // `$(...)`, backticks, and an embedded single quote must NOT survive as
         // live shell syntax. Single-quote wrapping makes everything literal except
         // the embedded single quote, which is closed/escaped/reopened as `'\''`.
         let nasty = "/opt/$(rm -rf ~)/`whoami`/r'b/hooks";
-        let entry = command_entry(nasty, "gemini", false);
+        let entry = command_entry(nasty, "gemini");
         assert_eq!(
             command_of(&entry),
             "'/opt/$(rm -rf ~)/`whoami`/r'\\''b/hooks' --agent gemini"
@@ -271,12 +264,8 @@ mod tests {
 
     #[cfg(windows)]
     #[test]
-    fn inline_path_is_double_quoted_on_windows() {
-        let entry = command_entry(
-            r"C:\Program Files\rb\rusty-brain-hooks.exe",
-            "gemini",
-            false,
-        );
+    fn path_is_double_quoted_on_windows() {
+        let entry = command_entry(r"C:\Program Files\rb\rusty-brain-hooks.exe", "gemini");
         assert_eq!(
             command_of(&entry),
             "\"C:\\Program Files\\rb\\rusty-brain-hooks.exe\" --agent gemini"

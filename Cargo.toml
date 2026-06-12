@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/rb-types",
+    "crates/rb-config",
     "crates/rb-store",
     "crates/rb-proto",
     "crates/rb-embed",
@@ -50,6 +51,8 @@ clap = { version = "4", features = ["derive", "env"] }
 anyhow = "1"
 wiremock = "0.6"
 libc = "0.2"
+# Capture-time secret redaction in rb-hooks (W0.5 minimal set; W2.4 expands it).
+regex = "1"
 assert_cmd = "2"
 predicates = "3"
 # Builds a binary owned by another workspace crate from within an integration

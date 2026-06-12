@@ -1,142 +1,83 @@
-//! Client-side namespace detection (P2): `CLAUDE.md` frontmatter/H1, then git
-//! root, then cwd, then `Global`.
-//!
-//! Pure core is parameterized over a "find nearest `CLAUDE.md`" closure and a
-//! "git root" closure so every branch is unit-testable without touching the real
-//! filesystem or shelling out to git. Never panics, never fails: degrades to the
-//! next branch and ultimately to `Namespace::Global`.
+//! Client-side namespace resolution: thin shim over [`rb_config::namespace`]
+//! (the single W0.3 implementation). The CLI is the interactive consumer: an
+//! unpinned `CLAUDE.md` frontmatter `project:` override warns on stderr and
+//! falls back to the git-toplevel name unless `--accept-namespace-override`
+//! pins it (known-hosts style). A worktree `.rusty-brain.toml` that diverges
+//! from the blob committed at `HEAD` likewise warns on stderr — only the
+//! committed content is ever honored.
 //!
 //! Resolution MUST run off the async runtime (it shells out to git and reads
-//! files); `main.rs` computes it before `block_on`.
+//! files); `main.rs` computes it before `block_on`. Never panics, never fails:
+//! degrades branch by branch to `Namespace::Global`.
 
+use rb_config::namespace::{
+    accept_override, resolve_namespace, NamespaceResolution, RepoConfigDivergenceKind,
+    REPO_CONFIG_FILE,
+};
 use rb_types::Namespace;
-use std::path::{Path, PathBuf};
-use std::process::Command;
 
-/// Detect the namespace for the real process. Reads the real cwd, searches for a
-/// `CLAUDE.md`, and invokes git. Synchronous: call this OFF the tokio runtime.
+/// Resolve for the CLI: `--namespace` flag > `RUSTY_BRAIN_NAMESPACE` env >
+/// detection. `accept` records the pin for an unpinned frontmatter override
+/// (explicit user consent). Synchronous: call this OFF the tokio runtime.
+pub fn resolve_for_cli(flag: Option<&str>, accept: bool) -> Namespace {
+    let NamespaceResolution {
+        namespace,
+        unpinned_override,
+        repo_config_divergence,
+    } = resolve_namespace(flag);
+    if let Some(d) = &repo_config_divergence {
+        match d.kind {
+            RepoConfigDivergenceKind::Untracked => eprintln!(
+                "WARNING: found {REPO_CONFIG_FILE} in {} but it is not committed at HEAD; \
+                 ignoring — commit it to take effect",
+                d.toplevel.display()
+            ),
+            RepoConfigDivergenceKind::Modified => eprintln!(
+                "WARNING: {REPO_CONFIG_FILE} in {} differs from the committed version; \
+                 using the committed content",
+                d.toplevel.display()
+            ),
+        }
+    }
+    let Some(o) = unpinned_override else {
+        return namespace;
+    };
+    if accept {
+        return match accept_override(&o) {
+            Ok(ns) => {
+                eprintln!(
+                    "pinned namespace override for {}: `{}`",
+                    o.toplevel.display(),
+                    o.claimed
+                );
+                ns
+            }
+            // The user consented explicitly: honor the override for this run
+            // even if persisting the pin failed.
+            Err(e) => {
+                eprintln!(
+                    "warning: could not record namespace pin ({e}); using `{}` for this run only",
+                    o.claimed
+                );
+                Namespace::Project(o.claimed)
+            }
+        };
+    }
+    eprintln!(
+        "WARNING: CLAUDE.md in {} claims namespace `{}`, but this repository is `{}`.\n\
+         Using `{}`. If `{}` is intentional, re-run with --accept-namespace-override to pin it.",
+        o.toplevel.display(),
+        o.claimed,
+        o.used,
+        o.used,
+        o.claimed
+    );
+    namespace
+}
+
+/// Compat entry point (original P2 API): plain detection, no flags.
 pub fn detect_namespace() -> Namespace {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    detect_namespace_with(&cwd, find_nearest_claude_md, git_toplevel)
-}
-
-/// Pure core. `find_claude_md` returns the nearest `CLAUDE.md`'s `(path, text)`
-/// (searching from `start` upward); `git_root` returns the git toplevel.
-///
-/// Order (first non-empty wins): (1) `CLAUDE.md` frontmatter `project:`,
-/// (2) `CLAUDE.md` first `# H1`, (3) git-root dir name, (4) `start` dir name,
-/// (5) `Global`.
-pub fn detect_namespace_with<C, G>(start: &Path, find_claude_md: C, git_root: G) -> Namespace
-where
-    C: Fn(&Path) -> Option<(PathBuf, String)>,
-    G: Fn(&Path) -> Option<PathBuf>,
-{
-    // (1)+(2): nearest CLAUDE.md -> frontmatter project, else first H1.
-    if let Some((_path, text)) = find_claude_md(start) {
-        if let Some(name) = parse_project_from_claude_md(&text) {
-            return Namespace::Project(name);
-        }
-    }
-    // (3): git-root directory name.
-    if let Some(name) = git_root(start).as_deref().and_then(dir_name) {
-        return Namespace::Project(name);
-    }
-    // (4): start (cwd) directory name.
-    if let Some(name) = dir_name(start) {
-        return Namespace::Project(name);
-    }
-    // (5): nothing usable.
-    Namespace::Global
-}
-
-/// Extract a non-empty, utf8 final path component. `None` for `/`, empty, or
-/// non-utf8 names — which makes the caller fall through to the next branch.
-fn dir_name(p: &Path) -> Option<String> {
-    p.file_name()
-        .and_then(|n| n.to_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .map(str::to_string)
-}
-
-/// Pure: parse a `CLAUDE.md` body for a project name. Prefer YAML-frontmatter
-/// `project: NAME` (leading `---` ... `---` block); else the first `# H1`.
-/// Lenient hand parser — never panics; returns `None` if neither is present.
-pub fn parse_project_from_claude_md(text: &str) -> Option<String> {
-    if let Some(name) = project_from_frontmatter(text) {
-        return Some(name);
-    }
-    first_h1(text)
-}
-
-/// Read `project: NAME` from a leading `---`-delimited frontmatter block.
-fn project_from_frontmatter(text: &str) -> Option<String> {
-    let mut lines = text.lines();
-    // Frontmatter must start at the very first line as `---`.
-    if lines.next().map(str::trim) != Some("---") {
-        return None;
-    }
-    for line in lines {
-        let trimmed = line.trim();
-        if trimmed == "---" {
-            break; // end of frontmatter
-        }
-        if let Some(rest) = trimmed.strip_prefix("project:") {
-            let value = rest.trim().trim_matches(|c| c == '"' || c == '\'').trim();
-            if !value.is_empty() {
-                return Some(value.to_string());
-            }
-            // Empty value: stop scanning frontmatter; defer to H1.
-            return None;
-        }
-    }
-    None
-}
-
-/// First markdown `# H1` heading text (exactly one leading `#`), trimmed.
-fn first_h1(text: &str) -> Option<String> {
-    for line in text.lines() {
-        let trimmed = line.trim_start();
-        if let Some(rest) = trimmed.strip_prefix("# ") {
-            let heading = rest.trim();
-            if !heading.is_empty() {
-                return Some(heading.to_string());
-            }
-        }
-    }
-    None
-}
-
-/// Walk up from `start` to the filesystem root, returning the first
-/// `CLAUDE.md`'s `(path, contents)`. `None` if none found or unreadable.
-fn find_nearest_claude_md(start: &Path) -> Option<(PathBuf, String)> {
-    for dir in start.ancestors() {
-        let candidate = dir.join("CLAUDE.md");
-        if let Ok(text) = std::fs::read_to_string(&candidate) {
-            return Some((candidate, text));
-        }
-    }
-    None
-}
-
-/// Find the git toplevel for `dir` by invoking git; `None` if not a repo.
-fn git_toplevel(dir: &Path) -> Option<PathBuf> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(dir)
-        .args(["rev-parse", "--show-toplevel"])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    let path = String::from_utf8(output.stdout).ok()?;
-    let trimmed = path.trim();
-    if trimmed.is_empty() {
-        None
-    } else {
-        Some(PathBuf::from(trimmed))
-    }
+    resolve_for_cli(None, false)
 }
 
 #[cfg(test)]
@@ -144,243 +85,144 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use rb_types::Namespace;
-    use std::path::{Path, PathBuf};
-
-    // --- parse_project_from_claude_md (pure text parsing) ---
 
     #[test]
-    fn frontmatter_project_wins_over_h1() {
-        let text = "---\nproject: from-frontmatter\nother: x\n---\n# From Heading\nbody\n";
-        assert_eq!(
-            parse_project_from_claude_md(text),
-            Some("from-frontmatter".to_string())
-        );
+    fn explicit_flag_beats_everything() {
+        // (e): the flag short-circuits detection entirely — no fs, no git, no
+        // warning path.
+        let ns = resolve_for_cli(Some("forced-name"), false);
+        assert_eq!(ns, Namespace::Project("forced-name".to_string()));
     }
 
     #[test]
-    fn frontmatter_project_with_quotes_and_spaces_is_trimmed() {
-        let text = "---\nproject:   \"my proj\"  \n---\n";
-        assert_eq!(
-            parse_project_from_claude_md(text),
-            Some("my proj".to_string())
-        );
+    fn blank_flag_falls_back_to_detection() {
+        // A whitespace-only flag is not an explicit namespace.
+        let ns = resolve_for_cli(Some("   "), false);
+        assert_ne!(ns, Namespace::Project("   ".to_string()));
     }
 
-    #[test]
-    fn falls_back_to_first_h1_when_no_frontmatter_project() {
-        let text = "---\nother: x\n---\nintro\n#  Heading Name  \n## sub\n";
-        assert_eq!(
-            parse_project_from_claude_md(text),
-            Some("Heading Name".to_string())
-        );
-    }
-
-    #[test]
-    fn h1_used_when_no_frontmatter_at_all() {
-        let text = "# Just A Heading\nbody\n";
-        assert_eq!(
-            parse_project_from_claude_md(text),
-            Some("Just A Heading".to_string())
-        );
-    }
-
-    #[test]
-    fn malformed_frontmatter_never_panics_and_degrades() {
-        // Unterminated frontmatter, no project key, no h1 -> None.
-        let text = "---\nproject\nnonsense: : :\n";
-        assert_eq!(parse_project_from_claude_md(text), None);
-    }
-
-    #[test]
-    fn empty_project_value_is_ignored() {
-        // project: with empty value must not yield an empty namespace.
-        let text = "---\nproject:   \n---\n# Heading\n";
-        assert_eq!(
-            parse_project_from_claude_md(text),
-            Some("Heading".to_string())
-        );
-    }
-
-    #[test]
-    fn empty_text_is_none() {
-        assert_eq!(parse_project_from_claude_md(""), None);
-    }
-
-    // --- detect_namespace_with (3-arg pure core) ---
-
-    fn no_claude(_: &Path) -> Option<(PathBuf, String)> {
-        None
-    }
-
-    #[test]
-    fn branch1_claude_md_frontmatter_project() {
-        let start = Path::new("/home/alice/code/app/src");
-        let find_claude = |_: &Path| -> Option<(PathBuf, String)> {
-            Some((
-                PathBuf::from("/home/alice/code/app/CLAUDE.md"),
-                "---\nproject: cool-app\n---\n# Other\n".to_string(),
-            ))
-        };
-        let git_root =
-            |_: &Path| -> Option<PathBuf> { Some(PathBuf::from("/home/alice/code/app")) };
-        let ns = detect_namespace_with(start, find_claude, git_root);
-        assert_eq!(ns, Namespace::Project("cool-app".to_string()));
-    }
-
-    #[test]
-    fn branch2_claude_md_h1_heading() {
-        let start = Path::new("/home/alice/code/app/src");
-        let find_claude = |_: &Path| -> Option<(PathBuf, String)> {
-            Some((
-                PathBuf::from("/home/alice/code/app/CLAUDE.md"),
-                "# Heading Project\nbody\n".to_string(),
-            ))
-        };
-        let git_root =
-            |_: &Path| -> Option<PathBuf> { Some(PathBuf::from("/home/alice/code/app")) };
-        let ns = detect_namespace_with(start, find_claude, git_root);
-        assert_eq!(ns, Namespace::Project("Heading Project".to_string()));
-    }
-
-    #[test]
-    fn branch3_git_root_dirname_when_claude_md_useless() {
-        let start = Path::new("/home/alice/code/rusty-brain/crates/rusty-brain");
-        // CLAUDE.md exists but has neither project nor h1 -> skip to git root.
-        let find_claude = |_: &Path| -> Option<(PathBuf, String)> {
-            Some((
-                PathBuf::from("/home/alice/code/rusty-brain/CLAUDE.md"),
-                "just some prose with no heading\n".to_string(),
-            ))
-        };
-        let git_root =
-            |_: &Path| -> Option<PathBuf> { Some(PathBuf::from("/home/alice/code/rusty-brain")) };
-        let ns = detect_namespace_with(start, find_claude, git_root);
-        assert_eq!(ns, Namespace::Project("rusty-brain".to_string()));
-    }
-
-    #[test]
-    fn branch4_cwd_dirname_outside_repo() {
-        let start = Path::new("/home/alice/scratch/notes");
-        let git_root = |_: &Path| -> Option<PathBuf> { None };
-        let ns = detect_namespace_with(start, no_claude, git_root);
-        assert_eq!(ns, Namespace::Project("notes".to_string()));
-    }
-
-    #[test]
-    fn branch5_global_for_root_dir() {
-        let start = Path::new("/");
-        let git_root = |_: &Path| -> Option<PathBuf> { None };
-        let ns = detect_namespace_with(start, no_claude, git_root);
-        assert_eq!(ns, Namespace::Global);
-    }
-
-    #[test]
-    fn non_utf8_git_root_dirname_degrades_to_cwd_then_global() {
-        // git root has a non-utf8 final component; start is "/" so we end at Global.
-        use std::ffi::OsString;
-        use std::os::unix::ffi::OsStringExt;
-        let mut bytes = b"/tmp/".to_vec();
-        bytes.extend_from_slice(&[0x66, 0x80, 0x6f]); // "f\x80o" invalid utf8
-        let bad = PathBuf::from(OsString::from_vec(bytes));
-        let start = Path::new("/");
-        let git_root = move |_: &Path| -> Option<PathBuf> { Some(bad.clone()) };
-        let ns = detect_namespace_with(start, no_claude, git_root);
-        // git-root name is non-utf8 -> None; start "/" has no name -> Global.
-        assert_eq!(ns, Namespace::Global);
-    }
-
-    #[test]
-    fn empty_frontmatter_project_skips_to_git_root() {
-        let start = Path::new("/home/alice/code/app/src");
-        let find_claude = |_: &Path| -> Option<(PathBuf, String)> {
-            Some((
-                PathBuf::from("/home/alice/code/app/CLAUDE.md"),
-                "---\nproject:   \n---\n".to_string(),
-            ))
-        };
-        let git_root =
-            |_: &Path| -> Option<PathBuf> { Some(PathBuf::from("/home/alice/code/app")) };
-        let ns = detect_namespace_with(start, find_claude, git_root);
-        // empty project + no h1 -> git root name.
-        assert_eq!(ns, Namespace::Project("app".to_string()));
-    }
-
+    // End-to-end resolution against real temp trees and real git, exercised
+    // through the shared rb-config implementation this shim delegates to.
     mod fs_walk {
-        #![allow(clippy::unwrap_used, clippy::expect_used)]
-        use super::super::{detect_namespace_with, find_nearest_claude_md};
+        use rb_config::namespace::{
+            git_toplevel, head_repo_config, resolve_namespace_in, NamespacePins,
+        };
         use rb_types::Namespace;
         use std::fs;
         use std::path::Path;
+        use std::process::{Command, Stdio};
         use tempfile::TempDir;
 
-        // Build start dir + write a CLAUDE.md `levels` directories above it.
-        fn tree_with_claude(levels: usize, body: &str) -> (TempDir, std::path::PathBuf) {
+        /// Run `git <args>` in `dir`; false (test skips) when git is
+        /// unavailable.
+        fn git_run(dir: &Path, args: &[&str]) -> bool {
+            Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+
+        /// `git init` with a repo-local identity so commits work everywhere.
+        fn git_init(dir: &Path) -> bool {
+            git_run(dir, &["init", "-q"])
+                && git_run(dir, &["config", "user.email", "test@example.com"])
+                && git_run(dir, &["config", "user.name", "Test"])
+        }
+
+        /// Stage everything and commit.
+        fn git_commit_all(dir: &Path) -> bool {
+            git_run(dir, &["add", "-A"])
+                && git_run(dir, &["commit", "-q", "-m", "init", "--no-gpg-sign"])
+        }
+
+        fn resolve(start: &Path) -> Namespace {
+            resolve_namespace_in(
+                start,
+                None,
+                &NamespacePins::default(),
+                git_toplevel,
+                head_repo_config,
+            )
+            .namespace
+        }
+
+        #[test]
+        fn walk_stops_at_git_toplevel_f54_regression() {
+            // (a) F54: outer CLAUDE.md (the ~/CLAUDE.md scenario) + inner
+            // CLAUDE.md-less repo -> the repo's own name, never the outer file.
             let tmp = TempDir::new().unwrap();
-            let root = tmp.path().to_path_buf();
-            let mut start = root.clone();
-            for i in 0..levels {
-                start = start.join(format!("d{i}"));
+            // Canonicalize: git reports the physical toplevel (macOS /tmp).
+            let outer = tmp.path().canonicalize().unwrap();
+            fs::write(
+                outer.join("CLAUDE.md"),
+                "---\nproject: outer-claim\n---\n# Outer Heading\n",
+            )
+            .unwrap();
+            let repo = outer.join("inner-repo");
+            let nested = repo.join("src");
+            fs::create_dir_all(&nested).unwrap();
+            if !git_init(&repo) {
+                return; // git unavailable; skip
             }
-            fs::create_dir_all(&start).unwrap();
-            fs::write(root.join("CLAUDE.md"), body).unwrap();
-            (tmp, start)
-        }
-
-        fn no_git(_: &Path) -> Option<std::path::PathBuf> {
-            None
+            assert_eq!(
+                resolve(&nested),
+                Namespace::Project("inner-repo".to_string())
+            );
         }
 
         #[test]
-        fn finds_claude_md_three_levels_up_and_uses_frontmatter() {
-            let (tmp, start) = tree_with_claude(3, "---\nproject: walked-up\n---\n# Ignored\n");
-            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
-            assert_eq!(ns, Namespace::Project("walked-up".to_string()));
-            drop(tmp);
-        }
-
-        #[test]
-        fn uses_h1_from_real_file_when_no_frontmatter() {
-            let (tmp, start) = tree_with_claude(2, "# Real Heading\nbody\n");
-            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
-            assert_eq!(ns, Namespace::Project("Real Heading".to_string()));
-            drop(tmp);
-        }
-
-        #[test]
-        fn nearest_claude_md_wins_over_higher_one() {
+        fn repo_committed_toml_wins_over_directory_name() {
+            // (b)+(d): identity travels with the COMMITTED `.rusty-brain.toml`.
             let tmp = TempDir::new().unwrap();
-            let root = tmp.path().to_path_buf();
-            let mid = root.join("mid");
-            let leaf = mid.join("leaf");
-            fs::create_dir_all(&leaf).unwrap();
-            fs::write(root.join("CLAUDE.md"), "---\nproject: outer\n---\n").unwrap();
-            fs::write(mid.join("CLAUDE.md"), "---\nproject: inner\n---\n").unwrap();
-            let ns = detect_namespace_with(&leaf, find_nearest_claude_md, no_git);
-            assert_eq!(ns, Namespace::Project("inner".to_string()));
-            drop(tmp);
+            let repo = tmp.path().canonicalize().unwrap().join("any-clone-name");
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(
+                repo.join(".rusty-brain.toml"),
+                "namespace = \"pinned-id\"\n",
+            )
+            .unwrap();
+            if !git_init(&repo) || !git_commit_all(&repo) {
+                return; // git unavailable; skip
+            }
+            assert_eq!(resolve(&repo), Namespace::Project("pinned-id".to_string()));
         }
 
         #[test]
-        fn malformed_claude_md_degrades_to_cwd_dirname() {
-            // CLAUDE.md present but no project + no h1 -> cwd dir name (no git).
+        fn untracked_toml_is_ignored_and_repo_name_is_used() {
+            // Inverse regression for the namespace-hijack fix: a worktree
+            // `.rusty-brain.toml` with no committed counterpart at HEAD must
+            // not redirect the CLI's namespace.
             let tmp = TempDir::new().unwrap();
-            let root = tmp.path().to_path_buf();
-            let start = root.join("my-project-dir");
-            fs::create_dir_all(&start).unwrap();
-            fs::write(root.join("CLAUDE.md"), "---\nbroken\n").unwrap();
-            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
-            assert_eq!(ns, Namespace::Project("my-project-dir".to_string()));
-            drop(tmp);
+            let repo = tmp.path().canonicalize().unwrap().join("host-repo");
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join("README.md"), "x\n").unwrap();
+            if !git_init(&repo) || !git_commit_all(&repo) {
+                return; // git unavailable; skip
+            }
+            fs::write(repo.join(".rusty-brain.toml"), "namespace = \"hijacked\"\n").unwrap();
+            assert_eq!(resolve(&repo), Namespace::Project("host-repo".to_string()));
         }
 
         #[test]
-        fn no_claude_md_anywhere_uses_cwd_dirname() {
+        fn malicious_repo_frontmatter_is_not_honored_unpinned() {
+            // (c) F22: a cloned repo's own CLAUDE.md cannot claim another
+            // project's namespace without an explicit pin.
             let tmp = TempDir::new().unwrap();
-            let start = tmp.path().join("standalone");
-            fs::create_dir_all(&start).unwrap();
-            let ns = detect_namespace_with(&start, find_nearest_claude_md, no_git);
-            assert_eq!(ns, Namespace::Project("standalone".to_string()));
-            drop(tmp);
+            let repo = tmp.path().canonicalize().unwrap().join("cloned-repo");
+            fs::create_dir_all(&repo).unwrap();
+            fs::write(repo.join("CLAUDE.md"), "---\nproject: victim\n---\n").unwrap();
+            if !git_init(&repo) {
+                return; // git unavailable; skip
+            }
+            assert_eq!(
+                resolve(&repo),
+                Namespace::Project("cloned-repo".to_string())
+            );
         }
     }
 }

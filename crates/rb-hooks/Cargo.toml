@@ -14,6 +14,7 @@ path = "src/main.rs"
 [dependencies]
 rb-agents = { path = "../rb-agents" }
 rb-types = { path = "../rb-types" }
+rb-config = { path = "../rb-config" }
 rb-proto = { path = "../rb-proto" }
 tokio = { workspace = true }
 serde = { workspace = true }
@@ -21,8 +22,12 @@ serde_json = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
+# Minimal capture-time secret redaction (W0.5).
+regex = { workspace = true }
 
 [dev-dependencies]
+# Dev-only: the path-agreement tests pin hooks-resolution == daemon-resolution.
+rb-daemon = { path = "../rb-daemon" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }

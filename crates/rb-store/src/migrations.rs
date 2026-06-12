@@ -169,6 +169,20 @@ pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {
     apply_all(conn, &migs)
 }
 
+/// Test-only: apply the real, file-discovered migrations up to and including
+/// `max_version`, recording checksums as the runner does. Used to build a
+/// populated "old schema" fixture and then prove a later migration applies
+/// cleanly on top of real rows.
+#[cfg(test)]
+pub(crate) fn run_migrations_up_to(conn: &rusqlite::Connection, max_version: i64) -> Result<()> {
+    ensure_migrations_table(conn)?;
+    let migs: Vec<Migration> = discover()?
+        .into_iter()
+        .filter(|m| m.version <= max_version)
+        .collect();
+    apply_all(conn, &migs)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::panic)]

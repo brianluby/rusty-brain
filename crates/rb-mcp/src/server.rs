@@ -1,6 +1,6 @@
 //! MCP method dispatch: one decoded JSON-RPC request -> optional response.
 
-use crate::change_buffer::ChangeBuffer;
+use crate::change_buffer::{ChangeBuffer, SubscriberStatus};
 use crate::jsonrpc::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
 };
@@ -155,18 +155,42 @@ async fn handle_poll_changes(
     };
 
     let Some(buffer) = buffer else {
-        // No background subscriber is running: nothing to drain, but this is not
-        // an error — the client can keep polling.
-        let content = json!({ "events": [], "dropped": 0 });
+        // No background subscriber is running (plain stdio mode): nothing to
+        // drain, but this is not an error — the client can keep polling. Report
+        // disconnected so "no events" is never mistaken for a quiet corpus.
+        let content = json!({
+            "events": [],
+            "dropped": 0,
+            "subscriber": { "status": "disconnected" }
+        });
         return JsonRpcResponse::success(id, tool_result(content, false));
     };
 
-    let drained = {
+    // Drain and snapshot health under one lock so they describe the same moment.
+    let (drained, status) = {
         let mut guard = buffer.lock().await;
-        guard.drain(max)
+        let drained = guard.drain(max);
+        (drained, guard.subscriber_status())
     };
-    let content = json!({ "events": drained.events, "dropped": drained.dropped });
+    let content = json!({
+        "events": drained.events,
+        "dropped": drained.dropped,
+        "subscriber": subscriber_json(status),
+    });
     JsonRpcResponse::success(id, tool_result(content, false))
+}
+
+/// Render subscriber health for the `poll_changes` payload. `for_secs` bounds
+/// how long changes may have gone unseen, so the model can tell "quiet"
+/// (connected, no events) from "deaf" (disconnected — events may be missing).
+fn subscriber_json(status: SubscriberStatus) -> Value {
+    match status {
+        SubscriberStatus::Connected => json!({ "status": "connected" }),
+        SubscriberStatus::Disconnected { since } => json!({
+            "status": "disconnected",
+            "for_secs": since.elapsed().as_secs(),
+        }),
+    }
 }
 
 /// Wrap a JSON payload as an MCP tool result (a single JSON text content item).
@@ -236,6 +260,16 @@ mod tests {
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],
                 },
+                // Mirrors the daemon: the engine rejects content updates with
+                // InvalidArgument and error_map forwards the message verbatim.
+                Request::Update { ref updates, .. } if updates.content.is_some() => {
+                    Response::Error {
+                        kind: "invalid_argument".into(),
+                        message: "invalid argument: content updates are not supported; \
+                                  create a new memory so embeddings stay consistent"
+                            .into(),
+                    }
+                }
                 Request::Update { .. } => Response::Updated,
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
@@ -391,6 +425,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_call_update_with_content_surfaces_guidance_not_internal_error() {
+        // F55: a content update must come back as an isError tool result whose
+        // text carries the actionable guidance, not an opaque internal fault.
+        let mut proxy = fake();
+        let r = req(
+            "tools/call",
+            Some(8),
+            json!({ "name": "update", "arguments": {
+                "id": MemoryId::new().to_string(),
+                "content": "rewritten body"
+            } }),
+        );
+        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], json!(true));
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("content updates are not supported"),
+            "guidance must reach the client verbatim: {text}"
+        );
+        assert!(
+            !text.contains("internal error"),
+            "rejection must be distinguishable from a real fault: {text}"
+        );
+        // The transport itself stays successful (result, not error).
+        assert!(resp.error.is_none());
+    }
+
+    #[tokio::test]
     async fn unknown_method_is_method_not_found() {
         let mut proxy = fake();
         let r = req("does/not/exist", Some(7), json!({}));
@@ -430,6 +493,8 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(text).unwrap();
         assert_eq!(payload["events"].as_array().unwrap().len(), 1);
         assert_eq!(payload["dropped"], 2);
+        // A fresh buffer with no subscriber report reads as deaf, not quiet.
+        assert_eq!(payload["subscriber"]["status"], "disconnected");
         assert_ne!(result["isError"], json!(true));
 
         // A second poll returns nothing new and zero drops (the ring was drained).
@@ -448,5 +513,73 @@ mod tests {
         let payload2: serde_json::Value = serde_json::from_str(&text2).unwrap();
         assert_eq!(payload2["events"].as_array().unwrap().len(), 0);
         assert_eq!(payload2["dropped"], 0);
+    }
+
+    // F57: the model must be able to distinguish "quiet" (connected, nothing
+    // happened) from "deaf" (subscriber down, events possibly missed).
+    #[tokio::test]
+    async fn poll_changes_reports_subscriber_health_transitions() {
+        use crate::change_buffer::ChangeBuffer;
+        use std::sync::Arc;
+        use tokio::sync::Mutex;
+
+        let mut proxy = fake();
+        let buffer = Arc::new(Mutex::new(ChangeBuffer::new(16)));
+
+        let poll = |id: i64| {
+            req(
+                "tools/call",
+                Some(id),
+                json!({ "name": "poll_changes", "arguments": {} }),
+            )
+        };
+        let payload_of = |resp: crate::jsonrpc::JsonRpcResponse| {
+            let text = resp.result.unwrap()["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .to_string();
+            serde_json::from_str::<serde_json::Value>(&text).unwrap()
+        };
+
+        // Connected: status alone, no outage duration.
+        buffer.lock().await.set_connected();
+        let resp = handle_request_with_buffer(poll(30), &mut proxy, &buffer)
+            .await
+            .unwrap();
+        let payload = payload_of(resp);
+        assert_eq!(payload["subscriber"]["status"], "connected");
+        assert!(payload["subscriber"].get("for_secs").is_none());
+
+        // Disconnected: carries how long the subscriber has been down.
+        buffer.lock().await.set_disconnected();
+        let resp = handle_request_with_buffer(poll(31), &mut proxy, &buffer)
+            .await
+            .unwrap();
+        let payload = payload_of(resp);
+        assert_eq!(payload["subscriber"]["status"], "disconnected");
+        assert!(
+            payload["subscriber"]["for_secs"].is_u64(),
+            "outage duration must be reported: {payload}"
+        );
+    }
+
+    #[tokio::test]
+    async fn poll_changes_without_buffer_reports_disconnected() {
+        // Plain stdio mode never runs a subscriber; "no events" must not read
+        // as a healthy quiet stream.
+        let mut proxy = fake();
+        let r = req(
+            "tools/call",
+            Some(32),
+            json!({ "name": "poll_changes", "arguments": {} }),
+        );
+        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let text = resp.result.unwrap()["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(payload["subscriber"]["status"], "disconnected");
+        assert_eq!(payload["events"].as_array().unwrap().len(), 0);
     }
 }

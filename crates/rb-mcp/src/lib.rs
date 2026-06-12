@@ -13,7 +13,7 @@ pub mod server;
 pub mod tools;
 pub mod transport;
 
-pub use change_buffer::{ChangeBuffer, Drained};
+pub use change_buffer::{ChangeBuffer, Drained, SubscriberStatus};
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use proxy::{build_request, response_to_content, DaemonProxy};
 pub use server::handle_request;

@@ -1,6 +1,10 @@
 //! Client connection with daemon auto-start and bounded backoff retry.
 
-use rb_proto::Client;
+// The auto-start allowlist is owned by rb-config so every spawner (CLI, hooks)
+// forwards the identical set; adding a var there widens the leak surface and
+// must fail `daemon_command_forwards_only_allowlisted_vars`.
+use rb_config::FORWARD_ENV;
+use rb_proto::{Client, ClientIdentity};
 use rb_types::{Error, Namespace, Result};
 use std::future::Future;
 use std::path::{Path, PathBuf};
@@ -49,20 +53,34 @@ where
     Err(last_err.unwrap_or_else(|| Error::Io("connect failed".into())))
 }
 
+/// Build this binary's provenance identity (W0.5): `source` is the producer
+/// surface (`cli` | `mcp`); user/host are left for the daemon's whoami
+/// fallback (same host, same user over the UDS).
+pub fn client_identity(source: &str) -> ClientIdentity {
+    ClientIdentity {
+        source: Some(source.to_string()),
+        ..Default::default()
+    }
+}
+
 /// Connect to the daemon at `socket_path` for `namespace`, auto-starting a
 /// detached `rusty-brain serve` child if the socket is not yet accepting.
+/// `identity` (see [`client_identity`]) is stamped as provenance on every
+/// memory the connection writes.
 pub async fn connect_or_start(
     socket_path: &Path,
     db_path: &Path,
     namespace: Namespace,
     self_exe: PathBuf,
+    identity: Option<ClientIdentity>,
 ) -> Result<Client> {
     let sock = socket_path.to_path_buf();
     let ns = namespace.clone();
     let connect = || {
         let sock = sock.clone();
         let ns = ns.clone();
-        async move { Client::connect(&sock, ns).await }
+        let identity = identity.clone();
+        async move { Client::connect_with_identity(&sock, ns, identity).await }
     };
     let spawn_sock = socket_path.to_path_buf();
     let spawn_db = db_path.to_path_buf();
@@ -83,21 +101,6 @@ fn spawn_daemon(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Result<(
     let mut cmd = daemon_command(self_exe, socket_path, db_path);
     cmd.spawn().map(|_child| ()).map_err(|e| Error::from_io(&e))
 }
-
-/// The exact set of parent vars the auto-start child may inherit. Everything
-/// else is cleared. Keep this list minimal — adding a var widens the leak
-/// surface and must fail `daemon_command_forwards_only_allowlisted_vars`.
-const FORWARD_ENV: &[&str] = &[
-    "VOYAGE_API_KEY",
-    "RB_ENRICH_BASE_URL",
-    "RB_ENRICH_MODEL",
-    "RB_ENRICH_API_KEY",
-    "HOME",
-    "PATH",
-    "XDG_RUNTIME_DIR",
-    "XDG_DATA_HOME",
-    "XDG_CONFIG_HOME",
-];
 
 fn daemon_command(self_exe: &Path, socket_path: &Path, db_path: &Path) -> Command {
     daemon_command_with(self_exe, socket_path, db_path, |key| {

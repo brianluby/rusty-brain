@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 rb-types = { path = "../rb-types" }
+rb-config = { path = "../rb-config" }
 rb-store = { path = "../rb-store" }
 rb-engine = { path = "../rb-engine" }
 rb-embed = { path = "../rb-embed" }

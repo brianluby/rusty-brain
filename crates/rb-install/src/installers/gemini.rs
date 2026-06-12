@@ -31,14 +31,13 @@ impl AgentInstaller for GeminiInstaller {
             InstallScope::Global => home_join(".gemini")?.join("settings.json"),
         };
         // Gemini: its own event names (SessionStart/AfterTool/SessionEnd/
-        // PreCompress), tool event `AfterTool`, INLINE form (Gemini has no `args`
-        // field — the `--agent` flag must live inside the single command string).
+        // PreCompress), tool event `AfterTool`. Like every CLI, no `args` field —
+        // the `--agent` flag must live inside the single command string.
         let merge = hooks_block(
             &hooks_bin.to_string_lossy(),
             AgentId::Gemini.as_str(),
             &GEMINI_EVENTS,
             "AfterTool",
-            false,
         );
         Ok(HookFragment { config_path, merge })
     }
@@ -91,9 +90,8 @@ mod tests {
             .as_array()
             .unwrap()[0]
             .clone();
-        // INLINE form: one shell string with the binary SHELL-QUOTED (the exact
-        // quoting is verified in `installers::tests`); there is NO separate `args`
-        // key.
+        // One shell string with the binary SHELL-QUOTED (the exact quoting is
+        // verified in `installers::tests`); there is NO separate `args` key.
         let cmd = entry.get("command").unwrap().as_str().unwrap();
         assert!(
             cmd.contains("/bin/rusty-brain-hooks"),

@@ -128,6 +128,9 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 keywords: Vec::new(),
                 tags: opt_string_vec(args, "tags")?,
                 related_files: Vec::new(),
+                // MCP-tool writes keep full trust (W0.5: only hook captures
+                // declare a lower prior).
+                confidence: 1.0,
             })
         }
         "recall" => Ok(Request::Recall {

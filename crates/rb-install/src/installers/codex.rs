@@ -31,14 +31,13 @@ impl AgentInstaller for CodexInstaller {
             InstallScope::Global => home_join(".codex")?.join("hooks.json"),
         };
         // Codex: SessionStart/PostToolUse/Stop/PreCompact event names, tool event
-        // `PostToolUse`, INLINE form (Codex has no `args` field — the `--agent`
-        // flag must live inside the single command string).
+        // `PostToolUse`. Like every CLI, no `args` field — the `--agent` flag
+        // must live inside the single command string.
         let merge = hooks_block(
             &hooks_bin.to_string_lossy(),
             AgentId::Codex.as_str(),
             &CODEX_EVENTS,
             "PostToolUse",
-            false,
         );
         Ok(HookFragment { config_path, merge })
     }
@@ -65,7 +64,7 @@ mod tests {
             .unwrap();
         assert_eq!(frag.config_path, PathBuf::from("/tmp/c/.codex/hooks.json"));
         let hooks = frag.merge.get("hooks").unwrap();
-        // Codex uses Claude's event names — but the command form differs.
+        // Codex uses Claude's event names (and the same single-string command form).
         for event in ["SessionStart", "PostToolUse", "Stop", "PreCompact"] {
             assert!(
                 hooks.get(event).is_some(),
@@ -79,9 +78,8 @@ mod tests {
         assert!(stop[0].get("matcher").is_none());
 
         let entry = post[0].get("hooks").unwrap().as_array().unwrap()[0].clone();
-        // INLINE form: one shell string with the binary SHELL-QUOTED (the exact
-        // quoting is verified in `installers::tests`); there is NO separate `args`
-        // key.
+        // One shell string with the binary SHELL-QUOTED (the exact quoting is
+        // verified in `installers::tests`); there is NO separate `args` key.
         let cmd = entry.get("command").unwrap().as_str().unwrap();
         assert!(
             cmd.contains("/bin/rusty-brain-hooks"),

@@ -7,7 +7,8 @@ use rb_search::{FusionMode, RrfConfig, Weights};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 use std::sync::Arc;
 
-/// Input to `remember`. Mirrors the proto `Request::Remember` payload.
+/// Input to `remember`. Mirrors the proto `Request::Remember` payload, plus
+/// the connection-scoped provenance the daemon resolves at handshake (W0.5).
 pub struct RememberInput {
     pub content: String,
     pub context: Option<String>,
@@ -16,6 +17,24 @@ pub struct RememberInput {
     pub keywords: Vec<String>,
     pub tags: Vec<String>,
     pub related_files: Vec<String>,
+    /// Trust prior in `0.0..=1.0`, validated fail-closed (1.0 = full trust,
+    /// the pre-W0.5 hardwired value; hook captures send 0.7).
+    pub confidence: f32,
+    pub provenance: Provenance,
+}
+
+/// Who/where/what produced a write (W0.5): the connection's handshake identity
+/// after the daemon's whoami fallback for user/host. `Default` (all `None`)
+/// matches pre-W0.5 behavior and is what direct engine callers (tests, eval)
+/// use.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Provenance {
+    pub origin_user: Option<String>,
+    pub origin_host: Option<String>,
+    pub origin_agent: Option<String>,
+    /// Producer surface: `hook` | `mcp` | `cli` | `job`.
+    pub origin_source: Option<String>,
+    pub session_id: Option<String>,
 }
 
 /// Policy layer: orchestrates heuristic enrichment + embedding + ranking over a
@@ -124,6 +143,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
         rb_types::validate_importance(input.importance)?;
+        // Fail-closed confidence range check (mirrors the storage CHECK, but
+        // surfaces as a clean validation error rather than a Storage one).
+        if !input.confidence.is_finite() || !(0.0..=1.0).contains(&input.confidence) {
+            return Err(rb_types::Error::InvalidArgument(format!(
+                "confidence {} out of range 0.0..=1.0",
+                input.confidence
+            )));
+        }
 
         let mut note = MemoryNote::new(
             self.namespace.clone(),
@@ -131,6 +158,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.memory_type,
             input.importance,
         );
+        note.confidence = input.confidence;
+        note.origin_user = input.provenance.origin_user;
+        note.origin_host = input.provenance.origin_host;
+        note.origin_agent = input.provenance.origin_agent;
+        note.origin_source = input.provenance.origin_source;
+        note.session_id = input.provenance.session_id;
         // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
         // the caller left empty; an enricher error degrades to the heuristic.
         let enrichment = match &self.enricher {
@@ -553,7 +586,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         updates: rb_types::MemoryUpdates,
     ) -> rb_types::Result<()> {
         if updates.content.is_some() {
-            return Err(rb_types::Error::Storage(
+            // Validation-class error: error_map forwards the message verbatim so
+            // MCP clients see actionable guidance instead of "internal error".
+            return Err(rb_types::Error::InvalidArgument(
                 "content updates are not supported; create a new memory so embeddings stay consistent"
                     .to_string(),
             ));
@@ -625,6 +660,8 @@ mod tests {
             keywords: Vec::new(),
             tags: Vec::new(),
             related_files: Vec::new(),
+            confidence: 1.0,
+            provenance: Provenance::default(),
         }
     }
 
@@ -639,6 +676,43 @@ mod tests {
         assert_eq!(eng.backend().count(), 1);
         let emb = eng.backend().embedding_of(&id).unwrap();
         assert_eq!(emb.len(), 16);
+    }
+
+    #[tokio::test]
+    async fn remember_stores_confidence_and_provenance() {
+        let eng = engine();
+        let mut inp = input("hook capture with provenance", 5);
+        inp.confidence = 0.7;
+        inp.provenance = Provenance {
+            origin_user: Some("alice".into()),
+            origin_host: Some("devbox".into()),
+            origin_agent: Some("claude-code".into()),
+            origin_source: Some("hook".into()),
+            session_id: Some("s-1".into()),
+        };
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.get(id).await.unwrap().unwrap();
+        assert!((note.confidence - 0.7).abs() < f32::EPSILON);
+        assert_eq!(note.origin_user.as_deref(), Some("alice"));
+        assert_eq!(note.origin_host.as_deref(), Some("devbox"));
+        assert_eq!(note.origin_agent.as_deref(), Some("claude-code"));
+        assert_eq!(note.origin_source.as_deref(), Some("hook"));
+        assert_eq!(note.session_id.as_deref(), Some("s-1"));
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_out_of_range_confidence() {
+        let eng = engine();
+        for bad in [-0.1f32, 1.1, f32::NAN, f32::INFINITY] {
+            let mut inp = input("bad confidence", 5);
+            inp.confidence = bad;
+            let err = eng.remember(inp).await.unwrap_err();
+            assert!(
+                matches!(err, rb_types::Error::InvalidArgument(_)),
+                "confidence {bad} must be InvalidArgument, got {err:?}"
+            );
+        }
+        assert_eq!(eng.backend().count(), 0, "nothing may be written");
     }
 
     #[tokio::test]
@@ -1380,7 +1454,12 @@ mod tests {
             )
             .await
             .unwrap_err();
-        assert!(err.to_string().contains("content updates"));
+        // Must be the validation-class variant: error_map forwards its message
+        // verbatim, so the client sees the guidance instead of "internal error".
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
+        assert!(err
+            .to_string()
+            .contains("content updates are not supported"));
         let note = eng.get(id).await.unwrap().unwrap();
         assert_eq!(note.content, "old body");
     }

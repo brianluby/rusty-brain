@@ -100,22 +100,39 @@ use rb_types::MemoryId;
 use tokio::net::{UnixListener, UnixStream};
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
+/// What the mock daemon observed from the hook: the handshake identity and
+/// the first Remember's payload (W0.5 provenance + confidence assertions).
+#[derive(Debug, Default, Clone)]
+struct Observed {
+    saw_remember: bool,
+    identity_source: Option<String>,
+    identity_agent: Option<String>,
+    confidence: Option<f32>,
+    content: Option<String>,
+    context: Option<String>,
+}
+
 // Accept one connection, handshake-ack, and answer the first Remember with a
-// canned id. Signals back via the channel that a Remember was observed.
-async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<bool>) {
+// canned id. Signals back via the channel what was observed.
+async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<Observed>) {
+    let mut observed = Observed::default();
     let Ok((stream, _addr)) = listener.accept().await else {
-        let _ = tx.send(false);
+        let _ = tx.send(observed);
         return;
     };
     let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
         Framed::new(stream, LengthDelimitedCodec::new());
-    let _hs: Handshake = match read_frame(&mut framed).await {
+    let hs: Handshake = match read_frame(&mut framed).await {
         Ok(h) => h,
         Err(_) => {
-            let _ = tx.send(false);
+            let _ = tx.send(observed);
             return;
         }
     };
+    if let Some(identity) = hs.identity {
+        observed.identity_source = identity.source;
+        observed.identity_agent = identity.agent;
+    }
     let _ = write_frame(
         &mut framed,
         &HandshakeAck {
@@ -125,11 +142,18 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
         },
     )
     .await;
-    let mut saw_remember = false;
     while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
         let resp = match req {
-            Request::Remember { .. } => {
-                saw_remember = true;
+            Request::Remember {
+                confidence,
+                content,
+                context,
+                ..
+            } => {
+                observed.saw_remember = true;
+                observed.confidence = Some(confidence);
+                observed.content = Some(content);
+                observed.context = context;
                 Response::Remembered {
                     id: MemoryId::new(),
                 }
@@ -150,16 +174,19 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
             break;
         }
     }
-    let _ = tx.send(saw_remember);
+    let _ = tx.send(observed);
 }
 
-#[test]
-fn post_tool_use_against_live_daemon_remembers() {
+/// Run the hooks binary against an in-process mock daemon, feeding `stdin`,
+/// and return what the daemon observed. The dedup cache is isolated to a fresh
+/// tempdir so a previously-persisted entry within the 60s TTL cannot suppress
+/// the Remember under test as a duplicate.
+fn observe_against_mock_daemon(stdin: &str) -> Observed {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("live.sock");
     let socket_str = socket.to_string_lossy().to_string();
 
-    let (tx, rx) = std::sync::mpsc::channel::<bool>();
+    let (tx, rx) = std::sync::mpsc::channel::<Observed>();
     let socket_for_thread = socket.clone();
     let server = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -168,21 +195,17 @@ fn post_tool_use_against_live_daemon_remembers() {
             .expect("rt");
         rt.block_on(async move {
             let listener = UnixListener::bind(&socket_for_thread).expect("bind");
-            let (otx, orx) = tokio::sync::oneshot::channel::<bool>();
+            let (otx, orx) = tokio::sync::oneshot::channel::<Observed>();
             let accept = tokio::spawn(serve_one_remember(listener, otx));
-            let saw = orx.await.unwrap_or(false);
+            let observed = orx.await.unwrap_or_default();
             let _ = accept.await;
-            let _ = tx.send(saw);
+            let _ = tx.send(observed);
         });
     });
 
     // Give the listener a moment to bind.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    // Isolate the dedup cache to this tempdir so a previously-persisted entry from
-    // an earlier run within the 60s TTL cannot suppress this observation as a
-    // duplicate (which would skip the Remember the test asserts on).
-    let stdin = r#"{"hook_event_name":"PostToolUse","cwd":"/tmp","session_id":"s1","tool_name":"Edit","tool_input":{"file_path":"/src/uniqueW9.rs"},"tool_response":"ok"}"#;
     let mut child = hooks_command()
         .args(["--agent", "claude-code"])
         .env("RUSTY_BRAIN_SOCKET", &socket_str)
@@ -201,10 +224,70 @@ fn post_tool_use_against_live_daemon_remembers() {
     let output = child.wait_with_output().expect("wait for output");
     assert!(output.status.success(), "must exit 0");
 
-    let saw_remember = rx
+    let observed = rx
         .recv_timeout(std::time::Duration::from_secs(10))
-        .unwrap_or(false);
-    assert!(saw_remember, "the daemon should have observed a Remember");
+        .unwrap_or_default();
     let _ = server.join();
     let _: PathBuf = socket; // keep tempdir alive until here
+    observed
+}
+
+#[test]
+fn post_tool_use_against_live_daemon_remembers() {
+    let stdin = r#"{"hook_event_name":"PostToolUse","cwd":"/tmp","session_id":"s1","tool_name":"Edit","tool_input":{"file_path":"/src/uniqueW9.rs"},"tool_response":"ok"}"#;
+    let observed = observe_against_mock_daemon(stdin);
+    assert!(
+        observed.saw_remember,
+        "the daemon should have observed a Remember"
+    );
+    // W0.5: a hook-written memory declares source=hook + the driving agent on
+    // the handshake identity, and carries confidence 0.7 on the Remember.
+    assert_eq!(observed.identity_source.as_deref(), Some("hook"));
+    assert_eq!(observed.identity_agent.as_deref(), Some("claude-code"));
+    let confidence = observed.confidence.expect("Remember carries confidence");
+    assert!(
+        (confidence - 0.7).abs() < f32::EPSILON,
+        "hook captures must send confidence 0.7, got {confidence}"
+    );
+}
+
+#[test]
+fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
+    // W0.5 minimal redaction: a tool response carrying every supported secret
+    // shape must arrive at the daemon with markers instead of plaintext.
+    let stdin = concat!(
+        r#"{"hook_event_name":"PostToolUse","cwd":"/tmp","session_id":"s1","#,
+        r#""tool_name":"Bash","tool_input":{"command":"deploy --password=hunter2"},"#,
+        r#""tool_response":"key AKIAABCDEFGHIJKLMNOP\nAuthorization: Bearer sk-live-deadbeef\n"#,
+        r#"GITHUB_TOKEN=ghp_secret123\n-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n"#,
+        r#"-----END RSA PRIVATE KEY-----\ndone"}"#
+    );
+    let observed = observe_against_mock_daemon(stdin);
+    assert!(observed.saw_remember, "the Remember must reach the daemon");
+
+    let payload = format!(
+        "{}\n{}",
+        observed.content.as_deref().unwrap_or_default(),
+        observed.context.as_deref().unwrap_or_default()
+    );
+    for secret in [
+        "hunter2",
+        "AKIAABCDEFGHIJKLMNOP",
+        "sk-live-deadbeef",
+        "ghp_secret123",
+        "MIIfakekeymaterial",
+    ] {
+        assert!(
+            !payload.contains(secret),
+            "planted secret {secret:?} leaked into the remember payload: {payload}"
+        );
+    }
+    assert!(
+        payload.contains("[REDACTED:"),
+        "redaction markers must be present: {payload}"
+    );
+    assert!(
+        payload.contains("done"),
+        "non-secret response text must survive: {payload}"
+    );
 }

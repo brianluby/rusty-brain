@@ -31,8 +31,20 @@ pub enum SubscribeItem {
 impl Client {
     /// Connect to the daemon socket, perform the versioned handshake, and verify
     /// the daemon speaks `CONTRACT_VERSION`. Fails closed on any version drift or
-    /// a non-ok ack.
+    /// a non-ok ack. Sends no identity; provenance-aware callers use
+    /// [`connect_with_identity`](Self::connect_with_identity).
     pub async fn connect(socket_path: &Path, namespace: Namespace) -> Result<Client> {
+        Self::connect_with_identity(socket_path, namespace, None).await
+    }
+
+    /// [`connect`](Self::connect) carrying an optional client identity on the
+    /// handshake (W0.5): the daemon stamps it as provenance on every memory this
+    /// connection writes. `None` matches the pre-W0.5 wire shape exactly.
+    pub async fn connect_with_identity(
+        socket_path: &Path,
+        namespace: Namespace,
+        identity: Option<crate::ClientIdentity>,
+    ) -> Result<Client> {
         let stream = UnixStream::connect(socket_path)
             .await
             .map_err(|e| Error::from_io(&e))?;
@@ -41,6 +53,7 @@ impl Client {
         let handshake = Handshake {
             contract_version: CONTRACT_VERSION,
             namespace,
+            identity,
         };
         write_frame(&mut framed, &handshake).await?;
 
@@ -61,11 +74,27 @@ impl Client {
         Ok(Client { framed })
     }
 
+    /// Send one request frame WITHOUT reading the response. Split from
+    /// [`request`](Self::request) so retrying callers can distinguish the two
+    /// failure phases: a SEND failure means the daemon never received the frame
+    /// (a Unix-socket write fails immediately once the peer has closed), so a
+    /// retry on a fresh connection is safe for any op; a RECV failure after a
+    /// successful send means the daemon may have executed the request and only
+    /// the response was lost, so only idempotent ops may be retried.
+    pub async fn send_request(&mut self, req: &Request) -> Result<()> {
+        write_frame(&mut self.framed, req).await
+    }
+
+    /// Read one response frame for a request previously sent with
+    /// [`send_request`](Self::send_request).
+    pub async fn recv_response(&mut self) -> Result<Response> {
+        read_frame(&mut self.framed).await
+    }
+
     /// Send one request and read one response.
     pub async fn request(&mut self, req: Request) -> Result<Response> {
-        write_frame(&mut self.framed, &req).await?;
-        let resp: Response = read_frame(&mut self.framed).await?;
-        Ok(resp)
+        self.send_request(&req).await?;
+        self.recv_response().await
     }
 
     /// Open a live change-notification stream on this connection. After this
@@ -114,7 +143,10 @@ impl Client {
         }
     }
 
-    /// Store a new memory; returns its id.
+    /// Store a new memory; returns its id. `confidence` is the trust prior in
+    /// `0.0..=1.0` (1.0 = today's full-trust default; hook captures send 0.7);
+    /// a non-finite or out-of-range value is rejected client-side with
+    /// [`Error::InvalidArgument`] before anything touches the wire.
     #[allow(clippy::too_many_arguments)]
     pub async fn remember(
         &mut self,
@@ -125,7 +157,15 @@ impl Client {
         keywords: Vec<String>,
         tags: Vec<String>,
         related_files: Vec<String>,
+        confidence: f32,
     ) -> Result<MemoryId> {
+        // Mirrors the engine-side check so a bad value fails fast and with the
+        // same error class the daemon would round-trip back.
+        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
+            return Err(Error::InvalidArgument(format!(
+                "confidence {confidence} out of range 0.0..=1.0"
+            )));
+        }
         let resp = self
             .request(Request::Remember {
                 content,
@@ -135,6 +175,7 @@ impl Client {
                 keywords,
                 tags,
                 related_files,
+                confidence,
             })
             .await?;
         match resp {
@@ -341,6 +382,63 @@ mod tests {
         server.await.unwrap();
     }
 
+    // The split send/recv phases must compose to the same round trip as
+    // `request` — they exist so retrying callers can tell a dead-on-send
+    // connection from a lost response.
+    #[tokio::test]
+    async fn send_request_then_recv_response_round_trips() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(run_responder(listener, CONTRACT_VERSION, true));
+
+        let mut client = Client::connect(&path, Namespace::Global).await.unwrap();
+        client.send_request(&Request::Ping).await.unwrap();
+        match client.recv_response().await.unwrap() {
+            Response::Pong { contract_version } => {
+                assert_eq!(contract_version, CONTRACT_VERSION);
+            }
+            other => panic!("expected Pong, got {other:?}"),
+        }
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn connect_with_identity_carries_identity_on_the_handshake() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        // Inline responder that captures the handshake identity for assertion.
+        let server = tokio::spawn(async move {
+            let (stream, _addr) = listener.accept().await.unwrap();
+            let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
+                Framed::new(stream, LengthDelimitedCodec::new());
+            let hs: Handshake = read_frame(&mut framed).await.unwrap();
+            write_frame(
+                &mut framed,
+                &HandshakeAck {
+                    contract_version: CONTRACT_VERSION,
+                    ok: true,
+                    message: None,
+                },
+            )
+            .await
+            .unwrap();
+            hs.identity
+        });
+
+        let identity = crate::ClientIdentity {
+            agent: Some("claude-code".into()),
+            session_id: Some("s-7".into()),
+            source: Some("hook".into()),
+            ..Default::default()
+        };
+        let _client =
+            Client::connect_with_identity(&path, Namespace::Global, Some(identity.clone()))
+                .await
+                .unwrap();
+        let got = server.await.unwrap();
+        assert_eq!(got, Some(identity), "identity must reach the daemon");
+    }
+
     #[tokio::test]
     async fn connect_rejects_contract_version_mismatch() {
         let (_dir, path) = socket_path();
@@ -491,6 +589,7 @@ mod wrapper_tests {
                 vec!["k".into()],
                 vec!["t".into()],
                 vec![],
+                1.0,
             )
             .await
             .unwrap();
@@ -528,6 +627,38 @@ mod wrapper_tests {
         let (rs, rc, rk) = c.reembed(Some(10)).await.unwrap();
         assert_eq!((rs, rc, rk), (6, 5, 1));
 
+        drop(c);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_invalid_confidence_before_any_io() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        // `serve` answers ANY Remember with Remembered, so an Err here can only
+        // come from the client-side validation: the frame never hit the wire.
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut c = connect(&path).await;
+        for bad in [f32::NAN, 1.5] {
+            let err = c
+                .remember(
+                    "body".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    bad,
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(_)),
+                "confidence {bad} must be InvalidArgument, got {err:?}"
+            );
+        }
         drop(c);
         server.await.unwrap();
     }

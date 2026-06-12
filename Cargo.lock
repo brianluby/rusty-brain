@@ -2483,6 +2483,7 @@ dependencies = [
 name = "rb-agents"
 version = "0.0.1"
 dependencies = [
+ "rb-config",
  "rb-daemon",
  "rb-embed",
  "rb-proto",
@@ -2495,12 +2496,24 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-config"
+version = "0.0.1"
+dependencies = [
+ "libc",
+ "rb-types",
+ "serde",
+ "tempfile",
+ "toml",
+]
+
+[[package]]
 name = "rb-daemon"
 version = "0.0.1"
 dependencies = [
  "async-trait",
  "chrono",
  "libc",
+ "rb-config",
  "rb-embed",
  "rb-engine",
  "rb-enrich",
@@ -2586,8 +2599,11 @@ dependencies = [
  "assert_cmd",
  "predicates",
  "rb-agents",
+ "rb-config",
+ "rb-daemon",
  "rb-proto",
  "rb-types",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -2666,6 +2682,7 @@ dependencies = [
  "sha2",
  "sqlite-vec",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
@@ -2871,6 +2888,7 @@ dependencies = [
  "async-trait",
  "clap",
  "predicates",
+ "rb-config",
  "rb-daemon",
  "rb-embed",
  "rb-mcp",

@@ -56,15 +56,19 @@ fn daemon_and_autostart_types_are_reexported() {
     // DaemonClient::connect is the entrypoint Parts W reuse; lock its argument
     // shape at compile time by binding the call to an explicitly-typed future.
     // The future is never awaited (no daemon is running): constructing it is
-    // enough to verify the `(&Path, Namespace, Duration, Option<AutoStart>)`
-    // signature against the public re-export.
+    // enough to verify the `(&Path, Namespace, Duration, Option<AutoStart>,
+    // Option<ClientIdentity>)` signature against the public re-export.
     let socket = Path::new("/tmp/rb-agents-public-api.sock");
+    // Explicitly typed so the test locks the identity PARAMETER type, not just
+    // the call's arity (a bare `None` would infer whatever connect takes).
+    let identity: Option<rb_proto::ClientIdentity> = None;
     let _connect: std::pin::Pin<Box<dyn std::future::Future<Output = Option<DaemonClient>>>> =
         Box::pin(DaemonClient::connect(
             socket,
             rb_types::Namespace::Global,
             Duration::from_millis(1),
             Some(auto.clone()),
+            identity,
         ));
 }
 
