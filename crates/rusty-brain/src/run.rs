@@ -113,7 +113,9 @@ async fn run_client(
                     Vec::new(),
                     tags,
                     Vec::new(),
-                    1.0,
+                    // CLI `remember` declares no explicit prior: the daemon
+                    // applies the 1.0 baseline (and an enricher may fill it).
+                    None,
                 )
                 .await
                 .context("remember failed")?;
@@ -160,6 +162,42 @@ async fn run_client(
             let notes = client.graph(id, depth).await.context("graph failed")?;
             println!("{}", output::render_notes(&notes, json));
         }
+        Command::Update {
+            id,
+            summary,
+            importance,
+            tags,
+            context,
+            confidence,
+        } => {
+            let id = parse_id(&id).context("invalid memory id")?;
+            let updates = rb_types::MemoryUpdates {
+                content: None,
+                summary,
+                importance,
+                // An absent --tags leaves tags unchanged (the CLI cannot
+                // distinguish "clear" from "not provided"; use MCP for that).
+                tags: if tags.is_empty() { None } else { Some(tags) },
+                context,
+                confidence,
+            };
+            client.update(id, updates).await.context("update failed")?;
+            println!("{}", output::render_updated(json));
+        }
+        Command::Link {
+            from,
+            to,
+            link_type,
+            reason,
+        } => {
+            let from = parse_id(&from).context("invalid `from` memory id")?;
+            let to = parse_id(&to).context("invalid `to` memory id")?;
+            client
+                .link(from, to, link_type, reason)
+                .await
+                .context("link failed")?;
+            println!("{}", output::render_linked(json));
+        }
         Command::Delete { id } => {
             let id = parse_id(&id).context("invalid memory id")?;
             client.delete(id).await.context("delete failed")?;
@@ -172,8 +210,11 @@ async fn run_client(
                 output::render_context(&recent, &important, total, json)
             );
         }
-        Command::Subscribe => {
-            client.subscribe().await.context("subscribe failed")?;
+        Command::Subscribe { since } => {
+            client
+                .subscribe_since(since)
+                .await
+                .context("subscribe failed")?;
             // Stream until the daemon closes the connection (or the process is
             // interrupted). recv_change returns Err(Io) on a clean close, which
             // we treat as a normal end-of-stream exit (not a failure).
@@ -241,6 +282,26 @@ async fn run_client(
                 println!("{{\"scanned\":{scanned},\"changed\":{changed},\"skipped\":{skipped}}}");
             } else {
                 println!("reembed: scanned={scanned} changed={changed} skipped={skipped}");
+            }
+        }
+        Command::Scrub => {
+            let (scanned, redacted, reembed_pending) =
+                client.scrub().await.context("scrub failed")?;
+            if json {
+                println!(
+                    "{{\"scanned\":{scanned},\"redacted\":{redacted},\"reembed_pending\":{reembed_pending}}}"
+                );
+            } else {
+                println!(
+                    "scrub: scanned={scanned} redacted={redacted} reembed_pending={reembed_pending}"
+                );
+            }
+            if reembed_pending > 0 {
+                // stderr so `--json` stdout stays machine-parseable.
+                eprintln!(
+                    "note: {reembed_pending} memories need re-embedding; run \
+                     `rusty-brain reembed` until changed=0 to recompute their vectors"
+                );
             }
         }
         Command::Namespace {

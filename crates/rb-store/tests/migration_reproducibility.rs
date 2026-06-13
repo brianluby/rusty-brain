@@ -126,6 +126,7 @@ fn fresh_db_exercises_every_query_path() {
         importance: Some(9),
         tags: Some(vec!["db".to_string(), "updated".to_string()]),
         context: Some("ctx".to_string()),
+        confidence: Some(0.8),
     };
     store.update_memory(&a.id, &updates).unwrap();
     let after = store.get_memory(&a.id).unwrap().unwrap();

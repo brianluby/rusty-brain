@@ -20,3 +20,6 @@ pub use embed_input::{embedding_input, EMBEDDING_INPUT_VERSION};
 pub use engine::{MemoryEngine, Provenance, RecallOutcome, RememberInput};
 pub use enricher::{Enricher, Enrichment};
 pub use linker::{Linker, SimilarityLinker};
+// Re-exported so the daemon can plumb the configured fusion strategy (W2.2)
+// into `MemoryEngine::with_fusion_mode` without a direct rb-search dependency.
+pub use rb_search::FusionMode;

@@ -41,7 +41,7 @@ async fn ingest<P: EmbeddingProvider>(
                 keywords: m.keywords.clone(),
                 tags: m.tags.clone(),
                 related_files: Vec::new(),
-                confidence: 1.0,
+                confidence: None,
                 provenance: Default::default(),
             })
             .await

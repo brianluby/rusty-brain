@@ -84,6 +84,25 @@ fn opt_importance(args: &Value, key: &str) -> Result<Option<u8>, ToolError> {
     }
 }
 
+/// Optional confidence argument: a JSON number validated against the
+/// canonical 0.0..=1.0 range (`rb_types::validate_confidence` is the single
+/// source of truth, mirroring `opt_importance`).
+fn opt_confidence(args: &Value, key: &str) -> Result<Option<f32>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Number(n)) => {
+            let v = n
+                .as_f64()
+                .ok_or_else(|| invalid(format!("'{key}' must be a number")))?
+                as f32;
+            rb_types::validate_confidence(v)
+                .map_err(|_| invalid(format!("'{key}' must be in the range 0.0..=1.0")))?;
+            Ok(Some(v))
+        }
+        Some(_) => Err(invalid(format!("'{key}' must be a number"))),
+    }
+}
+
 const MAX_LIMIT: usize = 100;
 
 fn opt_usize(args: &Value, key: &str, default: usize) -> Result<usize, ToolError> {
@@ -128,9 +147,10 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 keywords: Vec::new(),
                 tags: opt_string_vec(args, "tags")?,
                 related_files: Vec::new(),
-                // MCP-tool writes keep full trust (W0.5: only hook captures
-                // declare a lower prior).
-                confidence: 1.0,
+                // MCP-tool writes declare no explicit prior (W0.5: only hook
+                // captures declare a lower one). `None` keeps the full-trust
+                // 1.0 baseline and lets an enricher fill it (fix #4).
+                confidence: None,
             })
         }
         "recall" => Ok(Request::Recall {
@@ -167,8 +187,26 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 importance: opt_importance(args, "importance")?,
                 tags,
                 context: opt_string(args, "context")?,
+                confidence: opt_confidence(args, "confidence")?,
             };
             Ok(Request::Update { id, updates })
+        }
+        "link" => {
+            let from_raw = require_str(args, "from")?;
+            let from = MemoryId::from_str(from_raw)
+                .map_err(|e| invalid(format!("invalid memory id '{from_raw}': {e}")))?;
+            let to_raw = require_str(args, "to")?;
+            let to = MemoryId::from_str(to_raw)
+                .map_err(|e| invalid(format!("invalid memory id '{to_raw}': {e}")))?;
+            let link_type_raw = require_str(args, "type")?;
+            let link_type = rb_types::LinkType::parse(link_type_raw)
+                .map_err(|e| invalid(format!("invalid link type '{link_type_raw}': {e}")))?;
+            Ok(Request::Link {
+                from,
+                to,
+                link_type,
+                reason: opt_string(args, "reason")?,
+            })
         }
         "delete" => Ok(Request::Delete {
             id: parse_id(args)?,
@@ -216,6 +254,7 @@ pub fn response_to_content(resp: Response) -> Value {
         Response::Listed { memories } => json!({ "memories": memories }),
         Response::GraphResult { memories } => json!({ "memories": memories }),
         Response::Updated => json!({ "ok": true }),
+        Response::Linked => json!({ "ok": true }),
         Response::Deleted => json!({ "ok": true }),
         Response::ContextResult {
             recent,
@@ -235,6 +274,17 @@ pub fn response_to_content(resp: Response) -> Value {
         Response::NamespaceRenamed { moved, vectors } => {
             json!({ "moved": moved, "vectors": vectors })
         }
+        // Scrub is a CLI admin op (W2.4) with no MCP tool surface; projected
+        // anyway so the mapping stays total.
+        Response::Scrubbed {
+            scanned,
+            redacted,
+            reembed_pending,
+        } => json!({
+            "scanned": scanned,
+            "redacted": redacted,
+            "reembed_pending": reembed_pending,
+        }),
         Response::Error { kind, message } => {
             json!({ "error": { "kind": kind, "message": message } })
         }
@@ -372,6 +422,69 @@ mod tests {
             }
             other => panic!("expected Update, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn build_update_maps_and_validates_confidence() {
+        let id = MemoryId::new();
+        let u = build_request(
+            "update",
+            &json!({ "id": id.to_string(), "confidence": 0.25 }),
+        )
+        .unwrap();
+        match u {
+            Request::Update { updates, .. } => {
+                assert_eq!(updates.confidence, Some(0.25));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+        for bad in [json!(-0.1), json!(1.5), json!("high")] {
+            let err = build_request(
+                "update",
+                &json!({ "id": id.to_string(), "confidence": bad }),
+            )
+            .unwrap_err();
+            assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn build_link_maps_ids_type_and_reason() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let l = build_request(
+            "link",
+            &json!({
+                "from": a.to_string(),
+                "to": b.to_string(),
+                "type": "contradicts",
+                "reason": "newer decision disagrees"
+            }),
+        )
+        .unwrap();
+        match l {
+            Request::Link {
+                from,
+                to,
+                link_type,
+                reason,
+            } => {
+                assert_eq!(from, a);
+                assert_eq!(to, b);
+                assert_eq!(link_type, rb_types::LinkType::Contradicts);
+                assert_eq!(reason.as_deref(), Some("newer decision disagrees"));
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+        // Bad link type and missing required args are INVALID_PARAMS.
+        let err = build_request(
+            "link",
+            &json!({ "from": a.to_string(), "to": b.to_string(), "type": "depends_on" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+        let err = build_request("link", &json!({ "from": a.to_string() })).unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
     }
 
     #[test]

@@ -17,6 +17,10 @@ pub struct Enrichment {
     /// Inferred importance 1..=10 (advisory; NOT applied by the engine in v1 —
     /// reserved for a future caller-opt-in change).
     pub importance: Option<u8>,
+    /// Enricher-declared trust prior in `0.0..=1.0` (W2.2). Applied only when
+    /// the caller sent the full-trust default (an explicit caller prior always
+    /// wins); an out-of-range value is ignored by the engine, never an error.
+    pub confidence: Option<f32>,
 }
 
 /// Opt-in enrichment over raw memory content. The default path is heuristic and
@@ -50,6 +54,7 @@ mod tests {
                 tags: vec!["t".to_string()],
                 memory_type: Some(MemoryType::Insight),
                 importance: Some(7),
+                confidence: Some(0.9),
             })
         }
     }
@@ -63,6 +68,7 @@ mod tests {
         assert_eq!(out.tags, vec!["t".to_string()]);
         assert_eq!(out.memory_type, Some(MemoryType::Insight));
         assert_eq!(out.importance, Some(7));
+        assert_eq!(out.confidence, Some(0.9));
     }
 
     #[test]
@@ -73,5 +79,6 @@ mod tests {
         assert!(d.tags.is_empty());
         assert!(d.memory_type.is_none());
         assert!(d.importance.is_none());
+        assert!(d.confidence.is_none());
     }
 }

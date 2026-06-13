@@ -27,6 +27,11 @@ pub enum Error {
     Enrichment(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
+    /// An authenticated peer is not authorized for the requested operation
+    /// (W2.6: admin ops are gated on the daemon-verified peer identity, not on
+    /// anything the client declares). Client-safe: the message is guidance.
+    #[error("permission denied: {0}")]
+    PermissionDenied(String),
     #[error("io error ({kind:?}): {message}")]
     IoKind {
         kind: std::io::ErrorKind,

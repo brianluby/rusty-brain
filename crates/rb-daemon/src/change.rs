@@ -21,6 +21,7 @@ mod tests {
             id: MemoryId::new(),
             namespace: Namespace::Global,
             kind: ChangeKind::Updated,
+            seq: Some(1),
         };
         let direct: rb_types::MemoryChanged = via_daemon.clone();
         assert_eq!(via_daemon, direct);

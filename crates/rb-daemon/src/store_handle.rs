@@ -48,6 +48,41 @@ fn publish_change(events: &broadcast::Sender<MemoryChanged>, evt: MemoryChanged)
     }
 }
 
+/// Stamp the just-committed op's oplog seq onto a `MemoryChanged` and publish
+/// it (W2.7). Single source for all five writer arms (fix #5/#7): the seq is
+/// `MAX(seq)` on the writer's own connection immediately after the committed
+/// oplog row, so on the single writer it is reliably THIS op's seq. The
+/// read is effectively infallible here (the op just succeeded on this
+/// connection); a real error would mean the writer is failing, so it is
+/// logged rather than silently swallowed — a `None` seq would slip past the
+/// replay-overlap dedup in `stream_changes` and be re-delivered.
+fn publish_change_stamped(
+    events: &broadcast::Sender<MemoryChanged>,
+    store: Option<&SqliteStore>,
+    id: MemoryId,
+    namespace: Namespace,
+    kind: ChangeKind,
+) {
+    let seq = match store.map(|s| s.last_oplog_seq()) {
+        Some(Ok(seq)) => Some(seq),
+        Some(Err(e)) => {
+            tracing::warn!(error = %e, "could not read oplog seq for a change event; \
+                 emitting without a replay cursor (a reconnecting subscriber may re-see this event)");
+            None
+        }
+        None => None,
+    };
+    publish_change(
+        events,
+        MemoryChanged {
+            id,
+            namespace,
+            kind,
+            seq,
+        },
+    );
+}
+
 enum WriteCommand {
     Insert {
         note: Box<MemoryNote>,
@@ -125,6 +160,13 @@ enum WriteCommand {
         new: Namespace,
         merge: bool,
         reply: oneshot::Sender<Result<rb_store::NamespaceRenameOutcome>>,
+    },
+    /// Retroactively redact secrets from every stored memory (W2.4
+    /// `rusty-brain scrub`). Cross-namespace admin op (peer-gated server-side
+    /// like RenameNamespace); rewrites text + blanks embedding stamps, then
+    /// the caller runs `reembed` to recompute vectors.
+    Scrub {
+        reply: oneshot::Sender<Result<rb_store::ScrubOutcome>>,
     },
     #[cfg(test)]
     PanicForTest {
@@ -403,6 +445,19 @@ impl StoreHandle {
     /// Subscribe to best-effort memory change notifications.
     pub fn subscribe(&self) -> broadcast::Receiver<MemoryChanged> {
         self.events.subscribe()
+    }
+
+    /// Replay the durable oplog as change events for `namespace`, strictly
+    /// after `after`, oldest first, capped at `limit` (W2.7
+    /// replay-on-reconnect). Goes through the bounded read pool.
+    pub async fn oplog_changes_since(
+        &self,
+        namespace: rb_types::Namespace,
+        after: u64,
+        limit: usize,
+    ) -> Result<rb_store::OplogReplayPage> {
+        self.with_read(move |store| store.oplog_changes_since(&namespace, after, limit))
+            .await
     }
 
     /// Read up to `limit` active memories with the fields the importance job
@@ -773,6 +828,22 @@ impl StoreHandle {
             .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
     }
 
+    /// Retroactively redact secrets from every stored memory through the single
+    /// writer (W2.4). Returns the scan/redact/reembed-pending counts; the
+    /// caller then runs `reembed` to recompute vectors for the changed rows.
+    pub async fn scrub(&self) -> Result<rb_store::ScrubOutcome> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::Scrub { reply })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
     /// Enumerate up to `limit` active, non-superseded memories across ALL
     /// namespaces, oldest first then by id, for the consolidation job to scan.
     /// Each candidate carries the id/namespace/importance/created_at the job and
@@ -1032,13 +1103,12 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    publish_change(
+                    publish_change_stamped(
                         &events,
-                        MemoryChanged {
-                            id,
-                            namespace,
-                            kind: ChangeKind::Created,
-                        },
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Created,
                     );
                 }
                 if !writer_usable {
@@ -1068,13 +1138,12 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    publish_change(
+                    publish_change_stamped(
                         &events,
-                        MemoryChanged {
-                            id,
-                            namespace,
-                            kind: ChangeKind::Updated,
-                        },
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Updated,
                     );
                 }
                 if !writer_usable {
@@ -1101,13 +1170,12 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    publish_change(
+                    publish_change_stamped(
                         &events,
-                        MemoryChanged {
-                            id,
-                            namespace,
-                            kind: ChangeKind::Archived,
-                        },
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Archived,
                     );
                 }
                 if !writer_usable {
@@ -1189,13 +1257,12 @@ fn writer_loop(
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
                 if changed {
-                    publish_change(
+                    publish_change_stamped(
                         &events,
-                        MemoryChanged {
-                            id,
-                            namespace,
-                            kind: ChangeKind::Updated,
-                        },
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Updated,
                     );
                 }
                 if !writer_usable {
@@ -1255,13 +1322,12 @@ fn writer_loop(
                 // supersede archives `old`; mirror the Archive arm so subscribers
                 // observe the consolidation as an Archived event for `old`.
                 if changed {
-                    publish_change(
+                    publish_change_stamped(
                         &events,
-                        MemoryChanged {
-                            id: old,
-                            namespace,
-                            kind: ChangeKind::Archived,
-                        },
+                        store.as_ref(),
+                        old,
+                        namespace,
+                        ChangeKind::Archived,
                     );
                 }
                 if !writer_usable {
@@ -1314,6 +1380,33 @@ fn writer_loop(
                 let result = report.result.and_then(|()| {
                     outcome.ok_or_else(|| {
                         Error::Storage("namespace rename completed without an outcome".to_string())
+                    })
+                });
+                let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::Scrub { reply } => {
+                // No MemoryChanged events: scrub rewrites text in place but
+                // publishes no per-memory change (subscribers are not a
+                // redaction audit channel); the store writes the durable
+                // `scrub` oplog row inside the same transaction.
+                let mut outcome = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        outcome = Some(s.scrub()?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    outcome.ok_or_else(|| {
+                        Error::Storage("scrub completed without an outcome".to_string())
                     })
                 });
                 let _ = reply.send(result);

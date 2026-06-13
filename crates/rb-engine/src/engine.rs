@@ -17,9 +17,11 @@ pub struct RememberInput {
     pub keywords: Vec<String>,
     pub tags: Vec<String>,
     pub related_files: Vec<String>,
-    /// Trust prior in `0.0..=1.0`, validated fail-closed (1.0 = full trust,
-    /// the pre-W0.5 hardwired value; hook captures send 0.7).
-    pub confidence: f32,
+    /// Explicit trust prior in `0.0..=1.0` (validated fail-closed), or `None`
+    /// when the caller expressed no prior. `None` keeps the full-trust 1.0
+    /// baseline AND lets an enricher fill it; `Some(x)` is an explicit prior an
+    /// enricher must not override (fix #4). Hook captures send `Some(0.7)`.
+    pub confidence: Option<f32>,
     pub provenance: Provenance,
 }
 
@@ -64,6 +66,11 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     /// scale and stay unfloored until RRF is reachable and calibrated
     /// (W2.2/W4.1). See `rb_search::SCORE_FLOOR` for the derivation.
     score_floor: f32,
+    /// Determinism hook for eval/tests: when set, `remember` stamps
+    /// created/updated at this instant and ranking computes recency against
+    /// it, so (now - created_at) deltas are reproducible across runs instead
+    /// of riding the wall clock. `None` (production) uses `Utc::now()`.
+    fixed_now: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -82,7 +89,24 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
             score_floor: rb_search::SCORE_FLOOR,
+            fixed_now: None,
         }
+    }
+
+    /// Pin the engine's clock (eval/test determinism): `remember` stamps
+    /// created/updated at `now` and ranking computes recency against it, so
+    /// `(now - created_at)` deltas reproduce bit-for-bit across runs instead
+    /// of drifting with insert/query wall-clock timing. Never set in the
+    /// daemon.
+    pub fn with_fixed_now(mut self, now: chrono::DateTime<chrono::Utc>) -> Self {
+        self.fixed_now = Some(now);
+        self
+    }
+
+    /// The instant "now" for write stamps and recency ranking: the pinned
+    /// eval/test clock when set, else the wall clock.
+    fn now(&self) -> chrono::DateTime<chrono::Utc> {
+        self.fixed_now.unwrap_or_else(chrono::Utc::now)
     }
 
     /// Borrow the backend (used by daemon/tests for introspection).
@@ -173,13 +197,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
         rb_types::validate_importance(input.importance)?;
-        // Fail-closed confidence range check (mirrors the storage CHECK, but
-        // surfaces as a clean validation error rather than a Storage one).
-        if !input.confidence.is_finite() || !(0.0..=1.0).contains(&input.confidence) {
-            return Err(rb_types::Error::InvalidArgument(format!(
-                "confidence {} out of range 0.0..=1.0",
-                input.confidence
-            )));
+        // Fail-closed confidence range check on an EXPLICIT caller prior
+        // (mirrors the storage CHECK, but surfaces as a clean validation error
+        // rather than a Storage one). `None` carries no prior — valid.
+        if let Some(c) = input.confidence {
+            rb_types::validate_confidence(c)?;
         }
 
         let mut note = MemoryNote::new(
@@ -188,7 +210,17 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.memory_type,
             input.importance,
         );
-        note.confidence = input.confidence;
+        // Determinism hook: under a pinned clock the write stamps are the
+        // pinned instant, keeping recency deltas reproducible (eval only).
+        if let Some(now) = self.fixed_now {
+            note.created_at = now;
+            note.updated_at = now;
+        }
+        // `MemoryNote::new` defaults confidence to the full-trust 1.0 baseline;
+        // an explicit caller prior overrides it (an enricher will not — below).
+        if let Some(c) = input.confidence {
+            note.confidence = c;
+        }
         note.origin_user = input.provenance.origin_user;
         note.origin_host = input.provenance.origin_host;
         note.origin_agent = input.provenance.origin_agent;
@@ -229,6 +261,25 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         note.related_files = input.related_files;
         if let Some(ctx) = input.context {
             note.context = ctx;
+        }
+        // Enricher-declared confidence (W2.2: the enrichment trust producer).
+        // Applied only when the caller expressed NO prior (`input.confidence`
+        // is None) — an explicit caller prior always wins, even an explicit
+        // 1.0 (fix #4: a bare-f32 sentinel could not distinguish an explicit
+        // 1.0 from the default and would wrongly downgrade it). An out-of-range
+        // enricher value is ignored, not an error: enrichment is advisory and
+        // never fails a remember.
+        if input.confidence.is_none() {
+            if let Some(conf) = enrichment.as_ref().and_then(|e| e.confidence) {
+                if rb_types::validate_confidence(conf).is_ok() {
+                    note.confidence = conf;
+                } else {
+                    tracing::warn!(
+                        confidence = conf,
+                        "enricher returned out-of-range confidence; ignoring"
+                    );
+                }
+            }
         }
         note.embedding_model = self.embedder.model_id().to_string();
         // Stamp the composition version alongside the model so the `reembed`
@@ -464,7 +515,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // Dispatch on the configured fusion mode. `Linear` is the default and
         // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
         // hybrid (spec §7).
-        let now = chrono::Utc::now();
+        let now = self.now();
         let ranked = match self.fusion_mode {
             FusionMode::Linear => rb_search::rank(signals, self.weights, now, candidate_limit),
             FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
@@ -704,11 +755,70 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         if let Some(importance) = updates.importance {
             rb_types::validate_importance(importance)?;
         }
+        if let Some(confidence) = updates.confidence {
+            rb_types::validate_confidence(confidence)?;
+        }
         if self.get_scoped(id.clone()).await?.is_none() {
             return Err(rb_types::Error::NotFound(id));
         }
         self.backend
             .update(self.namespace.clone(), id, updates)
+            .await
+    }
+
+    /// Create an explicit link between two memories in this namespace (W2.2:
+    /// the user-facing producer for `contradicts` — the read side already
+    /// surfaces `contested` from active contradicts edges). Fail-closed
+    /// validation: self-links and duplicate `(from, to, type)` edges are
+    /// validation-class errors; both endpoints must exist in the caller's
+    /// namespace. A user-asserted link carries full strength (1.0).
+    pub async fn link(
+        &self,
+        from: MemoryId,
+        to: MemoryId,
+        link_type: rb_types::LinkType,
+        reason: Option<String>,
+    ) -> rb_types::Result<()> {
+        if from == to {
+            return Err(rb_types::Error::InvalidArgument(
+                "cannot link a memory to itself".to_string(),
+            ));
+        }
+        if link_type == rb_types::LinkType::Supersedes {
+            // A bare supersedes edge would bypass the atomic supersede
+            // machinery (which also stamps `superseded_by` on the old row).
+            return Err(rb_types::Error::InvalidArgument(
+                "supersedes links are created by storing a replacement memory, \
+                 not by linking; use a new memory that supersedes the old one"
+                    .to_string(),
+            ));
+        }
+        let source = self
+            .get_scoped(from.clone())
+            .await?
+            .ok_or_else(|| rb_types::Error::NotFound(from.clone()))?;
+        if self.get_scoped(to.clone()).await?.is_none() {
+            return Err(rb_types::Error::NotFound(to));
+        }
+        if source
+            .links
+            .iter()
+            .any(|l| l.target_id == to && l.link_type == link_type)
+        {
+            return Err(rb_types::Error::InvalidArgument(format!(
+                "a {} link from {from} to {to} already exists",
+                link_type.as_str()
+            )));
+        }
+        self.backend
+            .add_link(rb_types::MemoryLink {
+                source_id: from,
+                target_id: to,
+                link_type,
+                strength: 1.0,
+                reason: reason.unwrap_or_else(|| "user-asserted".to_string()),
+                created_at: chrono::Utc::now(),
+            })
             .await
     }
 
@@ -768,7 +878,9 @@ mod tests {
             keywords: Vec::new(),
             tags: Vec::new(),
             related_files: Vec::new(),
-            confidence: 1.0,
+            // No explicit prior: the engine applies the 1.0 baseline and an
+            // enricher (when present) may fill it.
+            confidence: None,
             provenance: Provenance::default(),
         }
     }
@@ -790,7 +902,7 @@ mod tests {
     async fn remember_stores_confidence_and_provenance() {
         let eng = engine();
         let mut inp = input("hook capture with provenance", 5);
-        inp.confidence = 0.7;
+        inp.confidence = Some(0.7);
         inp.provenance = Provenance {
             origin_user: Some("alice".into()),
             origin_host: Some("devbox".into()),
@@ -813,7 +925,7 @@ mod tests {
         let eng = engine();
         for bad in [-0.1f32, 1.1, f32::NAN, f32::INFINITY] {
             let mut inp = input("bad confidence", 5);
-            inp.confidence = bad;
+            inp.confidence = Some(bad);
             let err = eng.remember(inp).await.unwrap_err();
             assert!(
                 matches!(err, rb_types::Error::InvalidArgument(_)),
@@ -1869,6 +1981,47 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn update_sets_confidence_then_get_reflects_change() {
+        // W2.2: confidence is settable through the user-facing update path.
+        let eng = engine();
+        let id = eng.remember(input("trusted at first", 5)).await.unwrap();
+        eng.update(
+            id.clone(),
+            rb_types::MemoryUpdates {
+                confidence: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let note = eng.get(id).await.unwrap().unwrap();
+        assert!((note.confidence - 0.3).abs() < f32::EPSILON);
+    }
+
+    #[tokio::test]
+    async fn update_rejects_out_of_range_confidence() {
+        let eng = engine();
+        let id = eng.remember(input("valid", 5)).await.unwrap();
+        for bad in [-0.1f32, 1.5, f32::NAN] {
+            let err = eng
+                .update(
+                    id.clone(),
+                    rb_types::MemoryUpdates {
+                        confidence: Some(bad),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(err, rb_types::Error::InvalidArgument(_)),
+                "confidence {bad} must be InvalidArgument, got {err:?}"
+            );
+            assert!(err.to_string().contains("confidence"), "got {err}");
+        }
+    }
+
+    #[tokio::test]
     async fn update_does_not_mutate_cross_namespace_note() {
         let eng = engine();
         let cross = note(
@@ -1893,6 +2046,96 @@ mod tests {
 
         let note = eng.backend().note_of(&cross_id).unwrap();
         assert_eq!(note.content, "foreign body");
+    }
+
+    #[tokio::test]
+    async fn link_contradicts_makes_both_sides_contested_on_get() {
+        // W2.2 e2e: the user-facing link op is the contradicts producer; the
+        // existing read-side annotation must then surface contested on BOTH
+        // endpoints.
+        let eng = engine();
+        let a = eng.remember(input("use tabs", 5)).await.unwrap();
+        let b = eng.remember(input("use spaces", 5)).await.unwrap();
+        eng.link(
+            a.clone(),
+            b.clone(),
+            rb_types::LinkType::Contradicts,
+            Some("team flip-flopped".to_string()),
+        )
+        .await
+        .unwrap();
+        let got_a = eng.get(a).await.unwrap().unwrap();
+        let got_b = eng.get(b).await.unwrap().unwrap();
+        assert!(got_a.contested, "source of a contradicts link is contested");
+        assert!(got_b.contested, "target of a contradicts link is contested");
+    }
+
+    #[tokio::test]
+    async fn link_rejects_self_supersedes_missing_and_duplicate() {
+        let eng = engine();
+        let a = eng.remember(input("a", 5)).await.unwrap();
+        let b = eng.remember(input("b", 5)).await.unwrap();
+
+        let err = eng
+            .link(a.clone(), a.clone(), rb_types::LinkType::References, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)), "{err}");
+
+        let err = eng
+            .link(a.clone(), b.clone(), rb_types::LinkType::Supersedes, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("supersedes"),
+            "supersedes must be rejected with guidance: {err}"
+        );
+
+        let missing = MemoryId::new();
+        let err = eng
+            .link(
+                a.clone(),
+                missing.clone(),
+                rb_types::LinkType::References,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");
+
+        eng.link(a.clone(), b.clone(), rb_types::LinkType::References, None)
+            .await
+            .unwrap();
+        let err = eng
+            .link(a, b, rb_types::LinkType::References, None)
+            .await
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("already exists"),
+            "duplicate edge must be a clean validation error: {err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn link_does_not_cross_namespaces() {
+        // Both endpoints must be visible in the caller's namespace; a foreign
+        // memory is NotFound, not linkable.
+        let eng = engine();
+        let local = eng.remember(input("local", 5)).await.unwrap();
+        let foreign = note(
+            Namespace::Project("other".into()),
+            "foreign",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let foreign_id = foreign.id.clone();
+        eng.backend().insert_note(foreign);
+        let err = eng
+            .link(local, foreign_id, rb_types::LinkType::Contradicts, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");
     }
 
     #[tokio::test]
@@ -2065,6 +2308,54 @@ mod tests {
         assert_eq!(note.tags, vec!["callertag".to_string()]);
         // summary still comes from the enricher (caller never supplies it).
         assert_eq!(note.summary, "enriched summary");
+    }
+
+    #[tokio::test]
+    async fn remember_applies_enricher_confidence_when_caller_sent_no_prior() {
+        // W2.2: the enricher is a trust producer — its declared confidence
+        // lands on the note when the caller expressed no prior (confidence
+        // None), overriding the 1.0 baseline.
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        let id = eng.remember(input("body", 5)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert!(
+            (note.confidence - 0.6).abs() < f32::EPSILON,
+            "FixedEnricher declares 0.6, got {}",
+            note.confidence
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_keeps_explicit_caller_confidence_over_the_enricher() {
+        // An explicit caller prior (hook captures write 0.7) always wins.
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        let mut inp = input("body", 5);
+        inp.confidence = Some(0.7);
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert!(
+            (note.confidence - 0.7).abs() < f32::EPSILON,
+            "caller prior must win, got {}",
+            note.confidence
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_keeps_explicit_full_trust_over_the_enricher() {
+        // Fix #4: an EXPLICIT 1.0 must NOT be downgraded by the enricher. The
+        // old sentinel `(confidence - 1.0).abs() < EPSILON` could not tell an
+        // explicit 1.0 from the default and would wrongly apply the enricher's
+        // 0.6; with Option, Some(1.0) is explicit and is preserved.
+        let eng = engine().with_enricher(Arc::new(FixedEnricher));
+        let mut inp = input("fully trusted fact", 5);
+        inp.confidence = Some(1.0);
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert!(
+            (note.confidence - 1.0).abs() < f32::EPSILON,
+            "explicit 1.0 must survive enrichment, got {}",
+            note.confidence
+        );
     }
 
     #[tokio::test]

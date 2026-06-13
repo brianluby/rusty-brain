@@ -39,6 +39,8 @@ const REEMBED_DEFAULT_LIMIT: usize = 1000;
 const REEMBED_MAX_LIMIT: usize = 10_000;
 /// Maximum number of simultaneous client connections.
 const MAX_CONNECTIONS: usize = 256;
+/// Oplog rows fetched per replay batch on a `subscribe --since` reconnect.
+const OPLOG_REPLAY_BATCH: usize = 500;
 /// Idle deadline for the initial handshake read (fail fast on stalled connects).
 const HANDSHAKE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// Default idle deadline between consecutive request frames from an established
@@ -111,6 +113,10 @@ pub struct DaemonConfig {
     /// process env at bind — secrets are env-only and kept out of this
     /// `Debug`-printable struct.
     pub enrich: Option<EnrichEndpoint>,
+    /// Recall fusion strategy (W2.2: `RB_FUSION_MODE` / `search.fusion`).
+    /// `FusionMode::Linear` is the default; the default flip to RRF is
+    /// deferred to W4.1 eval evidence.
+    pub fusion_mode: rb_engine::FusionMode,
 }
 
 /// An OpenAI-compatible enrichment endpoint (no credentials here; see
@@ -132,6 +138,7 @@ pub struct Daemon {
     bind_guard: BindGuard,
     jobs_config: JobsConfig,
     request_idle_timeout: std::time::Duration,
+    fusion_mode: rb_engine::FusionMode,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -228,6 +235,7 @@ impl Daemon {
             bind_guard,
             jobs_config: config.jobs_config,
             request_idle_timeout,
+            fusion_mode: config.fusion_mode,
         })
     }
 
@@ -243,6 +251,7 @@ impl Daemon {
             mut bind_guard,
             jobs_config,
             request_idle_timeout,
+            fusion_mode,
         } = self;
         tokio::pin!(shutdown);
         // Writer-death signal (W1.6c): resolves only on an ABNORMAL writer
@@ -300,6 +309,7 @@ impl Daemon {
                                     jobs_config,
                                     request_idle_timeout,
                                     recall_counters,
+                                    fusion_mode,
                                 )
                                 .await
                                 {
@@ -500,6 +510,76 @@ async fn probe_live(path: &Path) -> bool {
     }
 }
 
+/// Kernel-verified identity of a connecting peer (W2.6): `getpeereid` on
+/// macOS/BSD, `SO_PEERCRED` on Linux, both via tokio's `peer_cred`. This — not
+/// the client-declared handshake identity — is the connection's principal for
+/// authorization decisions. The handshake identity remains provenance
+/// metadata only.
+#[derive(Debug, Clone, Copy)]
+struct PeerIdentity {
+    uid: Option<u32>,
+}
+
+impl PeerIdentity {
+    fn from_stream(stream: &UnixStream) -> Self {
+        match stream.peer_cred() {
+            Ok(cred) => Self {
+                uid: Some(cred.uid()),
+            },
+            Err(e) => {
+                warn!(error = %e, "could not read peer credentials; treating peer as non-admin");
+                Self { uid: None }
+            }
+        }
+    }
+
+    /// Admin = the kernel-verified peer uid equals the daemon's effective uid.
+    /// Unreadable peer credentials are never admin (fail closed). Root is NOT
+    /// special-cased: a root client gets no implicit admin grant from us (it
+    /// does not need one — it can read the DB file directly).
+    fn is_admin(&self) -> bool {
+        self.uid.is_some_and(|uid| uid == process_euid())
+    }
+}
+
+fn process_euid() -> u32 {
+    // SAFETY: geteuid takes no arguments, cannot fail, and touches no memory.
+    #[allow(unsafe_code)]
+    unsafe {
+        libc::geteuid()
+    }
+}
+
+/// Whether a request is a cross-namespace maintenance (admin) operation.
+/// These mutate or scan EVERY namespace, so they are gated on the
+/// kernel-verified peer identity rather than the handshake namespace.
+///
+/// EXHAUSTIVE on purpose (no `_` arm): a newly added `Request` variant fails
+/// to compile here until its author makes a deliberate admin/non-admin
+/// decision. A wildcard default would silently ship a new cross-namespace op
+/// ungated, defeating the W2.6 admin boundary.
+fn is_admin_op(req: &Request) -> bool {
+    match req {
+        // Cross-namespace maintenance: peer-gated.
+        Request::RunJob { .. }
+        | Request::Reembed { .. }
+        | Request::NamespaceRename { .. }
+        | Request::Scrub => true,
+        // Namespace-scoped by the handshake: not admin.
+        Request::Remember { .. }
+        | Request::Recall { .. }
+        | Request::Get { .. }
+        | Request::List { .. }
+        | Request::Graph { .. }
+        | Request::Update { .. }
+        | Request::Link { .. }
+        | Request::Delete { .. }
+        | Request::Context
+        | Request::Subscribe { .. }
+        | Request::Ping => false,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
@@ -509,7 +589,15 @@ async fn handle_connection(
     jobs_config: JobsConfig,
     request_idle_timeout: std::time::Duration,
     recall_counters: Arc<RecallChannelCounters>,
+    fusion_mode: rb_engine::FusionMode,
 ) -> Result<()> {
+    // W2.6 peer identity: read the kernel-verified peer credentials
+    // (`getpeereid`/`SO_PEERCRED` via tokio's `peer_cred`) BEFORE any frame is
+    // parsed. This is the connection's principal — nothing the client declares
+    // in the handshake can claim it. Admin ops are gated on it below;
+    // fail-closed: an unreadable peer cred is a non-admin connection.
+    let peer = PeerIdentity::from_stream(&stream);
+
     let mut framed = bounded_framed(stream);
 
     // Enforce a short deadline for the handshake so a stalled client cannot
@@ -567,7 +655,8 @@ async fn handle_connection(
     let store_for_stream = store.clone();
     let job_store = store.clone();
     let engine = {
-        let base = MemoryEngine::new(store, embedder, namespace.clone());
+        let base =
+            MemoryEngine::new(store, embedder, namespace.clone()).with_fusion_mode(fusion_mode);
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -586,8 +675,8 @@ async fn handle_connection(
         // Subscribe converts this connection into a one-way change stream. It
         // never returns to request/response cadence; it runs until the client
         // disconnects or the broadcast closes.
-        if matches!(req, Request::Subscribe) {
-            stream_changes(&mut framed, &store_for_stream, &namespace).await;
+        if let Request::Subscribe { since } = req {
+            stream_changes(&mut framed, &store_for_stream, &namespace, since).await;
             break;
         }
         let resp = dispatch(
@@ -596,6 +685,7 @@ async fn handle_connection(
             &jobs_config,
             &provenance,
             &recall_counters,
+            peer,
             req,
         )
         .await;
@@ -617,6 +707,7 @@ async fn stream_changes(
     framed: &mut Framed<UnixStream, LengthDelimitedCodec>,
     store: &StoreHandle,
     namespace: &rb_types::Namespace,
+    since: Option<u64>,
 ) {
     let mut rx = store.subscribe();
     // Acknowledge the subscription now that the broadcast receiver is registered.
@@ -626,11 +717,62 @@ async fn stream_changes(
     if write_frame(framed, &Response::SubscribeAck).await.is_err() {
         return; // client already gone
     }
+    // W2.7 replay-on-reconnect: with a cursor, replay every oplog change after
+    // it BEFORE live streaming. The broadcast receiver above is already
+    // registered, so a write landing during replay is buffered, not lost; the
+    // `replayed_to` watermark below drops the overlap (a live event whose seq
+    // the replay already delivered).
+    let mut replayed_to = since.unwrap_or(0);
+    if let Some(cursor) = since {
+        let mut after = cursor;
+        loop {
+            let page = match store
+                .oplog_changes_since(namespace.clone(), after, OPLOG_REPLAY_BATCH)
+                .await
+            {
+                Ok(page) => page,
+                Err(e) => {
+                    // Fail open to live-only streaming: the consumer keeps its
+                    // cursor and can retry; killing the stream would lose more.
+                    warn!(error = %e, "oplog replay failed; continuing with live stream only");
+                    break;
+                }
+            };
+            // Paginate on ROWS SCANNED, not events emitted: a page can return
+            // fewer events than scanned rows (bulk-admin rows are filtered),
+            // so `changes.len() < BATCH` would terminate early and drop every
+            // change after a page that contained filtered rows (W2.7 bug #2).
+            let done = page.scanned < OPLOG_REPLAY_BATCH;
+            // Advance the dedup watermark to the highest seq SCANNED (not just
+            // emitted): every overlap event with seq ≤ this was covered by the
+            // replay, so the live loop can safely drop it. No live event ever
+            // carries a filtered bulk-row seq (those publish no broadcast).
+            replayed_to = replayed_to.max(page.last_seq);
+            for evt in page.changes {
+                if write_frame(framed, &Response::Change(evt)).await.is_err() {
+                    return; // client disconnected mid-replay
+                }
+            }
+            if done {
+                break;
+            }
+            // Advance past every SCANNED row (incl. skipped ones) or a full
+            // page of skipped rows would re-scan forever / drop later rows.
+            after = page.last_seq;
+        }
+    }
     loop {
         match rx.recv().await {
             Ok(evt) => {
                 if &evt.namespace != namespace {
                     continue; // cross-namespace event: never leak it
+                }
+                // Overlap dedup: this event committed before (or during) the
+                // replay window and was already delivered from the oplog. An
+                // event without a seq cannot be compared — deliver it
+                // (over-notify is safe; silent drop is not).
+                if evt.seq.is_some_and(|s| s <= replayed_to) {
+                    continue;
                 }
                 if write_frame(framed, &Response::Change(evt)).await.is_err() {
                     break; // client disconnected
@@ -667,11 +809,23 @@ async fn dispatch<P>(
     jobs_config: &JobsConfig,
     provenance: &rb_engine::Provenance,
     recall_counters: &RecallChannelCounters,
+    peer: PeerIdentity,
     req: Request,
 ) -> Response
 where
     P: EmbeddingProvider,
 {
+    // W2.6: cross-namespace maintenance ops are admin-gated on the
+    // kernel-verified peer identity. Everything else stays namespace-scoped by
+    // the handshake (namespace is NOT an auth boundary — see
+    // docs/THREAT_MODEL.md).
+    if is_admin_op(&req) && !peer.is_admin() {
+        return error_to_response(Error::PermissionDenied(
+            "this is an admin operation: it requires a kernel-verified peer \
+             uid matching the daemon's user"
+                .to_string(),
+        ));
+    }
     match req {
         Request::Ping => Response::Pong {
             contract_version: CONTRACT_VERSION,
@@ -761,7 +915,7 @@ where
         },
         // Subscribe is handled by the streaming branch in `handle_connection`
         // before `dispatch` is called; reaching here is a protocol misuse.
-        Request::Subscribe => error_to_response(Error::InvalidArgument(
+        Request::Subscribe { .. } => error_to_response(Error::InvalidArgument(
             "Subscribe is a streaming op, not a single request".to_string(),
         )),
         Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config).await {
@@ -789,9 +943,28 @@ where
                 Err(e) => error_to_response(e),
             }
         }
+        Request::Link {
+            from,
+            to,
+            link_type,
+            reason,
+        } => match engine.link(from, to, link_type, reason).await {
+            Ok(()) => Response::Linked,
+            Err(e) => error_to_response(e),
+        },
+        // Admin op (peer-gated above): retroactive secret redaction across all
+        // namespaces through the single writer (W2.4).
+        Request::Scrub => match job_store.scrub().await {
+            Ok(outcome) => Response::Scrubbed {
+                scanned: outcome.scanned,
+                redacted: outcome.redacted,
+                reembed_pending: outcome.reembed_pending,
+            },
+            Err(e) => error_to_response(e),
+        },
         Request::NamespaceRename { old, new, merge } => {
             // One-time admin op (W0.3 carryover), cross-namespace by nature
-            // like RunJob/Reembed (admin-op gating arrives with W2.6). Both
+            // like RunJob/Reembed (peer-gated above, W2.6). Both
             // namespaces are round-trip validated before the writer sees them
             // so a malformed encoding can never land in the namespace column.
             match validate_namespace(old).and_then(|o| Ok((o, validate_namespace(new)?))) {
@@ -814,6 +987,46 @@ mod tests {
 
     use super::*;
     use rb_types::Namespace;
+
+    // W2.6: admin classification covers exactly the cross-namespace ops.
+    #[test]
+    fn admin_ops_are_runjob_reembed_and_namespace_rename() {
+        assert!(is_admin_op(&Request::RunJob {
+            job: rb_types::JobKind::LinkDecay
+        }));
+        assert!(is_admin_op(&Request::Reembed { limit: None }));
+        assert!(is_admin_op(&Request::NamespaceRename {
+            old: Namespace::Project("a".into()),
+            new: Namespace::Project("b".into()),
+            merge: false,
+        }));
+        for not_admin in [
+            Request::Ping,
+            Request::Context,
+            Request::Subscribe { since: None },
+            Request::Recall {
+                query: "q".into(),
+                memory_type: None,
+                tags: vec![],
+                limit: 1,
+            },
+        ] {
+            assert!(!is_admin_op(&not_admin), "{not_admin:?}");
+        }
+    }
+
+    // W2.6: the admin decision is the kernel-verified uid equaling the
+    // daemon's euid — unreadable peer creds and foreign uids fail closed.
+    #[test]
+    fn peer_identity_admin_is_same_euid_and_fails_closed() {
+        let me = process_euid();
+        assert!(PeerIdentity { uid: Some(me) }.is_admin());
+        assert!(!PeerIdentity {
+            uid: Some(me.wrapping_add(1))
+        }
+        .is_admin());
+        assert!(!PeerIdentity { uid: None }.is_admin());
+    }
 
     #[test]
     fn prepare_socket_dir_creates_missing_parent_private() {
@@ -886,6 +1099,7 @@ mod tests {
             jobs_config: JobsConfig::default(),
             request_idle_timeout: None,
             enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
         };
         assert_eq!(
             config
@@ -961,6 +1175,7 @@ mod tests {
             jobs_config: JobsConfig::default(),
             request_idle_timeout: None,
             enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
         };
         let daemon = Daemon::bind(
             config,

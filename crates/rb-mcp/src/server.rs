@@ -273,6 +273,7 @@ mod tests {
                     }
                 }
                 Request::Update { .. } => Response::Updated,
+                Request::Link { .. } => Response::Linked,
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
                     recent: vec![note()],
@@ -283,7 +284,7 @@ mod tests {
                     contract_version: 1,
                     recall_channels: None,
                 },
-                Request::Subscribe => Response::Pong {
+                Request::Subscribe { .. } => Response::Pong {
                     contract_version: 1,
                     recall_channels: None,
                 },
@@ -302,6 +303,11 @@ mod tests {
                 Request::NamespaceRename { .. } => Response::NamespaceRenamed {
                     moved: 0,
                     vectors: 0,
+                },
+                Request::Scrub => Response::Scrubbed {
+                    scanned: 0,
+                    redacted: 0,
+                    reembed_pending: 0,
                 },
             })
         }
@@ -357,13 +363,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_nine_tools() {
+    async fn tools_list_returns_ten_tools() {
         let mut proxy = fake();
         let r = req("tools/list", Some(2), json!({}));
         let resp = handle_request(r, &mut proxy).await.unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 9);
+        assert_eq!(tools.len(), 10);
         assert!(tools.iter().any(|t| t["name"] == "remember"));
+        assert!(tools.iter().any(|t| t["name"] == "link"));
         assert!(tools.iter().any(|t| t["name"] == "poll_changes"));
         assert!(tools[0]["inputSchema"]["type"] == "object");
     }
@@ -486,6 +493,7 @@ mod tests {
                 id: MemoryId::new(),
                 namespace: Namespace::Project("p".into()),
                 kind: ChangeKind::Created,
+                seq: None,
             });
             guard.record_dropped(2);
         }

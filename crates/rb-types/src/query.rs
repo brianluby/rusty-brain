@@ -51,6 +51,12 @@ pub struct MemoryUpdates {
     pub importance: Option<u8>,
     pub tags: Option<Vec<String>>,
     pub context: Option<String>,
+    /// Trust prior in `0.0..=1.0` (W2.2: the update-path confidence producer).
+    /// `#[serde(default)]` (`None`) keeps pre-W2.2 frames decodable in both
+    /// directions — the `contested` additive-field precedent. Range-validated
+    /// by the engine and again by the store.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub confidence: Option<f32>,
 }
 
 #[cfg(test)]
@@ -145,6 +151,7 @@ mod tests {
         assert!(u.importance.is_none());
         assert!(u.tags.is_none());
         assert!(u.context.is_none());
+        assert!(u.confidence.is_none());
     }
 
     #[test]
@@ -155,6 +162,7 @@ mod tests {
             importance: Some(9),
             tags: Some(vec!["x".to_string(), "y".to_string()]),
             context: Some("ctx".to_string()),
+            confidence: Some(0.4),
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: MemoryUpdates = serde_json::from_str(&json).unwrap();
@@ -163,5 +171,26 @@ mod tests {
         assert_eq!(back.importance, Some(9));
         assert_eq!(back.tags, Some(vec!["x".to_string(), "y".to_string()]));
         assert_eq!(back.context, Some("ctx".to_string()));
+        assert_eq!(back.confidence, Some(0.4));
+    }
+
+    #[test]
+    fn memory_updates_confidence_is_wire_compatible_in_both_directions() {
+        // Old frame (no `confidence` key) decodes to None; a None confidence
+        // serializes WITHOUT the key, keeping the frame byte-identical to the
+        // pre-W2.2 shape — the `contested` additive-field precedent.
+        let old = serde_json::json!({ "summary": "s" });
+        let back: MemoryUpdates = serde_json::from_value(old).unwrap();
+        assert!(back.confidence.is_none());
+
+        let none = MemoryUpdates {
+            summary: Some("s".to_string()),
+            ..Default::default()
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.as_object().unwrap().get("confidence").is_none(),
+            "None confidence must not serialize: {json}"
+        );
     }
 }

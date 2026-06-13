@@ -14,9 +14,9 @@ use rb_config::namespace::{
     UnpinnedOverride, REPO_CONFIG_FILE,
 };
 use rb_config::{
-    current_user, default_db_path, default_socket_path, db_path_from_env, socket_path_from_env,
-    ACCEPT_MODEL_CHANGE_ENV, DB_ENV, FORWARD_ENV, IDLE_TIMEOUT_ENV, JOBS_CONFIG_ENV,
-    NAMESPACE_ENV, SOCKET_ENV,
+    current_user, default_db_path, default_socket_path, resolve_db_path, resolve_socket_path,
+    ACCEPT_MODEL_CHANGE_ENV, DB_ENV, FORWARD_ENV, IDLE_TIMEOUT_ENV, JOBS_CONFIG_ENV, NAMESPACE_ENV,
+    SOCKET_ENV,
 };
 use rb_types::Namespace;
 use tempfile::TempDir;
@@ -59,13 +59,23 @@ fn idle_timeout_env_constant_has_expected_name() {
     assert_eq!(IDLE_TIMEOUT_ENV, "RUSTY_BRAIN_IDLE_TIMEOUT_SECS");
 }
 
-// W0.5 model-swap opt-in must be in FORWARD_ENV so an auto-started daemon
-// knows it should accept the corpus re-embed without a CLI flag.
+// C1 contract: FORWARD_ENV is secrets + identity + XDG/HOME ONLY — knobs like
+// the model-swap opt-in must NOT creep back in (they reach auto-started
+// daemons via the config file, or via the frozen LEGACY_KNOB_ENV compat list,
+// which spawn_forward_env still forwards when explicitly set).
 #[test]
-fn forward_env_includes_accept_model_change() {
+fn forward_env_excludes_knobs_but_spawn_forwarding_keeps_legacy_compat() {
     assert!(
-        FORWARD_ENV.contains(&ACCEPT_MODEL_CHANGE_ENV),
-        "FORWARD_ENV must include {ACCEPT_MODEL_CHANGE_ENV}"
+        !FORWARD_ENV.contains(&ACCEPT_MODEL_CHANGE_ENV),
+        "FORWARD_ENV must not regrow the {ACCEPT_MODEL_CHANGE_ENV} knob (C1)"
+    );
+    assert!(
+        rb_config::LEGACY_KNOB_ENV.contains(&ACCEPT_MODEL_CHANGE_ENV),
+        "{ACCEPT_MODEL_CHANGE_ENV} must stay supported via the frozen legacy list"
+    );
+    assert!(
+        rb_config::spawn_forward_env().any(|v| v == ACCEPT_MODEL_CHANGE_ENV),
+        "spawners must still forward {ACCEPT_MODEL_CHANGE_ENV} for compatibility"
     );
 }
 
@@ -156,7 +166,9 @@ fn default_pins_path_ends_with_namespace_pins_toml_in_rusty_brain_dir() {
         "pins file must be named namespace-pins.toml: {p:?}"
     );
     assert_eq!(
-        p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()),
+        p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str()),
         Some("rusty-brain"),
         "pins file must live in a rusty-brain directory: {p:?}"
     );
@@ -172,7 +184,9 @@ fn default_db_path_ends_with_rusty_brain_memory_db() {
     let p = default_db_path().unwrap();
     assert_eq!(p.file_name().and_then(|s| s.to_str()), Some("memory.db"));
     assert_eq!(
-        p.parent().and_then(|d| d.file_name()).and_then(|s| s.to_str()),
+        p.parent()
+            .and_then(|d| d.file_name())
+            .and_then(|s| s.to_str()),
         Some("rusty-brain"),
         "db must live in a rusty-brain directory: {p:?}"
     );
@@ -276,10 +290,7 @@ fn unclosed_frontmatter_with_project_key_still_returns_value() {
     // Frontmatter with opening `---` but no closing fence: the parser walks
     // until EOF. If it finds a `project:` line, it returns the value.
     let text = "---\nproject: no-close\nother: x\n";
-    assert_eq!(
-        project_from_frontmatter(text),
-        Some("no-close".to_string())
-    );
+    assert_eq!(project_from_frontmatter(text), Some("no-close".to_string()));
 }
 
 #[test]
@@ -513,13 +524,9 @@ fn repo_config_with_empty_namespace_falls_through_to_toplevel_name() {
     std::fs::create_dir_all(&top).unwrap();
     let git = |_: &Path| -> Option<std::path::PathBuf> { Some(top.clone()) };
     // namespace key present but value is empty after trimming.
-    let res = resolve_namespace_in(
-        &top,
-        None,
-        &NamespacePins::default(),
-        git,
-        |_| Some("namespace = \"\"\n".to_string()),
-    );
+    let res = resolve_namespace_in(&top, None, &NamespacePins::default(), git, |_| {
+        Some("namespace = \"\"\n".to_string())
+    });
     assert_eq!(res.namespace, Namespace::Project("my-repo".to_string()));
 }
 
@@ -530,13 +537,9 @@ fn repo_config_with_whitespace_namespace_falls_through_to_toplevel_name() {
     let top = tmp.path().join("my-repo");
     std::fs::create_dir_all(&top).unwrap();
     let git = |_: &Path| -> Option<std::path::PathBuf> { Some(top.clone()) };
-    let res = resolve_namespace_in(
-        &top,
-        None,
-        &NamespacePins::default(),
-        git,
-        |_| Some("namespace = \"   \"\n".to_string()),
-    );
+    let res = resolve_namespace_in(&top, None, &NamespacePins::default(), git, |_| {
+        Some("namespace = \"   \"\n".to_string())
+    });
     assert_eq!(res.namespace, Namespace::Project("my-repo".to_string()));
 }
 
@@ -547,17 +550,10 @@ fn repo_config_with_extra_toml_fields_still_uses_namespace() {
     let top = tmp.path().join("my-repo");
     std::fs::create_dir_all(&top).unwrap();
     let git = |_: &Path| -> Option<std::path::PathBuf> { Some(top.clone()) };
-    let res = resolve_namespace_in(
-        &top,
-        None,
-        &NamespacePins::default(),
-        git,
-        |_| Some("namespace = \"the-project\"\n# comment\nextra_key = 42\n".to_string()),
-    );
-    assert_eq!(
-        res.namespace,
-        Namespace::Project("the-project".to_string())
-    );
+    let res = resolve_namespace_in(&top, None, &NamespacePins::default(), git, |_| {
+        Some("namespace = \"the-project\"\n# comment\nextra_key = 42\n".to_string())
+    });
+    assert_eq!(res.namespace, Namespace::Project("the-project".to_string()));
 }
 
 /// Repo-committed TOML with no `namespace` key (other keys only) degrades to
@@ -568,13 +564,9 @@ fn repo_config_with_no_namespace_key_falls_through_to_toplevel_name() {
     let top = tmp.path().join("my-repo");
     std::fs::create_dir_all(&top).unwrap();
     let git = |_: &Path| -> Option<std::path::PathBuf> { Some(top.clone()) };
-    let res = resolve_namespace_in(
-        &top,
-        None,
-        &NamespacePins::default(),
-        git,
-        |_| Some("author = \"alice\"\nversion = \"1.0\"\n".to_string()),
-    );
+    let res = resolve_namespace_in(&top, None, &NamespacePins::default(), git, |_| {
+        Some("author = \"alice\"\nversion = \"1.0\"\n".to_string())
+    });
     assert_eq!(res.namespace, Namespace::Project("my-repo".to_string()));
 }
 
@@ -612,8 +604,13 @@ fn both_divergence_and_unpinned_override_are_reported_together() {
 /// divergence (nothing was found or rejected).
 #[test]
 fn global_resolution_has_no_override_and_no_divergence() {
-    let res: NamespaceResolution =
-        resolve_namespace_in(Path::new("/"), None, &NamespacePins::default(), no_git, no_head_config);
+    let res: NamespaceResolution = resolve_namespace_in(
+        Path::new("/"),
+        None,
+        &NamespacePins::default(),
+        no_git,
+        no_head_config,
+    );
     assert_eq!(res.namespace, Namespace::Global);
     assert!(res.unpinned_override.is_none());
     assert!(res.repo_config_divergence.is_none());
@@ -626,12 +623,26 @@ fn global_resolution_has_no_override_and_no_divergence() {
 #[test]
 fn empty_string_env_override_falls_back_to_default() {
     let _lock = ENV_LOCK.lock().unwrap();
+    // Point XDG_CONFIG_HOME at an empty temp dir so a developer's real
+    // `~/.config/rusty-brain/config.toml` cannot leak path knobs into the
+    // resolution under test (env > file > default; we are testing env+file
+    // both absent-or-empty).
+    let config_isolation = TempDir::new().unwrap();
+    let prev_cfg = std::env::var_os("XDG_CONFIG_HOME");
     let prev_sock = std::env::var_os(SOCKET_ENV);
     let prev_db = std::env::var_os(DB_ENV);
+    std::env::set_var("XDG_CONFIG_HOME", config_isolation.path());
     std::env::set_var(SOCKET_ENV, "");
     std::env::set_var(DB_ENV, "");
-    let sock = socket_path_from_env().unwrap();
-    let db = db_path_from_env().unwrap();
+    let sock = resolve_socket_path().unwrap();
+    let db = resolve_db_path().unwrap();
+    // Defaults computed under the SAME env so the comparison is apples-to-apples.
+    let default_sock = default_socket_path().unwrap();
+    let default_db = default_db_path().unwrap();
+    match prev_cfg {
+        Some(v) => std::env::set_var("XDG_CONFIG_HOME", v),
+        None => std::env::remove_var("XDG_CONFIG_HOME"),
+    }
     match prev_sock {
         Some(v) => std::env::set_var(SOCKET_ENV, v),
         None => std::env::remove_var(SOCKET_ENV),
@@ -641,6 +652,6 @@ fn empty_string_env_override_falls_back_to_default() {
         None => std::env::remove_var(DB_ENV),
     }
     // Both must equal their defaults (empty string is not a path override).
-    assert_eq!(sock, default_socket_path().unwrap());
-    assert_eq!(db, default_db_path().unwrap());
+    assert_eq!(sock, default_sock);
+    assert_eq!(db, default_db);
 }

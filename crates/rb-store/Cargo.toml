@@ -13,6 +13,7 @@ path = "src/lib.rs"
 
 [dependencies]
 rb-types = { path = "../rb-types" }
+rb-redact = { path = "../rb-redact" }
 rusqlite = { workspace = true }
 sqlite-vec = { workspace = true }
 include_dir = { workspace = true }

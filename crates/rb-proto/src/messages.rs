@@ -1,5 +1,5 @@
 use rb_types::{
-    JobKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
+    JobKind, LinkType, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
     SearchResult,
 };
 use serde::{Deserialize, Serialize};
@@ -65,11 +65,18 @@ pub enum Request {
         keywords: Vec<String>,
         tags: Vec<String>,
         related_files: Vec<String>,
-        /// Trust prior in `0.0..=1.0` (W0.5 / F39 producer down-payment).
-        /// `#[serde(default)]` to 1.0 so old clients keep today's behavior;
-        /// hook captures send 0.7. Range-validated by the engine.
-        #[serde(default = "default_confidence")]
-        confidence: f32,
+        /// Explicit trust prior in `0.0..=1.0` (W0.5 / F39 producer
+        /// down-payment), or `None` when the caller expressed no prior.
+        /// `None` means "use the full-trust default (1.0), but let an enricher
+        /// fill it if one runs"; `Some(x)` is an explicit caller prior that an
+        /// enricher must NOT override (fix #4 — distinguishing an explicit 1.0
+        /// from the default, which a bare `f32` could not). Hook captures send
+        /// `Some(0.7)`. `#[serde(default, skip_serializing_if)]`: an old client
+        /// omits the field (`None`), and a `None` serializes to nothing —
+        /// byte-identical to the pre-field frame, so no CONTRACT_VERSION bump.
+        /// Range-validated by the engine.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        confidence: Option<f32>,
     },
     Recall {
         query: String,
@@ -112,7 +119,18 @@ pub enum Request {
     /// (and `Response::Lagged` on broadcast overflow) until the client disconnects.
     /// The stream is scoped to the connection's handshake namespace, filtered
     /// server-side.
-    Subscribe,
+    ///
+    /// `since` (W2.7): when set, the daemon first REPLAYS every oplog change in
+    /// the namespace with `seq > since` (oldest first), then continues with
+    /// live events — a reconnecting subscriber resumes from its cursor instead
+    /// of silently missing whatever happened while it was away. Additive +
+    /// `#[serde(default)]`/`skip_serializing_if`: an old client's frame (no
+    /// key) decodes to `None`, and a `None` from a new client serializes
+    /// byte-identical to the old unit-variant frame.
+    Subscribe {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+    },
     /// One-time namespace rename (W0.3 carryover): re-scope every memory row
     /// from `old` to `new` in ONE writer transaction (memories, vec0 partition
     /// rows, one oplog entry). Refuses a non-empty `new` unless `merge` is set.
@@ -125,12 +143,24 @@ pub enum Request {
         #[serde(default)]
         merge: bool,
     },
-}
-
-/// Serde default for `Request::Remember::confidence`: full trust, the
-/// pre-W0.5 hardwired value.
-fn default_confidence() -> f32 {
-    1.0
+    /// Create an explicit link between two memories (W2.2: the user-facing
+    /// producer for `contradicts`; the read side already computes `contested`
+    /// from active contradicts edges). Additive variant per the
+    /// `NamespaceRename` precedent: an old daemon fails to decode it and
+    /// closes the connection (no CONTRACT_VERSION bump); `reason` is
+    /// `#[serde(default)]` so its absence decodes to `None`.
+    Link {
+        from: MemoryId,
+        to: MemoryId,
+        link_type: LinkType,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    /// Retroactively redact secrets from every stored memory (W2.4
+    /// `rusty-brain scrub`). Admin op, peer-gated server-side like RunJob /
+    /// Reembed / NamespaceRename. Replies with `Response::Scrubbed`. Additive
+    /// variant per the `NamespaceRename` precedent (no CONTRACT_VERSION bump).
+    Scrub,
 }
 
 /// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
@@ -209,6 +239,17 @@ pub enum Response {
     NamespaceRenamed {
         moved: u64,
         vectors: u64,
+    },
+    /// Acknowledges a `Request::Link`. Additive variant; old clients never see
+    /// it because they never send the request.
+    Linked,
+    /// Reply to `Request::Scrub` (W2.4): `redacted` of `scanned` rows had a
+    /// secret removed; `reembed_pending` of those need a `reembed` pass to
+    /// recompute their vector. Additive variant; old clients never see it.
+    Scrubbed {
+        scanned: u64,
+        redacted: u64,
+        reembed_pending: u64,
     },
     Error {
         kind: String,
@@ -324,10 +365,11 @@ mod tests {
     }
 
     #[test]
-    fn remember_without_confidence_defaults_to_full_trust() {
-        // Pre-W0.5 Remember payloads carry no confidence: serde must default it
-        // to 1.0 (today's hardwired value), keeping old clients byte-compatible.
-        let req = Request::Remember {
+    fn remember_without_confidence_decodes_to_none_and_none_omits_the_key() {
+        // Wire compat (fix #4): an old payload with no `confidence` decodes to
+        // None (the engine applies the 1.0 baseline), and a None serializes
+        // WITHOUT the key — byte-identical to the pre-field frame.
+        let explicit = Request::Remember {
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -335,17 +377,48 @@ mod tests {
             keywords: vec![],
             tags: vec![],
             related_files: vec![],
-            confidence: 0.3,
+            confidence: Some(0.3),
         };
-        let mut value = serde_json::to_value(&req).unwrap();
+        // Some(x) serializes the key and round-trips back to Some(x).
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert!(
+            json.get("confidence").is_some(),
+            "explicit confidence must serialize the key: {json}"
+        );
+        match serde_json::from_value::<Request>(json.clone()).unwrap() {
+            Request::Remember { confidence, .. } => {
+                assert!(confidence.is_some_and(|c| (c - 0.3).abs() < f32::EPSILON));
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+
+        // Removing the key decodes to None (old client / no explicit prior).
+        let mut value = json;
         value.as_object_mut().unwrap().remove("confidence");
         let back: Request = serde_json::from_value(value).unwrap();
         match back {
             Request::Remember { confidence, .. } => {
-                assert!((confidence - 1.0).abs() < f32::EPSILON);
+                assert_eq!(confidence, None);
             }
             other => panic!("expected Remember, got {other:?}"),
         }
+
+        // A None confidence serializes to nothing (no key) — pre-field shape.
+        let none = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.as_object().unwrap().get("confidence").is_none(),
+            "None confidence must not serialize: {json}"
+        );
     }
 
     #[test]
@@ -372,7 +445,7 @@ mod tests {
                 keywords: vec!["k".into()],
                 tags: vec!["t".into()],
                 related_files: vec!["src/lib.rs".into()],
-                confidence: 0.7,
+                confidence: Some(0.7),
             },
             Request::Recall {
                 query: "q".into(),
@@ -399,7 +472,8 @@ mod tests {
             Request::Delete { id },
             Request::Context,
             Request::Ping,
-            Request::Subscribe,
+            Request::Subscribe { since: None },
+            Request::Subscribe { since: Some(42) },
             Request::RunJob {
                 job: JobKind::LinkDecay,
             },
@@ -415,6 +489,7 @@ mod tests {
                 new: Namespace::Project("rusty-brain".into()),
                 merge: true,
             },
+            Request::Scrub,
         ]
     }
 
@@ -491,6 +566,7 @@ mod tests {
                 id: MemoryId::new(),
                 namespace: Namespace::Project("rusty-brain".into()),
                 kind: rb_types::ChangeKind::Created,
+                seq: Some(12),
             }),
             Response::Lagged { dropped: 3 },
             Response::SubscribeAck,
@@ -502,6 +578,12 @@ mod tests {
             Response::NamespaceRenamed {
                 moved: 12,
                 vectors: 9,
+            },
+            Response::Linked,
+            Response::Scrubbed {
+                scanned: 200,
+                redacted: 3,
+                reembed_pending: 2,
             },
         ]
     }
@@ -606,10 +688,18 @@ mod tests {
 
     #[test]
     fn subscribe_request_round_trips_and_uses_op_tag() {
-        let json = serde_json::to_string(&Request::Subscribe).unwrap();
+        // W2.7 wire compat: a cursorless Subscribe stays byte-identical to the
+        // pre-W2.7 unit-variant frame, and the old frame decodes to
+        // `since: None`.
+        let json = serde_json::to_string(&Request::Subscribe { since: None }).unwrap();
         assert_eq!(json, r#"{"op":"Subscribe"}"#);
         let back: Request = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+
+        let with_cursor = serde_json::to_string(&Request::Subscribe { since: Some(9) }).unwrap();
+        assert_eq!(with_cursor, r#"{"op":"Subscribe","since":9}"#);
+        let back: Request = serde_json::from_str(&with_cursor).unwrap();
+        assert!(matches!(back, Request::Subscribe { since: Some(9) }));
     }
 
     #[test]
@@ -619,6 +709,7 @@ mod tests {
             id: MemoryId::new(),
             namespace: Namespace::Project("rusty-brain".into()),
             kind: ChangeKind::Created,
+            seq: Some(3),
         });
         let json = serde_json::to_string(&change).unwrap();
         let back: Response = serde_json::from_str(&json).unwrap();

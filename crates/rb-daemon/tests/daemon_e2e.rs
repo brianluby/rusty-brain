@@ -45,6 +45,7 @@ impl RunningDaemon {
             jobs_config: rb_daemon::JobsConfig::default(),
             request_idle_timeout: None,
             enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
         };
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
 
@@ -112,7 +113,7 @@ async fn full_round_trip_through_client() {
             vec!["src/store.rs".to_string()],
             // Non-default on purpose: proves confidence round-trips through
             // wire + store instead of riding the serde default (1.0).
-            0.4,
+            Some(0.4),
         )
         .await
         .unwrap();
@@ -179,6 +180,88 @@ async fn full_round_trip_through_client() {
     daemon.stop().await;
 }
 
+// W2.2: the trust machinery is reachable end-to-end over the wire — an agent
+// can create a contradicts link and lower confidence, and reads then surface
+// `contested` and the new prior.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn link_and_confidence_update_round_trip_surfaces_contested() {
+    let daemon = RunningDaemon::start(4).await;
+    let ns = Namespace::Project("trust".to_string());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+
+    let a = client
+        .remember(
+            "deploys happen on fridays".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+    let b = client
+        .remember(
+            "deploys are frozen on fridays".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+
+    client
+        .link(
+            a.clone(),
+            b.clone(),
+            rb_types::LinkType::Contradicts,
+            Some("policy reversed".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let got_a = client.get(a.clone()).await.unwrap().unwrap();
+    let got_b = client.get(b.clone()).await.unwrap().unwrap();
+    assert!(got_a.contested, "link source must surface contested");
+    assert!(got_b.contested, "link target must surface contested");
+
+    // A duplicate edge is a clean validation-class error, not a Storage one.
+    let err = client
+        .link(a.clone(), b.clone(), rb_types::LinkType::Contradicts, None)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("already exists"),
+        "duplicate link must be a guidance-bearing rejection: {err}"
+    );
+
+    // Confidence is settable through the wire update path.
+    client
+        .update(
+            a.clone(),
+            MemoryUpdates {
+                confidence: Some(0.2),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let after = client.get(a).await.unwrap().unwrap();
+    assert!(
+        (after.confidence - 0.2).abs() < f32::EPSILON,
+        "confidence update must round-trip, got {}",
+        after.confidence
+    );
+
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 async fn many_concurrent_clients_no_lost_writes_no_errors() {
     let daemon = RunningDaemon::start(4).await;
@@ -203,7 +286,7 @@ async fn many_concurrent_clients_no_lost_writes_no_errors() {
                         vec!["concurrent".to_string()],
                         vec![],
                         vec![],
-                        1.0,
+                        Some(1.0),
                     )
                     .await
                     .unwrap();
@@ -244,7 +327,7 @@ async fn namespace_isolation_enforced_server_side() {
             vec!["alpha".to_string()],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -260,7 +343,7 @@ async fn namespace_isolation_enforced_server_side() {
             vec!["beta".to_string()],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -321,6 +404,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         jobs_config: rb_daemon::JobsConfig::default(),
         request_idle_timeout: None,
         enrich: None,
+        fusion_mode: rb_engine::FusionMode::Linear,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -343,6 +427,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         jobs_config: rb_daemon::JobsConfig::default(),
         request_idle_timeout: None,
         enrich: None,
+        fusion_mode: rb_engine::FusionMode::Linear,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -355,6 +440,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         jobs_config: rb_daemon::JobsConfig::default(),
         request_idle_timeout: None,
         enrich: None,
+        fusion_mode: rb_engine::FusionMode::Linear,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
     let err = Daemon::bind(cfg2, embedder).await.unwrap_err();
@@ -386,7 +472,7 @@ async fn large_limit_is_clamped_and_does_not_error() {
                 vec![],
                 vec![],
                 vec![],
-                1.0,
+                Some(1.0),
             )
             .await
             .unwrap();
@@ -434,7 +520,7 @@ async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -492,6 +578,130 @@ async fn wire_namespace_isolation_cross_namespace_ops_fail_closed() {
     daemon.stop().await;
 }
 
+// W2.4 / Phase 2 gate: retroactive `scrub` over the wire redacts a secret
+// that reached the store unredacted (the daemon's remember path does not
+// redact — only capture-time hooks do), so a row predating a rule is cleaned.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn scrub_over_the_wire_redacts_an_unredacted_stored_secret() {
+    let daemon = RunningDaemon::start(4).await;
+    let ns = Namespace::Project("scrub-wire".to_string());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+
+    // The daemon's Remember path stores verbatim (no capture-time redaction),
+    // so this lands a plaintext secret in the store — exactly the pre-rule
+    // row scrub exists to clean. The fake AWS key is BUILT from split literals
+    // so no committed byte forms a scanner-matchable token (push protection).
+    let secret = format!("AKIA{}", "A".repeat(16));
+    let id = client
+        .remember(
+            format!("rotate the key {secret} before friday"),
+            None,
+            MemoryType::Insight,
+            6,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+    let before = client.get(id.clone()).await.unwrap().unwrap();
+    assert!(before.content.contains(&secret));
+
+    // Same-uid test client is admin, so the gate admits the op.
+    let (scanned, redacted, reembed_pending) = client.scrub().await.unwrap();
+    assert!(scanned >= 1);
+    assert_eq!(redacted, 1);
+    assert_eq!(reembed_pending, 1, "content changed -> needs reembed");
+
+    let after = client.get(id).await.unwrap().unwrap();
+    assert!(
+        !after.content.contains(&secret),
+        "scrub must remove the stored secret: {}",
+        after.content
+    );
+    assert!(after.content.contains("[REDACTED:aws-key]"));
+
+    daemon.stop().await;
+}
+
+// W2.7 / Phase 2 gate: a killed-and-reconnected subscriber replays missed
+// events from its cursor instead of going silently empty.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn reconnected_subscriber_replays_missed_events_from_its_cursor() {
+    use rb_proto::SubscribeItem;
+    use rb_types::ChangeKind;
+
+    let daemon = RunningDaemon::start(4).await;
+    let ns = Namespace::Project("replay".to_string());
+
+    async fn next_change(sub: &mut Client) -> rb_types::MemoryChanged {
+        loop {
+            match tokio::time::timeout(Duration::from_secs(5), sub.recv_change())
+                .await
+                .expect("subscribe stream timed out")
+                .unwrap()
+            {
+                SubscribeItem::Change(evt) => break evt,
+                SubscribeItem::Lagged(_) => continue,
+            }
+        }
+    }
+
+    async fn remember(w: &mut Client, body: &str) -> rb_types::MemoryId {
+        w.remember(
+            body.to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap()
+    }
+
+    let mut writer = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    // Live subscriber sees the first write and records its cursor.
+    let mut sub = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+    sub.subscribe().await.unwrap();
+    let before = remember(&mut writer, "before the outage").await;
+    let evt = next_change(&mut sub).await;
+    assert_eq!(evt.id, before);
+    let cursor = evt.seq.expect("live events carry the oplog seq (W2.7)");
+
+    // Subscriber dies; two writes land while it is away.
+    drop(sub);
+    let missed_one = remember(&mut writer, "missed while away 1").await;
+    let missed_two = remember(&mut writer, "missed while away 2").await;
+
+    // Reconnect from the cursor: BOTH missed changes replay from the oplog,
+    // in commit order, before live streaming resumes.
+    let mut sub = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+    sub.subscribe_since(Some(cursor)).await.unwrap();
+    let replay_one = next_change(&mut sub).await;
+    let replay_two = next_change(&mut sub).await;
+    assert_eq!(replay_one.id, missed_one, "first missed change replays");
+    assert_eq!(replay_one.kind, ChangeKind::Created);
+    assert_eq!(replay_two.id, missed_two, "second missed change replays");
+    assert!(
+        replay_one.seq.unwrap() > cursor && replay_two.seq.unwrap() > replay_one.seq.unwrap(),
+        "replay is strictly after the cursor, in commit order"
+    );
+
+    // And the stream is LIVE after the replay: a new write arrives exactly
+    // once (the replay watermark must not duplicate it).
+    let live = remember(&mut writer, "after the reconnect").await;
+    let evt = next_change(&mut sub).await;
+    assert_eq!(evt.id, live, "live streaming resumes after replay");
+    assert!(evt.seq.unwrap() > replay_two.seq.unwrap());
+
+    daemon.stop().await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn subscribe_streams_only_own_namespace_changes() {
     use rb_proto::SubscribeItem;
@@ -516,7 +726,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -550,7 +760,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -566,7 +776,7 @@ async fn subscribe_streams_only_own_namespace_changes() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -621,7 +831,7 @@ async fn run_job_importance_recalibration_flows_through_client() {
             vec!["evolution".to_string()],
             vec!["jobs".to_string()],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -671,7 +881,7 @@ async fn reembed_over_the_wire_is_stamp_skip_and_idempotent() {
                 vec![format!("kw{i}")],
                 vec!["reembed".to_string()],
                 vec![],
-                1.0,
+                Some(1.0),
             )
             .await
             .unwrap();
@@ -739,7 +949,7 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -823,7 +1033,7 @@ async fn namespace_rename_round_trips_over_the_wire() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -836,7 +1046,7 @@ async fn namespace_rename_round_trips_over_the_wire() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();
@@ -853,7 +1063,7 @@ async fn namespace_rename_round_trips_over_the_wire() {
             vec![],
             vec![],
             vec![],
-            1.0,
+            Some(1.0),
         )
         .await
         .unwrap();

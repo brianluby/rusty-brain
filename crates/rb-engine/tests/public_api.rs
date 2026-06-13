@@ -230,7 +230,7 @@ async fn full_flow_through_public_api() {
             keywords: Vec::new(),
             tags: vec!["concurrency".to_string()],
             related_files: Vec::new(),
-            confidence: 1.0,
+            confidence: Some(1.0),
             provenance: Default::default(),
         })
         .await

@@ -43,6 +43,9 @@ impl Enricher for HeuristicEnricher {
             tags: Vec::new(),
             memory_type: None,
             importance: None,
+            // The heuristic has no basis for a trust judgment; the caller's
+            // prior (or the full-trust default) stands.
+            confidence: None,
         })
     }
 }

@@ -23,7 +23,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Minimal capture-time secret redaction (W0.5).
-regex = { workspace = true }
+rb-redact = { path = "../rb-redact" }
 
 [dev-dependencies]
 # Dev-only: the path-agreement tests pin hooks-resolution == daemon-resolution.

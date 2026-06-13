@@ -1,11 +1,23 @@
 //! Command-line surface for the `rusty-brain` binary (clap derive).
 
 use clap::{value_parser, Parser, Subcommand};
-use rb_types::MemoryType;
+use rb_types::{LinkType, MemoryType};
 
 /// Parse a `--type` value into a `MemoryType` using the canonical db strings.
 fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
     MemoryType::parse(s).map_err(|e| e.to_string())
+}
+
+/// Parse a link `--type` value into a `LinkType` using the canonical db strings.
+fn parse_link_type(s: &str) -> Result<LinkType, String> {
+    LinkType::parse(s).map_err(|e| e.to_string())
+}
+
+/// Clap range check for `--confidence` (inclusive 0.0..=1.0, finite).
+fn parse_confidence(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    rb_types::validate_confidence(v).map_err(|e| e.to_string())?;
+    Ok(v)
 }
 
 #[derive(Parser, Debug)]
@@ -112,6 +124,45 @@ pub enum Command {
         depth: u8,
     },
 
+    /// Apply a partial update to a memory (only provided fields change).
+    /// Content cannot be updated — store a new memory so embeddings stay
+    /// consistent.
+    Update {
+        /// Memory id (UUID).
+        id: String,
+        /// Replacement summary.
+        #[arg(long)]
+        summary: Option<String>,
+        /// Importance 1-10.
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
+        importance: Option<u8>,
+        /// Replacement tags (repeatable: `--tags a --tags b`).
+        #[arg(long)]
+        tags: Vec<String>,
+        /// Replacement context string.
+        #[arg(long)]
+        context: Option<String>,
+        /// Trust prior 0.0-1.0 (W2.2: e.g. lower it on a memory you no longer
+        /// fully trust).
+        #[arg(long, value_parser = parse_confidence)]
+        confidence: Option<f32>,
+    },
+
+    /// Link two memories (e.g. mark one as contradicting another). Both sides
+    /// of an active `contradicts` link surface `contested` on reads.
+    Link {
+        /// Source memory id (UUID).
+        from: String,
+        /// Target memory id (UUID).
+        to: String,
+        /// Link type: `contradicts`, `extends`, `implements`, or `references`.
+        #[arg(long = "type", value_parser = parse_link_type)]
+        link_type: LinkType,
+        /// Why this link exists (stored on the edge).
+        #[arg(long)]
+        reason: Option<String>,
+    },
+
     /// Soft-delete (archive) a memory.
     Delete {
         /// Memory id (UUID).
@@ -122,7 +173,14 @@ pub enum Command {
     Context,
 
     /// Stream live change notifications for the current namespace until Ctrl-C.
-    Subscribe,
+    Subscribe {
+        /// Resume from this oplog cursor: changes with seq > SINCE are
+        /// replayed from the durable log before live streaming begins, so a
+        /// reconnecting consumer misses nothing. Each streamed change carries
+        /// its `seq`; track the max you have seen.
+        #[arg(long)]
+        since: Option<u64>,
+    },
 
     /// Ping the daemon and report its contract version.
     Status,
@@ -143,6 +201,12 @@ pub enum Command {
         #[arg(long)]
         limit: Option<usize>,
     },
+
+    /// Retroactively redact secrets from every stored memory (W2.4). Rewrites
+    /// content/summary/context in place and marks affected rows for
+    /// re-embedding; follow with `rusty-brain reembed` until changed=0. Admin
+    /// op: only a client running as the daemon's own user may invoke it.
+    Scrub,
 
     /// Namespace administration (data-lifecycle helpers).
     Namespace {
@@ -185,8 +249,17 @@ mod tests {
     fn parses_subscribe_subcommand() {
         let cli = Cli::parse_from(["rusty-brain", "subscribe"]);
         assert!(
-            matches!(cli.command, Command::Subscribe),
+            matches!(cli.command, Command::Subscribe { since: None }),
             "`rusty-brain subscribe` must parse to Command::Subscribe"
+        );
+    }
+
+    #[test]
+    fn subscribe_accepts_a_since_cursor() {
+        let cli = Cli::parse_from(["rusty-brain", "subscribe", "--since", "42"]);
+        assert!(
+            matches!(cli.command, Command::Subscribe { since: Some(42) }),
+            "--since must parse as the oplog cursor"
         );
     }
 
@@ -194,7 +267,7 @@ mod tests {
     fn parses_subscribe_with_global_json_flag() {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
-        assert!(matches!(cli.command, Command::Subscribe));
+        assert!(matches!(cli.command, Command::Subscribe { .. }));
     }
 
     #[test]
@@ -271,6 +344,89 @@ mod tests {
             }
             other => panic!("expected Namespace Rename, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn update_parses_partial_fields_including_confidence() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "update",
+            "0c8e7f76-3a4f-4f7e-9d3a-111111111111",
+            "--importance",
+            "9",
+            "--confidence",
+            "0.3",
+        ]);
+        match cli.command {
+            Command::Update {
+                id,
+                summary,
+                importance,
+                tags,
+                context,
+                confidence,
+            } => {
+                assert_eq!(id, "0c8e7f76-3a4f-4f7e-9d3a-111111111111");
+                assert_eq!(summary, None);
+                assert_eq!(importance, Some(9));
+                assert!(tags.is_empty());
+                assert_eq!(context, None);
+                assert_eq!(confidence, Some(0.3));
+            }
+            other => panic!("expected Update, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_rejects_out_of_range_confidence_at_parse_time() {
+        for bad in ["-0.1", "1.5", "NaN"] {
+            let res =
+                Cli::try_parse_from(["rusty-brain", "update", "some-id", "--confidence", bad]);
+            assert!(res.is_err(), "confidence {bad} must fail to parse");
+        }
+    }
+
+    #[test]
+    fn link_parses_ids_type_and_reason() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "link",
+            "0c8e7f76-3a4f-4f7e-9d3a-111111111111",
+            "0c8e7f76-3a4f-4f7e-9d3a-222222222222",
+            "--type",
+            "contradicts",
+            "--reason",
+            "team reversed the decision",
+        ]);
+        match cli.command {
+            Command::Link {
+                from,
+                to,
+                link_type,
+                reason,
+            } => {
+                assert_eq!(from, "0c8e7f76-3a4f-4f7e-9d3a-111111111111");
+                assert_eq!(to, "0c8e7f76-3a4f-4f7e-9d3a-222222222222");
+                assert_eq!(link_type, LinkType::Contradicts);
+                assert_eq!(reason.as_deref(), Some("team reversed the decision"));
+            }
+            other => panic!("expected Link, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn link_requires_an_explicit_type() {
+        let res = Cli::try_parse_from(["rusty-brain", "link", "a-id", "b-id"]);
+        assert!(res.is_err(), "--type is required for link");
+    }
+
+    #[test]
+    fn parses_scrub_subcommand() {
+        let cli = Cli::parse_from(["rusty-brain", "scrub"]);
+        assert!(
+            matches!(cli.command, Command::Scrub),
+            "`rusty-brain scrub` must parse to Command::Scrub"
+        );
     }
 
     #[test]

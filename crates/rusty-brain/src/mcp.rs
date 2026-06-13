@@ -273,13 +273,27 @@ async fn run_subscriber(
     buffer: Arc<Mutex<ChangeBuffer>>,
 ) {
     let mut backoff = SUBSCRIBE_BACKOFF_INITIAL;
+    // W2.7 replay cursor: the highest oplog seq this subscriber has pushed
+    // into the ring. On reconnect we resubscribe `--since cursor`, so the
+    // daemon replays whatever committed during the outage instead of those
+    // changes being silently missed. `None` until the first seq-stamped event
+    // (a first connect has nothing to resume; a pre-seq daemon never advances
+    // it, which degrades to today's live-only behavior).
+    let mut cursor: Option<u64> = None;
     loop {
-        match connect_and_subscribe(socket_path, db_path, namespace.clone(), self_exe.clone()).await
+        match connect_and_subscribe(
+            socket_path,
+            db_path,
+            namespace.clone(),
+            self_exe.clone(),
+            cursor,
+        )
+        .await
         {
             Ok(mut client) => {
                 buffer.lock().await.set_connected();
                 backoff = SUBSCRIBE_BACKOFF_INITIAL;
-                pump_changes(&mut client, &buffer).await;
+                pump_changes(&mut client, &buffer, &mut cursor).await;
                 buffer.lock().await.set_disconnected();
             }
             Err(e) => {
@@ -297,12 +311,13 @@ async fn run_subscriber(
 }
 
 /// Open a fresh connection (auto-starting the daemon if needed) and switch it
-/// into the change stream.
+/// into the change stream, resuming from `since` when a cursor exists (W2.7).
 async fn connect_and_subscribe(
     socket_path: &Path,
     db_path: &Path,
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
+    since: Option<u64>,
 ) -> rb_types::Result<Client> {
     let mut client = connect_or_start(
         socket_path,
@@ -312,16 +327,24 @@ async fn connect_and_subscribe(
         Some(crate::client::client_identity("mcp")),
     )
     .await?;
-    client.subscribe().await?;
+    client.subscribe_since(since).await?;
     Ok(client)
 }
 
 /// Drain the live stream into the ring until it errors (daemon restart or
-/// shutdown); the caller handles reconnect.
-async fn pump_changes(client: &mut Client, buffer: &Arc<Mutex<ChangeBuffer>>) {
+/// shutdown), advancing the replay cursor past every seq-stamped event; the
+/// caller handles reconnect.
+async fn pump_changes(
+    client: &mut Client,
+    buffer: &Arc<Mutex<ChangeBuffer>>,
+    cursor: &mut Option<u64>,
+) {
     loop {
         match client.recv_change().await {
             Ok(SubscribeItem::Change(evt)) => {
+                if let Some(seq) = evt.seq {
+                    *cursor = Some(cursor.unwrap_or(0).max(seq));
+                }
                 buffer.lock().await.push(evt);
             }
             Ok(SubscribeItem::Lagged(n)) => {
@@ -386,14 +409,14 @@ mod tests {
                 keywords: vec![],
                 tags: vec![],
                 related_files: vec![],
-                confidence: 1.0,
+                confidence: None,
             },
             Request::Update {
                 id: id(),
                 updates: Default::default(),
             },
             Request::Delete { id: id() },
-            Request::Subscribe,
+            Request::Subscribe { since: None },
             Request::RunJob {
                 job: rb_types::JobKind::LinkDecay,
             },

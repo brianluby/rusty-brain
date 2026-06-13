@@ -1,4 +1,4 @@
-//! The 8 MCP tools rusty-brain exposes, each with a JSON-Schema input contract.
+//! The MCP tools rusty-brain exposes, each with a JSON-Schema input contract.
 
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -28,7 +28,7 @@ fn memory_type_enum() -> Value {
     ])
 }
 
-/// All 8 tool definitions. Pure: no IO, deterministic ordering.
+/// All tool definitions. Pure: no IO, deterministic ordering.
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
@@ -118,9 +118,32 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "summary": { "type": "string" },
                     "importance": { "type": "integer", "minimum": 1, "maximum": 10 },
                     "tags": { "type": "array", "items": { "type": "string" } },
-                    "context": { "type": "string" }
+                    "context": { "type": "string" },
+                    "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0,
+                                    "description": "Trust prior 0.0-1.0; lower it when a \
+                                                    memory looks unreliable or outdated." }
                 },
                 "required": ["id"]
+            }),
+        },
+        ToolDef {
+            name: "link",
+            description: "Link two memories. Use type 'contradicts' when one memory \
+                          contradicts another — both sides then surface a 'contested' \
+                          flag on recall/get until one is archived.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "from": { "type": "string", "description": "Source memory id (UUID)." },
+                    "to": { "type": "string", "description": "Target memory id (UUID)." },
+                    "type": { "type": "string",
+                              "enum": ["contradicts", "extends", "implements", "references"],
+                              "description": "Relationship kind (supersedes is created by \
+                                              storing a replacement memory, not by linking)." },
+                    "reason": { "type": "string",
+                                "description": "Why this link exists (stored on the edge)." }
+                },
+                "required": ["from", "to", "type"]
             }),
         },
         ToolDef {
@@ -168,7 +191,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn exposes_exactly_the_nine_tools() {
+    fn exposes_exactly_the_ten_tools() {
         let names: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
         let expected: BTreeSet<&str> = [
             "remember",
@@ -177,6 +200,7 @@ mod tests {
             "list",
             "graph",
             "update",
+            "link",
             "delete",
             "context",
             "poll_changes",
@@ -185,9 +209,47 @@ mod tests {
         .collect();
         assert_eq!(
             names, expected,
-            "tool set must be the 8 spine tools + poll_changes"
+            "tool set must be the 8 spine tools + link + poll_changes"
         );
-        assert_eq!(tool_definitions().len(), 9);
+        assert_eq!(tool_definitions().len(), 10);
+    }
+
+    #[test]
+    fn link_requires_from_to_and_type_and_omits_supersedes() {
+        // W2.2: the link tool is the contradicts producer; `supersedes` is
+        // deliberately absent from the schema enum (the engine rejects it —
+        // supersede is its own atomic op).
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "link")
+            .unwrap();
+        let required: Vec<&str> = t.input_schema["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert_eq!(required, vec!["from", "to", "type"]);
+        let kinds: Vec<&str> = t.input_schema["properties"]["type"]["enum"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|v| v.as_str().unwrap())
+            .collect();
+        assert!(kinds.contains(&"contradicts"));
+        assert!(!kinds.contains(&"supersedes"));
+    }
+
+    #[test]
+    fn update_schema_offers_confidence_in_unit_range() {
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "update")
+            .unwrap();
+        let conf = &t.input_schema["properties"]["confidence"];
+        assert_eq!(conf["type"], "number");
+        assert_eq!(conf["minimum"], 0.0);
+        assert_eq!(conf["maximum"], 1.0);
     }
 
     #[test]

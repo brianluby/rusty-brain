@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 
 pub use file::{
     config_file_path, load_file_config, parse_file_config, EmbedFileConfig, EnrichFileConfig,
-    FileConfig, LoadedFileConfig,
+    FileConfig, LoadedFileConfig, SearchFileConfig,
 };
 use rb_types::{Error, Result};
 
@@ -52,6 +52,10 @@ pub const ENRICH_BASE_URL_ENV: &str = "RB_ENRICH_BASE_URL";
 /// Env var for the opt-in LLM-enrichment model. Config-file equivalent:
 /// `enrich.model`.
 pub const ENRICH_MODEL_ENV: &str = "RB_ENRICH_MODEL";
+/// Env var selecting the recall fusion strategy (`linear` or `rrf`, W2.2).
+/// Config-file equivalent: `search.fusion`. NOT in [`FORWARD_ENV`] (C1: knobs
+/// reach auto-started daemons via the config file, never the env allowlist).
+pub const FUSION_MODE_ENV: &str = "RB_FUSION_MODE";
 
 /// The exact set of parent env vars an auto-start daemon child may inherit.
 /// Everything else is cleared before spawn (no parent-env leak into a
@@ -315,6 +319,34 @@ fn resolve_idle_timeout_secs(file_value: Option<u64>, warnings: &mut Vec<String>
     }
 }
 
+/// Normalize the fusion-mode knob (env > file): `linear`/`rrf`
+/// (case-insensitive, trimmed) pass through; anything else warns and is
+/// ignored per knob source, falling back to the next source then the engine
+/// default — the idle-timeout warn-and-ignore precedent.
+fn resolve_fusion_mode(
+    env_value: Option<String>,
+    file_value: Option<String>,
+    warnings: &mut Vec<String>,
+) -> Option<String> {
+    let mut normalize = |value: Option<String>, source: &str| -> Option<String> {
+        let raw = value?;
+        let v = raw.trim().to_ascii_lowercase();
+        match v.as_str() {
+            "linear" | "rrf" => Some(v),
+            _ => {
+                warnings.push(format!(
+                    "ignoring invalid {source}={raw:?} (want \"linear\" or \"rrf\")"
+                ));
+                None
+            }
+        }
+    };
+    if let Some(v) = normalize(env_value, FUSION_MODE_ENV) {
+        return Some(v);
+    }
+    normalize(file_value, "search.fusion in config file")
+}
+
 /// The fully resolved per-process configuration: env var > user config file >
 /// built-in default, per knob (CLI flags are applied above this by the
 /// binaries). Resolved identically by the CLI, the hooks, and the daemon —
@@ -341,6 +373,11 @@ pub struct EffectiveConfig {
     pub jobs_config: Option<PathBuf>,
     /// Per-connection request idle timeout in seconds; `None` = daemon default.
     pub idle_timeout_secs: Option<u64>,
+    /// Recall fusion strategy, normalized to `"linear"` or `"rrf"` (W2.2);
+    /// `None` = engine default (linear). Unknown values warn and are ignored
+    /// (the idle-timeout precedent). The daemon parses this into its
+    /// `FusionMode` — rb-config stays a leaf over rb-types.
+    pub fusion_mode: Option<String>,
     /// Non-fatal findings (unknown config keys, ignored invalid values).
     /// Callers surface these (`tracing::warn!`); they never fail resolution.
     pub warnings: Vec<String>,
@@ -355,6 +392,11 @@ impl EffectiveConfig {
         let mut warnings = loaded.warnings;
         let config = loaded.config;
         let idle_timeout_secs = resolve_idle_timeout_secs(config.idle_timeout_secs, &mut warnings);
+        let fusion_mode = resolve_fusion_mode(
+            env_string(FUSION_MODE_ENV),
+            file_string(&config.search.fusion),
+            &mut warnings,
+        );
         Ok(Self {
             socket_path: socket_path_with(&config)?,
             db_path: db_path_with(&config)?,
@@ -368,6 +410,7 @@ impl EffectiveConfig {
                 .or_else(|| file_string(&config.enrich.model)),
             jobs_config: env_override(JOBS_CONFIG_ENV).or_else(|| file_path(&config.jobs_config)),
             idle_timeout_secs,
+            fusion_mode,
             warnings,
         })
     }
@@ -449,6 +492,7 @@ mod tests {
             LOCAL_MODEL_ENV,
             ENRICH_BASE_URL_ENV,
             ENRICH_MODEL_ENV,
+            FUSION_MODE_ENV,
         ] {
             guards.push(EnvGuard::remove(name));
         }
@@ -614,7 +658,69 @@ mod tests {
         assert_eq!(effective.enrich_model, None);
         assert_eq!(effective.jobs_config, None);
         assert_eq!(effective.idle_timeout_secs, None);
+        assert_eq!(effective.fusion_mode, None);
         assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    // W2.2: the fusion-mode knob follows the same env > file > default
+    // precedence, normalizes case, and warns-and-ignores unknown values.
+    #[test]
+    fn fusion_mode_precedence_normalization_and_invalid_value_warning() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [search]
+            fusion = "rrf"
+            "#,
+        );
+
+        // File over default.
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.fusion_mode.as_deref(), Some("rrf"));
+        assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+
+        // Env over file, case-insensitive.
+        {
+            let _e = EnvGuard::set(FUSION_MODE_ENV, std::path::Path::new("Linear"));
+            let effective = EffectiveConfig::resolve().unwrap();
+            assert_eq!(effective.fusion_mode.as_deref(), Some("linear"));
+        }
+
+        // Invalid env value warns and falls back to the (valid) file value.
+        {
+            let _e = EnvGuard::set(FUSION_MODE_ENV, std::path::Path::new("cosine"));
+            let effective = EffectiveConfig::resolve().unwrap();
+            assert_eq!(effective.fusion_mode.as_deref(), Some("rrf"));
+            assert!(
+                effective
+                    .warnings
+                    .iter()
+                    .any(|w| w.contains("RB_FUSION_MODE")),
+                "invalid value must warn: {:?}",
+                effective.warnings
+            );
+        }
+
+        // Invalid file value (no env) warns and yields None (engine default).
+        write_config(
+            &confdir,
+            r#"
+            [search]
+            fusion = "best"
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(effective.fusion_mode, None);
+        assert!(
+            effective
+                .warnings
+                .iter()
+                .any(|w| w.contains("search.fusion")),
+            "invalid file value must warn: {:?}",
+            effective.warnings
+        );
     }
 
     // C1 agreement: with the config file as the ONLY source, the path

@@ -2603,8 +2603,8 @@ dependencies = [
  "rb-config",
  "rb-daemon",
  "rb-proto",
+ "rb-redact",
  "rb-types",
- "regex",
  "serde",
  "serde_json",
  "tempfile",
@@ -2664,6 +2664,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "rb-redact"
+version = "0.0.1"
+dependencies = [
+ "regex",
+]
+
+[[package]]
 name = "rb-search"
 version = "0.0.1"
 dependencies = [
@@ -2677,6 +2684,7 @@ version = "0.0.1"
 dependencies = [
  "chrono",
  "include_dir",
+ "rb-redact",
  "rb-types",
  "rusqlite",
  "serde_json",

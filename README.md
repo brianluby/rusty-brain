@@ -110,7 +110,7 @@ Implemented and test-covered (correctness only — see [Testing](#testing)):
   active `contradicts` link (best-effort, never fails recall).
 - **A single-writer daemon** over SQLite WAL with a concurrent read pool, change
   notifications via an in-process broadcast, and auto-start from any client command.
-- **An MCP server** exposing nine tools over stdio.
+- **An MCP server** exposing ten tools over stdio.
 - **A CLI** for direct use and scripting.
 - **Pluggable embeddings** — an offline deterministic provider (default), a Voyage API
   provider, and an optional local ONNX provider behind a feature flag.
@@ -176,6 +176,15 @@ rusty-brain list --min-importance 6
 rusty-brain graph <id> --depth 1
 rusty-brain context
 
+# adjust a memory you no longer fully trust, or mark two memories as
+# contradicting (both then surface `contested: true` on reads)
+rusty-brain update <id> --confidence 0.3
+rusty-brain link <from-id> <to-id> --type contradicts --reason "policy reversed"
+
+# retroactively redact secrets from every stored memory, then re-embed
+rusty-brain scrub
+rusty-brain reembed
+
 # add --json to any command for machine-readable output
 rusty-brain recall "sqlite" --json
 ```
@@ -220,8 +229,9 @@ MCP-capable agent at it as a stdio server, for example:
 }
 ```
 
-It exposes nine tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
-`delete`, `context`, and `poll_changes` (drains buffered change notifications).
+It exposes ten tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
+`link` (e.g. mark one memory as contradicting another), `delete`, `context`, and
+`poll_changes` (drains buffered change notifications).
 
 ### Capture hooks (optional)
 
@@ -264,6 +274,9 @@ local_model = "all-MiniLM-L6-v2"
 [enrich]
 base_url = "http://localhost:11434/v1"
 model = "llama3"             # both base_url and model required to activate
+
+[search]
+fusion = "linear"            # or "rrf" (Reciprocal Rank Fusion) for recall ranking
 ```
 
 Two further small files exist for namespace identity (and identity ONLY — a
@@ -289,6 +302,7 @@ unpinned overrides are never silently honored.
 | `RB_ENRICH_BASE_URL`, `RB_ENRICH_MODEL` | `enrich.base_url`, `enrich.model` | Optional LLM enrichment endpoint (off by default; heuristic enrichment is used otherwise). |
 | `RB_ENRICH_API_KEY` | — (secret, env-only) | API key for the enrichment endpoint (optional, e.g. Ollama needs none). |
 | `RB_JOBS_CONFIG` | `jobs_config` | Path to an evolution-jobs TOML config for `serve` (jobs are disabled if absent). |
+| `RB_FUSION_MODE` | `search.fusion` | Recall fusion strategy: `linear` (default) or `rrf`. |
 | `RUST_LOG` | — | Log verbosity (logs go to stderr; stdout is reserved for results). |
 
 ## Workspace layout
@@ -306,7 +320,8 @@ single-purpose; dependencies form a compiler-enforced DAG.
 | `rb-engine` | Per-request orchestration: enrich → embed → store → link → recall. |
 | `rb-enrich` | Opt-in LLM enrichment and semantic linking (heuristic offline by default). |
 | `rb-daemon` | Single-writer service: writer thread, read pool, socket listener, change broadcast, namespace isolation. |
-| `rb-mcp` | MCP stdio adapter (the nine tools). |
+| `rb-mcp` | MCP stdio adapter (the ten tools). |
+| `rb-redact` | Shared secret-redaction pass (rules + entropy sweep) for capture and `scrub`. |
 | `rusty-brain` | The `rusty-brain` binary: `serve`, `mcp`, and client subcommands. |
 | `rb-agents` | CLI-agnostic agent hook spine: event model and per-CLI adapters. |
 | `rb-hooks` | The `rusty-brain-hooks` capture binary (fail-open). |
