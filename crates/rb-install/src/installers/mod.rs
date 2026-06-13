@@ -32,8 +32,15 @@ pub fn builtins() -> Vec<Box<dyn AgentInstaller>> {
     ]
 }
 
-/// Claude Code's hook event names. The tool event is `PostToolUse`.
-pub(crate) const CLAUDE_EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
+/// Claude Code's hook event names. The tool event is `PostToolUse`; `SessionEnd`
+/// is the W3.1 capture point (folds the per-session scratch into one summary).
+pub(crate) const CLAUDE_EVENTS: [&str; 5] = [
+    "SessionStart",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+];
 /// Gemini's hook event names. The tool event is `AfterTool`.
 pub(crate) const GEMINI_EVENTS: [&str; 4] =
     ["SessionStart", "AfterTool", "SessionEnd", "PreCompress"];

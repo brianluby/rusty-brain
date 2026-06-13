@@ -28,6 +28,13 @@ pub enum HookEvent {
         last_assistant_message: Option<String>,
         stop_hook_active: bool,
     },
+    /// The agent SESSION is ending (distinct from a per-turn [`Stop`]). This is
+    /// W3.1's single capture point: the runtime folds the per-session scratch
+    /// file + transcript into ONE summary memory here. `reason` is the CLI's
+    /// termination label when reported (Claude Code: `clear` | `logout` |
+    /// `prompt_input_exit` | `other`). CLIs without a session-end event never
+    /// produce this variant.
+    SessionEnd { reason: Option<String> },
     /// The context is about to be compacted. Carries any custom instructions.
     PreCompact { custom_instructions: Option<String> },
     /// An event we do not model (or could not parse). Carries the raw event name.

@@ -5,29 +5,46 @@ use rb_agents::DaemonClient;
 use rb_agents::{HookContext, HookEvent, HookResult};
 
 use crate::capture;
-use crate::dedup::DedupCache;
+use crate::scratch::{self, Scratch};
 
-/// Dispatch one parsed hook context to its capture flow. The optional client is
-/// the (best-effort) daemon connection; `None` means degraded — flows still
-/// return `continue_execution: true`.
+/// Dispatch one parsed hook context to its capture flow. `client` is the
+/// (best-effort) daemon connection — `None` means degraded — and `scratch` is
+/// the per-session capture buffer, `None` when the event carries no session id.
+/// Every flow returns `continue_execution: true`.
 pub async fn dispatch(
     mut client: Option<&mut DaemonClient>,
-    dedup: &DedupCache,
+    scratch: Option<&Scratch>,
     ctx: &HookContext,
 ) -> HookResult {
     match &ctx.event {
-        HookEvent::SessionStart { .. } => capture::session_start(client.take()).await,
+        HookEvent::SessionStart { .. } => {
+            // Opportunistic hygiene: reclaim scratch files from abandoned /
+            // crashed sessions whose SessionEnd never fired (cheap; once per
+            // session, off the daemon path).
+            scratch::prune_stale();
+            capture::session_start(client.take()).await
+        }
         HookEvent::PostToolUse {
             tool_name,
             tool_input,
             tool_response,
-        } => {
-            capture::post_tool_use(client.take(), dedup, tool_name, tool_input, tool_response).await
+        } => capture::post_tool_use(scratch, tool_name, tool_input, tool_response).await,
+        // W3.1: a per-turn Stop stores nothing; the session fold is at SessionEnd.
+        HookEvent::Stop {
+            stop_hook_active, ..
+        } => capture::stop(*stop_hook_active),
+        HookEvent::SessionEnd { .. } => {
+            capture::session_end(
+                client.take(),
+                scratch,
+                &ctx.cwd,
+                ctx.transcript_path.as_deref(),
+            )
+            .await
         }
-        HookEvent::Stop { .. } => capture::stop(client.take(), &ctx.cwd).await,
-        HookEvent::PreCompact {
-            custom_instructions,
-        } => capture::pre_compact(client.take(), custom_instructions.as_deref()).await,
+        HookEvent::PreCompact { .. } => {
+            capture::pre_compact(client.take(), ctx.transcript_path.as_deref()).await
+        }
         HookEvent::Other(_) => HookResult {
             system_message: None,
             continue_execution: true,
@@ -53,37 +70,55 @@ mod tests {
 
     #[tokio::test]
     async fn other_event_is_noop_continue() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dedup = DedupCache::at(tmp.path().join("d.json"));
-        let result = dispatch(None, &dedup, &ctx(HookEvent::Other("Notification".into()))).await;
+        let result = dispatch(None, None, &ctx(HookEvent::Other("Notification".into()))).await;
         assert!(result.continue_execution);
         assert!(result.system_message.is_none());
     }
 
     #[tokio::test]
-    async fn post_tool_use_event_routes_and_continues() {
+    async fn post_tool_use_event_appends_to_scratch_and_writes_no_memory() {
         let tmp = tempfile::tempdir().unwrap();
-        let dedup = DedupCache::at(tmp.path().join("d.json"));
+        let scratch = Scratch::at(tmp.path().join("scratch.json"));
         let event = HookEvent::PostToolUse {
             tool_name: "Edit".to_string(),
             tool_input: serde_json::json!({"file_path": "/src/main.rs"}),
             tool_response: serde_json::json!("ok"),
         };
-        let result = dispatch(None, &dedup, &ctx(event)).await;
+        // No client passed: PostToolUse never needs the daemon (zero memories).
+        let result = dispatch(None, Some(&scratch), &ctx(event)).await;
         assert!(result.continue_execution);
-        // Routed to post_tool_use: the mutation must have been deduped.
-        assert!(dedup.is_duplicate("Edit", "Edited /src/main.rs"));
+        // Routed to post_tool_use: the file landed in the scratch (not a memory).
+        assert_eq!(scratch.read().files, vec!["/src/main.rs"]);
     }
 
     #[tokio::test]
-    async fn stop_event_continues() {
-        let tmp = tempfile::tempdir().unwrap();
-        let dedup = DedupCache::at(tmp.path().join("d.json"));
+    async fn stop_event_continues_and_stores_nothing() {
         let event = HookEvent::Stop {
             last_assistant_message: Some("done".to_string()),
             stop_hook_active: false,
         };
-        let result = dispatch(None, &dedup, &ctx(event)).await;
+        let result = dispatch(None, None, &ctx(event)).await;
         assert!(result.continue_execution);
+    }
+
+    #[tokio::test]
+    async fn session_end_event_routes_and_preserves_scratch_when_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::at(tmp.path().join("scratch.json"));
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        // No client (degraded): session_end folds but cannot store, so it
+        // PRESERVES the buffer for a retry/resume rather than losing the turn.
+        let result = dispatch(
+            None,
+            Some(&scratch),
+            &ctx(HookEvent::SessionEnd { reason: None }),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert_eq!(
+            scratch.read().files,
+            vec!["src/lib.rs"],
+            "a degraded SessionEnd preserves the scratch"
+        );
     }
 }

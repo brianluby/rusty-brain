@@ -38,6 +38,7 @@ fn public_surface_is_reachable_and_stable() {
         tags: vec![],
         related_files: vec![],
         confidence: Some(0.7),
+        supersedes: Some(MemoryId::new()),
     };
 
     // Error mapping helpers, round-tripping through the wire form.

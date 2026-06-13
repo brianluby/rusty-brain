@@ -37,6 +37,16 @@ const MAX_DEPTH: u8 = 8;
 const REEMBED_DEFAULT_LIMIT: usize = 1000;
 /// Hard cap on a single re-embed pass to bound writer-thread work per request.
 const REEMBED_MAX_LIMIT: usize = 10_000;
+/// W3.1 write-time near-dup suppression: cosine-similarity bound at or above
+/// which a freshly stored hook capture absorbs an EXISTING hook capture (via
+/// supersede). Deliberately near-identical-only so distinct session summaries
+/// are never collapsed at write time — looser clustering is the scheduled
+/// consolidation job's role. Suppression is gated to `origin_source == "hook"`
+/// on BOTH the new write and each candidate, so user/cli/mcp/job memories are
+/// never touched.
+const HOOK_NEAR_DUP_THRESHOLD: f32 = 0.97;
+/// Max existing hook near-dups absorbed per write (bounds the extra reads).
+const HOOK_NEAR_DUP_LIMIT: usize = 8;
 /// Maximum number of simultaneous client connections.
 const MAX_CONNECTIONS: usize = 256;
 /// Oplog rows fetched per replay batch on a `subscribe --since` reconnect.
@@ -685,6 +695,7 @@ async fn handle_connection(
             &jobs_config,
             &provenance,
             &recall_counters,
+            &namespace,
             peer,
             req,
         )
@@ -803,12 +814,71 @@ fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namesp
     }
 }
 
+/// W3.1 write-time near-dup suppression. After a hook-sourced memory `new_id`
+/// is stored, absorb every EXISTING active hook capture whose vector is a
+/// near-duplicate (cosine >= [`HOOK_NEAR_DUP_THRESHOLD`]) into it by superseding
+/// the older row through the existing atomic supersede. Strictly best-effort and
+/// bounded ([`HOOK_NEAR_DUP_LIMIT`] candidates): every read/write error is logged
+/// and skipped, and ONLY `origin_source == "hook"` candidates are superseded —
+/// user/cli/mcp/job memories are never collapsed automatically. Namespace
+/// isolation is guaranteed by both `near_duplicates` and the engine read.
+async fn suppress_hook_near_duplicates<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    namespace: &rb_types::Namespace,
+    new_id: &rb_types::MemoryId,
+) where
+    P: EmbeddingProvider,
+{
+    let dups = match job_store
+        .near_duplicates(
+            namespace.clone(),
+            new_id.clone(),
+            HOOK_NEAR_DUP_THRESHOLD,
+            HOOK_NEAR_DUP_LIMIT,
+        )
+        .await
+    {
+        Ok(dups) => dups,
+        Err(e) => {
+            warn!(error = %e, "near-dup scan failed; skipping write-time suppression");
+            return;
+        }
+    };
+    for (dup_id, _similarity) in dups {
+        if &dup_id == new_id {
+            continue;
+        }
+        // Only collapse OTHER automatic hook captures into the new memory; a
+        // non-hook (or already-archived/absent) candidate is left untouched.
+        // `peek` (not `get`) so inspecting a candidate's provenance never
+        // records an access — a maintenance scan must not pollute the W3.7
+        // usefulness signal on memories it deliberately leaves alone.
+        match engine.peek(dup_id.clone()).await {
+            Ok(Some(note)) if note.origin_source.as_deref() == Some("hook") => {
+                if let Err(e) = job_store
+                    .supersede(namespace.clone(), dup_id, new_id.clone())
+                    .await
+                {
+                    warn!(error = %e, "near-dup supersede failed; leaving the duplicate live");
+                }
+            }
+            Ok(_) => {}
+            Err(e) => {
+                warn!(error = %e, "near-dup candidate fetch failed; skipping it");
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
     provenance: &rb_engine::Provenance,
     recall_counters: &RecallChannelCounters,
+    namespace: &rb_types::Namespace,
     peer: PeerIdentity,
     req: Request,
 ) -> Response
@@ -842,6 +912,7 @@ where
             tags,
             related_files,
             confidence,
+            supersedes,
         } => {
             let input = RememberInput {
                 content,
@@ -855,7 +926,33 @@ where
                 provenance: provenance.clone(),
             };
             match engine.remember(input).await {
-                Ok(id) => Response::Remembered { id },
+                Ok(id) => {
+                    // W3.1 update-as-supersede: store the replacement first, then
+                    // archive the prior memory through the existing atomic
+                    // supersede (separate writer tx). Best-effort — a supersede
+                    // failure leaves the new memory stored and `old` un-archived,
+                    // never a partial state. `old == id` is impossible (the id is
+                    // freshly minted) but guarded for clarity.
+                    if let Some(old) = supersedes {
+                        if old != id {
+                            if let Err(e) = job_store
+                                .supersede(namespace.clone(), old, id.clone())
+                                .await
+                            {
+                                warn!(error = %e, "supersede after remember failed (new memory kept)");
+                            }
+                        }
+                    }
+                    // W3.1 write-time near-dup suppression: collapse OTHER active
+                    // hook captures that are near-identical to this one, so
+                    // automatic capture cannot pile up redundant rows between
+                    // scheduled consolidation runs. Gated to hook-source on the
+                    // write AND each candidate; never touches user/cli/mcp/job rows.
+                    if provenance.origin_source.as_deref() == Some("hook") {
+                        suppress_hook_near_duplicates(engine, job_store, namespace, &id).await;
+                    }
+                    Response::Remembered { id }
+                }
                 Err(e) => error_to_response(e),
             }
         }

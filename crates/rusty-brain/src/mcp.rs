@@ -410,6 +410,7 @@ mod tests {
                 tags: vec![],
                 related_files: vec![],
                 confidence: None,
+                supersedes: None,
             },
             Request::Update {
                 id: id(),

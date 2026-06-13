@@ -68,7 +68,13 @@ mod tests {
             PathBuf::from("/tmp/project/.claude/settings.json")
         );
         let hooks = frag.merge.get("hooks").unwrap();
-        for event in ["SessionStart", "PostToolUse", "Stop", "PreCompact"] {
+        for event in [
+            "SessionStart",
+            "PostToolUse",
+            "Stop",
+            "SessionEnd",
+            "PreCompact",
+        ] {
             let arr = hooks.get(event).unwrap().as_array().unwrap();
             assert_eq!(arr.len(), 1);
             let group = &arr[0];

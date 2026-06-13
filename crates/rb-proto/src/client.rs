@@ -156,6 +156,9 @@ impl Client {
     /// the full-trust 1.0 baseline and lets an enricher fill it). Hook captures
     /// pass `Some(0.7)`. An explicit out-of-range value is rejected client-side
     /// with [`Error::InvalidArgument`] before anything touches the wire.
+    ///
+    /// To store a replacement that supersedes an existing memory, use
+    /// [`Client::remember_superseding`].
     #[allow(clippy::too_many_arguments)]
     pub async fn remember(
         &mut self,
@@ -167,6 +170,65 @@ impl Client {
         tags: Vec<String>,
         related_files: Vec<String>,
         confidence: Option<f32>,
+    ) -> Result<MemoryId> {
+        self.remember_inner(
+            content,
+            context,
+            memory_type,
+            importance,
+            keywords,
+            tags,
+            related_files,
+            confidence,
+            None,
+        )
+        .await
+    }
+
+    /// Store a new memory that ATOMICALLY supersedes `supersedes` daemon-side
+    /// (W3.1 update-as-supersede): the replacement is written, then the prior
+    /// memory is archived and stamped `superseded_by` through the existing
+    /// atomic supersede. Returns the NEW memory's id. Same `confidence`
+    /// semantics as [`Client::remember`]. See [`Request::Remember::supersedes`].
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_superseding(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        keywords: Vec<String>,
+        tags: Vec<String>,
+        related_files: Vec<String>,
+        confidence: Option<f32>,
+        supersedes: MemoryId,
+    ) -> Result<MemoryId> {
+        self.remember_inner(
+            content,
+            context,
+            memory_type,
+            importance,
+            keywords,
+            tags,
+            related_files,
+            confidence,
+            Some(supersedes),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn remember_inner(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        keywords: Vec<String>,
+        tags: Vec<String>,
+        related_files: Vec<String>,
+        confidence: Option<f32>,
+        supersedes: Option<MemoryId>,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
         // with the same error class the daemon would round-trip back. None
@@ -188,6 +250,7 @@ impl Client {
                 tags,
                 related_files,
                 confidence,
+                supersedes,
             })
             .await?;
         match resp {
