@@ -64,6 +64,11 @@ impl AgentCli for ClaudeCodeCli {
             "PreCompact" => HookEvent::PreCompact {
                 custom_instructions: opt_str(raw, "custom_instructions"),
             },
+            // W3.1: the session-terminal event Claude Code emits once when a
+            // session ends (real payload carries `reason` + `transcript_path`).
+            "SessionEnd" => HookEvent::SessionEnd {
+                reason: opt_str(raw, "reason"),
+            },
             other => HookEvent::Other(other.to_string()),
         };
         HookContext {
@@ -229,6 +234,38 @@ mod tests {
             HookEvent::PreCompact {
                 custom_instructions: Some("keep decisions".to_string())
             }
+        );
+    }
+
+    #[test]
+    fn parses_session_end_with_reason_and_transcript() {
+        // W3.1: the real SessionEnd payload carries `reason` + `transcript_path`
+        // (mirrors rb-hooks/tests/fixtures/claude_code/session_end.json).
+        let raw = serde_json::json!({
+            "hook_event_name": "SessionEnd",
+            "reason": "other",
+            "session_id": "abc123",
+            "transcript_path": "/home/user/.claude/projects/p/abc.jsonl",
+            "cwd": "/p"
+        });
+        let ctx = cli().parse_input(&raw);
+        assert_eq!(
+            ctx.event,
+            HookEvent::SessionEnd {
+                reason: Some("other".to_string())
+            }
+        );
+        assert_eq!(
+            ctx.transcript_path,
+            Some(PathBuf::from("/home/user/.claude/projects/p/abc.jsonl"))
+        );
+        assert_eq!(ctx.session_id.as_deref(), Some("abc123"));
+
+        // A SessionEnd missing `reason` degrades to None, never errors.
+        let bare = serde_json::json!({ "hook_event_name": "SessionEnd", "cwd": "/p" });
+        assert_eq!(
+            cli().parse_input(&bare).event,
+            HookEvent::SessionEnd { reason: None }
         );
     }
 

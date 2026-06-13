@@ -18,8 +18,14 @@ use rb_install::installers::ClaudeCodeInstaller;
 use rb_install::uninstall::uninstall_file;
 use rb_install::writer::merge_into_file;
 
-/// The four Claude Code events the installer writes (mirrors `CLAUDE_EVENTS`).
-const OUR_EVENTS: [&str; 4] = ["SessionStart", "PostToolUse", "Stop", "PreCompact"];
+/// The Claude Code events the installer writes (mirrors `CLAUDE_EVENTS`).
+const OUR_EVENTS: [&str; 5] = [
+    "SessionStart",
+    "PostToolUse",
+    "Stop",
+    "SessionEnd",
+    "PreCompact",
+];
 
 /// Parse the recorded fixture.
 fn fixture() -> serde_json::Value {

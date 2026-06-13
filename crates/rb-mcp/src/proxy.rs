@@ -151,6 +151,9 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 // captures declare a lower one). `None` keeps the full-trust
                 // 1.0 baseline and lets an enricher fill it (fix #4).
                 confidence: None,
+                // The MCP `remember` tool stores plainly; update-as-supersede
+                // (W3.1) is driven by the hook capture path, not this tool.
+                supersedes: None,
             })
         }
         "recall" => Ok(Request::Recall {

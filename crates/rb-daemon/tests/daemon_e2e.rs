@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use rb_daemon::{Daemon, DaemonConfig, SharedEmbedder};
 use rb_embed::DeterministicProvider;
-use rb_proto::Client;
+use rb_proto::{Client, ClientIdentity};
 use rb_types::{Error, MemoryType, MemoryUpdates, Namespace};
 use tokio::sync::oneshot;
 use tokio::task::JoinHandle;
@@ -1154,6 +1154,233 @@ async fn namespace_rename_round_trips_over_the_wire() {
         .collect();
     assert_eq!(merged.len(), 3, "merge appended the bystander row");
     assert!(merged.contains(&id_other));
+
+    daemon.stop().await;
+}
+
+// W3.1 update-as-supersede: `remember_superseding` stores a replacement AND
+// atomically archives the prior memory in one wire call (the path the `Update`
+// and `Link` rejections point at). This is what the SessionEnd capture flow
+// uses to keep ONE live summary per session as it is re-summarized.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remember_superseding_archives_old_and_keeps_new() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("supersede-wire".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    let old = client
+        .remember(
+            "first draft of the session summary".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let new = client
+        .remember_superseding(
+            "revised session summary with the final decision".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            old.clone(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(new, old, "the replacement is a distinct memory");
+
+    // The old memory is archived and points at the replacement.
+    let archived = client.get(old.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        archived.superseded_by,
+        Some(new.clone()),
+        "old points at the replacement"
+    );
+    assert!(archived.archived_at.is_some(), "old is archived");
+
+    // The replacement is the only live row.
+    let live: Vec<_> = client
+        .list(None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(live, vec![new], "only the replacement remains live");
+
+    daemon.stop().await;
+}
+
+// W3.1 write-time near-dup suppression: two hook captures with identical
+// content embed to the same vector under the DeterministicProvider, so storing
+// the second (a cosine-1.0 near-dup) absorbs the first via supersede — automatic
+// capture can never pile up redundant rows between consolidation runs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_writes_collapse_near_duplicates_at_write_time() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("hook-neardup".to_string());
+    let hook = Some(ClientIdentity {
+        source: Some("hook".to_string()),
+        ..Default::default()
+    });
+    let mut client = Client::connect_with_identity(&daemon.socket, ns.clone(), hook)
+        .await
+        .unwrap();
+
+    let content = "Session touched src/store.rs; ran cargo test; all green".to_string();
+    let first = client
+        .remember(
+            content.clone(),
+            None,
+            MemoryType::Reference,
+            4,
+            vec![],
+            vec!["hook".to_string()],
+            vec![],
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+    let second = client
+        .remember(
+            content,
+            None,
+            MemoryType::Reference,
+            4,
+            vec![],
+            vec!["hook".to_string()],
+            vec![],
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+    assert_ne!(first, second);
+
+    // The earlier hook capture was absorbed into the newer one.
+    let archived = client.get(first.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        archived.superseded_by,
+        Some(second.clone()),
+        "first absorbed into second"
+    );
+    assert!(archived.archived_at.is_some());
+
+    // Only the newest capture remains live.
+    let live: Vec<_> = client
+        .list(None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert_eq!(live, vec![second], "only the newest hook capture is live");
+
+    daemon.stop().await;
+}
+
+// W3.1 write-time near-dup suppression is STRICTLY gated to hook-source on both
+// the new write and each candidate: a non-hook (user/cli/mcp) memory is never
+// collapsed, even when it is a genuine near-dup of a hook capture.
+//
+// The three memories share BYTE-IDENTICAL composite embeddings (same content,
+// tags, keywords, context — only the connection's origin_source differs), so
+// every one is a cosine-1.0 near-dup candidate of every other under the
+// DeterministicProvider. That makes the source gate the ONLY thing that can
+// spare the cli row — and the hook control proves the candidate IS surfaced and
+// would be collapsed but for its source. (A prior version differed in tags, so
+// the cli row was never even a candidate and the gate was never exercised.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn near_dup_suppression_never_touches_non_hook_memories() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("neardup-safety".to_string());
+    const TEXT: &str = "Deploys are frozen on Fridays — team policy";
+
+    let connect = |source: &'static str| {
+        Client::connect_with_identity(
+            &daemon.socket,
+            ns.clone(),
+            Some(ClientIdentity {
+                source: Some(source.to_string()),
+                ..Default::default()
+            }),
+        )
+    };
+
+    // Identical-composite store helper (no tags/keywords/context so the composite
+    // is exactly the content — the ONLY varying axis is the connection's source).
+    async fn store(client: &mut Client, text: &str) -> rb_types::MemoryId {
+        client
+            .remember(
+                text.to_string(),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    // A user-authored (cli) memory — exactly the kind suppression must protect.
+    let mut cli = connect("cli").await.unwrap();
+    let user_mem = store(&mut cli, TEXT).await;
+
+    // First HOOK capture (identical composite): suppression surfaces the cli row
+    // as a near-dup but its source gate spares it, and there is no prior hook row.
+    let mut hook = connect("hook").await.unwrap();
+    let hook_first = store(&mut hook, TEXT).await;
+
+    // Second HOOK capture (identical composite): suppression now surfaces BOTH
+    // the cli row and the first hook row. The first hook row IS collapsed (proving
+    // the candidate is reachable and would be superseded); the cli row is spared.
+    let hook_second = store(&mut hook, TEXT).await;
+
+    // CONTROL: an identical-composite HOOK row IS absorbed into the newest write.
+    let hook_first_after = cli.get(hook_first.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        hook_first_after.superseded_by,
+        Some(hook_second.clone()),
+        "an identical hook row must be collapsed (candidate is reachable)"
+    );
+    assert!(hook_first_after.archived_at.is_some());
+
+    // GATE: the non-hook memory — a near-dup under the SAME conditions — is NEVER
+    // touched. The only difference from the collapsed hook row is its source.
+    let user_after = cli.get(user_mem.clone()).await.unwrap().unwrap();
+    assert!(
+        user_after.archived_at.is_none(),
+        "non-hook memory must never be suppressed, even as a cosine-1.0 near-dup"
+    );
+    assert_eq!(user_after.superseded_by, None);
+
+    // Live set: the cli row and the newest hook row; the older hook row is gone.
+    let live: std::collections::HashSet<_> = hook
+        .list(None, 50)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|m| m.id)
+        .collect();
+    assert!(
+        live.contains(&user_mem) && live.contains(&hook_second),
+        "the cli row and newest hook row are live: {live:?}"
+    );
+    assert!(
+        !live.contains(&hook_first),
+        "the collapsed hook row is no longer live"
+    );
 
     daemon.stop().await;
 }

@@ -126,11 +126,15 @@ struct Observed {
     context: Option<String>,
 }
 
-// Accept one connection, handshake-ack, and answer the first Remember with a
-// canned id. Signals back via the channel what was observed.
+// Accept ONE connection (with a short timeout so an event that never connects —
+// PostToolUse / Stop / Other under W3.1 — cannot hang the mock), handshake-ack,
+// and answer the first Remember with a canned id. Signals back what was observed.
 async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<Observed>) {
     let mut observed = Observed::default();
-    let Ok((stream, _addr)) = listener.accept().await else {
+    let accept = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
+    let Ok(Ok((stream, _addr))) = accept else {
+        // No client connected within the window (a local-only event that skips
+        // the daemon entirely), or accept errored: report nothing observed.
         let _ = tx.send(observed);
         return;
     };
@@ -158,6 +162,7 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
     .await;
     while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
         let resp = match req {
+            // W3.1 added `supersedes`; the mock ignores it (matched via `..`).
             Request::Remember {
                 confidence,
                 content,
@@ -165,8 +170,6 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
                 ..
             } => {
                 observed.saw_remember = true;
-                // `confidence` is now Option<f32> on the wire (None = no prior);
-                // hook captures send Some(0.7), asserted below.
                 observed.confidence = confidence;
                 observed.content = Some(content);
                 observed.context = context;
@@ -195,11 +198,16 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
     let _ = tx.send(observed);
 }
 
-/// Run the hooks binary against an in-process mock daemon, feeding `stdin`,
-/// and return what the daemon observed plus the hook's stdout. The dedup cache
-/// is isolated to a fresh tempdir so a previously-persisted entry within the
-/// 60s TTL cannot suppress the Remember under test as a duplicate.
-fn observe_against_mock_daemon(stdin: &str) -> (Observed, String) {
+/// Run a SEQUENCE of hook invocations against ONE mock daemon, sharing the
+/// dedup + scratch cache dir (so a PostToolUse scratch survives into the
+/// following SessionEnd fold) and an optional pinned namespace. Returns what the
+/// mock observed (the single Remember a SessionEnd fold sends, if any) plus the
+/// LAST invocation's stdout. The cache is isolated to a fresh tempdir so a prior
+/// run can never interfere.
+fn observe_sequence_against_mock_daemon(
+    events: &[&str],
+    namespace: Option<&str>,
+) -> (Observed, String) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("live.sock");
     let socket_str = socket.to_string_lossy().to_string();
@@ -224,87 +232,67 @@ fn observe_against_mock_daemon(stdin: &str) -> (Observed, String) {
     // Give the listener a moment to bind.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
-    let mut child = hooks_command()
-        .args(["--agent", "claude-code"])
-        .env("RUSTY_BRAIN_SOCKET", &socket_str)
-        .env("XDG_CACHE_HOME", dir.path())
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .expect("spawn hooks binary");
-    child
-        .stdin
-        .take()
-        .expect("stdin")
-        .write_all(stdin.as_bytes())
-        .expect("write stdin");
-    let output = child.wait_with_output().expect("wait for output");
-    assert!(output.status.success(), "must exit 0");
+    let mut last_stdout = String::new();
+    for event in events {
+        let mut cmd = hooks_command();
+        cmd.args(["--agent", "claude-code"])
+            .env("RUSTY_BRAIN_SOCKET", &socket_str)
+            .env("XDG_CACHE_HOME", dir.path());
+        if let Some(ns) = namespace {
+            cmd.env("RUSTY_BRAIN_NAMESPACE", ns);
+        }
+        let mut child = cmd
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hooks binary");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(event.as_bytes())
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait for output");
+        assert!(output.status.success(), "must exit 0");
+        last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    }
 
     let observed = rx
-        .recv_timeout(std::time::Duration::from_secs(10))
+        .recv_timeout(std::time::Duration::from_secs(12))
         .unwrap_or_default();
     let _ = server.join();
     let _: PathBuf = socket; // keep tempdir alive until here
-    (
-        observed,
-        String::from_utf8_lossy(&output.stdout).to_string(),
-    )
+    (observed, last_stdout)
+}
+
+/// Single-event convenience over [`observe_sequence_against_mock_daemon`].
+fn observe_against_mock_daemon(stdin: &str) -> (Observed, String) {
+    observe_sequence_against_mock_daemon(&[stdin], None)
 }
 
 #[test]
-fn post_tool_use_against_live_daemon_remembers() {
-    // The REAL recorded Write payload: tool_response is an OBJECT
-    // ({"type":"create","filePath":...}), not the string a hand-authored
-    // payload would guess — this pins the object-handling path end-to-end.
-    let (observed, _stdout) = observe_against_mock_daemon(REAL_POST_TOOL_USE_WRITE);
+fn post_tool_use_writes_no_memory() {
+    // W3.1 capture inversion: PostToolUse appends to the per-session scratch and
+    // writes ZERO memories — it does not even connect to the daemon (the mock
+    // observes nothing). The REAL recorded Write payload pins this end-to-end.
+    let (observed, stdout) = observe_against_mock_daemon(REAL_POST_TOOL_USE_WRITE);
     assert!(
-        observed.saw_remember,
-        "the daemon should have observed a Remember"
+        !observed.saw_remember,
+        "PostToolUse must write no memory (W3.1 capture inversion)"
     );
-    // W0.5: a hook-written memory declares source=hook + the driving agent on
-    // the handshake identity, and carries confidence 0.7 on the Remember.
-    assert_eq!(observed.identity_source.as_deref(), Some("hook"));
-    assert_eq!(observed.identity_agent.as_deref(), Some("claude-code"));
-    let confidence = observed.confidence.expect("Remember carries confidence");
-    assert!(
-        (confidence - 0.7).abs() < f32::EPSILON,
-        "hook captures must send confidence 0.7, got {confidence}"
-    );
-    // The stored summary comes from the real tool_input.file_path...
-    assert_eq!(
-        observed.content.as_deref(),
-        Some("Wrote /private/tmp/rb-w07-capture/proj/hello.txt"),
-        "summary must be built from the real payload's tool_input"
-    );
-    // ...and the context from the real OBJECT tool_response, serialized.
-    let context = observed.context.as_deref().expect("context from response");
-    assert!(
-        context.contains("filePath") && context.contains("create"),
-        "object tool_response must be serialized into context, got {context}"
-    );
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    assert_eq!(value.get("continue").and_then(|v| v.as_bool()), Some(true));
 }
 
 #[test]
-fn stop_against_live_daemon_remembers_session_summary() {
-    // The REAL recorded Stop payload (stop_hook_active=false, object-free).
-    // Its cwd is the recording dir, which is not a git repo wherever the test
-    // runs, so git detection fails open to "no file modifications".
+fn stop_writes_no_memory() {
+    // W3.1: a per-turn Stop stores nothing; the session fold is at SessionEnd.
     let (observed, stdout) = observe_against_mock_daemon(REAL_STOP);
     assert!(
-        observed.saw_remember,
-        "Stop must store a session-summary memory"
-    );
-    let confidence = observed.confidence.expect("Remember carries confidence");
-    assert!(
-        (confidence - 0.7).abs() < f32::EPSILON,
-        "hook captures must send confidence 0.7, got {confidence}"
-    );
-    let content = observed.content.as_deref().unwrap_or_default();
-    assert!(
-        content.contains("Session ended"),
-        "session summary expected, got {content}"
+        !observed.saw_remember,
+        "Stop must store nothing (W3.1); the fold is at SessionEnd"
     );
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
@@ -313,10 +301,9 @@ fn stop_against_live_daemon_remembers_session_summary() {
 
 #[test]
 fn user_prompt_submit_is_a_no_op_continue() {
-    // The REAL recorded UserPromptSubmit payload. The event is intentionally
-    // unmodeled today (parses as HookEvent::Other) — W3.2 wires deterministic
-    // recall onto it. This pins the current no-op contract: continue, no
-    // injection, and ZERO memories written.
+    // The REAL recorded UserPromptSubmit payload. Unmodeled today (parses as
+    // HookEvent::Other) — W3.2 wires deterministic recall onto it. Pins the
+    // current no-op contract: continue, no injection, ZERO memories.
     let (observed, stdout) = observe_against_mock_daemon(REAL_USER_PROMPT_SUBMIT);
     assert!(
         !observed.saw_remember,
@@ -332,14 +319,14 @@ fn user_prompt_submit_is_a_no_op_continue() {
 }
 
 #[test]
-fn session_end_is_a_no_op_continue() {
-    // The REAL recorded SessionEnd payload (reason:"other" in -p mode). The
-    // event is intentionally unmodeled today (parses as HookEvent::Other) —
-    // W3.1's capture inversion makes it the one-summary-per-session writer.
+fn session_end_with_empty_scratch_writes_nothing() {
+    // SessionEnd connects, but a fresh cache dir (empty scratch), a non-existent
+    // cwd (no git changes), and a non-existent transcript leave nothing to fold
+    // → no memory, continue. The REAL recorded SessionEnd payload drives it.
     let (observed, stdout) = observe_against_mock_daemon(REAL_SESSION_END);
     assert!(
         !observed.saw_remember,
-        "SessionEnd must not write memories yet (W3.1 owns its consumption)"
+        "an empty-scratch SessionEnd has nothing to fold and writes nothing"
     );
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
@@ -348,21 +335,60 @@ fn session_end_is_a_no_op_continue() {
 }
 
 #[test]
-fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
-    // SYNTHETIC edge case: the recorded real session contains no secrets, so
-    // this payload is hand-authored (real-shaped fields, planted values).
-    // W0.5 minimal redaction: a tool response carrying every supported secret
-    // shape must arrive at the daemon with markers instead of plaintext.
-    let stdin = concat!(
-        r#"{"hook_event_name":"PostToolUse","cwd":"/tmp","session_id":"s1","#,
-        r#""tool_name":"Bash","tool_input":{"command":"deploy --password=hunter2"},"#,
-        r#""tool_response":"key AKIAABCDEFGHIJKLMNOP\nAuthorization: Bearer sk-live-deadbeef\n"#,
-        r#"GITHUB_TOKEN=ghp_secret123\n-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n"#,
-        r#"-----END RSA PRIVATE KEY-----\ndone"}"#
+fn session_end_folds_post_tool_use_scratch_into_one_summary() {
+    // The W3.1 lifecycle end-to-end against the mock: a PostToolUse appends the
+    // touched file to the per-session scratch (no memory, no connect); the
+    // following SessionEnd folds it into ONE summary Remember. Both share the
+    // cache dir + pinned namespace, and the REAL fixtures share a session id, so
+    // the scratch aligns across the two invocations.
+    let (observed, _stdout) = observe_sequence_against_mock_daemon(
+        &[REAL_POST_TOOL_USE_WRITE, REAL_SESSION_END],
+        Some("rb-it-fold"),
     );
-    let (observed, _stdout) = observe_against_mock_daemon(stdin);
-    assert!(observed.saw_remember, "the Remember must reach the daemon");
+    assert!(
+        observed.saw_remember,
+        "SessionEnd must fold the PostToolUse scratch into one summary"
+    );
+    // W0.5 provenance: the fold is a hook write at confidence 0.7.
+    assert_eq!(observed.identity_source.as_deref(), Some("hook"));
+    assert_eq!(observed.identity_agent.as_deref(), Some("claude-code"));
+    let confidence = observed.confidence.expect("Remember carries confidence");
+    assert!(
+        (confidence - 0.7).abs() < f32::EPSILON,
+        "hook captures must send confidence 0.7, got {confidence}"
+    );
+    // The summary lists the file the PostToolUse touched (from the REAL payload).
+    let content = observed.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("hello.txt"),
+        "the summary must fold the touched file: {content}"
+    );
+    assert!(
+        content.contains("Files touched"),
+        "the summary must carry a files section: {content}"
+    );
+}
 
+#[test]
+fn planted_secrets_never_reach_the_folded_remember_payload() {
+    // W0.5 minimal redaction at the WIRE level (the DB-bytes complement lives in
+    // rb-install/tests/e2e.rs): a Bash command + a FAILING tool response carrying
+    // every supported secret shape are folded by SessionEnd into the Remember,
+    // which must arrive with markers instead of plaintext. SYNTHETIC payloads
+    // (the recorded session contains no secrets).
+    let post = concat!(
+        r#"{"hook_event_name":"PostToolUse","cwd":"/tmp/rb-it-secret-xyz","session_id":"s1","#,
+        r#""tool_name":"Bash","tool_input":{"command":"deploy --password=hunter2 && echo keepme"},"#,
+        r#""tool_response":{"is_error":true,"stderr":"key AKIAABCDEFGHIJKLMNOP\nAuthorization: Bearer sk-live-deadbeef\n"#,
+        r#"GITHUB_TOKEN=ghp_secret123\n-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n-----END RSA PRIVATE KEY-----\ndone"}}"#
+    );
+    let session_end = r#"{"hook_event_name":"SessionEnd","cwd":"/tmp/rb-it-secret-xyz","session_id":"s1","reason":"other"}"#;
+    let (observed, _stdout) =
+        observe_sequence_against_mock_daemon(&[post, session_end], Some("rb-it-secret"));
+    assert!(
+        observed.saw_remember,
+        "the SessionEnd fold of the scratch must reach the daemon"
+    );
     let payload = format!(
         "{}\n{}",
         observed.content.as_deref().unwrap_or_default(),
@@ -377,7 +403,7 @@ fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
     ] {
         assert!(
             !payload.contains(secret),
-            "planted secret {secret:?} leaked into the remember payload: {payload}"
+            "planted secret {secret:?} leaked into the folded payload: {payload}"
         );
     }
     assert!(
@@ -385,8 +411,8 @@ fn planted_secrets_in_tool_response_never_reach_the_remember_payload() {
         "redaction markers must be present: {payload}"
     );
     assert!(
-        payload.contains("done"),
-        "non-secret response text must survive: {payload}"
+        payload.contains("keepme"),
+        "non-secret command text must survive: {payload}"
     );
 }
 
@@ -395,9 +421,7 @@ fn session_start_on_empty_corpus_injects_zero_tokens() {
     // W1.3 / F30 first-session scenario: the mock daemon answers Context with
     // ZERO memories, so SessionStart must inject literally nothing — no
     // `hookSpecificOutput.additionalContext`, no `systemMessage`, not even a
-    // header. The hook still continues. (The full Claude Code session-lifecycle
-    // version of this scenario lands in the W3.4 fixture harness.) Stdin is the
-    // REAL recorded SessionStart payload.
+    // header. The hook still continues. Stdin is the REAL recorded SessionStart.
     let (_observed, stdout) = observe_against_mock_daemon(REAL_SESSION_START);
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
@@ -521,10 +545,15 @@ fn real_user_prompt_submit_fixture_parses_as_other() {
 }
 
 #[test]
-fn real_session_end_fixture_parses_as_other() {
-    // Unmodeled today BY DESIGN: W3.1 (capture inversion) adds SessionEnd to
-    // CLAUDE_EVENTS and the adapter; until then it is Other, name preserved.
+fn real_session_end_fixture_parses_as_session_end() {
+    // W3.1 landed: the adapter now models SessionEnd (the capture point) and
+    // parses the recorded payload's `reason` ("other" in -p mode).
     let ctx = parse_fixture(REAL_SESSION_END);
     assert_common_context(&ctx);
-    assert_eq!(ctx.event, HookEvent::Other("SessionEnd".to_string()));
+    assert_eq!(
+        ctx.event,
+        HookEvent::SessionEnd {
+            reason: Some("other".to_string())
+        }
+    );
 }

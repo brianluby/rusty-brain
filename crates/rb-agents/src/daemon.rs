@@ -91,6 +91,38 @@ impl DaemonClient {
         }
     }
 
+    /// Best-effort `remember` that ATOMICALLY supersedes `supersedes` with the
+    /// new memory (W3.1 update-as-supersede): the SessionEnd flow uses it to
+    /// keep ONE live summary per session as the session is re-summarized.
+    /// Returns the NEW memory's id, or `None` on any error/timeout.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_superseding(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        tags: Vec<String>,
+        confidence: Option<f32>,
+        supersedes: MemoryId,
+    ) -> Option<MemoryId> {
+        let fut = self.client.remember_superseding(
+            content,
+            context,
+            memory_type,
+            importance,
+            Vec::new(),
+            tags,
+            Vec::new(),
+            confidence,
+            supersedes,
+        );
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(id)) => Some(id),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
     /// Best-effort context fetch. Returns `(recent, important, total)`, or `None`.
     pub async fn context(&mut self) -> Option<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         match tokio::time::timeout(self.timeout, self.client.context()).await {

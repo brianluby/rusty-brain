@@ -119,6 +119,63 @@ fn hooks_bin() -> PathBuf {
         .to_path_buf()
 }
 
+/// Fire one hook event through the built `rusty-brain-hooks` binary against the
+/// running daemon, with the dedup + scratch caches isolated to `project`
+/// (`XDG_CACHE_HOME`) and the namespace pinned. Asserts fail-open exit 0 and
+/// returns the child output.
+fn fire_hook(
+    hooks_bin: &Path,
+    daemon: &RunningDaemon,
+    namespace: &str,
+    project: &Path,
+    event: &str,
+) -> std::process::Output {
+    let out = Command::new(hooks_bin)
+        .args(["--agent", "claude-code"])
+        .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
+        .env("RUSTY_BRAIN_DB", &daemon.db)
+        // Explicit namespace (W0.3 rule 1) so capture and recall agree on
+        // identity without a git repo in the fixture.
+        .env("RUSTY_BRAIN_NAMESPACE", namespace)
+        // Isolate the dedup + scratch caches to the fixture tempdir so this run
+        // never touches the real ~/.cache and a prior run cannot interfere.
+        .env("XDG_CACHE_HOME", project)
+        .env_remove("VOYAGE_API_KEY")
+        .current_dir(project)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .and_then(|mut child| {
+            use std::io::Write as _;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin.write_all(event.as_bytes())?;
+            }
+            child.wait_with_output()
+        })
+        .expect("run rusty-brain-hooks");
+    assert!(
+        out.status.success(),
+        "rusty-brain-hooks must exit 0 (fail-open); stderr={:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    out
+}
+
+/// A Claude Code `SessionEnd` event JSON for `session_id` in `project` — the
+/// W3.1 capture point that folds the per-session scratch into one summary.
+fn session_end_event(project: &Path, session_id: &str) -> String {
+    serde_json::json!({
+        "session_id": session_id,
+        // No transcript here (the fold draws on the scratch + working tree).
+        "transcript_path": "/dev/null",
+        "cwd": project.to_string_lossy(),
+        "hook_event_name": "SessionEnd",
+        "reason": "other",
+    })
+    .to_string()
+}
+
 /// Read `.claude/settings.json` under `project` as JSON, or `Value::Null` if it
 /// does not exist.
 fn read_settings(project: &Path) -> serde_json::Value {
@@ -201,81 +258,67 @@ async fn install_capture_uninstall_round_trip() {
         "settings.json must contain the rusty-brain sentinel hook block after install; got: {after_install}"
     );
 
-    // --- 2) fire a PostToolUse Edit through the built hooks binary ------------
-    // Built via escargot (see `hooks_bin`): it is owned by `rb-hooks`, so a
-    // focused `cargo test -p rb-install` run would not otherwise build it.
+    // --- 2) fire a PostToolUse Edit, then SessionEnd, through the hooks binary -
+    // W3.1 capture inversion: PostToolUse appends the touched file to the
+    // per-session scratch (ZERO memories); SessionEnd folds the scratch into ONE
+    // recallable summary. Both fire through the REAL binary against the daemon.
+    // The hooks binary is built via escargot (see `hooks_bin`): it is owned by
+    // `rb-hooks`, so a focused `cargo test -p rb-install` run would not build it.
     let hooks_bin = hooks_bin();
-    let unique = "rb-e2e marker edit to src/zztest.rs at unique-token-9f3a";
-    let event = serde_json::json!({
-        "session_id": "rb-e2e-session",
+    let session_id = "rb-e2e-session";
+    let zztest = project.join("src").join("zztest.rs");
+    let post_tool_use = serde_json::json!({
+        "session_id": session_id,
         "transcript_path": "/dev/null",
         "cwd": project.to_string_lossy(),
         "permission_mode": "default",
         "hook_event_name": "PostToolUse",
         "tool_name": "Edit",
         "tool_input": {
-            "file_path": project.join("src").join("zztest.rs").to_string_lossy(),
+            "file_path": zztest.to_string_lossy(),
             "old_string": "old body",
-            "new_string": unique
+            "new_string": "rb-e2e marker edit"
         },
         "tool_response": { "success": true }
     })
     .to_string();
-
-    let hook_out = Command::new(&hooks_bin)
-        .args(["--agent", "claude-code"])
-        .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
-        .env("RUSTY_BRAIN_DB", &daemon.db)
-        // Explicit namespace (W0.3 rule 1) so capture and the recall below
-        // agree on identity without a git repo in the fixture.
-        .env("RUSTY_BRAIN_NAMESPACE", "rb-e2e-fixture")
-        // Isolate the dedup cache to the fixture tempdir so this test never reads
-        // or writes the real ~/.cache and a prior run cannot suppress this edit as
-        // a duplicate (mirrors crates/rb-hooks/tests/integration.rs).
-        .env("XDG_CACHE_HOME", &project)
-        .env_remove("VOYAGE_API_KEY")
-        .current_dir(&project)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write as _;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(event.as_bytes())?;
-            }
-            child.wait_with_output()
-        })
-        .expect("run rusty-brain-hooks post-tool-use");
-
-    // (a) FAIL-OPEN: the hook binary must always exit 0.
-    assert!(
-        hook_out.status.success(),
-        "rusty-brain-hooks must exit 0 (fail-open); status={:?} stdout={:?} stderr={:?}",
-        hook_out.status.code(),
-        String::from_utf8_lossy(&hook_out.stdout),
-        String::from_utf8_lossy(&hook_out.stderr)
+    let hook_out = fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-e2e-fixture",
+        &project,
+        &post_tool_use,
     );
-    // The Claude Code adapter always renders a continue:true envelope.
+    // (a) The Claude Code adapter always renders a continue:true envelope.
     let stdout = String::from_utf8_lossy(&hook_out.stdout);
     assert!(
         stdout.contains("\"continue\""),
         "hook stdout must be a Claude Code envelope with a continue field; got: {stdout}"
     );
 
-    // (b) the observation reached the daemon: recall finds the captured edit.
-    // NOTE (Part Z deviation): the Part W capture flow stores the human-readable
-    // summary `"Edited <file_path>"` as the memory content (the `new_string` body
-    // is not persisted), so the recallable token is the unique file path
-    // `src/zztest.rs` rather than the in-body `unique-token-9f3a` marker. This
-    // still proves the PostToolUse Edit observation reached the daemon.
+    // SessionEnd folds the per-session scratch into ONE summary memory.
+    fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-e2e-fixture",
+        &project,
+        &session_end_event(&project, session_id),
+    );
+
+    // (b) the folded summary reached the daemon and is recallable: it lists the
+    // touched file, so the recallable token is the `zztest.rs` path.
     let mut client = Client::connect(&daemon.socket, namespace.clone())
         .await
         .expect("connect to in-process daemon for recall");
     let mut found = false;
     for _ in 0..40 {
         let results = client
-            .recall("Edited zztest.rs marker edit".to_string(), None, vec![], 10)
+            .recall(
+                "session summary files touched zztest".to_string(),
+                None,
+                vec![],
+                10,
+            )
             .await
             .expect("recall");
         if results
@@ -289,7 +332,7 @@ async fn install_capture_uninstall_round_trip() {
     }
     assert!(
         found,
-        "the PostToolUse Edit observation must be stored in the daemon and recallable"
+        "the SessionEnd summary must fold the PostToolUse file edit and be recallable"
     );
 
     // --- 3) uninstall removes ONLY the sentinel block ------------------------
@@ -357,10 +400,13 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
         "ghp_secret123",
         "MIIfakekeymaterial",
     ];
-    // NOTE: the Bash summary truncates the command at 80 chars BEFORE the
-    // stored summary is built, so both the password and the sentinel must sit
-    // inside that window (this command is 56 chars).
-    let event = serde_json::json!({
+    // W3.1 capture inversion: PostToolUse appends the (redacted) command to the
+    // scratch; a FAILING tool response additionally records its (redacted)
+    // stderr. SessionEnd folds both into the stored summary. Planting secrets in
+    // BOTH the command and the failure stderr exercises every W0.5 minimal
+    // redaction rule through the real capture path; the non-secret SENTINEL rides
+    // in the command so the DB greps below can never pass vacuously.
+    let post_tool_use = serde_json::json!({
         "session_id": "rb-c4-db-grep",
         "transcript_path": "/dev/null",
         "cwd": project.to_string_lossy(),
@@ -369,41 +415,31 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
         "tool_input": {
             "command": format!("deploy --password={} && echo {SENTINEL}", PLANTED[0]),
         },
-        "tool_response": format!(
-            "key {}\nAuthorization: Bearer {}\nGITHUB_TOKEN={}\n\
-             -----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\ndone",
-            PLANTED[1], PLANTED[2], PLANTED[3], PLANTED[4]
-        ),
+        // A FAILING response: its stderr is captured (redacted) as a failure.
+        "tool_response": {
+            "is_error": true,
+            "stderr": format!(
+                "key {}\nAuthorization: Bearer {}\nGITHUB_TOKEN={}\n\
+                 -----BEGIN RSA PRIVATE KEY-----\n{}\n-----END RSA PRIVATE KEY-----\ndone",
+                PLANTED[1], PLANTED[2], PLANTED[3], PLANTED[4]
+            ),
+        },
     })
     .to_string();
-
-    let hook_out = Command::new(&hooks_bin)
-        .args(["--agent", "claude-code"])
-        .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
-        .env("RUSTY_BRAIN_DB", &daemon.db)
-        // Explicit namespace (W0.3 rule 1) so the hook capture and the recall
-        // below agree on identity without a git repo in the fixture.
-        .env("RUSTY_BRAIN_NAMESPACE", "rb-c4-db-grep")
-        // Isolate the dedup cache so a prior run cannot suppress this capture.
-        .env("XDG_CACHE_HOME", &project)
-        .env_remove("VOYAGE_API_KEY")
-        .current_dir(&project)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .and_then(|mut child| {
-            use std::io::Write as _;
-            if let Some(mut stdin) = child.stdin.take() {
-                stdin.write_all(event.as_bytes())?;
-            }
-            child.wait_with_output()
-        })
-        .expect("run rusty-brain-hooks post-tool-use");
-    assert!(
-        hook_out.status.success(),
-        "rusty-brain-hooks must exit 0 (fail-open); stderr={:?}",
-        String::from_utf8_lossy(&hook_out.stderr)
+    fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-c4-db-grep",
+        &project,
+        &post_tool_use,
+    );
+    // SessionEnd folds the scratch (redacted command + failure) into the summary.
+    fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-c4-db-grep",
+        &project,
+        &session_end_event(&project, "rb-c4-db-grep"),
     );
 
     // Vacuousness guard: the capture must actually land before we assert
@@ -414,7 +450,12 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     let mut found = false;
     for _ in 0..80 {
         let results = client
-            .recall("Ran command deploy sentinel".to_string(), None, vec![], 10)
+            .recall(
+                "session summary commands deploy sentinel".to_string(),
+                None,
+                vec![],
+                10,
+            )
             .await
             .expect("recall");
         if results.iter().any(|r| r.memory.content.contains(SENTINEL)) {
@@ -425,7 +466,7 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     }
     assert!(
         found,
-        "the planted-secret capture must be stored and recallable (sentinel {SENTINEL})"
+        "the planted-secret capture must be folded into the SessionEnd summary and recallable (sentinel {SENTINEL})"
     );
 
     // Stop the daemon FIRST: closing the last SQLite connection checkpoints
@@ -467,5 +508,103 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     }
 
     drop(db_dir);
+    drop(proj_dir);
+}
+
+/// Phase-3 gate (W3.1): a 40-turn simulated session must produce ≤ 5 memories
+/// (vs ~40 under the pre-inversion per-event capture). Drives 40 PostToolUse
+/// mutations + one SessionEnd through the REAL hooks binary into a REAL daemon,
+/// then counts the live memories: exactly one session summary, well under the
+/// gate's ceiling.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn forty_turn_session_produces_at_most_five_memories() {
+    let proj_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
+    let project = proj_dir.path().to_path_buf();
+    let namespace = Namespace::Project("rb-gate-40turn".to_string());
+
+    let daemon = RunningDaemon::start().await;
+    let hooks_bin = hooks_bin();
+    let session_id = "rb-gate-40turn-session";
+
+    // 40 turns of distinct mutations (Edit / Write / Bash), the kind that under
+    // the OLD capture flow would each have written their own memory.
+    for turn in 0..40u32 {
+        let event = match turn % 3 {
+            0 => serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": "/dev/null",
+                "cwd": project.to_string_lossy(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Edit",
+                "tool_input": { "file_path": format!("src/mod_{turn}.rs") },
+                "tool_response": { "success": true }
+            }),
+            1 => serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": "/dev/null",
+                "cwd": project.to_string_lossy(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Write",
+                "tool_input": { "file_path": format!("docs/note_{turn}.md") },
+                "tool_response": { "success": true }
+            }),
+            _ => serde_json::json!({
+                "session_id": session_id,
+                "transcript_path": "/dev/null",
+                "cwd": project.to_string_lossy(),
+                "hook_event_name": "PostToolUse",
+                "tool_name": "Bash",
+                "tool_input": { "command": format!("cargo test turn_{turn}") },
+                "tool_response": { "success": true }
+            }),
+        }
+        .to_string();
+        fire_hook(&hooks_bin, &daemon, "rb-gate-40turn", &project, &event);
+    }
+
+    // The single SessionEnd folds the whole turn's scratch into ONE summary.
+    fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-gate-40turn",
+        &project,
+        &session_end_event(&project, session_id),
+    );
+
+    let mut client = Client::connect(&daemon.socket, namespace)
+        .await
+        .expect("connect to in-process daemon");
+    // Poll briefly for the SessionEnd write to land.
+    let mut memories = Vec::new();
+    for _ in 0..40 {
+        memories = client.list(None, 1000).await.expect("list");
+        if !memories.is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    assert!(
+        !memories.is_empty(),
+        "the 40-turn session must capture SOMETHING (the gate must not pass vacuously)"
+    );
+    assert!(
+        memories.len() <= 5,
+        "Phase-3 gate: a 40-turn session must produce <=5 memories, got {} ({:?})",
+        memories.len(),
+        memories
+            .iter()
+            .map(|m| m.content.clone())
+            .collect::<Vec<_>>()
+    );
+    // The one memory is the folded session summary, listing folded mutations.
+    let summary = &memories[0];
+    assert!(
+        summary.content.contains("Session summary"),
+        "the captured memory is the SessionEnd summary, got: {}",
+        summary.content
+    );
+
+    daemon.stop().await;
     drop(proj_dir);
 }

@@ -698,6 +698,15 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         Ok(found)
     }
 
+    /// Namespace-scoped read that does NOT record an access, unlike [`get`](Self::get).
+    /// Used by internal maintenance (W3.1 write-time near-dup suppression) that
+    /// must inspect a memory's provenance without polluting its access /
+    /// usefulness signal — `access_count` is the "returned by recall" signal
+    /// (W3.7), so an automatic scan must never inflate it.
+    pub async fn peek(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
+        self.get_scoped(id).await
+    }
+
     /// List memories in the engine namespace, most-recent first, optionally
     /// filtered by a minimum importance.
     pub async fn list(

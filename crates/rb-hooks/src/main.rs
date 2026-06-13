@@ -6,11 +6,13 @@
 //! `{"continue":true,...}` to stdout, and always exits 0. Any panic or error
 //! anywhere degrades to a literal `{"continue":true}`.
 
+mod cache;
 mod capture;
 mod cli;
-mod dedup;
 mod dispatch;
 mod io;
+mod scratch;
+mod transcript;
 
 use std::time::Duration;
 
@@ -20,7 +22,7 @@ use rb_agents::{AutoStart, DaemonClient};
 use rb_agents::{HookEvent, HookResult};
 
 use crate::cli::Args;
-use crate::dedup::DedupCache;
+use crate::scratch::Scratch;
 
 /// Overall wall-clock budget for the connect+capture phase. On expiry the
 /// harness abandons the daemon work and still prints a fail-open response.
@@ -111,7 +113,14 @@ fn run() -> serde_json::Value {
         _ => None,
     };
 
-    let dedup = DedupCache::for_namespace(&namespace);
+    // Per-session capture scratch (W3.1): keyed by session id, namespace-isolated.
+    // Absent when the event carries no session id — capture then no-ops. The
+    // scratch is the sole capture-dedup mechanism (it coalesces exact repeats);
+    // no separate dedup window straddles its per-session reset boundary.
+    let scratch = ctx
+        .session_id
+        .as_deref()
+        .map(|sid| Scratch::for_session(&namespace, sid));
 
     // Build a runtime; if that fails, fail open.
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -139,7 +148,14 @@ fn run() -> serde_json::Value {
         // Overall timeout guards the whole connect+capture phase.
         match tokio::time::timeout(
             OVERALL_TIMEOUT,
-            capture_phase(&socket, &namespace, auto_start, identity, &dedup, &ctx),
+            capture_phase(
+                &socket,
+                &namespace,
+                auto_start,
+                identity,
+                scratch.as_ref(),
+                &ctx,
+            ),
         )
         .await
         {
@@ -154,24 +170,45 @@ fn run() -> serde_json::Value {
     cli.render_output(&result)
 }
 
-/// Connect (best-effort) and dispatch the event to its capture flow.
+/// Connect (best-effort, only when the event needs the store) and dispatch the
+/// event to its capture flow.
 async fn capture_phase(
     socket: &std::path::Path,
     namespace: &rb_types::Namespace,
     auto_start: Option<AutoStart>,
     identity: rb_proto::ClientIdentity,
-    dedup: &DedupCache,
+    scratch: Option<&Scratch>,
     ctx: &rb_agents::HookContext,
 ) -> HookResult {
-    let mut client = DaemonClient::connect(
-        socket,
-        namespace.clone(),
-        CONNECT_TIMEOUT,
-        auto_start,
-        Some(identity),
+    // W3.1: PostToolUse (scratch append) and Stop (no-op) never touch the
+    // daemon, so they skip the connect cost entirely; only SessionStart /
+    // SessionEnd / PreCompact read or write the store.
+    let mut client = if event_needs_daemon(&ctx.event) {
+        DaemonClient::connect(
+            socket,
+            namespace.clone(),
+            CONNECT_TIMEOUT,
+            auto_start,
+            Some(identity),
+        )
+        .await
+    } else {
+        None
+    };
+    dispatch::dispatch(client.as_mut(), scratch, ctx).await
+}
+
+/// True for events that read or write the store (and so need a daemon
+/// connection): SessionStart (inject), SessionEnd (fold + store), PreCompact
+/// (store). Local-only events — PostToolUse (scratch append), Stop (no-op),
+/// Other — skip the connect.
+fn event_needs_daemon(event: &HookEvent) -> bool {
+    matches!(
+        event,
+        HookEvent::SessionStart { .. }
+            | HookEvent::SessionEnd { .. }
+            | HookEvent::PreCompact { .. }
     )
-    .await;
-    dispatch::dispatch(client.as_mut(), dedup, ctx).await
 }
 
 fn continue_result() -> HookResult {

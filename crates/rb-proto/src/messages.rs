@@ -77,6 +77,20 @@ pub enum Request {
         /// Range-validated by the engine.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         confidence: Option<f32>,
+        /// When `Some(old)`, the daemon ATOMICALLY supersedes `old` with the
+        /// memory this request stores — archiving `old`, stamping its
+        /// `superseded_by`, and pruning its vector — exactly the "store a
+        /// replacement memory that supersedes the old one" path the `Update`
+        /// and `Link` rejections point at (W0.4 / W3.1 update-as-supersede).
+        /// The replacement is written first; the supersede follows in a second
+        /// writer transaction (the existing atomic supersede), so a supersede
+        /// failure leaves the new memory stored and `old` simply un-archived —
+        /// never a partial/corrupt state. `#[serde(default,
+        /// skip_serializing_if)]`: an old client omits the field (`None`) and a
+        /// `None` serializes to nothing — byte-identical to the pre-field
+        /// frame, so NO CONTRACT_VERSION bump (the `confidence` precedent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        supersedes: Option<MemoryId>,
     },
     Recall {
         query: String,
@@ -378,6 +392,7 @@ mod tests {
             tags: vec![],
             related_files: vec![],
             confidence: Some(0.3),
+            supersedes: None,
         };
         // Some(x) serializes the key and round-trips back to Some(x).
         let json = serde_json::to_value(&explicit).unwrap();
@@ -413,11 +428,69 @@ mod tests {
             tags: vec![],
             related_files: vec![],
             confidence: None,
+            supersedes: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
             json.as_object().unwrap().get("confidence").is_none(),
             "None confidence must not serialize: {json}"
+        );
+    }
+
+    #[test]
+    fn remember_without_supersedes_decodes_to_none_and_none_omits_the_key() {
+        // Wire compat (W3.1): an old payload with no `supersedes` decodes to
+        // None (a plain store), and a None serializes WITHOUT the key —
+        // byte-identical to the pre-field frame, so no CONTRACT_VERSION bump.
+        let old = MemoryId::new();
+        let explicit = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+            supersedes: Some(old.clone()),
+        };
+        // Some(id) serializes the key and round-trips back to the same id.
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert!(
+            json.get("supersedes").is_some(),
+            "explicit supersedes must serialize the key: {json}"
+        );
+        match serde_json::from_value::<Request>(json.clone()).unwrap() {
+            Request::Remember { supersedes, .. } => {
+                assert_eq!(supersedes, Some(old));
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+
+        // Removing the key decodes to None (old client / a plain store).
+        let mut value = json;
+        value.as_object_mut().unwrap().remove("supersedes");
+        match serde_json::from_value::<Request>(value).unwrap() {
+            Request::Remember { supersedes, .. } => assert_eq!(supersedes, None),
+            other => panic!("expected Remember, got {other:?}"),
+        }
+
+        // A None supersedes serializes to nothing (no key) — pre-field shape.
+        let none = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+            supersedes: None,
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.as_object().unwrap().get("supersedes").is_none(),
+            "None supersedes must not serialize: {json}"
         );
     }
 
@@ -446,6 +519,7 @@ mod tests {
                 tags: vec!["t".into()],
                 related_files: vec!["src/lib.rs".into()],
                 confidence: Some(0.7),
+                supersedes: Some(id.clone()),
             },
             Request::Recall {
                 query: "q".into(),
