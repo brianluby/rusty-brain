@@ -103,6 +103,12 @@ pub async fn run_serve(
             (Some(base_url), Some(model)) => Some(rb_daemon::EnrichEndpoint { base_url, model }),
             _ => None,
         },
+        // Pre-normalized by EffectiveConfig to "linear"/"rrf" (unknown values
+        // already warned and dropped there); anything else is the default.
+        fusion_mode: match effective.fusion_mode.as_deref() {
+            Some("rrf") => rb_daemon::FusionMode::Rrf,
+            _ => rb_daemon::FusionMode::Linear,
+        },
     };
     run_with_kind(kind, config, effective.local_model, accept, shutdown).await
 }
@@ -273,6 +279,7 @@ mod tests {
             jobs_config: rb_daemon::JobsConfig::default(),
             request_idle_timeout: None,
             enrich: None,
+            fusion_mode: rb_daemon::FusionMode::Linear,
         };
         let err = run_with_kind(
             ProviderKind::Local,

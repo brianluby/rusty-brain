@@ -52,6 +52,8 @@ struct ModelEnrichment {
     memory_type: Option<String>,
     #[serde(default)]
     importance: Option<u8>,
+    #[serde(default)]
+    confidence: Option<f32>,
 }
 
 impl OpenAiCompatEnricher {
@@ -136,7 +138,9 @@ impl OpenAiCompatEnricher {
          keywords (array of <=5 lowercase strings), tags (array of strings), \
          memory_type (one of: architecture_decision, code_pattern, bug_fix, \
          configuration, constraint, entity, insight, reference, preference), \
-         importance (integer 1-10)."
+         importance (integer 1-10), confidence (number 0.0-1.0: how reliable \
+         the stated fact looks — 1.0 for a verified outcome, lower for \
+         speculation or hearsay)."
     }
 
     fn user_prompt(content: &str, context: Option<&str>) -> String {
@@ -211,6 +215,15 @@ impl Enricher for OpenAiCompatEnricher {
             }
             None => None,
         };
+        let confidence = match model.confidence {
+            Some(c) if c.is_finite() && (0.0..=1.0).contains(&c) => Some(c),
+            Some(c) => {
+                return Err(Error::Enrichment(format!(
+                    "model returned confidence {c} out of range 0.0..=1.0"
+                )))
+            }
+            None => None,
+        };
 
         Ok(Enrichment {
             summary: model.summary,
@@ -218,6 +231,7 @@ impl Enricher for OpenAiCompatEnricher {
             tags: model.tags,
             memory_type,
             importance,
+            confidence,
         })
     }
 }

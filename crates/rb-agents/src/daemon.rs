@@ -63,7 +63,9 @@ impl DaemonClient {
     }
 
     /// Best-effort `remember`. Returns the new id, or `None` on any error/timeout.
-    /// `confidence` is the trust prior in `0.0..=1.0` (hook captures send 0.7).
+    /// `confidence` is the EXPLICIT trust prior in `0.0..=1.0`, or `None` for no
+    /// prior (the daemon applies the 1.0 baseline). Hook captures pass
+    /// `Some(0.7)`.
     pub async fn remember(
         &mut self,
         content: String,
@@ -71,7 +73,7 @@ impl DaemonClient {
         memory_type: MemoryType,
         importance: u8,
         tags: Vec<String>,
-        confidence: f32,
+        confidence: Option<f32>,
     ) -> Option<MemoryId> {
         let fut = self.client.remember(
             content,
@@ -172,6 +174,7 @@ mod tests {
             jobs_config: JobsConfig::default(),
             request_idle_timeout: None,
             enrich: None,
+            fusion_mode: rb_daemon::FusionMode::Linear,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(config, embedder).await.unwrap();
@@ -214,7 +217,7 @@ mod tests {
                 MemoryType::ArchitectureDecision,
                 9,
                 vec!["daemon".to_string()],
-                0.7,
+                Some(0.7),
             )
             .await
             .expect("remember must return an id");
@@ -267,7 +270,7 @@ mod tests {
                 MemoryType::Insight,
                 8,
                 vec![],
-                1.0,
+                Some(1.0),
             )
             .await
             .expect("remember must return an id");

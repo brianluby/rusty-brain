@@ -102,7 +102,15 @@ impl Client {
     /// call [`recv_change`](Self::recv_change) in a loop to read streamed frames.
     /// The stream is scoped server-side to the handshake namespace.
     pub async fn subscribe(&mut self) -> Result<()> {
-        write_frame(&mut self.framed, &Request::Subscribe).await?;
+        self.subscribe_since(None).await
+    }
+
+    /// Like [`subscribe`](Self::subscribe), but resume from an oplog cursor
+    /// (W2.7): every change with `seq > since` is replayed from the durable
+    /// oplog before live streaming begins, so a reconnecting consumer misses
+    /// nothing. Track the cursor as `max(seq)` over received changes.
+    pub async fn subscribe_since(&mut self, since: Option<u64>) -> Result<()> {
+        write_frame(&mut self.framed, &Request::Subscribe { since }).await?;
         // Block until the daemon confirms the broadcast receiver is registered.
         // Returning before the ack would let the caller commit a change that
         // races ahead of an active subscription and is silently missed.
@@ -143,10 +151,11 @@ impl Client {
         }
     }
 
-    /// Store a new memory; returns its id. `confidence` is the trust prior in
-    /// `0.0..=1.0` (1.0 = today's full-trust default; hook captures send 0.7);
-    /// a non-finite or out-of-range value is rejected client-side with
-    /// [`Error::InvalidArgument`] before anything touches the wire.
+    /// Store a new memory; returns its id. `confidence` is the EXPLICIT trust
+    /// prior in `0.0..=1.0`, or `None` to express no prior (the daemon applies
+    /// the full-trust 1.0 baseline and lets an enricher fill it). Hook captures
+    /// pass `Some(0.7)`. An explicit out-of-range value is rejected client-side
+    /// with [`Error::InvalidArgument`] before anything touches the wire.
     #[allow(clippy::too_many_arguments)]
     pub async fn remember(
         &mut self,
@@ -157,14 +166,17 @@ impl Client {
         keywords: Vec<String>,
         tags: Vec<String>,
         related_files: Vec<String>,
-        confidence: f32,
+        confidence: Option<f32>,
     ) -> Result<MemoryId> {
-        // Mirrors the engine-side check so a bad value fails fast and with the
-        // same error class the daemon would round-trip back.
-        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-            return Err(Error::InvalidArgument(format!(
-                "confidence {confidence} out of range 0.0..=1.0"
-            )));
+        // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
+        // with the same error class the daemon would round-trip back. None
+        // carries no prior and is always valid.
+        if let Some(c) = confidence {
+            if !c.is_finite() || !(0.0..=1.0).contains(&c) {
+                return Err(Error::InvalidArgument(format!(
+                    "confidence {c} out of range 0.0..=1.0"
+                )));
+            }
         }
         let resp = self
             .request(Request::Remember {
@@ -270,6 +282,39 @@ impl Client {
         }
     }
 
+    /// Create an explicit link between two memories (W2.2). `reason` defaults
+    /// daemon-side to "user-asserted" when `None`.
+    pub async fn link(
+        &mut self,
+        from: MemoryId,
+        to: MemoryId,
+        link_type: rb_types::LinkType,
+        reason: Option<String>,
+    ) -> Result<()> {
+        // Fast-fail the one link type the engine rejects outright (supersede is
+        // its own atomic op), so the caller gets the same InvalidArgument
+        // without a guaranteed-failing round-trip.
+        if link_type == rb_types::LinkType::Supersedes {
+            return Err(Error::InvalidArgument(
+                "supersedes links are created by storing a replacement memory, \
+                 not by linking"
+                    .to_string(),
+            ));
+        }
+        let resp = self
+            .request(Request::Link {
+                from,
+                to,
+                link_type,
+                reason,
+            })
+            .await?;
+        match resp {
+            Resp::Linked => Ok(()),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// Soft-archive a memory.
     pub async fn delete(&mut self, id: MemoryId) -> Result<()> {
         let resp = self.request(Request::Delete { id }).await?;
@@ -340,6 +385,22 @@ impl Client {
                 changed,
                 skipped,
             } => Ok((scanned, changed, skipped)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// Retroactively redact secrets from every stored memory (W2.4). Returns
+    /// `(scanned, redacted, reembed_pending)`; run `reembed` until `changed=0`
+    /// afterward to recompute vectors for the changed rows. Admin op: a
+    /// non-admin peer is rejected with `Error::PermissionDenied`.
+    pub async fn scrub(&mut self) -> Result<(u64, u64, u64)> {
+        let resp = self.request(Request::Scrub).await?;
+        match resp {
+            Resp::Scrubbed {
+                scanned,
+                redacted,
+                reembed_pending,
+            } => Ok((scanned, redacted, reembed_pending)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -599,6 +660,7 @@ mod wrapper_tests {
                     memories: vec![note()],
                 },
                 Request::Update { .. } => Response::Updated,
+                Request::Link { .. } => Response::Linked,
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
                     recent: vec![note()],
@@ -609,7 +671,7 @@ mod wrapper_tests {
                     contract_version: CONTRACT_VERSION,
                     recall_channels: None,
                 },
-                Request::Subscribe => Response::Pong {
+                Request::Subscribe { .. } => Response::Pong {
                     contract_version: CONTRACT_VERSION,
                     recall_channels: None,
                 },
@@ -628,6 +690,11 @@ mod wrapper_tests {
                     // can prove the flag rides the wire.
                     moved: if merge { 7 } else { 3 },
                     vectors: 2,
+                },
+                Request::Scrub => Response::Scrubbed {
+                    scanned: 0,
+                    redacted: 0,
+                    reembed_pending: 0,
                 },
             };
             write_frame(&mut framed, &resp).await.unwrap();
@@ -656,7 +723,7 @@ mod wrapper_tests {
                 vec!["k".into()],
                 vec!["t".into()],
                 vec![],
-                1.0,
+                Some(1.0),
             )
             .await
             .unwrap();
@@ -752,7 +819,7 @@ mod wrapper_tests {
                     vec![],
                     vec![],
                     vec![],
-                    bad,
+                    Some(bad),
                 )
                 .await
                 .unwrap_err();
@@ -839,7 +906,10 @@ mod subscribe_tests {
         .unwrap();
 
         let req: Request = read_frame(&mut framed).await.unwrap();
-        assert!(matches!(req, Request::Subscribe), "expected Subscribe");
+        assert!(
+            matches!(req, Request::Subscribe { since: None }),
+            "expected Subscribe"
+        );
 
         // The client's subscribe() blocks on this ack before returning.
         write_frame(&mut framed, &Response::SubscribeAck)
@@ -852,6 +922,7 @@ mod subscribe_tests {
                 id: change_id,
                 namespace: Namespace::Global,
                 kind: ChangeKind::Created,
+                seq: Some(1),
             }),
         )
         .await

@@ -58,6 +58,9 @@ pub struct FileConfig {
     /// secrets are env-only).
     #[serde(default)]
     pub enrich: EnrichFileConfig,
+    /// `[search]` section: recall ranking knobs.
+    #[serde(default)]
+    pub search: SearchFileConfig,
 }
 
 /// `[embed]` section of the config file.
@@ -83,6 +86,16 @@ pub struct EnrichFileConfig {
     /// `model` are required to activate LLM enrichment.
     #[serde(default)]
     pub model: Option<String>,
+}
+
+/// `[search]` section of the config file.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+pub struct SearchFileConfig {
+    /// Recall fusion strategy: `"linear"` (default) or `"rrf"` (W2.2; the
+    /// default flip decision is deferred to W4.1 eval evidence). Env
+    /// equivalent: `RB_FUSION_MODE`. Unknown values warn and are ignored.
+    #[serde(default)]
+    pub fusion: Option<String>,
 }
 
 /// A loaded (or absent) config file plus any non-fatal warnings produced while
@@ -165,16 +178,18 @@ fn warn_unknown_keys(table: &toml::Table, source: &Path, warnings: &mut Vec<Stri
         "jobs_config",
         "embed",
         "enrich",
+        "search",
     ];
     const EMBED: &[&str] = &["backend", "local_model"];
     const ENRICH: &[&str] = &["base_url", "model"];
+    const SEARCH: &[&str] = &["fusion"];
 
     for key in table.keys() {
         if !TOP_LEVEL.contains(&key.as_str()) {
             warnings.push(unknown_key_warning(key, source));
         }
     }
-    for (section, known) in [("embed", EMBED), ("enrich", ENRICH)] {
+    for (section, known) in [("embed", EMBED), ("enrich", ENRICH), ("search", SEARCH)] {
         if let Some(toml::Value::Table(inner)) = table.get(section) {
             for key in inner.keys() {
                 if !known.contains(&key.as_str()) {

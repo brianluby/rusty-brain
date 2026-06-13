@@ -108,6 +108,24 @@ pub fn render_remembered(id: &rb_types::MemoryId, json: bool) -> String {
     }
 }
 
+/// Render a successful update acknowledgement.
+pub fn render_updated(json: bool) -> String {
+    if json {
+        "{\"updated\":true}".to_string()
+    } else {
+        "Updated".to_string()
+    }
+}
+
+/// Render a successful link acknowledgement.
+pub fn render_linked(json: bool) -> String {
+    if json {
+        "{\"linked\":true}".to_string()
+    } else {
+        "Linked".to_string()
+    }
+}
+
 /// Render a successful delete acknowledgement.
 pub fn render_deleted(json: bool) -> String {
     if json {
@@ -154,21 +172,29 @@ pub fn render_change(item: &rb_proto::SubscribeItem, json: bool) -> String {
                 rb_types::ChangeKind::Archived => "Archived",
             };
             if json {
-                let value = serde_json::json!({
+                let mut value = serde_json::json!({
                     "kind": kind,
                     "namespace": evt.namespace.as_db_string(),
                     "id": evt.id.to_string(),
                 });
+                // W2.7: surface the oplog cursor so a consumer can resume with
+                // `subscribe --since <seq>`. Omitted (not null) when the
+                // daemon predates seq stamping.
+                if let (Some(seq), Some(obj)) = (evt.seq, value.as_object_mut()) {
+                    obj.insert("seq".to_string(), serde_json::json!(seq));
+                }
                 serde_json::to_string(&value).unwrap_or_else(|e| {
                     tracing::warn!(error = %e, "failed to render change JSON");
                     "{}".to_string()
                 })
             } else {
+                let seq = evt.seq.map(|s| format!(" (seq {s})")).unwrap_or_default();
                 format!(
-                    "{} {} {}",
+                    "{} {} {}{}",
                     kind.to_lowercase(),
                     evt.namespace.as_db_string(),
-                    evt.id
+                    evt.id,
+                    seq
                 )
             }
         }
@@ -328,6 +354,7 @@ mod tests {
             id: id.clone(),
             namespace: Namespace::Project("p".into()),
             kind: ChangeKind::Created,
+            seq: Some(4),
         });
         let out = render_change(&item, false);
         assert!(out.contains("created"), "kind shown: {out}");
@@ -352,6 +379,7 @@ mod tests {
             id: id.clone(),
             namespace: Namespace::Global,
             kind: ChangeKind::Archived,
+            seq: None,
         });
         let out = render_change(&item, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();

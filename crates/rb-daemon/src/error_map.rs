@@ -18,6 +18,7 @@ pub(crate) fn error_to_response(err: Error) -> Response {
         Error::InvalidLinkType(_) => ("invalid_link_type", err.to_string()),
         Error::DimensionMismatch { .. } => ("dimension_mismatch", err.to_string()),
         Error::InvalidArgument(_) => ("invalid_argument", err.to_string()),
+        Error::PermissionDenied(_) => ("permission_denied", err.to_string()),
 
         // Internal: log the real detail, send a generic message to the client.
         Error::Storage(_) => {
@@ -45,7 +46,9 @@ pub(crate) fn error_to_response(err: Error) -> Response {
             ("embedding", "internal error".to_string())
         }
         Error::Enrichment(_) => {
-            warn!("internal enrichment error");
+            // F26: like every other internal arm, the real detail goes to the
+            // server log (the wire still gets only the opaque sentinel).
+            warn!(error = %err, "internal enrichment error");
             ("enrichment", "internal error".to_string())
         }
     };
@@ -90,6 +93,7 @@ mod tests {
             (Error::Embedding("x".into()), "embedding"),
             (Error::Enrichment("x".into()), "enrichment"),
             (Error::InvalidArgument("x".into()), "invalid_argument"),
+            (Error::PermissionDenied("x".into()), "permission_denied"),
         ];
         for (err, expected_kind) in cases {
             match error_to_response(err) {
@@ -168,6 +172,21 @@ mod tests {
                 format!("invalid argument: {guidance}"),
                 "validation message must be forwarded verbatim"
             );
+        } else {
+            panic!("expected error response");
+        }
+    }
+
+    #[test]
+    fn permission_denied_is_client_safe_guidance() {
+        // W2.6: an authorization denial is guidance for the caller (what to do
+        // to be allowed), not an internal fault — it travels verbatim.
+        let msg = "this is an admin operation: it requires a kernel-verified \
+                   peer uid matching the daemon's user";
+        let r = error_to_response(Error::PermissionDenied(msg.into()));
+        if let Response::Error { kind, message } = r {
+            assert_eq!(kind, "permission_denied");
+            assert_eq!(message, format!("permission denied: {msg}"));
         } else {
             panic!("expected error response");
         }

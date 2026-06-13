@@ -237,6 +237,9 @@ impl MemoryBackend for MockBackend {
         if let Some(ctx) = updates.context {
             note.context = ctx;
         }
+        if let Some(conf) = updates.confidence {
+            note.confidence = conf;
+        }
         Ok(())
     }
 
@@ -433,6 +436,7 @@ impl Enricher for FixedEnricher {
             tags: vec!["enrtag".to_string()],
             memory_type: None,
             importance: None,
+            confidence: Some(0.6),
         })
     }
 }

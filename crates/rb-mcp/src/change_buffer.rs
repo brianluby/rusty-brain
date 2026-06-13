@@ -122,6 +122,7 @@ mod tests {
             id: MemoryId::new(),
             namespace: Namespace::Global,
             kind,
+            seq: None,
         }
     }
 

@@ -104,7 +104,19 @@ fn build_engine(
 ) -> rb_types::Result<MemoryEngine<SqliteBackend, DeterministicProvider>> {
     let backend = SqliteBackend::in_memory(EVAL_DIM)?;
     let embedder = DeterministicProvider::new(EVAL_DIM);
-    Ok(MemoryEngine::new(backend, embedder, eval_namespace()).with_fusion_mode(mode))
+    Ok(MemoryEngine::new(backend, embedder, eval_namespace())
+        .with_fusion_mode(mode)
+        .with_fixed_now(eval_now()))
+}
+
+/// The pinned eval clock (2026-01-01T00:00:00Z): every corpus row is stamped
+/// created/updated at this instant and ranking computes recency against it,
+/// so `(now - created_at)` is exactly zero for every memory and metrics
+/// reproduce bit-for-bit across runs. Without the pin, insert/query
+/// wall-clock timing leaks into the recency prior and near-tied ranks flip
+/// between runs (the `rrf_mode_is_deterministic_across_runs` flake).
+pub fn eval_now() -> chrono::DateTime<chrono::Utc> {
+    chrono::DateTime::from_timestamp(1_767_225_600, 0).expect("valid pinned eval timestamp")
 }
 
 /// Build a fresh in-memory engine over an arbitrary provider (real-model mode).
@@ -114,7 +126,7 @@ pub fn build_engine_with<P: EmbeddingProvider>(
     embedder: P,
 ) -> rb_types::Result<MemoryEngine<SqliteBackend, P>> {
     let backend = SqliteBackend::in_memory(embedder.dim())?;
-    Ok(MemoryEngine::new(backend, embedder, eval_namespace()))
+    Ok(MemoryEngine::new(backend, embedder, eval_namespace()).with_fixed_now(eval_now()))
 }
 
 /// Ingest the corpus through the engine, returning a fixture-key -> MemoryId map.
@@ -146,7 +158,7 @@ async fn ingest<P: EmbeddingProvider>(
                 keywords: m.keywords.clone(),
                 tags: m.tags.clone(),
                 related_files: Vec::new(),
-                confidence: 1.0,
+                confidence: None,
                 provenance: Default::default(),
             })
             .await?;

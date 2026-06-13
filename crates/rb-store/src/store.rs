@@ -35,6 +35,34 @@ pub struct NamespaceRenameOutcome {
     pub merged_into: u64,
 }
 
+/// One page of [`SqliteStore::oplog_changes_since`] replay (W2.7).
+///
+/// `changes` is the replayable events on this page (bulk-admin rows filtered
+/// out). `scanned`/`last_seq` describe the underlying oplog SCAN so the caller
+/// paginates correctly even when rows were filtered: keep paging while
+/// `scanned == limit`, advancing the cursor to `last_seq`.
+#[derive(Debug, Clone, Default)]
+pub struct OplogReplayPage {
+    pub changes: Vec<rb_types::MemoryChanged>,
+    /// Oplog rows examined on this page (≤ the requested limit).
+    pub scanned: usize,
+    /// Highest oplog seq examined (the next cursor); equals the input `after`
+    /// when the page was empty.
+    pub last_seq: u64,
+}
+
+/// Result of a retroactive [`SqliteStore::scrub`] pass (W2.4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct ScrubOutcome {
+    /// Rows examined (every memory, active and archived).
+    pub scanned: u64,
+    /// Rows whose content/summary/context had a secret redacted out.
+    pub redacted: u64,
+    /// Of `redacted`, rows whose embedding-feeding text (content/context)
+    /// changed and were therefore marked stale for re-embedding.
+    pub reembed_pending: u64,
+}
+
 /// The synchronous storage trait. The daemon wraps this on blocking threads.
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
@@ -689,11 +717,7 @@ impl SqliteStore {
     /// Used by maintenance/test paths; the engine never mutates confidence on the
     /// shipped recall/remember flow.
     pub fn set_confidence(&self, id: &MemoryId, confidence: f32) -> Result<()> {
-        if !confidence.is_finite() || !(0.0..=1.0).contains(&confidence) {
-            return Err(Error::InvalidArgument(format!(
-                "confidence {confidence} out of range 0.0..=1.0"
-            )));
-        }
+        rb_types::validate_confidence(confidence)?;
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — confidence is durable ranking state replay must reproduce.
         immediate_tx(&self.conn, || {
@@ -718,6 +742,284 @@ impl SqliteStore {
     /// reproducibility gate.
     pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
         meta_value(&self.conn, key)
+    }
+
+    /// Retroactively redact secrets from every stored memory (W2.4
+    /// `rusty-brain scrub`). Scans ALL rows — active AND archived, since a
+    /// secret at rest is a secret regardless of archive state — applies the
+    /// shared `rb_redact` pass to EVERY stored free-text column and rewrites
+    /// any row that changed.
+    ///
+    /// The redacted column set MUST be the union of the FTS-indexed text
+    /// columns (migration 001: `content`, `summary`, `keywords`, `tags`) and
+    /// the embedding-input columns (`rb_engine::embed_input`: `content`,
+    /// `keywords`, `tags`, `context`) — i.e. all five of content, summary,
+    /// keywords, tags, context — or a redacted-away secret could still be
+    /// discoverable by keyword search or still encoded in the vector after
+    /// reembed. FTS resyncs automatically via the `mem_au` trigger, which fires
+    /// on UPDATE OF content/summary/keywords/tags (migration 006).
+    /// `keywords`/`tags` are JSON arrays; redacting the raw JSON string is safe
+    /// — the `[REDACTED:..]` markers contain no quotes (the chars that would
+    /// break a JSON string value; the surrounding `[ ]` are inside the value
+    /// and harmless), so the array stays valid. A drift guard
+    /// (`scrub_covers_every_fts_and_embedding_text_column`) fails if a new
+    /// searchable/embedded column is added without teaching scrub.
+    ///
+    /// Embedding hygiene: a row's embedding stamp is blanked (so the next
+    /// `reembed` recomputes a clean vector) ONLY when it is ACTIVE and its
+    /// embedding-feeding text (content/keywords/tags/context) changed. Archived
+    /// rows have no
+    /// live vector — archival deletes the vec0 row, `reembed` skips
+    /// `archived_at IS NULL` rows, and `update_vector` refuses archived ids —
+    /// so blanking their stamp would inflate `reembed_pending` with work no
+    /// reembed pass could ever clear (the "run reembed until changed=0"
+    /// guidance would never converge). Their text is still redacted; only the
+    /// stamp/count is left alone. `reembed_pending` therefore counts exactly
+    /// the rows a follow-up `reembed` will revisit.
+    ///
+    /// `updated_at` is deliberately NOT bumped: scrub is administrative
+    /// hygiene, not an authorial edit (the `rename_namespace` /
+    /// `set_recalibrated_importance` rule), so it must not distort recency
+    /// ranking. One bulk oplog row records the pass.
+    pub fn scrub(&self) -> Result<ScrubOutcome> {
+        let outcome = immediate_tx(&self.conn, || {
+            let mut scanned = 0u64;
+            let mut redacted = 0u64;
+            let mut reembed_pending = 0u64;
+            // Keyset-paginate by memory_id so peak memory is bounded to one
+            // batch, not the whole corpus (scrub is meant to clean exactly the
+            // big DBs that a full-table snapshot would OOM). Already-rewritten
+            // rows keep their id, so `memory_id > cursor` never revisits them.
+            let mut cursor = String::new();
+            loop {
+                let batch = self.scrub_select_batch(&cursor)?;
+                if batch.is_empty() {
+                    break;
+                }
+                cursor = batch[batch.len() - 1].0.clone();
+                scanned += batch.len() as u64;
+                for (id, content, summary, context, keywords, tags, archived_at) in batch {
+                    // keywords/tags are JSON-array strings; redacting the raw
+                    // JSON is safe — the `[REDACTED:..]` markers contain no
+                    // quotes, so the array stays valid JSON.
+                    let cols = [
+                        ("content", &content, rb_redact::redact(&content)),
+                        ("summary", &summary, rb_redact::redact(&summary)),
+                        ("context", &context, rb_redact::redact(&context)),
+                        ("keywords", &keywords, rb_redact::redact(&keywords)),
+                        ("tags", &tags, rb_redact::redact(&tags)),
+                    ];
+                    if cols.iter().all(|(_, old, new)| new == *old) {
+                        continue; // nothing redactable in this row
+                    }
+                    redacted += 1;
+                    // Blank the embedding stamp only for ACTIVE rows whose
+                    // embedding-feeding text (content/context/keywords/tags —
+                    // summary does NOT feed the composite document) changed:
+                    // reembed only revisits active, stale rows, so an archived
+                    // row's blanked stamp would never be cleared.
+                    let embed_text_changed = cols
+                        .iter()
+                        .any(|(name, old, new)| *name != "summary" && new != *old);
+                    let blank_embed = archived_at.is_none() && embed_text_changed;
+                    if blank_embed {
+                        reembed_pending += 1;
+                    }
+                    // Build the SET from ONLY the columns that actually changed,
+                    // so a context-only redaction does not list content/summary/
+                    // keywords/tags and needlessly fire the `mem_au` FTS trigger
+                    // (`AFTER UPDATE OF content,summary,keywords,tags`).
+                    let mut sets: Vec<String> = Vec::new();
+                    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                    for (name, old, new) in &cols {
+                        if new != *old {
+                            sets.push(format!("{name} = ?{}", params.len() + 1));
+                            params.push(Box::new(new.clone()));
+                        }
+                    }
+                    if blank_embed {
+                        sets.push("embedding_input_version = ''".to_string());
+                    }
+                    let id_pos = params.len() + 1;
+                    params.push(Box::new(id.clone()));
+                    let sql = format!(
+                        "UPDATE memories SET {} WHERE memory_id = ?{id_pos}",
+                        sets.join(", ")
+                    );
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|b| b.as_ref()).collect();
+                    self.conn
+                        .execute(&sql, refs.as_slice())
+                        .map_err(storage_err)?;
+                }
+            }
+
+            if redacted > 0 {
+                let details = serde_json::json!({
+                    "scanned": scanned,
+                    "redacted": redacted,
+                    "reembed_pending": reembed_pending,
+                })
+                .to_string();
+                self.conn
+                    .execute(
+                        "INSERT INTO memory_oplog (site_id, op, memory_id, namespace, at, details)
+                         VALUES (?1, 'scrub', '', '', ?2, ?3)",
+                        rusqlite::params![self.site_id, chrono::Utc::now().timestamp(), details],
+                    )
+                    .map_err(storage_err)?;
+            }
+
+            Ok(ScrubOutcome {
+                scanned,
+                redacted,
+                reembed_pending,
+            })
+        })?;
+
+        // Force the pre-redaction WAL frames into the main DB and truncate the
+        // -wal file: without this, `scrub` could report success while the old
+        // plaintext still sits in the -wal on disk until an arbitrary later
+        // checkpoint. Best-effort and only when something changed (a no-op
+        // scrub wrote nothing). A no-op on an in-memory DB (no WAL). Residual:
+        // freed-page slack in the main DB needs VACUUM/purge (W5b.3) — out of
+        // scope here; this closes the obvious recoverable copy.
+        if outcome.redacted > 0 {
+            self.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(storage_err)?;
+        }
+        Ok(outcome)
+    }
+
+    /// One keyset page of redactable rows with `memory_id > cursor`, ordered by
+    /// `memory_id`, capped at `SCRUB_BATCH`. Split out so the prepared SELECT
+    /// statement is dropped before the caller issues UPDATEs for the page.
+    #[allow(clippy::type_complexity)]
+    fn scrub_select_batch(
+        &self,
+        cursor: &str,
+    ) -> Result<Vec<(String, String, String, String, String, String, Option<i64>)>> {
+        const SCRUB_BATCH: i64 = 500;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, content, summary, context, keywords, tags, archived_at \
+                 FROM memories WHERE memory_id > ?1 ORDER BY memory_id LIMIT ?2",
+            )
+            .map_err(storage_err)?;
+        let mapped = stmt
+            .query_map(rusqlite::params![cursor, SCRUB_BATCH], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for r in mapped {
+            out.push(r.map_err(storage_err)?);
+        }
+        Ok(out)
+    }
+
+    /// The highest oplog sequence committed so far (`0` on an empty log).
+    /// On the single writer thread, calling this right after a successful op
+    /// yields that op's seq (W2.7: stamped onto the broadcast `MemoryChanged`
+    /// so consumers can track a replay cursor).
+    pub fn last_oplog_seq(&self) -> Result<u64> {
+        let seq: i64 = self
+            .conn
+            .query_row("SELECT COALESCE(MAX(seq), 0) FROM memory_oplog", [], |r| {
+                r.get(0)
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        Ok(u64::try_from(seq).unwrap_or(0))
+    }
+
+    /// Replay the durable oplog as change events: every entry in `namespace`
+    /// with `seq > after`, oldest first, capped at `limit` (W2.7
+    /// replay-on-reconnect). Ops that do not describe a single memory's
+    /// change (`rename_namespace`) are skipped; `insert` maps to `Created`,
+    /// `archive`/`supersede` to `Archived`, and every other mutation
+    /// (`update`, `link`, `unlink`, `set_*`) to `Updated`.
+    pub fn oplog_changes_since(
+        &self,
+        namespace: &rb_types::Namespace,
+        after: u64,
+        limit: usize,
+    ) -> Result<OplogReplayPage> {
+        use rb_types::{ChangeKind, MemoryChanged};
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT seq, op, memory_id FROM memory_oplog
+                 WHERE namespace = ?1 AND seq > ?2
+                 ORDER BY seq ASC LIMIT ?3",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params![
+                    namespace.as_db_string(),
+                    i64::try_from(after).unwrap_or(i64::MAX),
+                    limit as i64
+                ],
+                |r| {
+                    Ok((
+                        r.get::<_, i64>(0)?,
+                        r.get::<_, String>(1)?,
+                        r.get::<_, String>(2)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut changes = Vec::new();
+        // `scanned` counts oplog ROWS examined (≤ limit), and `last_seq` is the
+        // highest seq examined — both BEFORE filtering. The caller paginates on
+        // these, not on `changes.len()`: a page is the tail only when fewer than
+        // `limit` ROWS were scanned, and the cursor must advance past every
+        // scanned row (including skipped ones) or a page full of skipped rows
+        // would loop forever / drop the rows after it (W2.7 replay bug #2).
+        let mut scanned = 0usize;
+        let mut last_seq = after;
+        for row in rows {
+            let (seq, op, id) = row.map_err(|e| Error::Storage(e.to_string()))?;
+            scanned += 1;
+            last_seq = last_seq.max(u64::try_from(seq).unwrap_or(0));
+            // Bulk admin ops (namespace_rename, scrub) carry an EMPTY memory_id
+            // sentinel and have no per-memory change identity to replay — skip
+            // by the sentinel, not by op string, so a new bulk op can never
+            // reach `parse_id("")` (which would error and abort the whole
+            // replay, silently dropping every later change — W2.7 bug #1).
+            if id.is_empty() {
+                continue;
+            }
+            let kind = match op.as_str() {
+                "insert" => ChangeKind::Created,
+                "archive" | "supersede" => ChangeKind::Archived,
+                // update / link / unlink / set_importance / set_confidence /
+                // set_link_strength — and, fail-open, any op string a NEWER
+                // writer invents: a replayed Updated is a safe over-notify.
+                _ => ChangeKind::Updated,
+            };
+            changes.push(MemoryChanged {
+                id: parse_id(&id)?,
+                namespace: namespace.clone(),
+                kind,
+                seq: Some(u64::try_from(seq).unwrap_or(0)),
+            });
+        }
+        Ok(OplogReplayPage {
+            changes,
+            scanned,
+            last_seq,
+        })
     }
 
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -1323,6 +1625,27 @@ fn seed_or_get_site_id(conn: &rusqlite::Connection) -> Result<String> {
         .ok_or_else(|| Error::Storage("meta.site_id missing after seed".to_string()))
 }
 
+/// Map a `memory_links` INSERT error: a PRIMARY-KEY/UNIQUE violation means the
+/// `(source, target, type)` edge already exists, so return the same
+/// validation-class "already exists" error `MemoryEngine::link`'s pre-check
+/// produces (deterministic across the check-then-act race). Every other error
+/// — including a FOREIGN-KEY violation on a missing endpoint — stays Storage.
+fn map_link_constraint_err(e: rusqlite::Error, link: &MemoryLink) -> Error {
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        {
+            return Error::InvalidArgument(format!(
+                "a {} link from {} to {} already exists",
+                link.link_type.as_str(),
+                link.source_id,
+                link.target_id
+            ));
+        }
+    }
+    Error::Storage(e.to_string())
+}
+
 /// Append one `memory_oplog` row for a mutation on `memory_id`, resolving the
 /// namespace from the memories row (already written within the same
 /// transaction for inserts). MUST be called inside the mutation's transaction
@@ -1611,12 +1934,10 @@ impl Store for SqliteStore {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
         // constraints are the backstop; these give a clean early error.
         rb_types::validate_importance(note.importance)?;
-        if !(0.0..=1.0).contains(&note.confidence) {
-            return Err(Error::Storage(format!(
-                "confidence {} is out of range 0.0..=1.0",
-                note.confidence
-            )));
-        }
+        // W2.8 taxonomy: a range rejection is guidance for the caller, so it
+        // must be validation-class (InvalidArgument travels verbatim over the
+        // wire; Storage is replaced with an opaque "internal error").
+        rb_types::validate_confidence(note.confidence)?;
 
         // Take the write lock at BEGIN (IMMEDIATE) instead of deferring it to the
         // first write. This avoids a deferred-transaction upgrade racing another
@@ -1968,9 +2289,12 @@ impl Store for SqliteStore {
 
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()> {
         // Defense-in-depth validation, consistent with insert_memory, before
-        // touching the DB. (MemoryUpdates has no confidence field.)
+        // touching the DB.
         if let Some(imp) = updates.importance {
             rb_types::validate_importance(imp)?;
+        }
+        if let Some(conf) = updates.confidence {
+            rb_types::validate_confidence(conf)?;
         }
 
         let mut sets: Vec<String> = Vec::new();
@@ -2001,6 +2325,10 @@ impl Store for SqliteStore {
         if let Some(context) = &updates.context {
             sets.push(format!("context = ?{}", params.len() + 1));
             params.push(Box::new(context.clone()));
+        }
+        if let Some(confidence) = updates.confidence {
+            sets.push(format!("confidence = ?{}", params.len() + 1));
+            params.push(Box::new(confidence as f64));
         }
 
         // If a field that feeds `embedding_input` (content / tags / context — the
@@ -2104,7 +2432,14 @@ impl Store for SqliteStore {
                         link.created_at.timestamp(),
                     ],
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                // A PK/UNIQUE violation means the (source,target,type) edge
+                // already exists. `MemoryEngine::link` is check-then-act, so a
+                // caller that loses the race to a concurrent insert reaches
+                // here; map it to the SAME deterministic validation-class error
+                // the pre-check produces ("already exists") instead of a
+                // generic Storage/"internal error". FK violations on a missing
+                // endpoint stay Storage (a different ConstraintViolation code).
+                .map_err(|e| map_link_constraint_err(e, link))?;
             let details = serde_json::json!({
                 "type": link.link_type.as_str(),
                 "target": link.target_id.to_string(),
@@ -2985,24 +3320,20 @@ mod insert_tests {
     }
 
     #[test]
-    fn insert_rejects_out_of_range_confidence() {
+    fn insert_rejects_out_of_range_confidence_as_invalid_argument() {
+        // W2.8 taxonomy: a range rejection is caller guidance, so it is
+        // validation-class (InvalidArgument travels verbatim over the wire;
+        // Storage would surface as an opaque "internal error").
         let store = SqliteStore::open_in_memory(8).unwrap();
-        // confidence = -0.1 is below the valid range 0.0..=1.0
         let mut m = MemoryNote::new(Namespace::Global, "bad".into(), MemoryType::Reference, 5);
-        m.confidence = -0.1;
-        let err = store.insert_memory(&m, None).unwrap_err();
-        assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("confidence")),
-            "expected storage error about confidence, got {err:?}"
-        );
-
-        // confidence = 1.1 is above the valid range
-        m.confidence = 1.1;
-        let err = store.insert_memory(&m, None).unwrap_err();
-        assert!(
-            matches!(err, Error::Storage(ref s) if s.contains("confidence")),
-            "expected storage error about confidence, got {err:?}"
-        );
+        for bad in [-0.1f32, 1.1, f32::NAN] {
+            m.confidence = bad;
+            let err = store.insert_memory(&m, None).unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidArgument(ref s) if s.contains("confidence")),
+                "expected invalid argument error about confidence for {bad}, got {err:?}"
+            );
+        }
     }
 }
 
@@ -3773,6 +4104,244 @@ mod list_tests {
 }
 
 #[cfg(test)]
+mod scrub_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    /// Shape-true FAKE secrets, BUILT at runtime from split literals so no
+    /// committed source byte forms a scanner-matchable token (GitHub push
+    /// protection blocks otherwise). Not real credentials.
+    fn aws_key() -> String {
+        format!("AKIA{}", "A".repeat(16))
+    }
+    fn github_token() -> String {
+        format!("ghp_{}", "A".repeat(36))
+    }
+
+    fn seeded(content: &str, context: &str) -> (SqliteStore, MemoryId) {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut m = MemoryNote::new(
+            Namespace::Project("scrub".into()),
+            content.to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        m.context = context.to_string();
+        m.summary = "a summary".to_string();
+        store.insert_memory(&m, None).unwrap();
+        (store, m.id)
+    }
+
+    #[test]
+    fn scrub_redacts_planted_secret_from_content_and_marks_reembed() {
+        let secret = aws_key();
+        let (store, id) = seeded(
+            &format!("deploy key is {secret} do not share"),
+            "no secret here",
+        );
+        let out = store.scrub().unwrap();
+        assert_eq!(out.scanned, 1);
+        assert_eq!(out.redacted, 1);
+        assert_eq!(out.reembed_pending, 1, "content changed -> reembed");
+
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert!(
+            !got.content.contains(&secret),
+            "plaintext secret must be gone: {}",
+            got.content
+        );
+        assert!(got.content.contains("[REDACTED:aws-key]"));
+        assert_eq!(
+            got.embedding_input_version, "",
+            "embedding stamp blanked for reembed"
+        );
+
+        // FTS no longer matches the secret token (mem_au resynced on content).
+        let hits = store
+            .keyword_search(&Namespace::Project("scrub".into()), &secret, 10)
+            .unwrap();
+        assert!(
+            hits.is_empty(),
+            "scrubbed secret must not be FTS-searchable"
+        );
+    }
+
+    #[test]
+    fn scrub_is_idempotent_and_a_clean_db_is_a_noop() {
+        let (store, _id) = seeded(&format!("token {} here", github_token()), "");
+        let first = store.scrub().unwrap();
+        assert_eq!(first.redacted, 1);
+        let second = store.scrub().unwrap();
+        assert_eq!(second.scanned, 1);
+        assert_eq!(second.redacted, 0, "second pass finds nothing to redact");
+        assert_eq!(second.reembed_pending, 0);
+    }
+
+    #[test]
+    fn scrub_redacts_archived_rows_too() {
+        let secret = aws_key();
+        let (store, id) = seeded(&format!("archived secret {secret}"), "");
+        store.archive_memory(&id).unwrap();
+        let out = store.scrub().unwrap();
+        assert_eq!(
+            out.redacted, 1,
+            "a secret at rest is scrubbed even if archived"
+        );
+        // Fix #3: an archived row's text is redacted, but it is NOT counted in
+        // reembed_pending — reembed skips archived rows, so counting it would
+        // make "reembed until changed=0" never converge.
+        assert_eq!(
+            out.reembed_pending, 0,
+            "archived rows must not be queued for a reembed that can never run"
+        );
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert!(!got.content.contains(&secret));
+    }
+
+    #[test]
+    fn scrub_drill_removes_planted_secret_from_the_db_file_at_rest() {
+        // W2.4 / Phase 2 gate: the scrub drill on a SEEDED db. A secret that
+        // predates the rule (written straight to the store, bypassing
+        // capture-time redaction) must be gone from the raw file bytes after
+        // scrub + checkpoint — the proof that retroactive redaction reaches
+        // disk, not just the in-memory row.
+        let secret = aws_key();
+        let secret = secret.as_str();
+        const SENTINEL: &str = "scrub-drill-sentinel-9b2e";
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("seeded.db");
+
+        {
+            let store = SqliteStore::open(&db, 8).unwrap();
+            let mut m = MemoryNote::new(
+                Namespace::Project("scrub".into()),
+                format!("deploy key {secret} and marker {SENTINEL}"),
+                MemoryType::Insight,
+                5,
+            );
+            m.summary = format!("uses {secret}");
+            store.insert_memory(&m, None).unwrap();
+
+            // Vacuousness guard: the secret really is at rest before scrub.
+            // In WAL mode the just-inserted row lives in the -wal file until
+            // checkpoint, so grep all three files, not just the main db.
+            let mut before = Vec::new();
+            for suffix in ["", "-wal", "-shm"] {
+                let p = format!("{}{suffix}", db.to_string_lossy());
+                if let Ok(bytes) = std::fs::read(&p) {
+                    before.extend_from_slice(&bytes);
+                }
+            }
+            assert!(
+                before.windows(secret.len()).any(|w| w == secret.as_bytes()),
+                "secret must be present before scrub (else the test is vacuous)"
+            );
+
+            let out = store.scrub().unwrap();
+            assert_eq!(out.redacted, 1);
+            // Close the connection so SQLite checkpoints WAL into the main file.
+        }
+
+        // Grep the main file plus any WAL/SHM straggler.
+        let mut at_rest = Vec::new();
+        for suffix in ["", "-wal", "-shm"] {
+            let p = format!("{}{suffix}", db.to_string_lossy());
+            if let Ok(bytes) = std::fs::read(&p) {
+                at_rest.extend_from_slice(&bytes);
+                at_rest.push(0);
+            }
+        }
+        assert!(
+            at_rest
+                .windows(SENTINEL.len())
+                .any(|w| w == SENTINEL.as_bytes()),
+            "the non-secret sentinel must survive (proves the row is intact)"
+        );
+        assert!(
+            at_rest
+                .windows(b"[REDACTED:".len())
+                .any(|w| w == b"[REDACTED:"),
+            "a redaction marker must be present at rest"
+        );
+        assert!(
+            !at_rest
+                .windows(secret.len())
+                .any(|w| w == secret.as_bytes()),
+            "the planted secret must be GONE from the db file bytes after scrub"
+        );
+    }
+
+    #[test]
+    fn scrub_covers_every_fts_and_embedding_text_column() {
+        // Fix #9: a secret in ANY FTS-indexed or embedding-feeding text column
+        // (content, summary, keywords, tags, context) must be redacted and no
+        // longer keyword-searchable. keywords/tags were previously NOT scrubbed
+        // despite being both FTS columns and embedding inputs.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("scrub".into());
+        // Each secret is a valid AWS-key shape: AKIA + exactly 16 [0-9A-Z]
+        // (the word padded with 'A' to width 16), distinct per column.
+        let key = |w: &str| format!("AKIA{w:A<16}");
+        let (c_sec, s_sec, k_sec, t_sec, x_sec) = (
+            key("CONTENT"),
+            key("SUMMARY"),
+            key("KEYWORD"),
+            key("TAGS"),
+            key("CONTEXT"),
+        );
+        let mut m = MemoryNote::new(
+            proj.clone(),
+            format!("content has {c_sec}"),
+            MemoryType::Insight,
+            5,
+        );
+        m.summary = format!("summary has {s_sec}");
+        m.keywords = vec![k_sec.clone(), "ok".into()];
+        m.tags = vec![t_sec.clone()];
+        m.context = format!("context has {x_sec}");
+        store.insert_memory(&m, None).unwrap();
+
+        let out = store.scrub().unwrap();
+        assert_eq!(out.redacted, 1);
+
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        for secret in [&c_sec, &s_sec, &k_sec, &t_sec, &x_sec] {
+            let secret = secret.as_str();
+            assert!(
+                !got.content.contains(secret)
+                    && !got.summary.contains(secret)
+                    && !got.context.contains(secret)
+                    && !got.keywords.iter().any(|k| k.contains(secret))
+                    && !got.tags.iter().any(|t| t.contains(secret)),
+                "secret {secret} must be redacted from every text column"
+            );
+            // And gone from FTS (content/summary/keywords/tags are indexed).
+            assert!(
+                store.keyword_search(&proj, secret, 10).unwrap().is_empty(),
+                "scrubbed secret {secret} must not be keyword-searchable"
+            );
+        }
+        // keywords/tags stayed valid JSON arrays (the non-secret element survived).
+        assert!(got.keywords.iter().any(|k| k == "ok"), "{:?}", got.keywords);
+    }
+
+    #[test]
+    fn scrub_appends_one_bulk_oplog_row_only_when_something_changed() {
+        let (store, _id) = seeded("clean content, nothing secret", "");
+        store.scrub().unwrap();
+        let n: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_oplog WHERE op = 'scrub'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(n, 0, "a no-op scrub logs nothing");
+    }
+}
+
+#[cfg(test)]
 mod update_tests {
     use super::*;
     use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace};
@@ -3791,6 +4360,7 @@ mod update_tests {
             importance: Some(9),
             tags: Some(vec!["alpha".into(), "beta".into()]),
             context: Some("new context".into()),
+            confidence: Some(0.4),
         };
         store.update_memory(&m.id, &updates).unwrap();
 
@@ -3800,6 +4370,7 @@ mod update_tests {
         assert_eq!(got.importance, 9);
         assert_eq!(got.tags, vec!["alpha".to_string(), "beta".to_string()]);
         assert_eq!(got.context, "new context");
+        assert!((got.confidence - 0.4).abs() < f32::EPSILON);
         assert!(got.updated_at.timestamp() > m.updated_at.timestamp());
 
         // FTS reflects new content, not old.
@@ -3831,6 +4402,46 @@ mod update_tests {
         assert_eq!(got.importance, 7);
         assert_eq!(got.content, "keep me");
         assert_eq!(got.summary, "keep summary");
+    }
+
+    #[test]
+    fn update_confidence_alone_persists_and_validates_range() {
+        // W2.2: confidence is settable through update_memory, and an
+        // out-of-range value fails closed as InvalidArgument before the DB.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let m = MemoryNote::new(Namespace::Global, "trusted".into(), MemoryType::Insight, 5);
+        store.insert_memory(&m, None).unwrap();
+
+        store
+            .update_memory(
+                &m.id,
+                &MemoryUpdates {
+                    confidence: Some(0.25),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((got.confidence - 0.25).abs() < f32::EPSILON);
+
+        for bad in [-0.1f32, 1.5, f32::NAN] {
+            let err = store
+                .update_memory(
+                    &m.id,
+                    &MemoryUpdates {
+                        confidence: Some(bad),
+                        ..Default::default()
+                    },
+                )
+                .unwrap_err();
+            assert!(
+                matches!(err, rb_types::Error::InvalidArgument(_)),
+                "confidence {bad} must be InvalidArgument, got {err:?}"
+            );
+        }
+        // The valid value persisted earlier survives the rejected writes.
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!((got.confidence - 0.25).abs() < f32::EPSILON);
     }
 
     #[test]
@@ -4092,6 +4703,30 @@ mod add_link_tests {
         // foreign_keys=ON => FK violation surfaces as a storage error.
         let err = store.add_link(&link).unwrap_err();
         assert!(matches!(err, Error::Storage(_)));
+    }
+
+    #[test]
+    fn add_link_duplicate_edge_is_invalid_argument_not_storage() {
+        // The (source,target,type) PK already exists: the concurrent-race path
+        // through add_link must surface the deterministic "already exists"
+        // validation error, not a generic Storage/"internal error".
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        let link = MemoryLink {
+            source_id: a.id.clone(),
+            target_id: b.id.clone(),
+            link_type: LinkType::Contradicts,
+            strength: 1.0,
+            reason: "x".into(),
+            created_at: a.created_at,
+        };
+        store.add_link(&link).unwrap();
+        let err = store.add_link(&link).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("already exists")),
+            "duplicate edge must map to InvalidArgument, got {err:?}"
+        );
     }
 }
 
@@ -4906,7 +5541,9 @@ mod contradiction_tests {
 #[cfg(test)]
 mod oplog_tests {
     use super::*;
-    use rb_types::{LinkType, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace};
+    use rb_types::{
+        ChangeKind, LinkType, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace,
+    };
 
     fn node(store: &SqliteStore, c: &str) -> MemoryNote {
         let n = MemoryNote::new(
@@ -5112,6 +5749,134 @@ mod oplog_tests {
         let details: serde_json::Value = serde_json::from_str(&rows[2].4).unwrap();
         assert_eq!(details["type"], "extends");
         assert_eq!(details["target"], b.id.to_string());
+    }
+
+    #[test]
+    fn oplog_changes_since_replays_kind_mapped_namespace_scoped_after_cursor() {
+        // W2.7 replay-on-reconnect: the oplog reads back as change events —
+        // kind-mapped, namespace-scoped, strictly after the cursor, oldest
+        // first, with seq stamped for cursor tracking.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("oplog".into());
+        let a = node(&store, "a"); // seq 1: insert
+        let b = node(&store, "b"); // seq 2: insert
+        store
+            .update_memory(
+                &a.id,
+                &MemoryUpdates {
+                    importance: Some(7),
+                    ..Default::default()
+                },
+            )
+            .unwrap(); // seq 3: update
+        store.archive_memory(&b.id).unwrap(); // seq 4: archive
+
+        // A foreign-namespace write must never leak into the replay.
+        let foreign = MemoryNote::new(
+            Namespace::Project("other".into()),
+            "foreign".to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&foreign, None).unwrap(); // seq 5
+
+        assert_eq!(store.last_oplog_seq().unwrap(), 5);
+
+        let all = store.oplog_changes_since(&ns, 0, 100).unwrap();
+        let kinds: Vec<_> = all.changes.iter().map(|e| e.kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                ChangeKind::Created,
+                ChangeKind::Created,
+                ChangeKind::Updated,
+                ChangeKind::Archived
+            ]
+        );
+        assert!(
+            all.changes.iter().all(|e| e.namespace == ns),
+            "namespace-scoped"
+        );
+        let seqs: Vec<_> = all.changes.iter().map(|e| e.seq.unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4], "oldest first, seq stamped");
+        assert_eq!(
+            all.scanned, 4,
+            "4 in-namespace rows scanned (foreign excluded)"
+        );
+        assert_eq!(all.last_seq, 4, "cursor advances to the last scanned seq");
+
+        // Strictly after a cursor.
+        let after = store.oplog_changes_since(&ns, 2, 100).unwrap();
+        assert_eq!(
+            after
+                .changes
+                .iter()
+                .map(|e| e.seq.unwrap())
+                .collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+
+        // Limit caps the scan.
+        let capped = store.oplog_changes_since(&ns, 0, 2).unwrap();
+        assert_eq!(capped.changes.len(), 2);
+        assert_eq!(capped.scanned, 2);
+
+        // Empty log tail: nothing after the max cursor.
+        let tail = store.oplog_changes_since(&ns, 5, 100).unwrap();
+        assert!(tail.changes.is_empty());
+        assert_eq!(tail.scanned, 0);
+        assert_eq!(tail.last_seq, 5, "empty page keeps the input cursor");
+    }
+
+    #[test]
+    fn oplog_replay_skips_bulk_admin_rows_and_paginates_past_them() {
+        // W2.7 bugs #1+#2: a namespace_rename row (empty memory_id, real
+        // namespace) must be SKIPPED (not crash parse_id("")) AND counted in
+        // `scanned` so pagination advances past it instead of looping or
+        // dropping later rows.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("bulk".into());
+        let other = Namespace::Project("src".into());
+        let insert = |s: &SqliteStore, n: &Namespace, c: &str| -> MemoryId {
+            let m = MemoryNote::new(n.clone(), c.into(), MemoryType::Insight, 5);
+            s.insert_memory(&m, None).unwrap();
+            m.id
+        };
+
+        let a = insert(&store, &ns, "a"); // seq 1: insert (bulk)
+        insert(&store, &other, "moving"); // seq 2: insert (src)
+                                          // Rename INTO `bulk` writes a namespace_rename row under `bulk`
+                                          // with an empty memory_id sentinel.
+        store.rename_namespace(&other, &ns, true).unwrap(); // seq 3: bulk row under `bulk`
+        let c = insert(&store, &ns, "c"); // seq 4: insert (bulk)
+
+        let page = store.oplog_changes_since(&ns, 0, 100).unwrap();
+        // The rename row is skipped, so no empty-id bulk row leaks into replay.
+        let ids: Vec<_> = page.changes.iter().map(|e| e.id.clone()).collect();
+        assert!(ids.contains(&a) && ids.contains(&c));
+        assert!(
+            page.changes.iter().all(|e| !e.id.to_string().is_empty()),
+            "no empty-id bulk row leaked into replay"
+        );
+        // ...but `scanned`/`last_seq` cover EVERY scanned row incl. the skipped.
+        assert_eq!(page.last_seq, store.last_oplog_seq().unwrap());
+
+        // Paginate with limit=1 so the rename row lands mid-stream: the cursor
+        // must still advance past it and reach every real change.
+        let mut after = 0u64;
+        let mut seen = Vec::new();
+        loop {
+            let page = store.oplog_changes_since(&ns, after, 1).unwrap();
+            if page.scanned == 0 {
+                break;
+            }
+            seen.extend(page.changes.iter().map(|e| e.id.clone()));
+            after = page.last_seq;
+        }
+        assert!(
+            seen.contains(&a) && seen.contains(&c),
+            "every real change is reached across pages despite the skipped bulk row"
+        );
     }
 
     #[test]

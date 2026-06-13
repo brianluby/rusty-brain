@@ -37,7 +37,7 @@ fn public_surface_is_reachable_and_stable() {
         keywords: vec![],
         tags: vec![],
         related_files: vec![],
-        confidence: 0.7,
+        confidence: Some(0.7),
     };
 
     // Error mapping helpers, round-tripping through the wire form.

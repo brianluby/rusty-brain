@@ -96,6 +96,15 @@ Target: security →8, teamfit →6.
 
 **Phase 2 gate:** redaction benchmark numbers documented and `scrub` drill passes on a seeded DB; injection drill passes; non-admin client cannot invoke RunJob/Reembed; provenance fields present from all three write paths; a killed-and-reconnected subscriber replays missed events from its cursor; fresh DB is 0600/0700.
 
+**Phase-2 gate evaluation (recorded 2026-06-13):**
+
+- *redaction benchmark documented + `scrub` drill on a seeded DB:* met — `rb-redact` benchmark records 90.3% detection (56/62) / 0 false positives over `crates/rb-redact/fixtures/benchmark.json` (pinned by `tests/benchmark.rs`; numbers in `docs/THREAT_MODEL.md` with the two KNOWN_UNCOVERED FN classes). Scrub drill: `scrub_drill_removes_planted_secret_from_the_db_file_at_rest` (rb-store, greps the raw file bytes after checkpoint) + `scrub_over_the_wire_redacts_an_unredacted_stored_secret` (daemon e2e).
+- *injection drill passes:* **deferred to W3.4, accepted.** W2.5 ships the data-not-instructions framing + provenance labels with unit coverage (`format_session_start_frames_memories_as_untrusted_data`); the *live* scripted drill (plant instruction-shaped memory, assert the agent does not act on it) requires the real-session harness, which the plan itself scopes to W3.4. Recorded here so the gate is not silently declared passed on this clause.
+- *non-admin cannot invoke RunJob/Reembed:* met by construction (W2.6) — `is_admin_op` gates RunJob/Reembed/NamespaceRename/Scrub on the kernel-verified peer uid; unit-tested (`peer_identity_admin_is_same_euid_and_fails_closed`, `admin_ops_are_runjob_reembed_and_namespace_rename`). A cross-uid e2e is impractical in CI (the test client shares the daemon's uid); the gate is met at the predicate + peer-cred level.
+- *provenance from all three write paths:* met — `source` is declared `hook` (rb-hooks), `mcp`, and `cli` (`client_identity`); user/host fall back to the daemon whoami (W0.5).
+- *killed-and-reconnected subscriber replays from its cursor:* met — `reconnected_subscriber_replays_missed_events_from_its_cursor` (W2.7 daemon e2e).
+- *fresh DB 0600/0700:* met — enforced in `Daemon::bind`/`prepare_*_dir` and the rb-store open path; tests `prepare_socket_dir_creates_missing_parent_private`, `prepare_db_dir_creates_missing_dir_private...`.
+
 ---
 
 ## 6. Phase 3 — Claude Code value

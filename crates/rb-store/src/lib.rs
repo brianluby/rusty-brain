@@ -11,6 +11,6 @@ mod store;
 
 pub use migrations::run_migrations;
 pub use store::{
-    AccessBump, ConsolidationCandidate, LinkRow, NamespaceRenameOutcome, RecalRow, SqliteStore,
-    Store,
+    AccessBump, ConsolidationCandidate, LinkRow, NamespaceRenameOutcome, OplogReplayPage, RecalRow,
+    ScrubOutcome, SqliteStore, Store,
 };

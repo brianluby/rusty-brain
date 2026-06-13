@@ -165,7 +165,9 @@ async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Se
                 ..
             } => {
                 observed.saw_remember = true;
-                observed.confidence = Some(confidence);
+                // `confidence` is now Option<f32> on the wire (None = no prior);
+                // hook captures send Some(0.7), asserted below.
+                observed.confidence = confidence;
                 observed.content = Some(content);
                 observed.context = context;
                 Response::Remembered {
