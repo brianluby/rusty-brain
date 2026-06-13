@@ -201,6 +201,15 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
             let link_type_raw = require_str(args, "type")?;
             let link_type = rb_types::LinkType::parse(link_type_raw)
                 .map_err(|e| invalid(format!("invalid link type '{link_type_raw}': {e}")))?;
+            // Reject the one type the engine rejects (and which the schema enum
+            // already omits) at the boundary, so a hand-crafted call fails with
+            // INVALID_PARAMS instead of a round-trip error.
+            if link_type == rb_types::LinkType::Supersedes {
+                return Err(invalid(
+                    "supersedes links are created by storing a replacement memory, not by linking"
+                        .to_string(),
+                ));
+            }
             Ok(Request::Link {
                 from,
                 to,

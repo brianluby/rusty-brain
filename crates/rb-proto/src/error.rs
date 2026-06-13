@@ -55,7 +55,18 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "embedding" => Error::Embedding(message.to_string()),
         "enrichment" => Error::Enrichment(message.to_string()),
         "invalid_argument" => Error::InvalidArgument(message.to_string()),
-        "permission_denied" => Error::PermissionDenied(message.to_string()),
+        // The wire message is the rendered Display ("permission denied: …").
+        // Strip that prefix before re-wrapping so the reconstructed error does
+        // not Display as "permission denied: permission denied: …". (The same
+        // latent double-prefix exists for the other reconstructed client-safe
+        // variants above as a pre-existing pattern; fixed here for the variant
+        // this change introduced.)
+        "permission_denied" => Error::PermissionDenied(
+            message
+                .strip_prefix("permission denied: ")
+                .unwrap_or(message)
+                .to_string(),
+        ),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
@@ -199,5 +210,14 @@ mod tests {
             round_trip(Error::InvalidArgument("importance 0".into())),
             Error::InvalidArgument(_)
         ));
+    }
+
+    #[test]
+    fn permission_denied_round_trips_without_double_prefix() {
+        let back = round_trip(Error::PermissionDenied("admin op required".into()));
+        assert!(matches!(back, Error::PermissionDenied(_)));
+        // The reconstructed error must Display exactly once, not
+        // "permission denied: permission denied: …".
+        assert_eq!(back.to_string(), "permission denied: admin op required");
     }
 }

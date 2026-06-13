@@ -17,7 +17,7 @@ history plus an editor's local history.
 
 ## Trust boundaries today
 
-```
+```text
 agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
         ▲                                  │
    client-declared identity          kernel-verified peer uid
@@ -47,7 +47,7 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    client-declared and is stored as *provenance metadata only* — useful for
    audit and ranking, never for authorization. The connection's principal is
    the peer uid read via `getpeereid`/`SO_PEERCRED` at accept time.
-   - **Admin ops** (`RunJob`, `Reembed`, `NamespaceRename` — the
+   - **Admin ops** (`RunJob`, `Reembed`, `NamespaceRename`, `Scrub` — the
      cross-namespace maintenance surface) require the peer uid to equal the
      daemon's effective uid; everything else stays namespace-scoped. The check
      fails closed: unreadable peer credentials are non-admin. Root gets no

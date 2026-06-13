@@ -291,6 +291,16 @@ impl Client {
         link_type: rb_types::LinkType,
         reason: Option<String>,
     ) -> Result<()> {
+        // Fast-fail the one link type the engine rejects outright (supersede is
+        // its own atomic op), so the caller gets the same InvalidArgument
+        // without a guaranteed-failing round-trip.
+        if link_type == rb_types::LinkType::Supersedes {
+            return Err(Error::InvalidArgument(
+                "supersedes links are created by storing a replacement memory, \
+                 not by linking"
+                    .to_string(),
+            ));
+        }
         let resp = self
             .request(Request::Link {
                 from,

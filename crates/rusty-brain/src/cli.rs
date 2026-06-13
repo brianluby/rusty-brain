@@ -9,8 +9,18 @@ fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
 }
 
 /// Parse a link `--type` value into a `LinkType` using the canonical db strings.
+/// `supersedes` is rejected here — that edge is created by storing a
+/// replacement memory, not by linking — so `rusty-brain link --type supersedes`
+/// fails locally instead of round-tripping to a daemon rejection.
 fn parse_link_type(s: &str) -> Result<LinkType, String> {
-    LinkType::parse(s).map_err(|e| e.to_string())
+    let link_type = LinkType::parse(s).map_err(|e| e.to_string())?;
+    if link_type == LinkType::Supersedes {
+        return Err(
+            "supersedes links are created by storing a replacement memory, not by linking"
+                .to_string(),
+        );
+    }
+    Ok(link_type)
 }
 
 /// Clap range check for `--confidence` (inclusive 0.0..=1.0, finite).
@@ -412,6 +422,16 @@ mod tests {
             }
             other => panic!("expected Link, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn link_rejects_supersedes_locally() {
+        // supersede is its own atomic op; the CLI must fail before the daemon.
+        let res = Cli::try_parse_from(["rusty-brain", "link", "a", "b", "--type", "supersedes"]);
+        assert!(
+            res.is_err(),
+            "--type supersedes must be rejected at parse time"
+        );
     }
 
     #[test]

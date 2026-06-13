@@ -145,7 +145,8 @@ const ENTROPY_MIN_BITS_PER_CHAR: f64 = 4.0;
 /// Replace standalone high-entropy tokens with `[REDACTED:high-entropy]`.
 ///
 /// A token qualifies when it is at least [`ENTROPY_MIN_LEN`] chars of
-/// secret-alphabet characters (`A-Za-z0-9 + / = _ -`), draws from at least
+/// secret-alphabet characters (`A-Za-z0-9 + = _ -`; `/` is deliberately a
+/// SEPARATOR, not a token char — see the body comment), draws from at least
 /// THREE character classes (upper/lower/digit/symbol — this exclusion keeps
 /// git SHAs and bare hex, which have at most two classes, out), is not
 /// UUID-shaped (memory ids legitimately appear in captures), and measures at

@@ -990,7 +990,7 @@ mod tests {
 
     // W2.6: admin classification covers exactly the cross-namespace ops.
     #[test]
-    fn admin_ops_are_runjob_reembed_and_namespace_rename() {
+    fn admin_ops_are_runjob_reembed_namespace_rename_and_scrub() {
         assert!(is_admin_op(&Request::RunJob {
             job: rb_types::JobKind::LinkDecay
         }));
@@ -1000,6 +1000,8 @@ mod tests {
             new: Namespace::Project("b".into()),
             merge: false,
         }));
+        // Scrub is the W2.4 cross-namespace admin op; it MUST be gated too.
+        assert!(is_admin_op(&Request::Scrub));
         for not_admin in [
             Request::Ping,
             Request::Context,

@@ -759,8 +759,9 @@ impl SqliteStore {
     /// reembed. FTS resyncs automatically via the `mem_au` trigger, which fires
     /// on UPDATE OF content/summary/keywords/tags (migration 006).
     /// `keywords`/`tags` are JSON arrays; redacting the raw JSON string is safe
-    /// — replacements are quote/bracket-free `[REDACTED:..]` markers, so the
-    /// array stays valid. A drift guard
+    /// — the `[REDACTED:..]` markers contain no quotes (the chars that would
+    /// break a JSON string value; the surrounding `[ ]` are inside the value
+    /// and harmless), so the array stays valid. A drift guard
     /// (`scrub_covers_every_fts_and_embedding_text_column`) fails if a new
     /// searchable/embedded column is added without teaching scrub.
     ///
@@ -781,101 +782,76 @@ impl SqliteStore {
     /// `set_recalibrated_importance` rule), so it must not distort recency
     /// ranking. One bulk oplog row records the pass.
     pub fn scrub(&self) -> Result<ScrubOutcome> {
-        immediate_tx(&self.conn, || {
-            // Snapshot every row's redactable text + archive state first;
-            // rewrite in a second pass so the UPDATE statements do not run
-            // while the SELECT statement borrows the connection.
-            #[allow(clippy::type_complexity)]
-            let rows: Vec<(
-                String,
-                String,
-                String,
-                String,
-                String,
-                String,
-                Option<i64>,
-            )> = {
-                let mut stmt = self
-                    .conn
-                    .prepare(
-                        "SELECT memory_id, content, summary, context, keywords, tags, archived_at \
-                         FROM memories",
-                    )
-                    .map_err(storage_err)?;
-                let mapped = stmt
-                    .query_map([], |r| {
-                        Ok((
-                            r.get::<_, String>(0)?,
-                            r.get::<_, String>(1)?,
-                            r.get::<_, String>(2)?,
-                            r.get::<_, String>(3)?,
-                            r.get::<_, String>(4)?,
-                            r.get::<_, String>(5)?,
-                            r.get::<_, Option<i64>>(6)?,
-                        ))
-                    })
-                    .map_err(storage_err)?;
-                let mut out = Vec::new();
-                for r in mapped {
-                    out.push(r.map_err(storage_err)?);
-                }
-                out
-            };
-
-            let scanned = rows.len() as u64;
+        let outcome = immediate_tx(&self.conn, || {
+            let mut scanned = 0u64;
             let mut redacted = 0u64;
             let mut reembed_pending = 0u64;
-
-            for (id, content, summary, context, keywords, tags, archived_at) in rows {
-                let new_content = rb_redact::redact(&content);
-                let new_summary = rb_redact::redact(&summary);
-                let new_context = rb_redact::redact(&context);
-                // keywords/tags are JSON-array strings; redacting the raw JSON
-                // is safe (markers are quote/bracket-free, array stays valid).
-                let new_keywords = rb_redact::redact(&keywords);
-                let new_tags = rb_redact::redact(&tags);
-                if new_content == content
-                    && new_summary == summary
-                    && new_context == context
-                    && new_keywords == keywords
-                    && new_tags == tags
-                {
-                    continue;
+            // Keyset-paginate by memory_id so peak memory is bounded to one
+            // batch, not the whole corpus (scrub is meant to clean exactly the
+            // big DBs that a full-table snapshot would OOM). Already-rewritten
+            // rows keep their id, so `memory_id > cursor` never revisits them.
+            let mut cursor = String::new();
+            loop {
+                let batch = self.scrub_select_batch(&cursor)?;
+                if batch.is_empty() {
+                    break;
                 }
-                redacted += 1;
-                // Blank the embedding stamp only for ACTIVE rows whose
-                // embedding-feeding text (content/keywords/tags/context —
-                // summary does NOT feed the composite document) changed:
-                // reembed only revisits active, stale rows, so an archived
-                // row's blanked stamp would never be cleared. One parameterized
-                // UPDATE handles both cases via a CASE on the bound flag.
-                let embed_text_changed = new_content != content
-                    || new_context != context
-                    || new_keywords != keywords
-                    || new_tags != tags;
-                let blank_embed = archived_at.is_none() && embed_text_changed;
-                if blank_embed {
-                    reembed_pending += 1;
+                cursor = batch[batch.len() - 1].0.clone();
+                scanned += batch.len() as u64;
+                for (id, content, summary, context, keywords, tags, archived_at) in batch {
+                    // keywords/tags are JSON-array strings; redacting the raw
+                    // JSON is safe — the `[REDACTED:..]` markers contain no
+                    // quotes, so the array stays valid JSON.
+                    let cols = [
+                        ("content", &content, rb_redact::redact(&content)),
+                        ("summary", &summary, rb_redact::redact(&summary)),
+                        ("context", &context, rb_redact::redact(&context)),
+                        ("keywords", &keywords, rb_redact::redact(&keywords)),
+                        ("tags", &tags, rb_redact::redact(&tags)),
+                    ];
+                    if cols.iter().all(|(_, old, new)| new == *old) {
+                        continue; // nothing redactable in this row
+                    }
+                    redacted += 1;
+                    // Blank the embedding stamp only for ACTIVE rows whose
+                    // embedding-feeding text (content/context/keywords/tags —
+                    // summary does NOT feed the composite document) changed:
+                    // reembed only revisits active, stale rows, so an archived
+                    // row's blanked stamp would never be cleared.
+                    let embed_text_changed = cols
+                        .iter()
+                        .any(|(name, old, new)| *name != "summary" && new != *old);
+                    let blank_embed = archived_at.is_none() && embed_text_changed;
+                    if blank_embed {
+                        reembed_pending += 1;
+                    }
+                    // Build the SET from ONLY the columns that actually changed,
+                    // so a context-only redaction does not list content/summary/
+                    // keywords/tags and needlessly fire the `mem_au` FTS trigger
+                    // (`AFTER UPDATE OF content,summary,keywords,tags`).
+                    let mut sets: Vec<String> = Vec::new();
+                    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::new();
+                    for (name, old, new) in &cols {
+                        if new != *old {
+                            sets.push(format!("{name} = ?{}", params.len() + 1));
+                            params.push(Box::new(new.clone()));
+                        }
+                    }
+                    if blank_embed {
+                        sets.push("embedding_input_version = ''".to_string());
+                    }
+                    let id_pos = params.len() + 1;
+                    params.push(Box::new(id.clone()));
+                    let sql = format!(
+                        "UPDATE memories SET {} WHERE memory_id = ?{id_pos}",
+                        sets.join(", ")
+                    );
+                    let refs: Vec<&dyn rusqlite::ToSql> =
+                        params.iter().map(|b| b.as_ref()).collect();
+                    self.conn
+                        .execute(&sql, refs.as_slice())
+                        .map_err(storage_err)?;
                 }
-                self.conn
-                    .execute(
-                        "UPDATE memories
-                         SET content = ?1, summary = ?2, context = ?3,
-                             keywords = ?4, tags = ?5,
-                             embedding_input_version =
-                                 CASE WHEN ?6 THEN '' ELSE embedding_input_version END
-                         WHERE memory_id = ?7",
-                        rusqlite::params![
-                            new_content,
-                            new_summary,
-                            new_context,
-                            new_keywords,
-                            new_tags,
-                            blank_embed,
-                            id
-                        ],
-                    )
-                    .map_err(storage_err)?;
             }
 
             if redacted > 0 {
@@ -899,7 +875,57 @@ impl SqliteStore {
                 redacted,
                 reembed_pending,
             })
-        })
+        })?;
+
+        // Force the pre-redaction WAL frames into the main DB and truncate the
+        // -wal file: without this, `scrub` could report success while the old
+        // plaintext still sits in the -wal on disk until an arbitrary later
+        // checkpoint. Best-effort and only when something changed (a no-op
+        // scrub wrote nothing). A no-op on an in-memory DB (no WAL). Residual:
+        // freed-page slack in the main DB needs VACUUM/purge (W5b.3) — out of
+        // scope here; this closes the obvious recoverable copy.
+        if outcome.redacted > 0 {
+            self.conn
+                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
+                .map_err(storage_err)?;
+        }
+        Ok(outcome)
+    }
+
+    /// One keyset page of redactable rows with `memory_id > cursor`, ordered by
+    /// `memory_id`, capped at `SCRUB_BATCH`. Split out so the prepared SELECT
+    /// statement is dropped before the caller issues UPDATEs for the page.
+    #[allow(clippy::type_complexity)]
+    fn scrub_select_batch(
+        &self,
+        cursor: &str,
+    ) -> Result<Vec<(String, String, String, String, String, String, Option<i64>)>> {
+        const SCRUB_BATCH: i64 = 500;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT memory_id, content, summary, context, keywords, tags, archived_at \
+                 FROM memories WHERE memory_id > ?1 ORDER BY memory_id LIMIT ?2",
+            )
+            .map_err(storage_err)?;
+        let mapped = stmt
+            .query_map(rusqlite::params![cursor, SCRUB_BATCH], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, String>(4)?,
+                    r.get::<_, String>(5)?,
+                    r.get::<_, Option<i64>>(6)?,
+                ))
+            })
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for r in mapped {
+            out.push(r.map_err(storage_err)?);
+        }
+        Ok(out)
     }
 
     /// The highest oplog sequence committed so far (`0` on an empty log).
@@ -1597,6 +1623,27 @@ fn seed_or_get_site_id(conn: &rusqlite::Connection) -> Result<String> {
     .map_err(storage_err)?;
     meta_value(conn, "site_id")?
         .ok_or_else(|| Error::Storage("meta.site_id missing after seed".to_string()))
+}
+
+/// Map a `memory_links` INSERT error: a PRIMARY-KEY/UNIQUE violation means the
+/// `(source, target, type)` edge already exists, so return the same
+/// validation-class "already exists" error `MemoryEngine::link`'s pre-check
+/// produces (deterministic across the check-then-act race). Every other error
+/// — including a FOREIGN-KEY violation on a missing endpoint — stays Storage.
+fn map_link_constraint_err(e: rusqlite::Error, link: &MemoryLink) -> Error {
+    if let rusqlite::Error::SqliteFailure(err, _) = &e {
+        if err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_PRIMARYKEY
+            || err.extended_code == rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE
+        {
+            return Error::InvalidArgument(format!(
+                "a {} link from {} to {} already exists",
+                link.link_type.as_str(),
+                link.source_id,
+                link.target_id
+            ));
+        }
+    }
+    Error::Storage(e.to_string())
 }
 
 /// Append one `memory_oplog` row for a mutation on `memory_id`, resolving the
@@ -2385,7 +2432,14 @@ impl Store for SqliteStore {
                         link.created_at.timestamp(),
                     ],
                 )
-                .map_err(|e| Error::Storage(e.to_string()))?;
+                // A PK/UNIQUE violation means the (source,target,type) edge
+                // already exists. `MemoryEngine::link` is check-then-act, so a
+                // caller that loses the race to a concurrent insert reaches
+                // here; map it to the SAME deterministic validation-class error
+                // the pre-check produces ("already exists") instead of a
+                // generic Storage/"internal error". FK violations on a missing
+                // endpoint stay Storage (a different ConstraintViolation code).
+                .map_err(|e| map_link_constraint_err(e, link))?;
             let details = serde_json::json!({
                 "type": link.link_type.as_str(),
                 "target": link.target_id.to_string(),
@@ -4649,6 +4703,30 @@ mod add_link_tests {
         // foreign_keys=ON => FK violation surfaces as a storage error.
         let err = store.add_link(&link).unwrap_err();
         assert!(matches!(err, Error::Storage(_)));
+    }
+
+    #[test]
+    fn add_link_duplicate_edge_is_invalid_argument_not_storage() {
+        // The (source,target,type) PK already exists: the concurrent-race path
+        // through add_link must surface the deterministic "already exists"
+        // validation error, not a generic Storage/"internal error".
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "a");
+        let b = node(&store, "b");
+        let link = MemoryLink {
+            source_id: a.id.clone(),
+            target_id: b.id.clone(),
+            link_type: LinkType::Contradicts,
+            strength: 1.0,
+            reason: "x".into(),
+            created_at: a.created_at,
+        };
+        store.add_link(&link).unwrap();
+        let err = store.add_link(&link).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(ref s) if s.contains("already exists")),
+            "duplicate edge must map to InvalidArgument, got {err:?}"
+        );
     }
 }
 
