@@ -39,38 +39,46 @@ fn error_kind(err: &Error) -> &'static str {
 
 /// Reconstruct a domain error from a wire `kind`/`message`.
 ///
+/// The wire `message` is the sender's rendered `Display` (prefix + inner, e.g.
+/// `"invalid argument: …"`). Re-wrapping that whole string in the same variant
+/// would re-add the prefix, so reconstruction would `Display` as
+/// `"invalid argument: invalid argument: …"`. To keep the round-tripped error's
+/// `Display` identical to the original, each same-variant arm strips its own
+/// `Display` prefix via [`unprefixed`] before re-wrapping — a no-op when the
+/// prefix is absent (e.g. an internal error whose wire message is the opaque
+/// `"internal error"` sentinel), so it is always safe.
+///
 /// Variants that carry structured data which cannot be parsed back from a
 /// string (`NotFound`, `DimensionMismatch`) degrade to `Error::Storage`
 /// carrying the original message -- faithful text, lossy structure. Unknown
 /// kinds also map to `Error::Storage` (fail closed: never silently succeed).
 pub fn response_error_to_error(kind: &str, message: &str) -> Error {
     match kind {
-        "storage" => Error::Storage(message.to_string()),
-        "migration" => Error::Migration(message.to_string()),
-        "invalid_namespace" => Error::InvalidNamespace(message.to_string()),
-        "invalid_memory_type" => Error::InvalidMemoryType(message.to_string()),
-        "invalid_link_type" => Error::InvalidLinkType(message.to_string()),
-        "serialization" => Error::Serialization(message.to_string()),
-        "io" => Error::Io(message.to_string()),
-        "embedding" => Error::Embedding(message.to_string()),
-        "enrichment" => Error::Enrichment(message.to_string()),
-        "invalid_argument" => Error::InvalidArgument(message.to_string()),
-        // The wire message is the rendered Display ("permission denied: …").
-        // Strip that prefix before re-wrapping so the reconstructed error does
-        // not Display as "permission denied: permission denied: …". (The same
-        // latent double-prefix exists for the other reconstructed client-safe
-        // variants above as a pre-existing pattern; fixed here for the variant
-        // this change introduced.)
-        "permission_denied" => Error::PermissionDenied(
-            message
-                .strip_prefix("permission denied: ")
-                .unwrap_or(message)
-                .to_string(),
-        ),
+        "storage" => Error::Storage(unprefixed(message, "storage error: ")),
+        "migration" => Error::Migration(unprefixed(message, "migration error: ")),
+        "invalid_namespace" => Error::InvalidNamespace(unprefixed(message, "invalid namespace: ")),
+        "invalid_memory_type" => {
+            Error::InvalidMemoryType(unprefixed(message, "invalid memory type: "))
+        }
+        "invalid_link_type" => Error::InvalidLinkType(unprefixed(message, "invalid link type: ")),
+        "serialization" => Error::Serialization(unprefixed(message, "serialization error: ")),
+        "io" => Error::Io(unprefixed(message, "io error: ")),
+        "embedding" => Error::Embedding(unprefixed(message, "embedding error: ")),
+        "enrichment" => Error::Enrichment(unprefixed(message, "enrichment error: ")),
+        "invalid_argument" => Error::InvalidArgument(unprefixed(message, "invalid argument: ")),
+        "permission_denied" => Error::PermissionDenied(unprefixed(message, "permission denied: ")),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
     }
+}
+
+/// Strip a variant's own `Display` prefix from a wire message if present,
+/// returning an owned `String`. A no-op (returns the message unchanged) when
+/// the prefix is absent, so reconstruction is robust whether the sender
+/// rendered the full `Display` or substituted an opaque sentinel.
+fn unprefixed(message: &str, prefix: &str) -> String {
+    message.strip_prefix(prefix).unwrap_or(message).to_string()
 }
 
 #[cfg(test)]
@@ -219,5 +227,33 @@ mod tests {
         // The reconstructed error must Display exactly once, not
         // "permission denied: permission denied: …".
         assert_eq!(back.to_string(), "permission denied: admin op required");
+    }
+
+    #[test]
+    fn same_variant_round_trips_preserve_display_without_doubling_the_prefix() {
+        // Every variant that reconstructs to the SAME variant must round-trip
+        // with an unchanged Display — no "<prefix>: <prefix>: …" doubling.
+        let cases = [
+            Error::Storage("disk full".into()),
+            Error::Migration("bad step".into()),
+            Error::InvalidNamespace("project:".into()),
+            Error::InvalidMemoryType("bogus".into()),
+            Error::InvalidLinkType("depends_on".into()),
+            Error::Serialization("bad json".into()),
+            Error::Io("broken pipe".into()),
+            Error::Embedding("model down".into()),
+            Error::Enrichment("llm 500".into()),
+            Error::InvalidArgument("importance 0".into()),
+            Error::PermissionDenied("admin op required".into()),
+        ];
+        for err in cases {
+            let want = err.to_string();
+            let back = round_trip(err);
+            assert_eq!(
+                back.to_string(),
+                want,
+                "round-trip must preserve Display exactly (no doubled prefix)"
+            );
+        }
     }
 }
