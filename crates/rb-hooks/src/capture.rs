@@ -373,6 +373,16 @@ async fn git_modified_files(cwd: &std::path::Path) -> Vec<String> {
 /// boundary; the once-per-session capture happens at SessionEnd. `stop_hook_active`
 /// is honored defensively — a Stop the hook itself forced must never re-enter
 /// capture — though this flow writes nothing regardless. Always continues.
+///
+/// KNOWN LIMITATION (W3.1 is Phase-3 "Claude Code value"): the non-Claude
+/// adapters map their terminal event to canonical `Stop` (Gemini `SessionEnd`,
+/// Codex `Stop`, OpenCode `session.idle`) and none emit a verified canonical
+/// `SessionEnd`, so those CLIs do NOT get the SessionEnd scratch fold yet — their
+/// PostToolUse scratch ages out unflushed. Folding on canonical `Stop` is unsafe
+/// because Claude's `Stop` is per-turn (it would over-capture), so restoring
+/// non-Claude capture needs each adapter to model its true session-end cadence.
+/// Tracked in `docs/follow-ups/2026-06-13-cross-cli-capture-inversion.md` — an
+/// explicit, non-silent gap, not an oversight.
 pub fn stop(stop_hook_active: bool) -> HookResult {
     if stop_hook_active {
         tracing::debug!("Stop with stop_hook_active=true: no capture (W3.1)");
@@ -380,24 +390,36 @@ pub fn stop(stop_hook_active: bool) -> HookResult {
     continue_only()
 }
 
-/// PreCompact flow (W3.1): read the TRANSCRIPT (not `custom_instructions`, which
-/// is empty on auto-compact and so effectively never fired) and persist ONE
-/// decision snapshot of the decision-marker lines about to be dropped by
-/// compaction. Hook-sourced, so write-time near-dup suppression collapses
-/// repeats across compactions. Always continues; with no transcript or no
-/// decisions, stores nothing.
+/// PreCompact flow (W3.1): persist ONE decision snapshot of the decision-marker
+/// lines about to be dropped by compaction. Decisions are drawn from the
+/// TRANSCRIPT (the Claude auto-compact path, where `custom_instructions` is
+/// empty) AND from `custom_instructions` when a CLI carries decision text there
+/// (a manual `/compact`, or a non-Claude CLI) — neither source alone covers
+/// every CLI, so both are honored. Hook-sourced, so write-time near-dup
+/// suppression collapses repeats across compactions. Always continues; with no
+/// decisions from either source, stores nothing.
 pub async fn pre_compact(
     client: Option<&mut DaemonClient>,
+    custom_instructions: Option<&str>,
     transcript_path: Option<&Path>,
 ) -> HookResult {
-    let Some(path) = transcript_path else {
-        return continue_only();
+    let mut decisions = match transcript_path {
+        Some(path) => transcript::read_digest(path).decisions,
+        None => Vec::new(),
     };
-    let digest = transcript::read_digest(path);
-    if digest.decisions.is_empty() {
+    if let Some(text) = custom_instructions {
+        let text = text.trim();
+        if !text.is_empty()
+            && transcript::has_decision_marker(text)
+            && !decisions.iter().any(|d| d == text)
+        {
+            decisions.push(text.to_string());
+        }
+    }
+    if decisions.is_empty() {
         return continue_only();
     }
-    let content = redact(&format_decision_snapshot(&digest.decisions));
+    let content = redact(&format_decision_snapshot(&decisions));
     if let Some(client) = client {
         let _ = client
             .remember(
@@ -471,7 +493,17 @@ async fn store_session_summary(
     prior_summary_id: Option<&str>,
 ) -> Option<MemoryId> {
     let tags = vec!["hook".to_string(), "session-summary".to_string()];
-    match prior_summary_id.and_then(|s| MemoryId::from_str(s).ok()) {
+    // A non-None id that fails to parse is a (rare) corrupt scratch: log it and
+    // degrade to a plain store. The prior summary may then go un-superseded — the
+    // hook near-dup backstop and the consolidation job remain the safety nets.
+    let prior = prior_summary_id.and_then(|s| {
+        MemoryId::from_str(s)
+            .map_err(|e| {
+                tracing::warn!(stored = %s, error = %e, "scratch prior_summary_id did not parse; storing a fresh summary");
+            })
+            .ok()
+    });
+    match prior {
         Some(old) => {
             client
                 .remember_superseding(
@@ -1050,8 +1082,8 @@ mod tests {
     // ---- PreCompact (transcript decision snapshot) -----------------------
 
     #[tokio::test]
-    async fn pre_compact_without_transcript_is_noop_continue() {
-        let result = pre_compact(None, None).await;
+    async fn pre_compact_without_any_source_is_noop_continue() {
+        let result = pre_compact(None, None, None).await;
         assert!(result.continue_execution);
         assert!(result.system_message.is_none());
     }
@@ -1070,12 +1102,14 @@ mod tests {
             ),
         )
         .unwrap();
-        let result = pre_compact(None, Some(&path)).await;
+        // Neither the transcript nor a non-decision custom_instructions yields a
+        // decision → no-op.
+        let result = pre_compact(None, Some("please continue"), Some(&path)).await;
         assert!(result.continue_execution);
     }
 
     #[tokio::test]
-    async fn pre_compact_with_decisions_continues() {
+    async fn pre_compact_with_transcript_decisions_continues() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("t.jsonl");
         std::fs::write(
@@ -1087,8 +1121,19 @@ mod tests {
         )
         .unwrap();
         // Client None (degraded): still continues; the snapshot just isn't stored.
-        let result = pre_compact(None, Some(&path)).await;
+        let result = pre_compact(None, None, Some(&path)).await;
         assert!(result.continue_execution);
+    }
+
+    #[tokio::test]
+    async fn pre_compact_honors_custom_instructions_with_a_decision_marker() {
+        // A manual /compact (or a non-Claude CLI) can carry the decision in
+        // custom_instructions with no transcript — that path must still capture.
+        let with_marker = pre_compact(None, Some("Decision: keep one writer"), None).await;
+        assert!(with_marker.continue_execution);
+        // Plain custom_instructions without a marker is not a decision.
+        let without_marker = pre_compact(None, Some("wrap it up please"), None).await;
+        assert!(without_marker.continue_execution);
     }
 
     #[test]

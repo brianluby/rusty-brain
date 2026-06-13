@@ -16,7 +16,7 @@
 //! store path uses).
 
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
@@ -56,10 +56,6 @@ pub struct ScratchData {
     /// so a resumed-then-re-ended session keeps ONE live summary, not two.
     #[serde(default)]
     pub prior_summary_id: Option<String>,
-    /// Unix seconds of the last mutation (kept for diagnostics; staleness is
-    /// pruned off the file mtime so even a corrupt scratch is reclaimable).
-    #[serde(default)]
-    pub updated_at: u64,
 }
 
 impl ScratchData {
@@ -124,7 +120,6 @@ impl Scratch {
         if list.len() < cap && !list.iter().any(|e| e == &value) {
             list.push(value);
         }
-        data.updated_at = now_secs();
         self.write(&data);
     }
 
@@ -143,7 +138,6 @@ impl Scratch {
     pub fn mark_folded(&self, summary_id: Option<&str>) {
         let data = ScratchData {
             prior_summary_id: summary_id.map(str::to_string),
-            updated_at: now_secs(),
             ..Default::default()
         };
         self.write(&data);
@@ -225,13 +219,6 @@ fn truncate(value: &str) -> String {
         Some((idx, _)) => value[..idx].to_string(),
         None => value.to_string(),
     }
-}
-
-fn now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
 }
 
 /// Opportunistically delete scratch files untouched for longer than the stale

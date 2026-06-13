@@ -42,8 +42,15 @@ pub async fn dispatch(
             )
             .await
         }
-        HookEvent::PreCompact { .. } => {
-            capture::pre_compact(client.take(), ctx.transcript_path.as_deref()).await
+        HookEvent::PreCompact {
+            custom_instructions,
+        } => {
+            capture::pre_compact(
+                client.take(),
+                custom_instructions.as_deref(),
+                ctx.transcript_path.as_deref(),
+            )
+            .await
         }
         HookEvent::Other(_) => HookResult {
             system_message: None,

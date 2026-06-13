@@ -39,11 +39,14 @@ const REEMBED_DEFAULT_LIMIT: usize = 1000;
 const REEMBED_MAX_LIMIT: usize = 10_000;
 /// W3.1 write-time near-dup suppression: cosine-similarity bound at or above
 /// which a freshly stored hook capture absorbs an EXISTING hook capture (via
-/// supersede). Deliberately near-identical-only so distinct session summaries
-/// are never collapsed at write time — looser clustering is the scheduled
-/// consolidation job's role. Suppression is gated to `origin_source == "hook"`
-/// on BOTH the new write and each candidate, so user/cli/mcp/job memories are
-/// never touched.
+/// supersede). Deliberately high (near-identical only): two captures this
+/// similar say the same thing, so collapsing to the newest is the intended
+/// dedup of redundant automatic captures — INCLUDING two session summaries from
+/// near-identical workflows (desired, not a bug; the newest is kept). Genuinely
+/// distinct summaries differ well below 0.97 under real embeddings and stay
+/// separate; looser clustering is the scheduled consolidation job's role. Gated
+/// to `origin_source == "hook"` on BOTH the new write and each candidate, so
+/// user/cli/mcp/job memories are never touched.
 const HOOK_NEAR_DUP_THRESHOLD: f32 = 0.97;
 /// Max existing hook near-dups absorbed per write (bounds the extra reads).
 const HOOK_NEAR_DUP_LIMIT: usize = 8;
