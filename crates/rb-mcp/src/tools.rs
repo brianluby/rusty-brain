@@ -33,7 +33,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "remember",
-            description: "Store a new memory in the shared store. Returns the new memory id.",
+            description: "Store a durable memory in the shared store. Use when the user \
+                          states a decision, preference, constraint, or correction worth \
+                          recalling in a future session (e.g. \"we use X because Y\", \
+                          \"always do Z\", \"never touch W\") — capture the decision and its \
+                          rationale, not transient chatter. Returns the new memory id.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -51,7 +55,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "recall",
-            description: "Hybrid (keyword + vector + graph) recall of memories matching a query.",
+            description: "Hybrid (keyword + vector + graph) recall of stored memories. Use \
+                          BEFORE starting a task, or whenever the user references a past \
+                          decision, prior work, or \"how we do X here\", to retrieve relevant \
+                          prior context. Returns ranked memories.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -68,7 +75,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get",
-            description: "Fetch a single memory (full content + links) by id.",
+            description: "Fetch one memory's full content + links by id. Use to expand a \
+                          memory surfaced by recall/list when you need its complete text or \
+                          its linked memories.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -79,7 +88,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list",
-            description: "List memories in the current namespace.",
+            description: "List memories in the current namespace (optionally filtered by \
+                          importance). Use to browse what is stored when you have no specific \
+                          query; prefer recall when you do.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -159,7 +170,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "context",
-            description: "Project context payload: recent + important memories and a total count.",
+            description: "Project memory digest: recent + important memories and a total \
+                          count for the current namespace. Use at the start of work to load \
+                          standing context before the user's first specific request.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -238,6 +251,30 @@ mod tests {
             .collect();
         assert!(kinds.contains(&"contradicts"));
         assert!(!kinds.contains(&"supersedes"));
+    }
+
+    #[test]
+    fn remember_and_recall_carry_trigger_conditions() {
+        // W3.2(c): descriptions are phrased as trigger conditions ("Use when…" /
+        // "Use BEFORE…") so the model elicits memory without rediscovering it.
+        let tools = tool_definitions();
+        let desc = |name: &str| {
+            tools
+                .iter()
+                .find(|t| t.name == name)
+                .unwrap_or_else(|| panic!("missing tool {name}"))
+                .description
+        };
+        assert!(
+            desc("remember").contains("Use when the user"),
+            "remember names a capture trigger: {}",
+            desc("remember")
+        );
+        assert!(
+            desc("recall").contains("Use BEFORE"),
+            "recall names a retrieve-before-work trigger: {}",
+            desc("recall")
+        );
     }
 
     #[test]

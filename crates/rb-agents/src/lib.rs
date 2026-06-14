@@ -23,9 +23,11 @@ pub use claude_code::ClaudeCodeCli;
 pub use cli::{agent_for, AgentCli, AgentId};
 pub use codex::CodexCli;
 pub use daemon::{AutoStart, DaemonClient};
-pub use event::{HookContext, HookEvent, HookResult};
+pub use event::{HookContext, HookEvent, HookResult, InjectionEvent};
 pub use gemini::GeminiCli;
-pub use install::{AgentInstaller, HookFragment, InstallScope, SENTINEL};
+pub use install::{
+    AgentInstaller, HookFragment, InstallScope, ManagedFile, ManagedTextBlock, SENTINEL,
+};
 pub use namespace::detect_namespace;
 pub use opencode::OpenCodeCli;
 pub use proc::run_git_bounded;

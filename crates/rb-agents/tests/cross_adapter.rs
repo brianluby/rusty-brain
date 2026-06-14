@@ -85,6 +85,7 @@ fn render_output_continue_is_true_for_all_four() {
         let out = cli.render_output(&HookResult {
             system_message: None,
             continue_execution: true,
+            ..HookResult::default()
         });
         assert_eq!(
             out["continue"],

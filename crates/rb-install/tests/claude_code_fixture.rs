@@ -19,8 +19,9 @@ use rb_install::uninstall::uninstall_file;
 use rb_install::writer::merge_into_file;
 
 /// The Claude Code events the installer writes (mirrors `CLAUDE_EVENTS`).
-const OUR_EVENTS: [&str; 5] = [
+const OUR_EVENTS: [&str; 6] = [
     "SessionStart",
+    "UserPromptSubmit",
     "PostToolUse",
     "Stop",
     "SessionEnd",

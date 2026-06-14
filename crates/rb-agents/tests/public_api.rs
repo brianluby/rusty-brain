@@ -24,6 +24,7 @@ fn event_model_types_are_reexported() {
     let result = HookResult {
         system_message: Some("x".to_string()),
         continue_execution: true,
+        ..HookResult::default()
     };
     assert!(result.continue_execution);
 }
@@ -78,11 +79,15 @@ fn install_contract_is_reexported() {
     assert_eq!(SENTINEL, "rusty-brain");
     let scope = InstallScope::Project(PathBuf::from("/proj"));
     assert_eq!(scope, InstallScope::Project(PathBuf::from("/proj")));
-    let fragment = HookFragment {
-        config_path: PathBuf::from("/proj/.claude/settings.json"),
-        merge: serde_json::json!({ SENTINEL: {} }),
-    };
+    let fragment = HookFragment::new(
+        PathBuf::from("/proj/.claude/settings.json"),
+        serde_json::json!({ SENTINEL: {} }),
+    );
     assert_eq!(fragment.merge[SENTINEL], serde_json::json!({}));
+    // The W3.2 managed side-effects default to empty for a hooks-only fragment.
+    assert!(fragment.allow_entries.is_empty());
+    assert!(fragment.managed_files.is_empty());
+    assert!(fragment.text_blocks.is_empty());
     // AgentInstaller is referenced as a trait bound to lock its name.
     fn _accepts_installer<T: AgentInstaller>(_t: &T) {}
 }

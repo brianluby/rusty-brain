@@ -3,12 +3,43 @@
 use std::path::PathBuf;
 
 use rb_agents::cli::AgentId;
-use rb_agents::install::{AgentInstaller, InstallScope};
+use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 
 use crate::installers::builtins;
 use crate::report::{AgentReport, AgentStatus, InstallError, InstallReport};
 use crate::uninstall::uninstall_file;
-use crate::writer::{merge_into_file, read_config};
+use crate::writer::{
+    ensure_allow_entries, ensure_text_block, merge_into_file, read_config, remove_allow_entries,
+    remove_managed_file, remove_text_block, write_managed_file,
+};
+
+/// Apply a fragment's W3.2 managed side-effects AFTER its hooks merge: union the
+/// `permissions.allow` entries (W3.2(c)) and write the managed files +
+/// marker-delimited text blocks (W3.2(b)). Each is idempotent on re-install.
+fn apply_managed_side_effects(frag: &HookFragment) -> rb_types::Result<()> {
+    ensure_allow_entries(&frag.config_path, &frag.allow_entries)?;
+    for file in &frag.managed_files {
+        write_managed_file(file)?;
+    }
+    for block in &frag.text_blocks {
+        ensure_text_block(block)?;
+    }
+    Ok(())
+}
+
+/// Reverse a fragment's managed side-effects on uninstall: remove our
+/// `permissions.allow` entries, delete the managed files, and strip the
+/// marker-delimited text blocks — the inverse of [`apply_managed_side_effects`].
+fn reverse_managed_side_effects(frag: &HookFragment) -> rb_types::Result<()> {
+    remove_allow_entries(&frag.config_path, &frag.allow_entries)?;
+    for file in &frag.managed_files {
+        remove_managed_file(&file.path)?;
+    }
+    for block in &frag.text_blocks {
+        remove_text_block(&block.path, &block.marker_id)?;
+    }
+    Ok(())
+}
 
 /// Resolve the hooks binary path: sibling of the running installer named
 /// `rusty-brain-hooks`, falling back to the bare name for `PATH` resolution.
@@ -107,8 +138,20 @@ pub fn run_install(
                         .ok()
                         .map(|v| contains_sentinel(&v))
                         .unwrap_or(false);
-                    match merge_into_file(&frag.config_path, &frag.merge) {
-                        Ok(_) => AgentReport {
+                    // Merge the sentinel hooks block, then apply the W3.2 managed
+                    // side-effects (permissions.allow + skill file + CLAUDE.md block).
+                    let outcome = merge_into_file(&frag.config_path, &frag.merge)
+                        .and_then(|_| apply_managed_side_effects(&frag));
+                    if outcome.is_err() {
+                        // Best-effort rollback so a partial install never leaves a
+                        // half-configured tree: reverse our side-effects and strip the
+                        // sentinel hooks block. Errors here are ignored — `outcome`
+                        // already carries the original failure reported below.
+                        let _ = reverse_managed_side_effects(&frag);
+                        let _ = uninstall_file(&frag.config_path);
+                    }
+                    match outcome {
+                        Ok(()) => AgentReport {
                             agent: id,
                             status: if had_sentinel {
                                 AgentStatus::Upgraded
@@ -152,8 +195,8 @@ pub fn run_uninstall(
     let mut agents = Vec::new();
     for inst in installers {
         let id = inst.id().as_str().to_string();
-        let config_path = match inst.hook_fragment(hooks_bin, scope) {
-            Ok(frag) => frag.config_path,
+        let frag = match inst.hook_fragment(hooks_bin, scope) {
+            Ok(frag) => frag,
             Err(e) => {
                 agents.push(AgentReport {
                     agent: id,
@@ -165,6 +208,7 @@ pub fn run_uninstall(
                 continue;
             }
         };
+        let config_path = frag.config_path.clone();
         if dry_run {
             agents.push(AgentReport {
                 agent: id,
@@ -175,7 +219,14 @@ pub fn run_uninstall(
             });
             continue;
         }
-        let report = match uninstall_file(&config_path) {
+        // Strip the sentinel hooks block AND reverse the W3.2 managed side-effects
+        // (permissions.allow entries, skill file, CLAUDE.md block). Run BOTH
+        // best-effort — the side-effects are independent of the JSON cleanup, so a
+        // broken settings.json must not strip the skill/block removal — then report
+        // the first error.
+        let uninstall_result = uninstall_file(&config_path);
+        let reverse_result = reverse_managed_side_effects(&frag);
+        let report = match uninstall_result.and(reverse_result) {
             Ok(()) => AgentReport {
                 agent: id,
                 status: AgentStatus::Removed,
@@ -324,10 +375,10 @@ mod tests {
                 InstallScope::Project(p) => p.clone(),
                 InstallScope::Global => std::path::PathBuf::from("/tmp"),
             };
-            Ok(rb_agents::install::HookFragment {
-                config_path: base.join(".claude").join("settings.json"),
-                merge: serde_json::json!({ "hooks": {} }),
-            })
+            Ok(rb_agents::install::HookFragment::new(
+                base.join(".claude").join("settings.json"),
+                serde_json::json!({ "hooks": {} }),
+            ))
         }
     }
 
@@ -429,5 +480,59 @@ mod tests {
         assert!(!contains_sentinel(&after), "sentinel gone after uninstall");
         assert_eq!(installed.status, installed.status); // report builds
         let _ = ReportStatus::Success;
+    }
+
+    #[test]
+    fn apply_then_reverse_managed_side_effects_round_trips() {
+        // The mechanism behind both normal uninstall and the partial-install
+        // rollback: apply (permissions + skill + CLAUDE.md block) then reverse
+        // restores the tree. Uses a CLAUDE.md WITHOUT a trailing newline to pin
+        // the byte-for-byte text-block round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"permissions":{"allow":["Bash(ls)"]}}"#).unwrap();
+        let claude_md = dir.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "# notes").unwrap();
+        let skill = dir.path().join("skills").join("rb-mem").join("SKILL.md");
+
+        let frag = HookFragment::new(settings.clone(), serde_json::json!({}))
+            .with_allow_entries(vec!["mcp__rusty-brain__*".to_string()])
+            .with_text_blocks(vec![rb_agents::install::ManagedTextBlock {
+                path: claude_md.clone(),
+                marker_id: "memory-policy".to_string(),
+                body: "policy".to_string(),
+            }])
+            .with_managed_files(vec![rb_agents::install::ManagedFile {
+                path: skill.clone(),
+                contents: "# skill".to_string(),
+            }]);
+
+        apply_managed_side_effects(&frag).unwrap();
+        assert!(skill.exists());
+        assert!(std::fs::read_to_string(&claude_md)
+            .unwrap()
+            .contains("BEGIN rusty-brain:memory-policy"));
+        let applied: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            applied["permissions"]["allow"],
+            serde_json::json!(["Bash(ls)", "mcp__rusty-brain__*"])
+        );
+
+        reverse_managed_side_effects(&frag).unwrap();
+        assert!(!skill.exists(), "skill removed");
+        assert!(!skill.parent().unwrap().exists(), "empty skill dir pruned");
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "# notes",
+            "CLAUDE.md restored byte-for-byte (no trailing newline added)"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            after["permissions"]["allow"],
+            serde_json::json!(["Bash(ls)"]),
+            "our allow entry removed, the user's kept"
+        );
     }
 }

@@ -39,7 +39,7 @@ impl AgentInstaller for GeminiInstaller {
             &GEMINI_EVENTS,
             "AfterTool",
         );
-        Ok(HookFragment { config_path, merge })
+        Ok(HookFragment::new(config_path, merge))
     }
 }
 

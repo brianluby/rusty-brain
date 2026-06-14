@@ -257,6 +257,38 @@ async fn install_capture_uninstall_round_trip() {
         has_sentinel_block(&after_install),
         "settings.json must contain the rusty-brain sentinel hook block after install; got: {after_install}"
     );
+    // W3.2(c): the MCP permission allowlist entry is written so headless
+    // model-initiated remember/recall never stall on an approval prompt (S1).
+    let allow_has_mcp = |s: &serde_json::Value| {
+        s.get("permissions")
+            .and_then(|p| p.get("allow"))
+            .and_then(|a| a.as_array())
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|e| e.as_str() == Some("mcp__rusty-brain__remember"))
+            })
+    };
+    assert!(
+        allow_has_mcp(&after_install),
+        "settings.json must allowlist the rusty-brain MCP tools after install; got: {after_install}"
+    );
+    // W3.2(b): the memory-policy block + skill are written on install.
+    let claude_md = project.join("CLAUDE.md");
+    let skill = project
+        .join(".claude")
+        .join("skills")
+        .join("rusty-brain-memory")
+        .join("SKILL.md");
+    assert!(
+        std::fs::read_to_string(&claude_md)
+            .unwrap_or_default()
+            .contains("BEGIN rusty-brain:memory-policy"),
+        "CLAUDE.md must carry the memory-policy block after install"
+    );
+    assert!(
+        skill.exists(),
+        "the memory skill must be written after install"
+    );
 
     // --- 2) fire a PostToolUse Edit, then SessionEnd, through the hooks binary -
     // W3.1 capture inversion: PostToolUse appends the touched file to the
@@ -335,6 +367,42 @@ async fn install_capture_uninstall_round_trip() {
         "the SessionEnd summary must fold the PostToolUse file edit and be recallable"
     );
 
+    // --- 2.5) W3.2(a): a UserPromptSubmit deterministically recalls + injects -
+    // Fire a UserPromptSubmit whose prompt matches the stored summary through the
+    // REAL binary against the daemon, and prove the hook injects the relevant
+    // memory as `hookSpecificOutput.additionalContext` tagged "UserPromptSubmit"
+    // — recall reaching the model WITHOUT it electing to call a tool.
+    let user_prompt = serde_json::json!({
+        "session_id": session_id,
+        "transcript_path": "/dev/null",
+        "cwd": project.to_string_lossy(),
+        "permission_mode": "default",
+        "hook_event_name": "UserPromptSubmit",
+        "prompt": "session summary files touched zztest"
+    })
+    .to_string();
+    let prompt_out = fire_hook(
+        &hooks_bin,
+        &daemon,
+        "rb-e2e-fixture",
+        &project,
+        &user_prompt,
+    );
+    let prompt_stdout = String::from_utf8_lossy(&prompt_out.stdout);
+    let envelope: serde_json::Value =
+        serde_json::from_str(&prompt_stdout).expect("UserPromptSubmit hook stdout is JSON");
+    assert_eq!(
+        envelope["hookSpecificOutput"]["hookEventName"], "UserPromptSubmit",
+        "W3.2(a): the injection must be tagged with the firing event; got {prompt_stdout}"
+    );
+    let injected = envelope["hookSpecificOutput"]["additionalContext"]
+        .as_str()
+        .unwrap_or_default();
+    assert!(
+        injected.contains("zztest.rs"),
+        "W3.2(a): the prompt-relevant memory must be injected as additionalContext; got {injected}"
+    );
+
     // --- 3) uninstall removes ONLY the sentinel block ------------------------
     let mut uninstall_cmd = Command::new(&install_bin);
     uninstall_cmd
@@ -356,6 +424,22 @@ async fn install_capture_uninstall_round_trip() {
     assert!(
         !has_sentinel_block(&after_uninstall),
         "the rusty-brain sentinel hook block must be gone after uninstall; got: {after_uninstall}"
+    );
+    // W3.2(c): uninstall also removes our MCP permission allowlist entry.
+    assert!(
+        !allow_has_mcp(&after_uninstall),
+        "the MCP permission allowlist entry must be gone after uninstall; got: {after_uninstall}"
+    );
+    // W3.2(b): the policy block is stripped and the skill file removed.
+    assert!(
+        !std::fs::read_to_string(&claude_md)
+            .unwrap_or_default()
+            .contains("rusty-brain:memory-policy"),
+        "the CLAUDE.md policy block must be gone after uninstall"
+    );
+    assert!(
+        !skill.exists(),
+        "the memory skill must be removed after uninstall"
     );
 
     daemon.stop().await;

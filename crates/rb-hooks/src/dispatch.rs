@@ -52,10 +52,12 @@ pub async fn dispatch(
             )
             .await
         }
-        HookEvent::Other(_) => HookResult {
-            system_message: None,
-            continue_execution: true,
-        },
+        // W3.2(a): recall memories relevant to the user's prompt and inject them
+        // as additionalContext (read-only; deterministic — no model election).
+        HookEvent::UserPromptSubmit { prompt } => {
+            capture::user_prompt_submit(client.take(), prompt.as_deref()).await
+        }
+        HookEvent::Other(_) => HookResult::default(),
     }
 }
 

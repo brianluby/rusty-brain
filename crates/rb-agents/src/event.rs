@@ -37,8 +37,41 @@ pub enum HookEvent {
     SessionEnd { reason: Option<String> },
     /// The context is about to be compacted. Carries any custom instructions.
     PreCompact { custom_instructions: Option<String> },
+    /// The user submitted a prompt. W3.2(a)'s deterministic-recall point: the
+    /// runtime recalls memories relevant to `prompt` and injects them via
+    /// `additionalContext` so recall no longer depends on the model electing to
+    /// call a tool. `prompt` is the raw user text (Claude Code `prompt` field);
+    /// CLIs without an equivalent event never produce this variant.
+    UserPromptSubmit { prompt: Option<String> },
     /// An event we do not model (or could not parse). Carries the raw event name.
     Other(String),
+}
+
+/// Which Claude Code hook event an injected [`HookResult::system_message`]
+/// belongs to. Only `SessionStart` and `UserPromptSubmit` feed
+/// `additionalContext` back to the model, and Claude Code requires
+/// `hookSpecificOutput.hookEventName` to name the firing event — so the capture
+/// flow that produced the injection declares which one here, and the Claude Code
+/// adapter stamps it. The other adapters ignore it (they render `system_message`
+/// their own way). Defaults to `SessionStart` (the original injection point).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum InjectionEvent {
+    /// Injected at session start (the W1.3/W2.5 digest).
+    #[default]
+    SessionStart,
+    /// Injected on a user prompt (the W3.2(a) deterministic recall).
+    UserPromptSubmit,
+}
+
+impl InjectionEvent {
+    /// The Claude Code `hookSpecificOutput.hookEventName` value for this channel.
+    #[must_use]
+    pub fn hook_event_name(self) -> &'static str {
+        match self {
+            InjectionEvent::SessionStart => "SessionStart",
+            InjectionEvent::UserPromptSubmit => "UserPromptSubmit",
+        }
+    }
 }
 
 /// The result of handling a hook event. In P4 `continue_execution` is ALWAYS
@@ -49,16 +82,23 @@ pub struct HookResult {
     pub system_message: Option<String>,
     /// Always `true` in P4. Kept explicit so renderers emit it verbatim.
     pub continue_execution: bool,
+    /// When `system_message` is injected back to the model, which hook event it
+    /// belongs to — drives `hookSpecificOutput.hookEventName` in the Claude Code
+    /// adapter. Irrelevant when `system_message` is `None`; defaults to
+    /// `SessionStart`. Ignored by the non-Claude adapters.
+    pub injection_event: InjectionEvent,
 }
 
 /// Fail-open default: a defaulted `HookResult` must NEVER block the CLI, so
 /// `continue_execution` defaults to `true` (the derived `Default` would have made
-/// it `false`, contradicting the P4 fail-open contract).
+/// it `false`, contradicting the P4 fail-open contract). `injection_event` is
+/// irrelevant while `system_message` is `None`.
 impl Default for HookResult {
     fn default() -> Self {
         Self {
             system_message: None,
             continue_execution: true,
+            injection_event: InjectionEvent::SessionStart,
         }
     }
 }

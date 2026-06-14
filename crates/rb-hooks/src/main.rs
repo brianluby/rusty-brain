@@ -199,23 +199,21 @@ async fn capture_phase(
 }
 
 /// True for events that read or write the store (and so need a daemon
-/// connection): SessionStart (inject), SessionEnd (fold + store), PreCompact
-/// (store). Local-only events — PostToolUse (scratch append), Stop (no-op),
-/// Other — skip the connect.
+/// connection): SessionStart (inject), UserPromptSubmit (recall + inject),
+/// SessionEnd (fold + store), PreCompact (store). Local-only events —
+/// PostToolUse (scratch append), Stop (no-op), Other — skip the connect.
 fn event_needs_daemon(event: &HookEvent) -> bool {
     matches!(
         event,
         HookEvent::SessionStart { .. }
+            | HookEvent::UserPromptSubmit { .. }
             | HookEvent::SessionEnd { .. }
             | HookEvent::PreCompact { .. }
     )
 }
 
 fn continue_result() -> HookResult {
-    HookResult {
-        system_message: None,
-        continue_execution: true,
-    }
+    HookResult::default()
 }
 
 /// Resolve the daemon socket path: `RUSTY_BRAIN_SOCKET` override, else the

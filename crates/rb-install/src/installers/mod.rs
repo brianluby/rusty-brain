@@ -33,9 +33,11 @@ pub fn builtins() -> Vec<Box<dyn AgentInstaller>> {
 }
 
 /// Claude Code's hook event names. The tool event is `PostToolUse`; `SessionEnd`
-/// is the W3.1 capture point (folds the per-session scratch into one summary).
-pub(crate) const CLAUDE_EVENTS: [&str; 5] = [
+/// is the W3.1 capture point (folds the per-session scratch into one summary);
+/// `UserPromptSubmit` is the W3.2(a) deterministic-recall injection point.
+pub(crate) const CLAUDE_EVENTS: [&str; 6] = [
     "SessionStart",
+    "UserPromptSubmit",
     "PostToolUse",
     "Stop",
     "SessionEnd",

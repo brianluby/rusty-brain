@@ -1,0 +1,94 @@
+{
+  "_about": "W3.2 elicitation scorecard scenarios. Each scenario is TWO scripted headless sessions in a fresh namespace: (1) a `plant` prompt where the user states a decision/preference/constraint WITHOUT mentioning memory, and (2) a later `work` prompt, in a fresh-context session of the same namespace, performing a task where that decision matters. The scorecard (scripts/w32-elicitation-scorecard.sh) measures, per scenario, `remember_fired` (the plant session made a model-initiated mcp__rusty-brain__remember call — the channel-b/c elicitation worked) and `recall_before_work` (the work session received recalled context before its first substantive action — the channel-a deterministic UserPromptSubmit injection and/or a model-initiated recall). Pass thresholds: remember_fired in >=70% of scenarios, recall_before_work in >=50%. See docs/eval/2026-06-13-w32-elicitation-scorecard.md.",
+  "pass_thresholds": { "remember_fired_rate": 0.70, "recall_before_work_rate": 0.50 },
+  "scenarios": [
+    {
+      "id": "arch-db-wal",
+      "topic": "database journal mode",
+      "plant": "For this project we've decided the SQLite daemon always runs in WAL journal mode — it's required for our concurrent-reader-while-writing pattern. Don't use the default rollback journal.",
+      "work": "Add a new SQLite connection helper for a background reporting reader. What journal/pragma settings should it use?",
+      "recall_query": "sqlite journal mode WAL",
+      "expect_token": "WAL"
+    },
+    {
+      "id": "constraint-no-unwrap",
+      "topic": "error-handling constraint",
+      "plant": "House rule for this codebase: never use .unwrap() or .expect() in library code — clippy is configured to deny them. Propagate errors with ? and our Result alias instead.",
+      "work": "Write a function that parses a port number from an environment variable and returns it.",
+      "recall_query": "unwrap expect clippy denied error handling",
+      "expect_token": "?"
+    },
+    {
+      "id": "pref-test-naming",
+      "topic": "test naming convention",
+      "plant": "We name tests as full sentences describing the behavior, e.g. `fn recall_returns_empty_on_no_match()`, not `test_recall_1`. Please follow that.",
+      "work": "Add a test for a function that validates an email address has an @ sign.",
+      "recall_query": "test naming convention sentence",
+      "expect_token": "_"
+    },
+    {
+      "id": "config-port-env",
+      "topic": "configuration source",
+      "plant": "Decision: all runtime configuration comes from a config.toml file, never from scattered environment variables. New knobs go in config.toml.",
+      "work": "We need a new 'max_connections' setting. Where should it be defined?",
+      "recall_query": "configuration config.toml not environment variables",
+      "expect_token": "config.toml"
+    },
+    {
+      "id": "arch-single-writer",
+      "topic": "concurrency architecture",
+      "plant": "Architecture decision: the store has a single-writer thread. All writes go through the daemon's writer; no other code path may open the DB for writing.",
+      "work": "I want to add a maintenance task that prunes old rows. How should it perform its deletes?",
+      "recall_query": "single writer thread daemon writes",
+      "expect_token": "writer"
+    },
+    {
+      "id": "constraint-redact-before-disk",
+      "topic": "security constraint",
+      "plant": "Hard security rule: every piece of external text must be redacted before it touches disk or the store. Secrets must never land in plaintext.",
+      "work": "Add capture of a shell command's output into our log store. Anything to watch for?",
+      "recall_query": "redact external text before disk secrets",
+      "expect_token": "redact"
+    },
+    {
+      "id": "pref-http-client",
+      "topic": "dependency preference",
+      "plant": "We standardized on `reqwest` for HTTP in this repo. Don't introduce other HTTP clients like hyper directly or ureq.",
+      "work": "Add a small client that GETs a JSON health endpoint and parses the status field.",
+      "recall_query": "http client reqwest standardized",
+      "expect_token": "reqwest"
+    },
+    {
+      "id": "arch-additive-wire-fields",
+      "topic": "protocol evolution rule",
+      "plant": "Protocol rule: new wire fields must be additive with serde(default, skip_serializing_if) and must NOT bump CONTRACT_VERSION. Breaking changes are forbidden without a version policy.",
+      "work": "I want to add an optional 'trace_id' field to the Request type. How should I declare it?",
+      "recall_query": "additive wire field serde default skip_serializing_if contract version",
+      "expect_token": "default"
+    },
+    {
+      "id": "constraint-namespace-not-auth",
+      "topic": "security boundary clarification",
+      "plant": "Important: the namespace is set at handshake and is NOT an authorization boundary. Never rely on it to gate access to memories.",
+      "work": "Can we use the namespace string to enforce that user A can't read user B's memories?",
+      "recall_query": "namespace not authorization boundary handshake",
+      "expect_token": "not"
+    },
+    {
+      "id": "pref-commit-style",
+      "topic": "commit message convention",
+      "plant": "Our commit messages use conventional-commit prefixes scoped by workstream, like `feat(p3): ...` and `fix(rb-proto): ...`. Please match that style.",
+      "work": "Draft a commit message for a change that fixes a panic in the redaction module.",
+      "recall_query": "commit message conventional prefix workstream",
+      "expect_token": "fix("
+    },
+    {
+      "id": "constraint-hook-fail-open",
+      "topic": "reliability constraint",
+      "plant": "Critical invariant: the hook binary is strictly fail-open. It must never panic, block, or exit non-zero — degrade silently instead.",
+      "work": "Add a new step to the hook that reads a config file. What's the failure behavior?",
+      "recall_query": "hook fail-open never panic block non-zero",
+      "expect_token": "fail-open"
+    }
+  ]
+}

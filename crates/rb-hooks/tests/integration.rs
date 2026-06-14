@@ -535,13 +535,17 @@ fn real_stop_fixture_parses_exactly() {
 }
 
 #[test]
-fn real_user_prompt_submit_fixture_parses_as_other() {
-    // Unmodeled today BY DESIGN: W3.2 (deterministic recall) consumes the
-    // `prompt` field; until then the canonical event is Other with the raw
-    // name preserved. The common context still parses.
+fn real_user_prompt_submit_fixture_parses_as_user_prompt_submit() {
+    // W3.2(a) landed: the adapter models UserPromptSubmit and parses the
+    // recorded payload's `prompt` field — the deterministic-recall query.
     let ctx = parse_fixture(REAL_USER_PROMPT_SUBMIT);
     assert_common_context(&ctx);
-    assert_eq!(ctx.event, HookEvent::Other("UserPromptSubmit".to_string()));
+    assert_eq!(
+        ctx.event,
+        HookEvent::UserPromptSubmit {
+            prompt: Some("Create a file named hello.txt containing exactly: hi".to_string())
+        }
+    );
 }
 
 #[test]

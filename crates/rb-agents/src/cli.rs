@@ -160,6 +160,7 @@ mod tests {
         let out = cli.render_output(&crate::event::HookResult {
             system_message: None,
             continue_execution: true,
+            ..crate::event::HookResult::default()
         });
         assert_eq!(out["continue"], serde_json::json!(true));
     }
@@ -179,6 +180,7 @@ mod tests {
         let out = cli.render_output(&crate::event::HookResult {
             system_message: Some("m".to_string()),
             continue_execution: true,
+            ..crate::event::HookResult::default()
         });
         // Gemini injects context via hookSpecificOutput.additionalContext, not the
         // user-facing systemMessage key.
@@ -203,6 +205,7 @@ mod tests {
         let out = cli.render_output(&crate::event::HookResult {
             system_message: None,
             continue_execution: true,
+            ..crate::event::HookResult::default()
         });
         assert_eq!(out["continue"], serde_json::json!(true));
     }

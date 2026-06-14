@@ -13,7 +13,7 @@ use std::time::Duration;
 // knobs need no forwarding — the spawned daemon re-reads config.toml itself.
 use rb_config::{spawn_forward_env, DB_ENV, SOCKET_ENV};
 use rb_proto::{Client, ClientIdentity};
-use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
+use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace, SearchResult};
 
 /// Auto-start parameters. Provided ONLY for `SessionStart`; any other event
 /// passes `None` so non-session hooks never spawn a daemon.
@@ -127,6 +127,19 @@ impl DaemonClient {
     pub async fn context(&mut self) -> Option<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         match tokio::time::timeout(self.timeout, self.client.context()).await {
             Ok(Ok(triple)) => Some(triple),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Best-effort hybrid recall on `query` (W3.2(a): the user's prompt). Returns
+    /// up to `limit` ranked results, or `None` on any error/timeout. Drops the
+    /// W1.6d degraded flag like [`Self::context`] — the hook surface degrades
+    /// silently and never blocks the CLI. Issues NO writer ops (W1.8: recall is
+    /// read-only), so a UserPromptSubmit on every turn stays cheap.
+    pub async fn recall(&mut self, query: String, limit: usize) -> Option<Vec<SearchResult>> {
+        let fut = self.client.recall(query, None, Vec::new(), limit);
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok(results)) => Some(results),
             Ok(Err(_)) | Err(_) => None,
         }
     }

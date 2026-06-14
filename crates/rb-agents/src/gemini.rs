@@ -232,6 +232,7 @@ mod tests {
         let with_msg = HookResult {
             system_message: Some("ctx".to_string()),
             continue_execution: true,
+            ..HookResult::default()
         };
         let v = GeminiCli.render_output(&with_msg);
         assert_eq!(v["continue"], json!(true));
@@ -245,6 +246,7 @@ mod tests {
         let without = HookResult {
             system_message: None,
             continue_execution: true,
+            ..HookResult::default()
         };
         let v = GeminiCli.render_output(&without);
         assert_eq!(v["continue"], json!(true));
