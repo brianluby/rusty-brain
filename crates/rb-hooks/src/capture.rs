@@ -95,12 +95,6 @@ fn is_preferred(m: &rb_types::MemoryNote) -> bool {
     ) && m.importance >= 8
 }
 
-/// Drop later duplicates by id, preserving first-seen order.
-fn dedup_by_id(items: &mut Vec<&rb_types::MemoryNote>) {
-    let mut seen = std::collections::HashSet::new();
-    items.retain(|m| seen.insert(m.id.clone()));
-}
-
 /// A `HookResult` that injects no message and always continues.
 fn continue_only() -> HookResult {
     HookResult::default()
@@ -235,18 +229,6 @@ pub async fn post_tool_use(
     continue_only()
 }
 
-/// Pure: format recent + important memories into a markdown system message,
-/// budgeted to ≤[`SESSION_START_MAX_ITEMS`] items and
-/// ≤`rb_tokens::INJECTION_BUDGET` tokens (W3.3), preferring standing
-/// constraints + architecture decisions (see [`is_preferred`]).
-///
-/// `mode` (from the CLI `source`): `Full` renders the Critical (`importance ≥ 8`)
-/// / Important (`== 7`) / Recent sections; `ConstraintsOnly` (after a compact)
-/// renders only `constraint` memories and returns `None` when there are none.
-///
-/// W1.3 empty-corpus rule: a fully empty corpus returns `None` (inject nothing).
-/// A non-zero total with no listable items still gets the header + the recall
-/// pointer (the count + pointer are informative).
 fn format_session_start(
     recent: &[rb_types::MemoryNote],
     important: &[rb_types::MemoryNote],
@@ -257,15 +239,16 @@ fn format_session_start(
         return None;
     }
 
-    // Build the sectioned candidate lists for this mode.
+    // Build the sectioned candidate lists for this mode. Cross-section duplicates
+    // (the daemon's `important` ⊆ `recent` by recency) are dropped at RENDER time
+    // by the `seen` set below, so each memory is listed once.
     let sections: Vec<(&str, Vec<&rb_types::MemoryNote>)> = match mode {
         InjectionMode::ConstraintsOnly => {
-            let mut constraints: Vec<&rb_types::MemoryNote> = important
+            let constraints: Vec<&rb_types::MemoryNote> = important
                 .iter()
                 .chain(recent.iter())
                 .filter(|m| m.memory_type == rb_types::MemoryType::Constraint)
                 .collect();
-            dedup_by_id(&mut constraints);
             // Nothing standing to re-establish after a compact → inject nothing.
             if constraints.is_empty() {
                 return None;
@@ -299,13 +282,18 @@ fn format_session_start(
 
     // Render items under the budget: stop at SESSION_START_MAX_ITEMS or once
     // adding the next line (plus the trailing pointer) would exceed the token
-    // budget. The first item is always allowed (each line is char-bounded, so it
-    // cannot alone exceed the budget); the pointer is included in the probe so
-    // the FINAL string is ≤ budget.
+    // budget. The first item is admitted unconditionally so a non-empty corpus
+    // always shows at least one memory; the trailing hard-truncate guard below
+    // then guarantees the FINAL string is ≤ budget even for a single pathological
+    // (dense CJK/emoji) line that a 200-CHAR bound cannot keep under a TOKEN cap.
     let mut shown = 0usize;
+    let mut seen = std::collections::HashSet::new();
     'sections: for (header, items) in &sections {
         let mut header_written = false;
         for m in items {
+            if !seen.insert(m.id.clone()) {
+                continue; // already listed in an earlier section
+            }
             if shown >= SESSION_START_MAX_ITEMS {
                 break 'sections;
             }
@@ -329,16 +317,23 @@ fn format_session_start(
     }
 
     out.push_str(SESSION_START_RECALL_POINTER);
+    // Hard guard: the unconditional first item could (pathologically) exceed the
+    // budget, so clamp the assembled digest to the token budget as a last resort.
+    // A no-op for normal content (the loop already kept it under).
+    if rb_tokens::count_tokens(&out) > rb_tokens::INJECTION_BUDGET {
+        out = rb_tokens::truncate_to_tokens(&out, rb_tokens::INJECTION_BUDGET).to_string();
+    }
     Some(out)
 }
 
 /// One-line rendering of a memory: prefer its summary, else its content,
 /// bounded to `max_chars` of displayed text. The text is quoted and labeled
 /// with its provenance (W2.5: who/what wrote it, when known) so the model reads
-/// it as sourced data, not as a directive. The SessionStart digest passes
-/// `usize::MAX` to preserve the full summary; the per-turn UserPromptSubmit
-/// recall passes a tight bound (W3.3 parity: summary-or-first-N-chars) so the
-/// injection stays cheap on every prompt.
+/// it as sourced data, not as a directive. Both injection channels pass
+/// `RECALL_LINE_CHARS` (W3.3: summary-or-first-N-chars) so each line stays cheap;
+/// a CHAR bound is not a TOKEN bound, so the SessionStart digest additionally
+/// hard-truncates the assembled output to the token budget (the per-turn recall
+/// caps item count instead).
 fn memory_line(memory: &rb_types::MemoryNote, max_chars: usize) -> String {
     let text = if memory.summary.trim().is_empty() {
         memory.content.as_str()
@@ -375,7 +370,10 @@ fn frame_quoted(text: &str) -> String {
         match ch {
             '\\' => out.push_str("\\\\"),
             '"' => out.push_str("\\\""),
-            c if c.is_control() => out.push(' '),
+            // Flatten every line-breaking char to a space: ASCII controls AND the
+            // Unicode line/paragraph separators U+2028/U+2029, which `is_control`
+            // misses yet renderers treat as hard breaks.
+            c if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') => out.push(' '),
             c => out.push(c),
         }
     }
@@ -1218,6 +1216,65 @@ mod tests {
         assert!(
             msg.contains("use the recall tool"),
             "the recall pointer is always present"
+        );
+    }
+
+    #[test]
+    fn format_session_start_token_budget_binds_before_item_cap() {
+        // Dense, high-entropy memories (code-like, NOT a compressible repeat) so
+        // the TOKEN budget — not the 10-item cap — is what stops the loop.
+        let dense = "fn handle(&mut self, r: Request) -> Result<Resp, Error> { \
+                     let n = self.db.query(\"SELECT * FROM mem WHERE imp >= 8\")?; \
+                     Ok(Resp::Ok(n)) } // namespace per-repo; redact AKIA secrets";
+        let important: Vec<_> = (0..50)
+            .map(|i| sample_note(&format!("{i}: {dense}"), 9))
+            .collect();
+        let msg = format_session_start(&[], &important, 50, InjectionMode::Full)
+            .expect("non-empty corpus");
+        let tokens = rb_tokens::count_tokens(&msg);
+        assert!(
+            tokens <= rb_tokens::INJECTION_BUDGET,
+            "{tokens} tokens > budget {}",
+            rb_tokens::INJECTION_BUDGET
+        );
+        let items = msg.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(
+            items < SESSION_START_MAX_ITEMS,
+            "the token budget must bind before the {SESSION_START_MAX_ITEMS}-item cap \
+             (got {items} items, {tokens} tokens)"
+        );
+        assert!(items >= 1, "at least one item shown");
+    }
+
+    #[test]
+    fn format_session_start_never_exceeds_budget_with_dense_unicode() {
+        // Emoji/CJK is token-dense (a 200-CHAR bound is not a TOKEN bound); the
+        // assembled digest must still be ≤ budget — the hard-truncate guard is the
+        // backstop for a pathological first line.
+        let emoji = "🧑‍💻🌍🔥✨🚀💡📦🛠🧪🔒".repeat(20);
+        let important: Vec<_> = (0..20).map(|_| sample_note(&emoji, 9)).collect();
+        let msg = format_session_start(&[], &important, 20, InjectionMode::Full)
+            .expect("non-empty corpus");
+        let tokens = rb_tokens::count_tokens(&msg);
+        assert!(
+            tokens <= rb_tokens::INJECTION_BUDGET,
+            "dense-unicode digest must stay within budget: {tokens} tokens"
+        );
+    }
+
+    #[test]
+    fn format_session_start_full_mode_dedups_across_sections() {
+        // The daemon returns `important` ⊆ `recent`; a high-importance memory must
+        // be listed ONCE, not once under Critical and again under Recent.
+        let m = sample_note("UNIQUE-MARKER decision", 9);
+        let important = vec![m.clone()];
+        let recent = vec![m];
+        let msg = format_session_start(&recent, &important, 1, InjectionMode::Full)
+            .expect("non-empty corpus");
+        assert_eq!(
+            msg.matches("UNIQUE-MARKER").count(),
+            1,
+            "the shared memory must appear once: {msg}"
         );
     }
 

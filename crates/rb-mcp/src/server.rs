@@ -449,6 +449,35 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tools_call_recall_splits_compact_text_and_full_structured_content() {
+        // W3.3: the model-facing `content[].text` is compact markdown while the
+        // FULL result survives on `structuredContent` (so `get` is rarely needed
+        // and nothing is lost on the wire).
+        let mut proxy = fake();
+        let r = req(
+            "tools/call",
+            Some(7),
+            json!({ "name": "recall", "arguments": { "query": "x" } }),
+        );
+        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let result = resp.result.unwrap();
+        // Compact text: a numbered markdown line, NOT the raw JSON.
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("1. ["), "compact markdown line: {text}");
+        assert!(
+            !text.contains("\"score\""),
+            "no raw JSON in the model text: {text}"
+        );
+        // The full structured result rides structuredContent with the score intact
+        // (f32 → JSON, so compare with tolerance).
+        let score = result["structuredContent"]["results"][0]["score"]
+            .as_f64()
+            .expect("score present on structuredContent");
+        assert!((score - 0.9).abs() < 1e-3, "score ≈ 0.9, got {score}");
+        assert_ne!(result["isError"], json!(true));
+    }
+
+    #[tokio::test]
     async fn tools_call_unknown_tool_is_method_not_found() {
         let mut proxy = fake();
         let r = req(

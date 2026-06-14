@@ -303,7 +303,16 @@ fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
     };
     let body: String = truncate_chars(raw, 200)
         .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
+        // Flatten every line-breaking char (ASCII controls + the Unicode
+        // separators U+2028/U+2029 that `is_control` misses) so stored content
+        // cannot inject a visual line break into the one-line projection.
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
         .collect();
     let contested = if m.contested { " ⚠ contested" } else { "" };
     format!(

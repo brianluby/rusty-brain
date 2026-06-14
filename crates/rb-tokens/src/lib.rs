@@ -43,6 +43,34 @@ pub fn count_tokens(text: &str) -> usize {
     }
 }
 
+/// The longest char-boundary prefix of `text` whose token count is ≤
+/// `max_tokens`. Used as a hard last-resort guard so a single pathological line
+/// (dense CJK/emoji, where 1 char can be several tokens) cannot blow a budget.
+/// Returns the whole string when it already fits; `""` when even one char
+/// exceeds `max_tokens`. Binary search → O(log n) `count_tokens` calls.
+#[must_use]
+pub fn truncate_to_tokens(text: &str, max_tokens: usize) -> &str {
+    if count_tokens(text) <= max_tokens {
+        return text;
+    }
+    // Char-boundary byte offsets (including the end), so every slice is valid UTF-8.
+    let bounds: Vec<usize> = text
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(text.len()))
+        .collect();
+    let (mut lo, mut hi) = (0usize, bounds.len() - 1);
+    while lo < hi {
+        let mid = lo + (hi - lo).div_ceil(2);
+        if count_tokens(&text[..bounds[mid]]) <= max_tokens {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    &text[..bounds[lo]]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -61,5 +89,20 @@ mod tests {
         let long = count_tokens("hello world — a noticeably longer sentence with more tokens.");
         assert!(short > 0, "non-empty text has > 0 tokens");
         assert!(long > short, "more text => more tokens");
+    }
+
+    #[test]
+    fn truncate_to_tokens_bounds_and_is_char_safe() {
+        let s = "the quick brown fox jumps over the lazy dog ".repeat(50);
+        let cut = truncate_to_tokens(&s, 20);
+        assert!(count_tokens(cut) <= 20, "truncated to <= 20 tokens");
+        assert!(cut.len() < s.len(), "actually truncated");
+        // A string that already fits is returned whole.
+        assert_eq!(truncate_to_tokens("hello world", 100), "hello world");
+        // Multibyte input is cut on a char boundary (never panics).
+        let cjk = "日本語のテキストを切り詰める".repeat(10);
+        let cut = truncate_to_tokens(&cjk, 5);
+        assert!(count_tokens(cut) <= 5);
+        assert!(cjk.is_char_boundary(cut.len()), "cut on a char boundary");
     }
 }
