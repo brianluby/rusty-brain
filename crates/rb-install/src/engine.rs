@@ -3,12 +3,43 @@
 use std::path::PathBuf;
 
 use rb_agents::cli::AgentId;
-use rb_agents::install::{AgentInstaller, InstallScope};
+use rb_agents::install::{AgentInstaller, HookFragment, InstallScope};
 
 use crate::installers::builtins;
 use crate::report::{AgentReport, AgentStatus, InstallError, InstallReport};
 use crate::uninstall::uninstall_file;
-use crate::writer::{merge_into_file, read_config};
+use crate::writer::{
+    ensure_allow_entries, ensure_text_block, merge_into_file, read_config, remove_allow_entries,
+    remove_managed_file, remove_text_block, write_managed_file,
+};
+
+/// Apply a fragment's W3.2 managed side-effects AFTER its hooks merge: union the
+/// `permissions.allow` entries (W3.2(c)) and write the managed files +
+/// marker-delimited text blocks (W3.2(b)). Each is idempotent on re-install.
+fn apply_managed_side_effects(frag: &HookFragment) -> rb_types::Result<()> {
+    ensure_allow_entries(&frag.config_path, &frag.allow_entries)?;
+    for file in &frag.managed_files {
+        write_managed_file(file)?;
+    }
+    for block in &frag.text_blocks {
+        ensure_text_block(block)?;
+    }
+    Ok(())
+}
+
+/// Reverse a fragment's managed side-effects on uninstall: remove our
+/// `permissions.allow` entries, delete the managed files, and strip the
+/// marker-delimited text blocks — the inverse of [`apply_managed_side_effects`].
+fn reverse_managed_side_effects(frag: &HookFragment) -> rb_types::Result<()> {
+    remove_allow_entries(&frag.config_path, &frag.allow_entries)?;
+    for file in &frag.managed_files {
+        remove_managed_file(&file.path)?;
+    }
+    for block in &frag.text_blocks {
+        remove_text_block(&block.path, &block.marker_id)?;
+    }
+    Ok(())
+}
 
 /// Resolve the hooks binary path: sibling of the running installer named
 /// `rusty-brain-hooks`, falling back to the bare name for `PATH` resolution.
@@ -107,8 +138,12 @@ pub fn run_install(
                         .ok()
                         .map(|v| contains_sentinel(&v))
                         .unwrap_or(false);
-                    match merge_into_file(&frag.config_path, &frag.merge) {
-                        Ok(_) => AgentReport {
+                    // Merge the sentinel hooks block, then apply the W3.2 managed
+                    // side-effects (permissions.allow + skill file + CLAUDE.md block).
+                    let outcome = merge_into_file(&frag.config_path, &frag.merge)
+                        .and_then(|_| apply_managed_side_effects(&frag));
+                    match outcome {
+                        Ok(()) => AgentReport {
                             agent: id,
                             status: if had_sentinel {
                                 AgentStatus::Upgraded
@@ -152,8 +187,8 @@ pub fn run_uninstall(
     let mut agents = Vec::new();
     for inst in installers {
         let id = inst.id().as_str().to_string();
-        let config_path = match inst.hook_fragment(hooks_bin, scope) {
-            Ok(frag) => frag.config_path,
+        let frag = match inst.hook_fragment(hooks_bin, scope) {
+            Ok(frag) => frag,
             Err(e) => {
                 agents.push(AgentReport {
                     agent: id,
@@ -165,6 +200,7 @@ pub fn run_uninstall(
                 continue;
             }
         };
+        let config_path = frag.config_path.clone();
         if dry_run {
             agents.push(AgentReport {
                 agent: id,
@@ -175,22 +211,25 @@ pub fn run_uninstall(
             });
             continue;
         }
-        let report = match uninstall_file(&config_path) {
-            Ok(()) => AgentReport {
-                agent: id,
-                status: AgentStatus::Removed,
-                config_path: Some(config_path),
-                version: None,
-                error: None,
-            },
-            Err(e) => AgentReport {
-                agent: id,
-                status: AgentStatus::Failed,
-                config_path: Some(config_path),
-                version: None,
-                error: Some(e.to_string()),
-            },
-        };
+        // Strip the sentinel hooks block, then reverse the W3.2 managed
+        // side-effects (permissions.allow entries, skill file, CLAUDE.md block).
+        let report =
+            match uninstall_file(&config_path).and_then(|()| reverse_managed_side_effects(&frag)) {
+                Ok(()) => AgentReport {
+                    agent: id,
+                    status: AgentStatus::Removed,
+                    config_path: Some(config_path),
+                    version: None,
+                    error: None,
+                },
+                Err(e) => AgentReport {
+                    agent: id,
+                    status: AgentStatus::Failed,
+                    config_path: Some(config_path),
+                    version: None,
+                    error: Some(e.to_string()),
+                },
+            };
         agents.push(report);
     }
     InstallReport::roll_up(scope_label(scope), dry_run, agents)
@@ -324,10 +363,10 @@ mod tests {
                 InstallScope::Project(p) => p.clone(),
                 InstallScope::Global => std::path::PathBuf::from("/tmp"),
             };
-            Ok(rb_agents::install::HookFragment {
-                config_path: base.join(".claude").join("settings.json"),
-                merge: serde_json::json!({ "hooks": {} }),
-            })
+            Ok(rb_agents::install::HookFragment::new(
+                base.join(".claude").join("settings.json"),
+                serde_json::json!({ "hooks": {} }),
+            ))
         }
     }
 

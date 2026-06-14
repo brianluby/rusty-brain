@@ -9,7 +9,7 @@
 use std::fs;
 use std::path::Path;
 
-use rb_agents::install::SENTINEL;
+use rb_agents::install::{ManagedFile, ManagedTextBlock, SENTINEL};
 use rb_types::{Error, Result};
 
 /// Read `path` as JSON, returning `{}` if the file is absent or empty.
@@ -122,6 +122,230 @@ pub fn merge_into_file(path: &Path, fragment: &serde_json::Value) -> Result<serd
         serde_json::to_string_pretty(&merged).map_err(|e| Error::Serialization(e.to_string()))?;
     write(path, &body, true)?;
     Ok(merged)
+}
+
+// ---- W3.2 managed side-effects (permissions.allow, whole files, text blocks) --
+//
+// These live BESIDE the sentinel JSON merge, never inside it: a permission
+// STRING and a Markdown block cannot carry the `{SENTINEL: true}` marker, so they
+// are added/removed by exact value / by begin-end markers instead of the sentinel
+// strip. Keeping them out of `merge_value`/`strip_sentinel` leaves those tested
+// functions — and the install→uninstall round-trip — unchanged.
+
+/// Read `path` as UTF-8 text, returning `""` if the file is absent.
+///
+/// # Errors
+/// Returns [`Error::Io`] on read failure.
+fn read_text(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    fs::read_to_string(path).map_err(|e| Error::Io(e.to_string()))
+}
+
+/// The begin/end markers wrapping a [`ManagedTextBlock`] keyed by `marker_id`.
+/// HTML comments so they are invisible in rendered Markdown but findable for
+/// idempotent replace + clean removal.
+fn block_markers(marker_id: &str) -> (String, String) {
+    (
+        format!(
+            "<!-- BEGIN rusty-brain:{marker_id} — managed by `rusty-brain install`; \
+             content between these markers is replaced on reinstall and removed on uninstall -->"
+        ),
+        format!("<!-- END rusty-brain:{marker_id} -->"),
+    )
+}
+
+/// Locate our block in `text` as the byte range `[start_of_begin .. end]`, where
+/// `end` includes the end marker and one trailing newline if present. `None`
+/// when the markers are absent (or malformed: a begin with no following end).
+fn find_block(text: &str, begin: &str, end: &str) -> Option<(usize, usize)> {
+    let start = text.find(begin)?;
+    let after_begin = start + begin.len();
+    let end_at = after_begin + text.get(after_begin..)?.find(end)?;
+    let mut stop = end_at + end.len();
+    if text.get(stop..).is_some_and(|rest| rest.starts_with('\n')) {
+        stop += 1;
+    }
+    Some((start, stop))
+}
+
+/// Write a whole installer-owned file (W3.2(b)), creating parent dirs. No
+/// backup: the file is ours, re-written verbatim each install.
+///
+/// # Errors
+/// Returns [`Error::Io`] on any filesystem failure.
+pub fn write_managed_file(file: &ManagedFile) -> Result<()> {
+    write(&file.path, &file.contents, false)
+}
+
+/// Delete an installer-owned file if present (the inverse of
+/// [`write_managed_file`]). Missing path is a no-op success.
+///
+/// # Errors
+/// Returns [`Error::Io`] on a filesystem failure other than "not found".
+pub fn remove_managed_file(path: &Path) -> Result<()> {
+    if path.exists() {
+        fs::remove_file(path).map_err(|e| Error::Io(e.to_string()))?;
+    }
+    Ok(())
+}
+
+/// Append (or, if already present, REPLACE in place) a marker-delimited text
+/// block in `block.path` (W3.2(b)), creating the file if absent. Idempotent: a
+/// second install with the same body is a no-op; a changed body replaces only
+/// the bytes between the markers, leaving the user's surrounding prose intact.
+///
+/// # Errors
+/// Returns [`Error::Io`] on read/write failure.
+pub fn ensure_text_block(block: &ManagedTextBlock) -> Result<()> {
+    let (begin, end) = block_markers(&block.marker_id);
+    let rendered = format!("{begin}\n{}\n{end}\n", block.body.trim_end());
+    let existing = read_text(&block.path)?;
+    let updated = match find_block(&existing, &begin, &end) {
+        Some((start, stop)) => {
+            let mut s = String::with_capacity(existing.len());
+            s.push_str(&existing[..start]);
+            s.push_str(&rendered);
+            s.push_str(&existing[stop..]);
+            s
+        }
+        None => {
+            let mut s = existing.clone();
+            // Separate from prior content with exactly one blank line.
+            if !s.is_empty() {
+                if !s.ends_with('\n') {
+                    s.push('\n');
+                }
+                s.push('\n');
+            }
+            s.push_str(&rendered);
+            s
+        }
+    };
+    if updated == existing {
+        return Ok(());
+    }
+    write(&block.path, &updated, false)
+}
+
+/// Remove our marker-delimited block from `path` (the inverse of
+/// [`ensure_text_block`]), plus one blank-line separator immediately before it.
+/// The user's surrounding content is preserved; a file that held only our block
+/// is left empty rather than deleted (it may be a user-created `CLAUDE.md`).
+/// Missing path / absent block is a no-op success.
+///
+/// # Errors
+/// Returns [`Error::Io`] on read/write failure.
+pub fn remove_text_block(path: &Path, marker_id: &str) -> Result<()> {
+    if !path.exists() {
+        return Ok(());
+    }
+    let existing = read_text(path)?;
+    let (begin, end) = block_markers(marker_id);
+    let Some((start, stop)) = find_block(&existing, &begin, &end) else {
+        return Ok(());
+    };
+    // Consume one blank-line separator we inserted before the block, if present.
+    let real_start = if existing[..start].ends_with("\n\n") {
+        start - 1
+    } else {
+        start
+    };
+    let mut updated = String::with_capacity(existing.len());
+    updated.push_str(&existing[..real_start]);
+    updated.push_str(&existing[stop..]);
+    if updated == existing {
+        return Ok(());
+    }
+    write(path, &updated, false)
+}
+
+/// Union `entries` into the config's `permissions.allow` array (W3.2(c)),
+/// creating `permissions`/`allow` as needed and skipping entries already
+/// present (idempotent — re-install adds nothing). Writes WITHOUT a backup so
+/// the `.bak` left by the preceding hooks merge keeps the true pre-install
+/// original. A malformed non-object `permissions` or non-array `allow` is left
+/// untouched rather than clobbered.
+///
+/// # Errors
+/// Returns [`Error::Io`]/[`Error::Serialization`] on read/parse/write failure.
+pub fn ensure_allow_entries(path: &Path, entries: &[String]) -> Result<()> {
+    if entries.is_empty() {
+        return Ok(());
+    }
+    let mut root = match read_config(path)? {
+        serde_json::Value::Object(m) => m,
+        serde_json::Value::Null => serde_json::Map::new(),
+        // A non-object settings file is malformed; do not clobber it.
+        _ => return Ok(()),
+    };
+    let permissions = root
+        .entry("permissions")
+        .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+    let serde_json::Value::Object(perms) = permissions else {
+        return Ok(());
+    };
+    let allow = perms
+        .entry("allow")
+        .or_insert_with(|| serde_json::Value::Array(Vec::new()));
+    let serde_json::Value::Array(arr) = allow else {
+        return Ok(());
+    };
+    let mut changed = false;
+    for e in entries {
+        let ev = serde_json::Value::String(e.clone());
+        if !arr.contains(&ev) {
+            arr.push(ev);
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(());
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| Error::Serialization(e.to_string()))?;
+    write(path, &body, false)
+}
+
+/// Remove `entries` from the config's `permissions.allow` (the inverse of
+/// [`ensure_allow_entries`]), pruning an `allow`/`permissions` we emptied while
+/// leaving any user entries. Missing path / absent entries is a no-op success.
+///
+/// # Errors
+/// Returns [`Error::Io`]/[`Error::Serialization`] on read/parse/write failure.
+pub fn remove_allow_entries(path: &Path, entries: &[String]) -> Result<()> {
+    if entries.is_empty() || !path.exists() {
+        return Ok(());
+    }
+    let mut root = match read_config(path)? {
+        serde_json::Value::Object(m) => m,
+        _ => return Ok(()),
+    };
+    let Some(serde_json::Value::Object(perms)) = root.get_mut("permissions") else {
+        return Ok(());
+    };
+    let Some(serde_json::Value::Array(allow)) = perms.get_mut("allow") else {
+        return Ok(());
+    };
+    let before = allow.len();
+    allow.retain(|v| {
+        !entries
+            .iter()
+            .any(|e| v == &serde_json::Value::String(e.clone()))
+    });
+    if allow.len() == before {
+        return Ok(()); // none of ours were present
+    }
+    if allow.is_empty() {
+        perms.remove("allow");
+    }
+    if perms.is_empty() {
+        root.remove("permissions");
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| Error::Serialization(e.to_string()))?;
+    write(path, &body, false)
 }
 
 /// Write `body` to `path` atomically; back up an existing file to `<name>.bak`.
@@ -466,5 +690,196 @@ mod tests {
         ] {
             assert_eq!(AgentId::parse(id.as_str()), Some(id));
         }
+    }
+
+    // ---- W3.2 managed side-effects --------------------------------------
+
+    fn read_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap()
+    }
+
+    #[test]
+    fn ensure_allow_entries_unions_preserves_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string_pretty(&serde_json::json!({
+                "permissions": { "allow": ["Bash(ls)"], "deny": ["Read(./.env)"] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        let entries = vec!["mcp__rusty-brain__*".to_string()];
+        ensure_allow_entries(&path, &entries).unwrap();
+        let v = read_json(&path);
+        let allow = v["permissions"]["allow"].as_array().unwrap();
+        assert!(
+            allow.contains(&serde_json::json!("Bash(ls)")),
+            "user entry preserved"
+        );
+        assert!(
+            allow.contains(&serde_json::json!("mcp__rusty-brain__*")),
+            "our entry added"
+        );
+        assert_eq!(
+            v["permissions"]["deny"],
+            serde_json::json!(["Read(./.env)"]),
+            "deny untouched"
+        );
+        // Idempotent: re-install adds no duplicate.
+        ensure_allow_entries(&path, &entries).unwrap();
+        assert_eq!(
+            read_json(&path)["permissions"]["allow"]
+                .as_array()
+                .unwrap()
+                .len(),
+            2,
+            "no duplicate entry on re-install"
+        );
+    }
+
+    #[test]
+    fn ensure_allow_entries_creates_permissions_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({ "model": "x" })).unwrap(),
+        )
+        .unwrap();
+        ensure_allow_entries(&path, &["mcp__rusty-brain__*".to_string()]).unwrap();
+        let v = read_json(&path);
+        assert_eq!(
+            v["permissions"]["allow"],
+            serde_json::json!(["mcp__rusty-brain__*"])
+        );
+        assert_eq!(v["model"], serde_json::json!("x"), "user keys preserved");
+    }
+
+    #[test]
+    fn ensure_then_remove_allow_entries_round_trips_to_user_block() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let original = serde_json::json!({ "permissions": { "allow": ["Bash(ls)"], "deny": [] } });
+        fs::write(&path, serde_json::to_string_pretty(&original).unwrap()).unwrap();
+        let entries = vec!["mcp__rusty-brain__*".to_string()];
+        ensure_allow_entries(&path, &entries).unwrap();
+        remove_allow_entries(&path, &entries).unwrap();
+        assert_eq!(
+            read_json(&path),
+            original,
+            "install + uninstall of our permission restores the user's block"
+        );
+    }
+
+    #[test]
+    fn remove_allow_entries_prunes_only_emptied_containers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        // Ours was the sole allow entry: allow AND permissions are pruned.
+        fs::write(
+            &path,
+            serde_json::to_string(&serde_json::json!({
+                "model": "x", "permissions": { "allow": ["mcp__rusty-brain__*"] }
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        remove_allow_entries(&path, &["mcp__rusty-brain__*".to_string()]).unwrap();
+        let v = read_json(&path);
+        assert!(
+            v.get("permissions").is_none(),
+            "emptied permissions pruned: {v}"
+        );
+        assert_eq!(v["model"], serde_json::json!("x"));
+    }
+
+    #[test]
+    fn ensure_text_block_appends_replaces_and_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        fs::write(&path, "# Project\n\nUser prose.\n").unwrap();
+        let block = |body: &str| ManagedTextBlock {
+            path: path.clone(),
+            marker_id: "memory-policy".to_string(),
+            body: body.to_string(),
+        };
+        ensure_text_block(&block("policy v1")).unwrap();
+        let s = fs::read_to_string(&path).unwrap();
+        assert!(s.contains("User prose."), "user prose preserved");
+        assert!(s.contains("policy v1") && s.contains("BEGIN rusty-brain:memory-policy"));
+        // Same body => no-op.
+        ensure_text_block(&block("policy v1")).unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            s,
+            "same body is a no-op"
+        );
+        // Changed body => replaced in place (still exactly one block).
+        ensure_text_block(&block("policy v2")).unwrap();
+        let s2 = fs::read_to_string(&path).unwrap();
+        assert!(s2.contains("policy v2") && !s2.contains("policy v1"));
+        assert_eq!(
+            s2.matches("BEGIN rusty-brain:memory-policy").count(),
+            1,
+            "exactly one block after replace"
+        );
+        assert!(s2.contains("User prose."));
+    }
+
+    #[test]
+    fn ensure_then_remove_text_block_restores_prose() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        let original = "# Project\n\nUser prose.\n";
+        fs::write(&path, original).unwrap();
+        let block = ManagedTextBlock {
+            path: path.clone(),
+            marker_id: "memory-policy".to_string(),
+            body: "policy".to_string(),
+        };
+        ensure_text_block(&block).unwrap();
+        assert_ne!(fs::read_to_string(&path).unwrap(), original);
+        remove_text_block(&path, "memory-policy").unwrap();
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            original,
+            "uninstall restores CLAUDE.md verbatim"
+        );
+    }
+
+    #[test]
+    fn ensure_text_block_creates_file_when_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("CLAUDE.md");
+        ensure_text_block(&ManagedTextBlock {
+            path: path.clone(),
+            marker_id: "m".to_string(),
+            body: "hi".to_string(),
+        })
+        .unwrap();
+        let s = fs::read_to_string(&path).unwrap();
+        assert!(s.contains("hi") && s.contains("BEGIN rusty-brain:m"));
+    }
+
+    #[test]
+    fn managed_file_write_then_remove_is_reversible() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir
+            .path()
+            .join("skills")
+            .join("rusty-brain-memory")
+            .join("SKILL.md");
+        let f = ManagedFile {
+            path: path.clone(),
+            contents: "# skill".to_string(),
+        };
+        write_managed_file(&f).unwrap();
+        assert_eq!(fs::read_to_string(&path).unwrap(), "# skill");
+        remove_managed_file(&path).unwrap();
+        assert!(!path.exists());
+        // Removing an absent file is a no-op success.
+        remove_managed_file(&path).unwrap();
     }
 }

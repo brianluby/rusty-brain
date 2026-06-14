@@ -129,6 +129,53 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
 - *Decision-grade rubric:* written (`docs/eval/2026-06-13-decision-grade-capture-rubric.md`); the ≥80% human-graded bar is sampled per release against a dogfood corpus (not yet sampled — needs accumulated dogfood capture).
 - *Deferred to the rest of Phase 3 (full gate NOT yet met):* the elicitation scorecard (W3.2), the token-accounting CI test (W3.3), and the W3.5 nightly A/B eval. Cross-CLI note: the canonical `Stop` now stores nothing, so a non-Claude CLI that maps its turn-stop to `Stop` no longer emits a per-turn summary; the SessionEnd fold is wired for Claude Code only until the other adapters model a session-end event.
 
+**Phase-3 progress — W3.2 three-channel elicitation (landed 2026-06-13):**
+
+- *Channel (a) deterministic recall:* a canonical `UserPromptSubmit` event added
+  end to end — `HookEvent::UserPromptSubmit { prompt }` (`rb-agents/event.rs`) +
+  the `claude_code` adapter `parse_input` arm; `render_output` generalized to
+  stamp `hookSpecificOutput.hookEventName` from a new `HookResult::injection_event`
+  (`InjectionEvent::{SessionStart,UserPromptSubmit}`) instead of hardcoding
+  `SessionStart` (Claude Code rejects a mismatched name). A fail-open
+  `DaemonClient::recall` (read-only — W1.8 zero writer ops) feeds
+  `capture::user_prompt_submit`, which injects the top-k (≤5) hits under a
+  per-line char bound, wrapped in the shared W2.5 `UNTRUSTED_DATA_FRAME` (now
+  reused by BOTH the SessionStart digest and the prompt recall). Dispatch arm +
+  `event_needs_daemon` + `CLAUDE_EVENTS` registration added. Proven live: an
+  rb-install e2e drives a real `UserPromptSubmit` through the real hook binary →
+  daemon → recall and asserts the injected `additionalContext` (tagged
+  `UserPromptSubmit`) carries the prompt-relevant memory.
+- *Channel (c) tool surface:* MCP tool descriptions rewritten to
+  trigger-condition phrasing (remember/recall/get/context/list); MCP
+  `instructions` added to `initialize` (was omitted); the Claude Code installer
+  now writes `permissions.allow: ["mcp__rusty-brain__*"]` — an anchored wildcard
+  verified valid against the Claude Code permission-rule docs (only an unanchored
+  `mcp__*` allow is rejected). Closes the S1 hard prereq: headless model-initiated
+  calls no longer stall on approval; the installer now emits what the nightly
+  smoke script had to hand-patch.
+- *Channel (b) policy:* a new installer managed-side-effects layer
+  (`HookFragment::{allow_entries, managed_files, text_blocks}` + engine
+  apply/reverse + idempotent, reversible writer ops) appends a marker-delimited
+  memory-policy block to project (or global) `CLAUDE.md` and ships a
+  `rusty-brain-memory` skill under `.claude/skills/`. These live BESIDE the
+  sentinel JSON merge (a permission string / Markdown block cannot carry the
+  `{rusty-brain: true}` sentinel), so `merge_value`/`strip_sentinel` and the
+  install→uninstall round-trip are unchanged; uninstall removes our
+  entries/block/file symmetrically (e2e-proven).
+- *Elicitation scorecard:* harness landed — 11 scenarios
+  (`crates/rb-eval/scorecard/w32_elicitation_scenarios.json`) + a runner
+  (`scripts/w32-elicitation-scorecard.sh`, with a CI-safe scoring `--self-test`)
+  + rubric (`docs/eval/2026-06-13-w32-elicitation-scorecard.md`). The measured
+  ≥10-session run is **DEFERRED** (needs `claude` + an API key + spend — the W3.5
+  nightly infra), recorded honestly like the W3.1 rubric sampling and the W2.5
+  drill, not silently declared passed.
+- *Deferred / full Phase-3 gate NOT yet met:* the scorecard MEASURED run (above),
+  W3.3 token economy (incl. the token-accounting CI test — the W3.2 injection +
+  `instructions` are written tight but not yet budget-asserted), and the W3.5
+  nightly A/B eval. Cross-CLI unchanged: only the Claude Code adapter models
+  `UserPromptSubmit`; Gemini/Codex/OpenCode do not (the W3.1 cross-CLI follow-up
+  still owns that).
+
 ---
 
 ## 7. Phase 4 — Prove it: eval gates, perf, fuzz

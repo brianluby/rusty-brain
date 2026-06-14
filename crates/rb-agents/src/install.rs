@@ -17,13 +17,91 @@ pub enum InstallScope {
     Global,
 }
 
-/// A config-file path plus the sentinel-keyed JSON block to deep-merge into it.
-/// `hook_fragment` produces this purely (no I/O); Part Y performs the atomic
-/// merge-write.
+/// A whole file the installer writes on install and deletes on uninstall (e.g.
+/// the W3.2(b) memory skill). The file is installer-owned: it has no in-file
+/// marker, so uninstall removes it by path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedFile {
+    /// Absolute path to write.
+    pub path: PathBuf,
+    /// Full file contents (UTF-8).
+    pub contents: String,
+}
+
+/// A marker-delimited block appended to a UTF-8 text file (e.g. the W3.2(b)
+/// memory-policy block in a project `CLAUDE.md`). The writer wraps `body` in
+/// begin/end markers keyed by `marker_id`, so re-install REPLACES the block
+/// between the markers (idempotent) and uninstall removes exactly it, leaving
+/// the user's surrounding prose untouched. A structured document cannot carry
+/// the JSON sentinel, so the text markers are the reversibility mechanism here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ManagedTextBlock {
+    /// Absolute path of the text file to append to (created if absent).
+    pub path: PathBuf,
+    /// Stable id embedded in the begin/end markers (must be constant across
+    /// install/uninstall so the block can be found again).
+    pub marker_id: String,
+    /// The block body inserted between the markers (the markers are added by
+    /// the writer, never by the caller).
+    pub body: String,
+}
+
+/// A config-file path plus the sentinel-keyed JSON block to deep-merge into it,
+/// and the non-JSON managed side-effects (permission allowlist entries, whole
+/// files, marker-delimited text blocks) the engine applies on install and
+/// reverses on uninstall. `hook_fragment` produces this purely (no I/O); Part Y
+/// performs the atomic writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookFragment {
     pub config_path: PathBuf,
     pub merge: serde_json::Value,
+    /// W3.2(c): entries unioned into the config's `permissions.allow` array
+    /// (idempotent add on install, removed on uninstall). Empty for installers
+    /// that need none. A permission string cannot carry the JSON sentinel, so it
+    /// is added/removed by exact value rather than via the sentinel strip.
+    pub allow_entries: Vec<String>,
+    /// W3.2(b): whole files written on install, deleted on uninstall.
+    pub managed_files: Vec<ManagedFile>,
+    /// W3.2(b): marker-delimited text blocks appended on install, removed on
+    /// uninstall.
+    pub text_blocks: Vec<ManagedTextBlock>,
+}
+
+impl HookFragment {
+    /// A hooks-only fragment (no managed permissions / files / text blocks) — the
+    /// shape every installer started with. Use the `with_*` builders to add the
+    /// W3.2 elicitation side-effects.
+    #[must_use]
+    pub fn new(config_path: PathBuf, merge: serde_json::Value) -> Self {
+        Self {
+            config_path,
+            merge,
+            allow_entries: Vec::new(),
+            managed_files: Vec::new(),
+            text_blocks: Vec::new(),
+        }
+    }
+
+    /// Set the `permissions.allow` entries (W3.2(c)).
+    #[must_use]
+    pub fn with_allow_entries(mut self, entries: Vec<String>) -> Self {
+        self.allow_entries = entries;
+        self
+    }
+
+    /// Set the whole managed files (W3.2(b)).
+    #[must_use]
+    pub fn with_managed_files(mut self, files: Vec<ManagedFile>) -> Self {
+        self.managed_files = files;
+        self
+    }
+
+    /// Set the marker-delimited text blocks (W3.2(b)).
+    #[must_use]
+    pub fn with_text_blocks(mut self, blocks: Vec<ManagedTextBlock>) -> Self {
+        self.text_blocks = blocks;
+        self
+    }
 }
 
 /// Marker key/comment identifying entries this installer owns. Uninstall removes
@@ -71,7 +149,7 @@ mod tests {
             let merge = serde_json::json!({
                 SENTINEL: { "hooks_bin": hooks_bin.display().to_string() }
             });
-            Ok(HookFragment { config_path, merge })
+            Ok(HookFragment::new(config_path, merge))
         }
     }
 

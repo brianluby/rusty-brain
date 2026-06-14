@@ -69,6 +69,12 @@ impl AgentCli for ClaudeCodeCli {
             "SessionEnd" => HookEvent::SessionEnd {
                 reason: opt_str(raw, "reason"),
             },
+            // W3.2(a): the user submitted a prompt (real payload carries the
+            // raw text under `prompt` + `transcript_path`). The deterministic
+            // recall flow queries the store with this text and injects hits.
+            "UserPromptSubmit" => HookEvent::UserPromptSubmit {
+                prompt: opt_str(raw, "prompt"),
+            },
             other => HookEvent::Other(other.to_string()),
         };
         HookContext {
@@ -89,15 +95,17 @@ impl AgentCli for ClaudeCodeCli {
             Value::Bool(result.continue_execution),
         );
         out.insert("suppressOutput".to_string(), Value::Bool(true));
-        // SessionStart context injection rides on `hookSpecificOutput.additionalContext`
-        // — the only field Claude Code feeds back into the model. `systemMessage` is
+        // Context injection rides on `hookSpecificOutput.additionalContext` — the
+        // only field Claude Code feeds back into the model. `systemMessage` is
         // user-facing only and would NOT reach the model, so it is never emitted.
-        // `system_message` is set solely by the SessionStart capture flow.
+        // `hookEventName` MUST name the firing event (Claude Code rejects a
+        // mismatched name): SessionStart for the session digest, UserPromptSubmit
+        // for the W3.2(a) per-prompt recall — carried on `result.injection_event`.
         if let Some(message) = &result.system_message {
             out.insert(
                 "hookSpecificOutput".to_string(),
                 serde_json::json!({
-                    "hookEventName": "SessionStart",
+                    "hookEventName": result.injection_event.hook_event_name(),
                     "additionalContext": message,
                 }),
             );
@@ -111,7 +119,7 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use crate::cli::AgentId;
-    use crate::event::{HookEvent, HookResult};
+    use crate::event::{HookEvent, HookResult, InjectionEvent};
 
     fn cli() -> ClaudeCodeCli {
         ClaudeCodeCli
@@ -270,13 +278,40 @@ mod tests {
     }
 
     #[test]
-    fn unknown_event_name_becomes_other() {
+    fn parses_user_prompt_submit_with_prompt() {
+        // W3.2(a): the real payload carries the user's text under `prompt`
+        // (mirrors rb-hooks/tests/fixtures/claude_code/user_prompt_submit.json).
         let raw = serde_json::json!({
             "hook_event_name": "UserPromptSubmit",
+            "prompt": "Create a file named hello.txt",
+            "session_id": "abc123",
             "cwd": "/p"
         });
         let ctx = cli().parse_input(&raw);
-        assert_eq!(ctx.event, HookEvent::Other("UserPromptSubmit".to_string()));
+        assert_eq!(
+            ctx.event,
+            HookEvent::UserPromptSubmit {
+                prompt: Some("Create a file named hello.txt".to_string())
+            }
+        );
+
+        // A UserPromptSubmit missing `prompt` degrades to None, never errors.
+        let bare = serde_json::json!({ "hook_event_name": "UserPromptSubmit", "cwd": "/p" });
+        assert_eq!(
+            cli().parse_input(&bare).event,
+            HookEvent::UserPromptSubmit { prompt: None }
+        );
+    }
+
+    #[test]
+    fn unknown_event_name_becomes_other() {
+        // `Notification` is a real Claude Code event rusty-brain does not model.
+        let raw = serde_json::json!({
+            "hook_event_name": "Notification",
+            "cwd": "/p"
+        });
+        let ctx = cli().parse_input(&raw);
+        assert_eq!(ctx.event, HookEvent::Other("Notification".to_string()));
     }
 
     #[test]
@@ -308,6 +343,7 @@ mod tests {
         let out = cli().render_output(&HookResult {
             system_message: None,
             continue_execution: true,
+            ..HookResult::default()
         });
         assert_eq!(out["continue"], true);
         assert_eq!(out["suppressOutput"], true);
@@ -321,6 +357,7 @@ mod tests {
         let out = cli().render_output(&HookResult {
             system_message: Some("injected context".to_string()),
             continue_execution: true,
+            injection_event: InjectionEvent::SessionStart,
         });
         assert_eq!(out["continue"], true);
         assert_eq!(out["suppressOutput"], true);
@@ -333,5 +370,25 @@ mod tests {
         );
         // The old user-facing systemMessage key must be gone.
         assert!(out.get("systemMessage").is_none());
+    }
+
+    #[test]
+    fn render_output_stamps_user_prompt_submit_event_name() {
+        // W3.2(a): a UserPromptSubmit injection must carry hookEventName
+        // "UserPromptSubmit" — Claude Code rejects additionalContext whose
+        // hookEventName does not match the firing event.
+        let out = cli().render_output(&HookResult {
+            system_message: Some("relevant memories".to_string()),
+            continue_execution: true,
+            injection_event: InjectionEvent::UserPromptSubmit,
+        });
+        assert_eq!(
+            out["hookSpecificOutput"]["hookEventName"],
+            "UserPromptSubmit"
+        );
+        assert_eq!(
+            out["hookSpecificOutput"]["additionalContext"],
+            "relevant memories"
+        );
     }
 }

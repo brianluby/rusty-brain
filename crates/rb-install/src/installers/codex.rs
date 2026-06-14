@@ -39,7 +39,7 @@ impl AgentInstaller for CodexInstaller {
             &CODEX_EVENTS,
             "PostToolUse",
         );
-        Ok(HookFragment { config_path, merge })
+        Ok(HookFragment::new(config_path, merge))
     }
 }
 
