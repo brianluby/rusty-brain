@@ -18,7 +18,9 @@ It bundles:
 The `rusty-brain` and `rusty-brain-hooks` binaries must be on `PATH`:
 
 ```bash
-cargo install --path crates/rusty-brain --path crates/rb-hooks   # from a checkout
+# from a checkout (one package per invocation):
+cargo install --path crates/rusty-brain   # the `rusty-brain` binary
+cargo install --path crates/rb-hooks      # the `rusty-brain-hooks` binary
 # or a signed release artifact / Homebrew once published
 ```
 

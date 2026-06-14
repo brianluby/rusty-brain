@@ -323,21 +323,43 @@ mod tests {
     fn committed_and_plugin_hooks_cover_exactly_the_claude_events() {
         use std::collections::BTreeSet;
         let expected: BTreeSet<&str> = crate::installers::CLAUDE_EVENTS.iter().copied().collect();
+        // PATH-relative (the installer emits an absolute, shell-quoted path — that
+        // is legitimately different and asserted separately).
+        const EXPECTED_CMD: &str = "rusty-brain-hooks --agent claude-code";
         for rel in [
             ".claude/settings.json",
             "plugins/rusty-brain/hooks/hooks.json",
         ] {
             let json = read_repo_json(rel);
-            let got: BTreeSet<&str> = json["hooks"]
+            let hooks = json["hooks"]
                 .as_object()
-                .unwrap_or_else(|| panic!("{rel}: hooks object"))
-                .keys()
-                .map(String::as_str)
-                .collect();
+                .unwrap_or_else(|| panic!("{rel}: hooks object"));
+            let got: BTreeSet<&str> = hooks.keys().map(String::as_str).collect();
             assert_eq!(
                 got, expected,
                 "{rel} must register exactly the CLAUDE_EVENTS"
             );
+            // Pin the command string + matcher too — event keys alone would not
+            // catch a typoed binary / wrong `--agent` / dropped matcher.
+            for (event, groups) in hooks {
+                let group = &groups[0];
+                assert_eq!(
+                    group["hooks"][0]["command"].as_str(),
+                    Some(EXPECTED_CMD),
+                    "{rel} {event} hook command"
+                );
+                if event == "PostToolUse" {
+                    assert_eq!(
+                        group["matcher"], "*",
+                        "{rel} PostToolUse carries the matcher"
+                    );
+                } else {
+                    assert!(
+                        group.get("matcher").is_none(),
+                        "{rel} {event} must omit the matcher"
+                    );
+                }
+            }
         }
     }
 

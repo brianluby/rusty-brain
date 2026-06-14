@@ -6,8 +6,9 @@ per project** — two active channels double-register the hooks (two captures pe
 event).
 
 All channels wire CONTEXT, not binaries: `rusty-brain` and `rusty-brain-hooks`
-must be on `PATH` (a checkout's `cargo install --path crates/rusty-brain --path
-crates/rb-hooks`, or a signed release / Homebrew once published). Missing
+must be on `PATH` — from a checkout, `cargo install --path crates/rusty-brain`
+and `cargo install --path crates/rb-hooks` (one package per invocation), or a
+signed release / Homebrew once published. Missing
 binaries degrade silently — the MCP server doesn't start and the strictly
 fail-open hooks no-op; nothing blocks.
 
@@ -34,13 +35,13 @@ both** — it dogfoods rusty-brain on itself and is the reference template to co
 
 Best for: a team repo where memory should be on for everyone with no per-user step.
 
-## Channel 3 — `rusty-brain install` (the W3.2 installer)
+## Channel 3 — `rusty-brain-install` (the W3.2 installer)
 
-`rusty-brain install --agents claude-code` writes the same hooks +
+`rusty-brain-install install --agents claude-code` writes the same hooks +
 `permissions.allow` (with an absolute, shell-quoted hooks path resolved for the
 local machine) plus the CLAUDE.md policy block and the skill. Best for: a user who
 wants a guided, machine-local setup without committing config or installing a
-plugin. `rusty-brain uninstall` reverses it.
+plugin. `rusty-brain-install uninstall` reverses it.
 
 ## Enterprise managed settings (Phase 5 rollout dependency)
 
