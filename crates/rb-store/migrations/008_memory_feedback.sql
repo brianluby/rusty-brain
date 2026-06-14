@@ -16,16 +16,20 @@
 -- disagree. Purely additive (new table only — no ALTER on `memories`), so the
 -- FTS triggers are untouched and the migration is trigger-safe.
 --
--- No foreign key to `memories(memory_id)`: the codebase does not PRAGMA
--- foreign_keys=ON, `memory_oplog` deliberately carries none either, and
--- memories are soft-deleted (archived, never removed), so a dangling reference
--- cannot arise in practice. The engine verifies the target exists in the
--- caller's namespace before the writer inserts here.
+-- No foreign key to `memories(memory_id)` — even though `foreign_keys=ON` (set
+-- in `SqliteStore::init`): `memory_feedback` is an append-only EVENT LOG, so it
+-- deliberately matches `memory_oplog` (the sibling op log, also FK-free) rather
+-- than the relational tables. Coupling an append-only log to row lifecycle would
+-- fight a future hard purge (W5b); memories are otherwise soft-deleted (archived,
+-- never removed), and the engine + the in-transaction existence check in
+-- `record_feedback` guard against orphan rows. The `kind` CHECK mirrors the
+-- enum-column convention (memories.memory_type, memory_links.link_type) and MUST
+-- stay in lockstep with `rb_types::FeedbackKind::as_str`.
 CREATE TABLE memory_feedback (
   id        INTEGER PRIMARY KEY AUTOINCREMENT,
   memory_id TEXT NOT NULL,
   namespace TEXT NOT NULL,
-  kind      TEXT NOT NULL,            -- helpful|wrong|stale (FeedbackKind::as_str)
+  kind      TEXT NOT NULL CHECK (kind IN ('helpful', 'wrong', 'stale')),  -- FeedbackKind::as_str
   principal TEXT,                     -- the giver (origin_user), or NULL when unknown
   at        INTEGER NOT NULL          -- unix seconds
 );

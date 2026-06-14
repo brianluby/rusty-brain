@@ -25,7 +25,8 @@ pub enum FeedbackKind {
 impl FeedbackKind {
     /// Stable string form used by the CLI `--kind` argument, the MCP tool enum,
     /// and the `memory_oplog` / `memory_feedback` `kind` column. MUST stay in
-    /// lockstep with the `serde(rename_all = "snake_case")` form.
+    /// lockstep with the `serde(rename_all = "snake_case")` form AND the
+    /// `migration 008` `CHECK (kind IN (...))` constraint.
     pub fn as_str(&self) -> &'static str {
         match self {
             FeedbackKind::Helpful => "helpful",

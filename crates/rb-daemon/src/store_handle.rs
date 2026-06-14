@@ -1223,11 +1223,17 @@ fn writer_loop(
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    // Mirror the Update arm: verify the row lives in the caller's
-                    // namespace before mutating, fail closed (NotFound) on a
-                    // missing or cross-namespace id.
+                    // Verify the row lives in the caller's namespace AND is still
+                    // active before mutating. The archived check is enforced HERE,
+                    // at the single-writer serialization point, to close the TOCTOU
+                    // the engine's pre-check (a pooled read) leaves open: a memory
+                    // archived between that read and this command must not receive
+                    // feedback. Fail closed (NotFound) on missing/cross-namespace/
+                    // archived — feedback targets live, recallable memories.
                     |s| match s.get_memory(&id) {
-                        Ok(Some(note)) if note.namespace == namespace => {
+                        Ok(Some(note))
+                            if note.namespace == namespace && note.archived_at.is_none() =>
+                        {
                             confidence =
                                 Some(s.record_feedback(&id, kind, principal.as_deref())?);
                             Ok(())
@@ -2538,12 +2544,40 @@ mod tests {
             .unwrap();
         assert!((after - 0.5).abs() < 1e-6, "0.8 - 0.30 = 0.50, got {after}");
         let stored = handle
-            .get(ns, id)
+            .get(ns.clone(), id.clone())
             .await
             .unwrap()
             .expect("memory present")
             .confidence;
         assert!((stored - 0.5).abs() < 1e-6, "the row reflects the nudge");
+
+        // Once archived, the writer-level guard rejects feedback (NotFound),
+        // closing the TOCTOU even when the engine's pre-check is bypassed.
+        handle.archive(ns.clone(), id.clone()).await.unwrap();
+        let err = handle
+            .record_feedback(
+                ns.clone(),
+                id.clone(),
+                rb_types::FeedbackKind::Helpful,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "feedback on an archived row must be NotFound at the writer, got {err:?}"
+        );
+        // The archived row's confidence is untouched by the rejected feedback.
+        let unchanged = handle
+            .get(ns, id)
+            .await
+            .unwrap()
+            .expect("memory present")
+            .confidence;
+        assert!(
+            (unchanged - 0.5).abs() < 1e-6,
+            "rejected feedback left confidence intact"
+        );
 
         handle.shutdown().await;
     }

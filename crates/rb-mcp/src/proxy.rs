@@ -439,12 +439,13 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         }
         Response::Updated => ToolContent::json(json!({ "ok": true }), false),
         Response::Linked => ToolContent::json(json!({ "ok": true }), false),
-        // W3.7: echo the post-nudge trust prior so the model sees the effect.
-        Response::FeedbackRecorded { confidence } => ToolContent {
-            text: format!("feedback recorded (confidence now {confidence:.2})"),
-            structured: json!({ "confidence": confidence }),
-            is_error: false,
-        },
+        // W3.7: an ack like Updated/Linked/Deleted — JSON in `text` (not a
+        // projected markdown line), so clients that parse `content[].text` as
+        // JSON for non-recall tools stay consistent. Echoes the post-nudge
+        // trust prior so the model sees the effect.
+        Response::FeedbackRecorded { confidence } => {
+            ToolContent::json(json!({ "ok": true, "confidence": confidence }), false)
+        }
         Response::Deleted => ToolContent::json(json!({ "ok": true }), false),
         Response::ContextResult {
             recent,
@@ -989,10 +990,12 @@ mod tests {
         );
         assert!(err.is_error, "error variant sets the isError flag");
 
-        // W3.7: feedback echoes the post-nudge confidence in text + structured.
+        // W3.7: feedback is an ack — JSON in `text` (== structured), like
+        // Updated/Linked/Deleted — echoing the post-nudge confidence.
         let fb = response_to_content(Response::FeedbackRecorded { confidence: 0.4 }, now);
         assert!(!fb.is_error);
-        assert!(fb.text.contains("0.40"), "{}", fb.text);
+        let fb_text: serde_json::Value = serde_json::from_str(&fb.text).unwrap();
+        assert!((fb_text["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
         assert!((fb.structured["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
     }
 
