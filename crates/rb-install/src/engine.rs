@@ -142,6 +142,14 @@ pub fn run_install(
                     // side-effects (permissions.allow + skill file + CLAUDE.md block).
                     let outcome = merge_into_file(&frag.config_path, &frag.merge)
                         .and_then(|_| apply_managed_side_effects(&frag));
+                    if outcome.is_err() {
+                        // Best-effort rollback so a partial install never leaves a
+                        // half-configured tree: reverse our side-effects and strip the
+                        // sentinel hooks block. Errors here are ignored — `outcome`
+                        // already carries the original failure reported below.
+                        let _ = reverse_managed_side_effects(&frag);
+                        let _ = uninstall_file(&frag.config_path);
+                    }
                     match outcome {
                         Ok(()) => AgentReport {
                             agent: id,
@@ -468,5 +476,59 @@ mod tests {
         assert!(!contains_sentinel(&after), "sentinel gone after uninstall");
         assert_eq!(installed.status, installed.status); // report builds
         let _ = ReportStatus::Success;
+    }
+
+    #[test]
+    fn apply_then_reverse_managed_side_effects_round_trips() {
+        // The mechanism behind both normal uninstall and the partial-install
+        // rollback: apply (permissions + skill + CLAUDE.md block) then reverse
+        // restores the tree. Uses a CLAUDE.md WITHOUT a trailing newline to pin
+        // the byte-for-byte text-block round-trip.
+        let dir = tempfile::tempdir().unwrap();
+        let settings = dir.path().join("settings.json");
+        std::fs::write(&settings, r#"{"permissions":{"allow":["Bash(ls)"]}}"#).unwrap();
+        let claude_md = dir.path().join("CLAUDE.md");
+        std::fs::write(&claude_md, "# notes").unwrap();
+        let skill = dir.path().join("skills").join("rb-mem").join("SKILL.md");
+
+        let frag = HookFragment::new(settings.clone(), serde_json::json!({}))
+            .with_allow_entries(vec!["mcp__rusty-brain__*".to_string()])
+            .with_text_blocks(vec![rb_agents::install::ManagedTextBlock {
+                path: claude_md.clone(),
+                marker_id: "memory-policy".to_string(),
+                body: "policy".to_string(),
+            }])
+            .with_managed_files(vec![rb_agents::install::ManagedFile {
+                path: skill.clone(),
+                contents: "# skill".to_string(),
+            }]);
+
+        apply_managed_side_effects(&frag).unwrap();
+        assert!(skill.exists());
+        assert!(std::fs::read_to_string(&claude_md)
+            .unwrap()
+            .contains("BEGIN rusty-brain:memory-policy"));
+        let applied: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            applied["permissions"]["allow"],
+            serde_json::json!(["Bash(ls)", "mcp__rusty-brain__*"])
+        );
+
+        reverse_managed_side_effects(&frag).unwrap();
+        assert!(!skill.exists(), "skill removed");
+        assert!(!skill.parent().unwrap().exists(), "empty skill dir pruned");
+        assert_eq!(
+            std::fs::read_to_string(&claude_md).unwrap(),
+            "# notes",
+            "CLAUDE.md restored byte-for-byte (no trailing newline added)"
+        );
+        let after: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&settings).unwrap()).unwrap();
+        assert_eq!(
+            after["permissions"]["allow"],
+            serde_json::json!(["Bash(ls)"]),
+            "our allow entry removed, the user's kept"
+        );
     }
 }

@@ -180,7 +180,9 @@ pub fn write_managed_file(file: &ManagedFile) -> Result<()> {
 }
 
 /// Delete an installer-owned file if present (the inverse of
-/// [`write_managed_file`]). Missing path is a no-op success.
+/// [`write_managed_file`]) and best-effort prune the now-empty directories the
+/// install created for it, so uninstall leaves no empty `skills/<name>/` tree.
+/// Missing path is a no-op success.
 ///
 /// # Errors
 /// Returns [`Error::Io`] on a filesystem failure other than "not found".
@@ -188,21 +190,29 @@ pub fn remove_managed_file(path: &Path) -> Result<()> {
     if path.exists() {
         fs::remove_file(path).map_err(|e| Error::Io(e.to_string()))?;
     }
+    // Best-effort: prune the directories the install created for this file (e.g.
+    // `skills/rusty-brain-memory/`, then `skills/`). `remove_dir` only succeeds on
+    // an EMPTY dir, so a user dir that holds other entries is never removed.
+    // Bounded to two levels so it never ascends to the agent config root
+    // (`.claude/`); any error (non-empty / missing / permissions) just stops.
+    let mut dir = path.parent();
+    for _ in 0..2 {
+        match dir {
+            Some(d) if fs::remove_dir(d).is_ok() => dir = d.parent(),
+            _ => break,
+        }
+    }
     Ok(())
 }
 
-/// Append (or, if already present, REPLACE in place) a marker-delimited text
-/// block in `block.path` (W3.2(b)), creating the file if absent. Idempotent: a
-/// second install with the same body is a no-op; a changed body replaces only
-/// the bytes between the markers, leaving the user's surrounding prose intact.
-///
-/// # Errors
-/// Returns [`Error::Io`] on read/write failure.
 pub fn ensure_text_block(block: &ManagedTextBlock) -> Result<()> {
     let (begin, end) = block_markers(&block.marker_id);
     let rendered = format!("{begin}\n{}\n{end}\n", block.body.trim_end());
     let existing = read_text(&block.path)?;
     let updated = match find_block(&existing, &begin, &end) {
+        // Already present: replace ONLY the bytes between (and including) the
+        // markers, leaving the user's surrounding content — and our leading
+        // separator at `start - 1` — untouched.
         Some((start, stop)) => {
             let mut s = String::with_capacity(existing.len());
             s.push_str(&existing[..start]);
@@ -210,18 +220,14 @@ pub fn ensure_text_block(block: &ManagedTextBlock) -> Result<()> {
             s.push_str(&existing[stop..]);
             s
         }
-        None => {
-            let mut s = existing.clone();
-            // Separate from prior content with exactly one blank line.
-            if !s.is_empty() {
-                if !s.ends_with('\n') {
-                    s.push('\n');
-                }
-                s.push('\n');
-            }
-            s.push_str(&rendered);
-            s
-        }
+        // Absent + empty file: write the block with NO leading separator, so no
+        // spurious leading blank line is left (and removal restores empty).
+        None if existing.is_empty() => rendered,
+        // Absent + non-empty: append after exactly ONE '\n' separator. That
+        // single owned newline is what `remove_text_block` strips, so the
+        // round-trip is byte-for-byte even when `existing` had no trailing
+        // newline (it then reads as `existing\n<block>`).
+        None => format!("{existing}\n{rendered}"),
     };
     if updated == existing {
         return Ok(());
@@ -230,10 +236,11 @@ pub fn ensure_text_block(block: &ManagedTextBlock) -> Result<()> {
 }
 
 /// Remove our marker-delimited block from `path` (the inverse of
-/// [`ensure_text_block`]), plus one blank-line separator immediately before it.
-/// The user's surrounding content is preserved; a file that held only our block
-/// is left empty rather than deleted (it may be a user-created `CLAUDE.md`).
-/// Missing path / absent block is a no-op success.
+/// [`ensure_text_block`]), including the single leading separator it owns, so the
+/// file is restored byte-for-byte to its pre-install content. The user's
+/// surrounding content is preserved; a file that held only our block is left
+/// empty rather than deleted (it may be a user-created `CLAUDE.md`). Missing path
+/// / absent block is a no-op success.
 ///
 /// # Errors
 /// Returns [`Error::Io`] on read/write failure.
@@ -246,14 +253,18 @@ pub fn remove_text_block(path: &Path, marker_id: &str) -> Result<()> {
     let Some((start, stop)) = find_block(&existing, &begin, &end) else {
         return Ok(());
     };
-    // Consume one blank-line separator we inserted before the block, if present.
-    let real_start = if existing[..start].ends_with("\n\n") {
+    // Strip the single leading '\n' separator `ensure_text_block` owns — the byte
+    // immediately before the begin marker — so the file is restored byte-for-byte
+    // to its pre-install content. `start - 1` indexes that ASCII '\n' (a valid
+    // char boundary); when the block sits at offset 0 (the file was empty) there
+    // is no separator to strip.
+    let cut = if start > 0 && existing.as_bytes()[start - 1] == b'\n' {
         start - 1
     } else {
         start
     };
     let mut updated = String::with_capacity(existing.len());
-    updated.push_str(&existing[..real_start]);
+    updated.push_str(&existing[..cut]);
     updated.push_str(&existing[stop..]);
     if updated == existing {
         return Ok(());
@@ -881,5 +892,68 @@ mod tests {
         assert!(!path.exists());
         // Removing an absent file is a no-op success.
         remove_managed_file(&path).unwrap();
+    }
+
+    #[test]
+    fn text_block_round_trip_is_byte_for_byte_regardless_of_trailing_newline() {
+        let dir = tempfile::tempdir().unwrap();
+        // Three originals: no trailing newline, with one, and empty.
+        for (i, original) in ["# Title", "# Title\n", ""].iter().enumerate() {
+            let path = dir.path().join(format!("CLAUDE{i}.md"));
+            fs::write(&path, original).unwrap();
+            let block = ManagedTextBlock {
+                path: path.clone(),
+                marker_id: "memory-policy".to_string(),
+                body: "policy".to_string(),
+            };
+            ensure_text_block(&block).unwrap();
+            assert!(
+                fs::read_to_string(&path)
+                    .unwrap()
+                    .contains("BEGIN rusty-brain:memory-policy"),
+                "block installed for original {original:?}"
+            );
+            remove_text_block(&path, "memory-policy").unwrap();
+            assert_eq!(
+                fs::read_to_string(&path).unwrap(),
+                *original,
+                "install+uninstall must restore original {original:?} byte-for-byte"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_managed_file_prunes_empty_dirs_but_not_populated() {
+        let dir = tempfile::tempdir().unwrap();
+        let skills = dir.path().join("skills");
+        let skill = skills.join("rusty-brain-memory").join("SKILL.md");
+        write_managed_file(&ManagedFile {
+            path: skill.clone(),
+            contents: "# skill".to_string(),
+        })
+        .unwrap();
+        assert!(skill.exists() && skills.exists());
+        remove_managed_file(&skill).unwrap();
+        assert!(!skill.exists(), "skill file removed");
+        assert!(
+            !skills.exists(),
+            "the empty skills/ tree the install created is pruned"
+        );
+
+        // A populated skills/ (another skill present) is NOT removed.
+        write_managed_file(&ManagedFile {
+            path: skill.clone(),
+            contents: "# skill".to_string(),
+        })
+        .unwrap();
+        let other = skills.join("user-skill").join("SKILL.md");
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(&other, "# user").unwrap();
+        remove_managed_file(&skill).unwrap();
+        assert!(!skill.parent().unwrap().exists(), "our empty dir pruned");
+        assert!(
+            skills.exists() && other.exists(),
+            "populated skills/ and the user's skill survive"
+        );
     }
 }

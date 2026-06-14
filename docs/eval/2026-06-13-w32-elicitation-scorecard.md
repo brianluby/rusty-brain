@@ -60,11 +60,14 @@ cargo build --release -p rusty-brain -p rb-hooks -p rb-install
 scripts/w32-elicitation-scorecard.sh --bin-dir target/release
 ```
 
-The runner isolates each scenario to its own `HOME` + namespace, installs via the
-real `rusty-brain-install` (so it exercises the channel-(c) `permissions.allow`
-write the prior nightly smoke script had to hand-patch), drives the two sessions
-with a cheap model under a hard spend cap, and detects the two metrics from the
-session transcripts under `~/.claude/projects/`.
+The runner runs each scenario's PLANT and WORK sessions in **separate `HOME`s**
+that share one socket/DB/namespace — so WORK recalls what PLANT stored while each
+session's transcript tree stays separate, letting each metric be scoped to the
+right session. It installs via the real `rusty-brain-install` (so it exercises the
+channel-(c) `permissions.allow` write the prior nightly smoke script had to
+hand-patch), drives the two sessions with a cheap model under a hard spend cap,
+and detects the two metrics from the per-session transcripts under
+`~/.claude/projects/`.
 
 ## Detection method (best-effort; refine on first measured run)
 

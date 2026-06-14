@@ -108,21 +108,19 @@ transcript_has_tool() {
   grep -rqlF "$tool" "$proj_transcripts_dir" 2>/dev/null
 }
 
-run_scenario() {
-  # Returns "<remember_fired> <recall_before_work>" as 0/1 pair on stdout.
-  local id="$1" plant="$2" work="$3"
-  local home="$WORKROOT/$id/home" proj="$WORKROOT/$id/proj"
+# Set up + run ONE headless session in its OWN HOME — so its transcript tree is
+# isolated for per-session metric scoping — but against a SHARED socket/DB/
+# namespace, so the WORK session recalls what the PLANT session stored.
+run_one_session() {
+  local home="$1" proj="$2" prompt="$3" log="$4" sock="$5" db="$6" ns="$7"
   mkdir -p "$home" "$proj"
+  printf '{"hasCompletedOnboarding": true}\n' > "$home/.claude.json"
   (
     export HOME="$home"
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
-    unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET
-    export RUSTY_BRAIN_SOCKET="$WORKROOT/$id/sock"
-    export RUSTY_BRAIN_NAMESPACE="rb-scorecard-$id"
+    export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
     export PATH="$BIN_DIR:$PATH"
-    printf '{"hasCompletedOnboarding": true}\n' > "$HOME/.claude.json"
     cd "$proj"
-
     # Install hooks + the W3.2 channels (the installer now writes the
     # permissions.allow mcp__rusty-brain__* entry — channel c). MCP server config
     # is project-scoped (.mcp.json + enableAllProjectMcpServers approves it
@@ -138,33 +136,43 @@ with open(p) as f: s = json.load(f)
 s["enableAllProjectMcpServers"] = True
 with open(p, "w") as f: json.dump(s, f, indent=2); f.write("\n")
 PY
-
-    common=(--setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD"
-            --permission-mode acceptEdits --allowedTools "Bash Edit Write")
-
-    # 1) PLANT session: state the decision; let the model elect to remember.
-    claude -p "$plant" "${common[@]}" >"$WORKROOT/$id/plant.log" 2>&1 || true
-    # 2) WORK session (fresh context, same namespace): UserPromptSubmit recall
-    #    fires deterministically before the model acts.
-    claude -p "$work" "${common[@]}" >"$WORKROOT/$id/work.log" 2>&1 || true
-
-    local transcripts="$HOME/.claude/projects"
-    local remembered=0 recalled=0
-    transcript_has_tool "$transcripts" "mcp__rusty-brain__remember" && remembered=1
-    # recall_before_work: the deterministic UserPromptSubmit injection reached
-    # the model (its block header is recorded in the work turn's context) OR the
-    # model made its own recall call.
-    if grep -rqlF "Memories relevant to this prompt" "$transcripts" 2>/dev/null \
-       || transcript_has_tool "$transcripts" "mcp__rusty-brain__recall"; then
-      recalled=1
-    fi
-    echo "$remembered $recalled"
+    claude -p "$prompt" \
+      --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
+      --permission-mode acceptEdits --allowedTools "Bash Edit Write" \
+      >"$log" 2>&1 || true
   )
+}
+
+run_scenario() {
+  # Echoes "<remember_fired> <recall_before_work>" (0/1 pair).
+  local id="$1" plant="$2" work="$3"
+  local base="$WORKROOT/$id"
+  local sock="$base/sock" db="$base/memory.db" ns="rb-scorecard-$id"
+  # PLANT and WORK run in SEPARATE HOMEs (so their transcript trees don't
+  # comingle — fix for the metric-conflation finding) but share the store via
+  # sock/db/ns, so WORK recalls what PLANT stored.
+  run_one_session "$base/home_plant" "$base/proj_plant" "$plant" "$base/plant.log" "$sock" "$db" "$ns"
+  run_one_session "$base/home_work" "$base/proj_work" "$work" "$base/work.log" "$sock" "$db" "$ns"
+
+  local rem=0 rec=0
+  # remember_fired: a model-initiated remember in the PLANT session ONLY.
+  transcript_has_tool "$base/home_plant/.claude/projects" "mcp__rusty-brain__remember" && rem=1
+  # recall_before_work: in the WORK session, the deterministic UserPromptSubmit
+  # injection reached the model (its block header is recorded in the work turn's
+  # context) OR the model made its own recall call.
+  if grep -rqlF "Memories relevant to this prompt" "$base/home_work/.claude/projects" 2>/dev/null \
+     || transcript_has_tool "$base/home_work/.claude/projects" "mcp__rusty-brain__recall"; then
+    rec=1
+  fi
+  echo "$rem $rec"
 }
 
 echo "== W3.2 elicitation scorecard (model=$MODEL, budget=\$$MAX_BUDGET_USD/session) =="
 total=0; remembered=0; recalled=0
-mapfile -t rows < <(jq -c '.scenarios[]' "$SCENARIOS")
+# Portable scenario load: `mapfile`/`readarray` is bash 4+, absent from the
+# bash 3.2 macOS ships, so read the JSONL objects with a plain loop.
+rows=()
+while IFS= read -r row; do rows+=("$row"); done < <(jq -c '.scenarios[]' "$SCENARIOS")
 for row in "${rows[@]}"; do
   id="$(jq -r '.id' <<<"$row")"
   plant="$(jq -r '.plant' <<<"$row")"
