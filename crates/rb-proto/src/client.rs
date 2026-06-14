@@ -5,8 +5,8 @@ use crate::frame::{read_frame, write_frame};
 use crate::messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
 use crate::{response_error_to_error, Response as Resp};
 use rb_types::{
-    Error, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result,
-    SearchResult,
+    Error, FeedbackKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
+    Result, SearchResult,
 };
 use std::path::Path;
 use tokio::net::UnixStream;
@@ -378,6 +378,16 @@ impl Client {
         }
     }
 
+    /// Record a usefulness signal about a recalled memory (W3.7). Returns the
+    /// memory's `confidence` after the bounded nudge.
+    pub async fn feedback(&mut self, id: MemoryId, kind: FeedbackKind) -> Result<f32> {
+        let resp = self.request(Request::Feedback { id, kind }).await?;
+        match resp {
+            Resp::FeedbackRecorded { confidence } => Ok(confidence),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// Soft-archive a memory.
     pub async fn delete(&mut self, id: MemoryId) -> Result<()> {
         let resp = self.request(Request::Delete { id }).await?;
@@ -724,6 +734,7 @@ mod wrapper_tests {
                 },
                 Request::Update { .. } => Response::Updated,
                 Request::Link { .. } => Response::Linked,
+                Request::Feedback { .. } => Response::FeedbackRecorded { confidence: 0.7 },
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
                     recent: vec![note()],

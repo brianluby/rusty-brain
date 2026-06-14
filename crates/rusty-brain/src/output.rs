@@ -126,6 +126,15 @@ pub fn render_linked(json: bool) -> String {
     }
 }
 
+/// Render a successful feedback acknowledgement, echoing the post-nudge trust prior.
+pub fn render_feedback(confidence: f32, json: bool) -> String {
+    if json {
+        format!("{{\"confidence\":{confidence}}}")
+    } else {
+        format!("Feedback recorded (confidence now {confidence:.2})")
+    }
+}
+
 /// Render a successful delete acknowledgement.
 pub fn render_deleted(json: bool) -> String {
     if json {
@@ -343,6 +352,14 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["deleted"].as_bool(), Some(true));
         assert_eq!(render_deleted(false), "Deleted");
+    }
+
+    #[test]
+    fn feedback_renders_confidence_in_both_modes() {
+        let json = render_feedback(0.4, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!((parsed["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!(render_feedback(0.4, false).contains("0.40"));
     }
 
     #[test]

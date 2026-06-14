@@ -286,6 +286,7 @@ mod tests {
                 }
                 Request::Update { .. } => Response::Updated,
                 Request::Link { .. } => Response::Linked,
+                Request::Feedback { .. } => Response::FeedbackRecorded { confidence: 0.7 },
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
                     recent: vec![note()],
@@ -411,8 +412,15 @@ mod tests {
         let r = req("tools/list", Some(2), json!({}));
         let resp = handle_request(r, &mut proxy).await.unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 5);
-        for name in ["remember", "recall", "get", "context", "update"] {
+        assert_eq!(tools.len(), 6);
+        for name in [
+            "remember",
+            "recall",
+            "get",
+            "context",
+            "update",
+            "memory_feedback",
+        ] {
             assert!(
                 tools.iter().any(|t| t["name"] == name),
                 "default set includes {name}"

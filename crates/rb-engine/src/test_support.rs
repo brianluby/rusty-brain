@@ -282,6 +282,22 @@ impl MemoryBackend for MockBackend {
         Ok(())
     }
 
+    async fn record_feedback(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        _principal: Option<String>,
+    ) -> rb_types::Result<f32> {
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&id)
+            .filter(|note| note.namespace == ns)
+            .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+        note.confidence = (note.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
+        Ok(note.confidence)
+    }
+
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
         use std::sync::atomic::Ordering;
         self.record_access_calls.fetch_add(1, Ordering::SeqCst);

@@ -152,6 +152,21 @@ fn fresh_db_exercises_every_query_path() {
         "stale FTS token 'concurrent' must be removed when a's content is updated"
     );
 
+    // --- record_feedback: migration 008 memory_feedback table + confidence nudge
+    // (a missing table/column here fails the whole gate, which is the point).
+    let conf_before = store.get_memory(&a.id).unwrap().unwrap().confidence;
+    let conf_after = store
+        .record_feedback(&a.id, rb_types::FeedbackKind::Wrong, Some("alice"))
+        .unwrap();
+    assert!(
+        conf_after < conf_before,
+        "wrong feedback lowers confidence ({conf_before} -> {conf_after})"
+    );
+    assert!(
+        (store.get_memory(&a.id).unwrap().unwrap().confidence - conf_after).abs() < 1e-6,
+        "the row reflects the nudged confidence"
+    );
+
     // --- archive_memory: soft delete; dropped from active list + keyword search
     store.archive_memory(&b.id).unwrap();
     let active_after = store.list(&ns, None, 10).unwrap();

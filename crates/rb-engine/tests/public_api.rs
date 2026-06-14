@@ -128,6 +128,22 @@ impl MemoryBackend for VecBackend {
         Ok(())
     }
 
+    async fn record_feedback(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        _principal: Option<String>,
+    ) -> rb_types::Result<f32> {
+        let mut guard = self.notes.lock().unwrap();
+        let note = guard
+            .get_mut(&id)
+            .filter(|note| note.namespace == ns)
+            .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+        note.confidence = (note.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
+        Ok(note.confidence)
+    }
+
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
         let mut guard = self.notes.lock().unwrap();
         // Trait contract: duplicates within one call bump once (mirrors

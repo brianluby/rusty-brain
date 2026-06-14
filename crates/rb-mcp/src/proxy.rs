@@ -6,7 +6,7 @@ use crate::jsonrpc::{JsonRpcError, INVALID_PARAMS, METHOD_NOT_FOUND};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rb_proto::{Request, Response};
-use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates};
+use rb_types::{FeedbackKind, MemoryId, MemoryNote, MemoryType, MemoryUpdates};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
@@ -225,6 +225,14 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
             id: parse_id(args)?,
         }),
         "context" => Ok(Request::Context),
+        "memory_feedback" => {
+            let id = parse_id(args)?;
+            let kind_raw = require_str(args, "kind")?;
+            // Forward FeedbackKind's own guidance ("expected helpful, wrong, or
+            // stale") as INVALID_PARAMS, mirroring the `link` type parse.
+            let kind = FeedbackKind::parse(kind_raw).map_err(|e| invalid(e.to_string()))?;
+            Ok(Request::Feedback { id, kind })
+        }
         other => Err(JsonRpcError::new(
             METHOD_NOT_FOUND,
             format!("unknown tool '{other}'"),
@@ -431,6 +439,13 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         }
         Response::Updated => ToolContent::json(json!({ "ok": true }), false),
         Response::Linked => ToolContent::json(json!({ "ok": true }), false),
+        // W3.7: an ack like Updated/Linked/Deleted — JSON in `text` (not a
+        // projected markdown line), so clients that parse `content[].text` as
+        // JSON for non-recall tools stay consistent. Echoes the post-nudge
+        // trust prior so the model sees the effect.
+        Response::FeedbackRecorded { confidence } => {
+            ToolContent::json(json!({ "ok": true, "confidence": confidence }), false)
+        }
         Response::Deleted => ToolContent::json(json!({ "ok": true }), false),
         Response::ContextResult {
             recent,
@@ -599,6 +614,35 @@ mod tests {
         }
         let d = build_request("delete", &json!({ "id": id.to_string() })).unwrap();
         assert!(matches!(d, Request::Delete { .. }));
+    }
+
+    #[test]
+    fn build_memory_feedback_parses_id_and_kind() {
+        let id = MemoryId::new();
+        let f = build_request(
+            "memory_feedback",
+            &json!({ "id": id.to_string(), "kind": "stale" }),
+        )
+        .unwrap();
+        match f {
+            Request::Feedback { kind, .. } => assert_eq!(kind, rb_types::FeedbackKind::Stale),
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+        // An unknown kind fails closed with INVALID_PARAMS + guidance.
+        let err = build_request(
+            "memory_feedback",
+            &json!({ "id": id.to_string(), "kind": "useless" }),
+        )
+        .unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+        assert!(
+            err.message.contains("helpful, wrong, or stale"),
+            "{}",
+            err.message
+        );
+        // A missing kind is a missing-required-string error.
+        let err = build_request("memory_feedback", &json!({ "id": id.to_string() })).unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
     }
 
     #[test]
@@ -945,6 +989,14 @@ mod tests {
             "error variant carries an `error` key"
         );
         assert!(err.is_error, "error variant sets the isError flag");
+
+        // W3.7: feedback is an ack — JSON in `text` (== structured), like
+        // Updated/Linked/Deleted — echoing the post-nudge confidence.
+        let fb = response_to_content(Response::FeedbackRecorded { confidence: 0.4 }, now);
+        assert!(!fb.is_error);
+        let fb_text: serde_json::Value = serde_json::from_str(&fb.text).unwrap();
+        assert!((fb_text["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
+        assert!((fb.structured["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
     }
 
     #[test]

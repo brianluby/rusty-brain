@@ -1,6 +1,6 @@
 use rb_types::{
-    JobKind, LinkType, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
-    SearchResult,
+    FeedbackKind, JobKind, LinkType, MemoryChanged, MemoryId, MemoryNote, MemoryType,
+    MemoryUpdates, Namespace, SearchResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -175,6 +175,21 @@ pub enum Request {
     /// Reembed / NamespaceRename. Replies with `Response::Scrubbed`. Additive
     /// variant per the `NamespaceRename` precedent (no CONTRACT_VERSION bump).
     Scrub,
+    /// Record a usefulness signal about a recalled memory (W3.7 / F37): the
+    /// distinct correctness/usefulness signal `access_count` is not (it counts
+    /// "returned", not "useful"). Namespace-scoped like `Update`/`Link` (NOT an
+    /// admin op) — the engine verifies `id` lives in the connection's namespace.
+    /// The daemon records a durable event row + an oplog entry and nudges the
+    /// memory's `confidence` (single-axis coupling, see `FeedbackKind`),
+    /// replying with `Response::FeedbackRecorded { confidence }`. Additive
+    /// variant per the `Link`/`Scrub` precedent: an old daemon fails to decode
+    /// it and closes the connection (no CONTRACT_VERSION bump — the handshake
+    /// version gates the shape of SHARED result types, and a new op the old
+    /// daemon simply does not implement is not such a change).
+    Feedback {
+        id: MemoryId,
+        kind: FeedbackKind,
+    },
 }
 
 /// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
@@ -264,6 +279,13 @@ pub enum Response {
         scanned: u64,
         redacted: u64,
         reembed_pending: u64,
+    },
+    /// Acknowledges a `Request::Feedback` (W3.7): `confidence` is the target
+    /// memory's trust prior AFTER the bounded nudge, so the caller can surface
+    /// the effect. Additive variant; old clients never see it because they never
+    /// send the request.
+    FeedbackRecorded {
+        confidence: f32,
     },
     Error {
         kind: String,
@@ -564,6 +586,10 @@ mod tests {
                 merge: true,
             },
             Request::Scrub,
+            Request::Feedback {
+                id: MemoryId::new(),
+                kind: rb_types::FeedbackKind::Wrong,
+            },
         ]
     }
 
@@ -654,6 +680,7 @@ mod tests {
                 vectors: 9,
             },
             Response::Linked,
+            Response::FeedbackRecorded { confidence: 0.4 },
             Response::Scrubbed {
                 scanned: 200,
                 redacted: 3,

@@ -1,11 +1,16 @@
 //! Command-line surface for the `rusty-brain` binary (clap derive).
 
 use clap::{value_parser, Parser, Subcommand};
-use rb_types::{LinkType, MemoryType};
+use rb_types::{FeedbackKind, LinkType, MemoryType};
 
 /// Parse a `--type` value into a `MemoryType` using the canonical db strings.
 fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
     MemoryType::parse(s).map_err(|e| e.to_string())
+}
+
+/// Parse a feedback `--kind` value into a `FeedbackKind` (helpful|wrong|stale).
+fn parse_feedback_kind(s: &str) -> Result<FeedbackKind, String> {
+    FeedbackKind::parse(s).map_err(|e| e.to_string())
 }
 
 /// Parse a link `--type` value into a `LinkType` using the canonical db strings.
@@ -171,6 +176,16 @@ pub enum Command {
         /// Why this link exists (stored on the edge).
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Record a usefulness signal about a memory (W3.7): `helpful`, `wrong`, or
+    /// `stale`. Nudges the memory's trust prior so future recalls improve.
+    Feedback {
+        /// Memory id (UUID) the feedback is about.
+        id: String,
+        /// Feedback kind: `helpful`, `wrong`, or `stale`.
+        #[arg(long = "kind", value_parser = parse_feedback_kind)]
+        kind: FeedbackKind,
     },
 
     /// Soft-delete (archive) a memory.
@@ -438,6 +453,32 @@ mod tests {
     fn link_requires_an_explicit_type() {
         let res = Cli::try_parse_from(["rusty-brain", "link", "a-id", "b-id"]);
         assert!(res.is_err(), "--type is required for link");
+    }
+
+    #[test]
+    fn feedback_parses_id_and_kind() {
+        let id = "0c8e7f76-3a4f-4f7e-9d3a-111111111111";
+        let cli = Cli::parse_from(["rusty-brain", "feedback", id, "--kind", "wrong"]);
+        match cli.command {
+            Command::Feedback { id: got, kind } => {
+                assert_eq!(got, id);
+                assert_eq!(kind, FeedbackKind::Wrong);
+            }
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feedback_rejects_unknown_kind_and_requires_it() {
+        // An invalid --kind fails at parse time (value_parser = parse_feedback_kind).
+        let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id", "--kind", "useless"]);
+        assert!(
+            res.is_err(),
+            "unknown --kind must be rejected at parse time"
+        );
+        // --kind is required.
+        let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id"]);
+        assert!(res.is_err(), "--kind is required for feedback");
     }
 
     #[test]

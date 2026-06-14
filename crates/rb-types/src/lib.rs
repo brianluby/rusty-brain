@@ -7,6 +7,7 @@
 
 mod change;
 mod error;
+mod feedback_kind;
 mod job;
 mod link;
 mod link_type;
@@ -19,6 +20,7 @@ mod validate;
 
 pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
+pub use feedback_kind::FeedbackKind;
 pub use job::JobKind;
 pub use link::{MemoryLink, SIMILARITY_LINK_MAX_COSINE_DISTANCE};
 pub use link_type::LinkType;

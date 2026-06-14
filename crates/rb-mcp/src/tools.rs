@@ -37,7 +37,14 @@ fn memory_type_enum() -> Value {
 /// Single source of truth for the default advertised set: the installer's
 /// `permissions.allow` allowlist (rb-install) is drift-tested against this, so
 /// every advertised default tool is auto-approved and none stalls a headless run.
-pub const DEFAULT_TOOLS: [&str; 5] = ["remember", "recall", "get", "context", "update"];
+pub const DEFAULT_TOOLS: [&str; 6] = [
+    "remember",
+    "recall",
+    "get",
+    "context",
+    "update",
+    "memory_feedback",
+];
 
 /// True when `RB_MCP_FULL_TOOLSET` is set (to any value): advertise every tool.
 fn full_toolset_enabled() -> bool {
@@ -216,6 +223,26 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "memory_feedback",
+            description: "Report whether a recalled memory was actually useful. Use AFTER \
+                          acting on a memory recall surfaced: 'helpful' if it helped, \
+                          'wrong' if it was incorrect, 'stale' if it was once right but is \
+                          now outdated. This is the usefulness signal access counts cannot \
+                          capture; it adjusts the memory's trust so future recalls improve.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string",
+                            "description": "Memory id (UUID) the feedback is about." },
+                    "kind": { "type": "string",
+                              "enum": ["helpful", "wrong", "stale"],
+                              "description": "helpful = was useful; wrong = incorrect; \
+                                              stale = outdated." }
+                },
+                "required": ["id", "kind"]
+            }),
+        },
+        ToolDef {
             name: "poll_changes",
             description: "Drain buffered change notifications for the current \
                           namespace since the last poll. Returns up to `max` events, \
@@ -241,7 +268,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn exposes_exactly_the_ten_tools() {
+    fn exposes_exactly_the_eleven_tools() {
         let names: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
         let expected: BTreeSet<&str> = [
             "remember",
@@ -253,28 +280,36 @@ mod tests {
             "link",
             "delete",
             "context",
+            "memory_feedback",
             "poll_changes",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             names, expected,
-            "tool set must be the 8 spine tools + link + poll_changes"
+            "tool set must be the 8 spine tools + link + memory_feedback + poll_changes"
         );
-        assert_eq!(tool_definitions().len(), 10);
+        assert_eq!(tool_definitions().len(), 11);
     }
 
     #[test]
     fn advertised_default_set_is_the_token_economy_subset() {
-        // W3.3: by default tools/list advertises only remember/recall/get/
-        // context/update; the rest are gated behind RB_MCP_FULL_TOOLSET.
+        // By default tools/list advertises remember/recall/get/context/update +
+        // memory_feedback (W3.7); the rest are gated behind RB_MCP_FULL_TOOLSET.
         let default: BTreeSet<&str> = advertised_tool_definitions_for(false)
             .iter()
             .map(|t| t.name)
             .collect();
-        let expected: BTreeSet<&str> = ["remember", "recall", "get", "context", "update"]
-            .into_iter()
-            .collect();
+        let expected: BTreeSet<&str> = [
+            "remember",
+            "recall",
+            "get",
+            "context",
+            "update",
+            "memory_feedback",
+        ]
+        .into_iter()
+        .collect();
         assert_eq!(
             default, expected,
             "default tools/list = the W3.3 token-economy subset"

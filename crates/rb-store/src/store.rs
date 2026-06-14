@@ -109,6 +109,21 @@ pub trait Store {
     /// Mark `old` as superseded by `new` AND archive `old`, in one transaction.
     /// Fails closed (rolls back) if `new` does not exist (FK on `superseded_by`).
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()>;
+    /// Record one usefulness-feedback event for `id` and nudge its `confidence`
+    /// (W3.7): in ONE transaction, append a `memory_feedback` row (kind +
+    /// `principal` giver), clamp `confidence + kind.confidence_delta()` to
+    /// `0.0..=1.0` and UPDATE the row, and append a `memory_oplog` `feedback`
+    /// entry — so the event log, the trust prior, and the durable change log can
+    /// never disagree. Returns the post-nudge `confidence`. A missing id is
+    /// `Error::NotFound` (the daemon already verifies namespace membership, but
+    /// this fails closed independently). `updated_at` is intentionally NOT
+    /// bumped (like `set_confidence`): feedback is not an authorial content edit.
+    fn record_feedback(
+        &self,
+        id: &MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<&str>,
+    ) -> Result<f32>;
     /// Fetch all of `ids` that exist AND belong to `ns`, returned in the SAME
     /// order as `ids` (missing/out-of-namespace ids skipped). One query; fixes
     /// the recall N+1. Links are loaded per returned note.
@@ -2568,6 +2583,61 @@ impl Store for SqliteStore {
         })
     }
 
+    fn record_feedback(
+        &self,
+        id: &MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<&str>,
+    ) -> Result<f32> {
+        let now = chrono::Utc::now().timestamp();
+        // Transaction: the feedback event row, the confidence nudge, and the
+        // oplog entry commit (or roll back) together — the usefulness signal,
+        // the trust prior, and the durable change log must never disagree.
+        immediate_tx(&self.conn, || {
+            // Read the current confidence + namespace fail-closed: a missing id
+            // is NotFound (the daemon already namespace-checks, but the store
+            // does not depend on that). The namespace rides into the feedback
+            // row and the oplog entry.
+            let row = match self.conn.query_row(
+                "SELECT confidence, namespace FROM memories WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| Ok((r.get::<_, f64>(0)?, r.get::<_, String>(1)?)),
+            ) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Err(Error::NotFound(id.clone()))
+                }
+                Err(e) => return Err(Error::Storage(e.to_string())),
+            };
+            let (current, namespace) = row;
+            // Single-axis confidence coupling (W3.7): clamp to the canonical
+            // 0.0..=1.0 range so one nudge can never push the prior out of band.
+            let new_confidence = ((current as f32) + kind.confidence_delta()).clamp(0.0, 1.0);
+            self.conn
+                .execute(
+                    "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
+                    rusqlite::params![new_confidence as f64, id.to_string()],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            self.conn
+                .execute(
+                    "INSERT INTO memory_feedback (memory_id, namespace, kind, principal, at)
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![id.to_string(), namespace, kind.as_str(), principal, now],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            // Durable oplog entry: the kind + resulting confidence ride in
+            // `details` so a replay/audit can reconstruct the nudge.
+            let details = serde_json::json!({
+                "kind": kind.as_str(),
+                "confidence": new_confidence,
+            })
+            .to_string();
+            append_oplog(&self.conn, &self.site_id, "feedback", id, &details)?;
+            Ok(new_confidence)
+        })
+    }
+
     fn get_many(&self, ns: &Namespace, ids: &[MemoryId]) -> Result<Vec<MemoryNote>> {
         if ids.is_empty() {
             return Ok(Vec::new());
@@ -4579,6 +4649,126 @@ mod update_tests {
         store.set_confidence(&MemoryId::new(), 0.2).unwrap();
         let still = store.get_memory(&m.id).unwrap().unwrap();
         assert!((still.confidence - 0.75).abs() < 1e-6);
+    }
+
+    #[test]
+    fn record_feedback_logs_event_moves_confidence_and_appends_oplog() {
+        use rb_types::FeedbackKind;
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(ns.clone(), "body".into(), MemoryType::Insight, 5);
+        m.confidence = 0.5;
+        store.insert_memory(&m, None).unwrap();
+
+        // `wrong` lowers confidence by the bounded delta and returns the result.
+        let after = store
+            .record_feedback(&m.id, FeedbackKind::Wrong, Some("alice"))
+            .unwrap();
+        assert!((after - 0.2).abs() < 1e-6, "0.5 - 0.30 = 0.20, got {after}");
+        let got = store.get_memory(&m.id).unwrap().unwrap();
+        assert!(
+            (got.confidence - 0.2).abs() < 1e-6,
+            "row reflects the nudge"
+        );
+
+        // `helpful` raises it back up by its (smaller) delta.
+        let after2 = store
+            .record_feedback(&m.id, FeedbackKind::Helpful, None)
+            .unwrap();
+        assert!(
+            (after2 - 0.25).abs() < 1e-6,
+            "0.20 + 0.05 = 0.25, got {after2}"
+        );
+
+        // Two event rows recorded, with kind + principal preserved (NULL when none).
+        let rows: Vec<(String, Option<String>, String)> = {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT kind, principal, namespace FROM memory_feedback
+                     WHERE memory_id = ?1 ORDER BY id",
+                )
+                .unwrap();
+            stmt.query_map(rusqlite::params![m.id.to_string()], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, Option<String>>(1)?,
+                    r.get::<_, String>(2)?,
+                ))
+            })
+            .unwrap()
+            .collect::<std::result::Result<_, _>>()
+            .unwrap()
+        };
+        assert_eq!(rows.len(), 2);
+        assert_eq!(
+            rows[0],
+            ("wrong".into(), Some("alice".into()), ns.as_db_string())
+        );
+        assert_eq!(rows[1], ("helpful".into(), None, ns.as_db_string()));
+
+        // Each feedback event appended exactly one `feedback` oplog row.
+        let oplog_feedback: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_oplog WHERE op = 'feedback' AND memory_id = ?1",
+                rusqlite::params![m.id.to_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oplog_feedback, 2, "one oplog row per feedback event");
+    }
+
+    #[test]
+    fn record_feedback_clamps_confidence_to_the_canonical_range() {
+        use rb_types::FeedbackKind;
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        let mut m = MemoryNote::new(ns, "body".into(), MemoryType::Insight, 5);
+        m.confidence = 1.0;
+        store.insert_memory(&m, None).unwrap();
+
+        // Many `wrong` reports floor at 0.0, never below.
+        let mut last = 1.0;
+        for _ in 0..10 {
+            last = store
+                .record_feedback(&m.id, FeedbackKind::Wrong, None)
+                .unwrap();
+        }
+        assert!(
+            (last - 0.0).abs() < 1e-6,
+            "wrong feedback floors at 0.0, got {last}"
+        );
+
+        // Many `helpful` reports cap at 1.0, never above.
+        let mut hi = 0.0;
+        for _ in 0..40 {
+            hi = store
+                .record_feedback(&m.id, FeedbackKind::Helpful, None)
+                .unwrap();
+        }
+        assert!(
+            (hi - 1.0).abs() < 1e-6,
+            "helpful feedback caps at 1.0, got {hi}"
+        );
+    }
+
+    #[test]
+    fn record_feedback_missing_id_is_not_found_and_writes_nothing() {
+        use rb_types::FeedbackKind;
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let missing = MemoryId::new();
+        let err = store
+            .record_feedback(&missing, FeedbackKind::Helpful, None)
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
+
+        // Fail-closed: the rolled-back transaction left no event row behind.
+        let count: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_feedback", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(count, 0, "a NotFound feedback inserts no row");
     }
 
     #[test]

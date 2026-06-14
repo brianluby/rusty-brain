@@ -152,6 +152,23 @@ impl MemoryBackend for SqliteBackend {
         store.record_access(&id)
     }
 
+    async fn record_feedback(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<String>,
+    ) -> rb_types::Result<f32> {
+        let store = self.lock()?;
+        // Namespace-scope like the daemon does before delegating to the store.
+        match store.get_memory(&id)? {
+            Some(note) if note.namespace == ns => {
+                store.record_feedback(&id, kind, principal.as_deref())
+            }
+            _ => Err(rb_types::Error::NotFound(id)),
+        }
+    }
+
     async fn record_accesses(&self, ids: Vec<MemoryId>) -> rb_types::Result<()> {
         let store = self.lock()?;
         store.record_accesses(&ids)
