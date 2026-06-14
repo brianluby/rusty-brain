@@ -74,12 +74,16 @@ and detects the two metrics from the per-session transcripts under
 - `remember_fired`: the PLANT session transcript JSONL contains a `tool_use`
   naming `mcp__rusty-brain__remember`.
 - `recall_before_work`: the WORK session transcript contains the deterministic
-  injection block header ("Memories relevant to this prompt") **or** a
-  `mcp__rusty-brain__recall` `tool_use`.
+  injection block header ("Memories relevant to this prompt"). This signal is
+  *before-work by construction* — the UserPromptSubmit hook injects at
+  prompt-submit, before the model's first action — so it cannot false-positive as
+  "recall after work" the way a model-initiated `recall` tool call (which can fire
+  mid-task) could; the tool-call fallback was therefore dropped.
 
 These greps are deliberately format-tolerant. The first real run should confirm
 how Claude Code records UserPromptSubmit `additionalContext` in the transcript
-and tighten the `recall_before_work` detection if needed.
+(and, if it is not recorded verbatim, fall back to asserting the recalled memory
+appears in the model's response).
 
 ## Notes / honesty
 

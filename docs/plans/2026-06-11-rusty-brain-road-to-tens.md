@@ -148,11 +148,11 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
 - *Channel (c) tool surface:* MCP tool descriptions rewritten to
   trigger-condition phrasing (remember/recall/get/context/list); MCP
   `instructions` added to `initialize` (was omitted); the Claude Code installer
-  now writes `permissions.allow: ["mcp__rusty-brain__*"]` — an anchored wildcard
-  verified valid against the Claude Code permission-rule docs (only an unanchored
-  `mcp__*` allow is rejected). Closes the S1 hard prereq: headless model-initiated
-  calls no longer stall on approval; the installer now emits what the nightly
-  smoke script had to hand-patch.
+  now writes least-privilege `permissions.allow` entries for the elicitation tools
+  (`mcp__rusty-brain__{remember,recall,get,list,context}` — the read-only tools
+  plus `remember`; NOT a `mcp__rusty-brain__*` wildcard, so a future mutating tool
+  like `delete` is not retroactively auto-approved). Closes the S1 hard prereq:
+  headless model-initiated remember/recall no longer stall on approval.
 - *Channel (b) policy:* a new installer managed-side-effects layer
   (`HookFragment::{allow_entries, managed_files, text_blocks}` + engine
   apply/reverse + idempotent, reversible writer ops) appends a marker-delimited

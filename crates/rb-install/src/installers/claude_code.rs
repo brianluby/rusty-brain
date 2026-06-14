@@ -14,13 +14,21 @@ use rb_types::Result;
 use super::{home_join, hooks_block, CLAUDE_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
-/// MCP tool-permission allowlist entry (W3.2(c) / spike S1): the anchored
-/// wildcard `mcp__rusty-brain__*` matches every tool the rusty-brain MCP server
-/// exposes, so headless `claude -p` runs never stall on a per-tool approval
-/// prompt. Per the Claude Code permission-rule docs an anchored
-/// `mcp__<server>__*` allow IS valid (only an unanchored `mcp__*` allow is
-/// rejected). Without this, every model-initiated remember/recall blocks.
-const MCP_ALLOW_ENTRY: &str = "mcp__rusty-brain__*";
+/// MCP tool-permission allowlist entries (W3.2(c) / spike S1): the tools the
+/// model needs for elicitation, allowlisted so headless `claude -p` runs never
+/// stall on a per-tool approval prompt. We enumerate the read-only tools plus
+/// `remember` (the only write) rather than the anchored wildcard
+/// `mcp__rusty-brain__*`: least-privilege keeps any future mutating/exfiltrating
+/// tool (e.g. `delete`, `link`) out of auto-approval until an intentional
+/// installer change adds it. Per the Claude Code permission-rule docs each
+/// `mcp__<server>__<tool>` entry is a valid exact allow.
+const MCP_ALLOW_ENTRIES: &[&str] = &[
+    "mcp__rusty-brain__remember",
+    "mcp__rusty-brain__recall",
+    "mcp__rusty-brain__get",
+    "mcp__rusty-brain__list",
+    "mcp__rusty-brain__context",
+];
 
 /// Skill directory name under `.claude/skills/` (W3.2(b)).
 const SKILL_DIR: &str = "rusty-brain-memory";
@@ -116,7 +124,7 @@ impl AgentInstaller for ClaudeCodeInstaller {
         // (c) allowlist the MCP server's tools (S1); (b) the CLAUDE.md policy block
         // + the memory skill.
         Ok(HookFragment::new(config_path, merge)
-            .with_allow_entries(vec![MCP_ALLOW_ENTRY.to_string()])
+            .with_allow_entries(MCP_ALLOW_ENTRIES.iter().map(|e| (*e).to_string()).collect())
             .with_text_blocks(vec![ManagedTextBlock {
                 path: claude_md,
                 marker_id: MEMORY_POLICY_MARKER.to_string(),
@@ -153,11 +161,17 @@ mod tests {
             frag.config_path,
             PathBuf::from("/tmp/project/.claude/settings.json")
         );
-        // W3.2(c): the fragment carries the MCP permission allowlist entry.
+        // W3.2(c): the fragment carries the explicit MCP permission allowlist.
         assert_eq!(
             frag.allow_entries,
-            vec!["mcp__rusty-brain__*".to_string()],
-            "fragment must allowlist the rusty-brain MCP server's tools"
+            vec![
+                "mcp__rusty-brain__remember".to_string(),
+                "mcp__rusty-brain__recall".to_string(),
+                "mcp__rusty-brain__get".to_string(),
+                "mcp__rusty-brain__list".to_string(),
+                "mcp__rusty-brain__context".to_string(),
+            ],
+            "fragment must allowlist the rusty-brain elicitation tools (least-privilege, no wildcard)"
         );
         let hooks = frag.merge.get("hooks").unwrap();
         for event in [

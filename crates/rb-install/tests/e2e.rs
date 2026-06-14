@@ -263,11 +263,14 @@ async fn install_capture_uninstall_round_trip() {
         s.get("permissions")
             .and_then(|p| p.get("allow"))
             .and_then(|a| a.as_array())
-            .is_some_and(|a| a.iter().any(|e| e.as_str() == Some("mcp__rusty-brain__*")))
+            .is_some_and(|a| {
+                a.iter()
+                    .any(|e| e.as_str() == Some("mcp__rusty-brain__remember"))
+            })
     };
     assert!(
         allow_has_mcp(&after_install),
-        "settings.json must allowlist mcp__rusty-brain__* after install; got: {after_install}"
+        "settings.json must allowlist the rusty-brain MCP tools after install; got: {after_install}"
     );
     // W3.2(b): the memory-policy block + skill are written on install.
     let claude_md = project.join("CLAUDE.md");

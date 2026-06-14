@@ -96,7 +96,7 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (needed to edi
 RT_THRESH="$(jq -r '.pass_thresholds.remember_fired_rate' "$SCENARIOS")"
 RC_THRESH="$(jq -r '.pass_thresholds.recall_before_work_rate' "$SCENARIOS")"
 
-WORKROOT="$(mktemp -d)"
+WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-w32-scorecard.XXXXXX")"
 cleanup() { rm -rf "$WORKROOT" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -126,15 +126,21 @@ run_one_session() {
     # is project-scoped (.mcp.json + enableAllProjectMcpServers approves it
     # non-interactively; W3.6 will commit these natively).
     rusty-brain-install install --agents claude-code >/dev/null
-    cat > "$proj/.mcp.json" <<EOF
-{ "mcpServers": { "rusty-brain": { "command": "$BIN_DIR/rusty-brain", "args": ["mcp"] } } }
-EOF
-    python3 - "$proj/.claude/settings.json" <<'PY'
+    # Write .mcp.json and approve the project server via python so json.dump
+    # handles any escaping in the binary path (the installer already wrote the
+    # permissions.allow entries — channel c).
+    python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
 import json, sys
-p = sys.argv[1]
-with open(p) as f: s = json.load(f)
+settings_path, mcp_path, server_cmd = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(mcp_path, "w") as f:
+    json.dump({"mcpServers": {"rusty-brain": {"command": server_cmd, "args": ["mcp"]}}}, f, indent=2)
+    f.write("\n")
+with open(settings_path) as f:
+    s = json.load(f)
 s["enableAllProjectMcpServers"] = True
-with open(p, "w") as f: json.dump(s, f, indent=2); f.write("\n")
+with open(settings_path, "w") as f:
+    json.dump(s, f, indent=2)
+    f.write("\n")
 PY
     claude -p "$prompt" \
       --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
@@ -157,13 +163,12 @@ run_scenario() {
   local rem=0 rec=0
   # remember_fired: a model-initiated remember in the PLANT session ONLY.
   transcript_has_tool "$base/home_plant/.claude/projects" "mcp__rusty-brain__remember" && rem=1
-  # recall_before_work: in the WORK session, the deterministic UserPromptSubmit
-  # injection reached the model (its block header is recorded in the work turn's
-  # context) OR the model made its own recall call.
-  if grep -rqlF "Memories relevant to this prompt" "$base/home_work/.claude/projects" 2>/dev/null \
-     || transcript_has_tool "$base/home_work/.claude/projects" "mcp__rusty-brain__recall"; then
-    rec=1
-  fi
+  # recall_before_work: the deterministic UserPromptSubmit injection reached the
+  # model in the WORK session. This signal is before-work BY CONSTRUCTION — the
+  # hook injects at prompt-submit, before the model's first action — so, unlike a
+  # model-initiated recall (which could fire mid-task), it cannot false-positive
+  # as "recall after work."
+  grep -rqlF "Memories relevant to this prompt" "$base/home_work/.claude/projects" 2>/dev/null && rec=1
   echo "$rem $rec"
 }
 

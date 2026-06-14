@@ -219,25 +219,29 @@ pub fn run_uninstall(
             });
             continue;
         }
-        // Strip the sentinel hooks block, then reverse the W3.2 managed
-        // side-effects (permissions.allow entries, skill file, CLAUDE.md block).
-        let report =
-            match uninstall_file(&config_path).and_then(|()| reverse_managed_side_effects(&frag)) {
-                Ok(()) => AgentReport {
-                    agent: id,
-                    status: AgentStatus::Removed,
-                    config_path: Some(config_path),
-                    version: None,
-                    error: None,
-                },
-                Err(e) => AgentReport {
-                    agent: id,
-                    status: AgentStatus::Failed,
-                    config_path: Some(config_path),
-                    version: None,
-                    error: Some(e.to_string()),
-                },
-            };
+        // Strip the sentinel hooks block AND reverse the W3.2 managed side-effects
+        // (permissions.allow entries, skill file, CLAUDE.md block). Run BOTH
+        // best-effort — the side-effects are independent of the JSON cleanup, so a
+        // broken settings.json must not strip the skill/block removal — then report
+        // the first error.
+        let uninstall_result = uninstall_file(&config_path);
+        let reverse_result = reverse_managed_side_effects(&frag);
+        let report = match uninstall_result.and(reverse_result) {
+            Ok(()) => AgentReport {
+                agent: id,
+                status: AgentStatus::Removed,
+                config_path: Some(config_path),
+                version: None,
+                error: None,
+            },
+            Err(e) => AgentReport {
+                agent: id,
+                status: AgentStatus::Failed,
+                config_path: Some(config_path),
+                version: None,
+                error: Some(e.to_string()),
+            },
+        };
         agents.push(report);
     }
     InstallReport::roll_up(scope_label(scope), dry_run, agents)
