@@ -4,8 +4,9 @@
 
 use crate::jsonrpc::{JsonRpcError, INVALID_PARAMS, METHOD_NOT_FOUND};
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use rb_proto::{Request, Response};
-use rb_types::{MemoryId, MemoryType, MemoryUpdates};
+use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
@@ -231,26 +232,170 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
     }
 }
 
-/// Map a daemon `Response` to the JSON value embedded in an MCP tool result.
-/// Domain types already derive `Serialize`, so this is a structural projection.
-pub fn response_to_content(resp: Response) -> Value {
+/// A projected MCP tool result (W3.3 token economy): compact markdown `text`
+/// the model reads, the full `structured` JSON exposed separately as optional
+/// `structuredContent`, and the daemon-error flag. Recall/list/context render as
+/// one compact line per memory; everything else keeps the full JSON as `text`.
+pub struct ToolContent {
+    pub text: String,
+    pub structured: Value,
+    pub is_error: bool,
+}
+
+impl ToolContent {
+    /// A result whose model-facing `text` is just the structured JSON
+    /// stringified — for tools with no compact markdown projection (e.g.
+    /// `poll_changes`, `get`, acks).
+    #[must_use]
+    pub fn json(structured: Value, is_error: bool) -> Self {
+        let text = serde_json::to_string(&structured).unwrap_or_else(|e| {
+            // Build the fallback via serde so an error string containing quotes /
+            // backslashes cannot produce invalid JSON.
+            json!({ "error": format!("serialize failed: {e}") }).to_string()
+        });
+        Self {
+            text,
+            structured,
+            is_error,
+        }
+    }
+}
+
+/// Compact relative age for a memory line, e.g. `just now` / `5m ago` / `3d ago`
+/// / `2w ago` / `4mo ago` / `1y ago`. Negative deltas (clock skew) read as
+/// `just now`.
+fn relative_age(created_at: DateTime<Utc>, now: DateTime<Utc>) -> String {
+    let secs = (now - created_at).num_seconds().max(0);
+    let (n, unit) = if secs < 60 {
+        return "just now".to_string();
+    } else if secs < 3600 {
+        (secs / 60, "m")
+    } else if secs < 86_400 {
+        (secs / 3600, "h")
+    } else if secs < 604_800 {
+        (secs / 86_400, "d")
+    } else if secs < 2_592_000 {
+        (secs / 604_800, "w")
+    } else if secs < 31_536_000 {
+        (secs / 2_592_000, "mo")
+    } else {
+        (secs / 31_536_000, "y")
+    };
+    format!("{n}{unit} ago")
+}
+
+/// Truncate `s` to at most `max` chars on a char boundary, appending `…` when cut.
+fn truncate_chars(s: &str, max: usize) -> String {
+    match s.char_indices().nth(max) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_string(),
+    }
+}
+
+/// One compact markdown line for a memory (W3.3):
+/// `[type, imp N, Xd ago] summary-or-first-200-chars (id <uuid>)` + ` ⚠ contested`.
+/// Newlines/control chars in the memory text are flattened to spaces so stored
+/// content cannot inject fake markdown structure into the result. The full id is
+/// kept (not a 6-char prefix) so the model can `get`/`update`/`link` the result;
+/// `structuredContent` carries it too.
+fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
+    let raw = if m.summary.trim().is_empty() {
+        m.content.trim()
+    } else {
+        m.summary.trim()
+    };
+    let body: String = truncate_chars(raw, 200)
+        .chars()
+        // Flatten every line-breaking char (ASCII controls + the Unicode
+        // separators U+2028/U+2029 that `is_control` misses) so stored content
+        // cannot inject a visual line break into the one-line projection.
+        .map(|c| {
+            if c.is_control() || matches!(c, '\u{2028}' | '\u{2029}') {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect();
+    let contested = if m.contested { " ⚠ contested" } else { "" };
+    format!(
+        "[{}, imp {}, {}] {} (id {}){}",
+        m.memory_type.as_str(),
+        m.importance,
+        relative_age(m.created_at, now),
+        body,
+        m.id,
+        contested,
+    )
+}
+
+/// Render memories as a numbered compact markdown list (one [`memory_md_line`]
+/// per entry).
+fn render_indexed<'a>(
+    memories: impl IntoIterator<Item = &'a MemoryNote>,
+    now: DateTime<Utc>,
+) -> String {
+    let mut out = String::new();
+    for (i, m) in memories.into_iter().enumerate() {
+        out.push_str(&format!("{}. {}\n", i + 1, memory_md_line(m, now)));
+    }
+    out
+}
+
+/// Compact markdown for the `context` projection: a total count plus Important
+/// and Recent sections (each a numbered list).
+fn render_context_md(
+    recent: &[MemoryNote],
+    important: &[MemoryNote],
+    total: usize,
+    now: DateTime<Utc>,
+) -> String {
+    if total == 0 && recent.is_empty() && important.is_empty() {
+        return "no stored memories".to_string();
+    }
+    let mut out = format!("{total} memories in scope.\n");
+    if !important.is_empty() {
+        out.push_str("\nImportant:\n");
+        out.push_str(&render_indexed(important.iter(), now));
+    }
+    if !recent.is_empty() {
+        out.push_str("\nRecent:\n");
+        out.push_str(&render_indexed(recent.iter(), now));
+    }
+    out
+}
+
+pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
     match resp {
-        Response::Remembered { id } => json!({ "id": id.to_string() }),
-        // W1.3 empty state: below-floor/empty recall returns a compact,
-        // model-legible hint instead of a bare empty array, so the model knows
-        // "nothing is stored" rather than suspecting a tool failure. Projection
-        // only — the wire `Response` is unchanged (no CONTRACT_VERSION bump).
+        Response::Remembered { id } => ToolContent::json(json!({ "id": id.to_string() }), false),
+        // W3.3: recall renders as compact markdown (one line per hit) for the
+        // model; the full results ride structuredContent. W1.3 empty state +
+        // W1.6d degraded warning are preserved. Projection only — the wire
+        // `Response` is unchanged (no CONTRACT_VERSION bump).
         Response::Recalled { results, degraded } => {
-            let mut content = if results.is_empty() {
+            let text = if results.is_empty() {
+                let mut t = "no stored memories match".to_string();
+                if degraded {
+                    t.push_str(" (vector search unavailable — keyword + graph channels only)");
+                }
+                t
+            } else {
+                let mut t = render_indexed(results.iter().map(|r| &r.memory), now);
+                if degraded {
+                    t.push_str(
+                        "⚠ vector search unavailable (embedding provider error); \
+                         keyword + graph results only\n",
+                    );
+                }
+                t
+            };
+            let mut structured = if results.is_empty() {
                 json!({ "results": [], "hint": "no stored memories match" })
             } else {
                 json!({ "results": results })
             };
-            // W1.6d: a degraded recall (embedder outage) carries a one-line
-            // warning so the model knows the results came from the keyword and
-            // graph channels only, not that nothing semantically similar exists.
             if degraded {
-                if let Some(obj) = content.as_object_mut() {
+                if let Some(obj) = structured.as_object_mut() {
                     obj.insert(
                         "warning".to_string(),
                         json!(
@@ -260,31 +405,60 @@ pub fn response_to_content(resp: Response) -> Value {
                     );
                 }
             }
-            content
+            ToolContent {
+                text,
+                structured,
+                is_error: false,
+            }
         }
-        Response::Got { memory } => json!({ "memory": memory }),
-        Response::Listed { memories } => json!({ "memories": memories }),
-        Response::GraphResult { memories } => json!({ "memories": memories }),
-        Response::Updated => json!({ "ok": true }),
-        Response::Linked => json!({ "ok": true }),
-        Response::Deleted => json!({ "ok": true }),
+        // `get` returns full content (the model fetched it deliberately), so it
+        // keeps the full JSON as text rather than a truncated projection.
+        Response::Got { memory } => ToolContent::json(json!({ "memory": memory }), false),
+        Response::Listed { memories } => {
+            let text = if memories.is_empty() {
+                "no stored memories".to_string()
+            } else {
+                render_indexed(memories.iter(), now)
+            };
+            ToolContent {
+                text,
+                structured: json!({ "memories": memories }),
+                is_error: false,
+            }
+        }
+        Response::GraphResult { memories } => {
+            ToolContent::json(json!({ "memories": memories }), false)
+        }
+        Response::Updated => ToolContent::json(json!({ "ok": true }), false),
+        Response::Linked => ToolContent::json(json!({ "ok": true }), false),
+        Response::Deleted => ToolContent::json(json!({ "ok": true }), false),
         Response::ContextResult {
             recent,
             important,
             total,
-        } => json!({ "recent": recent, "important": important, "total": total }),
+        } => {
+            let text = render_context_md(&recent, &important, total, now);
+            ToolContent {
+                text,
+                structured: json!({ "recent": recent, "important": important, "total": total }),
+                is_error: false,
+            }
+        }
         Response::Pong {
             contract_version, ..
-        } => json!({ "contract_version": contract_version }),
+        } => ToolContent::json(json!({ "contract_version": contract_version }), false),
         Response::JobRan {
             scanned,
             changed,
             skipped,
-        } => json!({ "scanned": scanned, "changed": changed, "skipped": skipped }),
+        } => ToolContent::json(
+            json!({ "scanned": scanned, "changed": changed, "skipped": skipped }),
+            false,
+        ),
         // Namespace rename is a CLI admin op (W0.3 carryover) with no MCP tool
         // surface; projected anyway so the mapping stays total.
         Response::NamespaceRenamed { moved, vectors } => {
-            json!({ "moved": moved, "vectors": vectors })
+            ToolContent::json(json!({ "moved": moved, "vectors": vectors }), false)
         }
         // Scrub is a CLI admin op (W2.4) with no MCP tool surface; projected
         // anyway so the mapping stays total.
@@ -292,23 +466,32 @@ pub fn response_to_content(resp: Response) -> Value {
             scanned,
             redacted,
             reembed_pending,
-        } => json!({
-            "scanned": scanned,
-            "redacted": redacted,
-            "reembed_pending": reembed_pending,
-        }),
-        Response::Error { kind, message } => {
-            json!({ "error": { "kind": kind, "message": message } })
-        }
+        } => ToolContent::json(
+            json!({
+                "scanned": scanned,
+                "redacted": redacted,
+                "reembed_pending": reembed_pending,
+            }),
+            false,
+        ),
+        Response::Error { kind, message } => ToolContent::json(
+            json!({ "error": { "kind": kind, "message": message } }),
+            true,
+        ),
         // Streamed subscribe frames (and the subscribe ack) never reach the
         // request/response proxy path; map them defensively to an error content
         // (unreachable in practice).
-        Response::Change(_) | Response::Lagged { .. } | Response::SubscribeAck => json!({
-            "error": {
-                "kind": "protocol",
-                "message": "unexpected streamed frame on a request/response call",
-            }
-        }),
+        Response::Change(_) | Response::Lagged { .. } | Response::SubscribeAck => {
+            ToolContent::json(
+                json!({
+                    "error": {
+                        "kind": "protocol",
+                        "message": "unexpected streamed frame on a request/response call",
+                    }
+                }),
+                true,
+            )
+        }
     }
 }
 
@@ -688,64 +871,109 @@ mod tests {
     }
 
     #[test]
-    fn response_to_content_renders_each_variant_as_json() {
+    fn response_to_content_renders_structured_json_plus_compact_markdown() {
         use rb_proto::Response;
+        let now = Utc::now();
         let id = MemoryId::new();
-        let remembered = response_to_content(Response::Remembered { id: id.clone() });
-        assert_eq!(remembered["id"], id.to_string());
+        let remembered = response_to_content(Response::Remembered { id: id.clone() }, now);
+        assert_eq!(remembered.structured["id"], id.to_string());
 
-        let recalled = response_to_content(Response::Recalled {
-            results: vec![SearchResult {
-                memory: note(),
-                score: 0.5,
-                channels: rb_types::ChannelHits::default(),
-            }],
-            degraded: false,
-        });
-        assert!(recalled["results"].is_array());
-        assert_eq!(recalled["results"][0]["score"], 0.5);
-
-        let got = response_to_content(Response::Got {
-            memory: Some(note()),
-        });
-        assert!(got["memory"]["content"].is_string());
-
-        let none = response_to_content(Response::Got { memory: None });
-        assert!(none["memory"].is_null());
-
-        let ctx = response_to_content(Response::ContextResult {
-            recent: vec![note()],
-            important: vec![note()],
-            total: 2,
-        });
-        assert_eq!(ctx["total"], 2);
-
-        let err = response_to_content(Response::Error {
-            kind: "not_found".into(),
-            message: "nope".into(),
-        });
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: vec![SearchResult {
+                    memory: note(),
+                    score: 0.5,
+                    channels: rb_types::ChannelHits::default(),
+                }],
+                degraded: false,
+            },
+            now,
+        );
+        // Full shape rides structuredContent (the wire Response is unchanged).
+        assert!(recalled.structured["results"].is_array());
+        assert_eq!(recalled.structured["results"][0]["score"], 0.5);
+        // W3.3: the model-facing text is a compact markdown line — type +
+        // importance + age + id — NOT the full JSON.
         assert!(
-            err.get("error").is_some(),
+            recalled
+                .text
+                .starts_with("1. [architecture_decision, imp 8, "),
+            "compact line: {}",
+            recalled.text
+        );
+        assert!(recalled.text.contains("just now"));
+        assert!(recalled.text.contains("one db one transaction"));
+        assert!(recalled.text.contains("(id "));
+        assert!(
+            !recalled.text.contains("\"score\""),
+            "no raw JSON in the model text"
+        );
+        assert!(!recalled.is_error);
+
+        let got = response_to_content(
+            Response::Got {
+                memory: Some(note()),
+            },
+            now,
+        );
+        assert!(got.structured["memory"]["content"].is_string());
+
+        let none = response_to_content(Response::Got { memory: None }, now);
+        assert!(none.structured["memory"].is_null());
+
+        let ctx = response_to_content(
+            Response::ContextResult {
+                recent: vec![note()],
+                important: vec![note()],
+                total: 2,
+            },
+            now,
+        );
+        assert_eq!(ctx.structured["total"], 2);
+        assert!(ctx.text.contains("2 memories in scope"));
+        assert!(ctx.text.contains("Important:") && ctx.text.contains("Recent:"));
+
+        let err = response_to_content(
+            Response::Error {
+                kind: "not_found".into(),
+                message: "nope".into(),
+            },
+            now,
+        );
+        assert!(
+            err.structured.get("error").is_some(),
             "error variant carries an `error` key"
         );
+        assert!(err.is_error, "error variant sets the isError flag");
     }
 
     #[test]
     fn recall_result_carries_contested_flag() {
         use rb_proto::Response;
-        // Feature C: the additive `contested` boolean surfaces in the MCP result
-        // schema for each recall row.
+        // Feature C: the additive `contested` boolean surfaces both in the
+        // structured schema and as a ⚠ marker on the compact line.
         let mut contested = note();
         contested.contested = true;
-        let recalled = response_to_content(Response::Recalled {
-            results: vec![SearchResult {
-                memory: contested,
-                score: 0.9,
-                channels: rb_types::ChannelHits::default(),
-            }],
-            degraded: false,
-        });
-        assert_eq!(recalled["results"][0]["memory"]["contested"], true);
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: vec![SearchResult {
+                    memory: contested,
+                    score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
+                }],
+                degraded: false,
+            },
+            Utc::now(),
+        );
+        assert_eq!(
+            recalled.structured["results"][0]["memory"]["contested"],
+            true
+        );
+        assert!(
+            recalled.text.contains("⚠ contested"),
+            "contested marker on the compact line: {}",
+            recalled.text
+        );
     }
 
     #[test]
@@ -753,73 +981,104 @@ mod tests {
         use rb_proto::Response;
         // W1.3: below-floor/empty recall renders `{results: [], hint: ...}` so
         // the model can tell "nothing stored matches" from a tool failure.
-        let recalled = response_to_content(Response::Recalled {
-            results: Vec::new(),
-            degraded: false,
-        });
-        assert!(recalled["results"].is_array());
-        assert_eq!(recalled["results"].as_array().map(Vec::len), Some(0));
-        assert_eq!(recalled["hint"], "no stored memories match");
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: Vec::new(),
+                degraded: false,
+            },
+            Utc::now(),
+        );
+        assert!(recalled.structured["results"].is_array());
+        assert_eq!(
+            recalled.structured["results"].as_array().map(Vec::len),
+            Some(0)
+        );
+        assert_eq!(recalled.structured["hint"], "no stored memories match");
+        assert_eq!(recalled.text, "no stored memories match");
     }
 
     #[test]
     fn non_empty_recall_carries_no_hint() {
         use rb_proto::Response;
         // The hint is the EMPTY state only — a populated recall keeps its
-        // pre-W1.3 shape byte-for-byte.
-        let recalled = response_to_content(Response::Recalled {
-            results: vec![SearchResult {
-                memory: note(),
-                score: 0.9,
-                channels: rb_types::ChannelHits::default(),
-            }],
-            degraded: false,
-        });
-        assert!(recalled.get("hint").is_none(), "hint only on empty results");
+        // pre-W1.3 structured shape.
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: vec![SearchResult {
+                    memory: note(),
+                    score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
+                }],
+                degraded: false,
+            },
+            Utc::now(),
+        );
+        assert!(
+            recalled.structured.get("hint").is_none(),
+            "hint only on empty results"
+        );
     }
 
     #[test]
     fn degraded_recall_renders_a_one_line_warning() {
         use rb_proto::Response;
         // W1.6d: a degraded recall (embedder outage; keyword+graph only)
-        // surfaces a one-line warning in the rendered output — on both the
-        // populated and the empty shape.
-        let recalled = response_to_content(Response::Recalled {
-            results: vec![SearchResult {
-                memory: note(),
-                score: 0.9,
-                channels: rb_types::ChannelHits::default(),
-            }],
-            degraded: true,
-        });
-        let warning = recalled["warning"]
+        // surfaces a warning in BOTH the structured payload and the compact text.
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: vec![SearchResult {
+                    memory: note(),
+                    score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
+                }],
+                degraded: true,
+            },
+            Utc::now(),
+        );
+        let warning = recalled.structured["warning"]
             .as_str()
             .expect("degraded recall must carry a warning line");
         assert!(
             warning.contains("vector search unavailable"),
             "warning names the degradation: {warning}"
         );
-
-        let empty = response_to_content(Response::Recalled {
-            results: Vec::new(),
-            degraded: true,
-        });
-        assert_eq!(empty["hint"], "no stored memories match");
         assert!(
-            empty["warning"].is_string(),
+            recalled.text.contains("vector search unavailable"),
+            "degraded warning also in the compact text: {}",
+            recalled.text
+        );
+
+        let empty = response_to_content(
+            Response::Recalled {
+                results: Vec::new(),
+                degraded: true,
+            },
+            Utc::now(),
+        );
+        assert_eq!(empty.structured["hint"], "no stored memories match");
+        assert!(
+            empty.structured["warning"].is_string(),
             "the empty state keeps the degradation warning too"
+        );
+        assert!(
+            empty.text.contains("vector search unavailable"),
+            "empty+degraded text still flags the outage: {}",
+            empty.text
         );
     }
 
     #[test]
     fn non_degraded_recall_carries_no_warning() {
         use rb_proto::Response;
-        let recalled = response_to_content(Response::Recalled {
-            results: Vec::new(),
-            degraded: false,
-        });
+        let recalled = response_to_content(
+            Response::Recalled {
+                results: Vec::new(),
+                degraded: false,
+            },
+            Utc::now(),
+        );
         assert!(
-            recalled.get("warning").is_none(),
+            recalled.structured.get("warning").is_none(),
             "warning only when degraded"
         );
     }

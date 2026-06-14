@@ -288,11 +288,18 @@ mod tests {
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[0]["result"]["serverInfo"]["name"], "rusty-brain");
 
-        // tools/list (id 2)
+        // tools/list (id 2) — W3.3: the DEFAULT advertised set is 5 tools
+        // (remember/recall/get/context/update); the rest are behind
+        // RB_MCP_FULL_TOOLSET.
         assert_eq!(responses[1]["id"], 2);
+        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
+            10
+        } else {
+            5
+        };
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            10
+            expected_tools
         );
 
         // tools/call (id 3) -> remembered id appears in the tool result text
@@ -406,9 +413,15 @@ mod tests {
             "error for over-long line has null id"
         );
         assert_eq!(responses[1]["id"], 11);
+        // W3.3: default advertised toolset is 5 (RB_MCP_FULL_TOOLSET gates the rest).
+        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
+            10
+        } else {
+            5
+        };
         assert_eq!(
             responses[1]["result"]["tools"].as_array().unwrap().len(),
-            10
+            expected_tools
         );
         server.await.unwrap().unwrap();
     }
