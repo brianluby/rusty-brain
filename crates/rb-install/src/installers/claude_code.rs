@@ -139,7 +139,7 @@ impl AgentInstaller for ClaudeCodeInstaller {
 
 #[cfg(test)]
 mod tests {
-    #![allow(clippy::unwrap_used, clippy::expect_used)]
+    #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use super::*;
     use rb_agents::install::SENTINEL;
     use std::path::PathBuf;
@@ -270,5 +270,95 @@ mod tests {
             frag.config_path,
             PathBuf::from(home).join(".claude").join("settings.json")
         );
+    }
+
+    // ---- W3.6a native-distribution drift guards -------------------------------
+    // The committed plugin + project config must stay consistent with the
+    // installer's canonical content, so the three distribution channels (plugin,
+    // committed project config, `rusty-brain install`) never silently drift apart.
+
+    fn repo_root() -> PathBuf {
+        // crates/rb-install -> repo root.
+        PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("..")
+            .join("..")
+    }
+
+    fn read_repo(rel: &str) -> String {
+        let p = repo_root().join(rel);
+        std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
+    }
+
+    fn read_repo_json(rel: &str) -> serde_json::Value {
+        serde_json::from_str(&read_repo(rel)).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
+    }
+
+    #[test]
+    fn plugin_skill_matches_installer_memory_skill() {
+        let on_disk = read_repo("plugins/rusty-brain/skills/rusty-brain-memory/SKILL.md");
+        assert_eq!(
+            on_disk.trim_end_matches('\n'),
+            MEMORY_SKILL.trim_end_matches('\n'),
+            "the committed plugin SKILL.md must match the installer's MEMORY_SKILL (no drift)"
+        );
+    }
+
+    #[test]
+    fn committed_settings_allowlist_matches_installer() {
+        let settings = read_repo_json(".claude/settings.json");
+        let allow: Vec<&str> = settings["permissions"]["allow"]
+            .as_array()
+            .expect("permissions.allow array")
+            .iter()
+            .map(|v| v.as_str().expect("string entry"))
+            .collect();
+        assert_eq!(
+            allow.as_slice(),
+            MCP_ALLOW_ENTRIES,
+            "committed .claude/settings.json allowlist must match the installer's MCP_ALLOW_ENTRIES"
+        );
+    }
+
+    #[test]
+    fn committed_and_plugin_hooks_cover_exactly_the_claude_events() {
+        use std::collections::BTreeSet;
+        let expected: BTreeSet<&str> = crate::installers::CLAUDE_EVENTS.iter().copied().collect();
+        for rel in [
+            ".claude/settings.json",
+            "plugins/rusty-brain/hooks/hooks.json",
+        ] {
+            let json = read_repo_json(rel);
+            let got: BTreeSet<&str> = json["hooks"]
+                .as_object()
+                .unwrap_or_else(|| panic!("{rel}: hooks object"))
+                .keys()
+                .map(String::as_str)
+                .collect();
+            assert_eq!(
+                got, expected,
+                "{rel} must register exactly the CLAUDE_EVENTS"
+            );
+        }
+    }
+
+    #[test]
+    fn committed_and_plugin_mcp_register_the_rusty_brain_server() {
+        for rel in [".mcp.json", "plugins/rusty-brain/.mcp.json"] {
+            let json = read_repo_json(rel);
+            let server = &json["mcpServers"]["rusty-brain"];
+            assert_eq!(server["command"], "rusty-brain", "{rel} server command");
+            assert_eq!(server["args"][0], "mcp", "{rel} server args");
+        }
+    }
+
+    #[test]
+    fn marketplace_lists_the_plugin_at_its_source_path() {
+        let mkt = read_repo_json(".claude-plugin/marketplace.json");
+        let plugin = &mkt["plugins"][0];
+        assert_eq!(plugin["name"], "rusty-brain");
+        assert_eq!(plugin["source"], "./plugins/rusty-brain");
+        // The referenced plugin manifest exists and agrees on the name.
+        let manifest = read_repo_json("plugins/rusty-brain/.claude-plugin/plugin.json");
+        assert_eq!(manifest["name"], "rusty-brain");
     }
 }

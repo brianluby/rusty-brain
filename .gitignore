@@ -8,3 +8,6 @@ Cargo.lock.orig
 .serena/
 # fastembed ONNX model cache (created by rb-eval recording / rb-embed local smoke tests)
 .fastembed_cache/
+# Claude Code personal/local settings override (never committed; the committed
+# .claude/settings.json is the shared rusty-brain dogfood config / reference template).
+.claude/settings.local.json
