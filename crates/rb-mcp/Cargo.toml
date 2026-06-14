@@ -19,6 +19,12 @@ serde_json = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
+# W3.3: relative-age rendering in the compact recall/list/context projection.
+chrono = { workspace = true }
+
+[dev-dependencies]
+# W3.3 token-accounting test: faithful BPE counts for tools/list + instructions.
+rb-tokens = { path = "../rb-tokens" }
 
 [lints]
 workspace = true

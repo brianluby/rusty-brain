@@ -1,0 +1,18 @@
+[package]
+name = "rb-tokens"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "rusty-brain: faithful BPE token counting (a proxy for Claude's tokenizer) + the W3.3 token-economy budgets."
+
+[lib]
+name = "rb_tokens"
+path = "src/lib.rs"
+
+[dependencies]
+tiktoken-rs = { workspace = true }
+
+[lints]
+workspace = true

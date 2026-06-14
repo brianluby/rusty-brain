@@ -17,12 +17,13 @@ pub async fn dispatch(
     ctx: &HookContext,
 ) -> HookResult {
     match &ctx.event {
-        HookEvent::SessionStart { .. } => {
+        HookEvent::SessionStart { source } => {
             // Opportunistic hygiene: reclaim scratch files from abandoned /
             // crashed sessions whose SessionEnd never fired (cheap; once per
             // session, off the daemon path).
             scratch::prune_stale();
-            capture::session_start(client.take()).await
+            // W3.3: the injection is source-aware (startup vs resume vs compact).
+            capture::session_start(client.take(), source.as_deref()).await
         }
         HookEvent::PostToolUse {
             tool_name,

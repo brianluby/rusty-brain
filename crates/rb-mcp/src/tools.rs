@@ -28,6 +28,39 @@ fn memory_type_enum() -> Value {
     ])
 }
 
+/// The default tools advertised to the model (W3.3 token economy). The rest —
+/// `list`, `graph`, `link`, `delete`, `poll_changes` — are gated behind
+/// `RB_MCP_FULL_TOOLSET` so the per-turn `tools/list` the model pays for stays
+/// small. (All tools remain ROUTABLE if called; gating only trims the advertised
+/// set.)
+const DEFAULT_TOOLS: [&str; 5] = ["remember", "recall", "get", "context", "update"];
+
+/// True when `RB_MCP_FULL_TOOLSET` is set (to any value): advertise every tool.
+fn full_toolset_enabled() -> bool {
+    std::env::var_os("RB_MCP_FULL_TOOLSET").is_some()
+}
+
+/// The tools advertised via `tools/list`: the [`DEFAULT_TOOLS`] subset by
+/// default (W3.3), or every tool when `RB_MCP_FULL_TOOLSET` is set.
+#[must_use]
+pub fn advertised_tool_definitions() -> Vec<ToolDef> {
+    advertised_tool_definitions_for(full_toolset_enabled())
+}
+
+/// The advertised tools for a given full/default choice — split out so tests
+/// exercise both sets without mutating the process environment.
+#[must_use]
+fn advertised_tool_definitions_for(full: bool) -> Vec<ToolDef> {
+    if full {
+        tool_definitions()
+    } else {
+        tool_definitions()
+            .into_iter()
+            .filter(|t| DEFAULT_TOOLS.contains(&t.name))
+            .collect()
+    }
+}
+
 /// All tool definitions. Pure: no IO, deterministic ordering.
 pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
@@ -225,6 +258,46 @@ mod tests {
             "tool set must be the 8 spine tools + link + poll_changes"
         );
         assert_eq!(tool_definitions().len(), 10);
+    }
+
+    #[test]
+    fn advertised_default_set_is_the_token_economy_subset() {
+        // W3.3: by default tools/list advertises only remember/recall/get/
+        // context/update; the rest are gated behind RB_MCP_FULL_TOOLSET.
+        let default: BTreeSet<&str> = advertised_tool_definitions_for(false)
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        let expected: BTreeSet<&str> = ["remember", "recall", "get", "context", "update"]
+            .into_iter()
+            .collect();
+        assert_eq!(
+            default, expected,
+            "default tools/list = the W3.3 token-economy subset"
+        );
+        // With the full toolset enabled, every tool is advertised.
+        let full: BTreeSet<&str> = advertised_tool_definitions_for(true)
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        let all: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
+        assert_eq!(full, all, "RB_MCP_FULL_TOOLSET advertises every tool");
+        assert!(default.len() < all.len(), "default is a strict subset");
+    }
+
+    #[test]
+    fn token_accounting_default_tools_list_under_budget() {
+        // W3.3 token-accounting CI guard: the DEFAULT tools/list payload the
+        // model pays for every turn must stay within budget — faithful BPE counts
+        // via rb-tokens (a proxy for Claude's tokenizer).
+        let payload = json!({ "tools": advertised_tool_definitions_for(false) });
+        let text = serde_json::to_string(&payload).unwrap();
+        let n = rb_tokens::count_tokens(&text);
+        assert!(
+            n <= rb_tokens::TOOLS_LIST_BUDGET,
+            "default tools/list is {n} tokens (budget {})",
+            rb_tokens::TOOLS_LIST_BUDGET
+        );
     }
 
     #[test]

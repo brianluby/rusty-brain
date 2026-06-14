@@ -176,6 +176,39 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   `UserPromptSubmit`; Gemini/Codex/OpenCode do not (the W3.1 cross-CLI follow-up
   still owns that).
 
+**Phase-3 progress — W3.3 token economy (landed 2026-06-14):**
+
+- *Tokenizer foundation:* new `rb-tokens` crate wraps `tiktoken-rs`
+  (`o200k_base`) as a faithful proxy for Claude's non-public tokenizer —
+  `count_tokens` is FAIL-SAFE (degrades to a char estimate, never panics, so the
+  fail-open hook is safe) — plus the three budgets (tools/list 900, instructions
+  150, injection 600). Validated offline (embedded vocab), `cargo-deny`/`audit`
+  clean, lean dep tree.
+- *(1) Compact-markdown projection:* `rb-mcp::response_to_content` returns
+  `ToolContent { text, structured }` — recall/list/context render as one compact
+  markdown line per memory (`[type, imp N, Xd ago] summary-or-first-200-chars
+  (id …)` + `⚠ contested`; age decision-critical; newlines flattened so stored
+  content can't inject fake markdown; score omitted), with the full JSON on
+  `structuredContent`. `get` keeps full content (deliberate fetch). Projection
+  ONLY — wire `Response` + CLI `--json` unchanged, no CONTRACT_VERSION bump.
+- *(2) Source-aware SessionStart injection:* the SessionStart `source` is
+  threaded into `capture::session_start` — startup/clear/unknown → full digest;
+  `compact` → constraints-only; `resume` → nothing. The digest is budgeted to
+  ≤600 tokens (rb-tokens, enforced at capture time) / ≤10 items, preferring
+  constraint + architecture_decision at importance ≥8, with the W2.5 framing and
+  a "use recall for the rest" pointer.
+- *(3) Default toolset shrink:* `tools/list` advertises only
+  remember/recall/get/context/update by default; list/graph/link/delete/
+  poll_changes are gated behind `RB_MCP_FULL_TOOLSET` (all remain ROUTABLE if
+  called — gating only trims the advertised set).
+- *(4) Token-accounting CI test:* faithful BPE assertions — default tools/list
+  ≤900 + instructions ≤150 (rb-mcp), SessionStart injection ≤600 under a large
+  corpus (rb-hooks).
+- *Deferred / Phase-3 gate still owed:* the W3.5 nightly A/B eval and the W3.2
+  elicitation scorecard MEASURED run (both need `claude` + API spend). With
+  W3.3 landed, the gate's token-accounting-test clause is now MET; the remaining
+  owed clauses are W3.5's outcome win and the scorecard's measured pass.
+
 ---
 
 ## 7. Phase 4 — Prove it: eval gates, perf, fuzz

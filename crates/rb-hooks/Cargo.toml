@@ -24,6 +24,9 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 # Minimal capture-time secret redaction (W0.5).
 rb-redact = { path = "../rb-redact" }
+# W3.3: enforce the <=600-token SessionStart injection budget at capture time
+# (fail-safe — count_tokens never panics, preserving the fail-open contract).
+rb-tokens = { path = "../rb-tokens" }
 
 [dev-dependencies]
 # Dev-only: the path-agreement tests pin hooks-resolution == daemon-resolution.

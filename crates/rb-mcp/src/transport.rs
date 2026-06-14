@@ -288,12 +288,11 @@ mod tests {
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[0]["result"]["serverInfo"]["name"], "rusty-brain");
 
-        // tools/list (id 2)
+        // tools/list (id 2) — W3.3: the DEFAULT advertised set is 5 tools
+        // (remember/recall/get/context/update); the rest are behind
+        // RB_MCP_FULL_TOOLSET.
         assert_eq!(responses[1]["id"], 2);
-        assert_eq!(
-            responses[1]["result"]["tools"].as_array().unwrap().len(),
-            10
-        );
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
 
         // tools/call (id 3) -> remembered id appears in the tool result text
         assert_eq!(responses[2]["id"], 3);
@@ -406,10 +405,8 @@ mod tests {
             "error for over-long line has null id"
         );
         assert_eq!(responses[1]["id"], 11);
-        assert_eq!(
-            responses[1]["result"]["tools"].as_array().unwrap().len(),
-            10
-        );
+        // W3.3: default advertised toolset is 5 (RB_MCP_FULL_TOOLSET gates the rest).
+        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
         server.await.unwrap().unwrap();
     }
 

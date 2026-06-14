@@ -4,8 +4,8 @@ use crate::change_buffer::{ChangeBuffer, SubscriberStatus};
 use crate::jsonrpc::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
 };
-use crate::proxy::{build_request, response_to_content, DaemonProxy};
-use crate::tools::tool_definitions;
+use crate::proxy::{build_request, response_to_content, DaemonProxy, ToolContent};
+use crate::tools::advertised_tool_definitions;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -93,7 +93,7 @@ fn initialize_result(params: &Value) -> Value {
 
 /// Build the `tools/list` result from the static tool definitions.
 fn tools_list_result() -> Value {
-    json!({ "tools": tool_definitions() })
+    json!({ "tools": advertised_tool_definitions() })
 }
 
 /// Handle `tools/call`: `poll_changes` drains the local change ring; every other
@@ -128,9 +128,10 @@ async fn handle_tools_call(
 
     match proxy.call(request).await {
         Ok(resp) => {
-            let content = response_to_content(resp);
-            let is_error = content.get("error").is_some();
-            JsonRpcResponse::success(id, tool_result(content, is_error))
+            // W3.3: project to compact markdown (the model reads `content[].text`)
+            // + full JSON in `structuredContent`. `now` drives relative-age render.
+            let content = response_to_content(resp, chrono::Utc::now());
+            JsonRpcResponse::success(id, tool_result(content))
         }
         Err(e) => JsonRpcResponse::error(
             id,
@@ -172,7 +173,7 @@ async fn handle_poll_changes(
             "dropped": 0,
             "subscriber": { "status": "disconnected" }
         });
-        return JsonRpcResponse::success(id, tool_result(content, false));
+        return JsonRpcResponse::success(id, tool_result(ToolContent::json(content, false)));
     };
 
     // Drain and snapshot health under one lock so they describe the same moment.
@@ -186,7 +187,7 @@ async fn handle_poll_changes(
         "dropped": drained.dropped,
         "subscriber": subscriber_json(status),
     });
-    JsonRpcResponse::success(id, tool_result(content, false))
+    JsonRpcResponse::success(id, tool_result(ToolContent::json(content, false)))
 }
 
 /// Render subscriber health for the `poll_changes` payload. `for_secs` bounds
@@ -202,13 +203,15 @@ fn subscriber_json(status: SubscriberStatus) -> Value {
     }
 }
 
-/// Wrap a JSON payload as an MCP tool result (a single JSON text content item).
-fn tool_result(content: Value, is_error: bool) -> Value {
-    let text = serde_json::to_string(&content)
-        .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
+/// Wrap a projected [`ToolContent`] as an MCP tool result: the compact markdown
+/// `text` the model reads, the full result as `structuredContent`, and the
+/// error flag.
+fn tool_result(content: ToolContent) -> Value {
     json!({
-        "content": [ { "type": "text", "text": text } ],
-        "isError": is_error
+        "content": [ { "type": "text", "text": content.text } ],
+        // W3.3: the full structured result rides alongside the compact text.
+        "structuredContent": content.structured,
+        "isError": content.is_error,
     })
 }
 
@@ -376,6 +379,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn token_accounting_instructions_under_budget() {
+        // W3.3 token-accounting CI guard: the initialize `instructions` string
+        // must stay within budget (faithful BPE counts via rb-tokens).
+        let n = rb_tokens::count_tokens(SERVER_INSTRUCTIONS);
+        assert!(
+            n <= rb_tokens::INSTRUCTIONS_BUDGET,
+            "instructions are {n} tokens (budget {})",
+            rb_tokens::INSTRUCTIONS_BUDGET
+        );
+    }
+
     #[tokio::test]
     async fn initialized_notification_gets_no_response() {
         let mut proxy = fake();
@@ -385,15 +400,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tools_list_returns_ten_tools() {
+    async fn tools_list_returns_default_token_economy_set() {
+        // W3.3: tools/list advertises only the default subset by default; the
+        // heavier tools are gated behind RB_MCP_FULL_TOOLSET. Skip if a dev/CI
+        // env has that override on (the unit gating test covers both paths).
+        if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
+            return;
+        }
         let mut proxy = fake();
         let r = req("tools/list", Some(2), json!({}));
         let resp = handle_request(r, &mut proxy).await.unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
-        assert_eq!(tools.len(), 10);
-        assert!(tools.iter().any(|t| t["name"] == "remember"));
-        assert!(tools.iter().any(|t| t["name"] == "link"));
-        assert!(tools.iter().any(|t| t["name"] == "poll_changes"));
+        assert_eq!(tools.len(), 5);
+        for name in ["remember", "recall", "get", "context", "update"] {
+            assert!(
+                tools.iter().any(|t| t["name"] == name),
+                "default set includes {name}"
+            );
+        }
+        for name in ["link", "poll_changes", "graph", "delete", "list"] {
+            assert!(
+                !tools.iter().any(|t| t["name"] == name),
+                "{name} is gated out of the default set"
+            );
+        }
         assert!(tools[0]["inputSchema"]["type"] == "object");
     }
 
