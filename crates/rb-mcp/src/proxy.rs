@@ -248,8 +248,11 @@ impl ToolContent {
     /// `poll_changes`, `get`, acks).
     #[must_use]
     pub fn json(structured: Value, is_error: bool) -> Self {
-        let text = serde_json::to_string(&structured)
-            .unwrap_or_else(|e| format!("{{\"error\":\"serialize failed: {e}\"}}"));
+        let text = serde_json::to_string(&structured).unwrap_or_else(|e| {
+            // Build the fallback via serde so an error string containing quotes /
+            // backslashes cannot produce invalid JSON.
+            json!({ "error": format!("serialize failed: {e}") }).to_string()
+        });
         Self {
             text,
             structured,

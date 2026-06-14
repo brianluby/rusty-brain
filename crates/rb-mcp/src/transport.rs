@@ -292,7 +292,15 @@ mod tests {
         // (remember/recall/get/context/update); the rest are behind
         // RB_MCP_FULL_TOOLSET.
         assert_eq!(responses[1]["id"], 2);
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
+            10
+        } else {
+            5
+        };
+        assert_eq!(
+            responses[1]["result"]["tools"].as_array().unwrap().len(),
+            expected_tools
+        );
 
         // tools/call (id 3) -> remembered id appears in the tool result text
         assert_eq!(responses[2]["id"], 3);
@@ -406,7 +414,15 @@ mod tests {
         );
         assert_eq!(responses[1]["id"], 11);
         // W3.3: default advertised toolset is 5 (RB_MCP_FULL_TOOLSET gates the rest).
-        assert_eq!(responses[1]["result"]["tools"].as_array().unwrap().len(), 5);
+        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
+            10
+        } else {
+            5
+        };
+        assert_eq!(
+            responses[1]["result"]["tools"].as_array().unwrap().len(),
+            expected_tools
+        );
         server.await.unwrap().unwrap();
     }
 

@@ -5,7 +5,9 @@
 //! tokenizer — the budgets below carry margin for the proxy gap. The vocab is
 //! embedded in the `tiktoken-rs` crate, so counting needs no network at runtime.
 //! `count_tokens` is fail-safe: a caller inside the strictly fail-open hook
-//! binary can never panic on a tokenizer error (it degrades to a char estimate).
+//! binary can never panic on a tokenizer error — it degrades to the UTF-8 byte
+//! length, a guaranteed UPPER bound on the token count (every o200k_base token
+//! maps to ≥ 1 byte), so budgets still hold in the degraded case.
 #![forbid(unsafe_code)]
 
 use std::sync::OnceLock;
@@ -24,7 +26,7 @@ pub const INSTRUCTIONS_BUDGET: usize = 150;
 pub const INJECTION_BUDGET: usize = 600;
 
 /// The lazily-initialized BPE, or `None` if it failed to load (then
-/// [`count_tokens`] falls back to a char estimate). `OnceLock` so the load
+/// [`count_tokens`] falls back to the UTF-8 byte length). `OnceLock` so the load
 /// happens at most once per process.
 fn bpe() -> Option<&'static CoreBPE> {
     static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
@@ -33,13 +35,14 @@ fn bpe() -> Option<&'static CoreBPE> {
 
 /// Count the tokens in `text` with the `o200k_base` BPE (a proxy for Claude's
 /// non-public tokenizer). Fail-safe: if the tokenizer cannot initialize, falls
-/// back to a conservative `bytes / 4` estimate (rounded up) so the budget still
-/// bounds the output and a fail-open caller never panics.
+/// back to the UTF-8 BYTE length — a guaranteed upper bound on the token count
+/// (every o200k_base token maps to ≥ 1 byte), so a budget guard can never be
+/// fooled into admitting over-budget output, and a fail-open caller never panics.
 #[must_use]
 pub fn count_tokens(text: &str) -> usize {
     match bpe() {
         Some(bpe) => bpe.encode_ordinary(text).len(),
-        None => text.len().div_ceil(4),
+        None => text.len(),
     }
 }
 
