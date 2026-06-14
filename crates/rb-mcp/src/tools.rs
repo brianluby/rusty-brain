@@ -33,7 +33,11 @@ fn memory_type_enum() -> Value {
 /// `RB_MCP_FULL_TOOLSET` so the per-turn `tools/list` the model pays for stays
 /// small. (All tools remain ROUTABLE if called; gating only trims the advertised
 /// set.)
-const DEFAULT_TOOLS: [&str; 5] = ["remember", "recall", "get", "context", "update"];
+///
+/// Single source of truth for the default advertised set: the installer's
+/// `permissions.allow` allowlist (rb-install) is drift-tested against this, so
+/// every advertised default tool is auto-approved and none stalls a headless run.
+pub const DEFAULT_TOOLS: [&str; 5] = ["remember", "recall", "get", "context", "update"];
 
 /// True when `RB_MCP_FULL_TOOLSET` is set (to any value): advertise every tool.
 fn full_toolset_enabled() -> bool {

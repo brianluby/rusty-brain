@@ -24,8 +24,8 @@
       "mcp__rusty-brain__remember",
       "mcp__rusty-brain__recall",
       "mcp__rusty-brain__get",
-      "mcp__rusty-brain__list",
-      "mcp__rusty-brain__context"
+      "mcp__rusty-brain__context",
+      "mcp__rusty-brain__update"
     ]
   }
 }

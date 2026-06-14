@@ -224,7 +224,7 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   (hooks + `permissions.allow` for the 5 elicitation tools) — the repo dogfoods
   rusty-brain on itself and is the zero-effort-on-clone reference template;
   `.claude/settings.local.json` is now gitignored.
-- *Three channels, pick one:* plugin / committed config / `rusty-brain install`
+- *Three channels, pick one:* plugin / committed config / `rusty-brain-install`
   ship the SAME context, so two active channels double-register the hooks.
   Documented in `docs/2026-06-14-native-distribution.md` with the **enterprise
   managed-settings** interactions (`permissions.deny`, `allowManagedHooksOnly`,
@@ -240,7 +240,7 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   settings template + `permissions.allow`) is now MET.
 - *Deferred:* the cross-harness **P7 APM spec** (the 2348-line Microsoft-APM
   package subsystem — `apm/` artifacts + `rusty-brain apm` CLI + an rb-install
-  delegation backend + CI) is its own track; `rusty-brain install` therefore
+  delegation backend + CI) is its own track; `rusty-brain-install` therefore
   stays the W3.2 installer for now, not yet the "thin wrapper preferring native
   channels" (that step is APM-dependent).
 

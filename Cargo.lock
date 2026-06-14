@@ -2691,6 +2691,7 @@ dependencies = [
  "rb-agents",
  "rb-daemon",
  "rb-embed",
+ "rb-mcp",
  "rb-proto",
  "rb-types",
  "serde",

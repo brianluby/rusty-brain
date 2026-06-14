@@ -6,7 +6,7 @@ description: Persist and recall durable project memory via rusty-brain. Use when
 # Rusty Brain memory
 
 rusty-brain stores durable project knowledge across sessions, exposed as MCP tools
-(`recall`, `remember`, `get`, `context`).
+(`recall`, `remember`, `get`, `context`, …).
 
 ## When to recall
 Before starting a task, or whenever the user references a past decision, prior work, or

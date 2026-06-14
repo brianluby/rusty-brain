@@ -14,20 +14,23 @@ use rb_types::Result;
 use super::{home_join, hooks_block, CLAUDE_EVENTS};
 use crate::detect::{find_binary_on_path, version_of};
 
-/// MCP tool-permission allowlist entries (W3.2(c) / spike S1): the tools the
-/// model needs for elicitation, allowlisted so headless `claude -p` runs never
-/// stall on a per-tool approval prompt. We enumerate the read-only tools plus
-/// `remember` (the only write) rather than the anchored wildcard
-/// `mcp__rusty-brain__*`: least-privilege keeps any future mutating/exfiltrating
-/// tool (e.g. `delete`, `link`) out of auto-approval until an intentional
-/// installer change adds it. Per the Claude Code permission-rule docs each
-/// `mcp__<server>__<tool>` entry is a valid exact allow.
+/// MCP tool-permission allowlist entries (W3.2(c) / spike S1): exactly the
+/// tools the MCP server ADVERTISES by default (`rb_mcp::tools::DEFAULT_TOOLS` —
+/// drift-tested below), allowlisted so headless `claude -p` runs never stall on
+/// a per-tool approval prompt. It must match the advertised default set: an
+/// advertised-but-unlisted tool (e.g. `update`) would stall; an
+/// unadvertised-but-listed tool is a dead entry. We enumerate exact
+/// `mcp__<server>__<tool>` entries rather than the anchored wildcard
+/// `mcp__rusty-brain__*` so the heavier tools behind `RB_MCP_FULL_TOOLSET`
+/// (`delete`, `link`, `graph`, …) are NOT auto-approved until intentionally
+/// advertised. Per the Claude Code permission-rule docs each entry is a valid
+/// exact allow.
 const MCP_ALLOW_ENTRIES: &[&str] = &[
     "mcp__rusty-brain__remember",
     "mcp__rusty-brain__recall",
     "mcp__rusty-brain__get",
-    "mcp__rusty-brain__list",
     "mcp__rusty-brain__context",
+    "mcp__rusty-brain__update",
 ];
 
 /// Skill directory name under `.claude/skills/` (W3.2(b)).
@@ -60,7 +63,7 @@ description: Persist and recall durable project memory via rusty-brain. Use when
 # Rusty Brain memory
 
 rusty-brain stores durable project knowledge across sessions, exposed as MCP tools
-(`recall`, `remember`, `get`, `context`).
+(`recall`, `remember`, `get`, `context`, …).
 
 ## When to recall
 Before starting a task, or whenever the user references a past decision, prior work, or
@@ -168,10 +171,10 @@ mod tests {
                 "mcp__rusty-brain__remember".to_string(),
                 "mcp__rusty-brain__recall".to_string(),
                 "mcp__rusty-brain__get".to_string(),
-                "mcp__rusty-brain__list".to_string(),
                 "mcp__rusty-brain__context".to_string(),
+                "mcp__rusty-brain__update".to_string(),
             ],
-            "fragment must allowlist the rusty-brain elicitation tools (least-privilege, no wildcard)"
+            "fragment must allowlist exactly the default advertised toolset (no wildcard)"
         );
         let hooks = frag.merge.get("hooks").unwrap();
         for event in [
@@ -320,6 +323,23 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_matches_the_mcp_default_advertised_toolset() {
+        // The allowlist must equal EXACTLY the tools the MCP server advertises by
+        // default (rb_mcp::tools::DEFAULT_TOOLS): every advertised tool
+        // auto-approved (no headless stall), and no dead entry for an
+        // unadvertised tool.
+        let expected: Vec<String> = rb_mcp::tools::DEFAULT_TOOLS
+            .iter()
+            .map(|t| format!("mcp__rusty-brain__{t}"))
+            .collect();
+        let got: Vec<String> = MCP_ALLOW_ENTRIES.iter().map(|s| (*s).to_string()).collect();
+        assert_eq!(
+            got, expected,
+            "MCP_ALLOW_ENTRIES must mirror rb_mcp::tools::DEFAULT_TOOLS (same tools, same order)"
+        );
+    }
+
+    #[test]
     fn committed_and_plugin_hooks_cover_exactly_the_claude_events() {
         use std::collections::BTreeSet;
         let expected: BTreeSet<&str> = crate::installers::CLAUDE_EVENTS.iter().copied().collect();
@@ -376,8 +396,13 @@ mod tests {
     #[test]
     fn marketplace_lists_the_plugin_at_its_source_path() {
         let mkt = read_repo_json(".claude-plugin/marketplace.json");
-        let plugin = &mkt["plugins"][0];
-        assert_eq!(plugin["name"], "rusty-brain");
+        // Find by name (robust to reordering / additional plugins), not plugins[0].
+        let plugin = mkt["plugins"]
+            .as_array()
+            .expect("plugins array")
+            .iter()
+            .find(|p| p["name"] == "rusty-brain")
+            .expect("marketplace must list the rusty-brain plugin");
         assert_eq!(plugin["source"], "./plugins/rusty-brain");
         // The referenced plugin manifest exists and agrees on the name.
         let manifest = read_repo_json("plugins/rusty-brain/.claude-plugin/plugin.json");
