@@ -456,6 +456,32 @@ mod tests {
     }
 
     #[test]
+    fn feedback_parses_id_and_kind() {
+        let id = "0c8e7f76-3a4f-4f7e-9d3a-111111111111";
+        let cli = Cli::parse_from(["rusty-brain", "feedback", id, "--kind", "wrong"]);
+        match cli.command {
+            Command::Feedback { id: got, kind } => {
+                assert_eq!(got, id);
+                assert_eq!(kind, FeedbackKind::Wrong);
+            }
+            other => panic!("expected Feedback, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn feedback_rejects_unknown_kind_and_requires_it() {
+        // An invalid --kind fails at parse time (value_parser = parse_feedback_kind).
+        let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id", "--kind", "useless"]);
+        assert!(
+            res.is_err(),
+            "unknown --kind must be rejected at parse time"
+        );
+        // --kind is required.
+        let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id"]);
+        assert!(res.is_err(), "--kind is required for feedback");
+    }
+
+    #[test]
     fn parses_scrub_subcommand() {
         let cli = Cli::parse_from(["rusty-brain", "scrub"]);
         assert!(

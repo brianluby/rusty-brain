@@ -844,7 +844,18 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         kind: rb_types::FeedbackKind,
         provenance: &Provenance,
     ) -> rb_types::Result<f32> {
-        if self.get_scoped(id.clone()).await?.is_none() {
+        // Feedback targets a LIVE, recallable memory: recall never returns
+        // archived rows, so an archived target is a caller error. Reject it
+        // (NotFound) via the `active_in_namespace` check `graph` uses — distinct
+        // from `update`/`link`, whose metadata edits remain valid on archived
+        // rows. This also avoids a pointless confidence nudge + `Updated` event
+        // on a soft-deleted memory.
+        let active = self
+            .get_scoped(id.clone())
+            .await?
+            .as_ref()
+            .is_some_and(|note| self.active_in_namespace(note));
+        if !active {
             return Err(rb_types::Error::NotFound(id));
         }
         self.backend
@@ -2236,6 +2247,20 @@ mod tests {
                 rb_types::FeedbackKind::Stale,
                 &Provenance::default(),
             )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_an_archived_memory() {
+        // Feedback is about live, recallable memories; an archived (soft-deleted)
+        // target is a caller error => NotFound (the `graph` active-scope rule).
+        let eng = engine();
+        let id = eng.remember(input("doomed but graded", 5)).await.unwrap();
+        eng.delete(id.clone()).await.unwrap();
+        let err = eng
+            .feedback(id, rb_types::FeedbackKind::Wrong, &Provenance::default())
             .await
             .unwrap_err();
         assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");

@@ -244,7 +244,7 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   stays the W3.2 installer for now, not yet the "thin wrapper preferring native
   channels" (that step is APM-dependent).
 
-**Phase-3 progress — W3.7 usefulness signal / `memory_feedback` (landed 2026-06-14, 1161 tests green):**
+**Phase-3 progress — W3.7 usefulness signal / `memory_feedback` (landed 2026-06-14, 1164 tests green):**
 
 - *The distinct usefulness signal:* a new `memory_feedback` MCP tool +
   `rusty-brain feedback <id> --kind <helpful|wrong|stale>` CLI report whether a
@@ -286,6 +286,13 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   guards forced the allowlist + committed-config updates in lockstep; the
   token-accounting CI test confirms the 6-tool default `tools/list` stays under
   the 900-token budget. F37 closed.
+- *Adversarial review (6-dimension fan-out + per-finding verification):* 2
+  findings confirmed, both fixed. (1) feedback on an ARCHIVED memory now returns
+  `NotFound` at the engine level (the `graph` active-scope rule) — feedback is
+  about live, recallable memories, so an archived target is a caller error,
+  avoiding a pointless confidence nudge + `Updated` event on a soft-deleted row.
+  (2) added CLI clap-parse tests for the `feedback` command (valid kind parses;
+  unknown/missing `--kind` rejected at parse time).
 
 ---
 
