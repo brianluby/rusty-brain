@@ -31,6 +31,7 @@ const MCP_ALLOW_ENTRIES: &[&str] = &[
     "mcp__rusty-brain__get",
     "mcp__rusty-brain__context",
     "mcp__rusty-brain__update",
+    "mcp__rusty-brain__memory_feedback",
 ];
 
 /// Skill directory name under `.claude/skills/` (W3.2(b)).
@@ -173,6 +174,7 @@ mod tests {
                 "mcp__rusty-brain__get".to_string(),
                 "mcp__rusty-brain__context".to_string(),
                 "mcp__rusty-brain__update".to_string(),
+                "mcp__rusty-brain__memory_feedback".to_string(),
             ],
             "fragment must allowlist exactly the default advertised toolset (no wildcard)"
         );

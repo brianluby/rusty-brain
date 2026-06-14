@@ -831,6 +831,32 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .await
     }
 
+    /// Record a usefulness-feedback event for a memory in this namespace (W3.7
+    /// / F37): the explicit usefulness/correctness signal `access_count` is not
+    /// (it counts "returned", not "useful"). Verifies `id` lives in the engine's
+    /// namespace (fail-closed `NotFound`), then records the event and nudges the
+    /// trust prior through the backend. `provenance` supplies the giver
+    /// (`origin_user`) for the W5c per-author trust rollup. Returns the memory's
+    /// `confidence` after the bounded nudge.
+    pub async fn feedback(
+        &self,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        provenance: &Provenance,
+    ) -> rb_types::Result<f32> {
+        if self.get_scoped(id.clone()).await?.is_none() {
+            return Err(rb_types::Error::NotFound(id));
+        }
+        self.backend
+            .record_feedback(
+                self.namespace.clone(),
+                id,
+                kind,
+                provenance.origin_user.clone(),
+            )
+            .await
+    }
+
     /// Soft-delete (archive) a memory. Spec §12: delete == soft archive.
     pub async fn delete(&self, id: MemoryId) -> rb_types::Result<()> {
         if self.get_scoped(id.clone()).await?.is_none() {
@@ -2142,6 +2168,74 @@ mod tests {
         eng.backend().insert_note(foreign);
         let err = eng
             .link(local, foreign_id, rb_types::LinkType::Contradicts, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");
+    }
+
+    #[tokio::test]
+    async fn feedback_nudges_confidence_for_a_known_memory() {
+        let eng = engine();
+        let id = eng.remember(input("decision", 5)).await.unwrap();
+        // A fresh MCP/CLI write starts at the full-trust 1.0 baseline.
+        let before = eng.get(id.clone()).await.unwrap().unwrap().confidence;
+        assert!((before - 1.0).abs() < 1e-6);
+
+        let after = eng
+            .feedback(
+                id.clone(),
+                rb_types::FeedbackKind::Wrong,
+                &Provenance::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            (after - 0.70).abs() < 1e-6,
+            "1.0 - 0.30 = 0.70, got {after}"
+        );
+        let stored = eng.get(id.clone()).await.unwrap().unwrap().confidence;
+        assert!((stored - 0.70).abs() < 1e-6, "get reflects the nudge");
+
+        let after2 = eng
+            .feedback(id, rb_types::FeedbackKind::Helpful, &Provenance::default())
+            .await
+            .unwrap();
+        assert!(
+            (after2 - 0.75).abs() < 1e-6,
+            "0.70 + 0.05 = 0.75, got {after2}"
+        );
+    }
+
+    #[tokio::test]
+    async fn feedback_rejects_unknown_and_cross_namespace() {
+        let eng = engine();
+        // Missing id => NotFound.
+        let err = eng
+            .feedback(
+                MemoryId::new(),
+                rb_types::FeedbackKind::Helpful,
+                &Provenance::default(),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");
+
+        // A memory in another namespace is invisible to this engine => NotFound.
+        let foreign = note(
+            Namespace::Project("other".into()),
+            "foreign",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let foreign_id = foreign.id.clone();
+        eng.backend().insert_note(foreign);
+        let err = eng
+            .feedback(
+                foreign_id,
+                rb_types::FeedbackKind::Stale,
+                &Provenance::default(),
+            )
             .await
             .unwrap_err();
         assert!(matches!(err, rb_types::Error::NotFound(_)), "{err}");

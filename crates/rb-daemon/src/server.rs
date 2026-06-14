@@ -586,6 +586,7 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Graph { .. }
         | Request::Update { .. }
         | Request::Link { .. }
+        | Request::Feedback { .. }
         | Request::Delete { .. }
         | Request::Context
         | Request::Subscribe { .. }
@@ -1050,6 +1051,13 @@ where
             reason,
         } => match engine.link(from, to, link_type, reason).await {
             Ok(()) => Response::Linked,
+            Err(e) => error_to_response(e),
+        },
+        // Namespace-scoped usefulness signal (W3.7): the engine verifies the
+        // memory lives in this connection's namespace; `provenance` supplies the
+        // giver (`origin_user`) recorded for the W5c per-author rollup.
+        Request::Feedback { id, kind } => match engine.feedback(id, kind, provenance).await {
+            Ok(confidence) => Response::FeedbackRecorded { confidence },
             Err(e) => error_to_response(e),
         },
         // Admin op (peer-gated above): retroactive secret redaction across all

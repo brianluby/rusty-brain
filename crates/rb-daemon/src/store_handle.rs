@@ -104,6 +104,18 @@ enum WriteCommand {
         link: Box<rb_types::MemoryLink>,
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Record a usefulness-feedback event for a memory and nudge its trust prior
+    /// (W3.7). Namespace-verified like `Update` before the store writes the event
+    /// row + confidence + oplog in one transaction. The typed reply carries the
+    /// post-nudge `confidence` (the `RenameNamespace`/`Scrub` typed-reply
+    /// precedent).
+    RecordFeedback {
+        namespace: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<String>,
+        reply: oneshot::Sender<Result<f32>>,
+    },
     /// Apply a batch of BUFFERED access bumps (W1.8). Recall and `get` never
     /// enqueue a writer command for access tracking — they accumulate into
     /// [`AccessBuffer`]; this command carries the periodic/shutdown flush.
@@ -1196,6 +1208,57 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::RecordFeedback {
+                namespace,
+                id,
+                kind,
+                principal,
+                reply,
+            } => {
+                // Capture the typed payload via the RenameNamespace/Scrub
+                // pattern (run_store_op is Result<()>-only).
+                let mut confidence = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    // Mirror the Update arm: verify the row lives in the caller's
+                    // namespace before mutating, fail closed (NotFound) on a
+                    // missing or cross-namespace id.
+                    |s| match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => {
+                            confidence =
+                                Some(s.record_feedback(&id, kind, principal.as_deref())?);
+                            Ok(())
+                        }
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    },
+                );
+                let changed = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    confidence.ok_or_else(|| {
+                        Error::Storage("feedback completed without an outcome".to_string())
+                    })
+                });
+                let _ = reply.send(result);
+                // Feedback nudges confidence (durable ranking state), so
+                // subscribers observe it as an Updated change.
+                if changed {
+                    publish_change_stamped(
+                        &events,
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Updated,
+                    );
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
             WriteCommand::FlushAccesses { bumps, reply } => {
                 // No MemoryChanged event: access tracking is observability-only.
                 let report = run_store_op(
@@ -1567,6 +1630,33 @@ impl MemoryBackend for StoreHandle {
             reply,
         };
         self.send_write(cmd, rx).await
+    }
+
+    async fn record_feedback(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<String>,
+    ) -> Result<f32> {
+        // Bespoke send with a typed reply payload (the `rename_namespace`/`scrub`
+        // precedent); `send_write` only carries `Result<()>`.
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::RecordFeedback {
+                namespace: ns,
+                id,
+                kind,
+                principal,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
     }
 
     async fn record_access(&self, id: MemoryId) -> Result<()> {
@@ -2404,6 +2494,56 @@ mod tests {
             row.base_importance, base,
             "the author prior must survive the job write"
         );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_record_feedback_is_namespace_scoped_and_nudges_confidence() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("feedback-write".to_string());
+
+        let mut m = note(&ns, "a decision worth grading");
+        m.confidence = 0.8;
+        let id = m.id.clone();
+        handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+
+        // Cross-namespace feedback fails closed, exactly like Update.
+        let err = handle
+            .record_feedback(
+                Namespace::Global,
+                id.clone(),
+                rb_types::FeedbackKind::Wrong,
+                Some("alice".to_string()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(_)),
+            "cross-namespace feedback must be NotFound, got {err:?}"
+        );
+
+        // In-namespace `wrong` lowers confidence through the single writer and
+        // the typed reply carries the post-nudge value.
+        let after = handle
+            .record_feedback(
+                ns.clone(),
+                id.clone(),
+                rb_types::FeedbackKind::Wrong,
+                Some("alice".to_string()),
+            )
+            .await
+            .unwrap();
+        assert!((after - 0.5).abs() < 1e-6, "0.8 - 0.30 = 0.50, got {after}");
+        let stored = handle
+            .get(ns, id)
+            .await
+            .unwrap()
+            .expect("memory present")
+            .confidence;
+        assert!((stored - 0.5).abs() < 1e-6, "the row reflects the nudge");
 
         handle.shutdown().await;
     }

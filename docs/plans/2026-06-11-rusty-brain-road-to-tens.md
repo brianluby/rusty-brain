@@ -244,6 +244,49 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   stays the W3.2 installer for now, not yet the "thin wrapper preferring native
   channels" (that step is APM-dependent).
 
+**Phase-3 progress — W3.7 usefulness signal / `memory_feedback` (landed 2026-06-14, 1161 tests green):**
+
+- *The distinct usefulness signal:* a new `memory_feedback` MCP tool +
+  `rusty-brain feedback <id> --kind <helpful|wrong|stale>` CLI report whether a
+  recalled memory was actually useful — the signal `access_count` (which counts
+  "returned", not "useful") cannot provide. `FeedbackKind` lives in `rb-types`
+  (snake_case serde + `parse`→`InvalidArgument`, the `JobKind` precedent;
+  `confidence_delta()` carries the coupling policy). Wired end to end:
+  `Request::Feedback { id, kind }` + `Response::FeedbackRecorded { confidence }`
+  (new variants, NO `CONTRACT_VERSION` bump — the `Link`/`Scrub` precedent: an
+  old daemon fails to decode a new op and closes; the handshake version gates the
+  shape of SHARED result types, which this is not). Namespace-scoped, NOT an
+  admin op — the engine verifies the target lives in the connection's namespace.
+- *Storage (event log, not a counter):* migration `008_memory_feedback.sql`
+  adds a `memory_feedback` table — one row per event (`memory_id`, `namespace`,
+  `kind`, `principal` = the giver's `origin_user`, `at`). Purely additive (no
+  `ALTER` on `memories`, so the FTS triggers are untouched). It is the
+  non-circular input W5c per-author trust weighting needs (aggregate by the
+  target memory's existing provenance via `GROUP BY`) and the positive signal
+  W1.9 importance recalibration can consume. `Store::record_feedback` writes the
+  event row + the confidence nudge + a `memory_oplog` `feedback` entry in ONE
+  transaction, so the event log, the trust prior, and the durable change log can
+  never disagree (the `set_confidence`/`supersede` precedent); `updated_at` is
+  deliberately not bumped (feedback is not an authorial content edit). The daemon
+  routes it through the single writer (`WriteCommand::RecordFeedback`, typed
+  `Result<f32>` reply via the `RenameNamespace`/`Scrub` outcome-capture pattern)
+  and publishes an `Updated` change event.
+- *Confidence coupling (single trust axis):* all three kinds move `confidence`,
+  clamped to `0.0..=1.0` — `helpful` +0.05 (toward full trust), `stale` −0.15,
+  `wrong` −0.30 (incorrect erodes trust more sharply than merely outdated). A
+  single nudge can never push the prior out of range, and several `wrong` reports
+  are required to fully erode trust. This unblocks W2.2's confidence producer,
+  W5c's non-circular trust input, and W1.9's importance recalibration (which
+  ships disabled until a separate activation, now that its usefulness signal
+  exists).
+- *Tool surface:* `memory_feedback` joins `DEFAULT_TOOLS` (advertised by default,
+  not gated behind `RB_MCP_FULL_TOOLSET`) — the signal only accumulates if the
+  model actually calls it after recall, which is the whole point. The
+  `DEFAULT_TOOLS`↔`MCP_ALLOW_ENTRIES`↔committed `.claude/settings.json` drift
+  guards forced the allowlist + committed-config updates in lockstep; the
+  token-accounting CI test confirms the 6-tool default `tools/list` stays under
+  the 900-token budget. F37 closed.
+
 ---
 
 ## 7. Phase 4 — Prove it: eval gates, perf, fuzz

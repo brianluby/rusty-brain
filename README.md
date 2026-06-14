@@ -229,9 +229,11 @@ MCP-capable agent at it as a stdio server, for example:
 }
 ```
 
-It exposes ten tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
-`link` (e.g. mark one memory as contradicting another), `delete`, `context`, and
-`poll_changes` (drains buffered change notifications).
+It exposes eleven tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
+`link` (e.g. mark one memory as contradicting another), `delete`, `context`,
+`memory_feedback` (report whether a recalled memory was `helpful`/`wrong`/`stale`,
+nudging its trust prior), and `poll_changes` (drains buffered change
+notifications).
 
 ### Capture hooks (optional)
 

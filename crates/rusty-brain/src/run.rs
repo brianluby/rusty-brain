@@ -198,6 +198,11 @@ async fn run_client(
                 .context("link failed")?;
             println!("{}", output::render_linked(json));
         }
+        Command::Feedback { id, kind } => {
+            let id = parse_id(&id).context("invalid memory id")?;
+            let confidence = client.feedback(id, kind).await.context("feedback failed")?;
+            println!("{}", output::render_feedback(confidence, json));
+        }
         Command::Delete { id } => {
             let id = parse_id(&id).context("invalid memory id")?;
             client.delete(id).await.context("delete failed")?;

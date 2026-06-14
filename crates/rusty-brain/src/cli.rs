@@ -1,11 +1,16 @@
 //! Command-line surface for the `rusty-brain` binary (clap derive).
 
 use clap::{value_parser, Parser, Subcommand};
-use rb_types::{LinkType, MemoryType};
+use rb_types::{FeedbackKind, LinkType, MemoryType};
 
 /// Parse a `--type` value into a `MemoryType` using the canonical db strings.
 fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
     MemoryType::parse(s).map_err(|e| e.to_string())
+}
+
+/// Parse a feedback `--kind` value into a `FeedbackKind` (helpful|wrong|stale).
+fn parse_feedback_kind(s: &str) -> Result<FeedbackKind, String> {
+    FeedbackKind::parse(s).map_err(|e| e.to_string())
 }
 
 /// Parse a link `--type` value into a `LinkType` using the canonical db strings.
@@ -171,6 +176,16 @@ pub enum Command {
         /// Why this link exists (stored on the edge).
         #[arg(long)]
         reason: Option<String>,
+    },
+
+    /// Record a usefulness signal about a memory (W3.7): `helpful`, `wrong`, or
+    /// `stale`. Nudges the memory's trust prior so future recalls improve.
+    Feedback {
+        /// Memory id (UUID) the feedback is about.
+        id: String,
+        /// Feedback kind: `helpful`, `wrong`, or `stale`.
+        #[arg(long = "kind", value_parser = parse_feedback_kind)]
+        kind: FeedbackKind,
     },
 
     /// Soft-delete (archive) a memory.

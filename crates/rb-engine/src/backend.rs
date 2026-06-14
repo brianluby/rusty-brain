@@ -48,6 +48,19 @@ pub trait MemoryBackend: Send + Sync {
     async fn archive(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<()>;
     /// Persist a directed link (write path).
     async fn add_link(&self, link: rb_types::MemoryLink) -> rb_types::Result<()>;
+    /// Record a usefulness-feedback event for `id` and nudge its trust prior
+    /// (W3.7): the explicit usefulness/correctness signal `access_count` is not
+    /// (it counts "returned", not "useful"). `principal` is the giver (the
+    /// connection's `origin_user`), recorded for the W5c per-author trust
+    /// rollup. Returns `id`'s `confidence` after the bounded, clamped nudge. A
+    /// missing or out-of-namespace id is `Error::NotFound`.
+    async fn record_feedback(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        kind: rb_types::FeedbackKind,
+        principal: Option<String>,
+    ) -> rb_types::Result<f32>;
     /// Bump access metadata for `id` (best-effort at call sites). W1.8:
     /// implementations MAY defer the bump — the daemon buffers it in memory
     /// and flushes batches off the read path, so recall/`get` issue zero
@@ -231,6 +244,21 @@ mod tests {
                 .ok_or_else(|| rb_types::Error::NotFound(link.source_id.clone()))?;
             note.links.push(link);
             Ok(())
+        }
+        async fn record_feedback(
+            &self,
+            ns: Namespace,
+            id: MemoryId,
+            kind: rb_types::FeedbackKind,
+            _principal: Option<String>,
+        ) -> rb_types::Result<f32> {
+            let mut guard = self.notes.lock().unwrap();
+            let note = guard
+                .get_mut(&id)
+                .filter(|note| note.namespace == ns)
+                .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+            note.confidence = (note.confidence + kind.confidence_delta()).clamp(0.0, 1.0);
+            Ok(note.confidence)
         }
         async fn record_access(&self, id: MemoryId) -> rb_types::Result<()> {
             let mut guard = self.notes.lock().unwrap();
