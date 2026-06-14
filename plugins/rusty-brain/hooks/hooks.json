@@ -1,0 +1,22 @@
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ],
+    "UserPromptSubmit": [
+      { "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "*", "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ],
+    "Stop": [
+      { "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ],
+    "PreCompact": [
+      { "hooks": [{ "type": "command", "command": "rusty-brain-hooks --agent claude-code" }] }
+    ]
+  }
+}

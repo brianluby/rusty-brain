@@ -29,6 +29,10 @@ rb-types = { path = "../rb-types" }
 rb-proto = { path = "../rb-proto" }
 rb-daemon = { path = "../rb-daemon" }
 rb-embed = { path = "../rb-embed" }
+# W3.6a drift guard: the permissions.allow list must equal the MCP server's
+# default advertised toolset (rb_mcp::tools::DEFAULT_TOOLS), so no advertised
+# tool stalls a headless run.
+rb-mcp = { path = "../rb-mcp" }
 tokio = { workspace = true }
 serde_json = { workspace = true }
 assert_cmd = { workspace = true }

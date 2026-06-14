@@ -1,0 +1,14 @@
+{
+  "name": "rusty-brain",
+  "owner": {
+    "name": "Brian Luby",
+    "url": "https://github.com/brianluby"
+  },
+  "plugins": [
+    {
+      "name": "rusty-brain",
+      "source": "./plugins/rusty-brain",
+      "description": "Persistent, decision-grade memory for Claude Code (rusty-brain MCP server + strictly fail-open capture hooks)."
+    }
+  ]
+}

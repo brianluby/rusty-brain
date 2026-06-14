@@ -1,0 +1,11 @@
+{
+  "name": "rusty-brain",
+  "description": "Persistent, decision-grade memory for Claude Code: recall relevant prior decisions before work and capture durable ones after — via the rusty-brain MCP server plus strictly fail-open capture hooks. Requires the `rusty-brain` and `rusty-brain-hooks` binaries on PATH (cargo install / Homebrew / signed release).",
+  "version": "0.0.1",
+  "author": {
+    "name": "Brian Luby"
+  },
+  "homepage": "https://github.com/brianluby/rusty-brain",
+  "repository": "https://github.com/brianluby/rusty-brain",
+  "license": "MIT"
+}

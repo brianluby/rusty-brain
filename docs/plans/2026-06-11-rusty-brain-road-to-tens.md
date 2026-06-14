@@ -116,7 +116,7 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
 - **W3.3 Token economy.** Projection implemented **exclusively in rb-mcp's `response_to_content`** (the wire Response and CLI `--json` keep the full shape — no CONTRACT_VERSION bump; rb-eval is unaffected). Render recall/list/context as markdown, one line per result: `N. [type, imp 8, 3d ago] summary-or-first-200-chars (id 1a2b3c)` + `⚠ contested` marker; age is decision-critical and was missing from the draft's 7-field projection; score bucketed or omitted; full JSON only as optional structuredContent. SessionStart injection is **source-aware** (full digest on `startup`; nothing on `resume`; constraints-only after `compact`), budget ≤600 tokens / ≤10 items, preferring constraint + architecture_decision at importance ≥8, with the W2.5 framing and a "use recall for older decisions" pointer. Default MCP toolset shrinks to remember/recall/get/context (+update); poll_changes/graph/delete/list behind `RB_MCP_FULL_TOOLSET`. **Token-accounting CI test**: tokenize the actual tools/list + instructions + injection payloads; fail above 900/150/600. *(F53, F56)*
 - **W3.4 Fixture harness.** Recorded real Claude Code settings.json + hook payloads (started in W0.7) expanded to full session-lifecycle coverage on macOS + Linux; the empty-corpus first-session scenario; the W2.5 injection drill lives here.
 - **W3.5 A/B outcome eval (nightly, not per-PR).** ≥10 scenario pairs run headless via `claude -p` with hooks+MCP installed: session 1 plants a decision/constraint; session 2 (fresh context, same namespace) performs a task where it matters. Arms: memory-on, memory-off, **CLAUDE.md-only** (the native baseline — this is the value-over-native proof F56 demands). Judge: deterministic assertion on output/diff where possible, LLM judge otherwise; N runs per scenario for stochasticity; report task success, turns-to-completion, token cost, and **memory-induced errors (stale/wrong memory acted on) enumerated, not averaged away**. Memory-on must win on success/turns within token budget. *(F56)*
-- **W3.6 Native distribution.** Claude Code plugin (hooks + MCP config + memory skill + `/rb:remember`, `/rb:recall`) publishable via a marketplace repo; committed `.mcp.json` + project `.claude/settings.json` template for zero-effort team rollout on clone; `rusty-brain install` becomes a thin wrapper preferring native channels; execute the existing **P7 APM spec** as the cross-harness channel; document enterprise managed-settings interactions (org policy can disable hooks/MCP — a Phase 5 rollout dependency).
+- **W3.6 Native distribution.** Claude Code plugin (hooks + MCP config + memory skill + `/rb:remember`, `/rb:recall`) publishable via a marketplace repo; committed `.mcp.json` + project `.claude/settings.json` template for zero-effort team rollout on clone; `rusty-brain-install` becomes a thin wrapper preferring native channels; execute the existing **P7 APM spec** as the cross-harness channel; document enterprise managed-settings interactions (org policy can disable hooks/MCP — a Phase 5 rollout dependency).
 - **W3.7 Usefulness signal.** `memory_feedback` MCP tool (helpful/wrong/stale) as the confidence producer W2.2 needs and the non-circular input W5c trust weighting needs — `access_count` counts "returned", not "useful". *(F37)*
 
 **Phase 3 gate:** a 40-turn simulated session produces ≤5 memories (vs ~40 today); elicitation scorecard passes; token-accounting test green; W3.5 nightly eval: memory-on beats memory-off AND CLAUDE.md-only on the scenario set; decision-grade rubric ≥80% on the sampled corpus. **Begin recruiting Phase 5 pilot users now.**
@@ -208,6 +208,41 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   elicitation scorecard MEASURED run (both need `claude` + API spend). With
   W3.3 landed, the gate's token-accounting-test clause is now MET; the remaining
   owed clauses are W3.5's outcome win and the scorecard's measured pass.
+
+**Phase-3 progress — W3.6a Claude-native distribution (landed 2026-06-14):**
+
+- *Plugin:* `plugins/rusty-brain/` is a complete Claude Code plugin —
+  `.claude-plugin/plugin.json`, `.mcp.json` (the stdio rusty-brain MCP server),
+  `hooks/hooks.json` (the 6 capture/inject hooks → `rusty-brain-hooks --agent
+  claude-code`), `skills/rusty-brain-memory/SKILL.md`, and `/rusty-brain:remember`
+  + `/rusty-brain:recall` slash commands. The repo is itself a marketplace
+  (`.claude-plugin/marketplace.json`): `/plugin marketplace add
+  brianluby/rusty-brain` → `/plugin install rusty-brain@rusty-brain`. (Namespace
+  = plugin name → `/rusty-brain:…`; chose the clear published name over the spec's
+  terse `/rb:`.)
+- *Committed project config:* repo-root `.mcp.json` + `.claude/settings.json`
+  (hooks + `permissions.allow` for the 5 elicitation tools) — the repo dogfoods
+  rusty-brain on itself and is the zero-effort-on-clone reference template;
+  `.claude/settings.local.json` is now gitignored.
+- *Three channels, pick one:* plugin / committed config / `rusty-brain-install`
+  ship the SAME context, so two active channels double-register the hooks.
+  Documented in `docs/2026-06-14-native-distribution.md` with the **enterprise
+  managed-settings** interactions (`permissions.deny`, `allowManagedHooksOnly`,
+  `allowManagedMcpServersOnly`, `strictPluginOnlyCustomization` can neutralize the
+  native channels — a Phase 5 rollout dependency).
+- *Drift guards:* rb-install tests assert the committed plugin SKILL.md ==
+  `MEMORY_SKILL`, the committed `permissions.allow` == `MCP_ALLOW_ENTRIES`, both
+  hooks files register exactly `CLAUDE_EVENTS`, and the `.mcp.json` / marketplace
+  shapes — so the channels can't silently drift.
+- *Binaries are a PATH prerequisite* (the channels wire CONTEXT, not binaries):
+  missing binaries degrade silently (MCP server doesn't start; fail-open hooks
+  no-op). The **claudecode-10 gate clause** (plugin + committed `.mcp.json` +
+  settings template + `permissions.allow`) is now MET.
+- *Deferred:* the cross-harness **P7 APM spec** (the 2348-line Microsoft-APM
+  package subsystem — `apm/` artifacts + `rusty-brain apm` CLI + an rb-install
+  delegation backend + CI) is its own track; `rusty-brain-install` therefore
+  stays the W3.2 installer for now, not yet the "thin wrapper preferring native
+  channels" (that step is APM-dependent).
 
 ---
 
