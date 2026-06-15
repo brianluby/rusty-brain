@@ -304,11 +304,16 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   `scripts/w35-ab-eval.sh` runs each WORK task under THREE arms — **memory-on**
   (rusty-brain plant→recall), **memory-off** (the floor), **claude-md** (the
   native baseline F56 must beat) — via `claude -p --output-format json` (turns +
-  cost come straight from the CLI). Deterministic judge: WORK output must contain
-  `expect` and not `forbid`; stale-trap scenarios flag a **memory-induced error**
-  when the memory-on arm emits the superseded `stale_token` (enumerated per run,
-  never averaged). PASS = memory-on success_rate ≥ both baselines AND beats each
-  on success-or-turns AND zero memory-induced errors. The judge + the aggregator
+  cost come straight from the CLI). Deterministic judge: EXPECT-ONLY — the
+  model's OUTPUT (final answer + files it wrote during WORK, never seeded files
+  like the claude-md arm's CLAUDE.md) must contain `expect`. A `forbid` token is
+  intentionally NOT used: it would false-fail correct answers that name the
+  rejected default, biasing the native baseline. Stale-trap scenarios flag a
+  **memory-induced error** only when the memory-on WORK task FAILS (`expect`
+  absent) AND the superseded `stale_token` is present — i.e. the model produced
+  the stale value instead of the current one (enumerated per run, never
+  averaged). PASS = memory-on success_rate ≥ both baselines AND beats each on
+  success-or-turns AND zero memory-induced errors. The judge + the aggregator
   are PURE and covered by `--self-test` (no API, CI-safe).
 - *Nightly infra:* `.github/workflows/w35-ab-eval.yml` clones the claude-smoke
   posture — scheduled+dispatch, `ANTHROPIC_API_KEY` preflight, cheap-model +

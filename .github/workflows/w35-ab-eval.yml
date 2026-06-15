@@ -88,10 +88,17 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
           RB_W35_MAX_BUDGET_USD: "0.50"
+          # Pass the dispatch input via env (never interpolate ${{ }} directly
+          # into the shell) and validate it's a positive integer before use, so a
+          # crafted dispatch value cannot inject shell (zizmor template-injection).
+          RUNS_INPUT: ${{ github.event.inputs.runs || '1' }}
         run: |
+          case "$RUNS_INPUT" in
+            ''|*[!0-9]*|0) echo "::error::'runs' must be a positive integer (got '$RUNS_INPUT')"; exit 1 ;;
+          esac
           scripts/w35-ab-eval.sh \
             --bin-dir target/release \
-            --runs "${{ github.event.inputs.runs || '1' }}" \
+            --runs "$RUNS_INPUT" \
             --out "${RUNNER_TEMP}/w35-report.tsv"
 
       # Upload ONLY the structured TSV report (scenario/arm/run/success/turns/

@@ -205,6 +205,11 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (needed to edi
 [ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 3' "$SCENARIOS")"
 MIE_ALLOWED="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS")"
 
+# A session that produced no parseable JSON result (timeout/error/budget) counts
+# as this many turns — a worst-case sentinel, well above a normal task, so a
+# failure can never make an arm look faster on the turns tiebreaker.
+TURNS_FAIL_SENTINEL="${RB_W35_TURNS_FAIL_SENTINEL:-99}"
+
 # Per-session wall-clock cap (defense against a hung session stalling the run).
 # `timeout` is GNU coreutils (not in macOS base); use it or `gtimeout` if present,
 # else run uncapped (the job-level timeout is the backstop). Empty -> no prefix.
@@ -278,37 +283,39 @@ PY
   )
 }
 
-# Build the judge text for a WORK session: the final `.result` from the JSON
-# output, plus any non-dotfile the model wrote in the project (the "output/diff"
-# the plan's judge inspects). Robust to a non-JSON log (budget/error): falls
-# back to the raw log so a failed parse never silently scores as success.
-collect_judge_text() {
-  local jsonlog="$1" proj="$2" out="$3"
-  if jq -e '.result' "$jsonlog" >/dev/null 2>&1; then
-    jq -r '.result' "$jsonlog" > "$out"
-  else
-    cp "$jsonlog" "$out"
-  fi
-  # Append files the model created/edited (skip dotdirs: .claude/.mcp.json/.git).
-  find "$proj" -type f -not -path '*/.*' -print0 2>/dev/null \
-    | xargs -0 cat >> "$out" 2>/dev/null || true
-}
-
-# Parse num_turns / total_cost_usd from a JSON-output log (0 when absent).
-json_turns() { jq -r '.num_turns // 0'      "$1" 2>/dev/null || echo 0; }
-json_cost()  { jq -r '.total_cost_usd // 0' "$1" 2>/dev/null || echo 0; }
-
 # Run the WORK session for one arm and append its result row to $RESULTS.
+#
+# Judge text = the model's OUTPUT only: the final `.result` from the JSON output
+# plus files the model WROTE DURING this session (mtime newer than a marker
+# stamped just before the run, each capped in size). Pre-seeded files — notably
+# the claude-md arm's seeded CLAUDE.md, which contains the decision's own
+# expect/stale tokens — are EXCLUDED, so the judge scores what the model produced,
+# not what it was handed. A non-JSON log (timeout/error/budget) falls back to the
+# raw log (so a failed session is judged, not silently skipped) AND scores
+# turns=$TURNS_FAIL_SENTINEL / cost=0 — a worst-case sentinel so a failure can
+# never make an arm look artificially fast on the turns tiebreaker.
 score_work() {
   local id="$1" arm="$2" run="$3" proj="$4" home="$5" work="$6" \
         expect="$7" forbid="$8" stale="$9"
-  local jlog="$proj/../work.json" jtext="$proj/../judge.txt"
+  local jlog="$proj/../work.json" jtext="$proj/../judge.txt" marker="$proj/../work.start"
+  : > "$marker"
   run_session "$home" "$proj" "$work" "$jlog" --output-format json
-  collect_judge_text "$jlog" "$proj" "$jtext"
-  local turns cost res
-  turns="$(json_turns "$jlog")"; cost="$(json_cost "$jlog")"
+  local turns cost
+  if jq -e '.result' "$jlog" >/dev/null 2>&1; then
+    jq -r '.result' "$jlog" > "$jtext"
+    turns="$(jq -r ".num_turns // $TURNS_FAIL_SENTINEL" "$jlog" 2>/dev/null || echo "$TURNS_FAIL_SENTINEL")"
+    cost="$(jq -r '.total_cost_usd // 0' "$jlog" 2>/dev/null || echo 0)"
+  else
+    cp "$jlog" "$jtext"           # failed/timeout: judge the raw log (-> success 0)
+    turns="$TURNS_FAIL_SENTINEL"; cost=0
+  fi
+  # Append ONLY files the model changed during this session (newer than marker),
+  # skipping large/binary files so one big write can't bloat the judge text.
+  find "$proj" -type f -not -path '*/.*' -newer "$marker" -size -256k -print0 2>/dev/null \
+    | xargs -0 cat >> "$jtext" 2>/dev/null || true
+  local res success mie
   res="$(judge_text "$jtext" "$expect" "$forbid" "$stale" "$arm")"
-  local success="${res% *}" mie="${res#* }"
+  success="${res% *}"; mie="${res#* }"
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$id" "$arm" "$run" "$success" "$turns" "$cost" "$mie" >> "$RESULTS"
   echo "   [$arm] success=$success turns=$turns cost=$cost mie=$mie"
 }
@@ -319,7 +326,13 @@ run_scenario_run() {
   local base="$WORKROOT/$id-r$run"
 
   # --- arm: memory-on (plant -> [supersede] -> work, shared store) -----------
-  local mbase="$base/on" sock="$base/on/sock" db="$base/on/memory.db" ns="rb-w35-$id-r$run"
+  # The Unix socket lives under a SHORT /tmp dir, not $WORKROOT: a temp HOME +
+  # long scenario id can push $WORKROOT/.../sock past macOS's ~104-byte sun_path
+  # limit and break daemon bind (the nightly-claude-smoke.sh socket-length note).
+  # The DB is a regular file (no length limit) so it stays under $WORKROOT.
+  local mbase="$base/on" db="$base/on/memory.db" ns="rb-w35-$id-r$run"
+  local sockdir; sockdir="$(mktemp -d "/tmp/rbw35.XXXXXX")"
+  local sock="$sockdir/s"
   mkdir -p "$mbase"
   local plant_home="$mbase/home_plant" plant_proj="$mbase/proj_plant"
   local work_home="$mbase/home_work" work_proj="$mbase/proj_work"
@@ -353,8 +366,10 @@ run_scenario_run() {
     }
     score_work "$id" "memory-on" "$run" "$work_proj" "$work_home" "$work" "$expect" "$forbid" "$stale"
   )
-  # Reap the session-started daemon for this run's store.
+  # Reap the session-started daemon for this run's store, then drop its short
+  # socket dir.
   if [ -f "$sock.pid" ]; then kill "$(cat "$sock.pid" 2>/dev/null)" 2>/dev/null || true; fi
+  rm -rf "$sockdir" 2>/dev/null || true
 
   # --- arm: claude-md-only (decision in CLAUDE.md, no rusty-brain) -----------
   local chome="$base/cmd/home" cproj="$base/cmd/proj"
