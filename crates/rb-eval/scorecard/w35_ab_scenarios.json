@@ -1,0 +1,123 @@
+{
+  "_about": "W3.5 A/B outcome-eval scenarios (plan §6 / W3.5). Each scenario is a planted project DECISION plus a later WORK task where that decision matters. The runner (scripts/w35-ab-eval.sh) executes the WORK task under THREE arms and judges the outcome deterministically: (1) memory-on — rusty-brain hooks+MCP installed, a PLANT session stores the decision, the WORK session recalls it; (2) memory-off — no rusty-brain, no decision available anywhere (the floor); (3) claude-md-only — no rusty-brain, but the decision is written into the project CLAUDE.md (the NATIVE baseline F56 demands a win over). Decisions are deliberately NON-OBVIOUS (the project's choice differs from a cold model's default) so the arms actually diverge. Judge: the WORK output (final answer + files written) must contain `expect` (decision honored) and not `forbid` (the default the decision overrode); matching is case-insensitive substring. `stale_trap` scenarios additionally plant a SUPERSEDING decision; in the memory-on arm, `stale_token` appearing in the WORK output means the model acted on a stale/wrong memory (a memory-induced error — enumerated per run, never averaged away). Pass: memory-on success_rate >= both baselines AND (strictly beats each baseline on success OR fewer turns) AND zero memory-induced errors. See docs/eval/2026-06-14-w35-ab-eval.md.",
+  "config": {
+    "runs_per_scenario": 3,
+    "memory_induced_errors_allowed": 0
+  },
+  "scenarios": [
+    {
+      "id": "dep-http-ureq",
+      "topic": "HTTP client dependency",
+      "plant": "Decision for this project: use the `ureq` crate for all outbound HTTP. We deliberately do NOT use reqwest (we want a tiny blocking client, no async runtime pulled in).",
+      "claude_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest.",
+      "work": "Add a small helper that performs an HTTP GET to a JSON health endpoint and parses the `status` field. Name the HTTP crate it should use and show the dependency line.",
+      "expect": "ureq",
+      "forbid": "reqwest"
+    },
+    {
+      "id": "dep-async-smol",
+      "topic": "async runtime",
+      "plant": "Architecture decision: this project's async runtime is `smol`. Do not add tokio — we keep the dependency tree small and smol is what everything else uses.",
+      "claude_md": "Async runtime: this project uses `smol`. Do not introduce tokio.",
+      "work": "I need to spawn a background task that periodically flushes a buffer. Which runtime API should I use and how do I spawn it?",
+      "expect": "smol",
+      "forbid": "tokio"
+    },
+    {
+      "id": "id-type-ulid",
+      "topic": "identifier type",
+      "plant": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.",
+      "claude_md": "Identifiers: entity ids are `Ulid`, never Uuid or integer ids.",
+      "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
+      "expect": "ulid",
+      "forbid": "uuid"
+    },
+    {
+      "id": "ser-msgpack",
+      "topic": "wire serialization format",
+      "plant": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do not serialize messages to JSON on the wire (JSON is only for human-facing CLI output).",
+      "claude_md": "Wire format: serialize messages with MessagePack (`rmp-serde`), not JSON.",
+      "work": "Add serialization for a new `Envelope` message type that goes over our internal socket. Which serializer should it use?",
+      "expect": "rmp",
+      "forbid": "serde_json"
+    },
+    {
+      "id": "err-apperror",
+      "topic": "error-handling convention",
+      "plant": "House rule: all fallible functions return our `AppError` type via the `?` operator. Never `.unwrap()` or `.expect()` in library code — clippy denies them.",
+      "claude_md": "Errors: return the project's `AppError` via `?`. No `.unwrap()`/`.expect()` in library code.",
+      "work": "Write a function that reads a required port number from an environment variable and returns it. Use our error convention.",
+      "expect": "apperror",
+      "forbid": ".unwrap()"
+    },
+    {
+      "id": "log-tracing",
+      "topic": "logging facility",
+      "plant": "Logging decision: use the `tracing` crate with structured fields everywhere. Plain `println!`/`eprintln!` for diagnostics is banned outside the CLI's user-facing output.",
+      "claude_md": "Logging: use `tracing` with structured fields. Do not use println!/eprintln! for diagnostics.",
+      "work": "Add diagnostic logging to a function that retries a network call, recording the attempt number. How should it log?",
+      "expect": "tracing",
+      "forbid": "println!"
+    },
+    {
+      "id": "time-unix-millis",
+      "topic": "timestamp storage",
+      "plant": "Decision: store all timestamps as UTC Unix milliseconds in an `i64` column. We do not store RFC3339/ISO-8601 strings in the database.",
+      "claude_md": "Timestamps: store as UTC Unix milliseconds (`i64`), never RFC3339 strings.",
+      "work": "Add a `created_at` field to a record that we persist to the database. What type and representation should it use?",
+      "expect": "milli",
+      "forbid": "rfc3339"
+    },
+    {
+      "id": "config-settings-toml",
+      "topic": "configuration source",
+      "plant": "Decision: all runtime configuration is read from a single `settings.toml` file. New knobs go in `settings.toml` — never scattered environment variables.",
+      "claude_md": "Config: all runtime configuration comes from `settings.toml`. Do not read config from environment variables.",
+      "work": "We need a new `max_connections` knob. Where should it be defined and how is it read?",
+      "expect": "settings.toml",
+      "forbid": "env::var"
+    },
+    {
+      "id": "arch-single-writer",
+      "topic": "concurrency architecture",
+      "plant": "Architecture: the store has a single writer thread reached through `WriterHandle`. No other code path may open the database for writing — all mutations go through the handle.",
+      "claude_md": "Writes: all database mutations go through the single-writer `WriterHandle`. Never open the DB for writing elsewhere.",
+      "work": "Add a maintenance task that prunes rows older than 30 days. How should it perform its deletes?",
+      "expect": "writerhandle",
+      "forbid": "open the database directly"
+    },
+    {
+      "id": "test-prefix-spec",
+      "topic": "test naming convention",
+      "plant": "Test convention: every test function name is prefixed with `spec_` and describes the behavior, e.g. `spec_rejects_empty_input`. Do not use a `test_` prefix.",
+      "claude_md": "Tests: prefix every test function name with `spec_` (e.g. `spec_rejects_empty_input`), not `test_`.",
+      "work": "Add a unit test for a function that validates an email address contains an `@`. Name the test function per our convention.",
+      "expect": "spec_",
+      "forbid": "fn test_"
+    },
+    {
+      "id": "stale-trap-http-switch",
+      "topic": "superseded HTTP client decision",
+      "stale_trap": true,
+      "plant": "For HTTP in this project we use the `reqwest` crate.",
+      "supersede": "Update: we have migrated off reqwest. All HTTP now uses the `ureq` crate — do NOT add reqwest to anything new; reqwest is being removed.",
+      "claude_md": "HTTP: use the `ureq` crate. (We migrated off reqwest; do not use reqwest.)",
+      "work": "Add a helper that performs an HTTP GET and returns the body. Which HTTP crate should it use?",
+      "expect": "ureq",
+      "forbid": "reqwest",
+      "stale_token": "reqwest"
+    },
+    {
+      "id": "stale-trap-config-rename",
+      "topic": "superseded config-path decision",
+      "stale_trap": true,
+      "plant": "Project configuration lives in a file named `app.toml` at the repo root.",
+      "supersede": "Update: we renamed the config file from `app.toml` to `config/settings.toml`. `app.toml` no longer exists — always read configuration from `config/settings.toml`.",
+      "claude_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
+      "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
+      "expect": "config/settings.toml",
+      "forbid": "app.toml",
+      "stale_token": "app.toml"
+    }
+  ]
+}

@@ -1,0 +1,139 @@
+# Phase-3 gate: nightly W3.5 A/B outcome eval (plan §6 / W3.5; F56).
+#
+# Drives scripts/w35-ab-eval.sh on macOS against freshly built binaries with the
+# real `claude` CLI. For each scenario it runs the same WORK task under three
+# arms — memory-on / memory-off / claude-md-only — and judges the outcome
+# deterministically, proving (or disproving) that rusty-brain memory makes the
+# agent DO BETTER than no memory AND than the native CLAUDE.md baseline, with
+# zero memory-induced errors. This is the gate's "memory-on beats memory-off AND
+# CLAUDE.md-only" clause.
+#
+# ALLOWED TO FAIL, WITH ALERTING: scheduled-only (plus manual dispatch); NEVER
+# gates PRs (it is nondeterministic and costs API spend). On failure it opens —
+# or comments on — a pinned issue titled "nightly w35 a/b eval failing"; on
+# success it closes that issue if open.
+#
+# Required repository secret:
+#   ANTHROPIC_API_KEY — an Anthropic API key with a small spend budget. Each
+#   WORK session runs `--model haiku --max-budget-usd 0.50`; a scheduled run is
+#   12 scenarios x N runs x up to 4 sessions, so budget a few dollars/night at
+#   N=2. Until the secret is configured, the run fails fast on preflight.
+#
+# COST/TIME: bounded by the per-session cap and `--runs` (default 2 here). A full
+# run takes tens of minutes; raise `runs` via workflow_dispatch for a deeper
+# sample when closing the gate.
+name: nightly w35 a/b eval
+
+on:
+  schedule:
+    - cron: "37 9 * * *" # nightly, offset from the claude-smoke job (08:23)
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "runs per scenario (stochasticity sample)"
+        required: false
+        default: "2"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  ab-eval:
+    name: w35 a/b outcome eval (macOS)
+    # Scheduled runs on forks would burn someone else's API budget; the eval is
+    # only meaningful on the canonical repo.
+    if: github.repository == 'brianluby/rusty-brain'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+      issues: write # open/update/close the alert issue
+    steps:
+      - name: Preflight - require the ANTHROPIC_API_KEY secret
+        env:
+          HAVE_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$HAVE_KEY" != "true" ]; then
+            echo "::error::repository secret ANTHROPIC_API_KEY is not configured; the W3.5 A/B eval cannot run. See the header comment in .github/workflows/w35-ab-eval.yml."
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
+
+      # DELIBERATELY UNPINNED (recorded trade-off, same as the claude-smoke job):
+      # tracking whatever version npm serves is the point of an eval against the
+      # real CLI. Exposure is bounded by the per-session spend cap.
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Run the W3.5 A/B eval
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RB_W35_MAX_BUDGET_USD: "0.50"
+        run: |
+          scripts/w35-ab-eval.sh \
+            --bin-dir target/release \
+            --runs "${{ github.event.inputs.runs || '2' }}" \
+            --out "${RUNNER_TEMP}/w35-report.tsv"
+
+      # Upload ONLY the structured TSV report (scenario/arm/run/success/turns/
+      # cost/mie columns — no model free-text), so unlike the smoke there is no
+      # session-output artifact that could carry a leaked key. The aggregate
+      # report + PASS/FAIL is in the job log (auto-masked by GitHub).
+      - name: Upload the A/B report
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: w35-ab-eval-report
+          path: ${{ runner.temp }}/w35-report.tsv
+          if-no-files-found: ignore
+
+      - name: Open or update the alert issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="nightly w35 a/b eval failing"
+          body="Nightly W3.5 A/B outcome eval failed: ${RUN_URL} (Phase-3 gate eval, allowed-to-fail; see .github/workflows/w35-ab-eval.yml)."
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,title \
+            --jq '[.[] | select(.title == "nightly w35 a/b eval failing")][0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            url="$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body")"
+            number="${url##*/}"
+            gh issue pin "$number" --repo "$GITHUB_REPOSITORY" \
+              || echo "could not pin issue #$number; it is open and titled '$title'"
+          fi
+
+      - name: Close the alert issue on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,title \
+            --jq '[.[] | select(.title == "nightly w35 a/b eval failing")][0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Recovered: ${RUN_URL}"
+          fi

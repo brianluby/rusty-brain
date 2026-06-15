@@ -294,6 +294,33 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   (2) added CLI clap-parse tests for the `feedback` command (valid kind parses;
   unknown/missing `--kind` rejected at parse time).
 
+**Phase-3 progress — W3.5 A/B outcome-eval HARNESS (landed 2026-06-14; measured run still owed):**
+
+- *What landed (the harness, not the measured numbers):* the outcome eval that
+  proves memory makes the agent DO BETTER — complementary to the W3.1 content
+  rubric and the W3.2 behavioral scorecard. 12 scenario pairs
+  (`crates/rb-eval/scorecard/w35_ab_scenarios.json`, incl. 2 stale-traps), each
+  a deliberately NON-OBVIOUS project decision so the arms diverge. Runner
+  `scripts/w35-ab-eval.sh` runs each WORK task under THREE arms — **memory-on**
+  (rusty-brain plant→recall), **memory-off** (the floor), **claude-md** (the
+  native baseline F56 must beat) — via `claude -p --output-format json` (turns +
+  cost come straight from the CLI). Deterministic judge: WORK output must contain
+  `expect` and not `forbid`; stale-trap scenarios flag a **memory-induced error**
+  when the memory-on arm emits the superseded `stale_token` (enumerated per run,
+  never averaged). PASS = memory-on success_rate ≥ both baselines AND beats each
+  on success-or-turns AND zero memory-induced errors. The judge + the aggregator
+  are PURE and covered by `--self-test` (no API, CI-safe).
+- *Nightly infra:* `.github/workflows/w35-ab-eval.yml` clones the claude-smoke
+  posture — scheduled+dispatch, `ANTHROPIC_API_KEY` preflight, cheap-model +
+  hard per-session spend cap, allowed-to-fail with a pinned alert issue. It
+  uploads ONLY the structured TSV report (no model free-text), so there is no
+  artifact secret-leak surface (simpler than the smoke's log-scrub).
+- *Still owed (the MEASURED run):* needs the `ANTHROPIC_API_KEY` repo secret +
+  spend budget. Same one secret unblocks the existing nightly claude-smoke AND
+  the W3.2 scorecard measured run AND this. Until it runs, the gate clause
+  "memory-on beats memory-off AND CLAUDE.md-only" is recorded as OWED, not met.
+  Rubric: `docs/eval/2026-06-14-w35-ab-eval.md`.
+
 ---
 
 ## 7. Phase 4 — Prove it: eval gates, perf, fuzz
