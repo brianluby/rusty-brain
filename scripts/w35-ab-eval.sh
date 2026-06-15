@@ -42,8 +42,15 @@ usage() { sed -n '2,31p' "$0"; exit 2; }
 # judge_text <textfile> <expect> <forbid> <stale_token> <arm>
 # Echoes "<success> <mie>" (each 0/1). Case-insensitive substring matching.
 #   success = expect present AND forbid absent (forbid empty => no forbid check)
-#   mie     = 1 only when arm is "memory-on", stale_token is non-empty, and the
-#             stale token appears (the model acted on a stale/wrong memory)
+#   mie     = a MEMORY-INDUCED ERROR: only on the memory-on arm, only when the
+#             task FAILED (success==0) AND the stale token is present. Keying mie
+#             on failure is deliberate: a substring grep cannot tell "acted on
+#             the stale memory" from "mentioned the superseded value while
+#             correctly choosing the new one" — so a CORRECT answer that merely
+#             names the old value (success==1) is NOT a memory-induced error.
+#             Stale-trap scenarios therefore set NO `forbid` (the old value
+#             appearing in passing must not fail success); `stale_token` + the
+#             success==0 gate carry the error signal instead.
 judge_text() {
   local file="$1" expect="$2" forbid="$3" stale="$4" arm="$5"
   local success=0 mie=0
@@ -53,7 +60,8 @@ judge_text() {
   if [ -n "$forbid" ] && grep -iqF -- "$forbid" "$file" 2>/dev/null; then
     success=0
   fi
-  if [ "$arm" = "memory-on" ] && [ -n "$stale" ] && grep -iqF -- "$stale" "$file" 2>/dev/null; then
+  if [ "$arm" = "memory-on" ] && [ "$success" -eq 0 ] && [ -n "$stale" ] \
+     && grep -iqF -- "$stale" "$file" 2>/dev/null; then
     mie=1
   fi
   echo "$success $mie"
@@ -110,18 +118,21 @@ self_test() {
   trap 'rm -rf "$tmp"' RETURN
 
   # judge_text cases.
-  printf 'use the ureq crate for HTTP\n' > "$tmp/honored.txt"
-  printf 'use reqwest for HTTP\n'        > "$tmp/violated.txt"
-  printf 'use ureq, never reqwest\n'     > "$tmp/mentions-both.txt"
+  printf 'use the ureq crate for HTTP\n' > "$tmp/new-only.txt"     # uses new, no old
+  printf 'use reqwest for HTTP\n'        > "$tmp/old-only.txt"     # uses old, not new
+  printf 'use ureq, never reqwest\n'     > "$tmp/new-names-old.txt" # uses new, names old in passing
 
   check() { # <desc> <expected "succ mie"> <actual>
     if [ "$2" = "$3" ]; then echo "ok: $1"; else echo "BUG: $1 (want '$2' got '$3')"; fail=1; fi
   }
-  check "honored => success, no mie"        "1 0" "$(judge_text "$tmp/honored.txt"  ureq reqwest reqwest memory-on)"
-  check "violated => fail + mie (memory-on)" "0 1" "$(judge_text "$tmp/violated.txt" ureq reqwest reqwest memory-on)"
-  check "violated in claude-md => fail, no mie" "0 0" "$(judge_text "$tmp/violated.txt" ureq reqwest reqwest claude-md)"
-  check "forbid present beats expect => fail + mie" "0 1" "$(judge_text "$tmp/mentions-both.txt" ureq reqwest reqwest memory-on)"
-  check "no stale token configured => no mie" "1 0" "$(judge_text "$tmp/honored.txt" ureq reqwest '' memory-on)"
+  # Stale-trap scenarios set NO forbid; success is expect-only, mie keys on failure.
+  check "trap: new only => success, no mie"                 "1 0" "$(judge_text "$tmp/new-only.txt"      ureq '' reqwest memory-on)"
+  check "trap: correct but names superseded value => success, NO mie" "1 0" "$(judge_text "$tmp/new-names-old.txt" ureq '' reqwest memory-on)"
+  check "trap: acted on stale (old, not new) => fail + mie" "0 1" "$(judge_text "$tmp/old-only.txt"      ureq '' reqwest memory-on)"
+  check "trap: acted-on-stale in claude-md => fail, no mie" "0 0" "$(judge_text "$tmp/old-only.txt"      ureq '' reqwest claude-md)"
+  # Non-trap scenarios set forbid; no stale token => never an mie.
+  check "non-trap: forbid present => fail, no mie"          "0 0" "$(judge_text "$tmp/old-only.txt"      ureq reqwest '' memory-on)"
+  check "non-trap: honored => success, no mie"              "1 0" "$(judge_text "$tmp/new-only.txt"      ureq reqwest '' memory-on)"
 
   # aggregate: a PASSING result set (memory-on best, no MIE).
   pass_tsv="$tmp/pass.tsv"
@@ -144,12 +155,17 @@ self_test() {
   } > "$nowin_tsv"
   if aggregate "$nowin_tsv" 0 >/dev/null; then echo "BUG: no-win set passed"; fail=1; else echo "ok: no-win set fails"; fi
 
-  # aggregate: a memory-induced error fails even when success/turns win.
+  # aggregate: a single memory-induced error fails the run even though memory-on
+  # otherwise wins on success-rate and turns (mie implies a failed run, so it
+  # rides on the run2 row with success=0; memory-on still beats both baselines).
   mie_tsv="$tmp/mie.tsv"
   {
-    printf 's1\tmemory-on\t1\t1\t2\t0.02\t1\n'
+    printf 's1\tmemory-on\t1\t1\t2\t0.02\t0\n'
+    printf 's1\tmemory-on\t2\t0\t2\t0.02\t1\n'
     printf 's1\tmemory-off\t1\t0\t5\t0.01\t0\n'
+    printf 's1\tmemory-off\t2\t0\t5\t0.01\t0\n'
     printf 's1\tclaude-md\t1\t0\t5\t0.02\t0\n'
+    printf 's1\tclaude-md\t2\t0\t5\t0.02\t0\n'
   } > "$mie_tsv"
   if aggregate "$mie_tsv" 0 >/dev/null; then echo "BUG: memory-induced error did not fail the run"; fail=1; else echo "ok: memory-induced error fails the run"; fi
 
@@ -189,6 +205,23 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (needed to edi
 [ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 3' "$SCENARIOS")"
 MIE_ALLOWED="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS")"
 
+# Per-session wall-clock cap (defense against a hung session stalling the run).
+# `timeout` is GNU coreutils (not in macOS base); use it or `gtimeout` if present,
+# else run uncapped (the job-level timeout is the backstop). Empty -> no prefix.
+SESSION_TIMEOUT=""
+if command -v timeout >/dev/null 2>&1; then
+  SESSION_TIMEOUT="timeout ${RB_W35_SESSION_TIMEOUT_SECS:-300}"
+elif command -v gtimeout >/dev/null 2>&1; then
+  SESSION_TIMEOUT="gtimeout ${RB_W35_SESSION_TIMEOUT_SECS:-300}"
+fi
+
+# Hermeticity (mirrors nightly-claude-smoke.sh): clear any rusty-brain path/
+# namespace overrides inherited from the environment. The memory-on arm RE-sets
+# these inside its own subshell per (scenario, run); clearing them here keeps the
+# memory-off and claude-md baselines from inheriting a CI-set store and silently
+# gaining memory. ANTHROPIC_API_KEY stays exported — claude needs it.
+unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE RUSTY_BRAIN_IDLE_TIMEOUT_SECS
+
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-w35-abeval.XXXXXX")"
 RESULTS="${REPORT_TSV:-$WORKROOT/results.tsv}"
 : > "$RESULTS"
@@ -200,7 +233,11 @@ trap cleanup EXIT
 seed_home() { mkdir -p "$1"; printf '{"hasCompletedOnboarding": true}\n' > "$1/.claude.json"; }
 
 # Run ONE headless session whose stdout is captured to $log. Extra args ($@)
-# tune output format. The session runs with a cheap model + hard spend cap.
+# tune output format. The session runs with a cheap model + hard spend cap, and
+# (when a `timeout` binary is available) a per-session wall-clock cap so one hung
+# session cannot stall the whole multi-session run — the spend cap bounds cost,
+# not wall-clock. A timed-out/failed session leaves a non-JSON log, which scores
+# as a failure (never silently as success).
 run_session() {
   local home="$1" proj="$2" prompt="$3" log="$4"; shift 4
   (
@@ -208,7 +245,7 @@ run_session() {
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
     export PATH="$BIN_DIR:$PATH"
     cd "$proj"
-    claude -p "$prompt" \
+    ${SESSION_TIMEOUT} claude -p "$prompt" \
       --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
       --permission-mode acceptEdits --allowedTools "Bash Edit Write" "$@" \
       >"$log" 2>&1 || true
@@ -216,9 +253,12 @@ run_session() {
 }
 
 # Install rusty-brain hooks + project MCP into a memory-on session's project.
+# Runs under the session's isolated HOME so a project install can never read or
+# write the caller's real ~/.claude.
 install_rusty_brain() {
-  local proj="$1"
+  local home="$1" proj="$2"
   (
+    export HOME="$home"
     export PATH="$BIN_DIR:$PATH"
     cd "$proj"
     rusty-brain-install install --agents claude-code >/dev/null
@@ -285,14 +325,32 @@ run_scenario_run() {
   local work_home="$mbase/home_work" work_proj="$mbase/proj_work"
   seed_home "$plant_home"; mkdir -p "$plant_proj"
   seed_home "$work_home";  mkdir -p "$work_proj"
-  install_rusty_brain "$plant_proj"
-  install_rusty_brain "$work_proj"
+  install_rusty_brain "$plant_home" "$plant_proj"
+  install_rusty_brain "$work_home" "$work_proj"
+  # Fairness (avoid a confound): the installer appends a "recall before work"
+  # memory-policy block to CLAUDE.md + ships a skill (the W3.2(b) elicitation
+  # channel). Strip BOTH from the WORK project so the memory-on work session
+  # gets the decision ONLY through the deterministic UserPromptSubmit recall
+  # injection (channel a — the actual store mechanism), not through extra prose
+  # guidance the baselines lack. The PLANT project keeps the block (we want
+  # capture to fire there). Project install writes <proj>/CLAUDE.md +
+  # <proj>/.claude/skills (verified in rb-install claude_code.rs).
+  rm -f "$work_proj/CLAUDE.md"
+  rm -rf "$work_proj/.claude/skills"
   (
     export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
     run_session "$plant_home" "$plant_proj" "$plant" "$mbase/plant.log"
     if [ -n "$supersede" ]; then
       run_session "$plant_home" "$plant_proj" "$supersede" "$mbase/supersede.log"
     fi
+    # The PLANT session's SessionStart hook must have auto-started the daemon
+    # (pidfile = <socket>.pid). If it did not, the memory-on arm would silently
+    # run WITHOUT memory and the whole comparison would be invalid — fail loudly
+    # (the nightly job's alert issue surfaces it), matching the smoke's contract.
+    [ -f "$sock.pid" ] || {
+      echo "ERROR: memory-on daemon did not auto-start for $id run $run (SessionStart hook?)" >&2
+      exit 1
+    }
     score_work "$id" "memory-on" "$run" "$work_proj" "$work_home" "$work" "$expect" "$forbid" "$stale"
   )
   # Reap the session-started daemon for this run's store.

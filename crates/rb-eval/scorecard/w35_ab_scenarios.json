@@ -1,5 +1,5 @@
 {
-  "_about": "W3.5 A/B outcome-eval scenarios (plan §6 / W3.5). Each scenario is a planted project DECISION plus a later WORK task where that decision matters. The runner (scripts/w35-ab-eval.sh) executes the WORK task under THREE arms and judges the outcome deterministically: (1) memory-on — rusty-brain hooks+MCP installed, a PLANT session stores the decision, the WORK session recalls it; (2) memory-off — no rusty-brain, no decision available anywhere (the floor); (3) claude-md-only — no rusty-brain, but the decision is written into the project CLAUDE.md (the NATIVE baseline F56 demands a win over). Decisions are deliberately NON-OBVIOUS (the project's choice differs from a cold model's default) so the arms actually diverge. Judge: the WORK output (final answer + files written) must contain `expect` (decision honored) and not `forbid` (the default the decision overrode); matching is case-insensitive substring. `stale_trap` scenarios additionally plant a SUPERSEDING decision; in the memory-on arm, `stale_token` appearing in the WORK output means the model acted on a stale/wrong memory (a memory-induced error — enumerated per run, never averaged away). Pass: memory-on success_rate >= both baselines AND (strictly beats each baseline on success OR fewer turns) AND zero memory-induced errors. See docs/eval/2026-06-14-w35-ab-eval.md.",
+  "_about": "W3.5 A/B outcome-eval scenarios (plan §6 / W3.5). Each scenario is a planted project DECISION plus a later WORK task where that decision matters. The runner (scripts/w35-ab-eval.sh) executes the WORK task under THREE arms and judges the outcome deterministically: (1) memory-on — rusty-brain hooks+MCP installed, a PLANT session stores the decision, the WORK session recalls it; (2) memory-off — no rusty-brain, no decision available anywhere (the floor); (3) claude-md-only — no rusty-brain, but the decision is written into the project CLAUDE.md (the NATIVE baseline F56 demands a win over). Decisions are deliberately NON-OBVIOUS (the project's choice differs from a cold model's default) so the arms actually diverge. Judge: the WORK output (final answer + files written) must contain `expect` (decision honored) and not `forbid` (the default the decision overrode); matching is case-insensitive substring. `stale_trap` scenarios additionally plant a SUPERSEDING decision and deliberately set NO `forbid` (the superseded value will appear in any correct explanation of the migration, so it must not fail success); a memory-induced error is recorded only when the WORK task FAILED (expect absent) AND `stale_token` is present in the memory-on arm — i.e. the model actually produced the stale value instead of the current one (enumerated per run, never averaged away). Pass: memory-on success_rate >= both baselines AND (strictly beats each baseline on success OR fewer turns) AND zero memory-induced errors. See docs/eval/2026-06-14-w35-ab-eval.md.",
   "config": {
     "runs_per_scenario": 3,
     "memory_induced_errors_allowed": 0
@@ -104,7 +104,6 @@
       "claude_md": "HTTP: use the `ureq` crate. (We migrated off reqwest; do not use reqwest.)",
       "work": "Add a helper that performs an HTTP GET and returns the body. Which HTTP crate should it use?",
       "expect": "ureq",
-      "forbid": "reqwest",
       "stale_token": "reqwest"
     },
     {
@@ -116,7 +115,6 @@
       "claude_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
       "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
       "expect": "config/settings.toml",
-      "forbid": "app.toml",
       "stale_token": "app.toml"
     }
   ]

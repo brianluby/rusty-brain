@@ -14,14 +14,18 @@
 # success it closes that issue if open.
 #
 # Required repository secret:
-#   ANTHROPIC_API_KEY — an Anthropic API key with a small spend budget. Each
-#   WORK session runs `--model haiku --max-budget-usd 0.50`; a scheduled run is
-#   12 scenarios x N runs x up to 4 sessions, so budget a few dollars/night at
-#   N=2. Until the secret is configured, the run fails fast on preflight.
+#   ANTHROPIC_API_KEY — an Anthropic API key with a spend budget. Each WORK
+#   session runs `--model haiku --max-budget-usd 0.50` (a hard per-session cap).
+#   Until the secret is configured, the run fails fast on preflight.
 #
-# COST/TIME: bounded by the per-session cap and `--runs` (default 2 here). A full
-# run takes tens of minutes; raise `runs` via workflow_dispatch for a deeper
-# sample when closing the gate.
+# COST/TIME: a run is 12 scenarios x N runs x ~4 sessions/run (memory-on plant +
+# work, plus a supersede for the 2 stale-traps; claude-md + memory-off each 1
+# work). The SCHEDULED run uses N=1 (~50 sessions) to stay inside the time/cost
+# envelope: worst-case spend is bounded by the $0.50 cap x sessions (~$25;
+# typical haiku spend is far lower, a few dollars), and wall-clock is ~1-2h at
+# 1-2 min/session. Closing the gate wants stochasticity — trigger a deeper
+# N>=3 sample via workflow_dispatch (allow it more time; the per-session timeout
+# in the script protects against hangs).
 name: nightly w35 a/b eval
 
 on:
@@ -30,9 +34,9 @@ on:
   workflow_dispatch:
     inputs:
       runs:
-        description: "runs per scenario (stochasticity sample)"
+        description: "runs per scenario (stochasticity sample; 3+ to close the gate)"
         required: false
-        default: "2"
+        default: "3"
 
 env:
   CARGO_TERM_COLOR: always
@@ -47,7 +51,7 @@ jobs:
     # only meaningful on the canonical repo.
     if: github.repository == 'brianluby/rusty-brain'
     runs-on: macos-latest
-    timeout-minutes: 120
+    timeout-minutes: 180
     permissions:
       contents: read
       issues: write # open/update/close the alert issue
@@ -87,7 +91,7 @@ jobs:
         run: |
           scripts/w35-ab-eval.sh \
             --bin-dir target/release \
-            --runs "${{ github.event.inputs.runs || '2' }}" \
+            --runs "${{ github.event.inputs.runs || '1' }}" \
             --out "${RUNNER_TEMP}/w35-report.tsv"
 
       # Upload ONLY the structured TSV report (scenario/arm/run/success/turns/
