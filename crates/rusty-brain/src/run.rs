@@ -103,22 +103,42 @@ async fn run_client(
             importance,
             context,
             tags,
+            supersedes,
         } => {
-            let id = client
-                .remember(
-                    content,
-                    context,
-                    memory_type,
-                    importance,
-                    Vec::new(),
-                    tags,
-                    Vec::new(),
-                    // CLI `remember` declares no explicit prior: the daemon
-                    // applies the 1.0 baseline (and an enricher may fill it).
-                    None,
-                )
-                .await
-                .context("remember failed")?;
+            // CLI `remember` declares no explicit prior: the daemon applies the
+            // 1.0 baseline (and an enricher may fill it).
+            let id = match supersedes {
+                Some(old) => {
+                    let old = parse_id(&old).context("--supersedes must be a memory UUID")?;
+                    client
+                        .remember_superseding(
+                            content,
+                            context,
+                            memory_type,
+                            importance,
+                            Vec::new(),
+                            tags,
+                            Vec::new(),
+                            None,
+                            old,
+                        )
+                        .await
+                        .context("remember --supersedes failed")?
+                }
+                None => client
+                    .remember(
+                        content,
+                        context,
+                        memory_type,
+                        importance,
+                        Vec::new(),
+                        tags,
+                        Vec::new(),
+                        None,
+                    )
+                    .await
+                    .context("remember failed")?,
+            };
             println!("{}", output::render_remembered(&id, json));
         }
         Command::Recall {
