@@ -268,15 +268,26 @@ score_session() { # dim id arm run proj home work expect forbid stale
 # SUPERSEDED state (Class C: X later replaced by X') is NOT yet expressible here —
 # the CLI has no `remember --supersedes` (supersede lives only in the engine's
 # remember_superseding, exercised by the hook). Class C must add that CLI flag, or
-# construct the superseded state another way; tracked as a Phase-2 open item.
+# construct the superseded state via `remember --supersedes`.
+#
+# Each fact: { content, supersedes_prev? }. Facts store in array order; a fact with
+# `supersedes_prev: true` is stored as a SUPERSEDING update of the immediately
+# prior planted fact (Class C: X then X' replacing X), archiving the predecessor so
+# recall returns only the current value — explicit, no lossy auto-capture (P2).
 plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array>
   local home="$1" facts="$2"
   ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"
-    local n i content
+    local n i content sup out last_id=""
     n="$(jq 'length' <<<"$facts")"
     for (( i=0; i<n; i++ )); do
       content="$(jq -r ".[$i].content" <<<"$facts")"
-      rusty-brain remember "$content" --type insight >/dev/null 2>&1 || true
+      sup="$(jq -r ".[$i].supersedes_prev // false" <<<"$facts")"
+      if [ "$sup" = "true" ] && [ -n "$last_id" ]; then
+        out="$(rusty-brain --json remember "$content" --type insight --supersedes "$last_id" 2>/dev/null)"
+      else
+        out="$(rusty-brain --json remember "$content" --type insight 2>/dev/null)"
+      fi
+      last_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
     done
   )
 }
@@ -303,12 +314,15 @@ run_scenario() { # row
     install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
     (
       export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
-      # Start a daemon for the store, then plant.
+      # Start a daemon for the store and WAIT for the socket to bind before
+      # planting (a fixed sleep races the bind — observed flaky).
       rusty-brain serve >/dev/null 2>&1 &
-      sleep 1
+      local dpid=$!
+      for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
       if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
       # (auto-capture mode: a plant session would run here — wired with dimension B.)
       score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
+      kill "$dpid" 2>/dev/null || true
     )
     rm -rf "$sockdir" 2>/dev/null || true
 
