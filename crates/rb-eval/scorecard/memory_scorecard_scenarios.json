@@ -1,0 +1,65 @@
+{
+  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail).",
+  "config": {
+    "runs_per_scenario": 5,
+    "memory_induced_errors_allowed": 0
+  },
+  "scenarios": [
+    {
+      "id": "fresh-http-switch",
+      "dimension": "freshness",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: for outbound HTTP this project uses the `reqwest` crate." },
+        { "content": "Update: we migrated off reqwest. All HTTP now uses the `ureq` crate — do NOT add reqwest to anything new; it is being removed.", "supersedes_prev": true }
+      ],
+      "realistic_claude_md": "HTTP: use the `reqwest` crate for outbound HTTP.",
+      "steelman_claude_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
+      "work": "Add a helper that performs an HTTP GET and returns the response body. Name the HTTP crate it should use and show the dependency line.",
+      "expect": "ureq",
+      "stale_token": "reqwest"
+    },
+    {
+      "id": "fresh-config-rename",
+      "dimension": "freshness",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: project configuration lives in a file named `app.toml` at the repo root." },
+        { "content": "Update: we renamed the config file from `app.toml` to `config/settings.toml`. `app.toml` no longer exists — always read configuration from `config/settings.toml`.", "supersedes_prev": true }
+      ],
+      "realistic_claude_md": "Config: read configuration from `app.toml` at the repo root.",
+      "steelman_claude_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
+      "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
+      "expect": "config/settings.toml",
+      "stale_token": "app.toml"
+    },
+    {
+      "id": "fresh-id-type",
+      "dimension": "freshness",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Convention: entity identifiers in this codebase are `Uuid`." },
+        { "content": "Update: we switched all entity identifiers from Uuid to `Ulid` (lexicographically sortable). New entities use Ulid; do not use Uuid for ids.", "supersedes_prev": true }
+      ],
+      "realistic_claude_md": "Identifiers: entity ids are `Uuid`.",
+      "steelman_claude_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
+      "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
+      "expect": "ulid",
+      "stale_token": "uuid"
+    },
+    {
+      "id": "fresh-test-runner",
+      "dimension": "freshness",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: run the test suite with `cargo test`." },
+        { "content": "Update: we moved the test suite to `cargo nextest run` for parallelism and isolation. Use nextest, not plain `cargo test`, in CI and locally.", "supersedes_prev": true }
+      ],
+      "realistic_claude_md": "Testing: run the suite with `cargo test`.",
+      "steelman_claude_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
+      "work": "I need to run the project's tests. What exact command should I use?",
+      "expect": "nextest",
+      "stale_token": "cargo test"
+    }
+  ]
+}
