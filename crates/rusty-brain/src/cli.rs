@@ -97,6 +97,12 @@ pub enum Command {
         /// Tags (repeatable: `--tags a --tags b`).
         #[arg(long)]
         tags: Vec<String>,
+        /// Supersede an existing memory: store this as the replacement and
+        /// archive the prior memory in one atomic op (the `supersedes` edge —
+        /// see `link`, which rejects `--type supersedes` for this reason). Value
+        /// is the UUID of the memory being replaced.
+        #[arg(long)]
+        supersedes: Option<String>,
     },
 
     /// Recall memories matching a query.
@@ -447,6 +453,29 @@ mod tests {
             res.is_err(),
             "--type supersedes must be rejected at parse time"
         );
+    }
+
+    #[test]
+    fn remember_accepts_supersedes_id() {
+        // The supersede edge IS created here (the replacement-memory path that
+        // `link --type supersedes` points at). Default: no prior.
+        let plain = Cli::parse_from(["rusty-brain", "remember", "a new decision"]);
+        match plain.command {
+            Command::Remember { supersedes, .. } => assert_eq!(supersedes, None),
+            other => panic!("expected Remember, got {other:?}"),
+        }
+        let old = "0c8e7f76-3a4f-4f7e-9d3a-111111111111";
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "remember",
+            "the replacement",
+            "--supersedes",
+            old,
+        ]);
+        match cli.command {
+            Command::Remember { supersedes, .. } => assert_eq!(supersedes.as_deref(), Some(old)),
+            other => panic!("expected Remember, got {other:?}"),
+        }
     }
 
     #[test]
