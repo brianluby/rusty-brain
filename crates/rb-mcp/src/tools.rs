@@ -99,10 +99,10 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "recall",
-            description: "Hybrid (keyword + vector + graph) recall of stored memories. Use \
-                          BEFORE starting a task, or whenever the user references a past \
-                          decision, prior work, or \"how we do X here\", to retrieve relevant \
-                          prior context. Returns ranked memories.",
+            description: "Hybrid (keyword + vector + graph) recall of stored memories. Relevant \
+                          memories are already injected each turn; use this to dig deeper when that \
+                          context is insufficient, or when the user references a past decision, \
+                          prior work, or \"how we do X here\". Returns ranked memories.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -215,8 +215,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "context",
             description: "Project memory digest: recent + important memories and a total \
-                          count for the current namespace. Use at the start of work to load \
-                          standing context before the user's first specific request.",
+                          count for the current namespace. Use to broaden standing context \
+                          when the per-turn injected memories are insufficient.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -367,8 +367,11 @@ mod tests {
 
     #[test]
     fn remember_and_recall_carry_trigger_conditions() {
-        // W3.2(c): descriptions are phrased as trigger conditions ("Use when…" /
-        // "Use BEFORE…") so the model elicits memory without rediscovering it.
+        // W3.2(c): descriptions are phrased as trigger conditions ("Use when…")
+        // so the model elicits memory without rediscovering it. Recall is framed
+        // as a dig-deeper/reference trigger — the per-turn UserPromptSubmit
+        // injection already surfaces relevant memories, so "recall before every
+        // task" would be a redundant double-dip (confirmed turn cost, W3.5).
         let tools = tool_definitions();
         let desc = |name: &str| {
             tools
@@ -383,8 +386,8 @@ mod tests {
             desc("remember")
         );
         assert!(
-            desc("recall").contains("Use BEFORE"),
-            "recall names a retrieve-before-work trigger: {}",
+            desc("recall").contains("user references a past"),
+            "recall names a reference/dig-deeper trigger: {}",
             desc("recall")
         );
     }
