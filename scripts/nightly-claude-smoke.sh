@@ -109,7 +109,8 @@ mkdir -p "$PROJ"
 cd "$PROJ"
 
 # Hooks: the real installer writes the project .claude/settings.json block
-# (SessionStart / PostToolUse / Stop / PreCompact -> rusty-brain-hooks).
+# (SessionStart / UserPromptSubmit / PostToolUse / Stop / SessionEnd / PreCompact
+# -> rusty-brain-hooks). Post-W3.1, SessionEnd is the single capture point.
 rusty-brain-install install --agents claude-code
 grep -q "rusty-brain-hooks" "$PROJ/.claude/settings.json" \
   || { echo "installer did not write the hook block to .claude/settings.json" >&2; exit 1; }
@@ -178,10 +179,15 @@ sleep "$IDLE_WAIT"
 kill -0 "$PID1" || { echo "daemon (pid $PID1) died during the idle window" >&2; exit 1; }
 
 # --- 5. Recall: the SAME daemon serves the captured memory --------------------
-rusty-brain recall "nightly smoke sentinel" >"$WORKDIR/recall-output.log" 2>&1 \
+# Post-W3.1 capture is SessionEnd-centric: one redacted "Session summary" insight
+# per session, not a per-command memory. Recall in human mode prints only the
+# ~150-char enriched summary prefix (the "Goal:" preamble), which truncates before
+# the captured command line; use --json so the assertion below sees the full
+# memory content (where the sentinel lives, in the "Commands run:" section).
+rusty-brain --json recall "nightly smoke sentinel" >"$WORKDIR/recall-output.log" 2>&1 \
   || { echo "recall failed:" >&2; cat "$WORKDIR/recall-output.log" >&2; exit 1; }
 grep -F "$SENTINEL" "$WORKDIR/recall-output.log" >/dev/null \
-  || { echo "recall did not return the captured session command:" >&2; cat "$WORKDIR/recall-output.log" >&2; exit 1; }
+  || { echo "recall did not return the captured session summary:" >&2; cat "$WORKDIR/recall-output.log" >&2; exit 1; }
 echo "recall round-trip OK (post-idle)"
 
 # --- 6. Exactly ONE 0600 DB ----------------------------------------------------
@@ -218,6 +224,10 @@ grep -aq -- "$SENTINEL" "${FILES[@]}" \
   || { echo "hook capture did not land in the DB (sentinel not found)" >&2; exit 1; }
 grep -aq "REDACTED:" "${FILES[@]}" \
   || { echo "no redaction marker found in the DB" >&2; exit 1; }
+# Specific to THIS planted key: prove redaction fired on the AWS key itself, not
+# merely that some unrelated credential produced a REDACTED: marker.
+grep -aq -- "REDACTED:aws-key" "${FILES[@]}" \
+  || { echo "planted AWS key was not redacted as [REDACTED:aws-key] in the DB" >&2; exit 1; }
 if grep -aq -- "$PLANTED" "${FILES[@]}"; then
   echo "planted fake AWS key found in PLAINTEXT in the DB" >&2
   exit 1
