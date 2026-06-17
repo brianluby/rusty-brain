@@ -296,7 +296,7 @@ plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array>
 
 run_scenario() { # row
   local row="$1"
-  local id dim plant_mode work expect forbid stale realistic steelman facts
+  local id dim plant_mode work expect forbid stale realistic steelman facts plant_session
   id="$(jq -r '.id' <<<"$row")"; dim="$(jq -r '.dimension' <<<"$row")"
   plant_mode="$(jq -r '.plant_mode' <<<"$row")"
   work="$(jq -r '.work' <<<"$row")"; expect="$(jq -r '.expect' <<<"$row")"
@@ -304,6 +304,7 @@ run_scenario() { # row
   realistic="$(jq -r '.realistic_claude_md // ""' <<<"$row")"
   steelman="$(jq -r '.steelman_claude_md // ""' <<<"$row")"
   facts="$(jq -c '.plant // []' <<<"$row")"
+  plant_session="$(jq -r '.plant_session // ""' <<<"$row")"
   local run=1
   while [ "$run" -le "$RUNS" ]; do
     local base="$WORKROOT/$id-r$run"
@@ -323,8 +324,28 @@ run_scenario() { # row
       rusty-brain serve >/dev/null 2>&1 &
       dpid=$!
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-      if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
-      # (auto-capture mode: a plant session would run here — wired with dimension B.)
+      if [ "$plant_mode" = "explicit" ]; then
+        plant_explicit "$wh" "$facts"
+      elif [ "$plant_mode" = "auto-capture" ]; then
+        # The real product loop: a decision EMERGES in a plant session whose
+        # SessionEnd hook folds it into the store — no explicit remember, no manual
+        # doc edit. The plant project keeps the installer defaults (incl. the
+        # CLAUDE.md memory-policy block): a faithful session, and any capture
+        # pollution it causes is a real gap this dimension is meant to surface.
+        ph="$mb/hp"; pp="$mb/pp"; seed_home "$ph"; mkdir -p "$pp"
+        install_rusty_brain "$ph" "$pp"
+        run_session "$ph" "$pp" "$plant_session" "$mb/plant.log"
+        # DIRECT capture fidelity (P-B metric): did the auto-captured summary
+        # actually land the fact? Distinguishes a CAPTURE miss from a RETRIEVAL
+        # miss. Logged, not gated — the scored signal is end-to-end memory-on
+        # success below; this tells us WHY when it is low.
+        cap=0
+        if ( export HOME="$wh"; export PATH="$BIN_DIR:$PATH"; rusty-brain --json recall "$work" 2>/dev/null ) \
+           | jq -e --arg e "$expect" 'any(.[]?; (((.memory.content // "") + " " + (.memory.summary // "")) | ascii_downcase) | contains($e | ascii_downcase))' >/dev/null 2>&1; then
+          cap=1
+        fi
+        echo "   capture_fidelity[$dim/$id r$run]: $cap (expect '$expect' present in the auto-captured store)"
+      fi
       score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
       kill "$dpid" 2>/dev/null || true
     )
