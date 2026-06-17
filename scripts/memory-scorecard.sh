@@ -307,8 +307,10 @@ run_scenario() { # row
     local base="$WORKROOT/$id-r$run"
     echo "-- $dim/$id (run $run/$RUNS) [$plant_mode]"
 
-    # memory-on
-    local mb="$base/on" db="$mb/memory.db" ns="rb-sc-$id-r$run"
+    # memory-on. NOTE: split the `local`s — a single `local a=.. b=$a` does NOT
+    # see the sibling under `set -u` (b errors as unbound).
+    local mb="$base/on"
+    local db="$mb/memory.db" ns="rb-sc-$id-r$run"
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     local wh="$mb/hw" wp="$mb/wp"; seed_home "$wh"; mkdir -p "$wp"
     install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
@@ -317,7 +319,7 @@ run_scenario() { # row
       # Start a daemon for the store and WAIT for the socket to bind before
       # planting (a fixed sleep races the bind — observed flaky).
       rusty-brain serve >/dev/null 2>&1 &
-      local dpid=$!
+      dpid=$!
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
       if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
       # (auto-capture mode: a plant session would run here — wired with dimension B.)
