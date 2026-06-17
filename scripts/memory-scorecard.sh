@@ -219,10 +219,12 @@ run_session() { # home proj prompt log [extra args...]
     export HOME="$home"
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
     export PATH="$BIN_DIR:$PATH"; cd "$proj"
+    # `</dev/null`: claude -p reads stdin; without this it drains whatever fd 0
+    # is (e.g. a caller's `while read` source), silently truncating the run.
     ${SESSION_TIMEOUT} claude -p "$prompt" \
       --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
       --permission-mode acceptEdits --allowedTools "Bash Edit Write" "$@" \
-      >"$log" 2>&1 || true
+      </dev/null >"$log" 2>&1 || true
   )
 }
 
@@ -345,7 +347,12 @@ run_scenario() { # row
 }
 
 echo "== memory-value scorecard (model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
-while IFS= read -r row; do run_scenario "$row"; done < <(jq -c '.scenarios[]' "$SCENARIOS_FILE")
+# Read ALL scenarios into an array BEFORE running any (mirrors w35-ab-eval.sh): a
+# streaming `while read < <(jq)` shares fd 0 with the loop body, and a body
+# command that consumes stdin (claude -p) would eat the remaining scenario lines.
+scenario_rows=()
+while IFS= read -r row; do scenario_rows+=("$row"); done < <(jq -c '.scenarios[]' "$SCENARIOS_FILE")
+for row in "${scenario_rows[@]}"; do run_scenario "$row"; done
 echo
 echo "== scorecard =="
 aggregate_scorecard "$RESULTS"
