@@ -10,7 +10,7 @@ use std::str::FromStr;
 
 use rb_agents::DaemonClient;
 use rb_agents::{HookResult, InjectionEvent};
-use rb_types::{MemoryId, MemoryType, SearchResult};
+use rb_types::{MemoryId, MemoryType, MemoryUpdates, SearchResult};
 
 use crate::scratch::{self, Scratch, ScratchData};
 use crate::transcript::{self, TranscriptDigest};
@@ -33,6 +33,9 @@ const PRE_COMPACT_IMPORTANCE: u8 = 8;
 /// Max items listed per section of the folded session summary (the scratch and
 /// transcript already cap their inputs; this bounds the assembled content).
 const SUMMARY_SECTION_LIMIT: usize = 25;
+/// Char bound for the clean one-line session `summary` (see
+/// [`extract_session_summary_line`]); keeps the injected recall line terse.
+const SUMMARY_LINE_MAX_CHARS: usize = 200;
 
 /// W2.5 untrusted-data preamble, shared by EVERY memory-injection channel (the
 /// SessionStart digest + the W3.2(a) UserPromptSubmit recall): frames the listed
@@ -643,6 +646,12 @@ pub async fn session_end(
         return continue_only();
     };
     let content = redact(&content);
+    // A clean one-line summary (redacted like the content) so the per-turn
+    // UserPromptSubmit recall injection — which renders the `summary` field —
+    // shows a decision-grade fact instead of the "Session summary. Goal:"
+    // scaffolding prefix. Set via a best-effort follow-up update below.
+    let summary_line =
+        extract_session_summary_line(&data, &git_files, &transcript).map(|s| redact(&s));
 
     // Only RESET the scratch once the fold is DURABLY stored. A degraded write
     // (no daemon connection, or a store error) leaves the buffer intact so a
@@ -654,9 +663,24 @@ pub async fn session_end(
     if let Some(new_id) =
         store_session_summary(client, content, data.prior_summary_id.as_deref()).await
     {
+        let folded_id = new_id.to_string();
+        // Best-effort: stamp the clean summary onto the just-stored memory. A
+        // degraded update merely leaves the engine's default summary in place —
+        // it never blocks the fold or the CLI.
+        if let Some(summary) = summary_line {
+            client
+                .update(
+                    new_id,
+                    MemoryUpdates {
+                        summary: Some(summary),
+                        ..Default::default()
+                    },
+                )
+                .await;
+        }
         // Stored: reset the buffer, retaining the new id so a resumed session
         // supersedes THIS summary instead of duplicating it.
-        scratch.mark_folded(Some(&new_id.to_string()));
+        scratch.mark_folded(Some(&folded_id));
     }
     continue_only()
 }
@@ -741,6 +765,50 @@ fn build_session_summary(
     push_section(&mut out, "Commands run", &data.commands);
     push_section(&mut out, "Failures", &data.failures);
     Some(out)
+}
+
+/// Derive a clean one-line summary for the session memory: the first decision,
+/// else the session goal, else the files touched, else the first command. The
+/// stored CONTENT keeps the full "Session summary." scaffolding; this line is set
+/// as the memory's `summary` field, so the per-turn recall injection (which
+/// renders `summary`) surfaces a fact instead of the "Session summary. Goal:"
+/// prefix. Returns `None` only when there is genuinely nothing to say (mirrors
+/// [`build_session_summary`]'s emptiness rule) so the engine default applies.
+/// Bounded to [`SUMMARY_LINE_MAX_CHARS`] on a char boundary. The caller redacts
+/// the result before it is stored.
+fn extract_session_summary_line(
+    data: &ScratchData,
+    git_files: &[String],
+    transcript: &TranscriptDigest,
+) -> Option<String> {
+    let clamp = |s: &str| -> String {
+        match s.char_indices().nth(SUMMARY_LINE_MAX_CHARS) {
+            Some((idx, _)) => s[..idx].to_string(),
+            None => s.to_string(),
+        }
+    };
+    if let Some(decision) = transcript.decisions.first() {
+        return Some(clamp(decision));
+    }
+    if let Some(goal) = transcript.user_prompts.first() {
+        return Some(clamp(goal));
+    }
+    // Files-touched fallback: the union of tool-tracked + working-tree edits
+    // (mirrors build_session_summary). MUST surface a file path — a no-transcript
+    // session's only recallable token is the file it changed.
+    let mut files = data.files.clone();
+    for f in git_files {
+        if !files.iter().any(|e| e == f) {
+            files.push(f.clone());
+        }
+    }
+    if !files.is_empty() {
+        return Some(clamp(&format!("Touched {}", files.join(", "))));
+    }
+    if let Some(command) = data.commands.first() {
+        return Some(clamp(command));
+    }
+    None
 }
 
 /// Append a titled bulleted section (bounded to [`SUMMARY_SECTION_LIMIT`]) when
@@ -1541,6 +1609,78 @@ mod tests {
         let summary =
             build_session_summary(&ScratchData::default(), &[], &TranscriptDigest::default());
         assert_eq!(summary, None);
+    }
+
+    #[test]
+    fn extract_session_summary_line_precedence_and_fallbacks() {
+        // 1. Decision wins over goal.
+        let t = TranscriptDigest {
+            user_prompts: vec!["the goal".into()],
+            decisions: vec!["use ureq, not reqwest".into()],
+        };
+        assert_eq!(
+            extract_session_summary_line(&ScratchData::default(), &[], &t).as_deref(),
+            Some("use ureq, not reqwest"),
+        );
+
+        // 2. No decision → the goal (no "Session summary." scaffolding prefix).
+        let t = TranscriptDigest {
+            user_prompts: vec!["store timestamps as unix millis".into()],
+            decisions: vec![],
+        };
+        let line = extract_session_summary_line(&ScratchData::default(), &[], &t);
+        assert_eq!(line.as_deref(), Some("store timestamps as unix millis"));
+        assert!(!line.unwrap().starts_with("Session summary"));
+
+        // 3. No transcript → files-touched fallback MUST surface the path (the
+        //    no-transcript session's only recallable token), unioning git files.
+        let data = ScratchData {
+            files: vec!["src/a.rs".into()],
+            ..Default::default()
+        };
+        let line = extract_session_summary_line(
+            &data,
+            &["src/b.rs".to_string()],
+            &TranscriptDigest::default(),
+        )
+        .expect("files fallback");
+        assert!(
+            line.contains("src/a.rs") && line.contains("src/b.rs"),
+            "{line}"
+        );
+
+        // 4. Only a command → that command.
+        let data = ScratchData {
+            commands: vec!["cargo test".into()],
+            ..Default::default()
+        };
+        assert_eq!(
+            extract_session_summary_line(&data, &[], &TranscriptDigest::default()).as_deref(),
+            Some("cargo test"),
+        );
+
+        // 5. Genuinely nothing → None (engine default summary applies).
+        assert_eq!(
+            extract_session_summary_line(
+                &ScratchData::default(),
+                &[],
+                &TranscriptDigest::default()
+            ),
+            None,
+        );
+    }
+
+    #[test]
+    fn extract_session_summary_line_clamps_on_char_boundary() {
+        // A multibyte decision longer than the bound must clamp without panicking
+        // on a non-char boundary.
+        let long = "é".repeat(SUMMARY_LINE_MAX_CHARS + 50);
+        let t = TranscriptDigest {
+            user_prompts: vec![],
+            decisions: vec![long],
+        };
+        let line = extract_session_summary_line(&ScratchData::default(), &[], &t).expect("some");
+        assert_eq!(line.chars().count(), SUMMARY_LINE_MAX_CHARS);
     }
 
     #[test]

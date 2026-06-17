@@ -13,7 +13,7 @@ use std::time::Duration;
 // knobs need no forwarding — the spawned daemon re-reads config.toml itself.
 use rb_config::{spawn_forward_env, DB_ENV, SOCKET_ENV};
 use rb_proto::{Client, ClientIdentity};
-use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace, SearchResult};
+use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, SearchResult};
 
 /// Auto-start parameters. Provided ONLY for `SessionStart`; any other event
 /// passes `None` so non-session hooks never spawn a daemon.
@@ -120,6 +120,19 @@ impl DaemonClient {
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(id)) => Some(id),
             Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// Best-effort partial update. Returns `true` on success, `false` on any
+    /// error/timeout. The SessionEnd fold uses it to set a clean decision-line
+    /// `summary` on the just-stored summary memory (the stored content keeps the
+    /// full "Session summary." scaffolding; only the injected/rendered summary
+    /// field is cleaned), so a degraded update merely leaves the engine's default
+    /// summary in place — never blocks the CLI.
+    pub async fn update(&mut self, id: MemoryId, updates: MemoryUpdates) -> bool {
+        match tokio::time::timeout(self.timeout, self.client.update(id, updates)).await {
+            Ok(Ok(())) => true,
+            Ok(Err(_)) | Err(_) => false,
         }
     }
 
