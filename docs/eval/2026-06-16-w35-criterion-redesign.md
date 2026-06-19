@@ -143,6 +143,12 @@ scorecard so the headline value is not silently dropped.
   and crank the corpus past comfortable context (500+ facts) so the retrieval
   edge — accuracy on a buried fact — actually bites. Token cost is the secondary
   axis; accuracy-at-scale is primary.
+- **Resolved (methodology), 2026-06-19 — see ADR-3 in
+  `docs/eval/2026-06-19-w35-cache-study.md`.** Score on `total_cost_usd`
+  (cache-adjusted by construction) + correctness, never raw input tokens; the
+  four `tok_*` buckets are surfaced diagnostically via `scripts/w35-trace-tools.sh`'s
+  cache aggregate. The measured run (scale corpus + spend) stays deferred; the
+  harness instrumentation + `--self-test` landed.
 
 ### B — Capture fidelity (build third; expect it to be the hardest bar)
 
