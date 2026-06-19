@@ -113,7 +113,13 @@ PY
 # Sum per-session token usage from a stream-json --verbose log. Echoes one
 # tab-separated line: tok_in<TAB>tok_cache_create<TAB>tok_cache_read<TAB>tok_out.
 # Pure over the log (no daemon, no API); each assistant event's .message.usage is
-# summed; missing fields read as 0 (defensive — the path is verified on first run).
+# summed; missing fields read as 0 (defensive). The .message.usage path matches the
+# Anthropic API usage shape — live verification is on the deferred measured run, and
+# --self-test (run by CI before every dispatch) guards it: a broken path yields
+# all-zeros, which the fixture's 2250/5000/5000/90 would fail on. All-zeros is ALSO
+# legitimate for an errored session (no assistant events); at runtime such a row is
+# already flagged by is_error=true/num_turns=0 (see emit_row), so it is not confused
+# with a path bug (which would show is_error=false, num_turns>0, tok=0).
 sum_usage() { # log
   jq -r 'select(.type=="assistant") | .message.usage // empty |
          [ (.input_tokens // 0),
@@ -219,8 +225,12 @@ self_test() {
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/rb-w35-cache.XXXXXX")"
   trap 'rm -rf "$tmp"' RETURN
   log="$tmp/fixture.jsonl"
-  # Two turns with usage (turn 1 writes cache, turn 2 reads it), plus a turn whose
-  # usage OMITS the cache fields (exercises the // 0 fallback), and a result event.
+  # Three assistant events carry usage: msg_a writes cache, msg_b reads it, msg_c
+  # OMITS the cache fields to exercise the // 0 fallback. The result event's
+  # num_turns is a SEMANTIC CLI count and is deliberately != the assistant-event
+  # count (3) — emit_row reads it straight from .result.num_turns, so the
+  # turns/cost wiring (cols 4-6 below) is checked independently of how many usage
+  # events precede it (as in real stream-json, where num_turns != assistant count).
   cat >"$log" <<'JSON'
 {"type":"system","subtype":"init","session_id":"s1"}
 {"type":"assistant","message":{"id":"msg_a","type":"message","role":"assistant","content":[{"type":"text","text":"ok"}],"usage":{"input_tokens":1000,"cache_creation_input_tokens":5000,"cache_read_input_tokens":0,"output_tokens":50}}}
