@@ -57,6 +57,21 @@ All notable changes to rusty-brain are documented here. The format is based on
   `rusty-brain-install` binaries alongside `rusty-brain` in `~/.local/bin`,
   `chmod +x`, with SHA-256 verification of each copy.
 
+### Added — W3.5 cache-trace instrumentation (P4a)
+
+- **`scripts/w35-trace-tools.sh`** now emits four `tok_*` columns
+  (`tok_in`, `tok_cache_create`, `tok_cache_read`, `tok_out`) summed from each
+  `assistant` event's `.message.usage`, plus a per-arm `aggregate_cache` table
+  (mean buckets + `mean_ctx_vol` and cache-weighted `mean_eff_in`). This is
+  the prompt-caching study for W3.5 dimension A — `total_cost_usd` is already
+  cache-adjusted, so the buckets are surfaced **diagnostically** (raw token
+  counts double-count cheap cache reads and must never be the cost axis).
+  **ADR-3** and the investigation live in
+  `docs/eval/2026-06-19-w35-cache-study.md`; the measured scale run stays
+  deferred (no API key/spend). New `--self-test` validates the token math +
+  aggregate with no API; `.github/workflows/w35-trace.yml` runs it on every
+  dispatch before spending.
+
 ### Notes
 
 - The three agent-surface crates are workspace members but are **never** in the
