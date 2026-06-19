@@ -62,6 +62,36 @@
       "work": "I need to run the project's tests. What exact command should I use?",
       "expect": "nextest",
       "stale_token": "cargo test"
+    },
+    {
+      "id": "cap-http-ureq",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "Team decision for this project: use the `ureq` crate for all outbound HTTP — deliberately NOT reqwest (we want a tiny blocking client, no async runtime). Please acknowledge you've noted this decision.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "HTTP: use the `ureq` crate for all outbound HTTP (not reqwest).",
+      "work": "Add a helper that performs an HTTP GET and returns the body. Which HTTP crate should it use?",
+      "expect": "ureq"
+    },
+    {
+      "id": "cap-error-apperror",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "House rule we just agreed on: every fallible function returns our project `AppError` type via the `?` operator — never `.unwrap()` or `.expect()` in library code. Acknowledge this decision.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Errors: return the project `AppError` via `?`; no `.unwrap()`/`.expect()` in library code.",
+      "work": "Write a function that reads a required port number from an environment variable. Follow our error-handling convention.",
+      "expect": "apperror"
+    },
+    {
+      "id": "cap-id-ulid",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "Convention we decided today: every entity identifier in this codebase is a `Ulid` (lexicographically sortable) — not Uuid, not autoincrement integers. Please note this.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Identifiers: entity ids are `Ulid` (not Uuid or integer ids).",
+      "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
+      "expect": "ulid"
     }
   ]
 }
