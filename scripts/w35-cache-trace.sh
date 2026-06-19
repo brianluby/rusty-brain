@@ -51,7 +51,7 @@
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-SCENARIOS="$REPO_ROOT/crates/rb-eval/scorecard/w35_ab_scenarios.json"
+SCENARIOS_JSON="$REPO_ROOT/crates/rb-eval/scorecard/w35_ab_scenarios.json"
 MODEL="${RB_W35_MODEL:-haiku}"
 MAX_BUDGET_USD="${RB_W35_MAX_BUDGET_USD:-0.50}"
 # A failed session scores this many turns — a worst-case sentinel, well above a
@@ -302,7 +302,7 @@ if [ "$MODE" = "self-test" ]; then self_test; exit $?; fi
 if [ "$MODE" = "aggregate" ]; then
   [ -f "$REPORT_TSV" ] || { echo "tsv not found: $REPORT_TSV" >&2; exit 1; }
   mie_default=0
-  [ -f "$SCENARIOS" ] && mie_default="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS" 2>/dev/null || echo 0)"
+  [ -f "$SCENARIOS_JSON" ] && mie_default="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS_JSON" 2>/dev/null || echo 0)"
   aggregate "$REPORT_TSV" "$mie_default"
   exit $?
 fi
@@ -318,20 +318,24 @@ command -v jq      >/dev/null 2>&1 || { echo "jq not on PATH (needed to parse st
 command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (corpus generator + settings.json edit)" >&2; exit 1; }
 [ -n "${ANTHROPIC_API_KEY:-${CLAUDE_CODE_API_KEY:-${CLAUDE_API_KEY:-}}}" ] \
   || { echo "no Anthropic API credential in env (ANTHROPIC_API_KEY / CLAUDE_CODE_API_KEY) — the measured run is DEFERRED until one is set" >&2; exit 1; }
-[ -f "$SCENARIOS" ] || { echo "scenarios file not found: $SCENARIOS" >&2; exit 1; }
+[ -f "$SCENARIOS_JSON" ] || { echo "scenarios file not found: $SCENARIOS_JSON" >&2; exit 1; }
 
 # Validate free-form inputs (never interpolate a dispatch value into a shell).
 case "$CORPUS_SIZES" in *[!0-9\ ]*) echo "--corpus-sizes may contain only digits and spaces" >&2; exit 2 ;; esac
 for cs in $CORPUS_SIZES; do
   case "$cs" in ''|*[!0-9]*) echo "--corpus-sizes has a non-numeric entry: '$cs'" >&2; exit 2 ;; esac
 done
+# Reject whitespace-only input (e.g. "   "): it passes the charset check above
+# but yields zero cells — a silent no-op run.
+case "$CORPUS_SIZES" in *[0-9]*) ;; *) echo "--corpus-sizes must contain at least one number" >&2; exit 2 ;; esac
 
 # Default scenarios: one stale-trap + two plain (cheap, exercises both judge paths).
 [ -n "$SCENARIOS" ] || SCENARIOS="dep-http-ureq config-settings-toml stale-trap-http-switch"
 case "$SCENARIOS" in *[!a-z0-9\ _-]*) echo "--scenarios may contain only [a-z0-9 _-]" >&2; exit 2 ;; esac
+case "$SCENARIOS" in *[a-z0-9]*) ;; *) echo "--scenarios must contain at least one id" >&2; exit 2 ;; esac
 
-[ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 3' "$SCENARIOS")"
-MIE_ALLOWED="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS")"
+[ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 3' "$SCENARIOS_JSON")"
+MIE_ALLOWED="$(jq -r '.config.memory_induced_errors_allowed // 0' "$SCENARIOS_JSON")"
 
 # Per-session wall-clock cap (defense against a hung session stalling the run).
 SESSION_TIMEOUT=""
@@ -516,10 +520,8 @@ run_cell() { # <id> <run> <corpus> <plant> <claude_md> <work> <expect> <forbid> 
 echo "== P4a cache study (model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
 echo "   scenarios: $SCENARIOS"
 echo "   corpus sizes (distractors): $CORPUS_SIZES"
-rows=()
-while IFS= read -r row; do rows+=("$row"); done < <(jq -c '.scenarios[]' "$SCENARIOS")
 for id in $SCENARIOS; do
-  row="$(jq -c --arg id "$id" '.scenarios[]|select(.id==$id)' "$SCENARIOS")"
+  row="$(jq -c --arg id "$id" '.scenarios[]|select(.id==$id)' "$SCENARIOS_JSON")"
   [ -n "$row" ] || { echo "scenario not found: $id" >&2; continue; }
   plant="$(jq -r '.plant' <<<"$row")"
   claude_md="$(jq -r '.claude_md' <<<"$row")"

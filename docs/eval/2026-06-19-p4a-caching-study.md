@@ -133,8 +133,11 @@ is bounded.
 **Pre-registered thresholds (the measured run picks the final option):**
 
 1. If, at corpus ≥ 500 facts, `memory-on` retrieval accuracy ≥ `steelman-baseline`
-   accuracy **and** `memory-on` `cache_read_input_tokens / input_tokens` ratio is
-   within 20% of `steelman`'s (per-turn median over N≥5 runs) → **ratify Opt 3.**
+   accuracy **and** `memory-on` cache-read ratio is within 20% of `steelman`'s
+   → **ratify Opt 3.** (cache-read ratio = `cache_read_input_tokens /
+   (cache_read_input_tokens + input_tokens)` — the fraction of input-side tokens
+   served from cache, computed as a per-cell session aggregate over N≥5 runs;
+   median + IQR is the recorded follow-up once N≥5 lands.)
 2. If `memory-on` accuracy wins but the cache ratio is worse than 20% (per-turn
    uncached cost > ~1.3× steelman's) → **adopt Opt 2 for the SessionStart
    channel only**, keeping per-turn UserPromptSubmit recall only where U1 + the
