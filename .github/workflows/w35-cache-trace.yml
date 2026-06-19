@@ -92,8 +92,16 @@ jobs:
           for cs in $CORPUS_INPUT; do
             case "$cs" in ''|*[!0-9]*) echo "::error::'corpus_sizes' has a non-numeric entry: '$cs'"; exit 1 ;; esac
           done
+          case "$CORPUS_INPUT" in
+            *[0-9]*) ;;
+            *) echo "::error::'corpus_sizes' must contain at least one number"; exit 1 ;;
+          esac
           case "$SCENARIOS_INPUT" in
             *[!a-z0-9\ _-]*) echo "::error::'scenarios' may contain only [a-z0-9 _-]"; exit 1 ;;
+          esac
+          case "$SCENARIOS_INPUT" in
+            *[a-z0-9]*) ;;
+            *) echo "::error::'scenarios' must contain at least one id"; exit 1 ;;
           esac
           scripts/w35-cache-trace.sh \
             --bin-dir target/release \
