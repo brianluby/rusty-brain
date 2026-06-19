@@ -1,0 +1,119 @@
+# P4a prompt-caching study (diagnostic; manual dispatch only; NEVER gates PRs).
+#
+# Drives scripts/w35-cache-trace.sh: for the named scenarios and corpus ladder it
+# runs the WORK session under FOUR arms (memory-on / steelman-baseline /
+# realistic-baseline / memory-off) with `--output-format stream-json --verbose`
+# and records the cached-vs-uncached input token breakdown that resolves ADR-3
+# (docs/eval/2026-06-19-p4a-caching-study.md). Uploads a structured TSV (numbers
+# + success flags only, no model free-text) — same artifact posture as
+# w35-ab-eval.yml / w35-trace.yml.
+#
+# Required repository secret:
+#   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.
+#
+# The DEFAULT dispatch is a SMALL slice (1 scenario x a 3-point corpus ladder x
+# 1 run ~= 12 sessions) for a cheap daily cache-dynamics signal. CLOSE THE GATE
+# (ADR-3) with a manual dispatch at --runs 5 --corpus-sizes "0 50 200 500 1000"
+# for stochasticity (allow it more time).
+name: p4a cache trace
+
+on:
+  workflow_dispatch:
+    inputs:
+      runs:
+        description: "work runs per (scenario, arm, corpus) cell"
+        required: false
+        default: "1"
+      corpus_sizes:
+        description: "space-separated distractor counts (digits + spaces only)"
+        required: false
+        default: "0 50 500"
+      scenarios:
+        description: "space-separated scenario ids ([a-z0-9 _-] only)"
+        required: false
+        default: "dep-http-ureq"
+
+env:
+  CARGO_TERM_COLOR: always
+
+permissions:
+  contents: read
+
+jobs:
+  trace:
+    name: p4a cache trace (macOS)
+    if: github.repository == 'brianluby/rusty-brain'
+    runs-on: macos-latest
+    timeout-minutes: 120
+    permissions:
+      contents: read
+    steps:
+      - name: Preflight - require the ANTHROPIC_API_KEY secret
+        env:
+          HAVE_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+        run: |
+          if [ "$HAVE_KEY" != "true" ]; then
+            echo "::error::repository secret ANTHROPIC_API_KEY is not configured; the cache trace cannot run."
+            exit 1
+          fi
+
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+
+      - name: Build release binaries
+        run: cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
+
+      - name: Install Claude Code CLI
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Run the cache trace
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          RB_W35_MAX_BUDGET_USD: "0.50"
+          # Pass dispatch inputs via env (never interpolate ${{ }} into the shell)
+          # and validate before use, so a crafted value cannot inject shell.
+          RUNS_INPUT: ${{ github.event.inputs.runs || '1' }}
+          CORPUS_INPUT: ${{ github.event.inputs.corpus_sizes || '0 50 500' }}
+          SCENARIOS_INPUT: ${{ github.event.inputs.scenarios || 'dep-http-ureq' }}
+        run: |
+          case "$RUNS_INPUT" in
+            ''|*[!0-9]*|0) echo "::error::'runs' must be a positive integer (got '$RUNS_INPUT')"; exit 1 ;;
+          esac
+          case "$CORPUS_INPUT" in
+            *[!0-9\ ]*) echo "::error::'corpus_sizes' may contain only digits and spaces (got '$CORPUS_INPUT')"; exit 1 ;;
+          esac
+          for cs in $CORPUS_INPUT; do
+            case "$cs" in ''|*[!0-9]*) echo "::error::'corpus_sizes' has a non-numeric entry: '$cs'"; exit 1 ;; esac
+          done
+          case "$CORPUS_INPUT" in
+            *[0-9]*) ;;
+            *) echo "::error::'corpus_sizes' must contain at least one number"; exit 1 ;;
+          esac
+          case "$SCENARIOS_INPUT" in
+            *[!a-z0-9\ _-]*) echo "::error::'scenarios' may contain only [a-z0-9 _-]"; exit 1 ;;
+          esac
+          case "$SCENARIOS_INPUT" in
+            *[a-z0-9]*) ;;
+            *) echo "::error::'scenarios' must contain at least one id"; exit 1 ;;
+          esac
+          scripts/w35-cache-trace.sh \
+            --bin-dir target/release \
+            --runs "$RUNS_INPUT" \
+            --corpus-sizes "$CORPUS_INPUT" \
+            --scenarios "$SCENARIOS_INPUT" \
+            --out "${RUNNER_TEMP}/p4a-cache.tsv"
+
+      - name: Upload the cache-trace TSV
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: p4a-cache-report
+          path: ${{ runner.temp }}/p4a-cache.tsv
+          if-no-files-found: ignore
