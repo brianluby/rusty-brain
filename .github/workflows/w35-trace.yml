@@ -63,6 +63,9 @@ jobs:
           npm install -g @anthropic-ai/claude-code
           claude --version
 
+      - name: Self-test (token math + cache aggregate, no API)
+        run: scripts/w35-trace-tools.sh --self-test
+
       - name: Run the tool trace
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
