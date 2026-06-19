@@ -20,12 +20,17 @@
 # dimensions plant explicitly; capture is its own dimension.
 #
 # This file ships the PURE scoring core (judge + scorecard aggregation) with a
-# `--self-test` that needs NO API, plus the live four-arm runner. Per P3 a single
-# run never gates; pass --runs >= 5 for a real read.
+# `--self-test` that needs NO API, plus the live four-arm runner.
+#
+# Variance protocol (P3): success is reported as a Wilson 95% CI and turns as
+# median [Q1-Q3]; a single run never gates. A run with any arm below --min-runs
+# (default 5, or config.min_runs) is DIRECTIONAL ONLY — it still prints the
+# scorecard but emits no SAFE/UNSAFE verdict and exits 0. The only hard gate
+# (P4) is zero memory-induced errors, and only from a >=min-runs run.
 #
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
-#   memory-scorecard.sh --bin-dir DIR [--runs N] [--out FILE] [--scenarios-file F]
+#   memory-scorecard.sh --bin-dir DIR [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
 set -uo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -56,55 +61,96 @@ judge_text() {
 
 # ---- pure scorecard aggregation (exercised by --self-test) -------------------
 # Reads a results TSV (dimension<TAB>scenario<TAB>arm<TAB>run<TAB>success<TAB>turns<TAB>mie)
-# from $1; prints the per-dimension scorecard + the safety gate; returns 0 iff the
-# SAFETY gate holds (zero memory-induced errors) — per P4 only safety is hard.
+# from $1. Prints the per-dimension scorecard — success as a Wilson 95% CI and
+# turns as median [Q1-Q3] (P3: median + spread, never a bare mean) — plus the
+# safety result. Returns 0 iff the SAFETY gate holds (zero memory-induced errors,
+# P4) AND no arm is below min_runs — a sub-min-runs run is DIRECTIONAL ONLY,
+# prints no SAFE/UNSAFE verdict, and returns 0 (P3: single runs never gate).
 # Dimension verdicts (beats realistic AND ties steelman) are reported, not gated.
+#
+#   $1 = tsv, $2 = steelman tie margin (default $TIE_MARGIN), $3 = min_runs (default 5).
 aggregate_scorecard() {
-  local tsv="$1" tie_margin="${2:-$TIE_MARGIN}"
-  awk -F'\t' -v tie="$tie_margin" '
-    function median(arr, n,   i, tmp, c) {
-      c = 0; for (i in arr) { tmp[++c] = arr[i] }
-      if (c == 0) return 0
-      # insertion sort (small n)
-      for (i = 2; i <= c; i++) { v = tmp[i]; j = i - 1;
-        while (j >= 1 && tmp[j] > v) { tmp[j+1] = tmp[j]; j-- } tmp[j+1] = v }
-      if (c % 2) return tmp[(c+1)/2]
-      return (tmp[c/2] + tmp[c/2+1]) / 2.0
+  local tsv="$1" tie_margin="${2:-${TIE_MARGIN:-0.10}}" min_runs="${3:-5}"
+  awk -F'\t' -v tie="$tie_margin" -v min_runs="$min_runs" '
+    # insertion sort arr[1..n] in place
+    function sortarr(arr, n,   i, j, v) {
+      for (i = 2; i <= n; i++) { v = arr[i]; j = i - 1;
+        while (j >= 1 && arr[j] > v) { arr[j+1] = arr[j]; j-- } arr[j+1] = v }
+    }
+    # linear-interpolated percentile p in [0,1] of arr[1..n] (n=count). Copies
+    # into `sorted` so the caller array is not mutated.
+    function pctile(arr, n, p,   sorted, i, rank, lo_i, hi_i, frac) {
+      if (n == 0) return 0
+      for (i = 1; i <= n; i++) sorted[i] = arr[i]
+      sortarr(sorted, n)
+      rank = (n - 1) * p + 1
+      lo_i = int(rank); if (lo_i < 1) lo_i = 1
+      hi_i = (lo_i < n) ? lo_i + 1 : lo_i
+      frac = rank - lo_i
+      return sorted[lo_i] + frac * (sorted[hi_i] - sorted[lo_i])
+    }
+    # Wilson 95% CI for k successes of n; sets globals wil_lo / wil_hi.
+    function wilson(k, n,   z, z2, phat, denom, center, half) {
+      z = 1.96; z2 = z * z
+      if (n == 0) { wil_lo = 0; wil_hi = 0; return }
+      phat = k / n
+      denom = 1 + z2 / n
+      center = (phat + z2 / (2 * n)) / denom
+      half = z * sqrt(phat * (1 - phat) / n + z2 / (4 * n * n)) / denom
+      wil_lo = center - half; wil_hi = center + half
     }
     {
       dim=$1; arm=$3; succ=$5; turns=$6; mie=$7;
       key = dim SUBSEP arm;
       n[key]++; s[key]+=succ;
-      tk = key SUBSEP n[key]; tv[tk] = turns;     # per-run turns for median
+      tk = key SUBSEP n[key]; tv[tk] = turns;
       dims[dim]=1;
       if (arm=="memory-on" && mie==1) { mie_total++; mie_list = mie_list sprintf("    - %s / %s run %s\n", dim, $2, $4) }
     }
     END {
-      printf "%-16s %-18s %5s %9s %11s\n", "dimension", "arm", "runs", "success", "med_turns";
+      directional = 0;
+      split("memory-on realistic-baseline steelman-baseline memory-off", order, " ");
+      printf "%-15s %-18s %5s %16s %16s\n", "dimension", "arm", "runs", "success [95% CI]", "med_turns [Q1-Q3]";
       pass_dims=0; total_dims=0;
       for (d in dims) {
         total_dims++;
-        split("memory-on realistic-baseline steelman-baseline memory-off", order, " ");
         for (i=1;i<=4;i++) {
           a=order[i]; key=d SUBSEP a;
-          if (n[key]==0) { printf "%-16s %-18s %5s %9s %11s\n", d, a, 0, "n/a", "n/a"; continue }
+          if (n[key]==0) {
+            directional = 1;   # missing arm = incomplete data → never gate (P3)
+            printf "%-15s %-18s %5d %16s %16s\n", d, a, 0, "n/a", "n/a"; continue
+          }
           rate[key]=s[key]/n[key];
-          # gather this arm-dim turns into a contiguous array for median()
+          if (n[key] < min_runs) directional = 1;
           delete tarr; m=0;
           for (r=1;r<=n[key];r++){ m++; tarr[m]=tv[key SUBSEP r] }
-          printf "%-16s %-18s %5d %8.0f%% %11.1f\n", d, a, n[key], rate[key]*100, median(tarr, m);
+          med = pctile(tarr, m, 0.5); q1 = pctile(tarr, m, 0.25); q3 = pctile(tarr, m, 0.75);
+          wilson(s[key], n[key]);
+          printf "%-15s %-18s %5d %5.0f%% [%.2f-%.2f] %8.1f [%.1f-%.1f]\n",
+                 d, a, n[key], rate[key]*100, wil_lo, wil_hi, med, q1, q3;
         }
-        on=rate[d SUBSEP "memory-on"]; rb=rate[d SUBSEP "realistic-baseline"]; sm=rate[d SUBSEP "steelman-baseline"];
-        beats_realistic = (on > rb);
-        ties_steelman   = (on >= sm - tie);
-        verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
-        if (beats_realistic && ties_steelman) pass_dims++;
-        printf "  -> %s: beats_realistic=%s ties_steelman=%s  => %s\n\n",
-               d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), verdict;
+        # A verdict needs all three comparison arms present; a missing baseline
+        # would default its rate to 0 and could falsify beats_realistic.
+        if (n[d SUBSEP "memory-on"]>0 && n[d SUBSEP "realistic-baseline"]>0 && n[d SUBSEP "steelman-baseline"]>0) {
+          on=rate[d SUBSEP "memory-on"]; rb=rate[d SUBSEP "realistic-baseline"]; sm=rate[d SUBSEP "steelman-baseline"];
+          beats_realistic = (on > rb);
+          ties_steelman   = (on >= sm - tie);
+          verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
+          if (beats_realistic && ties_steelman) pass_dims++;
+          printf "  -> %s: beats_realistic=%s ties_steelman=%s  => %s\n\n",
+                 d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), verdict;
+        } else {
+          printf "  -> %s: incomplete arms (no verdict)\n\n", d;
+        }
       }
       printf "scorecard: %d/%d dimensions pass (tracked, non-gating)\n", pass_dims, total_dims;
-      printf "SAFETY GATE — memory-induced errors: %d (allowed 0)\n", mie_total+0;
+      printf "SAFETY — memory-induced errors: %d (allowed 0)\n", mie_total+0;
       if (mie_total+0 > 0) { printf "  enumerated:\n%s", mie_list }
+      if (directional) {
+        printf "DIRECTIONAL ONLY — an arm is below min_runs=%d; single runs never gate (P3)\n", min_runs;
+        printf "result: DIRECTIONAL (not gating)\n";
+        exit 0;
+      }
       printf "result: %s\n", (mie_total+0 == 0 ? "SAFE" : "UNSAFE");
       exit (mie_total+0 == 0 ? 0 : 1);
     }
@@ -128,6 +174,9 @@ self_test() {
   check "acted on stale (memory-on) => fail + mie"          "0 1" "$(judge_text "$tmp/old.txt"       ureq '' reqwest memory-on)"
   check "acted on stale (baseline) => fail, no mie"         "0 0" "$(judge_text "$tmp/old.txt"       ureq '' reqwest steelman-baseline)"
 
+  # Scorecard fixtures below have N=1 per arm; pass min_runs=1 (3rd arg) so they
+  # still gate/verdict. The directional behavior is exercised separately.
+
   # A scorecard where memory beats realistic AND ties steelman, zero mie => SAFE, dim passes.
   local good="$tmp/good.tsv"
   {
@@ -136,8 +185,8 @@ self_test() {
     printf 'freshness\ts1\tsteelman-baseline\t1\t1\t2\t0\n'
     printf 'freshness\ts1\tmemory-off\t1\t0\t2\t0\n'
   } > "$good"
-  if aggregate_scorecard "$good" >/dev/null; then echo "ok: clean scorecard is SAFE"; else echo "BUG: clean scorecard flagged unsafe"; fail=1; fi
-  if aggregate_scorecard "$good" | grep -q '\-> freshness:.*=> PASS'; then echo "ok: dimension passes when it beats realistic + ties steelman"; else echo "BUG: dimension did not pass"; fail=1; fi
+  if aggregate_scorecard "$good" 0.10 1 >/dev/null; then echo "ok: clean scorecard is SAFE"; else echo "BUG: clean scorecard flagged unsafe"; fail=1; fi
+  if aggregate_scorecard "$good" 0.10 1 | grep -q '\-> freshness:.*=> PASS'; then echo "ok: dimension passes when it beats realistic + ties steelman"; else echo "BUG: dimension did not pass"; fail=1; fi
 
   # RE-RIG GUARD: memory beats realistic but LOSES to steelman => dimension must NOT pass.
   local rig="$tmp/rig.tsv"
@@ -147,9 +196,9 @@ self_test() {
     printf 'freshness\ts1\tsteelman-baseline\t1\t1\t2\t0\n'
     printf 'freshness\ts1\tmemory-off\t1\t0\t2\t0\n'
   } > "$rig"
-  if aggregate_scorecard "$rig" | grep -q '\-> freshness:.*=> no'; then echo "ok: re-rig guard — losing to steelman fails the dimension"; else echo "BUG: re-rig not caught"; fail=1; fi
+  if aggregate_scorecard "$rig" 0.10 1 | grep -q '\-> freshness:.*=> no'; then echo "ok: re-rig guard — losing to steelman fails the dimension"; else echo "BUG: re-rig not caught"; fail=1; fi
 
-  # SAFETY: a memory-induced error fails the hard gate even if dimensions look fine.
+  # SAFETY: a memory-induced error fails the hard gate at min_runs=1.
   local unsafe="$tmp/unsafe.tsv"
   {
     printf 'freshness\ts1\tmemory-on\t1\t0\t2\t1\n'
@@ -157,28 +206,62 @@ self_test() {
     printf 'freshness\ts1\tsteelman-baseline\t1\t1\t2\t0\n'
     printf 'freshness\ts1\tmemory-off\t1\t0\t2\t0\n'
   } > "$unsafe"
-  if aggregate_scorecard "$unsafe" >/dev/null; then echo "BUG: memory-induced error did not fail the safety gate"; fail=1; else echo "ok: memory-induced error fails the safety gate"; fi
+  if aggregate_scorecard "$unsafe" 0.10 1 >/dev/null; then echo "BUG: memory-induced error did not fail the safety gate"; fail=1; else echo "ok: memory-induced error fails the safety gate"; fi
 
-  # median: even count averages the two middles.
-  local med="$tmp/med.tsv"
+  # P3 — single runs never gate: the same unsafe data at min_runs=5 is DIRECTIONAL,
+  # exits 0 (does not gate), yet still reports + enumerates the memory-induced error.
+  if aggregate_scorecard "$unsafe" 0.10 5 >/dev/null; then echo "ok: sub-min-runs unsafe run is directional (exit 0)"; else echo "BUG: sub-min-runs run gated"; fail=1; fi
+  if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'DIRECTIONAL ONLY'; then echo "ok: sub-min-runs run prints DIRECTIONAL ONLY"; else echo "BUG: no DIRECTIONAL banner"; fail=1; fi
+  if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'memory-induced errors: 1'; then echo "ok: MIE still enumerated when directional"; else echo "BUG: MIE not enumerated when directional"; fail=1; fi
+
+  # IQR: turns {1,2,3,4,5} => median 3.0 [Q1 2.0, Q3 4.0].
+  local iqr="$tmp/iqr.tsv"
+  { for t in 1 2 3 4 5; do printf 'd\ts\tmemory-on\t%s\t1\t%s\t0\n' "$t" "$t"; done; } > "$iqr"
+  if aggregate_scorecard "$iqr" 0.10 1 | grep -qE 'memory-on.*3\.0 \[2\.0-4\.0\]'; then echo "ok: IQR of {1,2,3,4,5} = median 3.0 [2.0-4.0]"; else echo "BUG: IQR wrong"; aggregate_scorecard "$iqr" 0.10 1 | grep memory-on; fail=1; fi
+
+  # Wilson 95% CI: 4 successes of 5 (80%) => [0.38-0.96].
+  local wil="$tmp/wil.tsv"
   {
-    printf 'd\ts\tmemory-on\t1\t1\t1\t0\n'
-    printf 'd\ts\tmemory-on\t2\t1\t3\t0\n'
-    printf 'd\ts\tmemory-on\t3\t1\t5\t0\n'
-    printf 'd\ts\tmemory-on\t4\t1\t9\t0\n'
-  } > "$med"
-  if aggregate_scorecard "$med" | grep -qE 'memory-on .* 4 .* 4\.0'; then echo "ok: median turns of {1,3,5,9} = 4.0"; else echo "BUG: median wrong"; aggregate_scorecard "$med" | grep memory-on; fail=1; fi
+    printf 'd\ts\tmemory-on\t1\t1\t2\t0\n'
+    printf 'd\ts\tmemory-on\t2\t1\t2\t0\n'
+    printf 'd\ts\tmemory-on\t3\t1\t2\t0\n'
+    printf 'd\ts\tmemory-on\t4\t1\t2\t0\n'
+    printf 'd\ts\tmemory-on\t5\t0\t2\t0\n'
+  } > "$wil"
+  if aggregate_scorecard "$wil" 0.10 1 | grep -qE 'memory-on.*80% \[0\.38-0\.96\]'; then echo "ok: Wilson CI for 4/5 = 80% [0.38-0.96]"; else echo "BUG: Wilson CI wrong"; aggregate_scorecard "$wil" 0.10 1 | grep memory-on; fail=1; fi
+
+  # Complete gating run: all four arms at N=5 (>= min_runs), memory-on beats
+  # realistic AND ties steelman, zero MIE => gates SAFE, dimension PASS, and is
+  # NOT directional / not incomplete (locks the gating path vs the directional cases).
+  local full="$tmp/full.tsv"
+  {
+    for t in 1 2 3 4 5; do printf 'd\ts\tmemory-on\t%s\t1\t2\t0\n'        "$t"; done
+    for t in 1 2 3 4 5; do printf 'd\ts\trealistic-baseline\t%s\t0\t3\t0\n' "$t"; done
+    for t in 1 2 3 4;   do printf 'd\ts\tsteelman-baseline\t%s\t1\t2\t0\n'  "$t"; done
+                        printf 'd\ts\tsteelman-baseline\t5\t0\t2\t0\n'
+    for t in 1 2 3 4 5; do printf 'd\ts\tmemory-off\t%s\t0\t5\t0\n'         "$t"; done
+  } > "$full"
+  local fout; fout="$(aggregate_scorecard "$full" 0.10 5)"
+  if echo "$fout" | grep -q 'result: SAFE' && echo "$fout" | grep -q '\-> d:.*=> PASS' \
+     && ! echo "$fout" | grep -q 'DIRECTIONAL' && ! echo "$fout" | grep -q 'incomplete arms'; then
+    echo "ok: complete N=5 run gates SAFE + PASS, not directional"
+  else
+    echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
+  fi
 
   [ "$fail" -eq 0 ] && { echo "self-test PASS"; return 0; } || { echo "self-test FAIL" >&2; return 1; }
 }
 
 # ---- arg parsing -------------------------------------------------------------
-MODE="run"; BIN_DIR=""; RUNS=""; OUT=""
+MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test)      MODE="self-test"; shift ;;
     --bin-dir)        BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
     --runs)           RUNS="${2:?--runs needs a value}"; shift 2 ;;
+    --min-runs)       MIN_RUNS="${2:?--min-runs needs a value}"
+                      case "$MIN_RUNS" in ''|*[!0-9]*|0) echo "--min-runs must be a positive integer (got '$MIN_RUNS')" >&2; exit 2 ;; esac
+                      shift 2 ;;
     --out)            OUT="${2:?--out needs a value}"; shift 2 ;;
     --scenarios-file) SCENARIOS_FILE="${2:?--scenarios-file needs a value}"; shift 2 ;;
     -h|--help)        sed -n '2,30p' "$0"; exit 2 ;;
@@ -200,6 +283,12 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH" >&2; exit 1; 
 [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "ANTHROPIC_API_KEY is not set" >&2; exit 1; }
 [ -f "$SCENARIOS_FILE" ] || { echo "scenarios file not found: $SCENARIOS_FILE" >&2; exit 1; }
 [ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 5' "$SCENARIOS_FILE")"
+[ -n "$MIN_RUNS" ] || MIN_RUNS="$(jq -r '.config.min_runs // 5' "$SCENARIOS_FILE")"
+# RB_SCORECARD_TIE_MARGIN (env) overrides config; otherwise honor config.tie_margin
+# (alias: steelman_tie), else 0.10.
+if [ -z "${RB_SCORECARD_TIE_MARGIN+x}" ]; then
+  TIE_MARGIN="$(jq -r '.config.tie_margin // .config.steelman_tie // 0.10' "$SCENARIOS_FILE")"
+fi
 
 SESSION_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then SESSION_TIMEOUT="timeout ${RB_SCORECARD_SESSION_TIMEOUT_SECS:-300}"
@@ -355,4 +444,4 @@ while IFS= read -r row; do scenario_rows+=("$row"); done < <(jq -c '.scenarios[]
 for row in "${scenario_rows[@]}"; do run_scenario "$row"; done
 echo
 echo "== scorecard =="
-aggregate_scorecard "$RESULTS"
+aggregate_scorecard "$RESULTS" "$TIE_MARGIN" "$MIN_RUNS"

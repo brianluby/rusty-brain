@@ -2,7 +2,9 @@
   "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail).",
   "config": {
     "runs_per_scenario": 5,
-    "memory_induced_errors_allowed": 0
+    "memory_induced_errors_allowed": 0,
+    "min_runs": 5,
+    "tie_margin": 0.10
   },
   "scenarios": [
     {
