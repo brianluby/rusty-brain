@@ -63,9 +63,10 @@ judge_text() {
 # Reads a results TSV (dimension<TAB>scenario<TAB>arm<TAB>run<TAB>success<TAB>turns<TAB>mie)
 # from $1. Prints the per-dimension scorecard — success as a Wilson 95% CI and
 # turns as median [Q1-Q3] (P3: median + spread, never a bare mean) — plus the
-# safety result. Returns 0 iff the SAFETY gate holds (zero memory-induced errors,
-# P4) AND no arm is below min_runs — a sub-min-runs run is DIRECTIONAL ONLY,
-# prints no SAFE/UNSAFE verdict, and returns 0 (P3: single runs never gate).
+# safety result. Exit code: 0 for a DIRECTIONAL run (any arm below min_runs, or a
+# missing arm — prints no SAFE/UNSAFE verdict, never gates; P3: single runs never
+# gate); otherwise 0 iff the SAFETY gate holds (zero memory-induced errors, P4),
+# 1 on UNSAFE. The hard gate fires only from a >=min-runs, complete run.
 # Dimension verdicts (beats realistic AND ties steelman) are reported, not gated.
 #
 #   $1 = tsv, $2 = steelman tie margin (default $TIE_MARGIN), $3 = min_runs (default 5).
@@ -126,8 +127,8 @@ aggregate_scorecard() {
           for (r=1;r<=n[key];r++){ m++; tarr[m]=tv[key SUBSEP r] }
           med = pctile(tarr, m, 0.5); q1 = pctile(tarr, m, 0.25); q3 = pctile(tarr, m, 0.75);
           wilson(s[key], n[key]);
-          printf "%-15s %-18s %5d %5.0f%% [%.2f-%.2f] %8.1f [%.1f-%.1f]\n",
-                 d, a, n[key], rate[key]*100, wil_lo, wil_hi, med, q1, q3;
+          printf "%-15s %-18s %5d %5.0f%% [%.1f-%.1f] %8.1f [%.1f-%.1f]\n",
+                 d, a, n[key], rate[key]*100, wil_lo*100, wil_hi*100, med, q1, q3;
         }
         # A verdict needs all three comparison arms present; a missing baseline
         # would default its rate to 0 and could falsify beats_realistic.
@@ -228,7 +229,7 @@ self_test() {
     printf 'd\ts\tmemory-on\t4\t1\t2\t0\n'
     printf 'd\ts\tmemory-on\t5\t0\t2\t0\n'
   } > "$wil"
-  if aggregate_scorecard "$wil" 0.10 1 | grep -qE 'memory-on.*80% \[0\.38-0\.96\]'; then echo "ok: Wilson CI for 4/5 = 80% [0.38-0.96]"; else echo "BUG: Wilson CI wrong"; aggregate_scorecard "$wil" 0.10 1 | grep memory-on; fail=1; fi
+  if aggregate_scorecard "$wil" 0.10 1 | grep -qE 'memory-on.*80% \[37\.6-96\.4\]'; then echo "ok: Wilson CI for 4/5 = 80% [37.6-96.4]"; else echo "BUG: Wilson CI wrong"; aggregate_scorecard "$wil" 0.10 1 | grep memory-on; fail=1; fi
 
   # Complete gating run: all four arms at N=5 (>= min_runs), memory-on beats
   # realistic AND ties steelman, zero MIE => gates SAFE, dimension PASS, and is
@@ -264,7 +265,7 @@ while [ $# -gt 0 ]; do
                       shift 2 ;;
     --out)            OUT="${2:?--out needs a value}"; shift 2 ;;
     --scenarios-file) SCENARIOS_FILE="${2:?--scenarios-file needs a value}"; shift 2 ;;
-    -h|--help)        sed -n '2,30p' "$0"; exit 2 ;;
+    -h|--help)        awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 2 ;;
     *)                echo "unknown arg: $1" >&2; exit 2 ;;
   esac
 done
@@ -289,6 +290,9 @@ command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH" >&2; exit 1; 
 if [ -z "${RB_SCORECARD_TIE_MARGIN+x}" ]; then
   TIE_MARGIN="$(jq -r '.config.tie_margin // .config.steelman_tie // 0.10' "$SCENARIOS_FILE")"
 fi
+# Validate min_runs regardless of source (CLI or config): a non-numeric/0 value
+# coerces to 0 in awk, silently disabling the directional guard.
+case "$MIN_RUNS" in ''|*[!0-9]*|0) echo "min_runs must be a positive integer (got '$MIN_RUNS')" >&2; exit 2 ;; esac
 
 SESSION_TIMEOUT=""
 if command -v timeout >/dev/null 2>&1; then SESSION_TIMEOUT="timeout ${RB_SCORECARD_SESSION_TIMEOUT_SECS:-300}"
