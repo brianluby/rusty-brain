@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
 # P4a prompt-caching study (companion to scripts/w35-ab-eval.sh and
 # scripts/w35-trace-tools.sh; records ADR-3 in
 # docs/eval/2026-06-19-p4a-caching-study.md).
@@ -48,7 +49,7 @@
 #   scripts/w35-cache-trace.sh --bin-dir target/release
 # `--self-test` validates the usage-extraction + scoring math with NO API and is
 # CI-safe.
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCENARIOS_JSON="$REPO_ROOT/crates/rb-eval/scorecard/w35_ab_scenarios.json"
@@ -67,9 +68,9 @@ usage() { sed -n '2,46p' "$0"; exit 2; }
 # final `result` record (the same record that carries num_turns/total_cost_usd;
 # it sums every turn's usage, so it is the session-total cache economics):
 #   is_error  num_turns  cost  input_tok  cache_create_tok  cache_read_tok  output_tok
-# A non-parseable log (timeout/error/budget) yields a worst-case sentinel row so
-# a failure can never make an arm look artificially cheap on the cache metrics:
-# turns=TURNS_FAIL_SENTINEL, every token field 0, is_error=true.
+# A non-parseable log (timeout/error/budget) yields a worst-case sentinel row and
+# records is_error=true. Aggregation treats any error row as invalid data for ADR
+# ratification, so failures cannot look like cheap successful cache behavior.
 extract_usage() {
   local log="$1"
   local r is_err turns cost inp cc cr out
@@ -107,7 +108,7 @@ judge_text() {
 
 # --- aggregate + ADR-3 verdicts (pure; exercised by --self-test) -------------
 # Reads the results TSV:
-#   scenario<TAB>arm<TAB>corpus<TAB>run<TAB>success<TAB>turns<TAB>cost<TAB>input_tok<TAB>cache_create_tok<TAB>cache_read_tok<TAB>output_tok<TAB>mie
+#   scenario<TAB>arm<TAB>corpus<TAB>run<TAB>success<TAB>turns<TAB>cost<TAB>input_tok<TAB>cache_create_tok<TAB>cache_read_tok<TAB>output_tok<TAB>mie<TAB>is_error
 # Prints a per-(arm,corpus) cache-economics table, then a per-corpus verdict
 # applying ADR-3's pre-registered thresholds (memory-on vs steelman-baseline).
 aggregate() {
@@ -115,10 +116,11 @@ aggregate() {
   awk -F'\t' -v mie_allowed="$mie_allowed" '
     function ratio(cr, inp) { if (cr+inp == 0) return 0; return cr/(cr+inp) }
     {
-      arm=$2; c=$3; succ=$5; turns=$6; cost=$7; inp=$8; cc=$9; cr=$10; mie=$12;
+      arm=$2; c=$3; succ=$5; turns=$6; cost=$7; inp=$8; cc=$9; cr=$10; mie=$12; is_err=$13;
       key=arm SUBSEP c;
       n[key]++; s[key]+=succ; t[key]+=turns; co[key]+=cost;
       ti[key]+=inp; tcc[key]+=cc; tcr[key]+=cr;
+      if (is_err == "true") { e[key]++; err_total++; err_list = err_list sprintf("    - %s / %s corpus %s run %s\n", $1, arm, c, $4); }
       if (arm=="memory-on" && mie==1) { mie_total++; mie_list = mie_list sprintf("    - %s corpus %s run %s\n", $1, c, $4); }
       corpora[c]=1;
     }
@@ -147,19 +149,26 @@ aggregate() {
         c=corp[ci];
         onk ="memory-on" SUBSEP c;          stl="steelman-baseline" SUBSEP c;
         if (n[onk]==0 || n[stl]==0) { printf "  corpus %-6s SKIP (an arm produced no runs)\n", c; continue }
+        if (e[onk]+e[stl] > 0) {
+          printf "  corpus %-6s SKIP (session errors in memory-on or steelman-baseline)\n", c;
+          continue;
+        }
         on_acc = s[onk]/n[onk];             stl_acc = s[stl]/n[stl];
+        on_cost = co[onk]/n[onk];           stl_cost = co[stl]/n[stl];
         on_cr  = ratio(tcr[onk], ti[onk]);  stl_cr  = ratio(tcr[stl], ti[stl]);
         acc_ok = (on_acc >= stl_acc);
-        # threshold 2 "within 20%" = memory-on cache% >= 0.8 * steelman cache%
-        cache_ok = (stl_cr == 0 ? (on_cr == 0) : (on_cr >= 0.8 * stl_cr));
-        printf "  corpus %-6s acc on %.2f vs stl %.2f [%s] | cache%% on %.1f vs stl %.1f [%s]\n", \
-          c, on_acc, stl_acc, (acc_ok?"ok":"NO"), 100*on_cr, 100*stl_cr, (cache_ok?"ok":"NO");
-        if (acc_ok && cache_ok) {
-          verdict="RATIFY Opt 3 (accuracy + cache within 20% of steelman)"
-        } else if (acc_ok && !cache_ok) {
-          verdict="Opt 2 candidate (accuracy wins; cache ratio > 20% worse — consider caching the SessionStart digest)"
-        } else if (!acc_ok && cache_ok) {
-          verdict="accuracy loses at scale (cache is fine) — investigate retrieval, not caching"
+        acc_floor_ok = (s[onk] > 0 && s[stl] > 0);
+        # ADR-3: cost axis is total_cost_usd. "within 20%" means memory-on mean
+        # cost <= 1.2x steelman mean cost; cache buckets stay diagnostic.
+        cost_ok = (stl_cost == 0 ? (on_cost == 0) : (on_cost <= 1.2 * stl_cost));
+        printf "  corpus %-6s acc on %.2f vs stl %.2f [%s] | cost$ on %.4f vs stl %.4f [%s] | cache%% on %.1f vs stl %.1f\n", \
+          c, on_acc, stl_acc, (acc_ok && acc_floor_ok ? "ok" : "NO"), on_cost, stl_cost, (cost_ok?"ok":"NO"), 100*on_cr, 100*stl_cr;
+        if (acc_ok && acc_floor_ok && cost_ok) {
+          verdict="RATIFY Opt 3 (accuracy + total_cost_usd within 20% of steelman)"
+        } else if (acc_ok && acc_floor_ok && !cost_ok) {
+          verdict="Opt 2 candidate (accuracy wins; cost > 20% worse — consider caching the SessionStart digest)"
+        } else if (!(acc_ok && acc_floor_ok) && cost_ok) {
+          verdict="accuracy loses or is not meaningful at scale (cost is fine) — investigate retrieval, not caching"
         } else {
           verdict="descope dimension A token-cost axis (value is capture/freshness/reach per ADR-1)"
         }
@@ -167,11 +176,14 @@ aggregate() {
       }
       print "";
       mie_ok = (mie_total+0 <= mie_allowed+0);
+      data_ok = (err_total+0 == 0);
+      printf "session errors: %d\n", err_total+0;
+      if (err_total+0 > 0) { printf "  enumerated (ADR verdicts skipped for affected cells):\n%s", err_list; }
       printf "memory-induced errors: %d (allowed %d)\n", mie_total+0, mie_allowed+0;
       if (mie_total+0 > 0) { printf "  enumerated (never averaged away):\n%s", mie_list; }
       # The hard gate is still zero memory-induced errors (the safety property).
-      printf "p4a cache study: %s\n", (mie_ok ? "cache-economics recorded (see verdicts above)" : "FAIL (memory-induced errors)");
-      exit (mie_ok ? 0 : 1);
+      printf "p4a cache study: %s\n", (data_ok && mie_ok ? "cache-economics recorded (see verdicts above)" : (!data_ok ? "FAIL (session errors)" : "FAIL (memory-induced errors)"));
+      exit (data_ok && mie_ok ? 0 : 1);
     }
   ' "$tsv"
 }
@@ -230,39 +242,51 @@ self_test() {
   check "judge no mie off-arm"      "0 0" "$(judge_text "$tmp/old.txt" ureq ''   reqwest steelman-baseline)"
 
   # --- aggregate: ADR-3 threshold 1 (RATIFY Opt 3) at a corpus size. ---
-  # memory-on ties steelman on accuracy AND cache% within 20% -> ratify.
+  # memory-on ties steelman on accuracy AND total_cost_usd within 20% -> ratify.
   local tsv="$tmp/ratify.tsv"
   {
-    printf 's1\tmemory-on\t50\t1\t1\t3\t0.02\t600\t4000\t4400\t100\t0\n'
-    printf 's1\tsteelman-baseline\t50\t1\t1\t3\t0.02\t300\t4000\t8700\t100\t0\n'   # cache% 96.7
-    printf 's1\trealistic-baseline\t50\t1\t0\t5\t0.02\t300\t4000\t8700\t100\t0\n'
-    printf 's1\tmemory-off\t50\t1\t0\t5\t0.01\t6000\t0\t0\t100\t0\n'
+    printf 's1\tmemory-on\t50\t1\t1\t3\t0.02\t600\t4000\t4400\t100\t0\tfalse\n'
+    printf 's1\tsteelman-baseline\t50\t1\t1\t3\t0.02\t300\t4000\t8700\t100\t0\tfalse\n'
+    printf 's1\trealistic-baseline\t50\t1\t0\t5\t0.02\t300\t4000\t8700\t100\t0\tfalse\n'
+    printf 's1\tmemory-off\t50\t1\t0\t5\t0.01\t6000\t0\t0\t100\t0\tfalse\n'
   } > "$tsv"
   local verdict
   verdict="$(aggregate "$tsv" 0 2>/dev/null | grep -F -A1 -- 'corpus 50' | tail -1)"
-  if printf '%s' "$verdict" | grep -qF "RATIFY Opt 3"; then echo "ok: ratify Opt 3 when acc+cache within bounds"; else echo "BUG: ratify verdict (got [$verdict])"; fail=1; fi
+  if printf '%s' "$verdict" | grep -qF "RATIFY Opt 3"; then echo "ok: ratify Opt 3 when acc+cost within bounds"; else echo "BUG: ratify verdict (got [$verdict])"; fail=1; fi
 
-  # --- aggregate: ADR-3 threshold 2 (Opt 2 candidate) — cache ratio > 20% worse. ---
-  # memory-on cache% 88, steelman cache% 99 -> 88 < 0.8*99=79.2? no, 88>=79.2 so still ok.
-  # Push memory-on cache% down to 60 to force the Opt-2 branch: steelman 99, mem 60 -> 60<79.2 -> candidate.
+  # --- aggregate: ADR-3 threshold 2 (Opt 2 candidate) — total_cost_usd > 20% worse. ---
   local tsv2="$tmp/opt2.tsv"
   {
-    printf 's1\tmemory-on\t500\t1\t1\t3\t0.02\t4000\t4000\t6000\t100\t0\n'          # cache% 60
-    printf 's1\tsteelman-baseline\t500\t1\t1\t3\t0.02\t100\t4000\t9900\t100\t0\n'   # cache% 99
-    printf 's1\trealistic-baseline\t500\t1\t0\t5\t0.02\t100\t4000\t9900\t100\t0\n'
-    printf 's1\tmemory-off\t500\t1\t0\t5\t0.01\t10000\t0\t0\t100\t0\n'
+    printf 's1\tmemory-on\t500\t1\t1\t3\t0.03\t4000\t4000\t6000\t100\t0\tfalse\n'
+    printf 's1\tsteelman-baseline\t500\t1\t1\t3\t0.02\t100\t4000\t9900\t100\t0\tfalse\n'
+    printf 's1\trealistic-baseline\t500\t1\t0\t5\t0.02\t100\t4000\t9900\t100\t0\tfalse\n'
+    printf 's1\tmemory-off\t500\t1\t0\t5\t0.01\t10000\t0\t0\t100\t0\tfalse\n'
   } > "$tsv2"
   verdict="$(aggregate "$tsv2" 0 2>/dev/null | grep -F -A1 -- 'corpus 500' | tail -1)"
-  if printf '%s' "$verdict" | grep -qF "Opt 2 candidate"; then echo "ok: Opt 2 candidate when cache ratio > 20% worse"; else echo "BUG: opt2 verdict (got [$verdict])"; fail=1; fi
+  if printf '%s' "$verdict" | grep -qF "Opt 2 candidate"; then echo "ok: Opt 2 candidate when cost > 20% worse"; else echo "BUG: opt2 verdict (got [$verdict])"; fail=1; fi
 
   # --- aggregate: a memory-induced error fails the hard gate. ---
   local tsv3="$tmp/mie.tsv"
   {
-    printf 's1\tmemory-on\t50\t1\t0\t3\t0.02\t600\t4000\t4400\t100\t1\n'
-    printf 's1\tsteelman-baseline\t50\t1\t1\t3\t0.02\t300\t4000\t8700\t100\t0\n'
-    printf 's1\tmemory-off\t50\t1\t0\t5\t0.01\t6000\t0\t0\t100\t0\n'
+    printf 's1\tmemory-on\t50\t1\t0\t3\t0.02\t600\t4000\t4400\t100\t1\tfalse\n'
+    printf 's1\tsteelman-baseline\t50\t1\t1\t3\t0.02\t300\t4000\t8700\t100\t0\tfalse\n'
+    printf 's1\tmemory-off\t50\t1\t0\t5\t0.01\t6000\t0\t0\t100\t0\tfalse\n'
   } > "$tsv3"
   if aggregate "$tsv3" 0 >/dev/null 2>&1; then echo "BUG: mie did not fail the hard gate"; fail=1; else echo "ok: mie fails the hard gate"; fi
+
+  # --- aggregate: session errors fail data integrity and cannot ratify 0==0. ---
+  local tsv4="$tmp/errors.tsv" err_out
+  {
+    printf 's1\tmemory-on\t50\t1\t0\t99\t0\t0\t0\t0\t0\t0\ttrue\n'
+    printf 's1\tsteelman-baseline\t50\t1\t0\t99\t0\t0\t0\t0\t0\t0\ttrue\n'
+  } > "$tsv4"
+  if err_out="$(aggregate "$tsv4" 0 2>&1)"; then
+    echo "BUG: session errors did not fail data integrity"; fail=1
+  elif printf '%s' "$err_out" | grep -qF "RATIFY Opt 3"; then
+    echo "BUG: session errors ratified Opt 3"; fail=1
+  else
+    echo "ok: session errors fail data integrity and do not ratify"
+  fi
 
   # --- gen_corpus is deterministic + off-topic. ---
   local a b
@@ -271,7 +295,8 @@ self_test() {
   if [ "$a" = "$b" ]; then echo "ok: gen_corpus deterministic"; else echo "BUG: gen_corpus not deterministic"; fail=1; fi
   if printf '%s' "$a" | grep -qiwF "ureq"; then echo "BUG: gen_corpus leaked the target token"; fail=1; else echo "ok: gen_corpus off-topic"; fi
 
-  [ "$fail" -eq 0 ] && { echo "self-test PASS"; return 0; } || { echo "self-test FAIL" >&2; return 1; }
+  if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
+  echo "self-test FAIL" >&2; return 1
 }
 
 # --- arg parsing -------------------------------------------------------------
@@ -366,7 +391,7 @@ run_session() {
     export HOME="$home"
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
     export PATH="$BIN_DIR:$PATH"
-    cd "$proj"
+    cd "$proj" || return 1
     ${SESSION_TIMEOUT} claude -p "$prompt" \
       --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
       --permission-mode acceptEdits --allowedTools "Bash Edit Write" "$@" \
@@ -381,7 +406,7 @@ install_rusty_brain() {
   (
     export HOME="$home"
     export PATH="$BIN_DIR:$PATH"
-    cd "$proj"
+    cd "$proj" || return 1
     rusty-brain-install install --agents claude-code >/dev/null
     python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
 import json, sys
@@ -408,13 +433,13 @@ PY
 plant_corpus() { # <target_text> <scenario_id> <n_distractors>
   local target="$1" sid="$2" n="$3"
   local cmd="$BIN_DIR/rusty-brain"
-  "$cmd" remember "$target" --importance 8 >/dev/null 2>&1 || true
+  "$cmd" remember "$target" --importance 8 >/dev/null
   if [ "$n" -gt 0 ]; then
     local facts
     facts="$(gen_corpus "$sid" "$n")"
     while IFS= read -r fact; do
       [ -n "$fact" ] || continue
-      "$cmd" remember "${fact#- }" --importance 5 >/dev/null 2>&1 || true
+      "$cmd" remember "${fact#- }" --importance 5 >/dev/null
     done <<<"$facts"
   fi
 }
@@ -448,9 +473,9 @@ score_work() { # <id> <arm> <corpus> <run> <proj> <home> <work> <expect> <forbid
   local res; res="$(judge_text "$text" "$expect" "$forbid" "$stale" "$arm")"
   success="${res% *}"; mie="${res#* }"
   if [ "$is_err" = "true" ]; then success=0; fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$id" "$arm" "$corpus" "$run" "$success" "$turns" "$cost" \
-    "$inp" "$cc" "$cr" "$out" "$mie" >> "$RESULTS"
+    "$inp" "$cc" "$cr" "$out" "$mie" "$is_err" >> "$RESULTS"
   printf '   [%-18s c=%-4s] succ=%s turns=%s cost=%s cache%%=%.1f (cr=%s/%s)\n' \
     "$arm" "$corpus" "$success" "$turns" "$cost" \
     "$(awk -v cr="$cr" -v inp="$inp" 'BEGIN{ if(cr+inp==0) print 0; else printf "%.1f", 100*cr/(cr+inp) }')" \

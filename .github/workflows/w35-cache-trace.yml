@@ -73,6 +73,9 @@ jobs:
           npm install -g @anthropic-ai/claude-code
           claude --version
 
+      - name: Self-test (usage extraction + ADR math, no API)
+        run: scripts/w35-cache-trace.sh --self-test
+
       - name: Run the cache trace
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
