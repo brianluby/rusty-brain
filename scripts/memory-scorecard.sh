@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
 # Memory-value scorecard harness (W3.5 criterion redesign; see
 # docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to
 # scripts/w35-ab-eval.sh's single-fact gate. Instead of "memory-on beats one
@@ -31,7 +32,7 @@
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
 #   memory-scorecard.sh --bin-dir DIR [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCENARIOS_FILE="$REPO_ROOT/crates/rb-eval/scorecard/memory_scorecard_scenarios.json"
@@ -250,7 +251,8 @@ self_test() {
     echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
   fi
 
-  [ "$fail" -eq 0 ] && { echo "self-test PASS"; return 0; } || { echo "self-test FAIL" >&2; return 1; }
+  if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
+  echo "self-test FAIL" >&2; return 1
 }
 
 # ---- arg parsing -------------------------------------------------------------
@@ -311,7 +313,7 @@ run_session() { # home proj prompt log [extra args...]
   (
     export HOME="$home"
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
-    export PATH="$BIN_DIR:$PATH"; cd "$proj"
+    export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
     # `</dev/null`: claude -p reads stdin; without this it drains whatever fd 0
     # is (e.g. a caller's `while read` source), silently truncating the run.
     ${SESSION_TIMEOUT} claude -p "$prompt" \
@@ -324,7 +326,7 @@ run_session() { # home proj prompt log [extra args...]
 install_rusty_brain() { # home proj
   local home="$1" proj="$2"
   (
-    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj"
+    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
     rusty-brain-install install --agents claude-code >/dev/null
     python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
 import json, sys
@@ -378,11 +380,12 @@ plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array>
       content="$(jq -r ".[$i].content" <<<"$facts")"
       sup="$(jq -r ".[$i].supersedes_prev // false" <<<"$facts")"
       if [ "$sup" = "true" ] && [ -n "$last_id" ]; then
-        out="$(rusty-brain --json remember "$content" --type insight --supersedes "$last_id" 2>/dev/null)"
+        out="$(rusty-brain --json remember "$content" --type insight --supersedes "$last_id")"
       else
-        out="$(rusty-brain --json remember "$content" --type insight 2>/dev/null)"
+        out="$(rusty-brain --json remember "$content" --type insight)"
       fi
       last_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
+      [ -n "$last_id" ] || { echo "ERROR: explicit plant did not return an id for fact $i" >&2; return 1; }
     done
   )
 }
@@ -406,20 +409,26 @@ run_scenario() { # row
     # see the sibling under `set -u` (b errors as unbound).
     local mb="$base/on"
     local db="$mb/memory.db" ns="rb-sc-$id-r$run"
-    local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     local wh="$mb/hw" wp="$mb/wp"; seed_home "$wh"; mkdir -p "$wp"
     install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
+    local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     (
       export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
       # Start a daemon for the store and WAIT for the socket to bind before
       # planting (a fixed sleep races the bind — observed flaky).
       rusty-brain serve >/dev/null 2>&1 &
       dpid=$!
+      # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+      cleanup_memory_on() {
+        kill "$dpid" 2>/dev/null || true
+        rm -rf "$sockdir" 2>/dev/null || true
+      }
+      trap cleanup_memory_on EXIT
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
+      [ -S "$sock" ] || { echo "ERROR: memory-on daemon did not bind for $id run $run" >&2; exit 1; }
       if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
       # (auto-capture mode: a plant session would run here — wired with dimension B.)
       score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
-      kill "$dpid" 2>/dev/null || true
     )
     rm -rf "$sockdir" 2>/dev/null || true
 

@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# shellcheck disable=SC2030,SC2031
 # W3.5 turn-overhead TRACE (diagnostic, not a gate). Companion to
 # scripts/w35-ab-eval.sh. The gate run found memory-on ties claude-md on success
 # but LOSES on turns; code analysis blamed the live rusty-brain MCP server's
@@ -26,7 +27,7 @@
 #
 # Usage: w35-trace-tools.sh --bin-dir DIR [--runs N] [--out FILE] [--scenarios "id id ..."]
 #        w35-trace-tools.sh --self-test   # CI-safe: token math + aggregate, NO API
-set -uo pipefail
+set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCENARIOS_JSON="$REPO_ROOT/crates/rb-eval/scorecard/w35_ab_scenarios.json"
@@ -87,7 +88,7 @@ run_session() { # home proj prompt log [extra args...]
     export HOME="$home"
     unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
     export PATH="$BIN_DIR:$PATH"
-    cd "$proj"
+    cd "$proj" || return 1
     ${SESSION_TIMEOUT} claude -p "$prompt" \
       --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
       --permission-mode acceptEdits --allowedTools "Bash Edit Write" "$@" \
@@ -98,7 +99,7 @@ run_session() { # home proj prompt log [extra args...]
 install_rusty_brain() { # home proj
   local home="$1" proj="$2"
   (
-    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj"
+    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
     rusty-brain-install install --agents claude-code >/dev/null
     python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
 import json, sys

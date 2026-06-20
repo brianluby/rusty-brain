@@ -133,13 +133,11 @@ is bounded.
 **Pre-registered thresholds (the measured run picks the final option):**
 
 1. If, at corpus ≥ 500 facts, `memory-on` retrieval accuracy ≥ `steelman-baseline`
-   accuracy **and** `memory-on` cache-read ratio is within 20% of `steelman`'s
-   → **ratify Opt 3.** (cache-read ratio = `cache_read_input_tokens /
-   (cache_read_input_tokens + input_tokens)` — the fraction of input-side tokens
-   served from cache, computed as a per-cell session aggregate over N≥5 runs;
-   median + IQR is the recorded follow-up once N≥5 lands.)
-2. If `memory-on` accuracy wins but the cache ratio is worse than 20% (per-turn
-   uncached cost > ~1.3× steelman's) → **adopt Opt 2 for the SessionStart
+   accuracy **and** `memory-on` mean `total_cost_usd` is within 20% of `steelman`'s
+   → **ratify Opt 3.** `total_cost_usd` is the cache-adjusted cost axis; the
+   cache buckets explain why costs differ but are not the pass/fail metric.
+2. If `memory-on` accuracy wins but mean `total_cost_usd` is worse than 20%
+   → **adopt Opt 2 for the SessionStart
    channel only**, keeping per-turn UserPromptSubmit recall only where U1 + the
    accuracy data show it changes outcomes.
 3. If neither accuracy nor economics win at scale → memory's value is
