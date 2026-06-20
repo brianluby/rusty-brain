@@ -409,21 +409,26 @@ run_scenario() { # row
     # see the sibling under `set -u` (b errors as unbound).
     local mb="$base/on"
     local db="$mb/memory.db" ns="rb-sc-$id-r$run"
-    local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     local wh="$mb/hw" wp="$mb/wp"; seed_home "$wh"; mkdir -p "$wp"
     install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
+    local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     (
       export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
       # Start a daemon for the store and WAIT for the socket to bind before
       # planting (a fixed sleep races the bind — observed flaky).
       rusty-brain serve >/dev/null 2>&1 &
       dpid=$!
+      # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+      cleanup_memory_on() {
+        kill "$dpid" 2>/dev/null || true
+        rm -rf "$sockdir" 2>/dev/null || true
+      }
+      trap cleanup_memory_on EXIT
       for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-      [ -S "$sock" ] || { echo "ERROR: memory-on daemon did not bind for $id run $run" >&2; kill "$dpid" 2>/dev/null || true; exit 1; }
+      [ -S "$sock" ] || { echo "ERROR: memory-on daemon did not bind for $id run $run" >&2; exit 1; }
       if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
       # (auto-capture mode: a plant session would run here — wired with dimension B.)
       score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
-      kill "$dpid" 2>/dev/null || true
     )
     rm -rf "$sockdir" 2>/dev/null || true
 

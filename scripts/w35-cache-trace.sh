@@ -74,7 +74,7 @@ usage() { sed -n '2,46p' "$0"; exit 2; }
 extract_usage() {
   local log="$1"
   local r is_err turns cost inp cc cr out
-  r="$(jq -c 'select(.type=="result")' "$log" 2>/dev/null | tail -1)"
+  r="$(jq -c 'select(.type=="result")' "$log" 2>/dev/null | tail -1 || true)"
   if [ -n "$r" ]; then
     # `// true` would collapse an explicit false (jq's alt treats false as
     # empty), so gate on field presence: absent is_error => assume error.
@@ -233,6 +233,10 @@ self_test() {
   want=$'true\t'"$TURNS_FAIL_SENTINEL"$'\t0\t0\t0\t0\t0'
   if [ "$got" = "$want" ]; then echo "ok: extract_usage sentinel on empty log"; else echo "BUG: extract_usage empty (want [$want] got [$got])"; fail=1; fi
 
+  printf '{"type":"result","is_error":false\n' > "$tmp/bad.jsonl"
+  got="$(extract_usage "$tmp/bad.jsonl")"
+  if [ "$got" = "$want" ]; then echo "ok: extract_usage sentinel on malformed log"; else echo "BUG: extract_usage malformed (want [$want] got [$got])"; fail=1; fi
+
   # --- judge_text (parity smoke with w35-ab-eval; one case per branch). ---
   printf 'use the ureq crate\n' > "$tmp/n.txt"
   printf 'use reqwest\n'        > "$tmp/old.txt"
@@ -251,7 +255,7 @@ self_test() {
     printf 's1\tmemory-off\t50\t1\t0\t5\t0.01\t6000\t0\t0\t100\t0\tfalse\n'
   } > "$tsv"
   local verdict
-  verdict="$(aggregate "$tsv" 0 2>/dev/null | grep -F -A1 -- 'corpus 50' | tail -1)"
+  verdict="$(aggregate "$tsv" 0 2>/dev/null | grep -F -A1 -- 'corpus 50' | tail -1 || true)"
   if printf '%s' "$verdict" | grep -qF "RATIFY Opt 3"; then echo "ok: ratify Opt 3 when acc+cost within bounds"; else echo "BUG: ratify verdict (got [$verdict])"; fail=1; fi
 
   # --- aggregate: ADR-3 threshold 2 (Opt 2 candidate) — total_cost_usd > 20% worse. ---
@@ -262,7 +266,7 @@ self_test() {
     printf 's1\trealistic-baseline\t500\t1\t0\t5\t0.02\t100\t4000\t9900\t100\t0\tfalse\n'
     printf 's1\tmemory-off\t500\t1\t0\t5\t0.01\t10000\t0\t0\t100\t0\tfalse\n'
   } > "$tsv2"
-  verdict="$(aggregate "$tsv2" 0 2>/dev/null | grep -F -A1 -- 'corpus 500' | tail -1)"
+  verdict="$(aggregate "$tsv2" 0 2>/dev/null | grep -F -A1 -- 'corpus 500' | tail -1 || true)"
   if printf '%s' "$verdict" | grep -qF "Opt 2 candidate"; then echo "ok: Opt 2 candidate when cost > 20% worse"; else echo "BUG: opt2 verdict (got [$verdict])"; fail=1; fi
 
   # --- aggregate: a memory-induced error fails the hard gate. ---
@@ -494,11 +498,12 @@ run_cell() { # <id> <run> <corpus> <plant> <claude_md> <work> <expect> <forbid> 
   # Short /tmp socket dir (a long $WORKROOT path can exceed macOS's ~104-byte
   # sun_path limit — the nightly-claude-smoke.sh socket-length note).
   local mbase="$base/on"
-  local sockdir; sockdir="$(mktemp -d "/tmp/rbp4a.XXXXXX")"
-  local sock="$sockdir/s" db="$base/on/memory.db" ns="rb-p4a-$id-c${corpus}-r$run"
+  local db="$base/on/memory.db" ns="rb-p4a-$id-c${corpus}-r$run"
   local wh="$mbase/home" wp="$mbase/proj"
   seed_home "$wh"; mkdir -p "$wp"
   install_rusty_brain "$wh" "$wp"
+  local sockdir; sockdir="$(mktemp -d "/tmp/rbp4a.XXXXXX")"
+  local sock="$sockdir/s"
   # Confound strip (fairness, same as w35-ab-eval): remove the installer's
   # "recall before work" CLAUDE.md block + skill so the WORK session gets the
   # target ONLY through the deterministic UserPromptSubmit recall injection.
@@ -511,6 +516,14 @@ run_cell() { # <id> <run> <corpus> <plant> <claude_md> <work> <expect> <forbid> 
     # the PLANTED store. Without this export, recall would hit the empty default
     # store and memory-on would silently run without memory — the exact
     # invalidity the redesign warns about. Mirrors w35-ab-eval.sh.
+    # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
+    cleanup_memory_on() {
+      if [ -f "$sock.pid" ]; then
+        kill "$(cat "$sock.pid" 2>/dev/null)" 2>/dev/null || true
+      fi
+      rm -rf "$sockdir" 2>/dev/null || true
+    }
+    trap cleanup_memory_on EXIT
     export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
     plant_corpus "$plant" "$id" "$n"
     # The first remember must have auto-started the daemon (pidfile = socket.pid).
@@ -519,8 +532,6 @@ run_cell() { # <id> <run> <corpus> <plant> <claude_md> <work> <expect> <forbid> 
     [ -f "$sock.pid" ] || { echo "ERROR: memory-on daemon did not auto-start for $id c=$corpus run $run" >&2; exit 1; }
     score_work "$id" "memory-on" "$corpus" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
   )
-  [ -f "$sock.pid" ] && kill "$(cat "$sock.pid" 2>/dev/null)" 2>/dev/null || true
-  rm -rf "$sockdir" 2>/dev/null || true
 
   # --- arm: steelman-baseline (target + distractors in CLAUDE.md) ------------
   local sh="$base/stl/home" sp="$base/stl/proj"
