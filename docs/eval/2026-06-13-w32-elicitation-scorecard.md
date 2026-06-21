@@ -88,8 +88,8 @@ appears in the model's response).
 ## Notes / honesty
 
 - This is a **behavioral** scorecard (does the model use memory?), complementary
-  to the W3.1 decision-grade **content** rubric and the W3.5 A/B **outcome**
-  eval. None alone is sufficient; §13/§10 require all three tracked per release.
+  to the W3.1 decision-grade **content** rubric and the W3.5 memory-value
+  **outcome** scorecard. None alone is sufficient; §13/§10 require all three tracked per release.
 - The measured run is **not** part of per-PR CI (it is nondeterministic and costs
   API spend). It belongs with the W3.5 nightly arm. Until it runs, the Phase-3
   gate's "elicitation scorecard passes" clause is **owed**, not met — recorded

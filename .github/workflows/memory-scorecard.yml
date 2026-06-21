@@ -6,7 +6,7 @@
 # docs/eval/2026-06-16-w35-criterion-redesign.md.
 #
 # Uploads a structured TSV (dimension/scenario/arm/run/success/turns/mie — counts
-# + booleans, no model free-text), same artifact posture as w35-ab-eval.yml.
+# + booleans, no model free-text) — a CI-safe artifact with no leaked-secret surface.
 #
 # Required repository secret:
 #   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.

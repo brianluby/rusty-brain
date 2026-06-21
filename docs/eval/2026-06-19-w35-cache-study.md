@@ -1,6 +1,15 @@
-# W3.5 prompt-caching study — measuring cached vs uncached input (dimension A)
+# W3.5 prompt-caching study — measuring cached vs uncached input (dimension A) — RETIRED
 
-- **Status:** proposed (investigation + ADR-3; harness instrumentation landed, measured run deferred — no API key / spend in the landing environment, per the repo's land-harness-first convention).
+> **RETIRED 2026-06-21.** The P4a trace/cache instrumentation this study describes
+> (`scripts/w35-trace-tools.sh`, `scripts/w35-cache-trace.sh`, and their workflows)
+> was **removed** in the W3.5 A/B gate cutover. The cache-economics methodology
+> recorded here (ADR-3: score dimension A on `total_cost_usd` + accuracy, never raw
+> input tokens) is kept as a record and folds into the dimension-A runner if/when it
+> is built on the memory-value scorecard scaffold
+> ([`2026-06-16-w35-criterion-redesign.md`](2026-06-16-w35-criterion-redesign.md)).
+> File paths below no longer exist.
+
+- **Status:** **RETIRED** (instrumentation removed in the gate cutover; ADR-3 methodology kept as a record). Originally: proposed (investigation + ADR-3; harness landed, measured run deferred).
 - **Date:** 2026-06-19.
 - **Scope:** resolves the open question that gates dimension **A — Retrieval at scale** in the criterion redesign (`docs/eval/2026-06-16-w35-criterion-redesign.md`, "A only after the caching question is resolved"). This is P4a of the redesign build sequence.
 - **Companion harness:** `scripts/w35-trace-tools.sh` (extended: four `tok_*` columns + `aggregate_cache` + `--self-test`).
@@ -112,7 +121,9 @@ runner inherits it rather than retrofitting.
   mislead.
 - Model/TTL-specific cache-pricing for the `0.1` constant (haiku placeholder).
 
-## Harness change (landed)
+## Harness change (landed — then removed in the 2026-06-21 cutover)
+
+*(Historical: the harness below was deleted in the gate cutover; described in past sense.)*
 
 - `emit_row` appends `tok_in`, `tok_cache_create`, `tok_cache_read`, `tok_out`
   (session sums from `.message.usage`), via a pure `sum_usage` helper.
@@ -123,10 +134,10 @@ runner inherits it rather than retrofitting.
 - No protocol/contract change, no binary change. Output remains model-free-text
   free (token counts + tool names only), so it stays a safe CI artifact.
 
-## Validation for this step
+## Validation for this step (historical — the script below was removed in the 2026-06-21 cutover)
 
 ```
-scripts/w35-trace-tools.sh --self-test   # PASS, no API
+scripts/w35-trace-tools.sh --self-test   # PASS, no API (script since removed)
 ```
 
 ## Open questions for the measured run
