@@ -413,10 +413,19 @@ run_scenario() { # row
     install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     (
+      # Put the built binary FIRST on PATH (as run_session/install/plant_explicit
+      # do): a stray `rusty-brain` elsewhere on PATH would otherwise shadow it and
+      # the daemon launch fails with "unrecognized subcommand 'serve'".
+      export PATH="$BIN_DIR:$PATH"
       export RUSTY_BRAIN_SOCKET="$sock" RUSTY_BRAIN_DB="$db" RUSTY_BRAIN_NAMESPACE="$ns"
       # Start a daemon for the store and WAIT for the socket to bind before
-      # planting (a fixed sleep races the bind — observed flaky).
-      rusty-brain serve >/dev/null 2>&1 &
+      # planting (a fixed sleep races the bind — observed flaky). Capture the
+      # daemon's output: a fail-closed bind gate with the output discarded turns
+      # every failure into an unactionable "did not bind". It carries no secrets
+      # (the daemon never receives ANTHROPIC_API_KEY) and is printed only on a
+      # bind failure.
+      derr="$sockdir/daemon.log"
+      rusty-brain serve >"$derr" 2>&1 &
       dpid=$!
       # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
       cleanup_memory_on() {
@@ -424,8 +433,23 @@ run_scenario() { # row
         rm -rf "$sockdir" 2>/dev/null || true
       }
       trap cleanup_memory_on EXIT
-      for _ in $(seq 1 50); do [ -S "$sock" ] && break; sleep 0.2; done
-      [ -S "$sock" ] || { echo "ERROR: memory-on daemon did not bind for $id run $run" >&2; exit 1; }
+      # Poll up to 10s for the bind (normally <1s), but break the instant the
+      # daemon process dies so a startup crash (e.g. a wrong binary that lacks
+      # the `serve` subcommand) fails fast with its captured output, instead of
+      # waiting out the whole budget on a process that already exited.
+      bound=""
+      for _ in $(seq 1 50); do
+        if [ -S "$sock" ]; then bound=1; break; fi
+        kill -0 "$dpid" 2>/dev/null || break
+        sleep 0.2
+      done
+      if [ -z "$bound" ]; then
+        echo "ERROR: memory-on daemon did not bind for $id run $run (daemon alive=$(kill -0 "$dpid" 2>/dev/null && echo yes || echo no))" >&2
+        echo "----- daemon output (rusty-brain serve) -----" >&2
+        cat "$derr" >&2 2>/dev/null || true
+        echo "----- end daemon output -----" >&2
+        exit 1
+      fi
       if [ "$plant_mode" = "explicit" ]; then plant_explicit "$wh" "$facts"; fi
       # (auto-capture mode: a plant session would run here — wired with dimension B.)
       score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
