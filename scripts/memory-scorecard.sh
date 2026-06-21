@@ -93,7 +93,11 @@ PY
 # output_tokens} — the cache economics ADR-3 needs; see docs/eval/2026-06-19-*).
 # A non-parseable log (timeout/error/budget) yields a worst-case sentinel row and
 # is_error=true, so a failed session can never look like cheap successful caching.
-# (Verbatim shape from scripts/w35-cache-trace.sh's extract_usage.)
+# A PARSEABLE result that is itself an error (is_error=true — e.g. budget
+# exceeded) also gets the worst-case turns sentinel, so a failure never lowers an
+# arm's med_turns regardless of how it failed. (Shape from
+# scripts/w35-cache-trace.sh's extract_usage; the scorecard adds the parseable-
+# error turns sentinel.)
 extract_usage() {
   local log="$1"
   local r is_err turns cost inp cc cr out
@@ -108,6 +112,9 @@ extract_usage() {
     cc="$(jq -r    '.usage.cache_creation_input_tokens // 0' <<<"$r")"
     cr="$(jq -r    '.usage.cache_read_input_tokens // 0'     <<<"$r")"
     out="$(jq -r   '.usage.output_tokens // 0' <<<"$r")"
+    # A parseable but errored result must not report a low turn count (absent/0
+    # num_turns) that undercuts the sentinel contract — force the sentinel.
+    [ "$is_err" = "true" ] && turns="$TURNS_FAIL_SENTINEL"
   else
     is_err=true; turns="$TURNS_FAIL_SENTINEL"; cost=0; inp=0; cc=0; cr=0; out=0
   fi
@@ -183,6 +190,11 @@ aggregate_scorecard() {
       n[key]++; s[key]+=succ;
       co[key]+=cost; ci_in[key]+=inp; ci_cc[key]+=cc; ci_cr[key]+=cr;
       if (is_err == "true") err[key]++;
+      # Track per-RUN cost collapse: a non-errored run with zero/absent
+      # total_cost_usd. The mean can stay positive while one run collapsed the
+      # cost axis, so the ADR-3 verdict must fail closed on ANY such run, not
+      # just an all-zero mean.
+      if (is_err != "true" && cost + 0 <= 0) bad_cost[key]++;
       tk = key SUBSEP n[key]; tv[tk] = turns;
       dims[dim]=1;
       if (arm=="memory-on" && mie==1) { mie_total++; mie_list = mie_list sprintf("    - %s / %s run %s\n", dim, $2, $4) }
@@ -253,13 +265,13 @@ aggregate_scorecard() {
           printf "  -> retrieval_scale: SKIP cost verdict (memory-on or steelman-baseline produced no runs)\n";
         } else if (err[onk]+err[stl] > 0) {
           printf "  -> retrieval_scale: SKIP cost verdict (session errors in memory-on or steelman-baseline)\n";
-        } else if (on_cost <= 0 || stl_cost <= 0) {
-          # FAIL CLOSED: total_cost_usd is the load-bearing ADR-3 cost axis. A
-          # zero/absent cost on a NON-errored session (e.g. a claude build that
-          # omits total_cost_usd, or the `// 0` parse fallback firing) must never
-          # read as a passing 0-vs-0 comparison — it would silently RATIFY off a
-          # collapsed cost axis. Treat it as invalid data and skip the verdict.
-          printf "  -> retrieval_scale: SKIP cost verdict (zero/absent total_cost_usd on a non-errored cell — verify the result-record usage path)\n";
+        } else if (bad_cost[onk] + bad_cost[stl] > 0) {
+          # FAIL CLOSED: total_cost_usd is the load-bearing ADR-3 cost axis. ANY
+          # non-errored run with zero/absent cost (a claude build that omits
+          # total_cost_usd, or the `// 0` parse fallback firing) collapses the
+          # axis — and a positive mean from the other runs would still let it
+          # RATIFY. Skip the verdict whenever either arm has even one such run.
+          printf "  -> retrieval_scale: SKIP cost verdict (zero/absent total_cost_usd on a non-errored run — verify the result-record usage path)\n";
         } else {
           on_acc=rate[onk]; stl_acc=rate[stl];
           # acc floor: both arms must land the buried fact at least once, else a
@@ -344,6 +356,10 @@ self_test() {
   check "extract_usage reads aggregate cache fields" "$(printf 'false\t2\t0.0123\t1560\t4000\t5400\t160')" "$(extract_usage "$elog")"
   : > "$tmp/empty.jsonl"
   check "extract_usage sentinel on empty log" "$(printf 'true\t%s\t0\t0\t0\t0\t0' "$TURNS_FAIL_SENTINEL")" "$(extract_usage "$tmp/empty.jsonl")"
+  # A PARSEABLE result that is itself an error gets the worst-case turns sentinel
+  # (not its own low/absent num_turns), so a failure never lowers med_turns.
+  printf '{"type":"result","is_error":true,"num_turns":1,"total_cost_usd":0,"usage":{}}\n' > "$tmp/error-result.jsonl"
+  check "extract_usage sentinel on parseable error result" "$(printf 'true\t%s\t0\t0\t0\t0\t0' "$TURNS_FAIL_SENTINEL")" "$(extract_usage "$tmp/error-result.jsonl")"
 
   # Scorecard fixtures below have N=1 per arm; pass min_runs=1 (3rd arg) so they
   # still gate/verdict. The directional behavior is exercised separately.
@@ -440,6 +456,22 @@ self_test() {
   local zout; zout="$(aggregate_scorecard "$zcost" 0.10 1)"
   if printf '%s' "$zout" | grep -qF 'SKIP cost verdict (zero/absent total_cost_usd'; then echo "ok: ADR-3 fails closed on zero/absent cost (non-errored)"; else echo "BUG: ADR-3 zero-cost skip"; printf '%s\n' "$zout"; fail=1; fi
   if printf '%s' "$zout" | grep -qF 'RATIFY Opt 3'; then echo "BUG: ADR-3 ratified a zero-cost cell"; fail=1; else echo "ok: ADR-3 does not ratify a zero-cost cell"; fi
+
+  # ADR-3 fail-closed must catch a PARTIAL collapse too: one non-errored run with
+  # cost=0 among positive runs keeps the MEAN positive, yet the per-run guard must
+  # still SKIP (the mean-only check would have wrongly RATIFIED here).
+  local pcost="$tmp/pcost.tsv"
+  {
+    sc_row retrieval_scale a1 memory-on          1 1 3 0 0.02 600  4000 4400 100 false
+    sc_row retrieval_scale a1 memory-on          2 1 3 0 0    600  4000 4400 100 false
+    sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 300  4000 8700 100 false
+    sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 300  4000 8700 100 false
+    sc_row retrieval_scale a1 steelman-baseline  2 1 3 0 0.02 300  4000 8700 100 false
+    sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 6000 0    0    100 false
+  } > "$pcost"
+  local pout; pout="$(aggregate_scorecard "$pcost" 0.10 1)"
+  if printf '%s' "$pout" | grep -qF 'SKIP cost verdict (zero/absent total_cost_usd'; then echo "ok: ADR-3 fails closed on a PARTIAL zero-cost run (mean stays positive)"; else echo "BUG: ADR-3 partial zero-cost skip"; printf '%s\n' "$pout"; fail=1; fi
+  if printf '%s' "$pout" | grep -qF 'RATIFY Opt 3'; then echo "BUG: ADR-3 ratified despite a partial zero-cost run"; fail=1; else echo "ok: ADR-3 does not ratify with a partial zero-cost run"; fi
 
   # IQR: turns {1,2,3,4,5} => median 3.0 [Q1 2.0, Q3 4.0].
   local iqr="$tmp/iqr.tsv"
