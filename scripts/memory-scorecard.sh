@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2030,SC2031
 # Memory-value scorecard harness (W3.5 criterion redesign; see
-# docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to
-# scripts/w35-ab-eval.sh's single-fact gate. Instead of "memory-on beats one
+# docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to the retired
+# W3.5 A/B single-fact gate. Instead of "memory-on beats one
 # CLAUDE.md baseline on one fact", it scores memory on the axes where it
 # STRUCTURALLY differs from a hand-maintained file, against TWO baselines so a
 # win cannot come from re-rigging the eval toward memory:
@@ -361,11 +361,11 @@ score_session() { # dim id arm run proj home work expect forbid stale
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array
-# order, isolating retrieval from the lossy auto-capture path. NOTE: storing a
-# SUPERSEDED state (Class C: X later replaced by X') is NOT yet expressible here —
-# the CLI has no `remember --supersedes` (supersede lives only in the engine's
-# remember_superseding, exercised by the hook). Class C must add that CLI flag, or
-# construct the superseded state via `remember --supersedes`.
+# order, isolating retrieval from the lossy auto-capture path. A SUPERSEDED state
+# (Class C: X later replaced by X') is expressed with `rusty-brain remember
+# --supersedes <prior-id>` (cli.rs -> client.remember_superseding -> the engine's
+# atomic supersede — the same path the SessionEnd hook uses); plant_explicit below
+# threads the prior memory's id to drive it.
 #
 # Each fact: { content, supersedes_prev? }. Facts store in array order; a fact with
 # `supersedes_prev: true` is stored as a SUPERSEDING update of the immediately
@@ -449,7 +449,7 @@ run_scenario() { # row
 }
 
 echo "== memory-value scorecard (model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
-# Read ALL scenarios into an array BEFORE running any (mirrors w35-ab-eval.sh): a
+# Read ALL scenarios into an array BEFORE running any (not streamed): a
 # streaming `while read < <(jq)` shares fd 0 with the loop body, and a body
 # command that consumes stdin (claude -p) would eat the remaining scenario lines.
 scenario_rows=()
