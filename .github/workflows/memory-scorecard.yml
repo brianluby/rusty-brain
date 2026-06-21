@@ -1,21 +1,29 @@
-# Memory-value scorecard (W3.5 criterion redesign; manual dispatch only; NEVER
-# gates PRs). Drives scripts/memory-scorecard.sh: for each scenario it runs four
-# arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and scores
-# the dimension (memory-on must BEAT the realistic baseline AND TIE the steelman),
-# with the only hard gate being zero memory-induced errors. See
-# docs/eval/2026-06-16-w35-criterion-redesign.md.
+# Memory-value scorecard (W3.5 criterion redesign). Drives
+# scripts/memory-scorecard.sh: for each scenario it runs four arms (memory-on,
+# realistic-baseline, steelman-baseline, memory-off) and scores the dimension
+# (memory-on must BEAT the realistic baseline AND TIE the steelman), with the only
+# hard gate being zero memory-induced errors. See
+# docs/eval/2026-06-16-w35-criterion-redesign.md, and the measured Class C
+# (Freshness) baseline in docs/eval/2026-06-21-w35-class-c-freshness-measured.md.
+#
+# ALLOWED TO FAIL, WITH ALERTING: scheduled weekly (plus manual dispatch); NEVER
+# gates PRs (it is nondeterministic and costs API spend). On failure it opens or
+# comments on a pinned issue titled "weekly memory scorecard failing"; on success
+# it closes that issue if open. Same posture as w35-ab-eval.yml.
 #
 # Uploads a structured TSV (dimension/scenario/arm/run/success/turns/mie — counts
-# + booleans, no model free-text), same artifact posture as w35-ab-eval.yml.
+# + booleans, no model free-text).
 #
 # Required repository secret:
 #   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.
 #   A run is (scenarios x 4 arms x N) sessions; the per-session cap bounds spend.
-#   Per the variance protocol (P3) a single run never gates — dispatch N>=5 for a
-#   real read; use N=1 first as a cheap plumbing smoke.
+#   Per the variance protocol (P3) a single run never gates — the scheduled run
+#   uses N=5 for a real read; dispatch N=1 for a cheap plumbing smoke.
 name: memory scorecard
 
 on:
+  schedule:
+    - cron: "11 10 * * 1" # weekly (Mondays 10:11 UTC), offset from the nightly evals
   workflow_dispatch:
     inputs:
       runs:
@@ -37,6 +45,7 @@ jobs:
     timeout-minutes: 150
     permissions:
       contents: read
+      issues: write # open/update/close the alert issue
     steps:
       - name: Preflight - require the ANTHROPIC_API_KEY secret
         env:
@@ -89,3 +98,39 @@ jobs:
           name: memory-scorecard-report
           path: ${{ runner.temp }}/memory-scorecard.tsv
           if-no-files-found: ignore
+
+      - name: Open or update the alert issue on failure
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          title="weekly memory scorecard failing"
+          body="Weekly memory-value scorecard failed: ${RUN_URL} (W3.5 scorecard, allowed-to-fail; see .github/workflows/memory-scorecard.yml)."
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,title \
+            --jq '[.[] | select(.title == "weekly memory scorecard failing")][0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue comment "$number" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            url="$(gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body")"
+            number="${url##*/}"
+            gh issue pin "$number" --repo "$GITHUB_REPOSITORY" \
+              || echo "could not pin issue #$number; it is open and titled '$title'"
+          fi
+
+      - name: Close the alert issue on success
+        if: success()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          number="$(gh issue list --repo "$GITHUB_REPOSITORY" --state open \
+            --json number,title \
+            --jq '[.[] | select(.title == "weekly memory scorecard failing")][0].number // empty')"
+          if [ -n "$number" ]; then
+            gh issue close "$number" --repo "$GITHUB_REPOSITORY" \
+              --comment "Recovered: ${RUN_URL}"
+          fi
