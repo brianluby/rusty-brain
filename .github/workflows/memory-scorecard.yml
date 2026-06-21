@@ -2,11 +2,14 @@
 # gates PRs). Drives scripts/memory-scorecard.sh: for each scenario it runs four
 # arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and scores
 # the dimension (memory-on must BEAT the realistic baseline AND TIE the steelman),
-# with the only hard gate being zero memory-induced errors. See
-# docs/eval/2026-06-16-w35-criterion-redesign.md.
+# with the only hard gate being zero memory-induced errors. Covers freshness
+# (Class C) and retrieval@scale (Class A: a buried target among 500+ explicitly
+# planted distractors, scored on accuracy + total_cost_usd per ADR-3). See
+# docs/eval/2026-06-16-w35-criterion-redesign.md and docs/eval/2026-06-19-*.
 #
-# Uploads a structured TSV (dimension/scenario/arm/run/success/turns/mie — counts
-# + booleans, no model free-text), same artifact posture as w35-ab-eval.yml.
+# Uploads a structured 13-field TSV (dimension/scenario/arm/run/success/turns/mie/
+# cost/tok_in/tok_cc/tok_cr/tok_out/is_error — counts, costs + booleans, no model
+# free-text), same artifact posture as w35-ab-eval.yml.
 #
 # Required repository secret:
 #   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.

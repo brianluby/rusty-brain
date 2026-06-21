@@ -5,6 +5,30 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Class A retrieval@scale scorecard + bulk remember
+
+- **`rusty-brain remember --batch`**: read one fact per line from stdin and store
+  them all over a SINGLE daemon connection (the `--type`/`--importance`/`--tags`/
+  `--context` flags apply uniformly; blank lines are skipped; incompatible with a
+  positional content arg and with `--supersedes`). At 500+ facts a per-fact CLI
+  call is dominated by process spawn + handshake (the embed is the cheap
+  deterministic fallback), so reusing one connection is the win.
+- **Retrieval@scale (Class A) in the memory-value scorecard**: new
+  `retrieval_scale` scenarios in `crates/rb-eval/scorecard/memory_scorecard_scenarios.json`
+  bury one explicitly-planted target (importance 8) under `corpus_size` (500/500/
+  1000) deterministic off-topic distractors — bulk-planted into memory-on via
+  `remember --batch`, and written into both baselines' CLAUDE.md (steelman:
+  target + distractors; realistic: distractors only). Accuracy on the buried fact
+  is primary.
+- **ADR-3 token/cost reporting in the scorecard** (`scripts/memory-scorecard.sh`):
+  every session now runs under `--output-format stream-json --verbose`; the TSV
+  grew to 13 fields with `total_cost_usd` + the four cache buckets, the per-arm
+  table gained a `mcost$` column, and the `retrieval_scale` dimension prints an
+  ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 /
+  descope verdict comparing memory-on vs steelman on accuracy AND `total_cost_usd`
+  within 20%). All exercised by `--self-test` (no API); the measured run stays
+  deferred on a key + spend. See docs/eval/2026-06-19-w35-cache-study.md.
+
 ### Added — C1 user config file (W0.2 carryover)
 
 - **`~/.config/rusty-brain/config.toml`** (or under `$XDG_CONFIG_HOME`):

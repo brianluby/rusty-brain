@@ -149,6 +149,16 @@ scorecard so the headline value is not silently dropped.
   four `tok_*` buckets are surfaced diagnostically via `scripts/w35-trace-tools.sh`'s
   cache aggregate. The measured run (scale corpus + spend) stays deferred; the
   harness instrumentation + `--self-test` landed.
+- **Built (harness), 2026-06-21.** Dimension A is now instantiated in the unified
+  scorecard: `crates/rb-eval/scorecard/memory_scorecard_scenarios.json` carries
+  `retrieval_scale` scenarios (`corpus_size` 500+, one explicitly-planted target
+  at importance 8 buried under deterministically-generated off-topic distractors),
+  and `scripts/memory-scorecard.sh` scores every session under stream-json,
+  recording `total_cost_usd` + the four cache buckets and printing the ADR-3
+  per-dimension verdict (RATIFY Opt 3 / Opt 2 candidate / descope) — all exercised
+  by `--self-test` with no API. Distractors are bulk-planted via `rusty-brain
+  remember --batch` (one process for the whole corpus). The measured run (real
+  haiku sessions at N≥5) remains deferred on `ANTHROPIC_API_KEY` + spend.
 
 ### B — Capture fidelity (build third; expect it to be the hardest bar)
 
@@ -180,7 +190,8 @@ scorecard so the headline value is not silently dropped.
 3. **Validate** (first spend, small): `--self-test` → a 1-scenario smoke dispatch
    → the real C run at N ≥ 5. Read the scorecard.
 4. **A then B then R** (later, gated on the scaffold proving out in step 3), each
-   reusing the scaffold; A only after the caching question is resolved.
+   reusing the scaffold; A only after the caching question is resolved. **A's
+   harness landed 2026-06-21** (see §A "Built"); B and R remain.
 
 The scaffold (step 1), not Class C, is the real first deliverable — C is its
 first instance. Building C in isolation would bake a planting-mode and

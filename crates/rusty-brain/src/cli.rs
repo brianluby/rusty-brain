@@ -83,8 +83,11 @@ pub enum Command {
 
     /// Store a new memory.
     Remember {
-        /// Memory content (the body to remember).
-        content: String,
+        /// Memory content (the body to remember). Required UNLESS `--batch` is
+        /// set, in which case facts are read from stdin instead. (The
+        /// content-vs-batch conflict is declared once on `batch` below.)
+        #[arg(required_unless_present = "batch")]
+        content: Option<String>,
         /// Memory type (db string, e.g. `insight`, `bug_fix`).
         #[arg(long = "type", default_value = "insight", value_parser = parse_memory_type)]
         memory_type: MemoryType,
@@ -103,6 +106,15 @@ pub enum Command {
         /// is the UUID of the memory being replaced.
         #[arg(long)]
         supersedes: Option<String>,
+        /// Bulk mode: read one fact per line from stdin and store them all over
+        /// a SINGLE daemon connection. The `--type`/`--importance`/`--tags`/
+        /// `--context` flags apply uniformly to every fact; blank lines are
+        /// skipped. This avoids one process spawn + handshake per fact when
+        /// planting large corpora (e.g. retrieval-at-scale evals). Incompatible
+        /// with a positional content argument and with `--supersedes` (both
+        /// conflicts declared here).
+        #[arg(long, conflicts_with_all = ["supersedes", "content"])]
+        batch: bool,
     },
 
     /// Recall memories matching a query.
@@ -299,6 +311,61 @@ mod tests {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
         assert!(matches!(cli.command, Command::Subscribe { .. }));
+    }
+
+    #[test]
+    fn remember_batch_flag_parses_without_content() {
+        let cli = Cli::parse_from(["rusty-brain", "remember", "--batch", "--importance", "6"]);
+        match cli.command {
+            Command::Remember {
+                content,
+                batch,
+                importance,
+                ..
+            } => {
+                assert!(batch, "--batch must set the batch flag");
+                assert_eq!(
+                    content, None,
+                    "--batch reads facts from stdin, not a positional"
+                );
+                assert_eq!(importance, 6, "uniform --importance applies to the batch");
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remember_without_batch_keeps_content_required_and_optional_typed() {
+        // required_unless_present("batch"): no content AND no --batch => parse error
+        // (preserves the historical `remember` contract for a missing positional).
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "remember"]).is_err(),
+            "`remember` with neither content nor --batch must fail to parse"
+        );
+        // A bare positional still parses with batch defaulting off.
+        let cli = Cli::parse_from(["rusty-brain", "remember", "a fact"]);
+        match cli.command {
+            Command::Remember { content, batch, .. } => {
+                assert_eq!(content.as_deref(), Some("a fact"));
+                assert!(!batch, "--batch defaults off");
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remember_batch_conflicts_with_supersedes_and_content() {
+        // Bulk insert has no single prior, so --supersedes is meaningless with it.
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "remember", "--batch", "--supersedes", "x"])
+                .is_err(),
+            "--batch must conflict with --supersedes"
+        );
+        // A positional + --batch is ambiguous (stdin vs the positional).
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "remember", "a fact", "--batch"]).is_err(),
+            "--batch must conflict with a positional content argument"
+        );
     }
 
     #[test]
