@@ -105,6 +105,24 @@ asymmetry (above) means the choice of token metric is load-bearing.
 "token cost" axis means `total_cost_usd`. The harness change lands now so A's
 runner inherits it rather than retrofitting.
 
+**Methodology re-homed in the scorecard, 2026-06-21.** Although the trace/cache
+instrumentation above was retired in the gate cutover, the ADR-3 methodology it
+recorded was not lost — it now lives in the unified memory-value scorecard.
+`scripts/memory-scorecard.sh` runs every session under `--output-format
+stream-json --verbose`, records `total_cost_usd` + the four `tok_*` buckets into a
+13-field TSV, and for the `retrieval_scale` dimension prints the cache diagnostics
+(`cache%`, `ctx_vol` = in+cc+cr, `eff_in` = in+1.25·cc+0.1·cr) plus a SINGLE
+per-dimension RATIFY-Opt-3 / Opt-2 / descope verdict (memory-on vs steelman on
+accuracy AND `total_cost_usd` within 20%; the verdict fails closed — it SKIPs on
+session errors or zero/absent cost). The scorecard pools all `retrieval_scale`
+scenarios into one dimension cell (no per-corpus ladder — the retired prototype's
+corpus ladder did not carry over; cost is averaged across the corpus sizes). The
+Class A scenarios (`corpus_size` 500/500/1000) live in
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`; their 500+ distractors
+are bulk-planted via the new `rusty-brain remember --batch` (one process for the
+whole corpus). All of this is exercised by `--self-test` (no API); the measured
+run (real sessions at N≥5) stays deferred on a key + spend.
+
 **Deferred to the measured run (this is the "low spend" boundary).**
 
 - The `ANTHROPIC_API_KEY` repo secret + a small spend budget (the same one secret

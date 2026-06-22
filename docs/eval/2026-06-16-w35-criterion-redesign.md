@@ -36,10 +36,10 @@ every axis**:
 | freshness | already-current (stale-traps hand it the *updated* file) | docs go stale; memory auto-supersedes |
 | reach     | one machine, one developer                 | A's decision reaches B on another machine    |
 
-This document records the decisions for the redesigned eval. The shared scaffold +
-**Class C (Freshness)** have since landed (`scripts/memory-scorecard.sh`,
-`.github/workflows/memory-scorecard.yml`,
-`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`); dimensions A/B/R remain
+This document records the decisions for the redesigned eval. The shared scaffold,
+**Class C (Freshness)**, and the **Class A (Retrieval@scale)** harness have since
+landed (`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`); dimensions B/R remain
 per the build sequence in the last section.
 
 ## Decisions (ADRs)
@@ -155,9 +155,19 @@ scorecard so the headline value is not silently dropped.
   four `tok_*` cache buckets only diagnostically. The trace/cache instrumentation that
   prototyped this was **retired in the 2026-06-21 gate cutover** (its ADR-3 record is
   kept in the retired `docs/eval/2026-06-19-w35-cache-study.md` /
-  `docs/eval/2026-06-19-p4a-caching-study.md`); the methodology carries forward to the
-  dimension-A runner when it is built on this scaffold. The measured run (scale corpus
-  + spend) stays deferred.
+  `docs/eval/2026-06-19-p4a-caching-study.md`); the methodology now lives in the
+  dimension-A runner built directly on this scaffold (next bullet). The measured run
+  (scale corpus + spend) stays deferred.
+- **Built (harness), 2026-06-21.** Dimension A is now instantiated in the unified
+  scorecard: `crates/rb-eval/scorecard/memory_scorecard_scenarios.json` carries
+  `retrieval_scale` scenarios (`corpus_size` 500+, one explicitly-planted target
+  at importance 8 buried under deterministically-generated off-topic distractors),
+  and `scripts/memory-scorecard.sh` scores every session under stream-json,
+  recording `total_cost_usd` + the four cache buckets and printing the ADR-3
+  per-dimension verdict (RATIFY Opt 3 / Opt 2 candidate / descope) — all exercised
+  by `--self-test` with no API. Distractors are bulk-planted via `rusty-brain
+  remember --batch` (one process for the whole corpus). The measured run (real
+  haiku sessions at N≥5) remains deferred on `ANTHROPIC_API_KEY` + spend.
 
 ### B — Capture fidelity (build third; expect it to be the hardest bar)
 
@@ -190,7 +200,8 @@ scorecard so the headline value is not silently dropped.
 3. **Validate** (first spend, small): `--self-test` → a 1-scenario smoke dispatch
    → the real C run at N ≥ 5. Read the scorecard.
 4. **A then B then R** (later, gated on the scaffold proving out in step 3), each
-   reusing the scaffold; A only after the caching question is resolved.
+   reusing the scaffold; A only after the caching question is resolved. **A's
+   harness landed 2026-06-21** (see §A "Built"); B and R remain.
 
 The scaffold (step 1), not Class C, is the real first deliverable — C is its
 first instance. Building C in isolation would bake a planting-mode and

@@ -11,3 +11,4 @@ Cargo.lock.orig
 # Claude Code personal/local settings override (never committed; the committed
 # .claude/settings.json is the shared rusty-brain dogfood config / reference template).
 .claude/settings.local.json
+.worktrees

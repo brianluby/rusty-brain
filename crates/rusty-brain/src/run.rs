@@ -104,14 +104,72 @@ async fn run_client(
             context,
             tags,
             supersedes,
+            batch,
         } => {
             // CLI `remember` declares no explicit prior: the daemon applies the
             // 1.0 baseline (and an enricher may fill it).
-            let id = match supersedes {
-                Some(old) => {
-                    let old = parse_id(&old).context("--supersedes must be a memory UUID")?;
+            if batch {
+                // Bulk mode: one fact per stdin line, all stored over this single
+                // connection (clap guarantees no positional content / --supersedes
+                // here). Blank lines are skipped. Reusing one connection avoids a
+                // process spawn + handshake per fact when planting large corpora.
+                use tokio::io::AsyncBufReadExt as _;
+                let mut lines = tokio::io::BufReader::new(tokio::io::stdin()).lines();
+                let mut count: u64 = 0;
+                while let Some(line) = lines.next_line().await.context("reading --batch stdin")? {
+                    let fact = line.trim();
+                    if fact.is_empty() {
+                        continue;
+                    }
                     client
-                        .remember_superseding(
+                        .remember(
+                            fact.to_string(),
+                            context.clone(),
+                            memory_type,
+                            importance,
+                            Vec::new(),
+                            tags.clone(),
+                            Vec::new(),
+                            None,
+                        )
+                        .await
+                        .with_context(|| {
+                            format!("remember --batch failed at fact #{}", count + 1)
+                        })?;
+                    count += 1;
+                }
+                // Empty/all-blank stdin is a successful no-op (Unix-filter
+                // convention: exit 0), but warn on stderr so a mistaken
+                // `... | remember --batch` with no input is not silent.
+                if count == 0 {
+                    eprintln!(
+                        "warning: remember --batch read no facts from stdin (empty or all-blank input)"
+                    );
+                }
+                println!("{}", output::render_batch_remembered(count, json));
+            } else {
+                let content = content
+                    .context("remember requires a content argument unless --batch is set")?;
+                let id = match supersedes {
+                    Some(old) => {
+                        let old = parse_id(&old).context("--supersedes must be a memory UUID")?;
+                        client
+                            .remember_superseding(
+                                content,
+                                context,
+                                memory_type,
+                                importance,
+                                Vec::new(),
+                                tags,
+                                Vec::new(),
+                                None,
+                                old,
+                            )
+                            .await
+                            .context("remember --supersedes failed")?
+                    }
+                    None => client
+                        .remember(
                             content,
                             context,
                             memory_type,
@@ -120,26 +178,12 @@ async fn run_client(
                             tags,
                             Vec::new(),
                             None,
-                            old,
                         )
                         .await
-                        .context("remember --supersedes failed")?
-                }
-                None => client
-                    .remember(
-                        content,
-                        context,
-                        memory_type,
-                        importance,
-                        Vec::new(),
-                        tags,
-                        Vec::new(),
-                        None,
-                    )
-                    .await
-                    .context("remember failed")?,
-            };
-            println!("{}", output::render_remembered(&id, json));
+                        .context("remember failed")?,
+                };
+                println!("{}", output::render_remembered(&id, json));
+            }
         }
         Command::Recall {
             query,
