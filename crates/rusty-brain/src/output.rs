@@ -108,6 +108,16 @@ pub fn render_remembered(id: &rb_types::MemoryId, json: bool) -> String {
     }
 }
 
+/// Render a bulk-remember acknowledgement (`remember --batch`). json: an object
+/// `{ "count": <n> }`; human: `Remembered <n> memories`.
+pub fn render_batch_remembered(count: u64, json: bool) -> String {
+    if json {
+        format!("{{\"count\":{count}}}")
+    } else {
+        format!("Remembered {count} memories")
+    }
+}
+
 /// Render a successful update acknowledgement.
 pub fn render_updated(json: bool) -> String {
     if json {
@@ -324,6 +334,19 @@ mod tests {
         let out = render_notes(&notes, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed[0]["content"].as_str().unwrap(), "alpha");
+    }
+
+    #[test]
+    fn batch_remembered_renders_count_in_both_modes() {
+        assert_eq!(render_batch_remembered(3, true), "{\"count\":3}");
+        assert_eq!(render_batch_remembered(3, false), "Remembered 3 memories");
+        // A zero count still renders a valid, truthful object (empty-stdin no-op).
+        assert_eq!(render_batch_remembered(0, true), "{\"count\":0}");
+        assert_eq!(render_batch_remembered(0, false), "Remembered 0 memories");
+        // JSON mode is a parseable object carrying the inserted count.
+        let parsed: serde_json::Value =
+            serde_json::from_str(&render_batch_remembered(500, true)).unwrap();
+        assert_eq!(parsed["count"].as_u64().unwrap(), 500);
     }
 
     #[test]

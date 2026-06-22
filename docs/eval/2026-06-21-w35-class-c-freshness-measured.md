@@ -43,7 +43,7 @@ and a local live N=1.
 
 ## Result (N=10)
 
-```
+```text
 dimension   arm                 runs  success [95% CI]     med_turns [Q1-Q3]
 freshness   memory-on             40   100% [91.2-100.0]    1.0 [1.0-4.0]
 freshness   realistic-baseline    40     0% [0.0-8.8]       1.0 [1.0-3.0]

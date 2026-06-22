@@ -5,6 +5,30 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Class A retrieval@scale scorecard + bulk remember
+
+- **`rusty-brain remember --batch`**: read one fact per line from stdin and store
+  them all over a SINGLE daemon connection (the `--type`/`--importance`/`--tags`/
+  `--context` flags apply uniformly; blank lines are skipped; incompatible with a
+  positional content arg and with `--supersedes`). At 500+ facts a per-fact CLI
+  call is dominated by process spawn + handshake (the embed is the cheap
+  deterministic fallback), so reusing one connection is the win.
+- **Retrieval@scale (Class A) in the memory-value scorecard**: new
+  `retrieval_scale` scenarios in `crates/rb-eval/scorecard/memory_scorecard_scenarios.json`
+  bury one explicitly-planted target (importance 8) under `corpus_size` (500/500/
+  1000) deterministic off-topic distractors — bulk-planted into memory-on via
+  `remember --batch`, and written into both baselines' CLAUDE.md (steelman:
+  target + distractors; realistic: distractors only). Accuracy on the buried fact
+  is primary.
+- **ADR-3 token/cost reporting in the scorecard** (`scripts/memory-scorecard.sh`):
+  every session now runs under `--output-format stream-json --verbose`; the TSV
+  grew to 13 fields with `total_cost_usd` + the four cache buckets, the per-arm
+  table gained a `mcost$` column, and the `retrieval_scale` dimension prints an
+  ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 /
+  descope verdict comparing memory-on vs steelman on accuracy AND `total_cost_usd`
+  within 20%). All exercised by `--self-test` (no API); the measured run stays
+  deferred on a key + spend. See docs/eval/2026-06-19-w35-cache-study.md.
+
 ### Added — C1 user config file (W0.2 carryover)
 
 - **`~/.config/rusty-brain/config.toml`** (or under `$XDG_CONFIG_HOME`):
@@ -56,21 +80,6 @@ All notable changes to rusty-brain are documented here. The format is based on
 - **`scripts/install-agents.sh`**: places the `rusty-brain-hooks` and
   `rusty-brain-install` binaries alongside `rusty-brain` in `~/.local/bin`,
   `chmod +x`, with SHA-256 verification of each copy.
-
-### Added — W3.5 cache-trace instrumentation (P4a)
-
-- **`scripts/w35-trace-tools.sh`** now emits four `tok_*` columns
-  (`tok_in`, `tok_cache_create`, `tok_cache_read`, `tok_out`) summed from each
-  `assistant` event's `.message.usage`, plus a per-arm `aggregate_cache` table
-  (mean buckets + `mean_ctx_vol` and cache-weighted `mean_eff_in`). This is
-  the prompt-caching study for W3.5 dimension A — `total_cost_usd` is already
-  cache-adjusted, so the buckets are surfaced **diagnostically** (raw token
-  counts double-count cheap cache reads and must never be the cost axis).
-  **ADR-3** and the investigation live in
-  `docs/eval/2026-06-19-w35-cache-study.md`; the measured scale run stays
-  deferred (no API key/spend). New `--self-test` validates the token math +
-  aggregate with no API; `.github/workflows/w35-trace.yml` runs it on every
-  dispatch before spending.
 
 ### Notes
 

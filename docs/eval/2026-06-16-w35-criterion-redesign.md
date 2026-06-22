@@ -1,8 +1,12 @@
 # W3.5 A/B criterion redesign — from single-fact parity to a memory-value scorecard
 
-Status: **proposed** (decision record; supersedes the gate criterion in
-`docs/eval/2026-06-14-w35-ab-eval.md`, not the harness).
-Date: 2026-06-16.
+Status: **Accepted / active** (adopted 2026-06-21). This decision record supersedes
+the W3.5 A/B gate criterion in `docs/eval/2026-06-14-w35-ab-eval.md` (now retired)
+**and** its harness — the A/B harness, scenarios, and nightly workflow were removed
+in the gate cutover and replaced by the memory-value scorecard
+(`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`).
+Date: 2026-06-16 (accepted 2026-06-21).
 
 ## Why
 
@@ -32,8 +36,11 @@ every axis**:
 | freshness | already-current (stale-traps hand it the *updated* file) | docs go stale; memory auto-supersedes |
 | reach     | one machine, one developer                 | A's decision reaches B on another machine    |
 
-This document records the decisions for a redesigned eval. It does **not** change
-the harness yet; the build sequence is in the last section.
+This document records the decisions for the redesigned eval. The shared scaffold,
+**Class C (Freshness)**, and the **Class A (Retrieval@scale)** harness have since
+landed (`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`); dimensions B/R remain
+per the build sequence in the last section.
 
 ## Decisions (ADRs)
 
@@ -143,12 +150,24 @@ scorecard so the headline value is not silently dropped.
   and crank the corpus past comfortable context (500+ facts) so the retrieval
   edge — accuracy on a buried fact — actually bites. Token cost is the secondary
   axis; accuracy-at-scale is primary.
-- **Resolved (methodology), 2026-06-19 — see ADR-3 in
-  `docs/eval/2026-06-19-w35-cache-study.md`.** Score on `total_cost_usd`
-  (cache-adjusted by construction) + correctness, never raw input tokens; the
-  four `tok_*` buckets are surfaced diagnostically via `scripts/w35-trace-tools.sh`'s
-  cache aggregate. The measured run (scale corpus + spend) stays deferred; the
-  harness instrumentation + `--self-test` landed.
+- **Methodology resolved (2026-06-19; ADR-3).** Score on `total_cost_usd`
+  (cache-adjusted by construction) + correctness, never raw input tokens; report the
+  four `tok_*` cache buckets only diagnostically. The trace/cache instrumentation that
+  prototyped this was **retired in the 2026-06-21 gate cutover** (its ADR-3 record is
+  kept in the retired `docs/eval/2026-06-19-w35-cache-study.md` /
+  `docs/eval/2026-06-19-p4a-caching-study.md`); the methodology now lives in the
+  dimension-A runner built directly on this scaffold (next bullet). The measured run
+  (scale corpus + spend) stays deferred.
+- **Built (harness), 2026-06-21.** Dimension A is now instantiated in the unified
+  scorecard: `crates/rb-eval/scorecard/memory_scorecard_scenarios.json` carries
+  `retrieval_scale` scenarios (`corpus_size` 500+, one explicitly-planted target
+  at importance 8 buried under deterministically-generated off-topic distractors),
+  and `scripts/memory-scorecard.sh` scores every session under stream-json,
+  recording `total_cost_usd` + the four cache buckets and printing the ADR-3
+  per-dimension verdict (RATIFY Opt 3 / Opt 2 candidate / descope) — all exercised
+  by `--self-test` with no API. Distractors are bulk-planted via `rusty-brain
+  remember --batch` (one process for the whole corpus). The measured run (real
+  haiku sessions at N≥5) remains deferred on `ANTHROPIC_API_KEY` + spend.
 
 ### B — Capture fidelity (build third; expect it to be the hardest bar)
 
@@ -170,17 +189,19 @@ scorecard so the headline value is not silently dropped.
 
 ## Build sequence (this is the execution plan)
 
-0. **This doc** — lock the decisions (no code, no spend). ← current step.
+0. **This doc** — lock the decisions (no code, no spend). ✅ done.
 1. **Shared scaffold** (code, no spend): a `plant(mode = explicit | auto-capture)`
    primitive, the four-arm dual-baseline runner, the N-run variance aggregation,
    the scorecard + safety-only hard gate, and a `--self-test` (no API) for the
-   judge + aggregation math. Reuse `scripts/w35-ab-eval.sh`'s hermeticity.
+   judge + aggregation math. ✅ landed in `scripts/memory-scorecard.sh`, which carries
+   the hermetic-session pattern (isolated HOME + namespace, short /tmp socket, confound strip).
 2. **Class C** instantiated on the scaffold (no spend until run): explicit plant,
-   both baselines, thresholds pre-registered here.
+   both baselines, thresholds pre-registered here. ✅ landed (`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`).
 3. **Validate** (first spend, small): `--self-test` → a 1-scenario smoke dispatch
    → the real C run at N ≥ 5. Read the scorecard.
 4. **A then B then R** (later, gated on the scaffold proving out in step 3), each
-   reusing the scaffold; A only after the caching question is resolved.
+   reusing the scaffold; A only after the caching question is resolved. **A's
+   harness landed 2026-06-21** (see §A "Built"); B and R remain.
 
 The scaffold (step 1), not Class C, is the real first deliverable — C is its
 first instance. Building C in isolation would bake a planting-mode and

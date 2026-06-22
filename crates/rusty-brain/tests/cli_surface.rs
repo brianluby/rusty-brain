@@ -68,6 +68,15 @@ fn remember_rejects_out_of_range_importance() {
 }
 
 #[test]
+fn remember_help_shows_batch_flag() {
+    bin()
+        .args(["remember", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--batch"));
+}
+
+#[test]
 fn recall_help_shows_flags() {
     bin()
         .args(["recall", "--help"])

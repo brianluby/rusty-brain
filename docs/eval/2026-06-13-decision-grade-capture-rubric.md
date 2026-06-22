@@ -59,8 +59,8 @@ future session nothing it could not re-derive faster by looking at the repo.
 ## Notes
 
 - This is **self-grading against a known rubric**, which overfits; §13 requires
-  Phase-3 scorecards to also carry external evidence (the W3.5 A/B outcome eval,
-  fresh-eyes installs). Treat the 80% bar as necessary, not sufficient.
+  Phase-3 scorecards to also carry external evidence (the W3.5 memory-value
+  scorecard, fresh-eyes installs). Treat the 80% bar as necessary, not sufficient.
 - The heuristic summary builder (`rb-hooks/src/capture.rs::build_session_summary`)
   leads with **Goal** and **Decisions**; the daemon enricher (heuristic by
   default, LLM when configured) refines the stored `summary` field from that

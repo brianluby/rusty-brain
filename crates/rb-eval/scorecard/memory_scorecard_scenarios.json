@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail).",
+  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail). RETRIEVAL@SCALE (Class A, dimension `retrieval_scale`; redesign §A + ADR-3 in docs/eval/2026-06-19-*): one relevant fact buried among a large corpus. A scenario sets `corpus_size` to N (500+); the runner deterministically generates N OFF-TOPIC distractors (seeded by scenario id, fictional service ports — never colliding with an expect token) and (a) bulk-plants them into the memory-on store at importance 5 via `rusty-brain remember --batch` (one process for all N — a per-fact CLI call is dominated by process spawn at scale), under a single planted TARGET at importance 8; (b) writes them into BOTH baselines' CLAUDE.md so the buried target is the ONLY difference — `steelman_claude_md` holds the target + distractors (diligent human), `realistic_claude_md` is EMPTY so only distractors are written (the common 'nobody wrote it down' reality). Accuracy on the buried target is the PRIMARY axis; token cost is SECONDARY: every session runs under stream-json so the scorecard records total_cost_usd + the four cache buckets, and the `retrieval_scale` dimension prints an ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 / descope verdict comparing memory-on vs steelman on accuracy AND total_cost_usd within 20%). Class A plants no stale value, so it never contributes a memory-induced error; the hard gate stays zero MIE.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,
@@ -62,6 +62,45 @@
       "work": "I need to run the project's tests. What exact command should I use?",
       "expect": "nextest",
       "stale_token": "cargo test"
+    },
+    {
+      "id": "scale-http-buried",
+      "dimension": "retrieval_scale",
+      "plant_mode": "explicit",
+      "corpus_size": 500,
+      "plant": [
+        { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 8 }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest (we avoid pulling in an async runtime).",
+      "work": "Add a small helper that performs an HTTP GET to a JSON health endpoint and parses the `status` field. Name the HTTP crate it should use and show the dependency line.",
+      "expect": "ureq"
+    },
+    {
+      "id": "scale-id-type-buried",
+      "dimension": "retrieval_scale",
+      "plant_mode": "explicit",
+      "corpus_size": 500,
+      "plant": [
+        { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 8 }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Identifiers: entity ids are `Ulid` (lexicographically sortable), never Uuid or integer ids.",
+      "work": "Add a new `Order` struct that needs a unique id field. What type should the id field be?",
+      "expect": "ulid"
+    },
+    {
+      "id": "scale-wire-format-buried",
+      "dimension": "retrieval_scale",
+      "plant_mode": "explicit",
+      "corpus_size": 1000,
+      "plant": [
+        { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 8 }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",
+      "work": "Add serialization for a new `Envelope` message type that goes over our internal socket. Which serializer should it use?",
+      "expect": "rmp"
     }
   ]
 }
