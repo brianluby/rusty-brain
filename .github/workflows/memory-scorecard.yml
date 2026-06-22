@@ -9,7 +9,7 @@
 #
 # Uploads a structured 13-field TSV (dimension/scenario/arm/run/success/turns/mie/
 # cost/tok_in/tok_cc/tok_cr/tok_out/is_error — counts, costs + booleans, no model
-# free-text), same artifact posture as w35-ab-eval.yml.
+# free-text) — a CI-safe artifact with no leaked-secret surface.
 #
 # Required repository secret:
 #   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.

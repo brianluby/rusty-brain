@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2030,SC2031
 # Memory-value scorecard harness (W3.5 criterion redesign; see
-# docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to
-# scripts/w35-ab-eval.sh's single-fact gate. Instead of "memory-on beats one
+# docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to the retired
+# W3.5 A/B single-fact gate. Instead of "memory-on beats one
 # CLAUDE.md baseline on one fact", it scores memory on the axes where it
 # STRUCTURALLY differs from a hand-maintained file, against TWO baselines so a
 # win cannot come from re-rigging the eval toward memory:
@@ -71,7 +71,7 @@ judge_text() {
 # numbers) so they never accidentally contain an `expect`/`stale` token. Used by
 # the Class A (retrieval@scale) arms: planted into the memory-on store and written
 # into both baselines' CLAUDE.md so a buried target is the only thing that differs.
-# (Verbatim shape from scripts/w35-cache-trace.sh's gen_corpus.)
+# (Pattern carried from the retired P4a cache-trace prototype.)
 gen_corpus() {
   python3 - "$1" "$2" <<'PY'
 import sys, hashlib, random
@@ -95,9 +95,9 @@ PY
 # is_error=true, so a failed session can never look like cheap successful caching.
 # A PARSEABLE result that is itself an error (is_error=true — e.g. budget
 # exceeded) also gets the worst-case turns sentinel, so a failure never lowers an
-# arm's med_turns regardless of how it failed. (Shape from
-# scripts/w35-cache-trace.sh's extract_usage; the scorecard adds the parseable-
-# error turns sentinel.)
+# arm's med_turns regardless of how it failed. (Cache-token extraction was first
+# prototyped in the retired P4a cache-trace harness; the scorecard adds the
+# parseable-error turns sentinel.)
 extract_usage() {
   local log="$1"
   local r is_err turns cost inp cc cr out
@@ -630,10 +630,11 @@ score_session() { # dim id arm run proj home work expect forbid stale
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array
-# order, isolating retrieval from the lossy auto-capture path. The superseded
-# state (Class C: X later replaced by X') is constructed via `rusty-brain remember
-# --supersedes <id>`, which stores the replacement and archives the prior memory
-# in one atomic op (the same `supersedes` edge the SessionEnd hook exercises).
+# order, isolating retrieval from the lossy auto-capture path. A SUPERSEDED state
+# (Class C: X later replaced by X') is expressed with `rusty-brain remember
+# --supersedes <prior-id>` (cli.rs -> client.remember_superseding -> the engine's
+# atomic supersede — the same path the SessionEnd hook uses); plant_explicit below
+# threads the prior memory's id to drive it.
 #
 # Each fact: { content, importance?, supersedes_prev? }. Facts store in array
 # order at their `importance` (default 5); a fact with `supersedes_prev: true` is
@@ -753,7 +754,7 @@ run_scenario() { # row
 }
 
 echo "== memory-value scorecard (model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
-# Read ALL scenarios into an array BEFORE running any (mirrors w35-ab-eval.sh): a
+# Read ALL scenarios into an array BEFORE running any (not streamed): a
 # streaming `while read < <(jq)` shares fd 0 with the loop body, and a body
 # command that consumes stdin (claude -p) would eat the remaining scenario lines.
 scenario_rows=()

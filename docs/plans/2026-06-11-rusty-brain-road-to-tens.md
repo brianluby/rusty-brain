@@ -115,11 +115,11 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
 - **W3.2 Three-channel elicitation (ranked).** (a) **Deterministic recall**: a UserPromptSubmit hook (the event reaches the adapter today and is dropped as `Other`) runs recall on the user's prompt and injects top-k under a token budget via `additionalContext` — recall stops depending on the model electing to call a tool; (b) **policy**: the installer optionally appends a 4–6 line memory-policy block to project CLAUDE.md, and/or ships a skill; (c) **tool surface**: trigger-condition descriptions ("Use when the user states a decision, preference, or constraint…") + MCP `instructions` (cheap; currently omitted from initialize). Installer adds `permissions.allow` entries for `mcp__rusty-brain__*` — without allowlisting, every unprompted call stalls on an approval prompt. Channel ranking validated by the W3.5 transcript metrics. **Elicitation scorecard**: K≥10 scripted sessions where the user states a decision with no mention of memory; pass = remember fires in ≥70%, recall-before-work in ≥50%; tracked per release. *(F52)*
 - **W3.3 Token economy.** Projection implemented **exclusively in rb-mcp's `response_to_content`** (the wire Response and CLI `--json` keep the full shape — no CONTRACT_VERSION bump; rb-eval is unaffected). Render recall/list/context as markdown, one line per result: `N. [type, imp 8, 3d ago] summary-or-first-200-chars (id 1a2b3c)` + `⚠ contested` marker; age is decision-critical and was missing from the draft's 7-field projection; score bucketed or omitted; full JSON only as optional structuredContent. SessionStart injection is **source-aware** (full digest on `startup`; nothing on `resume`; constraints-only after `compact`), budget ≤600 tokens / ≤10 items, preferring constraint + architecture_decision at importance ≥8, with the W2.5 framing and a "use recall for older decisions" pointer. Default MCP toolset shrinks to remember/recall/get/context (+update); poll_changes/graph/delete/list behind `RB_MCP_FULL_TOOLSET`. **Token-accounting CI test**: tokenize the actual tools/list + instructions + injection payloads; fail above 900/150/600. *(F53, F56)*
 - **W3.4 Fixture harness.** Recorded real Claude Code settings.json + hook payloads (started in W0.7) expanded to full session-lifecycle coverage on macOS + Linux; the empty-corpus first-session scenario; the W2.5 injection drill lives here.
-- **W3.5 A/B outcome eval (nightly, not per-PR).** ≥10 scenario pairs run headless via `claude -p` with hooks+MCP installed: session 1 plants a decision/constraint; session 2 (fresh context, same namespace) performs a task where it matters. Arms: memory-on, memory-off, **CLAUDE.md-only** (the native baseline — this is the value-over-native proof F56 demands). Judge: deterministic assertion on output/diff where possible, LLM judge otherwise; N runs per scenario for stochasticity; report task success, turns-to-completion, token cost, and **memory-induced errors (stale/wrong memory acted on) enumerated, not averaged away**. Memory-on must win on success/turns within token budget. *(F56)*
+- **W3.5 A/B outcome eval (nightly, not per-PR).** ≥10 scenario pairs run headless via `claude -p` with hooks+MCP installed: session 1 plants a decision/constraint; session 2 (fresh context, same namespace) performs a task where it matters. Arms: memory-on, memory-off, **CLAUDE.md-only** (the native baseline — this is the value-over-native proof F56 demands). Judge: deterministic assertion on output/diff where possible, LLM judge otherwise; N runs per scenario for stochasticity; report task success, turns-to-completion, token cost, and **memory-induced errors (stale/wrong memory acted on) enumerated, not averaged away**. Memory-on must win on success/turns within token budget. **Superseded (2026-06-21):** this single-fact A/B criterion was redesigned into the four-arm **memory-value scorecard** (`docs/eval/2026-06-16-w35-criterion-redesign.md`; harness `scripts/memory-scorecard.sh`); the A/B harness, scenarios, and nightly workflow were retired in the gate cutover. *(F56)*
 - **W3.6 Native distribution.** Claude Code plugin (hooks + MCP config + memory skill + `/rb:remember`, `/rb:recall`) publishable via a marketplace repo; committed `.mcp.json` + project `.claude/settings.json` template for zero-effort team rollout on clone; `rusty-brain-install` becomes a thin wrapper preferring native channels; execute the existing **P7 APM spec** as the cross-harness channel; document enterprise managed-settings interactions (org policy can disable hooks/MCP — a Phase 5 rollout dependency).
 - **W3.7 Usefulness signal.** `memory_feedback` MCP tool (helpful/wrong/stale) as the confidence producer W2.2 needs and the non-circular input W5c trust weighting needs — `access_count` counts "returned", not "useful". *(F37)*
 
-**Phase 3 gate:** a 40-turn simulated session produces ≤5 memories (vs ~40 today); elicitation scorecard passes; token-accounting test green; W3.5 nightly eval: memory-on beats memory-off AND CLAUDE.md-only on the scenario set; decision-grade rubric ≥80% on the sampled corpus. **Begin recruiting Phase 5 pilot users now.**
+**Phase 3 gate:** a 40-turn simulated session produces ≤5 memories (vs ~40 today); elicitation scorecard passes; token-accounting test green; W3.5 outcome eval (the **memory-value scorecard**, redesigned from the original A/B gate — see `docs/eval/2026-06-16-w35-criterion-redesign.md`): memory-on beats the realistic baseline and ties the steelman with zero memory-induced errors; decision-grade rubric ≥80% on the sampled corpus. **Begin recruiting Phase 5 pilot users now.**
 
 **Phase-3 progress — W3.1 capture inversion (landed 2026-06-13):**
 
@@ -294,7 +294,7 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   (2) added CLI clap-parse tests for the `feedback` command (valid kind parses;
   unknown/missing `--kind` rejected at parse time).
 
-**Phase-3 progress — W3.5 A/B outcome-eval HARNESS (landed 2026-06-14; measured run still owed):**
+**Phase-3 progress — W3.5 A/B outcome-eval HARNESS (landed 2026-06-14; RETIRED 2026-06-21 — superseded by the memory-value scorecard):**
 
 - *What landed (the harness, not the measured numbers):* the outcome eval that
   proves memory makes the agent DO BETTER — complementary to the W3.1 content
@@ -325,6 +325,20 @@ Target: claudecode →8.5. This phase was redesigned after critique — the orig
   the W3.2 scorecard measured run AND this. Until it runs, the gate clause
   "memory-on beats memory-off AND CLAUDE.md-only" is recorded as OWED, not met.
   Rubric: `docs/eval/2026-06-14-w35-ab-eval.md`.
+- *Retired (2026-06-21 — gate cutover):* the single-fact A/B criterion was redesigned
+  (`docs/eval/2026-06-16-w35-criterion-redesign.md`) into the four-arm **memory-value
+  scorecard**. The A/B harness (`scripts/w35-ab-eval.sh`), its scenarios
+  (`crates/rb-eval/scorecard/w35_ab_scenarios.json`), the nightly workflow
+  (`.github/workflows/w35-ab-eval.yml`), and the P4a trace/cache instrumentation
+  (`scripts/w35-trace-tools.sh`, `scripts/w35-cache-trace.sh`,
+  `.github/workflows/w35-trace.yml`, `.github/workflows/w35-cache-trace.yml`) were
+  **removed** — the file paths named above in this entry no longer exist. The active
+  outcome/value eval is `scripts/memory-scorecard.sh` +
+  `crates/rb-eval/scorecard/memory_scorecard_scenarios.json` +
+  `.github/workflows/memory-scorecard.yml` (scaffold + Class C landed; A/B/R per the
+  redesign build sequence). The cache-economics methodology (ADR-3) is preserved in
+  the retired `docs/eval/2026-06-19-w35-cache-study.md` /
+  `docs/eval/2026-06-19-p4a-caching-study.md`.
 
 ---
 
@@ -386,9 +400,9 @@ Run the full review battery (see §13) and close the residue. Every "what 10 mea
 | security | continuous fuzzing + signed releases | W4.3 + W0.6 (verify both still on schedule) |
 | retrieval | multilingual | accepted gap (§15) |
 | teamfit | GDPR-grade deletion semantics beyond purge | accepted gap unless pilot demands it; documented in threat model |
-| claudecode | sustained elicitation + outcome wins across releases | W3.2 scorecard + W3.5 A/B tracked per release, regression = release blocker |
+| claudecode | sustained elicitation + outcome wins across releases | W3.2 scorecard + W3.5 memory-value scorecard tracked per release, regression = release blocker |
 
-**Final gate:** all six dimensions ≥9.5 on a fresh full review **plus** external evidence: pilot metrics, the A/B outcome results, and at least one fresh-eyes install by someone who has never used the tool.
+**Final gate:** all six dimensions ≥9.5 on a fresh full review **plus** external evidence: pilot metrics, the memory-value scorecard results, and at least one fresh-eyes install by someone who has never used the tool.
 
 ---
 
@@ -413,8 +427,8 @@ Phases are gate checkpoints; with one developer orchestrating agents, run as tra
 
 ## 13. CI & cadence policy
 
-- **Test tiers:** per-PR = unit + agreement + fixture e2e with injected short timeouts (minutes; any test >60 s wall-clock must justify per-PR placement); nightly = soak, fault injection, 10k/100k benches, real-Claude-Code smoke (allowed-to-fail with alerting), long fuzz, W3.5 A/B; per-phase = manual fresh-machine checklist.
-- **Review cadence:** dimension-scoped re-reviews at each phase boundary (Phase 1 → retrieval+correctness agents only, etc.); the **full** intensive review at the Phase 2 and Phase 4 boundaries and pre-pilot. Phase 3+ scorecards must include external evidence (pilot metrics, A/B results, fresh-eyes installs) — self-grading against a known rubric overfits to the reviewer.
+- **Test tiers:** per-PR = unit + agreement + fixture e2e with injected short timeouts (minutes; any test >60 s wall-clock must justify per-PR placement); nightly = soak, fault injection, 10k/100k benches, real-Claude-Code smoke (allowed-to-fail with alerting), long fuzz; the W3.5 memory-value scorecard runs on manual dispatch (not nightly, never gates PRs); per-phase = manual fresh-machine checklist.
+- **Review cadence:** dimension-scoped re-reviews at each phase boundary (Phase 1 → retrieval+correctness agents only, etc.); the **full** intensive review at the Phase 2 and Phase 4 boundaries and pre-pilot. Phase 3+ scorecards must include external evidence (pilot metrics, memory-value scorecard results, fresh-eyes installs) — self-grading against a known rubric overfits to the reviewer.
 - **Baseline discipline:** retrieval changes land with re-captured baselines + justification in the same commit (§4 ground rule).
 - **Contract-version policy:** additive serde-default fields: no bump. W0.5 (Handshake identity) and any Phase 0 protocol change share **one** bump. Breaking changes thereafter follow W5a.4.
 

@@ -1,9 +1,18 @@
-# P4a — prompt-caching study (investigation + ADR-3)
+# P4a — prompt-caching study (investigation + ADR-3) — RETIRED
 
-- **Status:** investigation findings established + harness landed (zero spend).
-  `scripts/w35-cache-trace.sh` + `--self-test` + `--aggregate` +
-  `.github/workflows/w35-cache-trace.yml` are in place. **ADR-3 is PROVISIONAL**
-  — the decision is deferred to a small measured run, with the thresholds that
+> **RETIRED 2026-06-21.** The cache-trace harness this doc describes
+> (`scripts/w35-cache-trace.sh` + `.github/workflows/w35-cache-trace.yml`) was
+> **removed** in the W3.5 A/B gate cutover. The investigation findings (F1–F4) and
+> the provisional ADR-3 thresholds are kept as a record and carry forward to the
+> dimension-A runner if/when it is built on the memory-value scorecard scaffold
+> ([`2026-06-16-w35-criterion-redesign.md`](2026-06-16-w35-criterion-redesign.md)).
+> File paths below no longer exist.
+
+- **Status:** **RETIRED** (harness removed in the gate cutover; findings + provisional
+  ADR-3 kept as a record). Originally: investigation findings established + harness
+  landed (zero spend); `scripts/w35-cache-trace.sh` + `--self-test` + `--aggregate` +
+  `.github/workflows/w35-cache-trace.yml` were in place; **ADR-3 was PROVISIONAL**
+  — the decision deferred to a small measured run, with the thresholds that
   pick the option pre-registered below (per the redesign's §P3: "pre-register
   pass thresholds *before* running").
 - **Date:** 2026-06-19.

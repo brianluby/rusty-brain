@@ -1,6 +1,15 @@
-# W3.5 prompt-caching study — measuring cached vs uncached input (dimension A)
+# W3.5 prompt-caching study — measuring cached vs uncached input (dimension A) — RETIRED
 
-- **Status:** proposed (investigation + ADR-3; harness instrumentation landed, measured run deferred — no API key / spend in the landing environment, per the repo's land-harness-first convention).
+> **RETIRED 2026-06-21.** The P4a trace/cache instrumentation this study describes
+> (`scripts/w35-trace-tools.sh`, `scripts/w35-cache-trace.sh`, and their workflows)
+> was **removed** in the W3.5 A/B gate cutover. The cache-economics methodology
+> recorded here (ADR-3: score dimension A on `total_cost_usd` + accuracy, never raw
+> input tokens) is kept as a record and folds into the dimension-A runner if/when it
+> is built on the memory-value scorecard scaffold
+> ([`2026-06-16-w35-criterion-redesign.md`](2026-06-16-w35-criterion-redesign.md)).
+> File paths below no longer exist.
+
+- **Status:** **RETIRED** (instrumentation removed in the gate cutover; ADR-3 methodology kept as a record). Originally: proposed (investigation + ADR-3; harness landed, measured run deferred).
 - **Date:** 2026-06-19.
 - **Scope:** resolves the open question that gates dimension **A — Retrieval at scale** in the criterion redesign (`docs/eval/2026-06-16-w35-criterion-redesign.md`, "A only after the caching question is resolved"). This is P4a of the redesign build sequence.
 - **Companion harness:** `scripts/w35-trace-tools.sh` (extended: four `tok_*` columns + `aggregate_cache` + `--self-test`).
@@ -96,22 +105,23 @@ asymmetry (above) means the choice of token metric is load-bearing.
 "token cost" axis means `total_cost_usd`. The harness change lands now so A's
 runner inherits it rather than retrofitting.
 
-**Landed in the scorecard, 2026-06-21.** ADR-3 is now wired into the unified
-scorecard, not just the standalone `w35-cache-trace.sh` study harness:
+**Methodology re-homed in the scorecard, 2026-06-21.** Although the trace/cache
+instrumentation above was retired in the gate cutover, the ADR-3 methodology it
+recorded was not lost — it now lives in the unified memory-value scorecard.
 `scripts/memory-scorecard.sh` runs every session under `--output-format
 stream-json --verbose`, records `total_cost_usd` + the four `tok_*` buckets into a
 13-field TSV, and for the `retrieval_scale` dimension prints the cache diagnostics
 (`cache%`, `ctx_vol` = in+cc+cr, `eff_in` = in+1.25·cc+0.1·cr) plus a SINGLE
 per-dimension RATIFY-Opt-3 / Opt-2 / descope verdict (memory-on vs steelman on
 accuracy AND `total_cost_usd` within 20%; the verdict fails closed — it SKIPs on
-session errors or zero/absent cost). Unlike `w35-cache-trace.sh`, the scorecard
-pools all `retrieval_scale` scenarios into one dimension cell (no per-corpus
-ladder — that ladder lives in `w35-cache-trace.sh`); cost is therefore averaged
-across the corpus sizes. The Class A scenarios (`corpus_size` 500/500/1000)
-live in `crates/rb-eval/scorecard/memory_scorecard_scenarios.json`; their 500+
-distractors are bulk-planted via the new `rusty-brain remember --batch` (one
-process for the whole corpus). All of this is exercised by `--self-test` (no API);
-the measured run (real sessions at N≥5) stays deferred on a key + spend.
+session errors or zero/absent cost). The scorecard pools all `retrieval_scale`
+scenarios into one dimension cell (no per-corpus ladder — the retired prototype's
+corpus ladder did not carry over; cost is averaged across the corpus sizes). The
+Class A scenarios (`corpus_size` 500/500/1000) live in
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`; their 500+ distractors
+are bulk-planted via the new `rusty-brain remember --batch` (one process for the
+whole corpus). All of this is exercised by `--self-test` (no API); the measured
+run (real sessions at N≥5) stays deferred on a key + spend.
 
 **Deferred to the measured run (this is the "low spend" boundary).**
 
@@ -129,7 +139,9 @@ the measured run (real sessions at N≥5) stays deferred on a key + spend.
   mislead.
 - Model/TTL-specific cache-pricing for the `0.1` constant (haiku placeholder).
 
-## Harness change (landed)
+## Harness change (landed — then removed in the 2026-06-21 cutover)
+
+*(Historical: the harness below was deleted in the gate cutover; described in past sense.)*
 
 - `emit_row` appends `tok_in`, `tok_cache_create`, `tok_cache_read`, `tok_out`
   (session sums from `.message.usage`), via a pure `sum_usage` helper.
@@ -140,10 +152,10 @@ the measured run (real sessions at N≥5) stays deferred on a key + spend.
 - No protocol/contract change, no binary change. Output remains model-free-text
   free (token counts + tool names only), so it stays a safe CI artifact.
 
-## Validation for this step
+## Validation for this step (historical — the script below was removed in the 2026-06-21 cutover)
 
 ```
-scripts/w35-trace-tools.sh --self-test   # PASS, no API
+scripts/w35-trace-tools.sh --self-test   # PASS, no API (script since removed)
 ```
 
 ## Open questions for the measured run
