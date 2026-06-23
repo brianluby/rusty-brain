@@ -143,6 +143,23 @@ impl Scratch {
         self.write(&data);
     }
 
+    /// Record the latest checkpoint summary id while retaining observations.
+    /// Used by non-Claude fallback boundaries where no true session terminus is
+    /// available: later checkpoints supersede the live summary without losing
+    /// early-session scratch entries.
+    ///
+    /// Like [`Scratch::append`], this is a best-effort, non-atomic
+    /// read-modify-write (last writer wins): the per-event hook binary is
+    /// single-process, so the only race is two overlapping hook processes for the
+    /// same session. A checkpoint racing a concurrent `append` could drop the
+    /// just-appended entry — an accepted file-level posture for coarse-grained,
+    /// best-effort capture, not a correctness guarantee.
+    pub fn mark_checkpointed(&self, summary_id: &str) {
+        let mut data = self.read();
+        data.prior_summary_id = Some(summary_id.to_string());
+        self.write(&data);
+    }
+
     /// Atomically write (temp file 0600 + rename), creating the parent 0700.
     /// Best-effort. The scratch holds best-effort-redacted plaintext, so it gets
     /// the same at-rest posture as the DB and socket: `docs/THREAT_MODEL.md`
@@ -339,6 +356,91 @@ mod tests {
             data.prior_summary_id.as_deref(),
             Some("mem-123"),
             "prior summary id survives a post-fold append"
+        );
+    }
+
+    #[test]
+    fn mark_checkpointed_keeps_buffer_and_updates_summary_id() {
+        let (_d, s) = scratch();
+        s.append(Kind::File, "src/lib.rs");
+        s.append(Kind::Command, "cargo test");
+        s.mark_checkpointed("mem-123");
+        let data = s.read();
+        assert_eq!(data.files, vec!["src/lib.rs"]);
+        assert_eq!(data.commands, vec!["cargo test"]);
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-123"));
+
+        s.append(Kind::File, "src/main.rs");
+        s.mark_checkpointed("mem-456");
+        let data = s.read();
+        assert_eq!(data.files, vec!["src/lib.rs", "src/main.rs"]);
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-456"));
+    }
+
+    #[test]
+    fn mark_checkpointed_on_fresh_scratch_sets_id_without_creating_stray_entries() {
+        // Calling mark_checkpointed on a completely empty scratch (no appends,
+        // no prior id) must only set prior_summary_id — the buffer stays empty.
+        let (_d, s) = scratch();
+        s.mark_checkpointed("mem-000");
+        let data = s.read();
+        assert!(
+            data.files.is_empty(),
+            "no files must appear after mark_checkpointed on empty scratch"
+        );
+        assert!(data.commands.is_empty());
+        assert!(data.failures.is_empty());
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-000"));
+        // is_empty only considers the observation buffers, not the id.
+        assert!(data.is_empty(), "scratch data is empty (no observations)");
+    }
+
+    #[test]
+    fn mark_checkpointed_after_mark_folded_updates_the_id_without_restoring_buffer() {
+        // If a SessionEnd (mark_folded) was followed by a SessionCheckpoint
+        // (mark_checkpointed), the buffer must stay clear — only the id changes.
+        let (_d, s) = scratch();
+        s.append(Kind::File, "src/first.rs");
+        s.mark_folded(Some("end-id-1"));
+        // After fold, the buffer is clear.
+        let d1 = s.read();
+        assert!(d1.is_empty());
+        assert_eq!(d1.prior_summary_id.as_deref(), Some("end-id-1"));
+
+        // A checkpoint now (no new observations since fold) replaces the id
+        // but still has nothing to restore into the files list.
+        s.mark_checkpointed("cp-id-2");
+        let d2 = s.read();
+        assert!(
+            d2.is_empty(),
+            "buffer must stay empty after mark_checkpointed with no new appends"
+        );
+        assert_eq!(d2.prior_summary_id.as_deref(), Some("cp-id-2"));
+    }
+
+    #[test]
+    fn mark_checkpointed_supersedes_prior_id_from_mark_folded_with_new_appends() {
+        // mark_folded sets prior_summary_id and clears. A subsequent append
+        // plus mark_checkpointed must keep BOTH the new entry AND the latest id.
+        let (_d, s) = scratch();
+        s.append(Kind::Command, "cargo build");
+        s.mark_folded(Some("old-end-id"));
+        s.append(Kind::File, "src/new.rs");
+        s.mark_checkpointed("cp-id-after-resume");
+        let data = s.read();
+        assert_eq!(
+            data.files,
+            vec!["src/new.rs"],
+            "new post-fold append is retained"
+        );
+        assert!(
+            data.commands.is_empty(),
+            "pre-fold commands were cleared by mark_folded"
+        );
+        assert_eq!(
+            data.prior_summary_id.as_deref(),
+            Some("cp-id-after-resume"),
+            "mark_checkpointed updates the id from the prior mark_folded value"
         );
     }
 

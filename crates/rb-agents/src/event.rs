@@ -28,6 +28,18 @@ pub enum HookEvent {
         last_assistant_message: Option<String>,
         stop_hook_active: bool,
     },
+    /// A best-available adapter-specific boundary for CLIs that do not expose a
+    /// verified session terminus. The runtime folds scratch into a live summary
+    /// here without clearing scratch, so later checkpoints supersede the prior
+    /// summary while preserving early observations. This is deliberately
+    /// distinct from [`SessionEnd`].
+    ///
+    /// Supersede only chains across checkpoints that STORE successfully: a
+    /// degraded checkpoint (no daemon, or a store error) leaves both the scratch
+    /// and the prior-summary id untouched, so the next successful checkpoint
+    /// stores fresh. Repeated degraded checkpoints therefore never accumulate
+    /// un-superseded live memories — they store nothing at all.
+    SessionCheckpoint { reason: Option<String> },
     /// The agent SESSION is ending (distinct from a per-turn [`Stop`]). This is
     /// W3.1's single capture point: the runtime folds the per-session scratch
     /// file + transcript into ONE summary memory here. `reason` is the CLI's
@@ -180,5 +192,82 @@ mod tests {
     fn other_event_preserves_raw_name() {
         let ev = HookEvent::Other("UserPromptSubmit".to_string());
         assert_eq!(ev, HookEvent::Other("UserPromptSubmit".to_string()));
+    }
+
+    // --- SessionCheckpoint (new in this PR) --------------------------------
+
+    #[test]
+    fn session_checkpoint_variant_with_some_reason() {
+        let ev = HookEvent::SessionCheckpoint {
+            reason: Some("Stop".to_string()),
+        };
+        assert_eq!(
+            ev,
+            HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string())
+            }
+        );
+        match ev {
+            HookEvent::SessionCheckpoint { reason } => {
+                assert_eq!(reason.as_deref(), Some("Stop"));
+            }
+            other => panic!("expected SessionCheckpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_checkpoint_variant_with_none_reason() {
+        let ev = HookEvent::SessionCheckpoint { reason: None };
+        assert_eq!(ev, HookEvent::SessionCheckpoint { reason: None });
+        match ev {
+            HookEvent::SessionCheckpoint { reason } => {
+                assert!(reason.is_none());
+            }
+            other => panic!("expected SessionCheckpoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_checkpoint_is_distinct_from_session_end_and_stop() {
+        // These three variants serve different lifecycle roles and must not
+        // accidentally compare equal to each other.
+        let checkpoint = HookEvent::SessionCheckpoint {
+            reason: Some("Stop".to_string()),
+        };
+        let session_end = HookEvent::SessionEnd {
+            reason: Some("Stop".to_string()),
+        };
+        let stop = HookEvent::Stop {
+            last_assistant_message: None,
+            stop_hook_active: false,
+        };
+        assert_ne!(
+            checkpoint, session_end,
+            "SessionCheckpoint must be distinct from SessionEnd"
+        );
+        assert_ne!(
+            checkpoint, stop,
+            "SessionCheckpoint must be distinct from Stop"
+        );
+    }
+
+    #[test]
+    fn hook_context_carries_session_checkpoint_event() {
+        let ctx = HookContext {
+            event: HookEvent::SessionCheckpoint {
+                reason: Some("boundary".to_string()),
+            },
+            cwd: PathBuf::from("/work/proj"),
+            session_id: Some("sess-cp".to_string()),
+            transcript_path: None,
+        };
+        assert_eq!(
+            ctx.event,
+            HookEvent::SessionCheckpoint {
+                reason: Some("boundary".to_string())
+            }
+        );
+        assert_eq!(ctx.session_id.as_deref(), Some("sess-cp"));
+        assert!(ctx.transcript_path.is_none());
     }
 }

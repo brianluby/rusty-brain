@@ -34,6 +34,15 @@ pub async fn dispatch(
         HookEvent::Stop {
             stop_hook_active, ..
         } => capture::stop(*stop_hook_active),
+        HookEvent::SessionCheckpoint { .. } => {
+            capture::session_checkpoint(
+                client.take(),
+                scratch,
+                &ctx.cwd,
+                ctx.transcript_path.as_deref(),
+            )
+            .await
+        }
         HookEvent::SessionEnd { .. } => {
             capture::session_end(
                 client.take(),
@@ -130,5 +139,63 @@ mod tests {
             vec!["src/lib.rs"],
             "a degraded SessionEnd preserves the scratch"
         );
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_event_routes_and_preserves_scratch_when_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::at(tmp.path().join("scratch.json"));
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        let result = dispatch(
+            None,
+            Some(&scratch),
+            &ctx(HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string()),
+            }),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert_eq!(
+            scratch.read().files,
+            vec!["src/lib.rs"],
+            "a degraded checkpoint preserves the scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_with_none_reason_routes_and_continues() {
+        // A checkpoint whose reason is None (the adapter did not provide a
+        // diagnostic label) must still route to the checkpoint flow and
+        // continue, never block or panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::at(tmp.path().join("scratch.json"));
+        scratch.append(scratch::Kind::Command, "cargo test");
+        let result = dispatch(
+            None,
+            Some(&scratch),
+            &ctx(HookEvent::SessionCheckpoint { reason: None }),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert_eq!(
+            scratch.read().commands,
+            vec!["cargo test"],
+            "a degraded None-reason checkpoint preserves the scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_without_scratch_continues() {
+        // No scratch means no session id — dispatch must still continue.
+        let result = dispatch(
+            None,
+            None,
+            &ctx(HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string()),
+            }),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert!(result.system_message.is_none());
     }
 }
