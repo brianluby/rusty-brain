@@ -4,7 +4,7 @@
 
 **Goal:** Build a locally-runnable bash harness that records real codex + opencode hook-lifecycle payloads and headless-result schemas into `crates/rb-hooks/tests/fixtures/<agent>/`, sanitized, so the cross-agent scorecard runner can later be built against recorded ground truth instead of guesses.
 
-**Architecture:** One bash script (`scripts/record-agent-fixtures.sh`) modeled on the existing `scripts/memory-scorecard.sh` — pure helper functions exercised by a no-API `--self-test`, plus a live recording path guarded behind real CLI auth. A standalone OpenCode logging plugin under `scripts/fixtures/opencode-logger/` lets recording proceed without the deferred `rb-install` opencode support. A `--dry-run` mode runs everything that needs no auth/network so the harness is verifiable and CI-gated offline.
+**Architecture:** One bash script (`scripts/record-agent-fixtures.sh`) modeled on the existing `scripts/memory-scorecard.sh` — pure helper functions exercised by a no-API `--self-test`, plus a live recording path guarded behind real CLI auth. The live path records against a STABLE per-agent recorder home OUTSIDE the repo (copied auth + persisted trust), pre-trusted once via `--setup-trust <agent>`, so the operator's real agent home is never mutated and no `--dangerously-bypass` flag is needed. A standalone OpenCode logging plugin under `scripts/fixtures/opencode-logger/` lets recording proceed without the deferred `rb-install` opencode support. A `--dry-run` mode runs everything that needs no auth/network so the harness is verifiable and CI-gated offline.
 
 **Tech Stack:** bash, python3 (already a scorecard dependency, used for regex-robust sanitization and JSON validation), jq, the codex/opencode CLIs (live path only), Rust (`rb-hooks` integration test that shells out to the dry-run).
 
@@ -12,7 +12,7 @@
 
 - Spec: `docs/specs/2026-06-23-cross-agent-fixture-recording.md` — every task implicitly serves it.
 - Fixture format mirrors `crates/rb-hooks/tests/fixtures/claude_code/`: one sanitized single-line raw-stdin JSON file per event (`<event>.json`), plus a README with provenance / recording recipe / sanitization table / fields-present-and-absent.
-- Recording must run inside a throwaway `HOME` + temp project; never mutate global agent state.
+- Recording must run against a STABLE per-agent recorder home OUTSIDE the repo (`${XDG_CACHE_HOME:-$HOME/.cache}/rusty-brain/fixture-record/<agent>/`) so persisted trust survives across runs; the operator's REAL agent home (`~/.codex`, `~/.local/share/opencode`) is never mutated. Auth is a read-only COPY into the recorder home (mode 0600); codex/opencode hooks are pre-trusted via a one-time `--setup-trust <agent>` step (no `--dangerously-bypass` flags).
 - Committed fixtures contain no secrets and no real home path (rewritten to `/Users/user`, matching the claude_code sanitization).
 - Codex `.codex/hooks.json` shape (from `rb-install`): `{"hooks": {"<Event>": [ <group> ]}}` where a group is `{"hooks":[{"type":"command","command":"<single shell string>"}]}` and the tool event `PostToolUse` additionally carries `"matcher":"*"`. Events: `SessionStart`, `PostToolUse`, `Stop`, `PreCompact`.
 - OpenCode hook event type strings (from the `OpenCodeCli` adapter): `session.created`, `tool.execute.after`, `session.idle`, `session.compacted`, `session.deleted`.
@@ -525,10 +525,11 @@ git commit -m "feat(fixtures): add README emitter and offline dry-run layout che
 - Modify: `scripts/record-agent-fixtures.sh`
 
 **Interfaces:**
-- Consumes: `codex_hooks_json`, `opencode_plugin_src`, `scrub`, `infer_terminus`, `emit_readme`.
-- Produces: `record_live <agent> <out_dir>` — sets up a throwaway HOME + project, registers logging hooks, runs a real multi-turn headless session capturing `result.jsonl`, counts the terminus event, sanitizes raw payloads into `<out_dir>/<event>.json`, and writes the README. Requires the agent CLI on PATH; never mutates global state.
+- Consumes: `recorder_home`, `setup_codex_home`/`setup_opencode_home`, `codex_trust_config`, `copy_ro`, `codex_hooks_json`, `opencode_plugin_src`, `scrub`, `infer_terminus`, `count_lines`, `emit_readme`.
+- Produces: `record_live <agent> <out_dir>` — prepares the STABLE recorder home (copied auth + directory trust + logging hooks), runs a real multi-turn headless session against it (`codex exec --json` / `opencode run --format json`, no `--dangerously` flag) capturing `result.jsonl`, counts the terminus event, sanitizes raw payloads into `<out_dir>/<event>.json`, and writes the README. Requires the agent CLI on PATH and (codex) a prior `--setup-trust` having persisted `[hooks.state]` trust — it REFUSES to record otherwise so it never produces empty fixtures. Never mutates the operator's real agent home.
+- Produces: `setup_trust <agent>` — the one-time interactive trust step (codex TUI hook trust; opencode home prep + auth verification).
 
-This task has no offline unit test (it requires live CLI auth). Its guardrails are tested instead: the missing-CLI preflight is checked in self-test, and the body reuses Task 2-6 helpers that are already covered.
+This task has no offline unit test (it requires live CLI auth). Its guardrails are tested instead: the missing-CLI preflight (for both `record_live` and `setup_trust`), the `recorder_home` path contract, `count_lines`, and `codex_trust_config` are all checked in self-test, and the body reuses Task 2-6 helpers that are already covered.
 
 - [ ] **Step 1: Write the failing preflight test**
 
@@ -706,24 +707,43 @@ git commit -m "test(fixtures): CI-gate recording harness self-test and dry-run"
 
 This task is run by a human with codex + opencode auth installed; it produces the actual committed fixtures and is the input to the follow-on scorecard-runner build.
 
-- [ ] **Step 1: Record codex fixtures**
+**Trust/auth model (binding):** each agent records against a STABLE recorder home OUTSIDE the repo at `${XDG_CACHE_HOME:-$HOME/.cache}/rusty-brain/fixture-record/<agent>/`. The harness copies the operator's real auth into that home (read-only on the real side, mode 0600) and seeds codex directory trust; the real `~/.codex` / opencode config is never mutated. Hooks are pre-trusted via a one-time `--setup-trust <agent>`, so recording uses NO `--dangerously-bypass-hook-trust` / `--dangerously-bypass-approvals-and-sandbox` flag.
+
+- [ ] **Step 1: One-time trust setup (run once per agent, in a real terminal)**
+
+```bash
+bash scripts/record-agent-fixtures.sh --setup-trust codex
+#   -> launches the codex TUI in the recorder CODEX_HOME. In the TUI: accept
+#      "trust this directory" (if prompted) and TRUST the hooks, then quit. This
+#      persists [projects].trust_level + [hooks.state].trusted_hash. The command
+#      then verifies via `codex doctor` and checks for [hooks.state] entries.
+bash scripts/record-agent-fixtures.sh --setup-trust opencode
+#   -> opencode has no trust gate; this prepares the recorder home (redirected
+#      XDG dirs + copied auth.json/account.json) and runs `opencode auth list`.
+```
+
+Re-run `--setup-trust <agent>` whenever the copied auth tokens expire (the recorder copy can drift from the real one as refresh tokens rotate; the real one stays untouched).
+
+- [ ] **Step 2: Record codex fixtures**
 
 Run: `bash scripts/record-agent-fixtures.sh --agent codex`
-Then review the diff under `crates/rb-hooks/tests/fixtures/codex/` — confirm no real home path or secret survived sanitization, and that the README provenance (CLI version, terminus verdict, events present/absent) is accurate. Fill the `codex exec` machine-readable flag actually used into the README recipe.
+This runs `CODEX_HOME=<rec> codex exec --json -C <rec proj> -s workspace-write --skip-git-repo-check -c approval_policy="never" "<prompt>"`. The harness REFUSES to record if `[hooks.state]` trust is missing (re-run `--setup-trust codex`). Then review the diff under `crates/rb-hooks/tests/fixtures/codex/` — confirm no real home path or secret survived sanitization, and that the README provenance (CLI version, terminus verdict, events present/absent) is accurate.
 
-- [ ] **Step 2: Record opencode fixtures**
+Open question to confirm at record time (documented in the README): whether codex `exec --json` fires `PreToolUse`/`PostToolUse` for non-shell tools (per `differences.md` they currently match SHELL commands only — the prompt exercises a Bash command to guarantee `PostToolUse` capture), and whether `file_change` items appear in the headless `--json` stream (the readiness gate in `docs/prds/2026-06-23-codex-apply-patch-capture.md`).
+
+- [ ] **Step 3: Record opencode fixtures**
 
 Run: `bash scripts/record-agent-fixtures.sh --agent opencode`
-Review `crates/rb-hooks/tests/fixtures/opencode/` the same way.
+This runs `opencode run --format json --dir <rec proj> "<prompt>"` with the XDG dirs redirected to the recorder home. Review `crates/rb-hooks/tests/fixtures/opencode/` the same way; capture the `--format json` result-stream schema verbatim (its event-type/envelope shape is still unknown until a real run).
 
-- [ ] **Step 3: Commit the recorded fixtures**
+- [ ] **Step 4: Commit the recorded fixtures**
 
 ```bash
 git add crates/rb-hooks/tests/fixtures/codex crates/rb-hooks/tests/fixtures/opencode
 git commit -m "test(fixtures): record real codex and opencode lifecycle fixtures"
 ```
 
-- [ ] **Step 4: Hand off to the scorecard-runner build**
+- [ ] **Step 5: Hand off to the scorecard-runner build**
 
 With recorded result schemas in hand, the cross-agent scorecard runner work (out of scope for this plan) can begin: decide the cost-axis policy from the real `result.jsonl`, add agent dispatch to `run_session`/install/`extract_usage`, and flip capability-matrix statuses only where a fixture proves the capability.
 

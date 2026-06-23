@@ -45,23 +45,26 @@ These stay gated on the fixtures this harness produces; none are implemented her
 
 ### Component 1 — `scripts/record-agent-fixtures.sh`
 
-`record-agent-fixtures.sh --agent codex|opencode|all [--out-dir DIR] [--dry-run]`
+`record-agent-fixtures.sh [--self-test] [--setup-trust codex|opencode] [--agent codex|opencode|all] [--out-dir DIR] [--dry-run]`
 
-For each agent, operate inside a throwaway `HOME` and temp project (mirroring the scorecard's `seed_home` + `HOME`-override discipline) so no global agent state is mutated — the precise blocker the prior recording attempt hit:
+For each agent, operate against a **stable per-agent recorder home OUTSIDE the repo** at `${XDG_CACHE_HOME:-$HOME/.cache}/rusty-brain/fixture-record/<agent>/` so persisted trust survives across runs, while the operator's REAL agent home (`~/.codex`, `~/.local/share/opencode`) is never mutated. The earlier "bare throwaway HOME" approach is the precise blocker the prior recording attempt hit: codex ran in an empty `$HOME/.codex` with no auth and an untrusted directory/hooks, so it captured zero events. The corrected isolation model:
+
+- The recorder home (mode 0700) holds the persisted trust and a **read-only COPY** of the operator's auth (mode 0600). codex: `CODEX_HOME=<recorder home>` with `auth.json` + a hand-written `[projects."<rec proj>"] trust_level = "trusted"` + `approval_policy = "never"` in `config.toml`. opencode: all four XDG dirs (`XDG_DATA_HOME`/`XDG_CONFIG_HOME`/`XDG_STATE_HOME`/`XDG_CACHE_HOME`) redirected under the recorder home, with `auth.json` + `account.json` copied into `<rec>/data/opencode/`.
+- **One-time trust** (`--setup-trust <agent>`): codex computes a per-hook `trusted_hash` over `.codex/hooks.json` that cannot be hand-written, so the operator runs the interactive `codex` TUI ONCE in the recorder home to persist `[hooks.state]` trust; later `codex exec` then fires the hooks with **NO** `--dangerously-bypass-hook-trust` flag. opencode has no directory/plugin trust gate, so its `--setup-trust` just prepares the recorder home and verifies auth.
 
 1. **Register logging hooks** that append each event's raw stdin JSON (plus a trailing newline, matching the claude_code recipe) to `raw/<event>.json`:
-   - **codex** → project `.codex/hooks.json`, `type: command` hooks for `SessionStart`, `PostToolUse` (matcher `*`), `Stop`, `PreCompact`.
+   - **codex** → recorder-project `.codex/hooks.json`, `type: command` hooks for `SessionStart`, `PostToolUse` (matcher `*`), `Stop`, `PreCompact`.
    - **opencode** → the Component 2 plugin, registering `session.created`, `tool.execute.after`, `session.idle`, `session.compacted`, `session.deleted`.
-2. **Drive a multi-turn headless session** that performs one Bash command and one file write (so `PostToolUse` / `tool.execute.after` fire), capturing the full machine-readable result stream to `result.jsonl` (or `result.json` if the agent emits a single object):
-   - codex → `codex exec "<prompt>"` with the agent's JSON/stream output flag (discovered at record time; the harness logs the exact invocation used).
-   - opencode → `opencode run "<prompt>"` likewise.
+2. **Drive a multi-turn headless session** that performs one Bash command and one file write (so `PostToolUse` / `tool.execute.after` fire), capturing the full machine-readable result stream to `result.jsonl` (or `result.json` if the agent emits a single object). No `--dangerously` bypass flag is used; trust is pre-persisted in the recorder home instead:
+   - codex → `CODEX_HOME=<rec> codex exec --json -C <rec proj> -s workspace-write --skip-git-repo-check -c approval_policy="never" "<prompt>"`.
+   - opencode → `opencode run --format json --dir <rec proj> "<prompt>"` with the XDG dirs redirected to the recorder home.
 3. **Terminus determination**: count occurrences of the candidate terminus event (`Stop` / `session.idle`) across the multi-turn run; emit a `terminus.json` note recording the count and the inferred verdict (`true-terminus` if fired once at end, `per-turn` otherwise). This is the evidence that resolves the mapping question the fixture READMEs flag.
 4. **Sanitize** before writing committed fixtures: replace the recording user's home dir with `/Users/user`; scrub the same secret classes the hook-capture redaction covers (bearer tokens, `key=value`, AWS-style keys, PEM blocks). The harness is bash, so it reimplements those patterns rather than calling the Rust redactor; the sanitizer is a pure shell function exercised by the dry-run, and a dry-run case pins parity with a known secret of each class.
 5. **Emit** per-event fixture files into `crates/rb-hooks/tests/fixtures/<agent>/` and regenerate that agent's README provenance + sanitization + terminus + result-schema sections, replacing the "blocked" placeholder.
 
 ### Component 2 — OpenCode logging plugin (`scripts/fixtures/opencode-logger/`)
 
-A minimal standalone JS/TS plugin opencode loads from the throwaway project. Its only job: write each hook event's payload to `raw/<event>.json`. It is a recording aid, not the production integration — that remains deferred per Non-Goals.
+A minimal standalone JS plugin opencode loads from the recorder project (referenced from `opencode.json`'s `plugin` array; opencode has no plugin-trust gate). Its only job: write each hook event's payload to `raw/<event>.json`. It taps both the generic `event` hook and the dedicated `tool.execute.after` hook, and exports the plugin under both a named and a default export. It is a recording aid, not the production integration — that remains deferred per Non-Goals.
 
 ### Component 3 — dry-run / self-test (offline-verifiable)
 
@@ -89,7 +92,7 @@ A fixture set for an agent is **complete** when `crates/rb-hooks/tests/fixtures/
 ## Acceptance Criteria
 
 - `scripts/record-agent-fixtures.sh --dry-run --agent all` passes offline with no auth/network, asserting hook-config validity, sanitization, and fixture layout.
-- The harness, run with auth, produces a complete fixture set (per above) for codex and for opencode without mutating global agent state.
+- The harness, run with auth (after a one-time `--setup-trust <agent>`), produces a complete fixture set (per above) for codex and for opencode without mutating the operator's real agent home (`~/.codex`, `~/.local/share/opencode`); all writes land in the stable recorder home outside the repo.
 - The OpenCode logging plugin loads and records payloads in a real `opencode run`.
 - No secrets or real home paths appear in committed fixtures.
 - Existing Claude Code rb-hooks tests and the scorecard `--self-test` still pass unchanged.
@@ -108,6 +111,12 @@ scripts/memory-scorecard.sh --self-test
 Live (what the operator runs locally, with CLI auth installed):
 
 ```bash
+# One-time per agent: pre-trust the recorder home (codex: interactive TUI hook
+# trust; opencode: no trust gate, just prepares the home). Re-run if tokens expire.
+bash scripts/record-agent-fixtures.sh --setup-trust codex
+bash scripts/record-agent-fixtures.sh --setup-trust opencode
+
+# Then record (no --dangerously flag; trust is pre-persisted in the recorder home):
 bash scripts/record-agent-fixtures.sh --agent codex
 bash scripts/record-agent-fixtures.sh --agent opencode
 # review the diff under crates/rb-hooks/tests/fixtures/{codex,opencode}/ before committing
@@ -118,12 +127,13 @@ bash scripts/record-agent-fixtures.sh --agent opencode
 - **Headless flag/format differs from assumptions.** The exact `codex exec` / `opencode run` machine-readable flag is discovered at record time, not assumed; the harness logs the invocation it used so the README is accurate. Mitigated by recording verbatim and deferring schema interpretation.
 - **Terminus is ambiguous from one run.** Multi-turn count is evidence, not proof; the README states the run shape so a later run can corroborate. Mapping changes stay gated until corroborated.
 - **OpenCode plugin API drift.** Pin the recorded OpenCode version in the README; the plugin is minimal to reduce surface.
-- **Accidental secret/state leak.** Sanitizer is fail-closed and dry-run-tested; throwaway `HOME` contains global writes.
+- **Accidental secret/state leak.** Sanitizer is fail-closed and dry-run-tested; auth is a read-only copy (mode 0600) into the recorder home (mode 0700) outside the repo, which `.gitignore` also covers as defense in depth. Only sanitized per-event payloads + the sanitized `result.jsonl` are written into the committed fixtures dir — never auth/config files.
+- **Token expiry in the recorder home.** The copied `auth.json` can drift from the real one as refresh tokens rotate (the recorder copy mutates, the real one is untouched). Benign for isolation; the operator re-runs `--setup-trust <agent>` to re-copy when tokens expire.
 
 ## Implementation Checklist
 
-- [ ] `scripts/record-agent-fixtures.sh` skeleton with arg parsing (`--agent`, `--out-dir`, `--dry-run`) and throwaway HOME/project setup.
-- [ ] codex hook-config generation + `codex exec` capture path.
+- [ ] `scripts/record-agent-fixtures.sh` skeleton with arg parsing (`--agent`, `--setup-trust`, `--out-dir`, `--dry-run`) and stable recorder-home setup.
+- [ ] codex hook-config generation + `codex exec --json` capture path against the recorder `CODEX_HOME`.
 - [ ] OpenCode logging plugin + `opencode run` capture path.
 - [ ] Pure sanitizer (home rewrite + secret scrub) with dry-run tests.
 - [ ] Terminus counter + `terminus.json` emitter.
