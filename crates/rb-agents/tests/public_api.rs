@@ -7,9 +7,9 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rb_agents::{
-    agent_for, detect_namespace, AgentCli, AgentId, AgentInstaller, AutoStart, ClaudeCodeCli,
-    CodexCli, DaemonClient, GeminiCli, HookContext, HookEvent, HookFragment, HookResult,
-    InstallScope, OpenCodeCli, SENTINEL,
+    agent_capabilities, agent_for, capability_for_agent, detect_namespace, AgentCli, AgentId,
+    AgentInstaller, AutoStart, ClaudeCodeCli, CodexCli, DaemonClient, GeminiCli, HookContext,
+    HookEvent, HookFragment, HookResult, InstallScope, OpenCodeCli, SupportLevel, SENTINEL,
 };
 
 #[test]
@@ -40,6 +40,18 @@ fn registry_and_adapters_are_reexported() {
     let _ = std::any::type_name::<OpenCodeCli>();
     let _ = std::any::type_name::<GeminiCli>();
     let _ = std::any::type_name::<CodexCli>();
+}
+
+#[test]
+fn capability_matrix_is_reexported() {
+    assert!(
+        agent_capabilities()
+            .iter()
+            .any(|capability| capability.agent == "claude-code"),
+        "claude-code capability row must be public"
+    );
+    let codex = capability_for_agent("codex").expect("codex capability row");
+    assert_eq!(codex.scorecard, SupportLevel::Unsupported);
 }
 
 #[test]

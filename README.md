@@ -243,6 +243,25 @@ are captured into memory automatically. The hooks are **fail-open**: any error
 degrades silently and never blocks the agent. Adapters exist for several agent CLIs;
 coverage is still being expanded.
 
+Current agent capability matrix:
+
+| Agent | Adapter | Capture | Retrieval | Config | Scorecard | Lifecycle source / limitation |
+|---|---|---|---|---|---|---|
+| `claude-code` | stable | supported | supported | supported | supported | Fixture-backed `SessionEnd` lifecycle under `crates/rb-hooks/tests/fixtures/claude_code/`. |
+| `codex` | experimental | partial | unsupported | partial | unsupported | `Stop` remains a no-op boundary until real fixtures prove a checkpoint or terminus; `apply_patch` capture is blocked. |
+| `opencode` | experimental | partial | unsupported | unsupported | unsupported | Adapter exists, but installer/plugin support and lifecycle fixtures are still deferred. |
+| `gemini` | experimental | partial | unsupported | partial | unsupported | Native `SessionEnd` remains canonical `Stop` until real fixtures prove a safer boundary. |
+| `hermes` | discovery | unknown | unknown | unknown | unsupported | Discovery-gated; no hook names or config paths are hard-coded. |
+
+The scorecard runner is target-aware:
+
+```bash
+scripts/memory-scorecard.sh --agent claude-code --runs 1
+scripts/memory-scorecard.sh --agent codex --runs 1      # explicit skip today
+scripts/memory-scorecard.sh --agent opencode --runs 1   # explicit skip today
+scripts/memory-scorecard.sh --agent all --runs 1        # prints skips, then runs Claude Code
+```
+
 ## Configuration
 
 Daemon knobs live in a user config file: `~/.config/rusty-brain/config.toml`

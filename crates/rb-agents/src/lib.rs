@@ -8,6 +8,7 @@
 //! never links it.
 #![forbid(unsafe_code)]
 
+mod capability;
 mod claude_code;
 pub mod cli;
 mod codex;
@@ -19,6 +20,9 @@ mod namespace;
 mod opencode;
 pub mod proc;
 
+pub use capability::{
+    agent_capabilities, capability_for_agent, AdapterStatus, AgentCapability, SupportLevel,
+};
 pub use claude_code::ClaudeCodeCli;
 pub use cli::{agent_for, AgentCli, AgentId};
 pub use codex::CodexCli;
