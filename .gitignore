@@ -13,21 +13,14 @@ Cargo.lock.orig
 .claude/settings.local.json
 .worktrees
 # Cross-agent fixture recorder home (scripts/record-agent-fixtures.sh). The
-# STABLE recorder home normally lives OUTSIDE the repo at
+# STABLE recorder home lives OUTSIDE the repo at
 # ${XDG_CACHE_HOME:-$HOME/.cache}/rusty-brain/fixture-record/<agent>/ and holds a
-# read-only COPY of the operator's auth + per-agent session history. Defense in
-# depth: if XDG_CACHE_HOME ever points inside the repo, never let it be committed.
+# read-only COPY of the operator's auth + raw, UN-sanitized per-agent session
+# history. Defense in depth: if XDG_CACHE_HOME ever points inside the repo, never
+# let it be committed. The committed fixtures under
+# crates/rb-hooks/tests/fixtures/{codex,opencode}/ are SANITIZED by the recorder
+# before they are written there and ARE the deliverable, so they are NOT ignored
+# (matching the tracked claude_code/ fixtures); the operator reviews the diff and
+# commits them deliberately per the plan's Task 9.
 **/rusty-brain/fixture-record/
 .cache/
-# Live-recorded agent fixtures (scripts/record-agent-fixtures.sh --agent <a>).
-# These land inside the repo at crates/rb-hooks/tests/fixtures/{codex,opencode}/
-# but are NOT committed automatically: they may carry pre-scrub/pre-operator-
-# reviewed payloads, so a careless `git add -A` must never stage them. Only the
-# hand-curated README.md (and any explicitly-allowlisted fixture) is tracked.
-# Ignore the recorded artifacts; keep README.md tracked via the negations below.
-crates/rb-hooks/tests/fixtures/codex/*.json
-crates/rb-hooks/tests/fixtures/codex/result.jsonl
-crates/rb-hooks/tests/fixtures/opencode/*.json
-crates/rb-hooks/tests/fixtures/opencode/result.jsonl
-!crates/rb-hooks/tests/fixtures/codex/README.md
-!crates/rb-hooks/tests/fixtures/opencode/README.md
