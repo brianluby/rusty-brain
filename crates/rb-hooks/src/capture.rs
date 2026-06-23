@@ -611,8 +611,7 @@ pub async fn pre_compact(
 /// How [`fold_session_summary`] resets the scratch once a fold is durably
 /// stored: `End` clears the buffer (true terminus), `Checkpoint` retains it so a
 /// later checkpoint re-folds early observations while superseding the live
-/// summary. Defined before its callers per the codebase's define-before-use
-/// convention.
+/// summary. Defined before its callers for readability.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FoldMode {
     End,

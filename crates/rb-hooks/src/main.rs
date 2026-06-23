@@ -182,7 +182,8 @@ async fn capture_phase(
 ) -> HookResult {
     // W3.1: PostToolUse (scratch append) and Stop (no-op) never touch the
     // daemon, so they skip the connect cost entirely; only SessionStart /
-    // SessionCheckpoint / SessionEnd / PreCompact read or write the store.
+    // UserPromptSubmit / SessionCheckpoint / SessionEnd / PreCompact read or
+    // write the store (see `event_needs_daemon`).
     let mut client = if event_needs_daemon(&ctx.event) {
         DaemonClient::connect(
             socket,
