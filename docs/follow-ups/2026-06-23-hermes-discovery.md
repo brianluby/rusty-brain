@@ -6,7 +6,10 @@
 
 ## Known facts
 
-- No Hermes adapter, installer, or scorecard target is implemented in this repo.
+- No Hermes adapter or installer is implemented in this repo; the only scorecard
+  presence is an unsupported `--agent hermes` target in `scripts/memory-scorecard.sh`
+  that emits a discovery-gated skip row (`scorecard_unsupported_hermes_discovery_gated`).
+  There is no live Hermes scorecard run.
 - No committed fixture proves Hermes hook event names, payload shape, lifecycle
   cadence, config path, transcript path, or prompt-time retrieval equivalent.
 - No code should hard-code Hermes hook names or lifecycle semantics until those
