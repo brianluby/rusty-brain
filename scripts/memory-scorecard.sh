@@ -31,7 +31,7 @@
 #
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
-#   memory-scorecard.sh --bin-dir DIR [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
+#   memory-scorecard.sh [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -136,10 +136,13 @@ write_claude_md() { # file body distractors
 }
 
 # ---- pure scorecard aggregation (exercised by --self-test) -------------------
-# Reads a 13-field results TSV:
+# Reads a results TSV. The first 13 fields are stable:
 #   dimension scenario arm run success turns mie cost tok_in tok_cc tok_cr tok_out is_error
 # (the first seven are unchanged; the trailing six are ADR-3 token/cost, appended
-# AFTER mie so the existing column indices are stable). Prints the per-dimension
+# AFTER mie so the existing column indices are stable). Class B appends four more
+# fields after those stable fields:
+#   cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count
+# Prints the per-dimension
 # scorecard — success as a Wilson 95% CI, turns as median [Q1-Q3] (P3: median +
 # spread, never a bare mean), and mean total_cost_usd — plus, for the
 # `retrieval_scale` dimension, an ADR-3 token/cost block (cache buckets +
@@ -186,6 +189,7 @@ aggregate_scorecard() {
     {
       dim=$1; arm=$3; succ=$5; turns=$6; mie=$7;
       cost=$8; inp=$9; cc=$10; cr=$11; is_err=$13;
+      cap_fid=$14; cap_reason=$15; cap_summary=$16; cap_mcp=$17;
       key = dim SUBSEP arm;
       n[key]++; s[key]+=succ;
       co[key]+=cost; ci_in[key]+=inp; ci_cc[key]+=cc; ci_cr[key]+=cr;
@@ -198,6 +202,16 @@ aggregate_scorecard() {
       tk = key SUBSEP n[key]; tv[tk] = turns;
       dims[dim]=1;
       if (arm=="memory-on" && mie==1) { mie_total++; mie_list = mie_list sprintf("    - %s / %s run %s\n", dim, $2, $4) }
+      if (dim=="capture" && arm=="memory-on" && cap_fid != "" && cap_fid != "na") {
+        csc=$2;
+        cap_scenarios[csc]=1;
+        cap_n[csc]++; cap_s[csc]+=cap_fid+0;
+        cap_summary_total[csc]+=cap_summary+0; cap_mcp_total[csc]+=cap_mcp+0;
+        cap_reason_count[csc SUBSEP cap_reason]++;
+        cap_total_n++; cap_total_s+=cap_fid+0;
+        cap_total_summary+=cap_summary+0; cap_total_mcp+=cap_mcp+0;
+        cap_reason_total[cap_reason]++;
+      }
     }
     END {
       directional = 0;
@@ -227,15 +241,52 @@ aggregate_scorecard() {
           on=rate[d SUBSEP "memory-on"]; rb=rate[d SUBSEP "realistic-baseline"]; sm=rate[d SUBSEP "steelman-baseline"];
           beats_realistic = (on > rb);
           ties_steelman   = (on >= sm - tie);
-          verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
-          if (beats_realistic && ties_steelman) pass_dims++;
-          printf "  -> %s: beats_realistic=%s ties_steelman=%s  => %s\n\n",
-                 d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), verdict;
+          if (d == "capture") {
+            cap_target_met = (cap_total_n > 0 && cap_total_s / cap_total_n >= 0.80);
+            verdict = (beats_realistic && ties_steelman && cap_target_met) ? "PASS" : "no";
+            if (beats_realistic && ties_steelman && cap_target_met) pass_dims++;
+            printf "  -> %s: beats_realistic=%s ties_steelman=%s capture_fidelity_target=%s  => %s\n\n",
+                   d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (cap_target_met?"yes":"NO"), verdict;
+          } else {
+            verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
+            if (beats_realistic && ties_steelman) pass_dims++;
+            printf "  -> %s: beats_realistic=%s ties_steelman=%s  => %s\n\n",
+                   d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), verdict;
+          }
         } else {
           printf "  -> %s: incomplete arms (no verdict)\n\n", d;
         }
       }
       printf "scorecard: %d/%d dimensions pass (tracked, non-gating)\n", pass_dims, total_dims;
+
+      if (cap_total_n > 0) {
+        split("cap_ok cap_no_session_summary cap_summary_missing_fact cap_forbidden_token cap_list_error cap_timeout cap_mcp_bypass_detected", reason_order, " ");
+        printf "\n== Class B capture fidelity (direct hook-origin session-summary; report-only) ==\n";
+        printf "%-28s %5s %18s %9s %10s %s\n", "scenario", "runs", "fidelity [95% CI]", "summaries", "mcp_bypass", "reasons";
+        for (csc in cap_scenarios) {
+          wilson(cap_s[csc], cap_n[csc]);
+          reasons = ""; sep = "";
+          for (ri=1; ri<=7; ri++) {
+            rr=reason_order[ri]; rc=cap_reason_count[csc SUBSEP rr]+0;
+            if (rc > 0) { reasons = reasons sep rr "=" rc; sep = "," }
+          }
+          if (reasons == "") reasons = "none";
+          printf "%-28s %5d %5.0f%% [%.1f-%.1f] %9d %10d %s\n",
+                 csc, cap_n[csc], 100*cap_s[csc]/cap_n[csc], wil_lo*100, wil_hi*100,
+                 cap_summary_total[csc], cap_mcp_total[csc], reasons;
+        }
+        wilson(cap_total_s, cap_total_n);
+        target_met = (cap_total_s / cap_total_n >= 0.80);
+        reasons = ""; sep = "";
+        for (ri=1; ri<=7; ri++) {
+          rr=reason_order[ri]; rc=cap_reason_total[rr]+0;
+          if (rc > 0) { reasons = reasons sep rr "=" rc; sep = "," }
+        }
+        if (reasons == "") reasons = "none";
+        printf "capture fidelity: %.0f%% [%.1f-%.1f] (%d/%d) target>=80%%=%s summaries=%d mcp_bypass=%d reasons=%s\n",
+               100*cap_total_s/cap_total_n, wil_lo*100, wil_hi*100, cap_total_s, cap_total_n,
+               (target_met?"yes":"NO"), cap_total_summary, cap_total_mcp, reasons;
+      }
 
       # --- ADR-3 retrieval@scale token/cost (docs/eval/2026-06-19-*) ----------
       # Accuracy is the PRIMARY axis (the dimension verdict above); cost
@@ -303,6 +354,71 @@ aggregate_scorecard() {
   ' "$tsv"
 }
 
+capture_fidelity_from_json() { # expect forbid json_file -> cap_fidelity<TAB>reason<TAB>summary_count<TAB>mcp_bypass_count
+  python3 - "$1" "$2" "$3" <<'PY'
+import json, sys
+
+expect, forbid, path = sys.argv[1], sys.argv[2], sys.argv[3]
+try:
+    data = json.load(open(path))
+except Exception:
+    print("0\tcap_list_error\t0\t0")
+    raise SystemExit(0)
+
+notes = data.get("memories", data) if isinstance(data, dict) else data
+if not isinstance(notes, list):
+    print("0\tcap_list_error\t0\t0")
+    raise SystemExit(0)
+
+def live(note):
+    return isinstance(note, dict) and note.get("archived_at") is None
+
+def hay(note):
+    return f"{note.get('content') or ''}\n{note.get('summary') or ''}".lower()
+
+def contains(note, token):
+    return bool(token) and token.lower() in hay(note)
+
+live_notes = [n for n in notes if live(n)]
+summaries = [
+    n for n in live_notes
+    if n.get("origin_source") == "hook" and "session-summary" in (n.get("tags") or [])
+]
+mcp_bypass = [
+    n for n in live_notes
+    if n.get("origin_source") == "mcp" and contains(n, expect)
+]
+
+has_expect = any(contains(n, expect) for n in summaries)
+has_forbid = bool(forbid) and any(contains(n, forbid) for n in summaries)
+
+reason = "cap_summary_missing_fact"
+fidelity = 0
+if mcp_bypass:
+    reason = "cap_mcp_bypass_detected"
+elif not summaries:
+    reason = "cap_no_session_summary"
+elif has_expect:
+    # The decided value WAS captured. A correct summary that names the rejected
+    # alternative in passing ("use ureq, not reqwest") must not false-fail, so
+    # expect-present wins over forbid-present -- the same rationale the freshness
+    # dimension uses to omit `forbid` entirely.
+    reason = "cap_ok"
+    fidelity = 1
+elif has_forbid:
+    # No summary captured the decided value AND one recorded the rejected
+    # alternative instead: the hook captured the WRONG decision.
+    reason = "cap_forbidden_token"
+
+print(f"{fidelity}\t{reason}\t{len(summaries)}\t{len(mcp_bypass)}")
+PY
+}
+
+reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
+  local mb="$1"
+  printf '%s\t%s\t%s\t%s\n' "$mb/ha" "$mb/pa" "$mb/hb" "$mb/pb"
+}
+
 # ---- self-test (no API) ------------------------------------------------------
 self_test() {
   echo "== memory-scorecard self-test (judge + scorecard math; no API) =="
@@ -320,12 +436,13 @@ self_test() {
   check "acted on stale (memory-on) => fail + mie"          "0 1" "$(judge_text "$tmp/old.txt"       ureq '' reqwest memory-on)"
   check "acted on stale (baseline) => fail, no mie"         "0 0" "$(judge_text "$tmp/old.txt"       ureq '' reqwest steelman-baseline)"
 
-  # Emit one 13-field results row; the trailing ADR-3 fields default to a
-  # cost/cache-free, no-error session so the scorecard-math fixtures stay terse.
-  # sc_row dim scenario arm run success turns mie [cost in cc cr out is_err]
+  # Emit one results row; the trailing ADR-3 and Class-B capture fields default
+  # to a cost/cache-free, no-error, non-capture session so fixtures stay terse.
+  # sc_row dim scenario arm run success turns mie [cost in cc cr out is_err cap_fid cap_reason cap_summary cap_mcp]
   sc_row() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-      "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-0}" "${9:-0}" "${10:-0}" "${11:-0}" "${12:-0}" "${13:-false}"
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+      "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-0}" "${9:-0}" "${10:-0}" "${11:-0}" "${12:-0}" "${13:-false}" \
+      "${14:-na}" "${15:-na}" "${16:-0}" "${17:-0}"
   }
 
   # gen_corpus: deterministic, off-topic, emits exactly N lines.
@@ -345,6 +462,93 @@ self_test() {
   if grep -qF 'service-svc-' "$wd/realistic.md" && ! grep -qiF ureq "$wd/realistic.md"; then echo "ok: write_claude_md realistic = distractors only (target omitted)"; else echo "BUG: realistic CLAUDE.md"; fail=1; fi
   if grep -qiF ureq "$wd/steelman.md" && grep -qF 'service-svc-' "$wd/steelman.md"; then echo "ok: write_claude_md steelman = target + distractors"; else echo "BUG: steelman CLAUDE.md"; fail=1; fi
   if [ ! -f "$wd/none.md" ]; then echo "ok: write_claude_md writes nothing when body + distractors empty"; else echo "BUG: empty write_claude_md created a file"; fail=1; fi
+
+  # Class B direct capture parser: only live hook-origin session summaries count;
+  # MCP-origin target memories are reported as bypasses, never a capture pass.
+  local capj="$tmp/capture.json"
+  printf '%s\n' '[{"content":"Decision: use ureq for HTTP","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":null}]' > "$capj"
+  check "capture parser accepts hook session-summary" "$(printf '1\tcap_ok\t1\t0')" "$(capture_fidelity_from_json ureq "" "$capj")"
+  printf '%s\n' '[{"content":"Decision: use ureq for HTTP","summary":"","tags":["session-summary"],"origin_source":"mcp","archived_at":null}]' > "$capj"
+  check "capture parser detects MCP bypass" "$(printf '0\tcap_mcp_bypass_detected\t0\t1')" "$(capture_fidelity_from_json ureq "" "$capj")"
+  printf '%s\n' '[{"content":"Decision: use reqwest for HTTP","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":null}]' > "$capj"
+  check "capture parser catches missing expected fact" "$(printf '0\tcap_summary_missing_fact\t1\t0')" "$(capture_fidelity_from_json ureq "" "$capj")"
+  # Forbidden token fires only when the decided value was NOT captured and the
+  # rejected alternative was: content names reqwest (forbid) but not ureq (expect).
+  check "capture parser catches forbidden token" "$(printf '0\tcap_forbidden_token\t1\t0')" "$(capture_fidelity_from_json ureq reqwest "$capj")"
+  # A correct summary that names the rejected alternative in passing must PASS:
+  # expect present wins over forbid present, so this is cap_ok, not a false-fail.
+  printf '%s\n' '[{"content":"Decision: use ureq, not reqwest","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":null}]' > "$capj"
+  check "capture parser passes correct fact that names the alternative" "$(printf '1\tcap_ok\t1\t0')" "$(capture_fidelity_from_json ureq reqwest "$capj")"
+  printf '%s\n' '[{"content":"Decision: use ureq for HTTP","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":"2026-06-23T00:00:00Z"}]' > "$capj"
+  check "capture parser ignores archived summaries" "$(printf '0\tcap_no_session_summary\t0\t0')" "$(capture_fidelity_from_json ureq "" "$capj")"
+
+  # Class R pure layout invariant: identity A and B get distinct homes/projects.
+  local ha pa hb pb
+  IFS=$'\t' read -r ha pa hb pb < <(reach_identity_paths "$tmp/on")
+  if [ "$ha" = "$tmp/on/ha" ] && [ "$pa" = "$tmp/on/pa" ] && [ "$hb" = "$tmp/on/hb" ] && [ "$pb" = "$tmp/on/pb" ] \
+     && [ "$ha" != "$hb" ] && [ "$pa" != "$pb" ]; then
+    echo "ok: reach identity layout uses separate A/B homes and projects"
+  else
+    echo "BUG: reach identity layout"; fail=1
+  fi
+
+  # Scenario-file contracts for the B/R additions. This is intentionally no-API:
+  # it catches schema drift, answer leakage in realistic reach baselines, and
+  # explicit-plant bypasses in auto-capture rows. Unlike the rest of the self-test
+  # this reads the on-disk scenarios file, so guard its presence with a clear
+  # message instead of letting python die on an unactionable traceback.
+  if [ ! -f "$SCENARIOS_FILE" ]; then
+    echo "BUG: scenarios file not found at '$SCENARIOS_FILE' (set --scenarios-file)"; fail=1
+  elif python3 - "$SCENARIOS_FILE" <<'PY'
+import json, sys
+path = sys.argv[1]
+data = json.load(open(path))
+scenarios = data.get("scenarios", [])
+errors = []
+
+captures = [s for s in scenarios if s.get("dimension") == "capture"]
+if len(captures) < 3:
+    errors.append(f"need >=3 capture scenarios, got {len(captures)}")
+for s in captures:
+    sid = s.get("id", "<missing>")
+    if s.get("plant_mode") != "auto-capture":
+        errors.append(f"{sid}: capture scenario must use plant_mode=auto-capture")
+    if not s.get("plant_session"):
+        errors.append(f"{sid}: auto-capture scenario needs plant_session")
+    if s.get("plant") not in (None, "", []):
+        errors.append(f"{sid}: auto-capture scenario must not have explicit plant")
+    if not (s.get("capture_expect") or s.get("expect")):
+        errors.append(f"{sid}: capture scenario needs capture_expect or expect")
+
+reaches = [s for s in scenarios if s.get("dimension") == "reach"]
+if len(reaches) < 3:
+    errors.append(f"need >=3 reach scenarios, got {len(reaches)}")
+for s in reaches:
+    sid = s.get("id", "<missing>")
+    expect = str(s.get("expect") or "").lower()
+    realistic = str(s.get("realistic_claude_md") or "").lower()
+    steelman = str(s.get("steelman_claude_md") or "").lower()
+    if s.get("plant_mode") != "explicit":
+        errors.append(f"{sid}: reach scenario must use explicit plant")
+    plant = s.get("plant")
+    if not isinstance(plant, list) or not plant:
+        errors.append(f"{sid}: reach scenario needs non-empty plant array")
+    if expect and expect in realistic:
+        errors.append(f"{sid}: realistic B CLAUDE.md leaks expect token")
+    if expect and expect not in steelman:
+        errors.append(f"{sid}: steelman B CLAUDE.md must contain expect token")
+
+if errors:
+    for e in errors:
+        print("BUG:", e)
+    raise SystemExit(1)
+print("ok: scenario contracts cover Class B capture and Class R reach")
+PY
+  then
+    :
+  else
+    fail=1
+  fi
 
   # extract_usage: reads the session-aggregate cache buckets from the result
   # record; a non-parseable log yields the worst-case sentinel + is_error=true.
@@ -376,6 +580,49 @@ self_test() {
   if aggregate_scorecard "$good" 0.10 1 | grep -q '\-> freshness:.*=> PASS'; then echo "ok: dimension passes when it beats realistic + ties steelman"; else echo "BUG: dimension did not pass"; fail=1; fi
   # A Class-C-only scorecard must NOT print the ADR-3 retrieval@scale block.
   if aggregate_scorecard "$good" 0.10 1 | grep -q 'ADR-3 retrieval@scale'; then echo "BUG: ADR-3 block printed without retrieval_scale data"; fail=1; else echo "ok: ADR-3 block omitted when no retrieval_scale dimension"; fi
+
+  # Class B capture aggregation: capture fields are appended after the stable
+  # 13 scorecard fields and roll up independently from end-to-end success.
+  local capagg="$tmp/capagg.tsv"
+  {
+    sc_row capture cap-one memory-on          1 1 2 0 0 0 0 0 0 false 1 cap_ok 1 0
+    sc_row capture cap-one realistic-baseline 1 0 2 0
+    sc_row capture cap-one steelman-baseline  1 1 2 0
+    sc_row capture cap-one memory-off         1 0 2 0
+    sc_row capture cap-two memory-on          1 0 2 0 0 0 0 0 0 false 0 cap_summary_missing_fact 1 0
+    sc_row capture cap-two realistic-baseline 1 0 2 0
+    sc_row capture cap-two steelman-baseline  1 1 2 0
+    sc_row capture cap-two memory-off         1 0 2 0
+  } > "$capagg"
+  local capout; capout="$(aggregate_scorecard "$capagg" 0.10 1)"
+  if printf '%s' "$capout" | grep -qF 'Class B capture fidelity'; then echo "ok: capture aggregation block prints"; else echo "BUG: capture aggregation block missing"; printf '%s\n' "$capout"; fail=1; fi
+  if printf '%s' "$capout" | grep -qF 'capture fidelity: 50%'; then echo "ok: capture aggregation reports aggregate rate"; else echo "BUG: capture aggregate rate"; printf '%s\n' "$capout"; fail=1; fi
+
+  # Class B verdict: downstream recall can beat/tie baselines while direct
+  # capture fidelity is still below the tracked >=80% target; that must NOT mark
+  # the capture dimension as passing.
+  local caplow="$tmp/caplow.tsv"
+  {
+    sc_row capture cap-one memory-on          1 1 2 0 0 0 0 0 0 false 1 cap_ok 1 0
+    sc_row capture cap-one realistic-baseline 1 0 2 0
+    sc_row capture cap-one steelman-baseline  1 1 2 0
+    sc_row capture cap-one memory-off         1 0 2 0
+    sc_row capture cap-two memory-on          1 1 2 0 0 0 0 0 0 false 0 cap_summary_missing_fact 1 0
+    sc_row capture cap-two realistic-baseline 1 0 2 0
+    sc_row capture cap-two steelman-baseline  1 1 2 0
+    sc_row capture cap-two memory-off         1 0 2 0
+  } > "$caplow"
+  local caplow_out; caplow_out="$(aggregate_scorecard "$caplow" 0.10 1)"
+  if printf '%s' "$caplow_out" | grep -q '\-> capture:.*capture_fidelity_target=NO.*=> no'; then echo "ok: capture dimension fails when direct fidelity target is missed"; else echo "BUG: capture dimension passed despite low direct fidelity"; printf '%s\n' "$caplow_out"; fail=1; fi
+
+  local caphigh="$tmp/caphigh.tsv"
+  {
+    sc_row capture cap-one memory-on          1 1 2 0 0 0 0 0 0 false 1 cap_ok 1 0
+    sc_row capture cap-one realistic-baseline 1 0 2 0
+    sc_row capture cap-one steelman-baseline  1 1 2 0
+    sc_row capture cap-one memory-off         1 0 2 0
+  } > "$caphigh"
+  if aggregate_scorecard "$caphigh" 0.10 1 | grep -q '\-> capture:.*capture_fidelity_target=yes.*=> PASS'; then echo "ok: capture dimension passes when downstream and direct fidelity targets pass"; else echo "BUG: capture dimension did not pass with high direct fidelity"; aggregate_scorecard "$caphigh" 0.10 1; fail=1; fi
 
   # RE-RIG GUARD: memory beats realistic but LOSES to steelman => dimension must NOT pass.
   local rig="$tmp/rig.tsv"
@@ -532,7 +779,8 @@ done
 if [ "$MODE" = "self-test" ]; then self_test; exit $?; fi
 
 # ---- live run prerequisites (the four-arm runner; needs API) -----------------
-[ -n "$BIN_DIR" ] || { echo "need --bin-dir (or --self-test)" >&2; exit 2; }
+[ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
+[ -d "$BIN_DIR" ] || { echo "bin dir not found: $BIN_DIR (build first with 'cargo build --release', or pass --bin-dir DIR)" >&2; exit 1; }
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 for bin in rusty-brain rusty-brain-hooks rusty-brain-install; do
   [ -x "$BIN_DIR/$bin" ] || { echo "missing binary: $BIN_DIR/$bin" >&2; exit 1; }
@@ -580,11 +828,19 @@ run_session() { # home proj prompt log [extra args...]
   )
 }
 
-install_rusty_brain() { # home proj
+install_claude_hooks() { # home proj
   local home="$1" proj="$2"
   (
     export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
     rusty-brain-install install --agents claude-code >/dev/null
+  )
+}
+
+install_rusty_brain() { # home proj
+  local home="$1" proj="$2"
+  install_claude_hooks "$home" "$proj"
+  (
+    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
     python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
 import json, sys
 sp, mp, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -595,15 +851,32 @@ PY
   )
 }
 
-# Score one work session and append a 13-field scorecard row. The session runs
+install_rusty_brain_hooks_only() { # home proj
+  local home="$1" proj="$2"
+  install_claude_hooks "$home" "$proj"
+  rm -f "$proj/.mcp.json"
+  python3 - "$proj/.claude/settings.json" <<'PY'
+import json, os, sys
+p = sys.argv[1]
+if not os.path.exists(p):
+    raise SystemExit(0)
+s = json.load(open(p))
+s.pop("enableAllProjectMcpServers", None)
+json.dump(s, open(p, "w"), indent=2)
+PY
+}
+
+# Score one work session and append a scorecard row. The first 13 fields are
+# stable; Class B capture metrics append four fields after them. The session runs
 # under `--output-format stream-json --verbose` so the final result record
 # carries num_turns, total_cost_usd, AND the session-aggregate cache buckets
 # (ADR-3, docs/eval/2026-06-19-*); extract_usage reads them. The judged text is
 # the model OUTPUT only: the final `.result` plus files written this session
 # (mtime newer than a marker, size-capped) — never the seeded CLAUDE.md, so the
 # baselines' planted distractors/target are not self-graded.
-score_session() { # dim id arm run proj home work expect forbid stale
+score_session() { # dim id arm run proj home work expect forbid stale [cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count]
   local dim="$1" id="$2" arm="$3" run="$4" proj="$5" home="$6" work="$7" expect="$8" forbid="$9" stale="${10}"
+  local cap_fidelity="${11:-na}" cap_reason="${12:-na}" cap_summary_count="${13:-0}" cap_mcp_bypass_count="${14:-0}"
   local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark"
   : > "$marker"
   run_session "$home" "$proj" "$work" "$jlog" --output-format stream-json --verbose
@@ -623,10 +896,15 @@ score_session() { # dim id arm run proj home work expect forbid stale
   success="${res% *}"; mie="${res#* }"
   # A server-level error forces failure: it must never look like a cheap success.
   if [ "$is_err" = "true" ]; then success=0; fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$dim" "$id" "$arm" "$run" "$success" "$turns" "$mie" \
-    "$cost" "$inp" "$cc" "$cr" "$out" "$is_err" >> "$RESULTS"
-  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=$mie"
+    "$cost" "$inp" "$cc" "$cr" "$out" "$is_err" \
+    "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count" >> "$RESULTS"
+  local cap_msg=""
+  if [ "$cap_fidelity" != "na" ]; then
+    cap_msg=" cap=$cap_fidelity/$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
+  fi
+  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=$mie$cap_msg"
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array
@@ -680,9 +958,45 @@ plant_corpus_distractors() { # home scenario_id n
   )
 }
 
+measure_capture_fidelity() { # home expect forbid
+  local home="$1" expect="$2" forbid="$3"
+  local out err result reason last=""
+  # The SessionEnd summary is written asynchronously by the hook, so poll the
+  # store until a definite verdict lands (CAP_POLL_MAX * CAP_POLL_SECS budget).
+  local CAP_POLL_MAX=50 CAP_POLL_SECS=0.2
+  out="$(mktemp "${TMPDIR:-/tmp}/rb-scorecard-list.XXXXXX.json")"
+  err="$(mktemp "${TMPDIR:-/tmp}/rb-scorecard-list.XXXXXX.err")"
+  for _ in $(seq 1 "$CAP_POLL_MAX"); do
+    if ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"; rusty-brain --json list --limit 1000 >"$out" 2>"$err" ); then
+      result="$(capture_fidelity_from_json "$expect" "$forbid" "$out")"
+      last="$result"
+      reason="$(cut -f2 <<<"$result")"
+      case "$reason" in
+        cap_ok|cap_forbidden_token|cap_summary_missing_fact|cap_mcp_bypass_detected)
+          rm -f "$out" "$err"
+          printf '%s\n' "$result"
+          return 0
+          ;;
+      esac
+    else
+      last="$(printf '0\tcap_list_error\t0\t0')"
+    fi
+    sleep "$CAP_POLL_SECS"
+  done
+  rm -f "$out" "$err"
+  # Budget exhausted without a terminal verdict. If the store was readable but the
+  # async SessionEnd summary never landed (cap_no_session_summary, or no poll ever
+  # recorded a state), that is a real timeout; a persistent list failure keeps its
+  # own cap_list_error so the report distinguishes "slow hook" from "broken store".
+  case "$(cut -f2 <<<"$last")" in
+    cap_no_session_summary|"") printf '0\tcap_timeout\t0\t0\n' ;;
+    *)                         printf '%s\n' "$last" ;;
+  esac
+}
+
 run_scenario() { # row
   local row="$1"
-  local id dim plant_mode work expect forbid stale realistic steelman facts corpus
+  local id dim plant_mode work expect forbid stale realistic steelman facts corpus plant_session capture_expect capture_forbid
   id="$(jq -r '.id' <<<"$row")"; dim="$(jq -r '.dimension' <<<"$row")"
   plant_mode="$(jq -r '.plant_mode' <<<"$row")"
   work="$(jq -r '.work' <<<"$row")"; expect="$(jq -r '.expect' <<<"$row")"
@@ -690,6 +1004,9 @@ run_scenario() { # row
   realistic="$(jq -r '.realistic_claude_md // ""' <<<"$row")"
   steelman="$(jq -r '.steelman_claude_md // ""' <<<"$row")"
   facts="$(jq -c '.plant // []' <<<"$row")"
+  plant_session="$(jq -r '.plant_session // ""' <<<"$row")"
+  capture_expect="$(jq -r '.capture_expect // .expect // ""' <<<"$row")"
+  capture_forbid="$(jq -r '.capture_forbid // ""' <<<"$row")"
   # corpus_size (Class A): N off-topic distractors that bury the target. Generated
   # ONCE per scenario (deterministic, seeded by id) so every run + arm sees the
   # same corpus. 0 (default, e.g. Class C) => no distractors, behavior unchanged.
@@ -706,8 +1023,13 @@ run_scenario() { # row
     # see the sibling under `set -u` (b errors as unbound).
     local mb="$base/on"
     local db="$mb/memory.db" ns="rb-sc-$id-r$run"
-    local wh="$mb/hw" wp="$mb/wp"; seed_home "$wh"; mkdir -p "$wp"
-    install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
+    # reach scores identity B (hb/pb) and uses the per-arm baseline homes, so the
+    # shared work home/project here is only set up for the non-reach dimensions.
+    local wh="$mb/hw" wp="$mb/wp"
+    if [ "$dim" != "reach" ]; then
+      seed_home "$wh"; mkdir -p "$wp"
+      install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
+    fi
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     (
       # Put the built binary FIRST on PATH (as run_session/install/plant_explicit
@@ -747,13 +1069,39 @@ run_scenario() { # row
         echo "----- end daemon output -----" >&2
         exit 1
       fi
-      if [ "$plant_mode" = "explicit" ]; then
-        plant_explicit "$wh" "$facts"
-        # Class A: bury the planted target under the distractor corpus (bulk-load).
-        plant_corpus_distractors "$wh" "$id" "$corpus"
+      local cap_fidelity="na" cap_reason="na" cap_summary_count="0" cap_mcp_bypass_count="0"
+      if [ "$dim" = "reach" ]; then
+        # Identity A plants from its home only (plant_explicit needs no project),
+        # so pa is intentionally unused; only B gets a project to be scored in.
+        local ha pa hb pb
+        IFS=$'\t' read -r ha pa hb pb < <(reach_identity_paths "$mb")
+        : "$pa" # tab-split placeholder; A needs no project dir
+        seed_home "$ha"; seed_home "$hb"; mkdir -p "$pb"
+        install_rusty_brain "$hb" "$pb"; rm -f "$pb/CLAUDE.md"; rm -rf "$pb/.claude/skills"
+        plant_explicit "$ha" "$facts"
+        score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale"
+      else
+        if [ "$plant_mode" = "explicit" ]; then
+          plant_explicit "$wh" "$facts"
+          # Class A: bury the planted target under the distractor corpus (bulk-load).
+          plant_corpus_distractors "$wh" "$id" "$corpus"
+        elif [ "$plant_mode" = "auto-capture" ]; then
+          local ph="$mb/hp" pp="$mb/pp" plog="$mb/plant.jsonl"
+          seed_home "$ph"; mkdir -p "$pp"
+          install_rusty_brain_hooks_only "$ph" "$pp"; rm -f "$pp/CLAUDE.md"; rm -rf "$pp/.claude/skills"
+          # Auto-capture plant: a real Claude Code session whose SessionEnd hook
+          # (no MCP) is the only path that writes memory for this dimension.
+          run_session "$ph" "$pp" "$plant_session" "$plog" --output-format stream-json --verbose
+          IFS=$'\t' read -r cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count \
+            < <(measure_capture_fidelity "$wh" "$capture_expect" "$capture_forbid")
+          echo "   [$dim/$id memory-on r$run] capture_fidelity=$cap_fidelity reason=$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
+        else
+          echo "ERROR: unknown plant_mode '$plant_mode' for $id" >&2
+          exit 1
+        fi
+        score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale" \
+          "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count"
       fi
-      # (auto-capture mode: a plant session would run here — wired with dimension B.)
-      score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale"
     )
     rm -rf "$sockdir" 2>/dev/null || true
 
