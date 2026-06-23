@@ -338,6 +338,8 @@ Expected: FAIL — `opencode_plugin_src: command not found` and the plugin-file 
 
 Create `scripts/fixtures/opencode-logger/plugin.js`. This is the committed reference copy (the harness rewrites the log dir at record time via `opencode_plugin_src`). It maps each event to a per-event file and appends the raw payload as one JSON line:
 
+> **NOTE (superseded draft):** the snippet below is the original sketch and is INCOMPLETE — the shipped `scripts/fixtures/opencode-logger/plugin.js` additionally registers a dedicated `"tool.execute.after"` hook slot (it is NOT part of the SDK `Event` union, so the generic `event` handler never receives it — and the Step 1 `grep -qE '"tool\.execute\.after"\s*:'` self-test would FAIL against this draft), renames `log()` to `write()`, adds a `flattenEvent()` helper, and provides a default export. See the committed `scripts/fixtures/opencode-logger/plugin.js` for the authoritative code.
+
 ```javascript
 // OpenCode fixture-recording plugin. Recording aid ONLY — not the production
 // integration (rb-install opencode support stays deferred). Writes each hook
@@ -369,6 +371,8 @@ export const FixtureLogger = async () => ({
 - [ ] **Step 4: Create the plugin README**
 
 Create `scripts/fixtures/opencode-logger/README.md`:
+
+> **NOTE (superseded draft):** this template predates the stable-recorder-home redesign. The shipped `scripts/fixtures/opencode-logger/README.md` says the plugin is copied into the recorder project (a STABLE recorder home OUTSIDE the repo with the operator's auth copied in, mode 0600), runs `opencode run --format json` with all XDG dirs redirected to the recorder home — not a "throwaway project". See the committed README for accurate wording.
 
 ```markdown
 # OpenCode fixture-recording plugin
@@ -549,6 +553,8 @@ Run: `bash scripts/record-agent-fixtures.sh --self-test`
 Expected: FAIL — `record_cli_for: command not found`.
 
 - [ ] **Step 3: Implement the CLI map, preflight, and `record_live`**
+
+> **NOTE (superseded draft — do NOT follow this body):** the `record_live` below is the PRE-REDESIGN sketch. It uses a throwaway `mktemp` HOME (`export HOME=...`) and runs bare `codex exec`/`opencode run` with no `CODEX_HOME`/XDG redirect and no hook-trust guard. The shipped implementation is the OPPOSITE per the binding decision (Global Constraints / Task 9): it calls `recorder_home()` for the STABLE per-agent home OUTSIDE the repo, delegates to `setup_codex_home()` / `setup_opencode_home()` to seed copied auth (0600) + directory trust + logging hooks, sets `CODEX_HOME="$rec"` (codex) / redirects all XDG dirs (opencode), refuses to record when `[hooks.state.]` hook trust is absent, and captures CLI output to a temp file INSIDE the recorder home before scrubbing into the repo. Use `scripts/record-agent-fixtures.sh` as the authoritative `record_live`/`setup_trust` source; the snippet below is kept only to show the TDD progression.
 
 ```bash
 record_cli_for() { case "$1" in codex) echo codex ;; opencode) echo opencode ;; *) echo "" ;; esac; }

@@ -19,3 +19,15 @@ Cargo.lock.orig
 # depth: if XDG_CACHE_HOME ever points inside the repo, never let it be committed.
 **/rusty-brain/fixture-record/
 .cache/
+# Live-recorded agent fixtures (scripts/record-agent-fixtures.sh --agent <a>).
+# These land inside the repo at crates/rb-hooks/tests/fixtures/{codex,opencode}/
+# but are NOT committed automatically: they may carry pre-scrub/pre-operator-
+# reviewed payloads, so a careless `git add -A` must never stage them. Only the
+# hand-curated README.md (and any explicitly-allowlisted fixture) is tracked.
+# Ignore the recorded artifacts; keep README.md tracked via the negations below.
+crates/rb-hooks/tests/fixtures/codex/*.json
+crates/rb-hooks/tests/fixtures/codex/result.jsonl
+crates/rb-hooks/tests/fixtures/opencode/*.json
+crates/rb-hooks/tests/fixtures/opencode/result.jsonl
+!crates/rb-hooks/tests/fixtures/codex/README.md
+!crates/rb-hooks/tests/fixtures/opencode/README.md

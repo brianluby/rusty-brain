@@ -170,7 +170,9 @@ dry_run_agent() { # agent out_dir
       ;;
     opencode)
       mkdir -p "$out/.opencode/plugin" "$out/raw"
-      opencode_plugin_src "$out/raw" > "$out/.opencode/plugin/fixture-logger.js"
+      # `.mjs` so the plugin is unambiguous ESM regardless of package.json (see
+      # setup_opencode_home).
+      opencode_plugin_src "$out/raw" > "$out/.opencode/plugin/fixture-logger.mjs"
       ;;
     *) echo "dry_run_agent: unknown agent $agent" >&2; return 1 ;;
   esac
@@ -265,9 +267,13 @@ setup_opencode_home() { # recorder_home
     || { echo "ERROR: missing ~/.local/share/opencode/auth.json; run \`opencode auth login\` first" >&2; return 1; }
   # account.json (active-provider index) is recommended so the provider list matches.
   copy_ro "$HOME/.local/share/opencode/account.json" "$rec/data/opencode/account.json" 2>/dev/null || true
-  # The recording plugin (registered via opencode.json's `plugin` array).
-  opencode_plugin_src "$raw" > "$proj/.opencode/plugin/fixture-logger.js"
-  printf '{"plugin":["./.opencode/plugin/fixture-logger.js"]}\n' > "$proj/opencode.json"
+  # The recording plugin (registered via opencode.json's `plugin` array). The
+  # output uses the `.mjs` extension so it is an unambiguous ESM module under
+  # any Bun version opencode bundles (the recorder project has no package.json
+  # `"type":"module"`, and a plain `.js` would be CJS by default in stricter
+  # runtimes — `.mjs` removes that ambiguity).
+  opencode_plugin_src "$raw" > "$proj/.opencode/plugin/fixture-logger.mjs"
+  printf '{"plugin":["./.opencode/plugin/fixture-logger.mjs"]}\n' > "$proj/opencode.json"
   echo "$proj"
 }
 
@@ -340,7 +346,13 @@ record_live() { # agent out_dir
   mkdir -p "$out"
   # A two-step prompt so the terminus event count can be compared against turns.
   local prompt="First run: echo hi via Bash. Then create a file notes.txt containing exactly: recorded. Do both."
+  # Capture raw CLI output to a temp file INSIDE the recorder home (outside the
+  # repo): if the harness is interrupted between CLI exit and the scrub pass,
+  # unscrubbed output (recorder-home path, session details, any echoed token)
+  # never lands in the working tree. The sanitized copy is written to
+  # $out/result.jsonl only after scrub succeeds.
   local result="$out/result.jsonl"
+  local raw_result="$rec/result.jsonl.raw"
   local proj raw
 
   case "$agent" in
@@ -368,7 +380,7 @@ record_live() { # agent out_dir
           --skip-git-repo-check \
           -c approval_policy="never" \
           -o "$proj/.last-message.txt" \
-          "$prompt" >"$result" 2>&1 || true
+          "$prompt" >"$raw_result" 2>&1 || true
       ;;
     opencode)
       proj="$(setup_opencode_home "$rec")" || return 1
@@ -383,7 +395,7 @@ record_live() { # agent out_dir
           XDG_STATE_HOME="$rec/state" XDG_CACHE_HOME="$rec/cache" \
           OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 \
           RB_FIXTURE_LOG_DIR="$raw" \
-          "$cli" run --format json --dir "$proj" "$prompt" ) >"$result" 2>&1 || true
+          "$cli" run --format json --dir "$proj" "$prompt" ) >"$raw_result" 2>&1 || true
       ;;
   esac
 
@@ -401,12 +413,14 @@ record_live() { # agent out_dir
     head -1 "$f" | scrub "$rec" "$real_home" > "$out/$stem.json"
     present="$present${present:+, }$stem"
   done
-  # Sanitize the result stream too (it can echo paths/secrets). Two simple
-  # commands (not `a && b`) so a scrub failure aborts under set -e instead of
-  # leaving the file unredacted.
-  if [ -f "$result" ]; then
-    scrub "$rec" "$real_home" < "$result" > "$result.tmp"
-    mv "$result.tmp" "$result"
+  # Sanitize the raw result stream (it can echo paths/secrets) from the temp
+  # file in the recorder home INTO the committed path. The unscrubbed raw never
+  # touches the repo; it is removed once the sanitized copy is written. Two
+  # simple commands (not `a && b`) so a scrub failure aborts under set -e
+  # instead of leaving an unredacted file behind.
+  if [ -f "$raw_result" ]; then
+    scrub "$rec" "$real_home" < "$raw_result" > "$result"
+    rm -f "$raw_result"
   fi
 
   # Terminus: count fired terminus events vs turns observed in the result.
@@ -493,7 +507,11 @@ self_test() {
   check "dry-run codex terminus.json is valid json" "0" "$(python3 -c 'import json,sys; json.load(sys.stdin)' < "$dr/codex/terminus.json"; echo $?)"
   check "dry-run codex README has files section" "1" "$(grep -cF '## Files' "$dr/codex/README.md")"
   dry_run_agent opencode "$dr/opencode"
-  check "dry-run emits opencode plugin" "1" "$( [ -f "$dr/opencode/.opencode/plugin/fixture-logger.js" ] && echo 1 || echo 0 )"
+  # The emitted plugin uses the .mjs extension (unambiguous ESM; the recorder
+  # project has no package.json "type":"module"). opencode.json must reference
+  # the .mjs path, not a plain .js.
+  check "dry-run emits opencode plugin (.mjs)" "1" "$( [ -f "$dr/opencode/.opencode/plugin/fixture-logger.mjs" ] && echo 1 || echo 0 )"
+  check "dry-run emits no plain .js plugin" "0" "$( [ -f "$dr/opencode/.opencode/plugin/fixture-logger.js" ] && echo 1 || echo 0 )"
   check "dry-run emits opencode README" "1" "$( [ -f "$dr/opencode/README.md" ] && echo 1 || echo 0 )"
   check "dry-run emits opencode terminus.json" "1" "$( [ -f "$dr/opencode/terminus.json" ] && echo 1 || echo 0 )"
   rm -rf "$dr"
@@ -504,6 +522,29 @@ self_test() {
   record_live nonexistent-agent "/tmp/rb-guard-should-not-exist" >/dev/null 2>&1 || guard_rc=$?
   check "record_live refuses absent CLI" "1" "$guard_rc"
   check "record_live wrote nothing for absent CLI" "0" "$( [ -d "/tmp/rb-guard-should-not-exist" ] && echo 1 || echo 0 )"
+  # record_live must ALSO refuse when codex IS on PATH but the recorder
+  # config.toml has no persisted [hooks.state.] hook trust (the realistic
+  # operator error: --setup-trust codex never run / trust never approved). This
+  # is the fail-closed guard against silently producing empty fixtures. Mock a
+  # codex on PATH (answers --version), point HOME at a dir holding .codex/auth.json
+  # so setup_codex_home's required auth copy succeeds, and point XDG_CACHE_HOME at
+  # an isolated recorder root. setup_codex_home regenerates config.toml WITHOUT a
+  # [hooks.state.] stanza, so the guard must trip (rc=1) and write no out dir.
+  local tg_bin tg_home tg_cache tg_out tg_rc=0
+  tg_bin="$(mktemp -d "${TMPDIR:-/tmp}/rb-tg-bin.XXXXXX")"
+  tg_home="$(mktemp -d "${TMPDIR:-/tmp}/rb-tg-home.XXXXXX")"
+  tg_cache="$(mktemp -d "${TMPDIR:-/tmp}/rb-tg-cache.XXXXXX")"
+  tg_out="$(mktemp -d "${TMPDIR:-/tmp}/rb-tg-out.XXXXXX")/codex"
+  printf '#!/bin/sh\necho "codex-cli 0.0.0-mock"\n' > "$tg_bin/codex"
+  chmod +x "$tg_bin/codex"
+  mkdir -p "$tg_home/.codex"
+  printf '{"OPENAI_API_KEY":"sk-mock-not-real"}\n' > "$tg_home/.codex/auth.json"
+  PATH="$tg_bin:$PATH" HOME="$tg_home" XDG_CACHE_HOME="$tg_cache" \
+    record_live codex "$tg_out" >/dev/null 2>&1 || tg_rc=$?
+  check "record_live refuses codex trust-not-done" "1" "$tg_rc"
+  check "record_live wrote no fixtures when trust missing" "0" \
+    "$( [ -f "$tg_out/README.md" ] || [ -f "$tg_out/result.jsonl" ] && echo 1 || echo 0 )"
+  rm -rf "$tg_bin" "$tg_home" "$tg_cache" "$(dirname "$tg_out")"
   check "codex cli name" "codex" "$(record_cli_for codex)"
   check "opencode cli name" "opencode" "$(record_cli_for opencode)"
   # recorder_home: STABLE per-agent home OUTSIDE the repo under the XDG cache
