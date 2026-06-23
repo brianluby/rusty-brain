@@ -378,6 +378,69 @@ mod tests {
     }
 
     #[test]
+    fn mark_checkpointed_on_fresh_scratch_sets_id_without_creating_stray_entries() {
+        // mark_checkpointed on a completely empty scratch (no appends, no prior
+        // id) must only set prior_summary_id — the observation buffer stays empty
+        // (is_empty considers the buffers, not the id).
+        let (_d, s) = scratch();
+        s.mark_checkpointed("mem-000");
+        let data = s.read();
+        assert!(data.files.is_empty());
+        assert!(data.commands.is_empty());
+        assert!(data.failures.is_empty());
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-000"));
+        assert!(data.is_empty(), "no observations recorded");
+    }
+
+    #[test]
+    fn mark_checkpointed_after_mark_folded_updates_the_id_without_restoring_buffer() {
+        // A SessionEnd (mark_folded) followed by a SessionCheckpoint
+        // (mark_checkpointed) with no new work: the buffer stays clear and only
+        // the id advances.
+        let (_d, s) = scratch();
+        s.append(Kind::File, "src/first.rs");
+        s.mark_folded(Some("end-id-1"));
+        let d1 = s.read();
+        assert!(d1.is_empty());
+        assert_eq!(d1.prior_summary_id.as_deref(), Some("end-id-1"));
+
+        s.mark_checkpointed("cp-id-2");
+        let d2 = s.read();
+        assert!(
+            d2.is_empty(),
+            "buffer stays empty after mark_checkpointed with no new appends"
+        );
+        assert_eq!(d2.prior_summary_id.as_deref(), Some("cp-id-2"));
+    }
+
+    #[test]
+    fn mark_checkpointed_supersedes_prior_id_from_mark_folded_with_new_appends() {
+        // Resume-after-fold: mark_folded clears + sets the id; a new append then a
+        // checkpoint must keep BOTH the post-fold entry AND the latest id, while
+        // the pre-fold entries stay cleared.
+        let (_d, s) = scratch();
+        s.append(Kind::Command, "cargo build");
+        s.mark_folded(Some("old-end-id"));
+        s.append(Kind::File, "src/new.rs");
+        s.mark_checkpointed("cp-id-after-resume");
+        let data = s.read();
+        assert_eq!(
+            data.files,
+            vec!["src/new.rs"],
+            "the post-fold append is retained"
+        );
+        assert!(
+            data.commands.is_empty(),
+            "pre-fold commands were cleared by mark_folded"
+        );
+        assert_eq!(
+            data.prior_summary_id.as_deref(),
+            Some("cp-id-after-resume"),
+            "mark_checkpointed advances the id from the prior mark_folded value"
+        );
+    }
+
+    #[test]
     fn mark_folded_with_none_clears_buffer() {
         let (_d, s) = scratch();
         s.append(Kind::Failure, "boom");

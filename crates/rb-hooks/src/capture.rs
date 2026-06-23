@@ -1739,6 +1739,14 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn session_checkpoint_without_scratch_continues() {
+        // No session id means scratch is None; the checkpoint must still
+        // continue (fail-open), never panic or block.
+        let result = session_checkpoint(None, None, std::path::Path::new("/tmp"), None).await;
+        assert!(result.continue_execution);
+    }
+
+    #[tokio::test]
     async fn session_checkpoint_with_nothing_to_fold_and_no_prior_id_is_a_noop() {
         // A fresh session that checkpoints before any tool runs: nothing to fold
         // and no prior id. Distinct from the End branch, which would write the

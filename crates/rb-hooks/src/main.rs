@@ -491,4 +491,63 @@ mod tests {
             stop_hook_active: false,
         }));
     }
+
+    #[test]
+    fn event_needs_daemon_is_true_for_all_store_events() {
+        // Every event that reads or writes the store must request a daemon
+        // connection. Adding a new store event without listing it here (or the
+        // inline comment in capture_phase) is the exact drift this pins down.
+        let store_events = [
+            HookEvent::SessionStart {
+                source: Some("startup".to_string()),
+            },
+            HookEvent::UserPromptSubmit {
+                prompt: Some("help me refactor".to_string()),
+            },
+            HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string()),
+            },
+            HookEvent::SessionCheckpoint { reason: None },
+            HookEvent::SessionEnd {
+                reason: Some("clear".to_string()),
+            },
+            HookEvent::PreCompact {
+                custom_instructions: None,
+            },
+        ];
+        for event in &store_events {
+            assert!(
+                event_needs_daemon(event),
+                "{event:?} must need the daemon (reads or writes the store)"
+            );
+        }
+    }
+
+    #[test]
+    fn event_needs_daemon_is_false_for_all_local_only_events() {
+        // Local-only events skip the connect cost; none read or write the store.
+        let local_events = [
+            HookEvent::PostToolUse {
+                tool_name: "Edit".to_string(),
+                tool_input: serde_json::json!({"file_path": "/x"}),
+                tool_response: serde_json::json!("ok"),
+            },
+            HookEvent::Stop {
+                last_assistant_message: None,
+                stop_hook_active: false,
+            },
+            HookEvent::Stop {
+                last_assistant_message: Some("done".to_string()),
+                stop_hook_active: true,
+            },
+            HookEvent::Other("UnknownEvent".to_string()),
+            HookEvent::Other(String::new()),
+        ];
+        for event in &local_events {
+            assert!(
+                !event_needs_daemon(event),
+                "{event:?} must NOT need the daemon (local-only, no store access)"
+            );
+        }
+    }
 }

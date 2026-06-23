@@ -193,4 +193,29 @@ mod tests {
         let ev = HookEvent::Other("UserPromptSubmit".to_string());
         assert_eq!(ev, HookEvent::Other("UserPromptSubmit".to_string()));
     }
+
+    #[test]
+    fn session_checkpoint_is_distinct_from_session_end_and_stop() {
+        // The three boundary variants serve different lifecycle roles (a
+        // non-terminal checkpoint, a true terminus, a per-turn stop) and must
+        // never compare equal — capture routes on exactly this distinction.
+        let checkpoint = HookEvent::SessionCheckpoint {
+            reason: Some("Stop".to_string()),
+        };
+        let session_end = HookEvent::SessionEnd {
+            reason: Some("Stop".to_string()),
+        };
+        let stop = HookEvent::Stop {
+            last_assistant_message: None,
+            stop_hook_active: false,
+        };
+        assert_ne!(
+            checkpoint, session_end,
+            "SessionCheckpoint must be distinct from SessionEnd"
+        );
+        assert_ne!(
+            checkpoint, stop,
+            "SessionCheckpoint must be distinct from Stop"
+        );
+    }
 }
