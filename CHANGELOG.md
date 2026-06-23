@@ -5,6 +5,19 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Cross-agent capability status
+
+- **Agent capability matrix**: `rb-agents` now exposes the current support state
+  for Claude Code, Codex, OpenCode, Gemini, and discovery-gated Hermes. The
+  matrix makes partial/unsupported capture, retrieval, config, and scorecard
+  capabilities explicit instead of implying parity.
+- **Scorecard agent targeting**: `scripts/memory-scorecard.sh --agent` now
+  accepts `claude-code`, `codex`, `opencode`, `gemini`, `hermes`, or `all`.
+  Claude Code runs the existing live scorecard; unsupported targets emit a
+  machine-readable skip line with agent, phase, status, reason, and detail.
+- **Hermes discovery note**: `docs/follow-ups/2026-06-23-hermes-discovery.md`
+  records the current known facts and blocks speculative hook/config constants.
+
 ### Added — W3.5 scorecard closeout
 
 - **W3.5 closeout artifact**:
