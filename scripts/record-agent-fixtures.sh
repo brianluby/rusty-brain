@@ -124,6 +124,76 @@ dry_run_agent() { # agent out_dir
   emit_readme "$agent" "$out" "dry-run (not recorded)" "ambiguous" "dry-run"
 }
 
+record_cli_for() { case "$1" in codex) echo codex ;; opencode) echo opencode ;; *) echo "" ;; esac; }
+
+seed_home() { mkdir -p "$1"; }
+
+# record_live <agent> <out_dir>: live recording path. Requires the agent CLI and
+# real auth. Runs entirely under a throwaway HOME so global agent state is never
+# touched. Captures raw per-event payloads, the headless result stream, counts
+# the terminus event across a multi-turn run, sanitizes, and writes fixtures.
+record_live() { # agent out_dir
+  local agent="$1" out="$2"
+  local cli; cli="$(record_cli_for "$agent")"
+  command -v "$cli" >/dev/null 2>&1 || { echo "ERROR: $cli not on PATH; cannot record $agent fixtures" >&2; return 1; }
+  local ver; ver="$("$cli" --version 2>/dev/null | head -1 || echo unknown)"
+
+  local work; work="$(mktemp -d "${TMPDIR:-/tmp}/rb-rec.XXXXXX")"
+  local home="$work/home" proj="$work/proj" raw="$work/raw"
+  seed_home "$home"; mkdir -p "$proj" "$raw"
+  mkdir -p "$out"
+
+  # A two-step prompt so the terminus event count can be compared against turns.
+  local prompt="First run: echo hi via Bash. Then create a file notes.txt containing exactly: recorded. Do both."
+  local result="$out/result.jsonl"
+
+  (
+    export HOME="$home"; cd "$proj" || exit 1
+    case "$agent" in
+      codex)
+        mkdir -p "$proj/.codex"
+        codex_hooks_json "$raw" > "$proj/.codex/hooks.json"
+        # Use codex's non-interactive exec with its machine-readable output flag.
+        # The exact flag is recorded in the README from `codex exec --help`.
+        codex exec "$prompt" >"$result" 2>&1 || true
+        ;;
+      opencode)
+        mkdir -p "$proj/.opencode/plugin"
+        export RB_FIXTURE_LOG_DIR="$raw"
+        opencode_plugin_src "$raw" > "$proj/.opencode/plugin/fixture-logger.js"
+        opencode run "$prompt" >"$result" 2>&1 || true
+        ;;
+    esac
+  )
+
+  # Sanitize each captured raw event into a committed single-line fixture.
+  local present="" stem ev terminus_stem
+  case "$agent" in
+    codex)    terminus_stem="stop" ;;
+    opencode) terminus_stem="session_idle" ;;
+  esac
+  for f in "$raw"/*.json; do
+    [ -e "$f" ] || continue
+    stem="$(basename "$f" .json)"
+    # Commit the FIRST captured line per event, sanitized (matches claude_code:
+    # one verbatim line per event).
+    head -1 "$f" | scrub "$home" > "$out/$stem.json"
+    present="$present${present:+, }$stem"
+  done
+  # Sanitize the result stream too (it can echo paths/secrets).
+  if [ -f "$result" ]; then scrub "$home" < "$result" > "$result.tmp" && mv "$result.tmp" "$result"; fi
+
+  # Terminus: count fired terminus events vs turns observed in the result.
+  local fired turns verdict
+  fired="$( [ -f "$raw/$terminus_stem.json" ] && grep -c . "$raw/$terminus_stem.json" || echo 0 )"
+  turns="$(grep -c . "$result" 2>/dev/null || echo 1)"
+  verdict="$(infer_terminus "$fired" "$turns")"
+
+  emit_readme "$agent" "$out" "$ver" "$verdict" "$present"
+  rm -rf "$work"
+  echo "recorded $agent fixtures under $out (events: ${present:-none}, terminus: $verdict)"
+}
+
 self_test() {
   echo "== record-agent-fixtures self-test (pure; no API) =="
   if agent_supported codex && agent_supported opencode && ! agent_supported gemini; then
@@ -170,6 +240,11 @@ self_test() {
   check "dry-run emits opencode plugin" "1" "$( [ -f "$dr/opencode/.opencode/plugin/fixture-logger.js" ] && echo 1 || echo 0 )"
   check "dry-run emits opencode README" "1" "$( [ -f "$dr/opencode/README.md" ] && echo 1 || echo 0 )"
   rm -rf "$dr"
+  # record_live must refuse to run when the agent CLI is absent (fail fast,
+  # never silently produce empty fixtures). Use a guaranteed-absent binary name.
+  ( cli_missing_msg() { record_cli_for nonexistent-agent; }; true )
+  check "codex cli name" "codex" "$(record_cli_for codex)"
+  check "opencode cli name" "opencode" "$(record_cli_for opencode)"
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
   echo "self-test FAIL" >&2; return 1
 }
