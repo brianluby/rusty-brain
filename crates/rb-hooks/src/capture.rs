@@ -1,7 +1,8 @@
 //! The capture flows, INVERTED for W3.1: SessionStart (inject context),
 //! PostToolUse (append a redacted observation to the per-session scratch — ZERO
 //! memories), Stop (store nothing), SessionEnd (fold scratch + transcript into
-//! ONE summary memory, update-as-supersede), PreCompact (one decision snapshot
+//! ONE summary memory, update-as-supersede), SessionCheckpoint (non-Claude
+//! fallback fold without clearing scratch), PreCompact (one decision snapshot
 //! from the transcript). Every flow returns a `HookResult` with
 //! `continue_execution: true`; nothing ever blocks.
 
@@ -551,15 +552,10 @@ async fn git_modified_files(cwd: &std::path::Path) -> Vec<String> {
 /// is honored defensively — a Stop the hook itself forced must never re-enter
 /// capture — though this flow writes nothing regardless. Always continues.
 ///
-/// KNOWN LIMITATION (W3.1 is Phase-3 "Claude Code value"): the non-Claude
-/// adapters map their terminal event to canonical `Stop` (Gemini `SessionEnd`,
-/// Codex `Stop`, OpenCode `session.idle`) and none emit a verified canonical
-/// `SessionEnd`, so those CLIs do NOT get the SessionEnd scratch fold yet — their
-/// PostToolUse scratch ages out unflushed. Folding on canonical `Stop` is unsafe
-/// because Claude's `Stop` is per-turn (it would over-capture), so restoring
-/// non-Claude capture needs each adapter to model its true session-end cadence.
-/// Tracked in `docs/follow-ups/2026-06-13-cross-cli-capture-inversion.md` — an
-/// explicit, non-silent gap, not an oversight.
+/// Non-Claude adapters may emit
+/// [`HookEvent::SessionCheckpoint`](rb_agents::HookEvent::SessionCheckpoint)
+/// once real fixtures verify an appropriate boundary. Until then, canonical
+/// `Stop` remains a pure no-op for every adapter.
 pub fn stop(stop_hook_active: bool) -> HookResult {
     if stop_hook_active {
         tracing::debug!("Stop with stop_hook_active=true: no capture (W3.1)");
@@ -612,19 +608,49 @@ pub async fn pre_compact(
     continue_only()
 }
 
-/// SessionEnd flow (W3.1): the single capture point. Fold the per-session
-/// scratch (files/commands/failures) + the transcript (goals/decisions) +
-/// working-tree changes into ONE summary memory. If a prior summary exists for
-/// this session (a resumed-then-re-ended session), supersede it
-/// (update-as-supersede) so exactly one live summary remains. The scratch is
-/// reset afterward, retaining the new summary id for a future resume. Always
-/// continues; with no scratch (no session id) or nothing worth summarizing,
-/// stores nothing.
+/// SessionEnd flow (W3.1): the single capture point for CLIs with a verified
+/// terminus. Fold the per-session scratch (files/commands/failures) + the
+/// transcript (goals/decisions) + working-tree changes into ONE summary memory.
+/// If a prior summary exists for this session (a resumed-then-re-ended session),
+/// supersede it (update-as-supersede) so exactly one live summary remains. The
+/// scratch is reset afterward, retaining the new summary id for a future resume.
+/// Always continues; with no scratch (no session id) or nothing worth
+/// summarizing, stores nothing.
 pub async fn session_end(
     client: Option<&mut DaemonClient>,
     scratch: Option<&Scratch>,
     cwd: &Path,
     transcript_path: Option<&Path>,
+) -> HookResult {
+    fold_session_summary(client, scratch, cwd, transcript_path, FoldMode::End).await
+}
+
+/// SessionCheckpoint flow: non-Claude fallback for CLIs that expose a
+/// best-available boundary but no fixture-verified true session terminus. It
+/// folds the same summary as [`session_end`], but retains scratch after storing
+/// so subsequent checkpoints preserve early observations and supersede the one
+/// live summary instead of creating unbounded live memories.
+pub async fn session_checkpoint(
+    client: Option<&mut DaemonClient>,
+    scratch: Option<&Scratch>,
+    cwd: &Path,
+    transcript_path: Option<&Path>,
+) -> HookResult {
+    fold_session_summary(client, scratch, cwd, transcript_path, FoldMode::Checkpoint).await
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldMode {
+    End,
+    Checkpoint,
+}
+
+async fn fold_session_summary(
+    client: Option<&mut DaemonClient>,
+    scratch: Option<&Scratch>,
+    cwd: &Path,
+    transcript_path: Option<&Path>,
+    mode: FoldMode,
 ) -> HookResult {
     let Some(scratch) = scratch else {
         return continue_only();
@@ -637,9 +663,11 @@ pub async fn session_end(
     };
 
     let Some(content) = build_session_summary(&data, &git_files, &transcript) else {
-        // Nothing worth folding: clear the buffer (keeping any prior id), write
-        // nothing.
-        scratch.mark_folded(data.prior_summary_id.as_deref());
+        // Nothing worth folding: a true SessionEnd clears the empty buffer; a
+        // checkpoint leaves it as-is because it is not a lifecycle terminus.
+        if mode == FoldMode::End {
+            scratch.mark_folded(data.prior_summary_id.as_deref());
+        }
         return continue_only();
     };
     let content = redact(&content);
@@ -654,9 +682,15 @@ pub async fn session_end(
     if let Some(new_id) =
         store_session_summary(client, content, data.prior_summary_id.as_deref()).await
     {
-        // Stored: reset the buffer, retaining the new id so a resumed session
-        // supersedes THIS summary instead of duplicating it.
-        scratch.mark_folded(Some(&new_id.to_string()));
+        let new_id = new_id.to_string();
+        match mode {
+            // Stored: reset the buffer, retaining the new id so a resumed session
+            // supersedes THIS summary instead of duplicating it.
+            FoldMode::End => scratch.mark_folded(Some(&new_id)),
+            // Stored: retain observations so the next checkpoint summary includes
+            // both early and late turns while superseding this live summary.
+            FoldMode::Checkpoint => scratch.mark_checkpointed(&new_id),
+        }
     }
     continue_only()
 }
@@ -896,6 +930,18 @@ mod tests {
         ] {
             assert!(!is_captured(t), "{t} (gemini) should not be captured");
         }
+    }
+
+    #[test]
+    fn codex_apply_patch_stays_blocked_without_a_real_fixture() {
+        let input = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observation("apply_patch", &input),
+            None,
+            "apply_patch must not capture until a real Codex PostToolUse fixture proves the payload"
+        );
     }
 
     #[test]
@@ -1598,6 +1644,31 @@ mod tests {
             "buffer is preserved on a degraded write"
         );
         assert_eq!(data.commands, vec!["cargo build"]);
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_preserves_scratch_on_a_degraded_write() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = scratch_at(tmp.path());
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        scratch.append(scratch::Kind::Command, "cargo build");
+        let result = session_checkpoint(None, Some(&scratch), tmp.path(), None).await;
+        assert!(result.continue_execution);
+        let data = scratch.read();
+        assert_eq!(data.files, vec!["src/lib.rs"]);
+        assert_eq!(data.commands, vec!["cargo build"]);
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_with_nothing_to_fold_does_not_clear_prior_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = scratch_at(tmp.path());
+        scratch.mark_checkpointed("mem-123");
+        let result = session_checkpoint(None, Some(&scratch), tmp.path(), None).await;
+        assert!(result.continue_execution);
+        let data = scratch.read();
+        assert!(data.is_empty());
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-123"));
     }
 
     #[tokio::test]

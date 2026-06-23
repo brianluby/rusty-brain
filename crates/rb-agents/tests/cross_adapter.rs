@@ -94,3 +94,48 @@ fn render_output_continue_is_true_for_all_four() {
         );
     }
 }
+
+#[test]
+fn non_claude_boundary_events_stay_stop_until_fixture_verified() {
+    let cases = [
+        (
+            AgentId::Gemini,
+            serde_json::json!({
+                "hook_event_name": "SessionEnd",
+                "cwd": "/proj",
+                "session_id": "s"
+            }),
+            "SessionEnd",
+        ),
+        (
+            AgentId::Codex,
+            serde_json::json!({
+                "hook_event_name": "Stop",
+                "cwd": "/proj",
+                "session_id": "s"
+            }),
+            "Stop",
+        ),
+        (
+            AgentId::OpenCode,
+            serde_json::json!({
+                "type": "session.idle",
+                "directory": "/proj",
+                "sessionID": "s"
+            }),
+            "session.idle",
+        ),
+    ];
+    for (id, raw, reason) in cases {
+        let cli = agent_for(id);
+        let ctx = cli.parse_input(&raw);
+        assert_eq!(
+            ctx.event,
+            HookEvent::Stop {
+                last_assistant_message: None,
+                stop_hook_active: false,
+            },
+            "{id:?} boundary {reason:?} must not checkpoint until a real fixture verifies it"
+        );
+    }
+}

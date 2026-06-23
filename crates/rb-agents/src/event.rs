@@ -28,6 +28,12 @@ pub enum HookEvent {
         last_assistant_message: Option<String>,
         stop_hook_active: bool,
     },
+    /// A best-available adapter-specific boundary for CLIs that do not expose a
+    /// verified session terminus. The runtime folds scratch into a live summary
+    /// here without clearing scratch, so later checkpoints supersede the prior
+    /// summary while preserving early observations. This is deliberately
+    /// distinct from [`SessionEnd`].
+    SessionCheckpoint { reason: Option<String> },
     /// The agent SESSION is ending (distinct from a per-turn [`Stop`]). This is
     /// W3.1's single capture point: the runtime folds the per-session scratch
     /// file + transcript into ONE summary memory here. `reason` is the CLI's

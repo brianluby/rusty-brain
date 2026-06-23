@@ -182,7 +182,7 @@ async fn capture_phase(
 ) -> HookResult {
     // W3.1: PostToolUse (scratch append) and Stop (no-op) never touch the
     // daemon, so they skip the connect cost entirely; only SessionStart /
-    // SessionEnd / PreCompact read or write the store.
+    // SessionCheckpoint / SessionEnd / PreCompact read or write the store.
     let mut client = if event_needs_daemon(&ctx.event) {
         DaemonClient::connect(
             socket,
@@ -200,13 +200,15 @@ async fn capture_phase(
 
 /// True for events that read or write the store (and so need a daemon
 /// connection): SessionStart (inject), UserPromptSubmit (recall + inject),
-/// SessionEnd (fold + store), PreCompact (store). Local-only events —
-/// PostToolUse (scratch append), Stop (no-op), Other — skip the connect.
+/// SessionCheckpoint/SessionEnd (fold + store), PreCompact (store). Local-only
+/// events — PostToolUse (scratch append), Stop (no-op), Other — skip the
+/// connect.
 fn event_needs_daemon(event: &HookEvent) -> bool {
     matches!(
         event,
         HookEvent::SessionStart { .. }
             | HookEvent::UserPromptSubmit { .. }
+            | HookEvent::SessionCheckpoint { .. }
             | HookEvent::SessionEnd { .. }
             | HookEvent::PreCompact { .. }
     )
@@ -476,5 +478,16 @@ mod tests {
             name, "rusty-brain-hooks",
             "auto-start must NOT target the hooks binary"
         );
+    }
+
+    #[test]
+    fn checkpoint_needs_daemon_but_stop_does_not() {
+        assert!(event_needs_daemon(&HookEvent::SessionCheckpoint {
+            reason: Some("Stop".to_string())
+        }));
+        assert!(!event_needs_daemon(&HookEvent::Stop {
+            last_assistant_message: Some("done".to_string()),
+            stop_hook_active: false,
+        }));
     }
 }

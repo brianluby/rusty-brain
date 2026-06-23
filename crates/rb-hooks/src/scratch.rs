@@ -143,6 +143,16 @@ impl Scratch {
         self.write(&data);
     }
 
+    /// Record the latest checkpoint summary id while retaining observations.
+    /// Used by non-Claude fallback boundaries where no true session terminus is
+    /// available: later checkpoints supersede the live summary without losing
+    /// early-session scratch entries.
+    pub fn mark_checkpointed(&self, summary_id: &str) {
+        let mut data = self.read();
+        data.prior_summary_id = Some(summary_id.to_string());
+        self.write(&data);
+    }
+
     /// Atomically write (temp file 0600 + rename), creating the parent 0700.
     /// Best-effort. The scratch holds best-effort-redacted plaintext, so it gets
     /// the same at-rest posture as the DB and socket: `docs/THREAT_MODEL.md`
@@ -340,6 +350,24 @@ mod tests {
             Some("mem-123"),
             "prior summary id survives a post-fold append"
         );
+    }
+
+    #[test]
+    fn mark_checkpointed_keeps_buffer_and_updates_summary_id() {
+        let (_d, s) = scratch();
+        s.append(Kind::File, "src/lib.rs");
+        s.append(Kind::Command, "cargo test");
+        s.mark_checkpointed("mem-123");
+        let data = s.read();
+        assert_eq!(data.files, vec!["src/lib.rs"]);
+        assert_eq!(data.commands, vec!["cargo test"]);
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-123"));
+
+        s.append(Kind::File, "src/main.rs");
+        s.mark_checkpointed("mem-456");
+        let data = s.read();
+        assert_eq!(data.files, vec!["src/lib.rs", "src/main.rs"]);
+        assert_eq!(data.prior_summary_id.as_deref(), Some("mem-456"));
     }
 
     #[test]
