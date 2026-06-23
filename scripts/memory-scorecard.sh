@@ -70,7 +70,7 @@ scorecard_skip_detail() { # agent
       printf 'OpenCode scorecard is blocked until the JS/TS plugin config path and lifecycle fixtures are implemented.'
       ;;
     gemini)
-      printf 'Gemini has an adapter, but the cross-agentic scorecard currently targets Claude Code, Codex, and OpenCode.'
+      printf 'Gemini has an adapter, but the cross-agentic scorecard currently supports only Claude Code; Gemini scorecard support is not yet implemented.'
       ;;
     hermes)
       printf 'Hermes is discovery-gated; no hook names, config paths, or lifecycle semantics are verified.'
@@ -838,7 +838,7 @@ if [ "$MODE" = "self-test" ]; then self_test; exit $?; fi
 
 if [ "$AGENT" = "all" ]; then
   echo "== memory-value scorecard agent target: all =="
-  PRE_SCORECARD_ROWS="$(scorecard_skip_line codex; scorecard_skip_line opencode)"
+  PRE_SCORECARD_ROWS="$(scorecard_skip_line codex; scorecard_skip_line opencode; scorecard_skip_line gemini; scorecard_skip_line hermes)"
   printf '%s\n' "$PRE_SCORECARD_ROWS"
   if [ -n "$OUT" ]; then
     printf '%s\n' "$PRE_SCORECARD_ROWS" > "$OUT"
