@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail). RETRIEVAL@SCALE (Class A, dimension `retrieval_scale`; redesign §A + ADR-3 in docs/eval/2026-06-19-*): one relevant fact buried among a large corpus. A scenario sets `corpus_size` to N (500+); the runner deterministically generates N OFF-TOPIC distractors (seeded by scenario id, fictional service ports — never colliding with an expect token) and (a) bulk-plants them into the memory-on store at importance 5 via `rusty-brain remember --batch` (one process for all N — a per-fact CLI call is dominated by process spawn at scale), under a single planted TARGET at importance 8; (b) writes them into BOTH baselines' CLAUDE.md so the buried target is the ONLY difference — `steelman_claude_md` holds the target + distractors (diligent human), `realistic_claude_md` is EMPTY so only distractors are written (the common 'nobody wrote it down' reality). Accuracy on the buried target is the PRIMARY axis; token cost is SECONDARY: every session runs under stream-json so the scorecard records total_cost_usd + the four cache buckets, and the `retrieval_scale` dimension prints an ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 / descope verdict comparing memory-on vs steelman on accuracy AND total_cost_usd within 20%). Class A plants no stale value, so it never contributes a memory-induced error; the hard gate stays zero MIE.",
+  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail). RETRIEVAL@SCALE (Class A, dimension `retrieval_scale`; redesign §A + ADR-3 in docs/eval/2026-06-19-*): one relevant fact buried among a large corpus. A scenario sets `corpus_size` to N (500+); the runner deterministically generates N OFF-TOPIC distractors (seeded by scenario id, fictional service ports — never colliding with an expect token) and (a) bulk-plants them into the memory-on store at importance 5 via `rusty-brain remember --batch` (one process for all N — a per-fact CLI call is dominated by process spawn at scale), under a single planted TARGET at importance 8; (b) writes them into BOTH baselines' CLAUDE.md so the buried target is the ONLY difference — `steelman_claude_md` holds the target + distractors (diligent human), `realistic_claude_md` is EMPTY so only distractors are written (the common 'nobody wrote it down' reality). Accuracy on the buried target is the PRIMARY axis; token cost is SECONDARY: every session runs under stream-json so the scorecard records total_cost_usd + the four cache buckets, and the `retrieval_scale` dimension prints an ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 / descope verdict comparing memory-on vs steelman on accuracy AND total_cost_usd within 20%). CAPTURE (Class B, dimension `capture`) uses `plant_mode:auto-capture`: a real Claude Code plant session with hooks only writes a SessionEnd summary, then the runner directly measures hook-origin `session-summary` fidelity from `rusty-brain --json list --limit 1000` before downstream recall. REACH (Class R, dimension `reach`) explicitly plants from identity A and scores only identity B with separate homes/projects sharing one DB, socket, and namespace. Class A/B/R plant no stale value, so they do not contribute memory-induced errors unless a scenario supplies stale_token; the hard gate stays zero MIE.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,
@@ -101,6 +101,78 @@
       "steelman_claude_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",
       "work": "Add serialization for a new `Envelope` message type that goes over our internal socket. Which serializer should it use?",
       "expect": "rmp"
+    },
+    {
+      "id": "cap-http-ureq",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "Create `docs/decision-http.md` containing exactly this project decision: outbound HTTP uses the `ureq` crate. Do not add extra alternatives.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Outbound HTTP uses the `ureq` crate.",
+      "work": "Choose the HTTP client for a new outbound call. Name the crate and show the dependency line.",
+      "expect": "ureq",
+      "capture_expect": "ureq",
+      "capture_forbid": "reqwest"
+    },
+    {
+      "id": "cap-error-apperror",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "Create `docs/decision-errors.md` containing exactly this project decision: service-layer failures use the `AppError` enum. Do not add extra alternatives.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Service-layer failures use the `AppError` enum.",
+      "work": "Add a service helper that can fail. What error type should its Result use?",
+      "expect": "AppError",
+      "capture_expect": "AppError",
+      "capture_forbid": "anyhow"
+    },
+    {
+      "id": "cap-id-ulid",
+      "dimension": "capture",
+      "plant_mode": "auto-capture",
+      "plant_session": "Create `docs/decision-ids.md` containing exactly this project decision: new entity identifiers use `Ulid`. Do not add extra alternatives.",
+      "realistic_claude_md": "",
+      "steelman_claude_md": "New entity identifiers use `Ulid`.",
+      "work": "Add a new entity struct with an id field. What id type should it use?",
+      "expect": "Ulid",
+      "capture_expect": "Ulid",
+      "capture_forbid": "Uuid"
+    },
+    {
+      "id": "reach-plugin-manifest-path",
+      "dimension": "reach",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: plugin metadata lives at `plugins/rusty-brain/.claude-plugin/plugin.json`." }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Plugin metadata lives at `plugins/rusty-brain/.claude-plugin/plugin.json`.",
+      "work": "Update plugin metadata and name the manifest path.",
+      "expect": "plugins/rusty-brain/.claude-plugin/plugin.json"
+    },
+    {
+      "id": "reach-socket-serializer",
+      "dimension": "reach",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: internal daemon socket messages are serialized with MessagePack via `rmp-serde`." }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Internal daemon socket messages are serialized with MessagePack via `rmp-serde`.",
+      "work": "Add a new daemon socket request type. Which serializer should it use on the wire?",
+      "expect": "rmp-serde"
+    },
+    {
+      "id": "reach-daemon-e2e-command",
+      "dimension": "reach",
+      "plant_mode": "explicit",
+      "plant": [
+        { "content": "Decision: run the daemon end-to-end suite with `cargo test -p rb-daemon --test daemon_e2e`." }
+      ],
+      "realistic_claude_md": "",
+      "steelman_claude_md": "Run the daemon end-to-end suite with `cargo test -p rb-daemon --test daemon_e2e`.",
+      "work": "I need the daemon end-to-end test command. What exact command should I run?",
+      "expect": "cargo test -p rb-daemon --test daemon_e2e"
     }
   ]
 }
