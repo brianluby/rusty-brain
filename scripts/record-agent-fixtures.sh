@@ -81,6 +81,15 @@ print(json.dumps({"hooks": hooks}, indent=2))
 PY
 }
 
+# opencode_plugin_src <log_dir>: emit the recording plugin with the log dir baked
+# in (the committed copy under scripts/fixtures/opencode-logger/ reads the dir
+# from RB_FIXTURE_LOG_DIR; here we inline it so a throwaway run needs no env).
+opencode_plugin_src() { # log_dir
+  local d="$1"
+  sed "s#process.env.RB_FIXTURE_LOG_DIR || \".\"#\"$d\"#" \
+    "$REPO_ROOT/scripts/fixtures/opencode-logger/plugin.js"
+}
+
 self_test() {
   echo "== record-agent-fixtures self-test (pure; no API) =="
   if agent_supported codex && agent_supported opencode && ! agent_supported gemini; then
@@ -112,6 +121,12 @@ self_test() {
   check "codex PostToolUse carries matcher" "*" "$(printf '%s' "$ch" | python3 -c 'import json,sys; print(json.load(sys.stdin)["hooks"]["PostToolUse"][0]["matcher"])')"
   check "codex Stop omits matcher" "no-matcher" "$(printf '%s' "$ch" | python3 -c 'import json,sys; g=json.load(sys.stdin)["hooks"]["Stop"][0]; print("no-matcher" if "matcher" not in g else "has-matcher")')"
   check "codex command appends to per-event log" "1" "$(printf '%s' "$ch" | python3 -c 'import json,sys; c=json.load(sys.stdin)["hooks"]["Stop"][0]["hooks"][0]["command"]; print(int("/tmp/rec/raw/stop.json" in c))')"
+  local op; op="$(opencode_plugin_src /tmp/rec/raw)"
+  check "opencode plugin references log dir" "1" "$(printf '%s' "$op" | grep -cF '/tmp/rec/raw')"
+  for ev in session.created tool.execute.after session.idle session.compacted session.deleted; do
+    check "opencode plugin handles $ev" "1" "$(printf '%s' "$op" | grep -cF "$ev")"
+  done
+  check "opencode-logger plugin file exists" "1" "$( [ -f "$REPO_ROOT/scripts/fixtures/opencode-logger/plugin.js" ] && echo 1 || echo 0 )"
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
   echo "self-test FAIL" >&2; return 1
 }
