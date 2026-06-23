@@ -389,17 +389,26 @@ mcp_bypass = [
     if n.get("origin_source") == "mcp" and contains(n, expect)
 ]
 
+has_expect = any(contains(n, expect) for n in summaries)
+has_forbid = bool(forbid) and any(contains(n, forbid) for n in summaries)
+
 reason = "cap_summary_missing_fact"
 fidelity = 0
 if mcp_bypass:
     reason = "cap_mcp_bypass_detected"
 elif not summaries:
     reason = "cap_no_session_summary"
-elif forbid and any(contains(n, forbid) for n in summaries):
-    reason = "cap_forbidden_token"
-elif any(contains(n, expect) for n in summaries):
+elif has_expect:
+    # The decided value WAS captured. A correct summary that names the rejected
+    # alternative in passing ("use ureq, not reqwest") must not false-fail, so
+    # expect-present wins over forbid-present -- the same rationale the freshness
+    # dimension uses to omit `forbid` entirely.
     reason = "cap_ok"
     fidelity = 1
+elif has_forbid:
+    # No summary captured the decided value AND one recorded the rejected
+    # alternative instead: the hook captured the WRONG decision.
+    reason = "cap_forbidden_token"
 
 print(f"{fidelity}\t{reason}\t{len(summaries)}\t{len(mcp_bypass)}")
 PY
@@ -463,7 +472,13 @@ self_test() {
   check "capture parser detects MCP bypass" "$(printf '0\tcap_mcp_bypass_detected\t0\t1')" "$(capture_fidelity_from_json ureq "" "$capj")"
   printf '%s\n' '[{"content":"Decision: use reqwest for HTTP","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":null}]' > "$capj"
   check "capture parser catches missing expected fact" "$(printf '0\tcap_summary_missing_fact\t1\t0')" "$(capture_fidelity_from_json ureq "" "$capj")"
-  check "capture parser catches forbidden token" "$(printf '0\tcap_forbidden_token\t1\t0')" "$(capture_fidelity_from_json reqwest reqwest "$capj")"
+  # Forbidden token fires only when the decided value was NOT captured and the
+  # rejected alternative was: content names reqwest (forbid) but not ureq (expect).
+  check "capture parser catches forbidden token" "$(printf '0\tcap_forbidden_token\t1\t0')" "$(capture_fidelity_from_json ureq reqwest "$capj")"
+  # A correct summary that names the rejected alternative in passing must PASS:
+  # expect present wins over forbid present, so this is cap_ok, not a false-fail.
+  printf '%s\n' '[{"content":"Decision: use ureq, not reqwest","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":null}]' > "$capj"
+  check "capture parser passes correct fact that names the alternative" "$(printf '1\tcap_ok\t1\t0')" "$(capture_fidelity_from_json ureq reqwest "$capj")"
   printf '%s\n' '[{"content":"Decision: use ureq for HTTP","summary":"","tags":["hook","session-summary"],"origin_source":"hook","archived_at":"2026-06-23T00:00:00Z"}]' > "$capj"
   check "capture parser ignores archived summaries" "$(printf '0\tcap_no_session_summary\t0\t0')" "$(capture_fidelity_from_json ureq "" "$capj")"
 
@@ -479,8 +494,12 @@ self_test() {
 
   # Scenario-file contracts for the B/R additions. This is intentionally no-API:
   # it catches schema drift, answer leakage in realistic reach baselines, and
-  # explicit-plant bypasses in auto-capture rows.
-  if python3 - "$SCENARIOS_FILE" <<'PY'
+  # explicit-plant bypasses in auto-capture rows. Unlike the rest of the self-test
+  # this reads the on-disk scenarios file, so guard its presence with a clear
+  # message instead of letting python die on an unactionable traceback.
+  if [ ! -f "$SCENARIOS_FILE" ]; then
+    echo "BUG: scenarios file not found at '$SCENARIOS_FILE' (set --scenarios-file)"; fail=1
+  elif python3 - "$SCENARIOS_FILE" <<'PY'
 import json, sys
 path = sys.argv[1]
 data = json.load(open(path))
@@ -941,9 +960,12 @@ plant_corpus_distractors() { # home scenario_id n
 measure_capture_fidelity() { # home expect forbid
   local home="$1" expect="$2" forbid="$3"
   local out err result reason last=""
+  # The SessionEnd summary is written asynchronously by the hook, so poll the
+  # store until a definite verdict lands (CAP_POLL_MAX * CAP_POLL_SECS budget).
+  local CAP_POLL_MAX=50 CAP_POLL_SECS=0.2
   out="$(mktemp "${TMPDIR:-/tmp}/rb-scorecard-list.XXXXXX.json")"
   err="$(mktemp "${TMPDIR:-/tmp}/rb-scorecard-list.XXXXXX.err")"
-  for _ in $(seq 1 50); do
+  for _ in $(seq 1 "$CAP_POLL_MAX"); do
     if ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"; rusty-brain --json list --limit 1000 >"$out" 2>"$err" ); then
       result="$(capture_fidelity_from_json "$expect" "$forbid" "$out")"
       last="$result"
@@ -958,7 +980,7 @@ measure_capture_fidelity() { # home expect forbid
     else
       last="$(printf '0\tcap_list_error\t0\t0')"
     fi
-    sleep 0.2
+    sleep "$CAP_POLL_SECS"
   done
   rm -f "$out" "$err"
   if [ -z "$last" ]; then
@@ -966,11 +988,6 @@ measure_capture_fidelity() { # home expect forbid
     return 0
   fi
   printf '%s\n' "$last"
-}
-
-run_auto_capture_plant() { # home proj prompt log
-  local home="$1" proj="$2" prompt="$3" log="$4"
-  run_session "$home" "$proj" "$prompt" "$log" --output-format stream-json --verbose
 }
 
 run_scenario() { # row
@@ -1002,8 +1019,11 @@ run_scenario() { # row
     # see the sibling under `set -u` (b errors as unbound).
     local mb="$base/on"
     local db="$mb/memory.db" ns="rb-sc-$id-r$run"
-    local wh="$mb/hw" wp="$mb/wp"; seed_home "$wh"; mkdir -p "$wp"
+    # reach scores identity B (hb/pb) and uses the per-arm baseline homes, so the
+    # shared work home/project here is only set up for the non-reach dimensions.
+    local wh="$mb/hw" wp="$mb/wp"
     if [ "$dim" != "reach" ]; then
+      seed_home "$wh"; mkdir -p "$wp"
       install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
     fi
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
@@ -1047,9 +1067,12 @@ run_scenario() { # row
       fi
       local cap_fidelity="na" cap_reason="na" cap_summary_count="0" cap_mcp_bypass_count="0"
       if [ "$dim" = "reach" ]; then
+        # Identity A plants from its home only (plant_explicit needs no project),
+        # so pa is intentionally unused; only B gets a project to be scored in.
         local ha pa hb pb
         IFS=$'\t' read -r ha pa hb pb < <(reach_identity_paths "$mb")
-        seed_home "$ha"; seed_home "$hb"; mkdir -p "$pa" "$pb"
+        : "$pa" # tab-split placeholder; A needs no project dir
+        seed_home "$ha"; seed_home "$hb"; mkdir -p "$pb"
         install_rusty_brain "$hb" "$pb"; rm -f "$pb/CLAUDE.md"; rm -rf "$pb/.claude/skills"
         plant_explicit "$ha" "$facts"
         score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale"
@@ -1062,7 +1085,9 @@ run_scenario() { # row
           local ph="$mb/hp" pp="$mb/pp" plog="$mb/plant.jsonl"
           seed_home "$ph"; mkdir -p "$pp"
           install_rusty_brain_hooks_only "$ph" "$pp"; rm -f "$pp/CLAUDE.md"; rm -rf "$pp/.claude/skills"
-          run_auto_capture_plant "$ph" "$pp" "$plant_session" "$plog"
+          # Auto-capture plant: a real Claude Code session whose SessionEnd hook
+          # (no MCP) is the only path that writes memory for this dimension.
+          run_session "$ph" "$pp" "$plant_session" "$plog" --output-format stream-json --verbose
           IFS=$'\t' read -r cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count \
             < <(measure_capture_fidelity "$wh" "$capture_expect" "$capture_forbid")
           echo "   [$dim/$id memory-on r$run] capture_fidelity=$cap_fidelity reason=$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
