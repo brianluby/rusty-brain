@@ -147,6 +147,13 @@ impl Scratch {
     /// Used by non-Claude fallback boundaries where no true session terminus is
     /// available: later checkpoints supersede the live summary without losing
     /// early-session scratch entries.
+    ///
+    /// Like [`Scratch::append`], this is a best-effort, non-atomic
+    /// read-modify-write (last writer wins): the per-event hook binary is
+    /// single-process, so the only race is two overlapping hook processes for the
+    /// same session. A checkpoint racing a concurrent `append` could drop the
+    /// just-appended entry — an accepted file-level posture for coarse-grained,
+    /// best-effort capture, not a correctness guarantee.
     pub fn mark_checkpointed(&self, summary_id: &str) {
         let mut data = self.read();
         data.prior_summary_id = Some(summary_id.to_string());

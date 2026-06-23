@@ -608,6 +608,17 @@ pub async fn pre_compact(
     continue_only()
 }
 
+/// How [`fold_session_summary`] resets the scratch once a fold is durably
+/// stored: `End` clears the buffer (true terminus), `Checkpoint` retains it so a
+/// later checkpoint re-folds early observations while superseding the live
+/// summary. Defined before its callers per the codebase's define-before-use
+/// convention.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FoldMode {
+    End,
+    Checkpoint,
+}
+
 /// SessionEnd flow (W3.1): the single capture point for CLIs with a verified
 /// terminus. Fold the per-session scratch (files/commands/failures) + the
 /// transcript (goals/decisions) + working-tree changes into ONE summary memory.
@@ -637,12 +648,6 @@ pub async fn session_checkpoint(
     transcript_path: Option<&Path>,
 ) -> HookResult {
     fold_session_summary(client, scratch, cwd, transcript_path, FoldMode::Checkpoint).await
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum FoldMode {
-    End,
-    Checkpoint,
 }
 
 async fn fold_session_summary(
@@ -803,8 +808,71 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use rb_proto::{
+        read_frame, write_frame, Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION,
+    };
+    use rb_types::Namespace;
+    use tokio::net::UnixListener;
+    use tokio_util::codec::{Framed, LengthDelimitedCodec};
+
     fn scratch_at(tmp: &std::path::Path) -> Scratch {
         Scratch::at(tmp.join("scratch.json"))
+    }
+
+    /// What an in-process mock daemon observed: per Remember the (content,
+    /// supersedes) it received, and the id it issued back, in order.
+    #[derive(Default)]
+    struct MockObserved {
+        remembers: Vec<(String, Option<MemoryId>)>,
+        issued: Vec<MemoryId>,
+    }
+
+    /// Accept ONE connection, handshake-ack, then answer every Remember on it with
+    /// a fresh id while recording what arrived. A reused [`DaemonClient`] keeps a
+    /// single connection across calls, so the whole sequence lands here.
+    async fn serve_remembers(listener: UnixListener, state: Arc<Mutex<MockObserved>>) {
+        let Ok((stream, _)) = listener.accept().await else {
+            return;
+        };
+        let mut framed: Framed<_, LengthDelimitedCodec> =
+            Framed::new(stream, LengthDelimitedCodec::new());
+        if read_frame::<_, Handshake>(&mut framed).await.is_err() {
+            return;
+        }
+        let _ = write_frame(
+            &mut framed,
+            &HandshakeAck {
+                contract_version: CONTRACT_VERSION,
+                ok: true,
+                message: None,
+            },
+        )
+        .await;
+        while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
+            let resp = match req {
+                Request::Remember {
+                    content,
+                    supersedes,
+                    ..
+                } => {
+                    let id = MemoryId::new();
+                    let mut s = state.lock().unwrap();
+                    s.remembers.push((content, supersedes));
+                    s.issued.push(id.clone());
+                    Response::Remembered { id }
+                }
+                _ => Response::Pong {
+                    contract_version: CONTRACT_VERSION,
+                    recall_channels: None,
+                },
+            };
+            if write_frame(&mut framed, &resp).await.is_err() {
+                break;
+            }
+        }
     }
 
     // ---- redaction (capture-time secret scrubbing) -----------------------
@@ -1669,6 +1737,96 @@ mod tests {
         let data = scratch.read();
         assert!(data.is_empty());
         assert_eq!(data.prior_summary_id.as_deref(), Some("mem-123"));
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_with_nothing_to_fold_and_no_prior_id_is_a_noop() {
+        // A fresh session that checkpoints before any tool runs: nothing to fold
+        // and no prior id. Distinct from the End branch, which would write the
+        // (absent) prior id back — the checkpoint touches scratch not at all.
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = scratch_at(tmp.path());
+        let result = session_checkpoint(None, Some(&scratch), tmp.path(), None).await;
+        assert!(result.continue_execution);
+        let data = scratch.read();
+        assert!(data.is_empty());
+        assert_eq!(data.prior_summary_id, None);
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_stored_path_retains_scratch_and_supersedes() {
+        // The novel semantic of this PR, exercised through a LIVE store (not the
+        // degraded `client = None` path): a stored checkpoint must call
+        // `mark_checkpointed` (retain buffer + record the new id), NOT
+        // `mark_folded` (clear). A second checkpoint then re-folds the retained
+        // scratch and supersedes the first summary. A regression that swapped in
+        // `mark_folded` would clear the buffer and fail this test.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let state = Arc::new(Mutex::new(MockObserved::default()));
+        let server = tokio::spawn(serve_remembers(listener, Arc::clone(&state)));
+
+        let mut client = DaemonClient::connect(
+            &socket,
+            Namespace::Project("rb-checkpoint-test".into()),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .expect("connect to the mock daemon");
+
+        let scratch = scratch_at(tmp.path());
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        scratch.append(scratch::Kind::Command, "cargo test");
+
+        // Checkpoint #1: folds + stores, then RETAINS the buffer.
+        let r1 = session_checkpoint(Some(&mut client), Some(&scratch), tmp.path(), None).await;
+        assert!(r1.continue_execution);
+        let d1 = scratch.read();
+        assert_eq!(
+            d1.files,
+            vec!["src/lib.rs"],
+            "a STORED checkpoint must retain the buffer (mark_checkpointed, not mark_folded)"
+        );
+        assert_eq!(d1.commands, vec!["cargo test"]);
+        assert!(
+            d1.prior_summary_id.is_some(),
+            "a stored checkpoint records the new summary id for the next supersede"
+        );
+
+        // Checkpoint #2: re-folds the retained scratch, superseding #1's summary.
+        let r2 = session_checkpoint(Some(&mut client), Some(&scratch), tmp.path(), None).await;
+        assert!(r2.continue_execution);
+        assert_eq!(
+            scratch.read().files,
+            vec!["src/lib.rs"],
+            "a second stored checkpoint still retains the buffer"
+        );
+
+        let observed = state.lock().unwrap();
+        assert_eq!(
+            observed.remembers.len(),
+            2,
+            "each stored checkpoint sends exactly one Remember"
+        );
+        assert_eq!(
+            observed.remembers[0].1, None,
+            "the first checkpoint has no prior summary to supersede"
+        );
+        assert_eq!(
+            observed.remembers[1].1.as_ref(),
+            observed.issued.first(),
+            "the second checkpoint supersedes the first summary's id"
+        );
+        assert!(
+            observed.remembers[1].0.contains("src/lib.rs"),
+            "the retained scratch feeds the next checkpoint fold: {}",
+            observed.remembers[1].0
+        );
+
+        server.abort();
     }
 
     #[tokio::test]

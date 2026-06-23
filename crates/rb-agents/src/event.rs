@@ -33,6 +33,12 @@ pub enum HookEvent {
     /// here without clearing scratch, so later checkpoints supersede the prior
     /// summary while preserving early observations. This is deliberately
     /// distinct from [`SessionEnd`].
+    ///
+    /// Supersede only chains across checkpoints that STORE successfully: a
+    /// degraded checkpoint (no daemon, or a store error) leaves both the scratch
+    /// and the prior-summary id untouched, so the next successful checkpoint
+    /// stores fresh. Repeated degraded checkpoints therefore never accumulate
+    /// un-superseded live memories — they store nothing at all.
     SessionCheckpoint { reason: Option<String> },
     /// The agent SESSION is ending (distinct from a per-turn [`Stop`]). This is
     /// W3.1's single capture point: the runtime folds the per-session scratch
