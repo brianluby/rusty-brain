@@ -60,3 +60,9 @@ export const FixtureLogger = async () => ({
       metadata: output?.metadata,
     }),
 });
+
+// opencode treats every exported Plugin-shaped function (named OR default) as a
+// plugin; provide a default too so a single-plugin file loads unambiguously
+// regardless of how opencode enumerates exports (the bundled example and the
+// user's own plugins both also provide a default export).
+export default FixtureLogger;
