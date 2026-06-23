@@ -43,6 +43,19 @@ PY
 ) "$1"
 }
 
+# infer_terminus <fired_count> <total_turns>: classify whether the candidate
+# terminus event is a true end-of-session (fired exactly once across a
+# multi-turn run) or a per-turn boundary. A single-turn run cannot distinguish
+# the two, so it is ambiguous. Evidence, not proof — the README records the run
+# shape so a later run can corroborate.
+infer_terminus() { # fired_count total_turns
+  local count="$1" turns="$2"
+  if [ "$turns" -le 1 ]; then echo "ambiguous"
+  elif [ "$count" -eq 1 ]; then echo "true-terminus"
+  elif [ "$count" -eq "$turns" ]; then echo "per-turn"
+  else echo "ambiguous"; fi
+}
+
 self_test() {
   echo "== record-agent-fixtures self-test (pure; no API) =="
   if agent_supported codex && agent_supported opencode && ! agent_supported gemini; then
@@ -64,6 +77,10 @@ self_test() {
   local pem
   pem="$(printf -- '-----BEGIN PRIVATE KEY-----\nMIIabc\n-----END PRIVATE KEY-----' | scrub '')"
   check "scrub redacts PEM block"    "<redacted-pem>" "$pem"
+  check "terminus fired-once => true-terminus" "true-terminus" "$(infer_terminus 1 3)"
+  check "terminus once-per-turn => per-turn"   "per-turn"      "$(infer_terminus 3 3)"
+  check "terminus single-turn run => ambiguous" "ambiguous"    "$(infer_terminus 1 1)"
+  check "terminus mismatch => ambiguous"       "ambiguous"     "$(infer_terminus 2 3)"
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
   echo "self-test FAIL" >&2; return 1
 }
