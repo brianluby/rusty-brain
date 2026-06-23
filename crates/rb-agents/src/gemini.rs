@@ -51,9 +51,10 @@ impl AgentCli for GeminiCli {
         let session_id = str_field(raw, "session_id");
 
         // Gemini's native hook event names differ from Claude's: the tool event is
-        // `AfterTool` (not `PostToolUse`), the stop event is `SessionEnd` (not
-        // `Stop`), and the pre-compaction event is `PreCompress` (not `PreCompact`).
-        // Map each native name onto the canonical [`HookEvent`].
+        // `AfterTool` (not `PostToolUse`), the stop-looking event is `SessionEnd`
+        // (not `Stop`), and the pre-compaction event is `PreCompress` (not
+        // `PreCompact`). `SessionEnd` stays a no-op Stop until a real fixture
+        // proves a better checkpoint or terminus boundary.
         let event = match raw.get("hook_event_name").and_then(Value::as_str) {
             Some("SessionStart") => HookEvent::SessionStart {
                 source: str_field(raw, "source"),
@@ -166,7 +167,8 @@ mod tests {
 
     #[test]
     fn parses_session_end_as_stop() {
-        // Gemini's stop event is named `SessionEnd`; it maps to canonical `Stop`.
+        // Gemini's boundary event is named `SessionEnd`, but without a verified
+        // true terminus fixture it maps to Stop, not checkpoint or canonical SessionEnd.
         let raw = json!({
             "hook_event_name": "SessionEnd",
             "last_assistant_message": "finished"

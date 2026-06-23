@@ -34,6 +34,15 @@ pub async fn dispatch(
         HookEvent::Stop {
             stop_hook_active, ..
         } => capture::stop(*stop_hook_active),
+        HookEvent::SessionCheckpoint { .. } => {
+            capture::session_checkpoint(
+                client.take(),
+                scratch,
+                &ctx.cwd,
+                ctx.transcript_path.as_deref(),
+            )
+            .await
+        }
         HookEvent::SessionEnd { .. } => {
             capture::session_end(
                 client.take(),
@@ -129,6 +138,27 @@ mod tests {
             scratch.read().files,
             vec!["src/lib.rs"],
             "a degraded SessionEnd preserves the scratch"
+        );
+    }
+
+    #[tokio::test]
+    async fn session_checkpoint_event_routes_and_preserves_scratch_when_degraded() {
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = Scratch::at(tmp.path().join("scratch.json"));
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        let result = dispatch(
+            None,
+            Some(&scratch),
+            &ctx(HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string()),
+            }),
+        )
+        .await;
+        assert!(result.continue_execution);
+        assert_eq!(
+            scratch.read().files,
+            vec!["src/lib.rs"],
+            "a degraded checkpoint preserves the scratch"
         );
     }
 }

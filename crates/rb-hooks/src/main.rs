@@ -182,7 +182,8 @@ async fn capture_phase(
 ) -> HookResult {
     // W3.1: PostToolUse (scratch append) and Stop (no-op) never touch the
     // daemon, so they skip the connect cost entirely; only SessionStart /
-    // SessionEnd / PreCompact read or write the store.
+    // UserPromptSubmit / SessionCheckpoint / SessionEnd / PreCompact read or
+    // write the store (see `event_needs_daemon`).
     let mut client = if event_needs_daemon(&ctx.event) {
         DaemonClient::connect(
             socket,
@@ -200,13 +201,15 @@ async fn capture_phase(
 
 /// True for events that read or write the store (and so need a daemon
 /// connection): SessionStart (inject), UserPromptSubmit (recall + inject),
-/// SessionEnd (fold + store), PreCompact (store). Local-only events —
-/// PostToolUse (scratch append), Stop (no-op), Other — skip the connect.
+/// SessionCheckpoint/SessionEnd (fold + store), PreCompact (store). Local-only
+/// events — PostToolUse (scratch append), Stop (no-op), Other — skip the
+/// connect.
 fn event_needs_daemon(event: &HookEvent) -> bool {
     matches!(
         event,
         HookEvent::SessionStart { .. }
             | HookEvent::UserPromptSubmit { .. }
+            | HookEvent::SessionCheckpoint { .. }
             | HookEvent::SessionEnd { .. }
             | HookEvent::PreCompact { .. }
     )
@@ -476,5 +479,75 @@ mod tests {
             name, "rusty-brain-hooks",
             "auto-start must NOT target the hooks binary"
         );
+    }
+
+    #[test]
+    fn checkpoint_needs_daemon_but_stop_does_not() {
+        assert!(event_needs_daemon(&HookEvent::SessionCheckpoint {
+            reason: Some("Stop".to_string())
+        }));
+        assert!(!event_needs_daemon(&HookEvent::Stop {
+            last_assistant_message: Some("done".to_string()),
+            stop_hook_active: false,
+        }));
+    }
+
+    #[test]
+    fn event_needs_daemon_is_true_for_all_store_events() {
+        // Every event that reads or writes the store must request a daemon
+        // connection. Adding a new store event without listing it here (or the
+        // inline comment in capture_phase) is the exact drift this pins down.
+        let store_events = [
+            HookEvent::SessionStart {
+                source: Some("startup".to_string()),
+            },
+            HookEvent::UserPromptSubmit {
+                prompt: Some("help me refactor".to_string()),
+            },
+            HookEvent::SessionCheckpoint {
+                reason: Some("Stop".to_string()),
+            },
+            HookEvent::SessionCheckpoint { reason: None },
+            HookEvent::SessionEnd {
+                reason: Some("clear".to_string()),
+            },
+            HookEvent::PreCompact {
+                custom_instructions: None,
+            },
+        ];
+        for event in &store_events {
+            assert!(
+                event_needs_daemon(event),
+                "{event:?} must need the daemon (reads or writes the store)"
+            );
+        }
+    }
+
+    #[test]
+    fn event_needs_daemon_is_false_for_all_local_only_events() {
+        // Local-only events skip the connect cost; none read or write the store.
+        let local_events = [
+            HookEvent::PostToolUse {
+                tool_name: "Edit".to_string(),
+                tool_input: serde_json::json!({"file_path": "/x"}),
+                tool_response: serde_json::json!("ok"),
+            },
+            HookEvent::Stop {
+                last_assistant_message: None,
+                stop_hook_active: false,
+            },
+            HookEvent::Stop {
+                last_assistant_message: Some("done".to_string()),
+                stop_hook_active: true,
+            },
+            HookEvent::Other("UnknownEvent".to_string()),
+            HookEvent::Other(String::new()),
+        ];
+        for event in &local_events {
+            assert!(
+                !event_needs_daemon(event),
+                "{event:?} must NOT need the daemon (local-only, no store access)"
+            );
+        }
     }
 }
