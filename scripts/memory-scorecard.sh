@@ -521,8 +521,8 @@ for s in captures:
         errors.append(f"{sid}: capture scenario needs capture_expect or expect")
 
 reaches = [s for s in scenarios if s.get("dimension") == "reach"]
-if len(reaches) < 2:
-    errors.append(f"need >=2 reach scenarios, got {len(reaches)}")
+if len(reaches) < 3:
+    errors.append(f"need >=3 reach scenarios, got {len(reaches)}")
 for s in reaches:
     sid = s.get("id", "<missing>")
     expect = str(s.get("expect") or "").lower()
@@ -780,6 +780,7 @@ if [ "$MODE" = "self-test" ]; then self_test; exit $?; fi
 
 # ---- live run prerequisites (the four-arm runner; needs API) -----------------
 [ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
+[ -d "$BIN_DIR" ] || { echo "bin dir not found: $BIN_DIR (build first with 'cargo build --release', or pass --bin-dir DIR)" >&2; exit 1; }
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
 for bin in rusty-brain rusty-brain-hooks rusty-brain-install; do
   [ -x "$BIN_DIR/$bin" ] || { echo "missing binary: $BIN_DIR/$bin" >&2; exit 1; }
@@ -983,11 +984,14 @@ measure_capture_fidelity() { # home expect forbid
     sleep "$CAP_POLL_SECS"
   done
   rm -f "$out" "$err"
-  if [ -z "$last" ]; then
-    printf '0\tcap_timeout\t0\t0\n'
-    return 0
-  fi
-  printf '%s\n' "$last"
+  # Budget exhausted without a terminal verdict. If the store was readable but the
+  # async SessionEnd summary never landed (cap_no_session_summary, or no poll ever
+  # recorded a state), that is a real timeout; a persistent list failure keeps its
+  # own cap_list_error so the report distinguishes "slow hook" from "broken store".
+  case "$(cut -f2 <<<"$last")" in
+    cap_no_session_summary|"") printf '0\tcap_timeout\t0\t0\n' ;;
+    *)                         printf '%s\n' "$last" ;;
+  esac
 }
 
 run_scenario() { # row
