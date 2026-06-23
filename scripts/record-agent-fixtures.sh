@@ -56,6 +56,31 @@ infer_terminus() { # fired_count total_turns
   else echo "ambiguous"; fi
 }
 
+# codex_hooks_json <log_dir>: emit a .codex/hooks.json whose every event command
+# appends that event's raw stdin JSON (+ trailing newline) to a per-event file,
+# matching the rb-install codex schema: { "hooks": { "<Event>": [ <group> ] } }
+# where a group is { "hooks": [ { "type":"command", "command":"<shell string>" } ] }
+# and the tool event (PostToolUse) additionally carries "matcher":"*".
+codex_hooks_json() { # log_dir
+  local d="$1"
+  python3 - "$d" <<'PY'
+import json, sys
+d = sys.argv[1]
+events = {"SessionStart": "session_start", "PostToolUse": "post_tool_use",
+          "Stop": "stop", "PreCompact": "pre_compact"}
+def cmd(stem):
+    f = f"{d}/{stem}.json"
+    return f"cat >> '{f}'; printf '\\n' >> '{f}'"
+hooks = {}
+for event, stem in events.items():
+    group = {"hooks": [{"type": "command", "command": cmd(stem)}]}
+    if event == "PostToolUse":
+        group = {"matcher": "*", **group}
+    hooks[event] = [group]
+print(json.dumps({"hooks": hooks}, indent=2))
+PY
+}
+
 self_test() {
   echo "== record-agent-fixtures self-test (pure; no API) =="
   if agent_supported codex && agent_supported opencode && ! agent_supported gemini; then
@@ -81,6 +106,12 @@ self_test() {
   check "terminus once-per-turn => per-turn"   "per-turn"      "$(infer_terminus 3 3)"
   check "terminus single-turn run => ambiguous" "ambiguous"    "$(infer_terminus 1 1)"
   check "terminus mismatch => ambiguous"       "ambiguous"     "$(infer_terminus 2 3)"
+  local ch; ch="$(codex_hooks_json /tmp/rec/raw)"
+  check "codex hooks.json is valid json" "0" "$(printf '%s' "$ch" | python3 -c 'import json,sys; json.load(sys.stdin)'; echo $?)"
+  check "codex registers all four events" "4" "$(printf '%s' "$ch" | python3 -c 'import json,sys; h=json.load(sys.stdin)["hooks"]; print(sum(k in h for k in ("SessionStart","PostToolUse","Stop","PreCompact")))')"
+  check "codex PostToolUse carries matcher" "*" "$(printf '%s' "$ch" | python3 -c 'import json,sys; print(json.load(sys.stdin)["hooks"]["PostToolUse"][0]["matcher"])')"
+  check "codex Stop omits matcher" "no-matcher" "$(printf '%s' "$ch" | python3 -c 'import json,sys; g=json.load(sys.stdin)["hooks"]["Stop"][0]; print("no-matcher" if "matcher" not in g else "has-matcher")')"
+  check "codex command appends to per-event log" "1" "$(printf '%s' "$ch" | python3 -c 'import json,sys; c=json.load(sys.stdin)["hooks"]["Stop"][0]["hooks"][0]["command"]; print(int("/tmp/rec/raw/stop.json" in c))')"
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
   echo "self-test FAIL" >&2; return 1
 }
