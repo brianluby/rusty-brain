@@ -1,17 +1,9 @@
 # opencode Fixture Status
 
-> **Status: awaiting live re-record.** The local `result.jsonl` (untracked
-> working-tree artifact) is from a pre-fix run that omitted `--format json`, so
-> it captured human-formatted TUI text instead of parseable JSON events. The
-> per-event `*.json` files were captured by the logging plugin and are
-> representative, but the result stream must be re-recorded with `--agent
-> opencode` (the redesigned harness now passes `opencode run --format json`
-> against a stable recorder home with copied auth).
-
 ## Provenance
 
-- **CLI:** 1.17.5 (awaiting re-record with --format json)
-- **Captured:** pending re-record, Darwin 25.5.0
+- **CLI:** 1.17.5
+- **Captured:** 2026-06-23, Darwin 25.5.0
 - **Captured by:** scripts/record-agent-fixtures.sh
 - **Events:** session_created, session_idle, tool_execute_after
 
@@ -24,9 +16,9 @@ trust survives across runs. The operator's real auth is COPIED in (read-only on
 the real side, mode 0600), so the real agent home (`~/.codex` /
 `~/.local/share/opencode`) is never mutated.
 
-opencode has NO directory/plugin trust gate, so `--setup-trust opencode` only prepares the recorder home (redirected XDG dirs + copied `auth.json`/`account.json`) and verifies auth; no interactive trust step and no `--dangerously` flag.
+opencode has NO directory/plugin trust gate. It records under the operator`'s REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.
 
-Record command: `opencode run --format json --dir <rec proj> "<prompt>"` with all XDG dirs redirected to the recorder home. One multi-turn headless session (one Bash + one file write)
+Record command: `RB_FIXTURE_LOG_DIR=<rec>/raw opencode run --format json --dir <rec proj> "<prompt>"` under a hard timeout, using the real opencode config/auth. One multi-turn headless session (one Bash + one file write)
 is captured to `result.jsonl`, then sanitized.
 
 ## Sanitization
