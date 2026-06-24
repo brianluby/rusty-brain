@@ -371,6 +371,10 @@ record_live() { # agent out_dir
       #   -s workspace-write      -> model may write files under cwd, no bypass
       #   --skip-git-repo-check   -> allow a non-git record dir (does NOT grant trust)
       #   -c approval_policy=never -> non-interactive, never block on approval
+      # Optional model pin (--model / RB_REC_MODEL). codex config override form;
+      # model ids have no spaces, so unquoted word-splitting is safe (as with
+      # ${SESSION_TIMEOUT}). Empty => codex uses its configured default.
+      local model_flag=""; [ -n "$MODEL" ] && model_flag="-c model=$MODEL"
       # ${SESSION_TIMEOUT}: a stuck/retry session can't hang. </dev/null: no TTY block.
       CODEX_HOME="$rec" ${SESSION_TIMEOUT} "$cli" exec \
           --json \
@@ -378,6 +382,7 @@ record_live() { # agent out_dir
           -s workspace-write \
           --skip-git-repo-check \
           -c approval_policy="never" \
+          ${model_flag} \
           -o "$proj/.last-message.txt" \
           "$prompt" </dev/null >"$raw_result" 2>&1 || true
       ;;
@@ -385,6 +390,9 @@ record_live() { # agent out_dir
       proj="$(setup_opencode_proj "$rec")" || return 1
       raw="$rec/raw"
       rm -f "$raw"/*.json 2>/dev/null || true
+      # Optional model pin (--model / RB_REC_MODEL) -> opencode `-m provider/model`.
+      # Empty => opencode uses the real config's default model.
+      local model_flag=""; [ -n "$MODEL" ] && model_flag="-m $MODEL"
       # Record under the operator's REAL opencode config/auth/home (the working
       # model + permissions); only the project-local plugin + RB_FIXTURE_LOG_DIR
       # are recorder-specific. The earlier full XDG redirect picked a fresh config
@@ -395,7 +403,7 @@ record_live() { # agent out_dir
       ( cd "$proj" && env \
           OPENCODE_DISABLE_AUTOUPDATE=1 \
           RB_FIXTURE_LOG_DIR="$raw" \
-          ${SESSION_TIMEOUT} "$cli" run --format json --dir "$proj" "$prompt" \
+          ${SESSION_TIMEOUT} "$cli" run --format json ${model_flag} --dir "$proj" "$prompt" \
           </dev/null ) >"$raw_result" 2>&1 || true
       ;;
   esac
@@ -434,6 +442,20 @@ record_live() { # agent out_dir
 
   # Spec-required machine-readable terminus artifact for the future scorecard.
   printf '{"verdict":"%s","fired":%s,"turns":%s}\n' "$verdict" "$fired" "$turns" > "$out/terminus.json"
+
+  # Surface a failed/empty session instead of bare success: warn when the tool
+  # event never fired (the model ran no tool — usually a wrong/unavailable model
+  # or auth error) or the result stream carries an error record. Never silently
+  # degrade (the prior run reported success despite a ProviderModelNotFoundError).
+  local tool_stem=""
+  case "$agent" in codex) tool_stem="post_tool_use" ;; opencode) tool_stem="tool_execute_after" ;; esac
+  if [ -n "$tool_stem" ] && [ ! -f "$out/$tool_stem.json" ]; then
+    echo "WARNING: no '$tool_stem' event captured — the session ran no tool." >&2
+    if grep -qiE '"type":"error"|ModelNotFound|does not.*include|unauthor|invalid|error' "$out/result.jsonl" 2>/dev/null; then
+      echo "         result.jsonl carries an error (e.g. an unavailable model or auth)." >&2
+      echo "         Pin a working model: --model <provider/model> (or RB_REC_MODEL=...)." >&2
+    fi
+  fi
 
   emit_readme "$agent" "$out" "$ver" "$verdict" "$present" "$os_info" "$capture_date"
   echo "recorded $agent fixtures under $out (events: ${present:-none}, terminus: $verdict)"
@@ -580,13 +602,14 @@ self_test() {
   echo "self-test FAIL" >&2; return 1
 }
 
-MODE="record"; AGENT=""; OUT_DIR=""; DRY_RUN=0; TRUST_AGENT=""
+MODE="record"; AGENT=""; OUT_DIR=""; DRY_RUN=0; TRUST_AGENT=""; MODEL="${RB_REC_MODEL:-}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test) MODE="self-test"; shift ;;
     --agent)     AGENT="${2:?--agent needs a value}"
                  case "$AGENT" in codex|opencode|all) ;; *) echo "--agent must be codex, opencode, or all (got '$AGENT')" >&2; exit 2 ;; esac
                  shift 2 ;;
+    --model)     MODEL="${2:?--model needs a value}"; shift 2 ;;
     --setup-trust)
                  # Accepts `--setup-trust <agent>`; or `--setup-trust` paired
                  # with `--agent <a>` (the latter resolved after the loop).
