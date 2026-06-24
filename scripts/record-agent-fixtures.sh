@@ -128,8 +128,8 @@ emit_readme() {
       trust_line='codex computes a per-hook `trusted_hash` that cannot be hand-written, so the operator pre-trusts the hooks ONCE via `--setup-trust codex` (interactive TUI); persisted `[hooks.state]` trust then lets recording run with NO `--dangerously-bypass-hook-trust` flag.'
       record_line='`CODEX_HOME=<rec> codex exec --json -C <rec proj> -s workspace-write --skip-git-repo-check -c approval_policy="never" "<prompt>"`' ;;
     opencode)
-      trust_line='opencode has NO directory/plugin trust gate, so `--setup-trust opencode` only prepares the recorder home (redirected XDG dirs + copied `auth.json`/`account.json`) and verifies auth; no interactive trust step and no `--dangerously` flag.'
-      record_line='`opencode run --format json --dir <rec proj> "<prompt>"` with all XDG dirs redirected to the recorder home' ;;
+      trust_line='opencode has NO directory/plugin trust gate. It records under the operator`'"'"'s REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.'
+      record_line='`RB_FIXTURE_LOG_DIR=<rec>/raw opencode run --format json --dir <rec proj> "<prompt>"` under a hard timeout, using the real opencode config/auth' ;;
     *)
       trust_line='Hooks are pre-trusted via `--setup-trust '"$agent"'`; no `--dangerously` bypass flag is used.'
       record_line='the headless CLI invocation logged at record time' ;;
@@ -171,7 +171,7 @@ dry_run_agent() { # agent out_dir
     opencode)
       mkdir -p "$out/.opencode/plugin" "$out/raw"
       # `.mjs` so the plugin is unambiguous ESM regardless of package.json (see
-      # setup_opencode_home).
+      # setup_opencode_proj).
       opencode_plugin_src "$out/raw" > "$out/.opencode/plugin/fixture-logger.mjs"
       ;;
     *) echo "dry_run_agent: unknown agent $agent" >&2; return 1 ;;
@@ -251,27 +251,19 @@ setup_codex_home() { # recorder_home
   echo "$proj"
 }
 
-# setup_opencode_home <recorder_home>: prepare a stable opencode home for
-# recording by redirecting every XDG dir under the recorder root and copying the
-# operator's real auth.json + account.json (read-only on the real side, 0600).
-# opencode has NO directory/plugin trust gate, so no pre-trust step is needed —
-# a plugin referenced from opencode.json loads unconditionally. Echoes the
-# recorder project dir on stdout. Caller exports the XDG vars from recorder_home.
-setup_opencode_home() { # recorder_home
+# setup_opencode_proj <recorder_home>: prepare ONLY a scratch project with the
+# logging plugin registered. opencode records under the operator's REAL config /
+# auth / home (the model + permissions that actually work — the earlier full XDG
+# redirect picked a fresh config whose default model the operator's plan excluded,
+# which retry-looped forever). The project-local opencode.json loads the plugin
+# and RB_FIXTURE_LOG_DIR points it at <rec>/raw. Echoes the project dir on stdout.
+setup_opencode_proj() { # recorder_home
   local rec="$1"
   local proj="$rec/proj" raw="$rec/raw"
-  mkdir -p "$rec/data/opencode" "$rec/config/opencode" "$rec/state/opencode" \
-           "$rec/cache/opencode" "$proj/.opencode/plugin" "$raw"
+  mkdir -p "$proj/.opencode/plugin" "$raw"
   chmod 700 "$rec"
-  copy_ro "$HOME/.local/share/opencode/auth.json" "$rec/data/opencode/auth.json" \
-    || { echo "ERROR: missing ~/.local/share/opencode/auth.json; run \`opencode auth login\` first" >&2; return 1; }
-  # account.json (active-provider index) is recommended so the provider list matches.
-  copy_ro "$HOME/.local/share/opencode/account.json" "$rec/data/opencode/account.json" 2>/dev/null || true
-  # The recording plugin (registered via opencode.json's `plugin` array). The
-  # output uses the `.mjs` extension so it is an unambiguous ESM module under
-  # any Bun version opencode bundles (the recorder project has no package.json
-  # `"type":"module"`, and a plain `.js` would be CJS by default in stricter
-  # runtimes — `.mjs` removes that ambiguity).
+  # `.mjs` so the plugin is an unambiguous ESM module regardless of the runtime's
+  # default module type (the recorder project has no package.json "type":"module").
   opencode_plugin_src "$raw" > "$proj/.opencode/plugin/fixture-logger.mjs"
   printf '{"plugin":["./.opencode/plugin/fixture-logger.mjs"]}\n' > "$proj/opencode.json"
   echo "$proj"
@@ -307,19 +299,25 @@ setup_trust() { # agent
       fi
       ;;
     opencode)
-      local rec_data="$rec/data" rec_config="$rec/config" rec_state="$rec/state" rec_cache="$rec/cache"
-      setup_opencode_home "$rec" >/dev/null || return 1
-      echo "opencode has no directory/plugin trust gate; verifying auth resolved against the recorder home."
-      echo "  Recorder home: $rec"
-      env XDG_DATA_HOME="$rec_data" XDG_CONFIG_HOME="$rec_config" \
-          XDG_STATE_HOME="$rec_state" XDG_CACHE_HOME="$rec_cache" \
-          OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 \
-          "$cli" auth list || true
-      echo "ok: opencode recorder home prepared (no interactive trust step required)."
+      setup_opencode_proj "$rec" >/dev/null || return 1
+      echo "opencode has no trust gate and records under your REAL ~/.config/opencode"
+      echo "(the working model + auth). Verifying auth is configured:"
+      echo "  Recorder project: $rec/proj"
+      "$cli" auth list || true
+      echo "ok: opencode recorder project prepared (no interactive trust step required)."
       ;;
     *) echo "setup_trust: unknown agent $agent" >&2; return 1 ;;
   esac
 }
+
+# Hard per-session timeout: a stuck or retry-looping agent run (e.g. an
+# inaccessible-model retry loop) must never hang the recorder. Prefer coreutils
+# `timeout`; fall back to `gtimeout` (macOS/brew). If neither exists, run without
+# a wrapper (best effort) — surfaced as a one-time warning, never a silent hang.
+RB_REC_TIMEOUT_SECS="${RB_REC_TIMEOUT_SECS:-180}"
+SESSION_TIMEOUT=""
+if command -v timeout  >/dev/null 2>&1; then SESSION_TIMEOUT="timeout ${RB_REC_TIMEOUT_SECS}"
+elif command -v gtimeout >/dev/null 2>&1; then SESSION_TIMEOUT="gtimeout ${RB_REC_TIMEOUT_SECS}"; fi
 
 # record_live <agent> <out_dir>: live recording path. Requires the agent CLI and
 # real auth, plus a one-time `--setup-trust <agent>` having run (codex hooks must
@@ -373,29 +371,32 @@ record_live() { # agent out_dir
       #   -s workspace-write      -> model may write files under cwd, no bypass
       #   --skip-git-repo-check   -> allow a non-git record dir (does NOT grant trust)
       #   -c approval_policy=never -> non-interactive, never block on approval
-      CODEX_HOME="$rec" "$cli" exec \
+      # ${SESSION_TIMEOUT}: a stuck/retry session can't hang. </dev/null: no TTY block.
+      CODEX_HOME="$rec" ${SESSION_TIMEOUT} "$cli" exec \
           --json \
           -C "$proj" \
           -s workspace-write \
           --skip-git-repo-check \
           -c approval_policy="never" \
           -o "$proj/.last-message.txt" \
-          "$prompt" >"$raw_result" 2>&1 || true
+          "$prompt" </dev/null >"$raw_result" 2>&1 || true
       ;;
     opencode)
-      proj="$(setup_opencode_home "$rec")" || return 1
+      proj="$(setup_opencode_proj "$rec")" || return 1
       raw="$rec/raw"
       rm -f "$raw"/*.json 2>/dev/null || true
-      # Redirect ALL opencode dirs into the recorder home so auth resolves there
-      # and no global opencode state is touched. RB_FIXTURE_LOG_DIR points the
-      # plugin at the raw log dir. --format json streams parseable events. Do NOT
-      # pass --pure (it would skip the plugin). No trust gate exists for opencode.
+      # Record under the operator's REAL opencode config/auth/home (the working
+      # model + permissions); only the project-local plugin + RB_FIXTURE_LOG_DIR
+      # are recorder-specific. The earlier full XDG redirect picked a fresh config
+      # whose default model the operator's plan excluded -> infinite retry/hang.
+      # --format json -> parseable events; do NOT pass --pure (it skips plugins).
+      # </dev/null -> a fresh-permission prompt can't block on the TTY.
+      # ${SESSION_TIMEOUT} -> a retry loop can't hang the recorder.
       ( cd "$proj" && env \
-          XDG_DATA_HOME="$rec/data" XDG_CONFIG_HOME="$rec/config" \
-          XDG_STATE_HOME="$rec/state" XDG_CACHE_HOME="$rec/cache" \
-          OPENCODE_DISABLE_AUTOUPDATE=1 OPENCODE_DISABLE_MODELS_FETCH=1 \
+          OPENCODE_DISABLE_AUTOUPDATE=1 \
           RB_FIXTURE_LOG_DIR="$raw" \
-          "$cli" run --format json --dir "$proj" "$prompt" ) >"$raw_result" 2>&1 || true
+          ${SESSION_TIMEOUT} "$cli" run --format json --dir "$proj" "$prompt" \
+          </dev/null ) >"$raw_result" 2>&1 || true
       ;;
   esac
 
