@@ -314,7 +314,7 @@ setup_trust() { # agent
 # inaccessible-model retry loop) must never hang the recorder. Prefer coreutils
 # `timeout`; fall back to `gtimeout` (macOS/brew). If neither exists, run without
 # a wrapper (best effort) — surfaced as a one-time warning, never a silent hang.
-RB_REC_TIMEOUT_SECS="${RB_REC_TIMEOUT_SECS:-180}"
+RB_REC_TIMEOUT_SECS="${RB_REC_TIMEOUT_SECS:-300}"
 SESSION_TIMEOUT=""
 if command -v timeout  >/dev/null 2>&1; then SESSION_TIMEOUT="timeout ${RB_REC_TIMEOUT_SECS}"
 elif command -v gtimeout >/dev/null 2>&1; then SESSION_TIMEOUT="gtimeout ${RB_REC_TIMEOUT_SECS}"; fi
@@ -342,6 +342,10 @@ record_live() { # agent out_dir
   local rec; rec="$(recorder_home "$agent")"
 
   mkdir -p "$out"
+  # Clear prior per-event fixtures so a re-run never mixes stale events from an
+  # earlier session with the new capture (README is preserved; result.jsonl and
+  # terminus.json are regenerated below). Only this run's events should remain.
+  find "$out" -maxdepth 1 -type f ! -name 'README.md' -delete 2>/dev/null || true
   # A two-step prompt so the terminus event count can be compared against turns.
   local prompt="First run: echo hi via Bash. Then create a file notes.txt containing exactly: recorded. Do both."
   # Capture raw CLI output to a temp file INSIDE the recorder home (outside the
