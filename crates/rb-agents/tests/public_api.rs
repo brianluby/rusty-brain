@@ -78,10 +78,7 @@ fn support_level_variants_are_reexported() {
 
 #[test]
 fn all_five_agents_are_present_in_public_matrix() {
-    let agents: Vec<_> = agent_capabilities()
-        .iter()
-        .map(|c| c.agent)
-        .collect();
+    let agents: Vec<_> = agent_capabilities().iter().map(|c| c.agent).collect();
     for expected in ["claude-code", "codex", "opencode", "gemini", "hermes"] {
         assert!(
             agents.contains(&expected),
@@ -104,7 +101,10 @@ fn agent_capability_struct_fields_accessible_via_public_api() {
     let _scorecard: SupportLevel = cap.scorecard;
     let _source: &str = cap.verified_lifecycle_source;
     let _limitations: &[&str] = cap.limitations;
-    assert!(!_source.is_empty(), "verified_lifecycle_source must not be empty");
+    assert!(
+        !_source.is_empty(),
+        "verified_lifecycle_source must not be empty"
+    );
     assert!(!_limitations.is_empty(), "limitations must not be empty");
 }
 

@@ -31,7 +31,7 @@
 #
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
-#   memory-scorecard.sh [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
+#   memory-scorecard.sh [--agent claude-code|codex|opencode|gemini|hermes|all] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -46,6 +46,46 @@ TIE_MARGIN="${RB_SCORECARD_TIE_MARGIN:-0.10}"
 # well above a normal task, so a failure can never make an arm look faster on the
 # turns tiebreaker. Used by extract_usage (exercised by --self-test).
 TURNS_FAIL_SENTINEL="${RB_SCORECARD_TURNS_FAIL_SENTINEL:-99}"
+
+scorecard_agent_supported() { # agent
+  [ "$1" = "claude-code" ]
+}
+
+scorecard_skip_reason() { # agent
+  case "$1" in
+    codex)    printf 'scorecard_unsupported_codex_fixture_gated' ;;
+    opencode) printf 'scorecard_unsupported_opencode_plugin_deferred' ;;
+    gemini)   printf 'scorecard_unsupported_gemini_not_first_priority' ;;
+    hermes)   printf 'scorecard_unsupported_hermes_discovery_gated' ;;
+    *)        printf 'scorecard_unsupported_unknown_agent' ;;
+  esac
+}
+
+scorecard_skip_detail() { # agent
+  case "$1" in
+    codex)
+      printf 'Codex scorecard is blocked until capture lifecycle, prompt retrieval, and apply_patch fixture gates are resolved.'
+      ;;
+    opencode)
+      printf 'OpenCode scorecard is blocked until the JS/TS plugin config path and lifecycle fixtures are implemented.'
+      ;;
+    gemini)
+      printf 'Gemini has an adapter, but the cross-agentic scorecard currently supports only Claude Code; Gemini scorecard support is not yet implemented.'
+      ;;
+    hermes)
+      printf 'Hermes is discovery-gated; no hook names, config paths, or lifecycle semantics are verified.'
+      ;;
+    *)
+      printf 'Unknown scorecard agent target.'
+      ;;
+  esac
+}
+
+scorecard_skip_line() { # agent
+  local agent="$1"
+  printf 'agent=%s\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=%s\tdetail=%s\n' \
+    "$agent" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
+}
 
 # ---- pure judge (P: gate's substring judge; exercised by --self-test) --------
 # judge_text <textfile> <expect> <forbid> <stale> <arm> -> "<success> <mie>"
@@ -157,6 +197,7 @@ write_claude_md() { # file body distractors
 aggregate_scorecard() {
   local tsv="$1" tie_margin="${2:-${TIE_MARGIN:-0.10}}" min_runs="${3:-5}"
   awk -F'\t' -v tie="$tie_margin" -v min_runs="$min_runs" '
+    /^agent=/ { next }
     # cache-read fraction cr/(cr+in) — 0 when there is no input (ADR-3 diag).
     function ratio(cr, inp) { if (cr + inp == 0) return 0; return cr / (cr + inp) }
     # insertion sort arr[1..n] in place
@@ -492,6 +533,19 @@ self_test() {
     echo "BUG: reach identity layout"; fail=1
   fi
 
+  local skip_line
+  skip_line="$(scorecard_skip_line codex)"
+  if printf '%s' "$skip_line" | grep -qF $'agent=codex\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=scorecard_unsupported_codex_fixture_gated'; then
+    echo "ok: scorecard unsupported agent skip is machine-readable"
+  else
+    echo "BUG: scorecard unsupported agent skip line"; printf '%s\n' "$skip_line"; fail=1
+  fi
+  if scorecard_agent_supported claude-code && ! scorecard_agent_supported codex; then
+    echo "ok: only claude-code is currently scorecard-supported"
+  else
+    echo "BUG: scorecard supported-agent predicate"; fail=1
+  fi
+
   # Scenario-file contracts for the B/R additions. This is intentionally no-API:
   # it catches schema drift, answer leakage in realistic reach baselines, and
   # explicit-plant bypasses in auto-capture rows. Unlike the rest of the self-test
@@ -571,6 +625,7 @@ PY
   # A scorecard where memory beats realistic AND ties steelman, zero mie => SAFE, dim passes.
   local good="$tmp/good.tsv"
   {
+    scorecard_skip_line codex
     sc_row freshness s1 memory-on          1 1 2 0
     sc_row freshness s1 realistic-baseline 1 0 2 0
     sc_row freshness s1 steelman-baseline  1 1 2 0
@@ -760,10 +815,13 @@ PY
 }
 
 # ---- arg parsing -------------------------------------------------------------
-MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""
+MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""; AGENT="claude-code"; PRE_SCORECARD_ROWS=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test)      MODE="self-test"; shift ;;
+    --agent)          AGENT="${2:?--agent needs a value}"
+                      case "$AGENT" in claude-code|codex|opencode|gemini|hermes|all) ;; *) echo "--agent must be one of: claude-code, codex, opencode, gemini, hermes, all (got '$AGENT')" >&2; exit 2 ;; esac
+                      shift 2 ;;
     --bin-dir)        BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
     --runs)           RUNS="${2:?--runs needs a value}"; shift 2 ;;
     --min-runs)       MIN_RUNS="${2:?--min-runs needs a value}"
@@ -777,6 +835,24 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$MODE" = "self-test" ]; then self_test; exit $?; fi
+
+if [ "$AGENT" = "all" ]; then
+  echo "== memory-value scorecard agent target: all =="
+  PRE_SCORECARD_ROWS="$(scorecard_skip_line codex; scorecard_skip_line opencode; scorecard_skip_line gemini; scorecard_skip_line hermes)"
+  printf '%s\n' "$PRE_SCORECARD_ROWS"
+  if [ -n "$OUT" ]; then
+    printf '%s\n' "$PRE_SCORECARD_ROWS" > "$OUT"
+  fi
+  AGENT="claude-code"
+elif ! scorecard_agent_supported "$AGENT"; then
+  skip_line="$(scorecard_skip_line "$AGENT")"
+  echo "== memory-value scorecard agent target: $AGENT =="
+  printf '%s\n' "$skip_line"
+  if [ -n "$OUT" ]; then
+    printf '%s\n' "$skip_line" > "$OUT"
+  fi
+  exit 0
+fi
 
 # ---- live run prerequisites (the four-arm runner; needs API) -----------------
 [ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
@@ -808,6 +884,9 @@ elif command -v gtimeout >/dev/null 2>&1; then SESSION_TIMEOUT="gtimeout ${RB_SC
 unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE RUSTY_BRAIN_IDLE_TIMEOUT_SECS
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-scorecard.XXXXXX")"
 RESULTS="${OUT:-$WORKROOT/scorecard.tsv}"; : > "$RESULTS"
+if [ -n "$PRE_SCORECARD_ROWS" ]; then
+  printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RESULTS"
+fi
 cleanup() { rm -rf "$WORKROOT" 2>/dev/null || true; }
 trap cleanup EXIT
 
@@ -1125,7 +1204,7 @@ run_scenario() { # row
   done
 }
 
-echo "== memory-value scorecard (model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
+echo "== memory-value scorecard (agent=$AGENT, model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
 # Read ALL scenarios into an array BEFORE running any (not streamed): a
 # streaming `while read < <(jq)` shares fd 0 with the loop body, and a body
 # command that consumes stdin (claude -p) would eat the remaining scenario lines.

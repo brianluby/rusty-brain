@@ -1,10 +1,13 @@
 # W3.5 A/B criterion redesign — from single-fact parity to a memory-value scorecard
 
-Status: **Accepted / active** (adopted 2026-06-21). This decision record supersedes
-the W3.5 A/B gate criterion in `docs/eval/2026-06-14-w35-ab-eval.md` (now retired)
-**and** its harness — the A/B harness, scenarios, and nightly workflow were removed
-in the gate cutover and replaced by the memory-value scorecard
-(`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
+Status: **Accepted / active** (adopted 2026-06-21). Final W3.5 closeout:
+`docs/eval/2026-06-23-w35-scorecard-closeout.md`.
+
+This decision record supersedes the W3.5 A/B gate criterion in
+`docs/eval/2026-06-14-w35-ab-eval.md` (now retired) **and** its harness — the A/B
+harness, scenarios, and nightly workflow were removed in the gate cutover and
+replaced by the memory-value scorecard (`scripts/memory-scorecard.sh`,
+`.github/workflows/memory-scorecard.yml`,
 `crates/rb-eval/scorecard/memory_scorecard_scenarios.json`).
 Date: 2026-06-16 (accepted 2026-06-21).
 
@@ -36,11 +39,13 @@ every axis**:
 | freshness | already-current (stale-traps hand it the *updated* file) | docs go stale; memory auto-supersedes |
 | reach     | one machine, one developer                 | A's decision reaches B on another machine    |
 
-This document records the decisions for the redesigned eval. The shared scaffold,
-**Class C (Freshness)**, and the **Class A (Retrieval@scale)** harness have since
-landed (`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
-`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`); dimensions B/R remain
-per the build sequence in the last section.
+This document records the decisions for the redesigned eval. The shared scaffold
+and all four dimensions have since landed in the unified scorecard
+(`scripts/memory-scorecard.sh`, `.github/workflows/memory-scorecard.yml`,
+`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`). As of the 2026-06-23
+closeout, only **Class C (Freshness)** has raw measured evidence; **Class A
+(Retrieval@scale)**, **Class B (Capture)**, and **Class R (Reach/team)** are
+landed but unmeasured. Do not read the W3.5 scorecard as Phase 5 pilot proof.
 
 ## Decisions (ADRs)
 
@@ -200,8 +205,11 @@ scorecard so the headline value is not silently dropped.
 3. **Validate** (first spend, small): `--self-test` → a 1-scenario smoke dispatch
    → the real C run at N ≥ 5. Read the scorecard.
 4. **A then B then R** (later, gated on the scaffold proving out in step 3), each
-   reusing the scaffold; A only after the caching question is resolved. **A's
-   harness landed 2026-06-21** (see §A "Built"); B and R remain.
+   reusing the scaffold; A only after the caching question is resolved.
+   **Closeout 2026-06-23:** A, B, and R harness/scenario code has landed, but no
+   raw N>=5 A/B/R measured artifact exists yet. See
+   `docs/eval/2026-06-23-w35-scorecard-closeout.md` for the final W3.5 status,
+   deferrals, and Phase-5-not-proven caveat.
 
 The scaffold (step 1), not Class C, is the real first deliverable — C is its
 first instance. Building C in isolation would bake a planting-mode and

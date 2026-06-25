@@ -196,7 +196,11 @@ mod tests {
     fn agent_ids_are_unique() {
         let mut seen = std::collections::HashSet::new();
         for capability in agent_capabilities() {
-            assert!(seen.insert(capability.agent), "duplicate agent id: {}", capability.agent);
+            assert!(
+                seen.insert(capability.agent),
+                "duplicate agent id: {}",
+                capability.agent
+            );
         }
     }
 
@@ -264,22 +268,26 @@ mod tests {
                 continue;
             }
             assert_ne!(
-                capability.capture, SupportLevel::Unknown,
+                capability.capture,
+                SupportLevel::Unknown,
                 "agent {} capture must not be Unknown",
                 capability.agent
             );
             assert_ne!(
-                capability.retrieval, SupportLevel::Unknown,
+                capability.retrieval,
+                SupportLevel::Unknown,
                 "agent {} retrieval must not be Unknown",
                 capability.agent
             );
             assert_ne!(
-                capability.config, SupportLevel::Unknown,
+                capability.config,
+                SupportLevel::Unknown,
                 "agent {} config must not be Unknown",
                 capability.agent
             );
             assert_ne!(
-                capability.scorecard, SupportLevel::Unknown,
+                capability.scorecard,
+                SupportLevel::Unknown,
                 "agent {} scorecard must not be Unknown",
                 capability.agent
             );
