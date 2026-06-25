@@ -1,6 +1,8 @@
 //! Offline CI gate for the cross-agent fixture-recording harness: runs the
 //! script's pure `--self-test` and an `--dry-run --agent all`. The live
 //! recording path needs CLI auth and is exercised manually by the operator.
+#![allow(clippy::unwrap_used, clippy::expect_used)]
+
 use std::path::PathBuf;
 use std::process::Command;
 
