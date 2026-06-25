@@ -45,9 +45,14 @@ agent_supported() { case "$1" in codex|opencode) return 0 ;; *) return 1 ;; esac
 # fixpoint: redacted placeholders contain chars outside each pattern's class, so
 # re-running is a no-op.
 scrub() { # real_home [extra_home ...]
-  # The Python program is passed as a file via process substitution (not on
-  # stdin) so the function's piped payload stays connected to sys.stdin.
-  python3 <(cat <<'PY'
+  # Write the Python program to a TEMP FILE, NOT `python3 <(cat <<'PY')`: bash
+  # 3.2 (the macOS system bash) brace-expands heredoc content inside `<(...)`
+  # process substitution, mangling regex quantifiers like `{7,}` -> `7`. A temp
+  # file preserves the program byte-for-byte and keeps the function's piped
+  # payload connected to sys.stdin.
+  local prog rc
+  prog="$(mktemp "${TMPDIR:-/tmp}/rb-scrub.XXXXXX")" || return 1
+  cat > "$prog" <<'PY'
 import sys, re
 homes = [h for h in sys.argv[1:] if h]
 data = sys.stdin.read()
@@ -75,7 +80,11 @@ for rx, repl in subs:
     data = rx.sub(repl, data)
 sys.stdout.write(data)
 PY
-) "$@"
+  # `if` so set -e captures the status instead of aborting mid-function; callers
+  # fail closed on a nonzero scrub (redaction must never be silently skipped).
+  if python3 "$prog" "$@"; then rc=0; else rc=$?; fi
+  rm -f "$prog"
+  return "$rc"
 }
 
 # infer_terminus <fired_count> <total_turns>: classify whether the candidate
