@@ -15,7 +15,7 @@
 2. **Then do cross-agent capture/parity.**
    - Record real lifecycle fixtures for Codex/OpenCode/Gemini.
    - Decide safe `SessionEnd`/`SessionCheckpoint` mappings.
-   - Add a capability matrix and docs for Codex/OpenCode/Hermes.
+   - Update the capability matrix and docs for Codex/OpenCode/Hermes (the matrix and Hermes discovery note already landed in PR #43) based on the recorded fixture evidence.
    - Only then expand scorecard targeting by agent.
 
 3. **After that, move to Phase 4 / validation hardening.**
