@@ -182,4 +182,188 @@ mod tests {
     fn unknown_agent_has_no_capability_row() {
         assert_eq!(capability_for_agent("copilot"), None);
     }
+
+    // --- Regression / boundary tests ----------------------------------------
+
+    #[test]
+    fn agent_count_is_exactly_five() {
+        // Regression: adding or removing an agent without updating related
+        // logic (scorecard routing, docs table, changelog) is a common mistake.
+        assert_eq!(agent_capabilities().len(), 5);
+    }
+
+    #[test]
+    fn agent_ids_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for capability in agent_capabilities() {
+            assert!(
+                seen.insert(capability.agent),
+                "duplicate agent id: {}",
+                capability.agent
+            );
+        }
+    }
+
+    // --- Data-integrity tests ------------------------------------------------
+
+    #[test]
+    fn all_agents_have_non_empty_limitations() {
+        for capability in agent_capabilities() {
+            assert!(
+                !capability.limitations.is_empty(),
+                "agent {} has empty limitations slice",
+                capability.agent
+            );
+        }
+    }
+
+    #[test]
+    fn all_agents_have_non_empty_verified_lifecycle_source() {
+        for capability in agent_capabilities() {
+            assert!(
+                !capability.verified_lifecycle_source.is_empty(),
+                "agent {} has empty verified_lifecycle_source",
+                capability.agent
+            );
+        }
+    }
+
+    // --- Adapter status tests ------------------------------------------------
+
+    #[test]
+    fn experimental_agents_are_codex_opencode_gemini() {
+        let experimental: Vec<_> = agent_capabilities()
+            .iter()
+            .filter(|c| c.adapter_status == AdapterStatus::Experimental)
+            .map(|c| c.agent)
+            .collect();
+        assert_eq!(experimental, vec!["codex", "opencode", "gemini"]);
+    }
+
+    #[test]
+    fn hermes_is_the_only_discovery_gated_agent() {
+        let discovery: Vec<_> = agent_capabilities()
+            .iter()
+            .filter(|c| c.adapter_status == AdapterStatus::Discovery)
+            .map(|c| c.agent)
+            .collect();
+        assert_eq!(discovery, vec!["hermes"]);
+    }
+
+    // --- Capability level exhaustiveness ------------------------------------
+
+    #[test]
+    fn claude_code_has_all_four_capabilities_supported() {
+        let cc = capability_for_agent("claude-code").expect("claude-code row");
+        assert_eq!(cc.capture, SupportLevel::Supported, "capture");
+        assert_eq!(cc.retrieval, SupportLevel::Supported, "retrieval");
+        assert_eq!(cc.config, SupportLevel::Supported, "config");
+        assert_eq!(cc.scorecard, SupportLevel::Supported, "scorecard");
+    }
+
+    #[test]
+    fn non_hermes_agents_have_no_unknown_support_levels() {
+        for capability in agent_capabilities() {
+            if capability.agent == "hermes" {
+                continue;
+            }
+            assert_ne!(
+                capability.capture,
+                SupportLevel::Unknown,
+                "agent {} capture must not be Unknown",
+                capability.agent
+            );
+            assert_ne!(
+                capability.retrieval,
+                SupportLevel::Unknown,
+                "agent {} retrieval must not be Unknown",
+                capability.agent
+            );
+            assert_ne!(
+                capability.config,
+                SupportLevel::Unknown,
+                "agent {} config must not be Unknown",
+                capability.agent
+            );
+            assert_ne!(
+                capability.scorecard,
+                SupportLevel::Unknown,
+                "agent {} scorecard must not be Unknown",
+                capability.agent
+            );
+        }
+    }
+
+    #[test]
+    fn retrieval_is_unsupported_for_all_non_claude_experimental_agents() {
+        for agent in ["codex", "opencode", "gemini"] {
+            let capability = capability_for_agent(agent).expect("agent row");
+            assert_eq!(
+                capability.retrieval,
+                SupportLevel::Unsupported,
+                "agent {} retrieval should be Unsupported",
+                agent
+            );
+        }
+    }
+
+    #[test]
+    fn hermes_scorecard_is_explicitly_unsupported_not_unknown() {
+        // scorecard must be Unsupported (a deliberate decision), not Unknown (unverified).
+        let hermes = capability_for_agent("hermes").expect("hermes row");
+        assert_eq!(hermes.scorecard, SupportLevel::Unsupported);
+        assert_ne!(hermes.scorecard, SupportLevel::Unknown);
+    }
+
+    // --- Lookup semantics ----------------------------------------------------
+
+    #[test]
+    fn capability_for_agent_is_case_sensitive() {
+        // The agent id is a stable lower-case token; upper-case must not match.
+        assert_eq!(capability_for_agent("Claude-Code"), None);
+        assert_eq!(capability_for_agent("CLAUDE-CODE"), None);
+        assert_eq!(capability_for_agent("Hermes"), None);
+    }
+
+    #[test]
+    fn capability_for_agent_returns_none_for_empty_string() {
+        assert_eq!(capability_for_agent(""), None);
+    }
+
+    // --- Debug / trait-impl smoke tests -------------------------------------
+
+    #[test]
+    fn adapter_status_debug_displays_variant_name() {
+        assert_eq!(format!("{:?}", AdapterStatus::Stable), "Stable");
+        assert_eq!(format!("{:?}", AdapterStatus::Experimental), "Experimental");
+        assert_eq!(format!("{:?}", AdapterStatus::Discovery), "Discovery");
+        assert_eq!(format!("{:?}", AdapterStatus::Unsupported), "Unsupported");
+    }
+
+    #[test]
+    fn support_level_debug_displays_variant_name() {
+        assert_eq!(format!("{:?}", SupportLevel::Supported), "Supported");
+        assert_eq!(format!("{:?}", SupportLevel::Partial), "Partial");
+        assert_eq!(format!("{:?}", SupportLevel::Unsupported), "Unsupported");
+        assert_eq!(format!("{:?}", SupportLevel::Unknown), "Unknown");
+    }
+
+    #[test]
+    fn adapter_status_equality_is_reflexive() {
+        assert_eq!(AdapterStatus::Stable, AdapterStatus::Stable);
+        assert_ne!(AdapterStatus::Stable, AdapterStatus::Experimental);
+    }
+
+    #[test]
+    fn support_level_equality_is_reflexive() {
+        assert_eq!(SupportLevel::Supported, SupportLevel::Supported);
+        assert_ne!(SupportLevel::Supported, SupportLevel::Partial);
+    }
+
+    #[test]
+    fn agent_capability_is_copy() {
+        // Verifies `Copy` derive by value-copy of a capability row.
+        let cap = *capability_for_agent("claude-code").expect("claude-code row");
+        assert_eq!(cap.agent, "claude-code");
+    }
 }
