@@ -348,29 +348,51 @@ mod tests {
         // PATH-relative (the installer emits an absolute, shell-quoted path — that
         // is legitimately different and asserted separately).
         const EXPECTED_CMD: &str = "rusty-brain-hooks --agent claude-code";
-        for rel in [
-            ".claude/settings.json",
-            "plugins/rusty-brain/hooks/hooks.json",
+        // `.claude/settings.json` is the live repo config; the installer merges its
+        // sentinel-scoped groups NON-destructively, so the file may legitimately
+        // carry foreign hooks (e.g. a team CI gate on `PreToolUse`) alongside ours.
+        // The assertion therefore scopes to rusty-brain-managed events there. The
+        // plugin `hooks.json` is wholly installer-owned, so it must contain ONLY
+        // our events — no foreign hooks allowed.
+        for (rel, foreign_allowed) in [
+            (".claude/settings.json", true),
+            ("plugins/rusty-brain/hooks/hooks.json", false),
         ] {
             let json = read_repo_json(rel);
             let hooks = json["hooks"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{rel}: hooks object"));
-            let got: BTreeSet<&str> = hooks.keys().map(String::as_str).collect();
+            // The rusty-brain group within an event is the one whose entry command
+            // is EXPECTED_CMD; a foreign hook on the same event is ignored.
+            let rb_group = |event: &str| -> Option<&serde_json::Value> {
+                hooks
+                    .get(event)?
+                    .as_array()?
+                    .iter()
+                    .find(|g| g["hooks"][0]["command"].as_str() == Some(EXPECTED_CMD))
+            };
+            let ours: BTreeSet<&str> = hooks
+                .keys()
+                .map(String::as_str)
+                .filter(|e| rb_group(e).is_some())
+                .collect();
             assert_eq!(
-                got, expected,
-                "{rel} must register exactly the CLAUDE_EVENTS"
+                ours, expected,
+                "{rel} must register exactly the CLAUDE_EVENTS for rusty-brain"
             );
-            // Pin the command string + matcher too — event keys alone would not
-            // catch a typoed binary / wrong `--agent` / dropped matcher.
-            for (event, groups) in hooks {
-                let group = &groups[0];
+            if !foreign_allowed {
+                let all: BTreeSet<&str> = hooks.keys().map(String::as_str).collect();
                 assert_eq!(
-                    group["hooks"][0]["command"].as_str(),
-                    Some(EXPECTED_CMD),
-                    "{rel} {event} hook command"
+                    all, expected,
+                    "{rel} is installer-owned and must contain ONLY the CLAUDE_EVENTS"
                 );
-                if event == "PostToolUse" {
+            }
+            // Pin the command string + matcher on OUR group — event keys alone would
+            // not catch a typoed binary / wrong `--agent` / dropped matcher.
+            for event in &expected {
+                let group =
+                    rb_group(event).unwrap_or_else(|| panic!("{rel} {event}: rusty-brain group"));
+                if *event == "PostToolUse" {
                     assert_eq!(
                         group["matcher"], "*",
                         "{rel} PostToolUse carries the matcher"
