@@ -2,7 +2,11 @@
 
 - **Date:** 2026-06-13
 - **Area:** `rb-agents` adapters (Gemini / Codex / OpenCode) + `rb-hooks` capture
-- **Status:** Deferred (Phase 3 is scoped to "Claude Code value")
+- **Status:** Resolution planned — see
+  [cross-CLI terminus mapping plan](../plans/2026-06-26-cross-cli-terminus-mapping.md).
+  The recovery mechanism (`SessionCheckpoint` + `FoldMode::Checkpoint`) already
+  exists and is wired/tested but dormant; OpenCode's mapping is now fixture-backed
+  (ready to implement), Codex/Gemini remain fixture-gated.
 - **Severity:** Medium — a capture **regression** for non-Claude CLIs until resolved
 
 ## Summary
