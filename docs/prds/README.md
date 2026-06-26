@@ -14,6 +14,10 @@ This directory contains implementation-ready product requirements for the remain
 | Codex `apply_patch` capture | [2026-06-23-codex-apply-patch-capture.md](2026-06-23-codex-apply-patch-capture.md) | Upstream/readiness-gated |
 | Cross-agentic agent parity for OpenCode, Codex, and Hermes | [2026-06-23-cross-agentic-agent-parity.md](2026-06-23-cross-agentic-agent-parity.md) | New sprint task |
 
+## Sequencing
+
+- [Next-work sequencing and parallelization](2026-06-23-next-work-sequencing.md) — ordering and parallel-track guidance across the W3.5 closeout and cross-agent parity work.
+
 ## Notes
 
 - The original six implementation tasks are now seven because the sprint needs a separate cross-agentic parity task.

@@ -12,3 +12,15 @@ Cargo.lock.orig
 # .claude/settings.json is the shared rusty-brain dogfood config / reference template).
 .claude/settings.local.json
 .worktrees
+# Cross-agent fixture recorder home (scripts/record-agent-fixtures.sh). The
+# STABLE recorder home lives OUTSIDE the repo at
+# ${XDG_CACHE_HOME:-$HOME/.cache}/rusty-brain/fixture-record/<agent>/ and holds a
+# read-only COPY of the operator's auth + raw, UN-sanitized per-agent session
+# history. Defense in depth: if XDG_CACHE_HOME ever points inside the repo, never
+# let it be committed. The committed fixtures under
+# crates/rb-hooks/tests/fixtures/{codex,opencode}/ are SANITIZED by the recorder
+# before they are written there and ARE the deliverable, so they are NOT ignored
+# (matching the tracked claude_code/ fixtures); the operator reviews the diff and
+# commits them deliberately per the plan's Task 9.
+**/rusty-brain/fixture-record/
+.cache/

@@ -1,0 +1,1 @@
+{"type":"tool.execute.after","tool":"bash","sessionID":"ses_107a97eedffedZEkDN11h8NsVD","callID":"call_ZpF91Qt8d4ipkorwMpK8m8Vo","args":{"command":"echo hi","timeout":120000,"workdir":"/Users/user/proj","description":"Prints hi using Bash"},"output":"hi\n","title":"Prints hi using Bash","metadata":{"output":"hi\n","exit":0,"description":"Prints hi using Bash","truncated":false}}
