@@ -16,7 +16,7 @@ trust survives across runs. The operator's real auth is COPIED in (read-only on
 the real side, mode 0600), so the real agent home (`~/.codex` /
 `~/.local/share/opencode`) is never mutated.
 
-opencode has NO directory/plugin trust gate. It records under the operator`'s REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.
+opencode has NO directory/plugin trust gate. It records under the operator's REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.
 
 Record command: `RB_FIXTURE_LOG_DIR=<rec>/raw opencode run --format json --dir <rec proj> "<prompt>"` under a hard timeout, using the real opencode config/auth. One multi-turn headless session (one Bash + one file write)
 is captured to `result.jsonl`, then sanitized.

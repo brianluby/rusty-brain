@@ -145,11 +145,11 @@ emit_readme() {
     codex)
       trust_line='codex computes a per-hook `trusted_hash` that cannot be hand-written, so the operator pre-trusts the hooks ONCE via `--setup-trust codex` (interactive TUI); persisted `[hooks.state]` trust then lets recording run with NO `--dangerously-bypass-hook-trust` flag.'
       record_line='`CODEX_HOME=<rec> codex exec --json -C <rec proj> -s workspace-write --skip-git-repo-check -c approval_policy="never" "<prompt>"`'
-      home_line='The operator`'"'"'s real `~/.codex/auth.json` is COPIED in (read-only on the real side, mode 0600) under `CODEX_HOME=<rec>`, so the real `~/.codex` is never mutated.' ;;
+      home_line='The operator'"'"'s real `~/.codex/auth.json` is COPIED in (read-only on the real side, mode 0600) under `CODEX_HOME=<rec>`, so the real `~/.codex` is never mutated.' ;;
     opencode)
-      trust_line='opencode has NO directory/plugin trust gate. It records under the operator`'"'"'s REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.'
+      trust_line='opencode has NO directory/plugin trust gate. It records under the operator'"'"'s REAL `~/.config/opencode` (the working model + auth); only a project-local plugin + `RB_FIXTURE_LOG_DIR` are recorder-specific. `--setup-trust opencode` just verifies auth; no interactive trust step and no `--dangerously` flag.'
       record_line='`RB_FIXTURE_LOG_DIR=<rec>/raw opencode run --format json --dir <rec proj> "<prompt>"` under a hard timeout, using the real opencode config/auth'
-      home_line='opencode records under the operator`'"'"'s REAL `~/.config/opencode` / `~/.local/share/opencode` (no auth copy, no XDG redirect — its default config picks the working model). The recorder home holds only the scratch project + raw event logs. ONE session entry IS written to the real opencode history (the documented, accepted side effect); no auth or config file is copied or modified.' ;;
+      home_line='opencode records under the operator'"'"'s REAL `~/.config/opencode` / `~/.local/share/opencode` (no auth copy, no XDG redirect — its default config picks the working model). The recorder home holds only the scratch project + raw event logs. ONE session entry IS written to the real opencode history (the documented, accepted side effect); no auth or config file is copied or modified.' ;;
     *)
       trust_line='Hooks are pre-trusted via `--setup-trust '"$agent"'`; no `--dangerously` bypass flag is used.'
       record_line='the headless CLI invocation logged at record time'

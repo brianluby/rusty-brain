@@ -9,7 +9,7 @@ set -uo pipefail
 
 export RUSTFLAGS="${RUSTFLAGS:--D warnings}"   # CI sets this globally (ci.yml env)
 FAST=0; [ "${1:-}" = "--fast" ] && FAST=1
-ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT"
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"; cd "$ROOT" || exit 1
 
 rc=0
 step() { # label cmd...

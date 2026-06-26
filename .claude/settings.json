@@ -70,7 +70,7 @@
             "if": "Bash(gh pr create*)",
             "timeout": 900,
             "statusMessage": "Running local CI before PR",
-            "command": "S=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/scripts/ci-local.sh\"; [ -x \"$S\" ] || exit 0; if bash \"$S\" >/tmp/rb-ci-gate.log 2>&1; then exit 0; else printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Local CI failed (scripts/ci-local.sh). PR creation blocked. Re-run scripts/ci-local.sh or check /tmp/rb-ci-gate.log for the failing gate.\"}}'; fi"
+            "command": "IN=\"$(cat)\"; case \"$IN\" in *\"gh pr create\"*) ;; *) exit 0 ;; esac; S=\"${CLAUDE_PROJECT_DIR:-$(git rev-parse --show-toplevel 2>/dev/null)}/scripts/ci-local.sh\"; [ -x \"$S\" ] || exit 0; if bash \"$S\" >/tmp/rb-ci-gate.log 2>&1; then exit 0; else printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"permissionDecision\":\"deny\",\"permissionDecisionReason\":\"Local CI failed (scripts/ci-local.sh). PR creation blocked. Re-run scripts/ci-local.sh or check /tmp/rb-ci-gate.log for the failing gate.\"}}'; fi"
           }
         ]
       }
