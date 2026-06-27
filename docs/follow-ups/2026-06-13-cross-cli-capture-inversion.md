@@ -2,31 +2,37 @@
 
 - **Date:** 2026-06-13
 - **Area:** `rb-agents` adapters (Gemini / Codex / OpenCode) + `rb-hooks` capture
-- **Status:** Resolution planned — see
+- **Status:** Resolution in progress — see
   [cross-CLI terminus mapping plan](../plans/2026-06-26-cross-cli-terminus-mapping.md).
   The recovery mechanism (`SessionCheckpoint` + `FoldMode::Checkpoint`) already
-  exists and is wired/tested but dormant; OpenCode's terminus mapping is
-  fixture-backed (Gap A), but full capture restoration still needs the separate
-  `apply_patch` tool-coverage fix (Gap B). Codex/Gemini remain fixture-gated.
+  existed but was dormant; OpenCode's terminus mapping (Gap A) is now **landed**
+  (`session.idle` → `SessionCheckpoint`, fixture-backed lifecycle test). Full
+  OpenCode capture restoration still needs the separate `apply_patch`
+  tool-coverage fix (Gap B). Codex/Gemini remain fixture-gated.
 - **Severity:** Medium — a capture **regression** for non-Claude CLIs until resolved
 
 ## Summary
 
 W3.1 inverted capture: canonical `Stop` now stores **nothing**, and the
 once-per-session fold happens at canonical `SessionEnd`. Only the **Claude Code**
-adapter emits canonical `SessionEnd` (verified against recorded fixtures). The
-other three adapters map their terminal event onto canonical `Stop`:
+adapter emits canonical `SessionEnd` (verified against recorded fixtures). Of the
+other three adapters, Gemini and Codex still map their terminal event onto
+canonical `Stop`, while OpenCode now maps `session.idle` to canonical
+`SessionCheckpoint` (Gap A):
 
 | CLI | terminal native event | canonical mapping |
 |---|---|---|
-| Gemini | `SessionEnd` | `Stop` (`crates/rb-agents/src/gemini.rs`) |
-| Codex | `Stop` | `Stop` (`crates/rb-agents/src/codex.rs`) |
-| OpenCode | `session.idle` | `Stop` (`crates/rb-agents/src/opencode.rs`) |
+| Gemini | `SessionEnd` | `Stop` (`crates/rb-agents/src/gemini.rs`) — fixture-gated |
+| Codex | `Stop` | `Stop` (`crates/rb-agents/src/codex.rs`) — fixture-gated |
+| OpenCode | `session.idle` | `SessionCheckpoint` (`crates/rb-agents/src/opencode.rs`) — **Gap A landed** |
 
-So for Gemini / Codex / OpenCode: `PostToolUse` appends to the per-session
-scratch as designed, but no canonical `SessionEnd` ever fires, so the scratch is
-never folded into a summary — it simply ages out via `scratch::prune_stale`
-(24h). Net effect vs pre-W3.1: those CLIs go from per-event capture to **no new
+OpenCode's `session.idle` now folds via canonical `SessionCheckpoint` (Gap A,
+multi-fire checkpoint-safe), so its bash-tool scratch is captured again. Codex
+and Gemini remain on `Stop` until a recorded lifecycle fixture proves their
+terminus cadence. For any CLI still on `Stop`: `PostToolUse` appends to the
+per-session scratch as designed, but no canonical fold ever fires, so the scratch
+is never folded into a summary — it simply ages out via `scratch::prune_stale`
+(24h). Net effect vs pre-W3.1 (while unmapped): per-event capture → **no new
 capture** (existing memories still recall/inject fine).
 
 ## Why it was not fixed in W3.1

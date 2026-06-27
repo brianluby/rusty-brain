@@ -89,10 +89,19 @@ impl AgentCli for OpenCodeCli {
                 tool_input: first_value(raw, &["args", "tool_input"]),
                 tool_response: first_value(raw, &["output", "tool_response"]),
             },
-            Some("session.idle") => HookEvent::Stop {
-                last_assistant_message: first_str(raw, &["last_assistant_message"]),
-                // OpenCode has no stop-hook-forced-continuation equivalent.
-                stop_hook_active: false,
+            // OpenCode's `session.idle` is its terminal/idle boundary — the event
+            // it emits to mark "the turn settled". It is NOT a clean once-per-
+            // session terminus: the recorded `terminus.json` verdict is
+            // `ambiguous` (a single-run observation, fired=2), so its cadence is
+            // unproven. That ambiguity is exactly why it maps to the multi-fire-
+            // safe SessionCheckpoint and NOT Stop: each idle folds the accumulated
+            // scratch into one *superseding* summary (retaining the buffer), so
+            // ANY fire count >= 1 converges to one progressively-complete memory
+            // rather than N — robust to the cadence, restoring capture that
+            // canonical Stop dropped. `first_str` stays forward-compatible:
+            // today's idle payload carries no `reason`, so this resolves to None.
+            Some("session.idle") => HookEvent::SessionCheckpoint {
+                reason: first_str(raw, &["reason"]),
             },
             Some("session.compacted") => HookEvent::PreCompact {
                 custom_instructions: first_str(raw, &["custom_instructions"]),
@@ -196,19 +205,15 @@ mod tests {
     }
 
     #[test]
-    fn parses_session_idle_as_stop() {
+    fn parses_session_idle_as_session_checkpoint() {
+        // Gap A: session.idle is the fold event. It is multi-fire (not a clean
+        // terminus), so it maps to the superseding SessionCheckpoint, not Stop.
         let raw = json!({
             "type": "session.idle",
             "last_assistant_message": "done"
         });
         let ctx = OpenCodeCli.parse_input(&raw);
-        assert_eq!(
-            ctx.event,
-            HookEvent::Stop {
-                last_assistant_message: Some("done".to_string()),
-                stop_hook_active: false,
-            }
-        );
+        assert_eq!(ctx.event, HookEvent::SessionCheckpoint { reason: None });
     }
 
     #[test]

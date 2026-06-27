@@ -22,6 +22,14 @@ const REAL_POST_TOOL_USE_WRITE: &str =
 const REAL_STOP: &str = include_str!("fixtures/claude_code/stop.json");
 const REAL_SESSION_END: &str = include_str!("fixtures/claude_code/session_end.json");
 
+// ---- REAL recorded OpenCode hook payloads (PR #46, see fixtures/opencode/) ----
+// Both share session id `ses_107a97…` so a PostToolUse scratch aligns into the
+// following `session.idle` fold. `tool_execute_after` is a BASH event (command
+// `echo hi`): it pins bash-command capture only, NOT file-edit capture (Gap B /
+// `apply_patch`, tracked separately).
+const OPENCODE_TOOL_EXECUTE_AFTER: &str = include_str!("fixtures/opencode/tool_execute_after.json");
+const OPENCODE_SESSION_IDLE: &str = include_str!("fixtures/opencode/session_idle.json");
+
 fn hooks_command() -> std::process::Command {
     std::process::Command::cargo_bin("rusty-brain-hooks").expect("binary builds")
 }
@@ -116,6 +124,11 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// What the mock daemon observed from the hook: the handshake identity and
 /// the first Remember's payload (W0.5 provenance + confidence assertions).
+///
+/// The scalar `content`/`context`/`confidence` fields mirror the FIRST Remember
+/// (back-compat with the single-fold lifecycle tests). `remembers` records EVERY
+/// Remember in order — needed to assert multi-checkpoint supersede chains, where
+/// the second checkpoint's `supersedes` must point at the first's issued id.
 #[derive(Debug, Default, Clone)]
 struct Observed {
     saw_remember: bool,
@@ -124,95 +137,148 @@ struct Observed {
     confidence: Option<f32>,
     content: Option<String>,
     context: Option<String>,
+    remembers: Vec<RememberObs>,
 }
 
-// Accept ONE connection (with a short timeout so an event that never connects —
-// PostToolUse / Stop / Other under W3.1 — cannot hang the mock), handshake-ack,
-// and answer the first Remember with a canned id. Signals back what was observed.
-async fn serve_one_remember(listener: UnixListener, tx: tokio::sync::oneshot::Sender<Observed>) {
-    let mut observed = Observed::default();
-    let accept = tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
-    let Ok(Ok((stream, _addr))) = accept else {
-        // No client connected within the window (a local-only event that skips
-        // the daemon entirely), or accept errored: report nothing observed.
-        let _ = tx.send(observed);
-        return;
-    };
-    let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
-        Framed::new(stream, LengthDelimitedCodec::new());
-    let hs: Handshake = match read_frame(&mut framed).await {
-        Ok(h) => h,
-        Err(_) => {
-            let _ = tx.send(observed);
-            return;
-        }
-    };
-    if let Some(identity) = hs.identity {
-        observed.identity_source = identity.source;
-        observed.identity_agent = identity.agent;
-    }
-    let _ = write_frame(
-        &mut framed,
-        &HandshakeAck {
-            contract_version: CONTRACT_VERSION,
-            ok: true,
-            message: None,
-        },
-    )
-    .await;
-    while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
-        let resp = match req {
-            // W3.1 added `supersedes`; the mock ignores it (matched via `..`).
-            Request::Remember {
-                confidence,
-                content,
-                context,
-                ..
-            } => {
-                observed.saw_remember = true;
+/// One Remember the mock observed: its folded `content`, the `supersedes` id it
+/// carried (the prior summary it replaces, if any), and the canned `issued_id`
+/// the mock answered with (so a later checkpoint's `supersedes` can be matched
+/// against it).
+#[derive(Debug, Clone)]
+struct RememberObs {
+    content: String,
+    supersedes: Option<String>,
+    issued_id: String,
+}
+
+/// Record one request into `observed` and build the mock's response. A Remember
+/// is answered with a fresh canned id (recorded on the `RememberObs` so a later
+/// checkpoint's `supersedes` can be matched against it); Context/Ping/other get
+/// benign answers. The scalar fields track the FIRST Remember for back-compat.
+fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
+    match req {
+        Request::Remember {
+            confidence,
+            content,
+            context,
+            supersedes,
+            ..
+        } => {
+            let id = MemoryId::new();
+            observed.saw_remember = true;
+            if observed.remembers.is_empty() {
                 observed.confidence = confidence;
-                observed.content = Some(content);
+                observed.content = Some(content.clone());
                 observed.context = context;
-                Response::Remembered {
-                    id: MemoryId::new(),
-                }
             }
-            Request::Context => Response::ContextResult {
-                recent: vec![],
-                important: vec![],
-                total: 0,
-            },
-            Request::Ping => Response::Pong {
-                contract_version: CONTRACT_VERSION,
-                recall_channels: None,
-            },
-            _ => Response::Pong {
-                contract_version: CONTRACT_VERSION,
-                recall_channels: None,
-            },
+            observed.remembers.push(RememberObs {
+                content,
+                supersedes: supersedes.map(|m| m.to_string()),
+                issued_id: id.to_string(),
+            });
+            Response::Remembered { id }
+        }
+        Request::Context => Response::ContextResult {
+            recent: vec![],
+            important: vec![],
+            total: 0,
+        },
+        Request::Ping => Response::Pong {
+            contract_version: CONTRACT_VERSION,
+            recall_channels: None,
+        },
+        _ => Response::Pong {
+            contract_version: CONTRACT_VERSION,
+            recall_channels: None,
+        },
+    }
+}
+
+// Serve the mock daemon. When `single` is true, serve exactly one connection
+// (the single-fold lifecycle tests); when false, keep accepting a fresh
+// connection per fold (a multi-checkpoint sequence). The driver signals
+// completion explicitly via `shutdown_rx` once it has issued every hook
+// invocation, so the accept loop never uses a wall-clock timeout as a
+// sequence-completion signal — that previously made multi-checkpoint runs
+// timing-sensitive (a slow CI spawn could close the listener before the next
+// checkpoint connected). The whole call stays bounded by the driver's
+// `recv_timeout`. Signals back what was observed.
+async fn serve_remembers(
+    listener: UnixListener,
+    tx: tokio::sync::oneshot::Sender<Observed>,
+    single: bool,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+) {
+    let mut observed = Observed::default();
+    loop {
+        // Accept the next connection, but stop the moment the driver signals it
+        // has finished issuing invocations (or its thread dies and drops the
+        // sender, which resolves the recv to Err). `biased` prefers a ready
+        // connection so a genuine fold is never dropped for a pending shutdown.
+        let accepted = tokio::select! {
+            biased;
+            res = listener.accept() => res,
+            _ = &mut shutdown_rx => break,
         };
-        if write_frame(&mut framed, &resp).await.is_err() {
+        let Ok((stream, _addr)) = accepted else {
+            // accept errored: stop and report what was observed so far.
+            break;
+        };
+        let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
+            Framed::new(stream, LengthDelimitedCodec::new());
+        let hs: Handshake = match read_frame(&mut framed).await {
+            Ok(h) => h,
+            // A bad handshake aborts this connection; in single mode we are done,
+            // otherwise wait for the next checkpoint's connection.
+            Err(_) if single => break,
+            Err(_) => continue,
+        };
+        if let Some(identity) = hs.identity {
+            observed.identity_source = identity.source;
+            observed.identity_agent = identity.agent;
+        }
+        let _ = write_frame(
+            &mut framed,
+            &HandshakeAck {
+                contract_version: CONTRACT_VERSION,
+                ok: true,
+                message: None,
+            },
+        )
+        .await;
+        while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
+            let resp = record_and_respond(req, &mut observed);
+            if write_frame(&mut framed, &resp).await.is_err() {
+                break;
+            }
+        }
+        if single {
             break;
         }
     }
     let _ = tx.send(observed);
 }
 
-/// Run a SEQUENCE of hook invocations against ONE mock daemon, sharing the
-/// dedup + scratch cache dir (so a PostToolUse scratch survives into the
-/// following SessionEnd fold) and an optional pinned namespace. Returns what the
-/// mock observed (the single Remember a SessionEnd fold sends, if any) plus the
-/// LAST invocation's stdout. The cache is isolated to a fresh tempdir so a prior
-/// run can never interfere.
-fn observe_sequence_against_mock_daemon(
+/// Run a SEQUENCE of hook invocations for `agent` against ONE mock daemon,
+/// sharing the dedup + scratch cache dir (so a PostToolUse scratch survives into
+/// the following fold) and an optional pinned namespace. Returns what the mock
+/// observed plus the LAST invocation's stdout. The cache is isolated to a fresh
+/// tempdir so a prior run can never interfere. When `single`, the mock serves
+/// exactly one connection; otherwise it serves every fold's connection (for
+/// multi-checkpoint supersede assertions).
+fn observe_sequence_impl(
     events: &[&str],
     namespace: Option<&str>,
+    agent: &str,
+    single: bool,
 ) -> (Observed, String) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("live.sock");
     let socket_str = socket.to_string_lossy().to_string();
 
     let (tx, rx) = std::sync::mpsc::channel::<Observed>();
+    // Driver -> mock "all invocations issued" signal (see `serve_remembers`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_thread = socket.clone();
     let server = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -222,20 +288,20 @@ fn observe_sequence_against_mock_daemon(
         rt.block_on(async move {
             let listener = UnixListener::bind(&socket_for_thread).expect("bind");
             let (otx, orx) = tokio::sync::oneshot::channel::<Observed>();
-            let accept = tokio::spawn(serve_one_remember(listener, otx));
+            let accept = tokio::spawn(serve_remembers(listener, otx, single, shutdown_rx));
             let observed = orx.await.unwrap_or_default();
             let _ = accept.await;
             let _ = tx.send(observed);
         });
     });
 
-    // Give the listener a moment to bind.
+    // Give the listener a moment to bind before the first hook connects.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut last_stdout = String::new();
     for event in events {
         let mut cmd = hooks_command();
-        cmd.args(["--agent", "claude-code"])
+        cmd.args(["--agent", agent])
             .env("RUSTY_BRAIN_SOCKET", &socket_str)
             .env("XDG_CACHE_HOME", dir.path());
         if let Some(ns) = namespace {
@@ -258,6 +324,11 @@ fn observe_sequence_against_mock_daemon(
         last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
     }
 
+    // Every hook invocation has run: tell the mock to stop accepting. Dropping
+    // the sender on an early panic also resolves the mock's recv to Err, so it
+    // never hangs.
+    let _ = shutdown_tx.send(());
+
     let observed = rx
         .recv_timeout(std::time::Duration::from_secs(12))
         .unwrap_or_default();
@@ -266,9 +337,30 @@ fn observe_sequence_against_mock_daemon(
     (observed, last_stdout)
 }
 
+/// Single-fold lifecycle sequence: the mock serves exactly one daemon
+/// connection (the one fold a SessionEnd/SessionCheckpoint sends, if any).
+fn observe_sequence_against_mock_daemon(
+    events: &[&str],
+    namespace: Option<&str>,
+    agent: &str,
+) -> (Observed, String) {
+    observe_sequence_impl(events, namespace, agent, true)
+}
+
+/// Multi-checkpoint sequence: the mock serves EVERY fold's connection and
+/// records each Remember, so a supersede chain across repeated checkpoints can
+/// be asserted. Costs one idle-accept timeout at the end of the run.
+fn observe_sequence_collecting_remembers(
+    events: &[&str],
+    namespace: Option<&str>,
+    agent: &str,
+) -> (Observed, String) {
+    observe_sequence_impl(events, namespace, agent, false)
+}
+
 /// Single-event convenience over [`observe_sequence_against_mock_daemon`].
-fn observe_against_mock_daemon(stdin: &str) -> (Observed, String) {
-    observe_sequence_against_mock_daemon(&[stdin], None)
+fn observe_against_mock_daemon(stdin: &str, agent: &str) -> (Observed, String) {
+    observe_sequence_against_mock_daemon(&[stdin], None, agent)
 }
 
 #[test]
@@ -276,7 +368,7 @@ fn post_tool_use_writes_no_memory() {
     // W3.1 capture inversion: PostToolUse appends to the per-session scratch and
     // writes ZERO memories — it does not even connect to the daemon (the mock
     // observes nothing). The REAL recorded Write payload pins this end-to-end.
-    let (observed, stdout) = observe_against_mock_daemon(REAL_POST_TOOL_USE_WRITE);
+    let (observed, stdout) = observe_against_mock_daemon(REAL_POST_TOOL_USE_WRITE, "claude-code");
     assert!(
         !observed.saw_remember,
         "PostToolUse must write no memory (W3.1 capture inversion)"
@@ -289,7 +381,7 @@ fn post_tool_use_writes_no_memory() {
 #[test]
 fn stop_writes_no_memory() {
     // W3.1: a per-turn Stop stores nothing; the session fold is at SessionEnd.
-    let (observed, stdout) = observe_against_mock_daemon(REAL_STOP);
+    let (observed, stdout) = observe_against_mock_daemon(REAL_STOP, "claude-code");
     assert!(
         !observed.saw_remember,
         "Stop must store nothing (W3.1); the fold is at SessionEnd"
@@ -304,7 +396,7 @@ fn user_prompt_submit_is_a_no_op_continue() {
     // The REAL recorded UserPromptSubmit payload. Unmodeled today (parses as
     // HookEvent::Other) — W3.2 wires deterministic recall onto it. Pins the
     // current no-op contract: continue, no injection, ZERO memories.
-    let (observed, stdout) = observe_against_mock_daemon(REAL_USER_PROMPT_SUBMIT);
+    let (observed, stdout) = observe_against_mock_daemon(REAL_USER_PROMPT_SUBMIT, "claude-code");
     assert!(
         !observed.saw_remember,
         "UserPromptSubmit must not write memories (W3.2 owns its consumption)"
@@ -323,7 +415,7 @@ fn session_end_with_empty_scratch_writes_nothing() {
     // SessionEnd connects, but a fresh cache dir (empty scratch), a non-existent
     // cwd (no git changes), and a non-existent transcript leave nothing to fold
     // → no memory, continue. The REAL recorded SessionEnd payload drives it.
-    let (observed, stdout) = observe_against_mock_daemon(REAL_SESSION_END);
+    let (observed, stdout) = observe_against_mock_daemon(REAL_SESSION_END, "claude-code");
     assert!(
         !observed.saw_remember,
         "an empty-scratch SessionEnd has nothing to fold and writes nothing"
@@ -344,6 +436,7 @@ fn session_end_folds_post_tool_use_scratch_into_one_summary() {
     let (observed, _stdout) = observe_sequence_against_mock_daemon(
         &[REAL_POST_TOOL_USE_WRITE, REAL_SESSION_END],
         Some("rb-it-fold"),
+        "claude-code",
     );
     assert!(
         observed.saw_remember,
@@ -370,6 +463,88 @@ fn session_end_folds_post_tool_use_scratch_into_one_summary() {
 }
 
 #[test]
+fn opencode_session_idle_folds_tool_scratch_into_one_checkpoint_summary() {
+    // Gap A end-to-end: OpenCode's `session.idle` is the fold event. A
+    // `tool.execute.after` (bash) appends the command to the per-session scratch
+    // (no memory, no connect); the following `session.idle` folds it into ONE
+    // SessionCheckpoint summary Remember. Both REAL fixtures share the cache dir,
+    // pinned namespace, and recorded session id, so the scratch aligns.
+    //
+    // FAILS before Gap A: `session.idle` maps to canonical Stop, which stores
+    // nothing, so the mock observes no Remember.
+    //
+    // SCOPE: the fixture is a BASH event, so this proves bash-command capture
+    // folds — NOT file-edit capture (Gap B / `apply_patch`).
+    let (observed, _stdout) = observe_sequence_against_mock_daemon(
+        &[OPENCODE_TOOL_EXECUTE_AFTER, OPENCODE_SESSION_IDLE],
+        Some("rb-it-opencode-fold"),
+        "opencode",
+    );
+    assert!(
+        observed.saw_remember,
+        "OpenCode session.idle must fold the tool scratch into one checkpoint summary"
+    );
+    // Same W0.5 provenance as Claude, but stamped with the OpenCode agent id.
+    assert_eq!(observed.identity_source.as_deref(), Some("hook"));
+    assert_eq!(observed.identity_agent.as_deref(), Some("opencode"));
+    let confidence = observed.confidence.expect("Remember carries confidence");
+    assert!(
+        (confidence - 0.7).abs() < f32::EPSILON,
+        "hook captures must send confidence 0.7, got {confidence}"
+    );
+    // The summary folds the recorded bash command under its commands section.
+    let content = observed.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("echo hi"),
+        "the checkpoint summary must fold the recorded bash command: {content}"
+    );
+    assert!(
+        content.contains("Commands run"),
+        "the summary must carry a commands section: {content}"
+    );
+}
+
+#[test]
+fn opencode_second_session_idle_supersedes_the_first_checkpoint() {
+    // Gap A multi-fire safety: two `session.idle` events => two SessionCheckpoint
+    // folds. The second must SUPERSEDE the first (one live summary, not two):
+    // checkpoint #1 RETAINS the scratch, checkpoint #2 re-folds it and points
+    // `supersedes` at #1's issued id. This is why `session.idle` maps to a
+    // (multi-fire-safe) checkpoint rather than a once-per-session SessionEnd.
+    let (observed, _stdout) = observe_sequence_collecting_remembers(
+        &[
+            OPENCODE_TOOL_EXECUTE_AFTER,
+            OPENCODE_SESSION_IDLE,
+            OPENCODE_SESSION_IDLE,
+        ],
+        Some("rb-it-opencode-supersede"),
+        "opencode",
+    );
+    assert_eq!(
+        observed.remembers.len(),
+        2,
+        "two session.idle checkpoints must produce exactly two Remembers, got {:?}",
+        observed.remembers
+    );
+    assert_eq!(
+        observed.remembers[0].supersedes, None,
+        "the first checkpoint supersedes nothing"
+    );
+    assert_eq!(
+        observed.remembers[1].supersedes.as_deref(),
+        Some(observed.remembers[0].issued_id.as_str()),
+        "the second checkpoint must supersede the first checkpoint's summary id"
+    );
+    // The retained scratch feeds the second fold too: the command persists into
+    // the superseding summary (one progressively-complete memory, not a reset).
+    assert!(
+        observed.remembers[1].content.contains("echo hi"),
+        "the superseding summary must still carry the folded command: {}",
+        observed.remembers[1].content
+    );
+}
+
+#[test]
 fn planted_secrets_never_reach_the_folded_remember_payload() {
     // W0.5 minimal redaction at the WIRE level (the DB-bytes complement lives in
     // rb-install/tests/e2e.rs): a Bash command + a FAILING tool response carrying
@@ -383,8 +558,11 @@ fn planted_secrets_never_reach_the_folded_remember_payload() {
         r#"GITHUB_TOKEN=ghp_secret123\n-----BEGIN RSA PRIVATE KEY-----\nMIIfakekeymaterial\n-----END RSA PRIVATE KEY-----\ndone"}}"#
     );
     let session_end = r#"{"hook_event_name":"SessionEnd","cwd":"/tmp/rb-it-secret-xyz","session_id":"s1","reason":"other"}"#;
-    let (observed, _stdout) =
-        observe_sequence_against_mock_daemon(&[post, session_end], Some("rb-it-secret"));
+    let (observed, _stdout) = observe_sequence_against_mock_daemon(
+        &[post, session_end],
+        Some("rb-it-secret"),
+        "claude-code",
+    );
     assert!(
         observed.saw_remember,
         "the SessionEnd fold of the scratch must reach the daemon"
@@ -422,7 +600,7 @@ fn session_start_on_empty_corpus_injects_zero_tokens() {
     // ZERO memories, so SessionStart must inject literally nothing — no
     // `hookSpecificOutput.additionalContext`, no `systemMessage`, not even a
     // header. The hook still continues. Stdin is the REAL recorded SessionStart.
-    let (_observed, stdout) = observe_against_mock_daemon(REAL_SESSION_START);
+    let (_observed, stdout) = observe_against_mock_daemon(REAL_SESSION_START, "claude-code");
     let value: serde_json::Value =
         serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
     assert_eq!(

@@ -85,10 +85,11 @@ const CAPABILITIES: &[AgentCapability] = &[
         retrieval: SupportLevel::Unsupported,
         config: SupportLevel::Unsupported,
         scorecard: SupportLevel::Unsupported,
-        verified_lifecycle_source: "crates/rb-hooks/tests/fixtures/opencode/README.md",
+        verified_lifecycle_source: "crates/rb-hooks/tests/fixtures/opencode/",
         limitations: &[
             "Hook adapter exists, but rb-install plugin support is deferred.",
-            "session.idle remains canonical Stop and session.deleted remains Other until fixtures prove otherwise.",
+            "session.idle maps to canonical SessionCheckpoint (fixture-backed lifecycle test; multi-fire checkpoint-safe, one-run observation fired=2, verdict ambiguous); session.deleted remains Other.",
+            "Capture stays Partial: bash-command capture folds, but file edits via apply_patch are not yet captured (Gap B / apply_patch normalization pending).",
         ],
     },
     AgentCapability {
