@@ -63,7 +63,8 @@ fold (the "fold event"); every other lifecycle event maps to canonical `Stop`
 same session. So the decision is two steps:
 
 **Step 1 — choose the single fold event.** Prefer a clean once-per-session
-terminus if the CLI has one; otherwise use the most-terminal per-turn signal.
+terminus if the CLI has one; otherwise use the most-terminal multi-fire signal
+(a per-turn stop or an idle boundary).
 The recorded lifecycle fixture answers which case applies:
 
 > Does the chosen event fire **exactly once per session**, or **once per turn**
@@ -73,17 +74,19 @@ The recorded lifecycle fixture answers which case applies:
 
 - **Fires once per session (clean terminus):** → canonical `SessionEnd`.
   Fold + clear scratch. One summary per session, matching Claude.
-- **Fires per turn / multiple times (no clean terminus):** → canonical
-  `SessionCheckpoint`. Each firing folds the accumulated scratch into one
-  superseding summary and retains the buffer. Converges to a complete, single
-  live summary; never multiplies memories (supersede keeps exactly one).
+- **Fires multiple times per session (no clean terminus — e.g. a per-turn stop
+  or an idle boundary):** → canonical `SessionCheckpoint`. Each firing folds the
+  accumulated scratch into one superseding summary and retains the buffer.
+  Converges to a complete, single live summary; never multiplies memories
+  (supersede keeps exactly one).
 
 **Everything else → `Stop`.** Every lifecycle event that is NOT the chosen fold
 event maps to canonical `Stop` and stores nothing. This is the rule that
-prevents double-folding: when a CLI exposes both a per-turn signal and a
-per-session terminus, the terminus is the fold event (Step 2) and the per-turn
-signal stays `Stop`; when a CLI exposes only per-turn signals, exactly one of
-them is promoted to the `SessionCheckpoint` fold event and the rest stay `Stop`.
+prevents double-folding: when a CLI exposes both a multi-fire signal and a
+clean per-session terminus, the terminus is the fold event (Step 2) and the
+multi-fire signal stays `Stop`; when a CLI exposes only multi-fire signals
+(per-turn stops or idle boundaries), exactly one of them is promoted to the
+`SessionCheckpoint` fold event and the rest stay `Stop`.
 
 **No fold event at all** (no usable terminal or per-turn signal): accept the
 gap, document per-CLI, rely on `prune_stale`. Not expected for any current CLI.

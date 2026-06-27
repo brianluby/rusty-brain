@@ -5,8 +5,9 @@
 - **Status:** Resolution planned — see
   [cross-CLI terminus mapping plan](../plans/2026-06-26-cross-cli-terminus-mapping.md).
   The recovery mechanism (`SessionCheckpoint` + `FoldMode::Checkpoint`) already
-  exists and is wired/tested but dormant; OpenCode's mapping is now fixture-backed
-  (ready to implement), Codex/Gemini remain fixture-gated.
+  exists and is wired/tested but dormant; OpenCode's terminus mapping is
+  fixture-backed (Gap A), but full capture restoration still needs the separate
+  `apply_patch` tool-coverage fix (Gap B). Codex/Gemini remain fixture-gated.
 - **Severity:** Medium — a capture **regression** for non-Claude CLIs until resolved
 
 ## Summary
