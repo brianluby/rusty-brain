@@ -194,24 +194,34 @@ fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
     }
 }
 
-// Serve the mock daemon. Each `accept` has a short timeout so an event that never
-// connects — PostToolUse / Stop / Other under W3.1 — cannot hang the mock. When
-// `single` is true, serve exactly one connection (the single-fold lifecycle
-// tests); when false, keep accepting until an idle timeout (a multi-checkpoint
-// sequence opens a fresh connection per fold). Signals back what was observed.
+// Serve the mock daemon. When `single` is true, serve exactly one connection
+// (the single-fold lifecycle tests); when false, keep accepting a fresh
+// connection per fold (a multi-checkpoint sequence). The driver signals
+// completion explicitly via `shutdown_rx` once it has issued every hook
+// invocation, so the accept loop never uses a wall-clock timeout as a
+// sequence-completion signal — that previously made multi-checkpoint runs
+// timing-sensitive (a slow CI spawn could close the listener before the next
+// checkpoint connected). The whole call stays bounded by the driver's
+// `recv_timeout`. Signals back what was observed.
 async fn serve_remembers(
     listener: UnixListener,
     tx: tokio::sync::oneshot::Sender<Observed>,
     single: bool,
+    mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
 ) {
     let mut observed = Observed::default();
     loop {
-        let accept =
-            tokio::time::timeout(std::time::Duration::from_secs(2), listener.accept()).await;
-        let Ok(Ok((stream, _addr))) = accept else {
-            // No client connected within the window (a local-only event that
-            // skips the daemon entirely, or no further checkpoint), or accept
-            // errored: stop and report what was observed so far.
+        // Accept the next connection, but stop the moment the driver signals it
+        // has finished issuing invocations (or its thread dies and drops the
+        // sender, which resolves the recv to Err). `biased` prefers a ready
+        // connection so a genuine fold is never dropped for a pending shutdown.
+        let accepted = tokio::select! {
+            biased;
+            res = listener.accept() => res,
+            _ = &mut shutdown_rx => break,
+        };
+        let Ok((stream, _addr)) = accepted else {
+            // accept errored: stop and report what was observed so far.
             break;
         };
         let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
@@ -267,6 +277,8 @@ fn observe_sequence_impl(
     let socket_str = socket.to_string_lossy().to_string();
 
     let (tx, rx) = std::sync::mpsc::channel::<Observed>();
+    // Driver -> mock "all invocations issued" signal (see `serve_remembers`).
+    let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
     let socket_for_thread = socket.clone();
     let server = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -276,14 +288,14 @@ fn observe_sequence_impl(
         rt.block_on(async move {
             let listener = UnixListener::bind(&socket_for_thread).expect("bind");
             let (otx, orx) = tokio::sync::oneshot::channel::<Observed>();
-            let accept = tokio::spawn(serve_remembers(listener, otx, single));
+            let accept = tokio::spawn(serve_remembers(listener, otx, single, shutdown_rx));
             let observed = orx.await.unwrap_or_default();
             let _ = accept.await;
             let _ = tx.send(observed);
         });
     });
 
-    // Give the listener a moment to bind.
+    // Give the listener a moment to bind before the first hook connects.
     std::thread::sleep(std::time::Duration::from_millis(200));
 
     let mut last_stdout = String::new();
@@ -311,6 +323,11 @@ fn observe_sequence_impl(
         assert!(output.status.success(), "must exit 0");
         last_stdout = String::from_utf8_lossy(&output.stdout).to_string();
     }
+
+    // Every hook invocation has run: tell the mock to stop accepting. Dropping
+    // the sender on an early panic also resolves the mock's recv to Err, so it
+    // never hangs.
+    let _ = shutdown_tx.send(());
 
     let observed = rx
         .recv_timeout(std::time::Duration::from_secs(12))

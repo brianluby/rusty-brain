@@ -15,8 +15,10 @@
 
 W3.1 inverted capture: canonical `Stop` now stores **nothing**, and the
 once-per-session fold happens at canonical `SessionEnd`. Only the **Claude Code**
-adapter emits canonical `SessionEnd` (verified against recorded fixtures). The
-other three adapters mapped their terminal event onto canonical `Stop`:
+adapter emits canonical `SessionEnd` (verified against recorded fixtures). Of the
+other three adapters, Gemini and Codex still map their terminal event onto
+canonical `Stop`, while OpenCode now maps `session.idle` to canonical
+`SessionCheckpoint` (Gap A):
 
 | CLI | terminal native event | canonical mapping |
 |---|---|---|
