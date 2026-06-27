@@ -96,7 +96,12 @@ fn render_output_continue_is_true_for_all_four() {
 }
 
 #[test]
-fn non_claude_boundary_events_stay_stop_until_fixture_verified() {
+fn fixture_gated_boundary_events_stay_stop_until_verified() {
+    // Codex (`Stop`) and Gemini (`SessionEnd`) have no recorded lifecycle fixture
+    // proving their terminus cadence yet, so their boundary stays canonical Stop
+    // (stores nothing) rather than guessing a checkpoint/terminus mapping.
+    // OpenCode is NO LONGER here: its `session.idle` FOLD is fixture-backed by a
+    // green lifecycle test (see `opencode_session_idle_maps_to_checkpoint_not_stop`).
     let cases = [
         (
             AgentId::Gemini,
@@ -116,15 +121,6 @@ fn non_claude_boundary_events_stay_stop_until_fixture_verified() {
             }),
             "Stop",
         ),
-        (
-            AgentId::OpenCode,
-            serde_json::json!({
-                "type": "session.idle",
-                "directory": "/proj",
-                "sessionID": "s"
-            }),
-            "session.idle",
-        ),
     ];
     for (id, raw, reason) in cases {
         let cli = agent_for(id);
@@ -138,4 +134,22 @@ fn non_claude_boundary_events_stay_stop_until_fixture_verified() {
             "{id:?} boundary {reason:?} must not checkpoint until a real fixture verifies it"
         );
     }
+}
+
+#[test]
+fn opencode_session_idle_maps_to_checkpoint_not_stop() {
+    // Gap A: OpenCode's `session.idle` is the fold event. Its FOLD behavior is
+    // fixture-backed (a green lifecycle test); its firing cadence is ambiguous
+    // (one-run terminus.json: fired=2, verdict `ambiguous`), and SessionCheckpoint
+    // is multi-fire-safe for ANY count >= 1 — so it maps to canonical
+    // SessionCheckpoint, NOT Stop, restoring capture that Stop dropped. This is the
+    // worked example the Codex / Gemini terminus decisions follow once their
+    // fixtures land.
+    let cli = agent_for(AgentId::OpenCode);
+    let ctx = cli.parse_input(&serde_json::json!({
+        "type": "session.idle",
+        "directory": "/proj",
+        "sessionID": "s"
+    }));
+    assert_eq!(ctx.event, HookEvent::SessionCheckpoint { reason: None });
 }
