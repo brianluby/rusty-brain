@@ -2,8 +2,9 @@
 
 - **Date:** 2026-06-26
 - **Scope:** Resolve the post-W3.1 capture regression for the non-Claude CLIs
-  (Codex / OpenCode / Gemini) by mapping each CLI's terminal native event onto a
-  canonical event that actually folds the session scratch into a memory.
+  (Codex / OpenCode; Gemini descoped 2026-06-27) by mapping each CLI's terminal
+  native event onto a canonical event that actually folds the session scratch
+  into a memory.
 - **Status:** Design + scaffolding. OpenCode's terminus mapping is decidable now
   (multi-fire checkpoint-safe), but restoring OpenCode capture also requires a
   separate `apply_patch` tool-coverage fix (Gap B), and scorecard enablement is a
