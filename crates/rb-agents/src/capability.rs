@@ -101,7 +101,7 @@ const CAPABILITIES: &[AgentCapability] = &[
         scorecard: SupportLevel::Unsupported,
         verified_lifecycle_source: "crates/rb-hooks/tests/fixtures/gemini/README.md",
         limitations: &[
-            "Native SessionEnd remains canonical Stop until a real lifecycle fixture proves a checkpoint or terminus boundary.",
+            "Native SessionEnd remains canonical Stop; terminus mapping is descoped (no lifecycle fixture planned).",
             "Prompt-time retrieval parity has not been verified.",
         ],
     },

@@ -8,8 +8,9 @@
   (multi-fire checkpoint-safe), but restoring OpenCode capture also requires a
   separate `apply_patch` tool-coverage fix (Gap B), and scorecard enablement is a
   larger task than a flag flip — do NOT implement OpenCode end-to-end from the
-  terminus decision alone. Codex and Gemini decisions are fixture-gated (decision
-  trees below). This is "Worker C" per the sequencing PRD.
+  terminus decision alone. Codex's decision is fixture-gated (decision tree
+  below). **Gemini is descoped** (2026-06-27) — removed from active scope; it
+  stays on canonical `Stop`. This is "Worker C" per the sequencing PRD.
 - **Related:**
   [cross-cli-capture-inversion follow-up](../follow-ups/2026-06-13-cross-cli-capture-inversion.md),
   [cross-agent fixture-recording spec](../specs/2026-06-23-cross-agent-fixture-recording.md),
@@ -142,7 +143,8 @@ existing `"patch" => "Edit"` arm does NOT cover it — the recorded tool name is
    `apply_patch` `tool.execute.after` fixture (record one — the committed fixture
    set lacks it).
 
-Gap A is the worked example the Codex/Gemini terminus decisions follow. Gap B is
+Gap A is the worked example the Codex terminus decision follows (Gemini
+descoped). Gap B is
 tracked alongside the Codex `apply_patch` follow-up.
 
 ### Codex — FIXTURE-GATED
@@ -166,20 +168,18 @@ Unrelated and still deferred: Codex `apply_patch` capture remains blocked upstre
 [apply_patch follow-up](../follow-ups/2026-06-02-codex-apply-patch-capture.md).
 Codex shell capture already works (`tool_name: "Bash"`).
 
-### Gemini — FIXTURE-GATED
+### Gemini — DESCOPED (2026-06-27)
 
-Gemini native events: `SessionStart`, `AfterTool`, `SessionEnd`, `PreCompress`
-(`crates/rb-agents/src/gemini.rs`). Native `SessionEnd` currently maps to canonical
-`Stop` (`gemini.rs:68`) precisely because its cadence is unverified — the adapter
-comment calls it ambiguous.
+Gemini is removed from the active cross-CLI terminus/capture work. Its adapter
+(`crates/rb-agents/src/gemini.rs`) stays as-is: native `SessionEnd` continues to
+map to canonical `Stop` (`gemini.rs:68`), so Gemini neither folds nor
+double-folds — its capture stays `Partial`, no worse than today. No Gemini
+lifecycle fixture will be recorded and no mapping change will be made under this
+plan.
 
-**Open question:** is Gemini's native `SessionEnd` a true once-per-session
-terminus or a per-turn stop? Record a Gemini lifecycle fixture (the recorder
-currently scopes codex+opencode; extend it, or capture Gemini by hand per the
-W3.4 recipe) and inspect the firing count.
-
-**Decision tree:** identical to Codex — once-per-session → canonical `SessionEnd`;
-per-turn → canonical `SessionCheckpoint`.
+If Gemini is reprioritized later, the work is unchanged from the Codex template:
+record a lifecycle fixture, inspect `terminus.json`, and map its `SessionEnd`
+once-per-session → canonical `SessionEnd` / per-turn → `SessionCheckpoint`.
 
 ## Scorecard targeting — a SEPARATE, larger task (do not couple to terminus mapping)
 
@@ -267,11 +267,11 @@ OpenCode scorecard — separate task (see "Scorecard targeting" above):
    `memory-scorecard.sh`, then flip `scorecard_agent_supported`. This is the bulk
    of the work and is NOT unlocked by terminus mapping alone.
 
-Codex / Gemini: record fixture → inspect `terminus.json` → apply the terminus
-decision tree (Gap A analog) → assess each one's file-edit tool coverage (Gap B
-analog) → then scorecard. Codex needs the operator's one-time `--setup-trust
-codex` before recording; Codex `apply_patch` stays upstream-blocked
-(openai/codex#16732).
+Codex: record fixture → inspect `terminus.json` → apply the terminus decision
+tree (Gap A analog) → assess its file-edit tool coverage (Gap B analog) → then
+scorecard. Codex needs the operator's one-time `--setup-trust codex` before
+recording; Codex `apply_patch` stays upstream-blocked (openai/codex#16732).
+(Gemini is descoped — see the Gemini section.)
 
 ## Risks / open questions
 

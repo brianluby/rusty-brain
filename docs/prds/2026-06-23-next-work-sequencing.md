@@ -13,7 +13,7 @@
    - This lets us say W3.5 is closed without overstating it.
 
 2. **Then do cross-agent capture/parity.**
-   - Record real lifecycle fixtures for Codex/OpenCode/Gemini.
+   - Record real lifecycle fixtures for Codex/OpenCode. (Gemini descoped 2026-06-27.)
    - Decide safe `SessionEnd`/`SessionCheckpoint` mappings.
    - Update the capability matrix and docs for Codex/OpenCode/Hermes (the matrix and Hermes discovery note already landed in PR #43) based on the recorded fixture evidence.
    - Only then expand scorecard targeting by agent.
@@ -39,7 +39,7 @@ Yes, work can overlap — but keep the branches separate.
 - **Within cross-agent**, fixture recording can be parallelized by CLI:
   - Codex lifecycle fixture
   - OpenCode lifecycle fixture
-  - Gemini lifecycle fixture
+  - ~~Gemini lifecycle fixture~~ (descoped 2026-06-27)
 
   Each should produce its own sanitized fixture notes before shared code mappings are changed.
 
@@ -52,7 +52,7 @@ Yes, work can overlap — but keep the branches separate.
 ### Practical split
 
 - **Worker A:** W3.5 closeout branch.
-- **Worker B:** Codex/OpenCode/Gemini lifecycle fixtures.
+- **Worker B:** Codex/OpenCode lifecycle fixtures (Gemini descoped 2026-06-27).
 - **Worker C** (after B has evidence): mapping / capability-matrix / agent-scorecard work.
 
 The main merge dependency is low: W3.5 closeout can merge first, and cross-agent parity can continue independently.
