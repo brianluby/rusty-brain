@@ -227,13 +227,22 @@ async fn run_client(
         } => {
             let text = if path == "-" {
                 use tokio::io::AsyncReadExt as _;
-                let mut buf = String::new();
+                let mut buf = Vec::new();
                 tokio::io::stdin()
-                    .read_to_string(&mut buf)
+                    .take(256 * 1024 * 1024)
+                    .read_to_end(&mut buf)
                     .await
                     .context("reading restore stdin")?;
-                buf
+                String::from_utf8_lossy(&buf).into_owned()
             } else {
+                let metadata =
+                    std::fs::metadata(&path).with_context(|| format!("statting {path:?}"))?;
+                if metadata.len() > 256 * 1024 * 1024 {
+                    anyhow::bail!(
+                        "export file {path:?} is {} MiB; cap is 256 MiB",
+                        metadata.len() / (1024 * 1024)
+                    );
+                }
                 std::fs::read_to_string(&path)
                     .with_context(|| format!("reading export file {path:?}"))?
             };

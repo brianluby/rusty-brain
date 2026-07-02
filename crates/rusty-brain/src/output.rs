@@ -544,6 +544,7 @@ mod tests {
             memory_type: MemoryType::ArchitectureDecision,
             importance: 8,
             source: "docs/adr.md".to_string(),
+            tags: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);
@@ -567,6 +568,7 @@ mod tests {
             memory_type: MemoryType::Insight,
             importance: 5,
             source: format!("docs/{token}.md"),
+            tags: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);

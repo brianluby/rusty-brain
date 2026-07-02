@@ -146,7 +146,8 @@ pub enum Command {
         max_bytes: usize,
     },
 
-    /// Export memories to stdout (markdown, json, or csv).
+    /// Export memories to stdout. CSV omits the content body (metadata only);
+    /// use markdown or json for full-fidelity dumps.
     Export {
         /// Output format: markdown, json, or csv.
         #[arg(long, default_value = "markdown", value_parser = parse_export_format)]

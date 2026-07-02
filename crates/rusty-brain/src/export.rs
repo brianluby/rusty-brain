@@ -227,12 +227,12 @@ pub fn prune_backups(db_path: &Path, retain: usize) -> anyhow::Result<usize> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str())? == "json" {
-                let mtime = e.metadata().ok()?.modified().ok()?;
-                Some((p, mtime))
-            } else {
-                None
+            let name = p.file_name().and_then(|s| s.to_str())?;
+            if !name.starts_with("backup-") {
+                return None;
             }
+            let mtime = e.metadata().ok()?.modified().ok()?;
+            Some((p, mtime))
         })
         .collect();
     files.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -257,13 +257,13 @@ pub fn list_backups(db_path: &Path) -> Vec<(PathBuf, u64)> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if p.extension().and_then(|s| s.to_str())? == "json" {
-                let md = e.metadata().ok()?;
-                let mtime = md.modified().ok()?;
-                Some((p, mtime, md.len()))
-            } else {
-                None
+            let name = p.file_name().and_then(|s| s.to_str())?;
+            if !name.starts_with("backup-") {
+                return None;
             }
+            let md = e.metadata().ok()?;
+            let mtime = md.modified().ok()?;
+            Some((p, mtime, md.len()))
         })
         .collect();
     files.sort_by_key(|b| std::cmp::Reverse(b.1));
@@ -294,6 +294,7 @@ pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
             memory_type: m.memory_type,
             importance: m.importance,
             source: format!("restore:{}", m.id),
+            tags: m.tags,
         });
     }
     Ok(items)
