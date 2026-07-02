@@ -2992,6 +2992,7 @@ dependencies = [
  "rb-embed",
  "rb-mcp",
  "rb-proto",
+ "rb-redact",
  "rb-types",
  "serde_json",
  "tempfile",

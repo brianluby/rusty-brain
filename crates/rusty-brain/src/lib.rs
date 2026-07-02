@@ -6,6 +6,7 @@
 
 pub mod cli;
 pub mod client;
+pub mod import;
 pub mod logging;
 pub mod mcp;
 pub mod namespace_detect;

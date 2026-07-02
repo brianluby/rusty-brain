@@ -163,6 +163,13 @@ Client commands auto-start the daemon on first use (and connect to it thereafter
 so you can go straight to storing and recalling:
 
 ```bash
+# seed a fresh brain from existing project context (CLAUDE.md, README,
+# CHANGELOG.md, docs/**/*.md, and recent decision-ish git commits)
+rusty-brain init --yes
+
+# preview a one-off text/markdown import without storing anything
+rusty-brain import docs/architecture.md --dry-run
+
 # store a memory (namespace is detected from the current project / git root)
 rusty-brain remember "We use a single-writer daemon over SQLite WAL" \
   --type architecture_decision --importance 8 --tags storage --tags concurrency
@@ -184,6 +191,10 @@ rusty-brain link <from-id> <to-id> --type contradicts --reason "policy reversed"
 # retroactively redact secrets from every stored memory, then re-embed
 rusty-brain scrub
 rusty-brain reembed
+
+# list or undo first-run/import batches
+rusty-brain init --list-batches
+rusty-brain init --undo <batch-id>
 
 # add --json to any command for machine-readable output
 rusty-brain recall "sqlite" --json
