@@ -1,6 +1,11 @@
-# Sprint PRDs - 2026-06-23
+# PRDs
 
-This directory contains implementation-ready product requirements for the remaining rusty-brain closeout work identified from roadmap docs, GitHub issues/PRs, and the sprint board on 2026-06-23.
+This directory contains implementation-ready product requirements.
+
+The 2026-06-23 set covers the remaining closeout work identified from roadmap
+docs, GitHub issues/PRs, and the sprint board. The 2026-07-02 set comes from a
+senior-PM product review and targets the activation/value-realization gap the
+engineering roadmap does not measure.
 
 ## Final Sprint Task List
 
@@ -17,6 +22,23 @@ This directory contains implementation-ready product requirements for the remain
 ## Sequencing
 
 - [Next-work sequencing and parallelization](2026-06-23-next-work-sequencing.md) — ordering and parallel-track guidance across the W3.5 closeout and cross-agent parity work.
+
+## 2026-07-02 — Product-review feature PRDs
+
+From the senior-PM product review. Ordered by leverage (Tier 1 = activation/retention loop, Tier 2 = differentiation, Tier 3 = hygiene/scale).
+
+| # | Tier | PRD |
+| --- | --- | --- |
+| 1 | 1 | [First-run cold-start and project import](2026-07-02-init-and-project-import.md) |
+| 2 | 1 | ["Memory is working" observability](2026-07-02-doctor-and-stats-observability.md) |
+| 3 | 1 | [Portable export and one-command backup](2026-07-02-portable-export-and-backup.md) |
+| 4 | 2 | [Typed code anchors](2026-07-02-typed-code-anchors.md) |
+| 5 | 2 | [Decision history and audit timeline](2026-07-02-decision-history-timeline.md) |
+| 6 | 2 | [Guided contradiction/dedup resolution](2026-07-02-contradiction-dedup-review.md) |
+| 7 | 2 | [HTTP/REST surface and agent-agnostic recall](2026-07-02-http-surface-and-agent-agnostic-recall.md) |
+| 8 | 3 | [User-facing retention and forgetting policy](2026-07-02-user-facing-retention-policy.md) |
+| 9 | 3 | [Search and filter parity](2026-07-02-search-filter-parity.md) |
+| 10 | 3 | [Native Windows support](2026-07-02-native-windows-support.md) |
 
 ## Notes
 

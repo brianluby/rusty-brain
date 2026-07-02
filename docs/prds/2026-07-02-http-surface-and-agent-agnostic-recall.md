@@ -1,0 +1,147 @@
+# PRD: HTTP/REST Surface and Agent-Agnostic Prompt-Time Recall
+
+## Status
+
+Draft. From the 2026-07-02 senior-PM product review. The roadmap is ~90%
+Claude Code; today everything funnels through stdio MCP or the CLI. A local
+HTTP surface unlocks any tool/script/non-MCP agent and expands TAM beyond
+coding agents, and a generic recall-before-work abstraction is what the
+cross-agent parity PRD is reaching for as a *product* invariant.
+
+## Owner Area
+
+Primary: transport, server listeners, and the prompt-time injection seam.
+
+Touchpoints:
+
+- `crates/rb-daemon/src/server.rs` (listener; transport seam)
+- `crates/rb-proto/src/client.rs`, `crates/rb-proto/src/codec.rs`
+  (stream-generic framing - the W5a.3 transport-genericization, pulled
+  forward)
+- `crates/rb-mcp/src/proxy.rs`
+- `crates/rb-agents/src/event.rs` (`UserPromptSubmit` abstraction)
+- `crates/rb-agents/src/capability.rs` (`retrieval` capability)
+- `crates/rb-hooks/src/capture.rs` (`capture::user_prompt_submit`)
+- `docs/prds/2026-06-23-cross-agentic-agent-parity.md` (CA6 prompt-time
+  retrieval)
+- `docs/THREAT_MODEL.md` (network surface - must be updated)
+
+## Problem
+
+Two coupled gaps:
+
+1. **Transport lock-in.** The daemon speaks Unix-domain-socket framing only.
+   Anything that is not the CLI, an MCP stdio client, or a hook cannot reach
+   memory - no dashboards, no scripts in other languages, no non-MCP agents,
+   no remote/SSH use. The "substrate" promise is undercut.
+2. **Claude-specific recall.** The W3.2 deterministic prompt-time injection
+   depends on Claude's `UserPromptSubmit`. Other agents either lack it or
+   model it differently, so recall-before-work stays Claude-only instead of
+   being a product invariant.
+
+## Goals
+
+- An optional local HTTP/REST listener (`rusty-brain serve --http`) exposing
+  the same operations as the CLI/MCP, for any client.
+- An agent-agnostic "recall-before-work" abstraction so prompt-time retrieval
+  is a capability, not a Claude implementation detail.
+- Default-off, opt-in, loopback-only, with clear security framing; the
+  single-machine/per-user posture is preserved.
+
+## Non-Goals
+
+- Do not replace MCP stdio (it stays the primary agent surface).
+- Do not build team-mode auth (that is Phase 5a/W5a.1); HTTP v1 is loopback
+  + same-user peer-cred, not multi-host.
+- Do not expose admin ops over HTTP without the existing peer-cred gate.
+- Do not change ranking or the response shape.
+
+## Functional Requirements
+
+### HTTP-1. HTTP listener (opt-in, loopback)
+
+- `serve --http [bind]` (default `127.0.0.1:0` or a configured port) starts
+  an HTTP listener alongside (or instead of) the UDS listener.
+- REST endpoints mirror CLI/MCP operations: `POST /remember`, `POST
+  /recall`, `GET /memories/:id`, `GET /context`, `POST /feedback`, etc.,
+  over JSON. The existing `Response` types serialize directly.
+- Default-off; enabling it is explicit. A config knob (`[http] enable`,
+  `bind`) under the same precedence rules as other knobs; secrets stay
+  env-only.
+
+### HTTP-2. Security posture (v1: loopback + same-user)
+
+- Bind loopback only by default; a non-loopback bind requires an explicit
+  opt-in flag and prints a warning.
+- Peer identity reuses the W2.6 peer-cred machinery where available;
+  admin ops (`RunJob`/`Reembed`/`Scrub`/`NamespaceRename`) stay admin-gated.
+- The threat model is updated: HTTP is a new network surface; v1 is
+  same-machine/same-user and explicitly not an auth boundary.
+
+### HTTP-3. Transport genericization (pulled forward from W5a.3)
+
+- Generalize the codec/client to `Client<S>` over any async stream
+  (`UnixStream` / `TcpStream`), reusing the existing length-delimited JSON
+  framing. This is the W5a.3 seam pulled forward; it must not regress the
+  UDS path (agreement tests pin both).
+
+### HTTP-4. Agent-agnostic prompt-time recall
+
+- Promote `recall-before-work` to a capability in
+  `rb-agents::capability` (`retrieval`: supported/partial/unsupported).
+- Define an agent-agnostic injection contract (top-k under the token budget,
+  the W2.5 untrusted-data frame, the W3.3 source-aware rules) independent of
+  any one agent's event name.
+- Per-adapter, map the agent's closest event to that contract (Claude's
+  `UserPromptSubmit`; Codex/OpenCode equivalents where they exist; documented
+  unsupported where they do not). Capability matrix (CA6) records the truth.
+
+## Acceptance Criteria
+
+- `serve --http` responds to `POST /recall` with the same ranked results as
+  the CLI, over loopback.
+- A non-loopback bind refuses without an explicit opt-in and warns.
+- Admin ops over HTTP are peer-cred-gated exactly as over UDS.
+- An agent without `UserPromptSubmit` can still get prompt-time recall via
+  its mapped equivalent, or the capability matrix records `unsupported`
+  (never silent parity).
+- UDS path is byte-for-byte unaffected (agreement test).
+
+## Verification
+
+```bash
+cargo test -p rb-daemon
+cargo test -p rb-proto
+cargo test -p rb-mcp
+cargo test -p rb-agents
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+```
+
+Plus an HTTP e2e hitting `/recall` and `/feedback`, and a peer-cred test
+asserting admin rejection.
+
+## Risks
+
+- New attack surface. Mitigate: default-off, loopback-only, peer-cred,
+  threat-model update, admin gating; no multi-host auth in v1.
+- Transport refactor regresses UDS. Mitigate: pull W5a.3's `Client<S>`
+  genericization with agreement tests on both transports.
+- Agent recall abstraction too broad. Mitigate: narrow contract (top-k,
+  budget, framing) and fixture-gated per-agent mapping (no invented events).
+
+## Implementation Checklist
+
+- [ ] Generalize codec/client to `Client<S>` (W5a.3 seam).
+- [ ] Add opt-in HTTP listener + REST endpoints.
+- [ ] Loopback default + non-loopback opt-in + peer-cred admin gate.
+- [ ] Promote recall-before-work to an agent capability.
+- [ ] Map per-adapter events to the injection contract; update the matrix.
+- [ ] Update the threat model; add HTTP + UDS agreement tests.
+
+## Roadmap Fit
+
+Realizes the "substrate, not orchestrator" promise and expands TAM (PRD
+review, Tier 2). Pulls W5a.3 transport genericization forward safely and
+delivers the cross-agent parity PRD's CA6 as a product invariant rather than
+adapter plumbing.
