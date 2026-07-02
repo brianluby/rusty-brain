@@ -196,6 +196,20 @@ rusty-brain reembed
 rusty-brain init --list-batches
 rusty-brain init --undo <batch-id>
 
+# export memories (post-redaction, sorted by id for git-diffability)
+rusty-brain export --format markdown
+rusty-brain export --format json --min-importance 5
+rusty-brain export --format csv
+
+# one-command timestamped backup (with optional retention pruning)
+rusty-brain backup
+rusty-brain backup --retention 5 --format json
+rusty-brain backup --list
+
+# restore from a JSON export (idempotent via dedup, re-embeds under current model)
+rusty-brain restore backup-20260702T210230.json
+echo "$JSON" | rusty-brain restore -
+
 # add --json to any command for machine-readable output
 rusty-brain recall "sqlite" --json
 ```

@@ -1,7 +1,7 @@
 //! Async dispatch from parsed `Cli` to daemon/client behavior.
 
 use crate::cli::{Cli, Command};
-use crate::{client, import, output, paths, serve};
+use crate::{client, export, import, output, paths, serve};
 use anyhow::Context as _;
 use rb_types::MemoryId;
 use std::path::Path;
@@ -85,6 +85,7 @@ async fn run_client(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
+    let ns_str = namespace.as_db_string();
     let mut client = client::connect_or_start(
         socket_path,
         db_path,
@@ -178,6 +179,78 @@ async fn run_client(
                 return Ok(());
             }
             run_import_items(&mut client, db_path, &items, &tags, json).await?;
+        }
+        Command::Export {
+            format,
+            memory_type,
+            tags,
+            min_importance,
+        } => {
+            let filters = export::ExportFilters {
+                memory_type,
+                tags,
+                min_importance,
+            };
+            let memories = export::fetch_memories(&mut client, &filters).await?;
+            let output = export::format_export(&memories, &ns_str, format);
+            println!("{output}");
+        }
+        Command::Backup {
+            format,
+            retention,
+            list,
+        } => {
+            if list {
+                let backups = export::list_backups(db_path);
+                println!("{}", output::render_backup_list(&backups, json));
+                return Ok(());
+            }
+            let filters = export::ExportFilters::default();
+            let memories = export::fetch_memories(&mut client, &filters).await?;
+            let content = export::format_export(&memories, &ns_str, format);
+            let path = export::write_backup(db_path, &content, format.extension())
+                .context("writing backup")?;
+            let pruned = if let Some(n) = retention {
+                export::prune_backups(db_path, n).unwrap_or(0)
+            } else {
+                0
+            };
+            println!(
+                "{}",
+                output::render_backup_result(&path, memories.len(), pruned, json)
+            );
+        }
+        Command::Restore {
+            path,
+            tags,
+            dry_run,
+        } => {
+            let text = if path == "-" {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = String::new();
+                tokio::io::stdin()
+                    .read_to_string(&mut buf)
+                    .await
+                    .context("reading restore stdin")?;
+                buf
+            } else {
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading export file {path:?}"))?
+            };
+            let items = export::parse_restore(&text).context("parsing export for restore")?;
+            if dry_run {
+                let plan = output::render_restore_plan(&items, json);
+                println!("{plan}");
+                return Ok(());
+            }
+            let counts = export::restore_items(&mut client, &items, &tags)
+                .await
+                .context("restoring memories")?;
+            let batch_id = import::new_batch_id();
+            println!(
+                "{}",
+                output::render_import_result(&batch_id, counts, false, json)
+            );
         }
         Command::Remember {
             content,

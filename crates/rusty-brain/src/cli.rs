@@ -8,6 +8,18 @@ fn parse_memory_type(s: &str) -> Result<MemoryType, String> {
     MemoryType::parse(s).map_err(|e| e.to_string())
 }
 
+/// Parse `--format` for export.
+fn parse_export_format(s: &str) -> Result<crate::export::ExportFormat, String> {
+    match s.to_ascii_lowercase().as_str() {
+        "md" | "markdown" => Ok(crate::export::ExportFormat::Markdown),
+        "json" => Ok(crate::export::ExportFormat::Json),
+        "csv" => Ok(crate::export::ExportFormat::Csv),
+        _ => Err(format!(
+            "unknown format '{s}'; expected markdown, json, or csv"
+        )),
+    }
+}
+
 /// Parse a feedback `--kind` value into a `FeedbackKind` (helpful|wrong|stale).
 fn parse_feedback_kind(s: &str) -> Result<FeedbackKind, String> {
     FeedbackKind::parse(s).map_err(|e| e.to_string())
@@ -132,6 +144,47 @@ pub enum Command {
         /// Maximum bytes to read from the input.
         #[arg(long, default_value_t = 65_536)]
         max_bytes: usize,
+    },
+
+    /// Export memories to stdout (markdown, json, or csv).
+    Export {
+        /// Output format: markdown, json, or csv.
+        #[arg(long, default_value = "markdown", value_parser = parse_export_format)]
+        format: crate::export::ExportFormat,
+        /// Filter by memory type.
+        #[arg(long = "type", value_parser = parse_memory_type)]
+        memory_type: Option<MemoryType>,
+        /// Filter by tags (repeatable; all must be present).
+        #[arg(long)]
+        tags: Vec<String>,
+        /// Minimum importance 1-10.
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
+        min_importance: Option<u8>,
+    },
+
+    /// Write a timestamped backup snapshot to the data dir.
+    Backup {
+        /// Backup format (default json for full fidelity).
+        #[arg(long, default_value = "json", value_parser = parse_export_format)]
+        format: crate::export::ExportFormat,
+        /// Keep only the N most recent backups (prune older ones).
+        #[arg(long)]
+        retention: Option<usize>,
+        /// List existing backups instead of creating one.
+        #[arg(long = "list")]
+        list: bool,
+    },
+
+    /// Restore memories from a JSON export file or stdin.
+    Restore {
+        /// Path to a JSON export file, or '-' for stdin.
+        path: String,
+        /// Tags to add to restored memories (repeatable).
+        #[arg(long)]
+        tags: Vec<String>,
+        /// Preview what would be restored without storing.
+        #[arg(long)]
+        dry_run: bool,
     },
 
     /// Store a new memory.

@@ -402,3 +402,143 @@ fn import_dry_run_prints_plan_and_stores_nothing() {
         "dry-run must not store the imported text; got: {stdout}"
     );
 }
+
+#[test]
+fn export_then_restore_round_trips_and_redacts() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(
+        wait_for_socket(&socket, Duration::from_secs(10)),
+        "daemon socket never appeared at {}",
+        socket.display()
+    );
+
+    // Plant a secret in memory content via the import path (which redacts
+    // client-side before the wire/store, so the DB has the redacted form).
+    let secret = "AKIAABCDEFGHIJKLMNOP";
+    let mut import_child = cli(&exe, &socket, &db, dir.path(), "export-e2e")
+        .args([
+            "import",
+            "-",
+            "--type",
+            "architecture_decision",
+            "--importance",
+            "9",
+        ])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn import");
+    use std::io::Write as _;
+    import_child
+        .stdin
+        .take()
+        .expect("import stdin")
+        .write_all(
+            format!(
+                "# Storage Decision\nThe durable storage decision is sqlite-wal. Key {secret}\n"
+            )
+            .as_bytes(),
+        )
+        .expect("write import stdin");
+    let import_out = import_child.wait_with_output().expect("wait import");
+    assert!(
+        import_out.status.success(),
+        "import failed: stderr={:?}",
+        String::from_utf8_lossy(&import_out.stderr)
+    );
+
+    // Export as JSON.
+    let export = cli(&exe, &socket, &db, dir.path(), "export-e2e")
+        .args(["--json", "export", "--format", "json"])
+        .output()
+        .expect("run export");
+    assert!(
+        export.status.success(),
+        "export failed: stderr={:?}",
+        String::from_utf8_lossy(&export.stderr)
+    );
+    let export_text = String::from_utf8_lossy(&export.stdout);
+    let parsed: serde_json::Value = serde_json::from_str(&export_text).expect("export is JSON");
+    assert!(
+        parsed["count"].as_u64().unwrap_or(0) >= 1,
+        "export should have at least one memory: {export_text}"
+    );
+    // The planted secret must be redacted at rest, so the export must not
+    // contain it.
+    assert!(
+        !export_text.contains(secret),
+        "export leaked secret: {export_text}"
+    );
+
+    // Restore (into the same namespace). Dedup should skip all items since
+    // the content is already stored.
+    let restore = cli(&exe, &socket, &db, dir.path(), "export-e2e")
+        .args(["--json", "restore", "-"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .expect("spawn restore");
+    let mut child = restore;
+    child
+        .stdin
+        .take()
+        .expect("restore stdin")
+        .write_all(export_text.as_bytes())
+        .expect("write export to restore stdin");
+    let restore_out = child.wait_with_output().expect("wait restore");
+    assert!(
+        restore_out.status.success(),
+        "restore failed: stderr={:?}",
+        String::from_utf8_lossy(&restore_out.stderr)
+    );
+    let restore_report: serde_json::Value =
+        serde_json::from_slice(&restore_out.stdout).expect("restore --json stdout is an object");
+    assert_eq!(
+        restore_report["skipped_duplicate"].as_u64(),
+        Some(parsed["count"].as_u64().unwrap()),
+        "restore should skip all as duplicates (idempotent): {}",
+        String::from_utf8_lossy(&restore_out.stdout)
+    );
+
+    // Recall still works.
+    let recall = cli(&exe, &socket, &db, dir.path(), "export-e2e")
+        .args(["recall", "durable storage decision", "--limit", "10"])
+        .output()
+        .expect("run recall");
+    assert!(recall.status.success());
+    let stdout = String::from_utf8_lossy(&recall.stdout);
+    assert!(
+        stdout.contains("sqlite-wal") || stdout.contains("sqlite"),
+        "recall should surface the exported/restored memory; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains(secret),
+        "recall must not show the unredacted secret: {stdout}"
+    );
+
+    // Backup writes a timestamped file under the data dir.
+    let backup = cli(&exe, &socket, &db, dir.path(), "export-e2e")
+        .args(["--json", "backup"])
+        .output()
+        .expect("run backup");
+    assert!(
+        backup.status.success(),
+        "backup failed: stderr={:?}",
+        String::from_utf8_lossy(&backup.stderr)
+    );
+    let backup_report: serde_json::Value =
+        serde_json::from_slice(&backup.stdout).expect("backup --json stdout is an object");
+    let backup_path = backup_report["path"].as_str().expect("backup path in JSON");
+    assert!(Path::new(backup_path).exists(), "backup file exists");
+    let backup_content = std::fs::read_to_string(backup_path).unwrap();
+    assert!(
+        !backup_content.contains(secret),
+        "backup file must not contain the secret"
+    );
+}
