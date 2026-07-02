@@ -39,6 +39,9 @@ pub struct ImportItem {
     /// Human-readable provenance label (file path, "git log", "stdin"). Stored
     /// in the memory's `context` field so it shows in recall.
     pub source: String,
+    /// Per-item tags merged with the batch tag at store time. Empty for file
+    /// imports; populated by restore from the original memory's tags.
+    pub tags: Vec<String>,
 }
 
 /// Counts for an import run.
@@ -177,6 +180,7 @@ pub fn extract_text(
         memory_type,
         importance,
         source: label.to_string(),
+        tags: Vec::new(),
     }
 }
 
@@ -383,6 +387,7 @@ fn recent_decision_commits(root: &Path, limit: usize) -> Vec<ImportItem> {
             memory_type: MemoryType::Insight,
             importance: 4,
             source: format!("git log {hash}"),
+            tags: Vec::new(),
         });
     }
     items
@@ -425,8 +430,9 @@ pub async fn store_items(
             continue;
         }
 
-        let mut tags = Vec::with_capacity(1 + extra_tags.len());
+        let mut tags = Vec::with_capacity(1 + item.tags.len() + extra_tags.len());
         tags.push(tag.to_string());
+        tags.extend(item.tags.iter().cloned());
         tags.extend(extra_tags.iter().cloned());
         match client
             .remember(
@@ -592,7 +598,7 @@ fn safe_ledger_name(batch_id: &str) -> String {
 }
 
 #[cfg(unix)]
-fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut f = std::fs::OpenOptions::new()
@@ -607,7 +613,7 @@ fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 

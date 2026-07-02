@@ -216,6 +216,95 @@ pub fn render_import_batches(batches: &[BatchInfo], json: bool) -> String {
     out.trim_end().to_string()
 }
 
+/// Render a backup result (path written, memory count, pruned count).
+pub fn render_backup_result(
+    path: &std::path::Path,
+    count: usize,
+    pruned: usize,
+    json: bool,
+) -> String {
+    if json {
+        serde_json::json!({
+            "path": path.display().to_string(),
+            "memories": count,
+            "pruned": pruned,
+        })
+        .to_string()
+    } else {
+        let mut out = format!("Backup written: {} ({} memories)", path.display(), count);
+        if pruned > 0 {
+            out.push_str(&format!(", pruned {pruned} old backup(s)"));
+        }
+        out
+    }
+}
+
+/// Render existing backups (human: one line per file; json: array).
+pub fn render_backup_list(backups: &[(std::path::PathBuf, u64)], json: bool) -> String {
+    if json {
+        let items: Vec<_> = backups
+            .iter()
+            .map(|(p, sz)| {
+                serde_json::json!({
+                    "path": p.display().to_string(),
+                    "bytes": sz,
+                })
+            })
+            .collect();
+        serde_json::json!({"backups": items}).to_string()
+    } else if backups.is_empty() {
+        "No backups found.".to_string()
+    } else {
+        let mut out = String::from("Backups:\n");
+        for (path, size) in backups {
+            out.push_str(&format!("- {} ({})\n", path.display(), format_size(*size)));
+        }
+        out.trim_end().to_string()
+    }
+}
+
+/// Render a restore dry-run plan.
+pub fn render_restore_plan(items: &[ImportItem], json: bool) -> String {
+    if json {
+        let items: Vec<_> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "summary": redact(&item.summary),
+                    "type": item.memory_type.as_str(),
+                    "importance": item.importance,
+                    "source": redact(&item.source),
+                })
+            })
+            .collect();
+        serde_json::json!({"planned": items.len(), "items": items}).to_string()
+    } else if items.is_empty() {
+        "No memories to restore.".to_string()
+    } else {
+        let mut out = format!("Restore plan: {} memories\n", items.len());
+        for item in items {
+            out.push_str(&format!(
+                "- [{} imp {}] {} ({})\n",
+                item.memory_type.as_str(),
+                item.importance,
+                redact(&item.summary),
+                redact(&item.source)
+            ));
+        }
+        out.trim_end().to_string()
+    }
+}
+
+fn format_size(bytes: u64) -> String {
+    if bytes < 1024 {
+        format!("{bytes} B")
+    } else if bytes < 1024 * 1024 {
+        format!("{:.1} KiB", bytes as f64 / 1024.0)
+    } else {
+        format!("{:.1} MiB", bytes as f64 / (1024.0 * 1024.0))
+    }
+}
+
 /// Render a successful update acknowledgement.
 pub fn render_updated(json: bool) -> String {
     if json {
@@ -455,6 +544,7 @@ mod tests {
             memory_type: MemoryType::ArchitectureDecision,
             importance: 8,
             source: "docs/adr.md".to_string(),
+            tags: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);
@@ -478,6 +568,7 @@ mod tests {
             memory_type: MemoryType::Insight,
             importance: 5,
             source: format!("docs/{token}.md"),
+            tags: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);

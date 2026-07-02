@@ -1,7 +1,7 @@
 //! Async dispatch from parsed `Cli` to daemon/client behavior.
 
 use crate::cli::{Cli, Command};
-use crate::{client, import, output, paths, serve};
+use crate::{client, export, import, output, paths, serve};
 use anyhow::Context as _;
 use rb_types::MemoryId;
 use std::path::Path;
@@ -85,6 +85,7 @@ async fn run_client(
     db_path: &std::path::Path,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
+    let ns_str = namespace.as_db_string();
     let mut client = client::connect_or_start(
         socket_path,
         db_path,
@@ -175,6 +176,90 @@ async fn run_client(
             let items = vec![item];
             if dry_run {
                 println!("{}", output::render_import_plan(&items, json));
+                return Ok(());
+            }
+            run_import_items(&mut client, db_path, &items, &tags, json).await?;
+        }
+        Command::Export {
+            format,
+            memory_type,
+            tags,
+            min_importance,
+        } => {
+            let filters = export::ExportFilters {
+                memory_type,
+                tags,
+                min_importance,
+            };
+            let snapshot = export::fetch_memories(&mut client, &filters).await?;
+            if snapshot.maybe_truncated {
+                eprintln!(
+                    "warning: export reached the 100000-memory wire limit and may be incomplete"
+                );
+            }
+            let output = export::format_export(&snapshot.memories, &ns_str, format)?;
+            println!("{output}");
+        }
+        Command::Backup {
+            format,
+            retention,
+            list,
+        } => {
+            if list {
+                let backups = export::list_backups(db_path);
+                println!("{}", output::render_backup_list(&backups, json));
+                return Ok(());
+            }
+            let filters = export::ExportFilters::default();
+            let snapshot = export::fetch_memories(&mut client, &filters).await?;
+            if snapshot.maybe_truncated {
+                eprintln!(
+                    "warning: backup reached the 100000-memory wire limit and may be incomplete"
+                );
+            }
+            let content = export::format_export(&snapshot.memories, &ns_str, format)?;
+            let path = export::write_backup(db_path, &content, format.extension())
+                .context("writing backup")?;
+            let pruned = if let Some(n) = retention {
+                export::prune_backups(db_path, n).context("pruning old backups")?
+            } else {
+                0
+            };
+            println!(
+                "{}",
+                output::render_backup_result(&path, snapshot.memories.len(), pruned, json)
+            );
+        }
+        Command::Restore {
+            path,
+            tags,
+            dry_run,
+        } => {
+            let text = if path == "-" {
+                use tokio::io::AsyncReadExt as _;
+                let mut buf = Vec::new();
+                tokio::io::stdin()
+                    .take(256 * 1024 * 1024)
+                    .read_to_end(&mut buf)
+                    .await
+                    .context("reading restore stdin")?;
+                String::from_utf8_lossy(&buf).into_owned()
+            } else {
+                let metadata =
+                    std::fs::metadata(&path).with_context(|| format!("statting {path:?}"))?;
+                if metadata.len() > 256 * 1024 * 1024 {
+                    anyhow::bail!(
+                        "export file {path:?} is {} MiB; cap is 256 MiB",
+                        metadata.len() / (1024 * 1024)
+                    );
+                }
+                std::fs::read_to_string(&path)
+                    .with_context(|| format!("reading export file {path:?}"))?
+            };
+            let items = export::parse_restore(&text).context("parsing export for restore")?;
+            if dry_run {
+                let plan = output::render_restore_plan(&items, json);
+                println!("{plan}");
                 return Ok(());
             }
             run_import_items(&mut client, db_path, &items, &tags, json).await?;
