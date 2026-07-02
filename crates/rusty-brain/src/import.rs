@@ -224,7 +224,7 @@ fn derive_summary(text: &str, label: &str) -> String {
     for line in text.lines() {
         let t = line.trim();
         if let Some(heading) = t.strip_prefix('#') {
-            let heading = heading.trim();
+            let heading = heading.trim_start_matches('#').trim();
             if !heading.is_empty() {
                 return truncate_summary(heading);
             }
@@ -394,8 +394,7 @@ fn recent_decision_commits(root: &Path, limit: usize) -> Vec<ImportItem> {
 
 /// Store `items` over a single connection. Each item is redacted, then a
 /// read-only recall probe skips an exact-content duplicate (so re-running an
-/// import adds nothing). On `dry_run`, probes still run (so the plan reports
-/// duplicates) but nothing is stored and no ledger is written.
+/// import adds nothing).
 ///
 /// Returns the per-item outcome (the stored id, or `None` for skipped/failed)
 /// and aggregate counts.
@@ -404,7 +403,6 @@ pub async fn store_items(
     items: &[ImportItem],
     tag: &str,
     extra_tags: &[String],
-    dry_run: bool,
 ) -> anyhow::Result<(Vec<Option<MemoryId>>, ImportCounts)> {
     let mut ids = Vec::with_capacity(items.len());
     let mut counts = ImportCounts::default();
@@ -423,12 +421,6 @@ pub async fn store_items(
 
         if is_duplicate(client, &content).await? {
             counts.skipped_duplicate += 1;
-            ids.push(None);
-            continue;
-        }
-
-        if dry_run {
-            counts.new += 1;
             ids.push(None);
             continue;
         }
@@ -475,7 +467,7 @@ async fn is_duplicate(client: &mut Client, redacted_content: &str) -> anyhow::Re
         return Ok(false);
     }
     let (results, _degraded) = client
-        .recall_with_status(query, None, Vec::new(), 5)
+        .recall_with_status(query, None, Vec::new(), 20)
         .await?;
     let target = redacted_content.trim();
     Ok(results.iter().any(|r| r.memory.content.trim() == target))
@@ -493,11 +485,9 @@ pub fn write_ledger(db_path: &Path, batch_id: &str, ids: &[MemoryId]) -> anyhow:
         "batch": batch_id,
         "ids": ids.iter().map(|id| id.to_string()).collect::<Vec<_>>(),
     });
-    // Atomic write: temp file 0600 + rename (the scratch/DB at-rest precedent).
+    // Atomic write: temp file created 0600 on Unix + rename.
     let tmp = path.with_extension("json.tmp");
-    std::fs::write(&tmp, payload.to_string())
-        .with_context(|| format!("writing ledger {}", tmp.display()))?;
-    set_private(&tmp)?;
+    write_private(&tmp, &payload.to_string())?;
     std::fs::rename(&tmp, &path)
         .with_context(|| format!("installing ledger {}", path.display()))?;
     Ok(())
@@ -602,15 +592,23 @@ fn safe_ledger_name(batch_id: &str) -> String {
 }
 
 #[cfg(unix)]
-fn set_private(path: &Path) -> anyhow::Result<()> {
-    use std::os::unix::fs::PermissionsExt as _;
-    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))
+fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt as _;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(content.as_bytes())
+        .with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(not(unix))]
-fn set_private(_path: &Path) -> anyhow::Result<()> {
-    Ok(())
+fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+    std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 
 #[cfg(test)]
@@ -651,6 +649,15 @@ mod tests {
             "no heading here"
         );
         assert_eq!(derive_summary("\n\n   \n", "docs/x.md"), "x.md");
+    }
+
+    #[test]
+    fn derive_summary_strips_all_heading_markers() {
+        assert_eq!(derive_summary("## Design\nbody", "x"), "Design");
+        assert_eq!(
+            derive_summary("### Deep Section\nbody", "x"),
+            "Deep Section"
+        );
     }
 
     #[test]

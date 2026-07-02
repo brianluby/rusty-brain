@@ -134,22 +134,17 @@ async fn run_client(
                 return Ok(());
             }
             if !yes {
-                if !json {
-                    println!("{}", output::render_import_plan(&items, false));
+                if json {
+                    println!("{{\"aborted\":true,\"error\":\"--yes is required with --json\"}}");
+                    return Ok(());
                 }
+                println!("{}", output::render_import_plan(&items, false));
                 if !confirm_import(items.len())? {
-                    println!(
-                        "{}",
-                        if json {
-                            "{\"aborted\":true}"
-                        } else {
-                            "Aborted"
-                        }
-                    );
+                    println!("Aborted");
                     return Ok(());
                 }
             }
-            run_import_items(&mut client, db_path, &items, &[], false, json).await?;
+            run_import_items(&mut client, db_path, &items, &[], json).await?;
         }
         Command::Import {
             path,
@@ -161,13 +156,18 @@ async fn run_client(
         } => {
             let item = if path == "-" {
                 use tokio::io::AsyncReadExt as _;
-                let mut text = String::new();
+                let mut buf = Vec::new();
                 tokio::io::stdin()
                     .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
-                    .read_to_string(&mut text)
+                    .read_to_end(&mut buf)
                     .await
                     .context("reading import stdin")?;
-                import::extract_text("stdin", &text, memory_type, importance)
+                import::extract_text(
+                    "stdin",
+                    &String::from_utf8_lossy(&buf),
+                    memory_type,
+                    importance,
+                )
             } else {
                 import::extract_file(Path::new(&path), max_bytes, memory_type, importance)
                     .with_context(|| format!("import source {path:?} yielded no text"))?
@@ -177,7 +177,7 @@ async fn run_client(
                 println!("{}", output::render_import_plan(&items, json));
                 return Ok(());
             }
-            run_import_items(&mut client, db_path, &items, &tags, false, json).await?;
+            run_import_items(&mut client, db_path, &items, &tags, json).await?;
         }
         Command::Remember {
             content,
@@ -492,21 +492,20 @@ async fn run_import_items(
     db_path: &Path,
     items: &[import::ImportItem],
     extra_tags: &[String],
-    dry_run: bool,
     json: bool,
 ) -> anyhow::Result<()> {
     let batch_id = import::new_batch_id();
     let tag = import::batch_tag(&batch_id);
-    let (ids, counts) = import::store_items(client, items, &tag, extra_tags, dry_run)
+    let (ids, counts) = import::store_items(client, items, &tag, extra_tags)
         .await
         .context("storing imported memories")?;
     let stored: Vec<MemoryId> = ids.into_iter().flatten().collect();
-    if !dry_run && !stored.is_empty() {
+    if !stored.is_empty() {
         import::write_ledger(db_path, &batch_id, &stored).context("writing import undo ledger")?;
     }
     println!(
         "{}",
-        output::render_import_result(&batch_id, counts, dry_run, json)
+        output::render_import_result(&batch_id, counts, false, json)
     );
     Ok(())
 }

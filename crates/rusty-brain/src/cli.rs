@@ -100,10 +100,16 @@ pub enum Command {
         #[arg(long, default_value_t = 6, value_parser = value_parser!(u8).range(1..=10))]
         importance: u8,
         /// Undo a prior import batch by id (printed after a successful init/import).
-        #[arg(long, conflicts_with_all = ["dry_run", "list_batches"])]
+        #[arg(
+            long,
+            conflicts_with_all = ["yes", "dry_run", "max_files", "max_bytes", "importance", "list_batches"]
+        )]
         undo: Option<String>,
         /// List undoable import batches for the current database.
-        #[arg(long = "list-batches", conflicts_with_all = ["undo"])]
+        #[arg(
+            long = "list-batches",
+            conflicts_with_all = ["yes", "dry_run", "max_files", "max_bytes", "importance", "undo"]
+        )]
         list_batches: bool,
     },
 
@@ -409,6 +415,25 @@ mod tests {
             "--list-batches",
         ])
         .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn init_undo_conflicts_with_scan_flags() {
+        let err = Cli::try_parse_from([
+            "rusty-brain",
+            "init",
+            "--undo",
+            "import-abc",
+            "--max-files",
+            "10",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"));
+
+        let err =
+            Cli::try_parse_from(["rusty-brain", "init", "--list-batches", "--importance", "7"])
+                .unwrap_err();
         assert!(err.to_string().contains("cannot be used with"));
     }
 
