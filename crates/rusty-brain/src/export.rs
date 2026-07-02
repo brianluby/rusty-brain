@@ -505,9 +505,9 @@ mod tests {
             sample_note("A", "body a", MemoryType::Insight, 3),
         ];
         // Swap to ensure they're not pre-sorted.
-        notes.sort_by_key(|b| std::cmp::Reverse(b.id.to_string()));
-        notes.sort_by_key(|a| a.id.to_string());
-        assert!(notes[0].id.to_string() <= notes[1].id.to_string());
+        notes.sort_by_key(|b| std::cmp::Reverse(b.id.as_uuid()));
+        sort_memories_by_id(&mut notes);
+        assert!(notes[0].id.as_uuid() <= notes[1].id.as_uuid());
     }
 
     #[test]
