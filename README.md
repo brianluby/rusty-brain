@@ -207,7 +207,7 @@ rusty-brain backup --retention 5 --format json
 rusty-brain backup --list
 
 # restore from a JSON export (idempotent via dedup, re-embeds under current model)
-rusty-brain restore backup-20260702T210230.json
+rusty-brain restore backup-20260702T210230.123456789.json
 echo "$JSON" | rusty-brain restore -
 
 # add --json to any command for machine-readable output

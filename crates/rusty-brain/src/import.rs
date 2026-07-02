@@ -598,7 +598,7 @@ fn safe_ledger_name(batch_id: &str) -> String {
 }
 
 #[cfg(unix)]
-pub fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     use std::io::Write;
     use std::os::unix::fs::OpenOptionsExt as _;
     let mut f = std::fs::OpenOptions::new()
@@ -613,7 +613,7 @@ pub fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
 }
 
 #[cfg(not(unix))]
-pub fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
+pub(crate) fn write_private(path: &Path, content: &str) -> anyhow::Result<()> {
     std::fs::write(path, content).with_context(|| format!("writing {}", path.display()))
 }
 

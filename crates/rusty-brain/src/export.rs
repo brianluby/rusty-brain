@@ -20,6 +20,8 @@ use rb_proto::Client;
 use rb_types::{MemoryNote, MemoryType};
 use std::path::{Path, PathBuf};
 
+const EXPORT_LIST_LIMIT: usize = 100_000;
+
 /// Export format selector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExportFormat {
@@ -56,6 +58,14 @@ pub struct ExportEnvelope {
     pub memories: Vec<MemoryNote>,
 }
 
+/// Memories fetched for export plus whether the bounded wire list may have
+/// truncated the namespace.
+#[derive(Debug, Clone)]
+pub struct ExportSnapshot {
+    pub memories: Vec<MemoryNote>,
+    pub maybe_truncated: bool,
+}
+
 // ---------------------------------------------------------------------------
 // Export (read-only dump via the wire list path)
 // ---------------------------------------------------------------------------
@@ -66,11 +76,15 @@ pub struct ExportEnvelope {
 pub async fn fetch_memories(
     client: &mut Client,
     filters: &ExportFilters,
-) -> anyhow::Result<Vec<MemoryNote>> {
+) -> anyhow::Result<ExportSnapshot> {
     let memories = client
-        .list(filters.min_importance, 100_000)
+        .list(filters.min_importance, EXPORT_LIST_LIMIT)
         .await
         .context("listing memories for export")?;
+    let maybe_truncated = memories.len() == EXPORT_LIST_LIMIT;
+    if maybe_truncated {
+        tracing::warn!(limit = EXPORT_LIST_LIMIT, "export result may be truncated");
+    }
     let mut filtered = memories
         .into_iter()
         .filter(|m| {
@@ -88,16 +102,27 @@ pub async fn fetch_memories(
             true
         })
         .collect::<Vec<_>>();
-    filtered.sort_by_key(|m| m.id.to_string());
-    Ok(filtered)
+    sort_memories_by_id(&mut filtered);
+    Ok(ExportSnapshot {
+        memories: filtered,
+        maybe_truncated,
+    })
+}
+
+fn sort_memories_by_id(memories: &mut [MemoryNote]) {
+    memories.sort_by_key(|m| m.id.as_uuid());
 }
 
 /// Format memories as the requested output format.
-pub fn format_export(memories: &[MemoryNote], namespace: &str, format: ExportFormat) -> String {
+pub fn format_export(
+    memories: &[MemoryNote],
+    namespace: &str,
+    format: ExportFormat,
+) -> anyhow::Result<String> {
     match format {
         ExportFormat::Json => format_json(memories, namespace),
-        ExportFormat::Markdown => format_markdown(memories),
-        ExportFormat::Csv => format_csv(memories),
+        ExportFormat::Markdown => Ok(format_markdown(memories)),
+        ExportFormat::Csv => Ok(format_csv(memories)),
     }
 }
 
@@ -105,7 +130,7 @@ fn now_utc() -> chrono::DateTime<chrono::Utc> {
     chrono::Utc::now()
 }
 
-fn format_json(memories: &[MemoryNote], namespace: &str) -> String {
+fn format_json(memories: &[MemoryNote], namespace: &str) -> anyhow::Result<String> {
     let envelope = ExportEnvelope {
         version: 1,
         exported_at: now_utc(),
@@ -113,10 +138,7 @@ fn format_json(memories: &[MemoryNote], namespace: &str) -> String {
         count: memories.len(),
         memories: memories.to_vec(),
     };
-    serde_json::to_string_pretty(&envelope).unwrap_or_else(|e| {
-        tracing::error!(error = %e, "failed to serialize export JSON");
-        "{}".to_string()
-    })
+    serde_json::to_string_pretty(&envelope).context("serializing export JSON")
 }
 
 fn format_markdown(memories: &[MemoryNote]) -> String {
@@ -182,10 +204,15 @@ fn format_csv(memories: &[MemoryNote]) -> String {
 }
 
 fn csv_escape(s: &str) -> String {
+    let s = if s.starts_with(['=', '+', '-', '@', '\t', '\r']) {
+        format!("'{s}")
+    } else {
+        s.to_string()
+    };
     if s.contains(',') || s.contains('"') || s.contains('\n') {
         format!("\"{}\"", s.replace('"', "\"\""))
     } else {
-        s.to_string()
+        s
     }
 }
 
@@ -227,8 +254,7 @@ pub fn prune_backups(db_path: &Path, retain: usize) -> anyhow::Result<usize> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            let name = p.file_name().and_then(|s| s.to_str())?;
-            if !name.starts_with("backup-") {
+            if !is_backup_file(&p) {
                 return None;
             }
             let mtime = e.metadata().ok()?.modified().ok()?;
@@ -257,8 +283,7 @@ pub fn list_backups(db_path: &Path) -> Vec<(PathBuf, u64)> {
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            let name = p.file_name().and_then(|s| s.to_str())?;
-            if !name.starts_with("backup-") {
+            if !is_backup_file(&p) {
                 return None;
             }
             let md = e.metadata().ok()?;
@@ -268,6 +293,12 @@ pub fn list_backups(db_path: &Path) -> Vec<(PathBuf, u64)> {
         .collect();
     files.sort_by_key(|b| std::cmp::Reverse(b.1));
     files.into_iter().map(|(p, _, sz)| (p, sz)).collect()
+}
+
+fn is_backup_file(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|s| s.to_str())
+        .is_some_and(|name| name.starts_with("backup-"))
 }
 
 // ---------------------------------------------------------------------------
@@ -280,6 +311,9 @@ pub fn list_backups(db_path: &Path) -> Vec<(PathBuf, u64)> {
 pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
     let envelope: ExportEnvelope = serde_json::from_str(text)
         .context("parsing export JSON (expected a rusty-brain export)")?;
+    if envelope.version != 1 {
+        anyhow::bail!("unsupported export version {}", envelope.version);
+    }
     let mut items = Vec::with_capacity(envelope.memories.len());
     for m in envelope.memories {
         if m.archived_at.is_some() {
@@ -383,7 +417,7 @@ mod tests {
                 9,
             ),
         ];
-        let json = format_json(&notes, "project:test");
+        let json = format_json(&notes, "project:test").unwrap();
         let items = parse_restore(&json).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].summary, "Decision A");
@@ -411,6 +445,14 @@ mod tests {
     }
 
     #[test]
+    fn csv_escapes_formula_like_summary() {
+        let mut note = sample_note("formula", "body", MemoryType::Insight, 1);
+        note.summary = "=cmd|' /C calc'!A0".to_string();
+        let csv = format_csv(&[note]);
+        assert!(csv.contains("'=cmd|' /C calc'!A0"), "{csv}");
+    }
+
+    #[test]
     fn parse_restore_skips_archived_and_superseded() {
         let mut archived = sample_note("Old", "Old content", MemoryType::Insight, 3);
         archived.archived_at = Some(chrono::Utc::now());
@@ -418,7 +460,7 @@ mod tests {
         superseded.superseded_by = Some(MemoryId::new());
         let active = sample_note("Active", "Live content", MemoryType::Insight, 5);
         let notes = vec![archived, superseded, active];
-        let json = format_json(&notes, "project:test");
+        let json = format_json(&notes, "project:test").unwrap();
         let items = parse_restore(&json).unwrap();
         assert_eq!(items.len(), 1);
         assert_eq!(items[0].summary, "Active");

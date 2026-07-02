@@ -191,8 +191,13 @@ async fn run_client(
                 tags,
                 min_importance,
             };
-            let memories = export::fetch_memories(&mut client, &filters).await?;
-            let output = export::format_export(&memories, &ns_str, format);
+            let snapshot = export::fetch_memories(&mut client, &filters).await?;
+            if snapshot.maybe_truncated {
+                eprintln!(
+                    "warning: export reached the 100000-memory wire limit and may be incomplete"
+                );
+            }
+            let output = export::format_export(&snapshot.memories, &ns_str, format)?;
             println!("{output}");
         }
         Command::Backup {
@@ -206,18 +211,23 @@ async fn run_client(
                 return Ok(());
             }
             let filters = export::ExportFilters::default();
-            let memories = export::fetch_memories(&mut client, &filters).await?;
-            let content = export::format_export(&memories, &ns_str, format);
+            let snapshot = export::fetch_memories(&mut client, &filters).await?;
+            if snapshot.maybe_truncated {
+                eprintln!(
+                    "warning: backup reached the 100000-memory wire limit and may be incomplete"
+                );
+            }
+            let content = export::format_export(&snapshot.memories, &ns_str, format)?;
             let path = export::write_backup(db_path, &content, format.extension())
                 .context("writing backup")?;
             let pruned = if let Some(n) = retention {
-                export::prune_backups(db_path, n).unwrap_or(0)
+                export::prune_backups(db_path, n).context("pruning old backups")?
             } else {
                 0
             };
             println!(
                 "{}",
-                output::render_backup_result(&path, memories.len(), pruned, json)
+                output::render_backup_result(&path, snapshot.memories.len(), pruned, json)
             );
         }
         Command::Restore {
@@ -252,14 +262,7 @@ async fn run_client(
                 println!("{plan}");
                 return Ok(());
             }
-            let counts = export::restore_items(&mut client, &items, &tags)
-                .await
-                .context("restoring memories")?;
-            let batch_id = import::new_batch_id();
-            println!(
-                "{}",
-                output::render_import_result(&batch_id, counts, false, json)
-            );
+            run_import_items(&mut client, db_path, &items, &tags, json).await?;
         }
         Command::Remember {
             content,
