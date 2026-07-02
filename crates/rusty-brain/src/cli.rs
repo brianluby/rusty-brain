@@ -81,6 +81,53 @@ pub enum Command {
     /// Run the MCP (Model Context Protocol) stdio server for agents.
     Mcp,
 
+    /// Seed memory from existing project context (first-run cold start).
+    Init {
+        /// Skip the confirmation prompt and store the planned memories.
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Print the import plan without storing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum project files to scan (well-known root files + docs/).
+        #[arg(long, default_value_t = 50)]
+        max_files: usize,
+        /// Maximum bytes to read from any one source file.
+        #[arg(long, default_value_t = 65_536)]
+        max_bytes: usize,
+        /// Default importance 1-10 for seeded memories (source adapters may
+        /// nudge it, e.g. CLAUDE.md constraints are one point higher).
+        #[arg(long, default_value_t = 6, value_parser = value_parser!(u8).range(1..=10))]
+        importance: u8,
+        /// Undo a prior import batch by id (printed after a successful init/import).
+        #[arg(long, conflicts_with_all = ["dry_run", "list_batches"])]
+        undo: Option<String>,
+        /// List undoable import batches for the current database.
+        #[arg(long = "list-batches", conflicts_with_all = ["undo"])]
+        list_batches: bool,
+    },
+
+    /// Import a text/markdown file, or '-' for stdin, into the current namespace.
+    Import {
+        /// Path to a text/markdown file, or '-' to read stdin.
+        path: String,
+        /// Memory type applied to the imported item.
+        #[arg(long = "type", default_value = "insight", value_parser = parse_memory_type)]
+        memory_type: MemoryType,
+        /// Importance 1-10.
+        #[arg(long, default_value_t = 5, value_parser = value_parser!(u8).range(1..=10))]
+        importance: u8,
+        /// Tags (repeatable). An `import_batch:<id>` tag is added automatically.
+        #[arg(long)]
+        tags: Vec<String>,
+        /// Print the import plan without storing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Maximum bytes to read from the input.
+        #[arg(long, default_value_t = 65_536)]
+        max_bytes: usize,
+    },
+
     /// Store a new memory.
     Remember {
         /// Memory content (the body to remember). Required UNLESS `--batch` is
@@ -311,6 +358,94 @@ mod tests {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
         assert!(matches!(cli.command, Command::Subscribe { .. }));
+    }
+
+    #[test]
+    fn init_parses_yes_dry_run_and_bounds() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "init",
+            "--yes",
+            "--dry-run",
+            "--max-files",
+            "12",
+            "--max-bytes",
+            "4096",
+            "--importance",
+            "7",
+        ]);
+        match cli.command {
+            Command::Init {
+                yes,
+                dry_run,
+                max_files,
+                max_bytes,
+                importance,
+                undo,
+                list_batches,
+            } => {
+                assert!(yes);
+                assert!(dry_run);
+                assert_eq!(max_files, 12);
+                assert_eq!(max_bytes, 4096);
+                assert_eq!(importance, 7);
+                assert_eq!(undo, None);
+                assert!(!list_batches);
+            }
+            other => panic!("expected Init, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn init_parses_undo_and_list_batches_conflicts() {
+        let undo = Cli::parse_from(["rusty-brain", "init", "--undo", "import-abc"]);
+        assert!(matches!(undo.command, Command::Init { undo: Some(_), .. }));
+
+        let err = Cli::try_parse_from([
+            "rusty-brain",
+            "init",
+            "--undo",
+            "import-abc",
+            "--list-batches",
+        ])
+        .unwrap_err();
+        assert!(err.to_string().contains("cannot be used with"));
+    }
+
+    #[test]
+    fn import_parses_file_type_tags_and_dry_run() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "import",
+            "docs/ADR.md",
+            "--type",
+            "architecture_decision",
+            "--importance",
+            "8",
+            "--tags",
+            "seed",
+            "--dry-run",
+            "--max-bytes",
+            "8192",
+        ]);
+        match cli.command {
+            Command::Import {
+                path,
+                memory_type,
+                importance,
+                tags,
+                dry_run,
+                max_bytes,
+            } => {
+                assert_eq!(path, "docs/ADR.md");
+                assert_eq!(memory_type, MemoryType::ArchitectureDecision);
+                assert_eq!(importance, 8);
+                assert_eq!(tags, vec!["seed"]);
+                assert!(dry_run);
+                assert_eq!(max_bytes, 8192);
+            }
+            other => panic!("expected Import, got {other:?}"),
+        }
     }
 
     #[test]

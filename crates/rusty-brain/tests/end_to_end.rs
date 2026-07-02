@@ -34,6 +34,59 @@ fn wait_for_socket(path: &Path, timeout: Duration) -> bool {
     std::os::unix::net::UnixStream::connect(path).is_ok()
 }
 
+fn spawn_daemon(exe: &Path, socket: &Path, db: &Path, config_home: &Path) -> Reap {
+    Reap(
+        Command::new(exe)
+            .arg("serve")
+            .env("RUSTY_BRAIN_SOCKET", socket)
+            .env("RUSTY_BRAIN_DB", db)
+            .env("XDG_CONFIG_HOME", config_home)
+            .env_remove("VOYAGE_API_KEY")
+            .env("RUST_LOG", "warn")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn daemon"),
+    )
+}
+
+fn cli(exe: &Path, socket: &Path, db: &Path, config_home: &Path, namespace: &str) -> Command {
+    let mut cmd = Command::new(exe);
+    cmd.env("RUSTY_BRAIN_SOCKET", socket)
+        .env("RUSTY_BRAIN_DB", db)
+        .env("XDG_CONFIG_HOME", config_home)
+        .env("RUSTY_BRAIN_NAMESPACE", namespace)
+        .env_remove("VOYAGE_API_KEY");
+    cmd
+}
+
+fn db_family_contains(db: &Path, needle: &[u8]) -> bool {
+    let Some(parent) = db.parent() else {
+        return false;
+    };
+    let Some(file_name) = db.file_name().and_then(|s| s.to_str()) else {
+        return false;
+    };
+    let Ok(entries) = std::fs::read_dir(parent) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+        if !name.starts_with(file_name) {
+            continue;
+        }
+        let Ok(bytes) = std::fs::read(&path) else {
+            continue;
+        };
+        if bytes.windows(needle.len()).any(|w| w == needle) {
+            return true;
+        }
+    }
+    false
+}
+
 #[test]
 fn remember_then_recall_round_trips_through_the_binary() {
     let dir = tempfile::tempdir().unwrap();
@@ -186,5 +239,166 @@ fn remember_batch_bulk_loads_lines_from_stdin() {
     assert!(
         predicate::str::contains("9847").eval(&stdout),
         "recall did not surface a batch-loaded fact; got: {stdout}"
+    );
+}
+
+#[test]
+fn init_seeds_deduplicates_redacts_and_undoes_project_context() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(project.join("docs")).unwrap();
+    let secret = "AKIAABCDEFGHIJKLMNOP";
+    std::fs::write(
+        project.join("README.md"),
+        format!("# Demo\n\nThe durable storage decision is sqlite vec. Secret {secret}\n"),
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("CLAUDE.md"),
+        "# Policy\nNever commit secrets.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("docs").join("adr-storage.md"),
+        "# Storage ADR\nWe adopted sqlite-vec for local-first memory retrieval.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("docs").join("usage.md"),
+        "# Usage\nRun rusty-brain init before the first session.\n",
+    )
+    .unwrap();
+    std::fs::write(
+        project.join("docs").join("constraints.md"),
+        "# Constraints\nThe daemon remains local-first and per-user.\n",
+    )
+    .unwrap();
+
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(
+        wait_for_socket(&socket, Duration::from_secs(10)),
+        "daemon socket never appeared at {}",
+        socket.display()
+    );
+
+    let init = cli(&exe, &socket, &db, dir.path(), "init-e2e")
+        .current_dir(&project)
+        .args(["--json", "init", "--yes"])
+        .output()
+        .expect("run init");
+    assert!(
+        init.status.success(),
+        "init failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&init.stdout),
+        String::from_utf8_lossy(&init.stderr)
+    );
+    let first: serde_json::Value = serde_json::from_slice(&init.stdout).unwrap();
+    let batch = first["batch"].as_str().unwrap().to_string();
+    assert!(
+        first["new"].as_u64().unwrap_or(0) >= 5,
+        "init should seed well-known files + docs: {}",
+        String::from_utf8_lossy(&init.stdout)
+    );
+    assert!(
+        !db_family_contains(&db, secret.as_bytes()),
+        "planted secret must be redacted before reaching sqlite files"
+    );
+
+    let recall = cli(&exe, &socket, &db, dir.path(), "init-e2e")
+        .current_dir(&project)
+        .args(["recall", "durable storage decision", "--limit", "10"])
+        .output()
+        .expect("run recall");
+    assert!(recall.status.success());
+    let stdout = String::from_utf8_lossy(&recall.stdout);
+    assert!(
+        stdout.contains("sqlite vec") || stdout.contains("sqlite-vec"),
+        "recall should surface seeded context; got: {stdout}"
+    );
+
+    let second = cli(&exe, &socket, &db, dir.path(), "init-e2e")
+        .current_dir(&project)
+        .args(["--json", "init", "--yes"])
+        .output()
+        .expect("run init second time");
+    assert!(second.status.success());
+    let second_report: serde_json::Value = serde_json::from_slice(&second.stdout).unwrap();
+    assert_eq!(
+        second_report["new"].as_u64(),
+        Some(0),
+        "second init should be idempotent: {}",
+        String::from_utf8_lossy(&second.stdout)
+    );
+
+    let undo = cli(&exe, &socket, &db, dir.path(), "init-e2e")
+        .current_dir(&project)
+        .args(["--json", "init", "--undo", &batch])
+        .output()
+        .expect("undo init batch");
+    assert!(
+        undo.status.success(),
+        "undo failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&undo.stdout),
+        String::from_utf8_lossy(&undo.stderr)
+    );
+
+    let recall_after_undo = cli(&exe, &socket, &db, dir.path(), "init-e2e")
+        .current_dir(&project)
+        .args(["recall", "durable storage decision", "--limit", "10"])
+        .output()
+        .expect("recall after undo");
+    assert!(recall_after_undo.status.success());
+    let stdout = String::from_utf8_lossy(&recall_after_undo.stdout);
+    assert!(
+        !stdout.contains("sqlite vec") && !stdout.contains("sqlite-vec"),
+        "undo should remove the seeded batch from recall; got: {stdout}"
+    );
+}
+
+#[test]
+fn import_dry_run_prints_plan_and_stores_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let project = dir.path().join("project");
+    std::fs::create_dir_all(&project).unwrap();
+    let source = project.join("seed.md");
+    std::fs::write(
+        &source,
+        "# Dry Run Seed\nThe dry-run-only sentinel is never stored.\n",
+    )
+    .unwrap();
+
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    let dry_run = cli(&exe, &socket, &db, dir.path(), "import-dry-run-e2e")
+        .current_dir(&project)
+        .args(["--json", "import", source.to_str().unwrap(), "--dry-run"])
+        .output()
+        .expect("run import dry-run");
+    assert!(
+        dry_run.status.success(),
+        "dry-run failed: stdout={:?} stderr={:?}",
+        String::from_utf8_lossy(&dry_run.stdout),
+        String::from_utf8_lossy(&dry_run.stderr)
+    );
+    let plan: serde_json::Value = serde_json::from_slice(&dry_run.stdout).unwrap();
+    assert_eq!(plan["planned"].as_u64(), Some(1));
+
+    let recall = cli(&exe, &socket, &db, dir.path(), "import-dry-run-e2e")
+        .current_dir(&project)
+        .args(["recall", "dry-run-only sentinel", "--limit", "10"])
+        .output()
+        .expect("recall dry-run sentinel");
+    assert!(recall.status.success());
+    let stdout = String::from_utf8_lossy(&recall.stdout);
+    assert!(
+        stdout.contains("No stored memories match"),
+        "dry-run must not store the imported text; got: {stdout}"
     );
 }

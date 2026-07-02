@@ -1,5 +1,7 @@
 //! Pure rendering of results to human text or JSON (stdout).
 
+use crate::import::{BatchInfo, ImportCounts, ImportItem, UndoCounts};
+use rb_redact::redact;
 use rb_types::{MemoryNote, SearchResult};
 
 /// Render recall hits. JSON: the raw `Vec<SearchResult>`. Human: one line per hit.
@@ -116,6 +118,102 @@ pub fn render_batch_remembered(count: u64, json: bool) -> String {
     } else {
         format!("Remembered {count} memories")
     }
+}
+
+/// Render the candidate import plan before writes happen.
+pub fn render_import_plan(items: &[ImportItem], json: bool) -> String {
+    if json {
+        let items: Vec<_> = items
+            .iter()
+            .map(|item| {
+                serde_json::json!({
+                    "source": redact(&item.source),
+                    "summary": redact(&item.summary),
+                    "type": item.memory_type.as_str(),
+                    "importance": item.importance,
+                })
+            })
+            .collect();
+        return serde_json::json!({"planned": items.len(), "items": items}).to_string();
+    }
+    if items.is_empty() {
+        return "No import candidates found.".to_string();
+    }
+    let mut out = format!("Import plan: {} candidate memories\n", items.len());
+    for item in items {
+        out.push_str(&format!(
+            "- [{} imp {}] {} ({})\n",
+            item.memory_type.as_str(),
+            item.importance,
+            redact(&item.summary),
+            redact(&item.source)
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render an import result. `dry_run` means no writes happened; counts still
+/// include duplicate probes.
+pub fn render_import_result(
+    batch_id: &str,
+    counts: ImportCounts,
+    dry_run: bool,
+    json: bool,
+) -> String {
+    if json {
+        return serde_json::json!({
+            "batch": batch_id,
+            "dry_run": dry_run,
+            "new": counts.new,
+            "skipped_duplicate": counts.skipped_duplicate,
+            "failed": counts.failed,
+        })
+        .to_string();
+    }
+    let verb = if dry_run {
+        "would remember"
+    } else {
+        "remembered"
+    };
+    let mut out = format!(
+        "Import batch {batch_id}: {verb} {} memories (skipped_duplicate={} failed={})",
+        counts.new, counts.skipped_duplicate, counts.failed
+    );
+    if !dry_run && counts.new > 0 {
+        out.push_str(&format!("\nUndo with: rusty-brain init --undo {batch_id}"));
+    }
+    out
+}
+
+/// Render an import-batch undo acknowledgement.
+pub fn render_import_undo(batch_id: &str, counts: UndoCounts, json: bool) -> String {
+    if json {
+        serde_json::json!({"batch": batch_id, "deleted": counts.deleted}).to_string()
+    } else {
+        format!(
+            "Undid import batch {batch_id}: deleted {} memories",
+            counts.deleted
+        )
+    }
+}
+
+/// Render undoable import batches.
+pub fn render_import_batches(batches: &[BatchInfo], json: bool) -> String {
+    if json {
+        let batches: Vec<_> = batches
+            .iter()
+            .map(|batch| serde_json::json!({"batch": batch.id, "count": batch.count}))
+            .collect();
+        return serde_json::json!({"batches": batches}).to_string();
+    }
+    if batches.is_empty() {
+        return "No import batches found.".to_string();
+    }
+    let mut out = String::from("Import batches:\n");
+    for batch in batches {
+        out.push_str(&format!("- {} ({} memories)\n", batch.id, batch.count));
+    }
+    out.trim_end().to_string()
 }
 
 /// Render a successful update acknowledgement.
@@ -347,6 +445,98 @@ mod tests {
         let parsed: serde_json::Value =
             serde_json::from_str(&render_batch_remembered(500, true)).unwrap();
         assert_eq!(parsed["count"].as_u64().unwrap(), 500);
+    }
+
+    #[test]
+    fn import_plan_renders_items_in_both_modes() {
+        let items = vec![ImportItem {
+            summary: "Use SQLite".to_string(),
+            content: "Use SQLite for local-first storage".to_string(),
+            memory_type: MemoryType::ArchitectureDecision,
+            importance: 8,
+            source: "docs/adr.md".to_string(),
+        }];
+
+        let human = render_import_plan(&items, false);
+        assert!(human.contains("Use SQLite"), "summary shown: {human}");
+
+        let json = render_import_plan(&items, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["planned"].as_u64().unwrap(), 1);
+        assert_eq!(
+            parsed["items"][0]["type"].as_str().unwrap(),
+            "architecture_decision"
+        );
+    }
+
+    #[test]
+    fn import_plan_redacts_preview_metadata() {
+        let token = format!("sk-proj-{}", "A".repeat(40));
+        let items = vec![ImportItem {
+            summary: format!("token {token}"),
+            content: "not rendered".to_string(),
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            source: format!("docs/{token}.md"),
+        }];
+
+        let human = render_import_plan(&items, false);
+        assert!(
+            !human.contains(&token),
+            "human preview leaked token: {human}"
+        );
+        assert!(human.contains("[REDACTED:model-api-key]"), "{human}");
+
+        let json = render_import_plan(&items, true);
+        assert!(!json.contains(&token), "json preview leaked token: {json}");
+        assert!(json.contains("[REDACTED:model-api-key]"), "{json}");
+    }
+
+    #[test]
+    fn import_result_includes_undo_hint_only_for_written_batches() {
+        let written = render_import_result(
+            "import-abc",
+            ImportCounts {
+                new: 2,
+                skipped_duplicate: 1,
+                failed: 0,
+            },
+            false,
+            false,
+        );
+        assert!(written.contains("init --undo import-abc"));
+
+        let dry_run = render_import_result(
+            "import-abc",
+            ImportCounts {
+                new: 2,
+                skipped_duplicate: 0,
+                failed: 0,
+            },
+            true,
+            false,
+        );
+        assert!(!dry_run.contains("--undo"));
+    }
+
+    #[test]
+    fn import_undo_and_batches_render_parseable_json() {
+        let undo = render_import_undo("import-abc", UndoCounts { deleted: 2 }, true);
+        let parsed: serde_json::Value = serde_json::from_str(&undo).unwrap();
+        assert_eq!(parsed["deleted"].as_u64().unwrap(), 2);
+
+        let batches = render_import_batches(
+            &[BatchInfo {
+                id: "import-abc".to_string(),
+                count: 2,
+            }],
+            true,
+        );
+        let parsed: serde_json::Value = serde_json::from_str(&batches).unwrap();
+        assert_eq!(
+            parsed["batches"][0]["batch"].as_str().unwrap(),
+            "import-abc"
+        );
     }
 
     #[test]

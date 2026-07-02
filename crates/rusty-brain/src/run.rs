@@ -1,9 +1,10 @@
 //! Async dispatch from parsed `Cli` to daemon/client behavior.
 
 use crate::cli::{Cli, Command};
-use crate::{client, output, paths, serve};
+use crate::{client, import, output, paths, serve};
 use anyhow::Context as _;
 use rb_types::MemoryId;
+use std::path::Path;
 use std::str::FromStr;
 
 /// Parse a CLI id argument into a `MemoryId`, surfacing a clear error.
@@ -97,6 +98,87 @@ async fn run_client(
     match command {
         Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
         Command::Mcp => anyhow::bail!("internal: mcp must be handled before run_client"),
+        Command::Init {
+            yes,
+            dry_run,
+            max_files,
+            max_bytes,
+            importance,
+            undo,
+            list_batches,
+        } => {
+            if list_batches {
+                let batches = import::list_batches(db_path);
+                println!("{}", output::render_import_batches(&batches, json));
+                return Ok(());
+            }
+            if let Some(batch_id) = undo {
+                let counts = import::undo_batch(&mut client, db_path, &batch_id)
+                    .await
+                    .with_context(|| format!("undoing import batch {batch_id}"))?;
+                println!("{}", output::render_import_undo(&batch_id, counts, json));
+                return Ok(());
+            }
+
+            let root = std::env::current_dir().context("resolving current directory")?;
+            let items = import::scan_project(
+                &root,
+                import::ScanOptions {
+                    max_files,
+                    max_bytes,
+                    importance,
+                },
+            );
+            if items.is_empty() || dry_run {
+                println!("{}", output::render_import_plan(&items, json));
+                return Ok(());
+            }
+            if !yes {
+                if !json {
+                    println!("{}", output::render_import_plan(&items, false));
+                }
+                if !confirm_import(items.len())? {
+                    println!(
+                        "{}",
+                        if json {
+                            "{\"aborted\":true}"
+                        } else {
+                            "Aborted"
+                        }
+                    );
+                    return Ok(());
+                }
+            }
+            run_import_items(&mut client, db_path, &items, &[], false, json).await?;
+        }
+        Command::Import {
+            path,
+            memory_type,
+            importance,
+            tags,
+            dry_run,
+            max_bytes,
+        } => {
+            let item = if path == "-" {
+                use tokio::io::AsyncReadExt as _;
+                let mut text = String::new();
+                tokio::io::stdin()
+                    .take(u64::try_from(max_bytes).unwrap_or(u64::MAX))
+                    .read_to_string(&mut text)
+                    .await
+                    .context("reading import stdin")?;
+                import::extract_text("stdin", &text, memory_type, importance)
+            } else {
+                import::extract_file(Path::new(&path), max_bytes, memory_type, importance)
+                    .with_context(|| format!("import source {path:?} yielded no text"))?
+            };
+            let items = vec![item];
+            if dry_run {
+                println!("{}", output::render_import_plan(&items, json));
+                return Ok(());
+            }
+            run_import_items(&mut client, db_path, &items, &tags, false, json).await?;
+        }
         Command::Remember {
             content,
             memory_type,
@@ -403,6 +485,44 @@ async fn run_client(
         }
     }
     Ok(())
+}
+
+async fn run_import_items(
+    client: &mut rb_proto::Client,
+    db_path: &Path,
+    items: &[import::ImportItem],
+    extra_tags: &[String],
+    dry_run: bool,
+    json: bool,
+) -> anyhow::Result<()> {
+    let batch_id = import::new_batch_id();
+    let tag = import::batch_tag(&batch_id);
+    let (ids, counts) = import::store_items(client, items, &tag, extra_tags, dry_run)
+        .await
+        .context("storing imported memories")?;
+    let stored: Vec<MemoryId> = ids.into_iter().flatten().collect();
+    if !dry_run && !stored.is_empty() {
+        import::write_ledger(db_path, &batch_id, &stored).context("writing import undo ledger")?;
+    }
+    println!(
+        "{}",
+        output::render_import_result(&batch_id, counts, dry_run, json)
+    );
+    Ok(())
+}
+
+fn confirm_import(count: usize) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!("Store {count} imported memories? [y/N] ");
+    std::io::stderr().flush().context("flushing prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading confirmation")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
 }
 
 #[cfg(test)]
