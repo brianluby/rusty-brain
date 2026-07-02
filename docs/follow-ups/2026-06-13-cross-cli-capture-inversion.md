@@ -8,7 +8,8 @@
   existed but was dormant; OpenCode's terminus mapping (Gap A) is now **landed**
   (`session.idle` → `SessionCheckpoint`, fixture-backed lifecycle test). Full
   OpenCode capture restoration still needs the separate `apply_patch`
-  tool-coverage fix (Gap B). Codex/Gemini remain fixture-gated.
+  tool-coverage fix (Gap B). Codex remains fixture-gated; Gemini is descoped
+  (2026-06-27).
 - **Severity:** Medium — a capture **regression** for non-Claude CLIs until resolved
 
 ## Summary
@@ -22,14 +23,15 @@ canonical `Stop`, while OpenCode now maps `session.idle` to canonical
 
 | CLI | terminal native event | canonical mapping |
 |---|---|---|
-| Gemini | `SessionEnd` | `Stop` (`crates/rb-agents/src/gemini.rs`) — fixture-gated |
+| Gemini | `SessionEnd` | `Stop` (`crates/rb-agents/src/gemini.rs`) — descoped |
 | Codex | `Stop` | `Stop` (`crates/rb-agents/src/codex.rs`) — fixture-gated |
 | OpenCode | `session.idle` | `SessionCheckpoint` (`crates/rb-agents/src/opencode.rs`) — **Gap A landed** |
 
 OpenCode's `session.idle` now folds via canonical `SessionCheckpoint` (Gap A,
 multi-fire checkpoint-safe), so its bash-tool scratch is captured again. Codex
-and Gemini remain on `Stop` until a recorded lifecycle fixture proves their
-terminus cadence. For any CLI still on `Stop`: `PostToolUse` appends to the
+remains on `Stop` until a recorded lifecycle fixture proves its terminus cadence.
+Gemini is **descoped** (2026-06-27): it stays on `Stop`, no worse than today, and
+no fixture/mapping work is planned for it under this track. For any CLI still on `Stop`: `PostToolUse` appends to the
 per-session scratch as designed, but no canonical fold ever fires, so the scratch
 is never folded into a summary — it simply ages out via `scratch::prune_stale`
 (24h). Net effect vs pre-W3.1 (while unmapped): per-event capture → **no new
