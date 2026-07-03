@@ -5,13 +5,15 @@
   (Codex / OpenCode; Gemini descoped 2026-06-27) by mapping each CLI's terminal
   native event onto a canonical event that actually folds the session scratch
   into a memory.
-- **Status:** Design + scaffolding. OpenCode's terminus mapping is decidable now
-  (multi-fire checkpoint-safe), but restoring OpenCode capture also requires a
-  separate `apply_patch` tool-coverage fix (Gap B), and scorecard enablement is a
-  larger task than a flag flip — do NOT implement OpenCode end-to-end from the
-  terminus decision alone. Codex's decision is fixture-gated (decision tree
-  below). **Gemini is descoped** (2026-06-27) — removed from active scope; it
-  stays on canonical `Stop`. This is "Worker C" per the sequencing PRD.
+- **Status:** OpenCode capture **restored** (2026-07-02): Gap A (`session.idle` →
+  `SessionCheckpoint`) and Gap B (`apply_patch` → `Edit` + V4A `patchText` path
+  extraction in `edited_path`) both landed, with fixture-backed lifecycle tests;
+  the `opencode` capability row graduated capture `Partial` → `Supported`.
+  Scorecard enablement is still a separate, larger task than a flag flip — do NOT
+  flip it from the capture work alone. Codex's decision is fixture-gated
+  (decision tree below). **Gemini is descoped** (2026-06-27) — removed from
+  active scope; it stays on canonical `Stop`. This is "Worker C" per the
+  sequencing PRD.
 - **Related:**
   [cross-cli-capture-inversion follow-up](../follow-ups/2026-06-13-cross-cli-capture-inversion.md),
   [cross-agent fixture-recording spec](../specs/2026-06-23-cross-agent-fixture-recording.md),
@@ -121,32 +123,41 @@ terminus"):** map `session.idle` → canonical **`SessionCheckpoint`** (today `S
 become a memory instead of ageing out. OpenCode exposes no cleaner terminus
 (`session.deleted` is not emitted on a normal headless run).
 
-**Gap B — tool coverage (BLOCKS "capture restored").** The terminus mapping only
-folds what the scratch already contains, and OpenCode's file edits are NOT being
-captured into the scratch. The recorded run created `notes.txt` via the
-**`apply_patch`** tool (`crates/rb-hooks/tests/fixtures/opencode/result.jsonl:10`,
-`"tool":"apply_patch"` with a `patchText`), but `normalize_tool`
-(`crates/rb-hooks/src/capture.rs:127`) has no `apply_patch` arm — it falls through
-to `""` (not captured). The committed `tool_execute_after.json` fixture captured
-the **`bash`** event, not the edit, so a lifecycle test that replays only that
-fixture would pass while every OpenCode file edit silently drops on the floor.
+**Gap B — tool coverage.** [LANDED 2026-07-02] `normalize_tool` now maps
+`apply_patch` → `Edit`, and `edited_path` parses the V4A `patchText`
+`*** Add|Update|Delete File: <path>` directive; a fixture-backed lifecycle test
+(`opencode_apply_patch_file_edit_folds_into_checkpoint_summary`) replays the real
+`result.jsonl:10` payload. With Gap A and Gap B both landed, OpenCode capture is
+restored and the `opencode` capability row graduated `Partial → Supported`.
 
-This is the same `apply_patch` family as the deferred Codex gap, but it manifests
-**live** for OpenCode+gpt-5.5 (Codex's is upstream-blocked from even firing). The
-existing `"patch" => "Edit"` arm does NOT cover it — the recorded tool name is
-`apply_patch`, and the payload carries `patchText` (a raw patch), not a
-`file_path`, so a bare arm would summarize as "Edited unknown".
-
-**Therefore "OpenCode capture is restored" is FALSE until BOTH land:**
-1. `session.idle` → `SessionCheckpoint` (Gap A), AND
-2. an `apply_patch` arm in `normalize_tool` + edited-path extraction from
-   `patchText` in `summarize_post_tool_use`, proven by a real OpenCode
-   `apply_patch` `tool.execute.after` fixture (record one — the committed fixture
-   set lacks it).
-
-Gap A is the worked example the Codex terminus decision follows (Gemini
-descoped). Gap B is
-tracked alongside the Codex `apply_patch` follow-up.
+> Historical pre-fix rationale (retained for the decision record; superseded by
+> the LANDED note above):
+>
+> The terminus mapping only folds what the scratch already contains, and OpenCode's
+> file edits are NOT being captured into the scratch. The recorded run created
+> `notes.txt` via the **`apply_patch`** tool
+> (`crates/rb-hooks/tests/fixtures/opencode/result.jsonl:10`,
+> `"tool":"apply_patch"` with a `patchText`), but `normalize_tool`
+> (`crates/rb-hooks/src/capture.rs:127`) has no `apply_patch` arm — it falls
+> through to `""` (not captured). The committed `tool_execute_after.json` fixture
+> captured the **`bash`** event, not the edit, so a lifecycle test that replays
+> only that fixture would pass while every OpenCode file edit silently drops on
+> the floor.
+>
+> This is the same `apply_patch` family as the deferred Codex gap, but it
+> manifests **live** for OpenCode+gpt-5.5 (Codex's is upstream-blocked from even
+> firing). The existing `"patch" => "Edit"` arm does NOT cover it — the recorded
+> tool name is `apply_patch`, and the payload carries `patchText` (a raw patch),
+> not a `file_path`, so a bare arm would summarize as "Edited unknown".
+>
+> **Therefore "OpenCode capture is restored" was FALSE until BOTH landed:**
+> 1. `session.idle` → `SessionCheckpoint` (Gap A), AND
+> 2. an `apply_patch` arm in `normalize_tool` + edited-path extraction from
+>    `patchText`, proven by a real OpenCode `apply_patch` `tool.execute.after`
+>    fixture.
+>
+> Gap A is the worked example the Codex terminus decision follows (Gemini
+> descoped). Gap B is tracked alongside the Codex `apply_patch` follow-up.
 
 ### Codex — FIXTURE-GATED
 

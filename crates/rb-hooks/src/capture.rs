@@ -118,8 +118,11 @@ use rb_redact::redact;
 ///   These arrive verbatim in Gemini's `AfterTool` payload, so they MUST be
 ///   recognized here or every Gemini file edit/write/shell command would degrade
 ///   to a no-op capture.
-/// - Codex: its shell tool reports `Bash` (already handled above); its
-///   `apply_patch` edit tool is intentionally deferred — see the inline note.
+/// - Codex: its shell tool reports `Bash` (already handled above). Its
+///   `apply_patch` edit tool shares OpenCode's name, so the arm below captures
+///   it wherever a CLI fires PostToolUse for it — OpenCode does (with a V4A
+///   `patchText`); Codex does not yet (openai/codex#16732 — hooks fire only for
+///   the shell tool), so the arm is simply unreached for Codex today.
 ///
 /// Lowercasing first lets the Claude (capitalized) and OpenCode/Gemini (snake)
 /// spellings match the same arms. Anything not a recognized mutation tool maps to
@@ -135,14 +138,13 @@ fn normalize_tool(tool_name: &str) -> &'static str {
         "replace" => "Edit",
         "write_file" => "Write",
         "run_shell_command" => "Bash",
-        // Codex: its shell tool reports "Bash" (handled above). Its file-edit tool
-        // `apply_patch` (tool_name "apply_patch") is INTENTIONALLY not mapped yet:
-        // Codex does not currently emit PostToolUse for apply_patch (OpenAI codex
-        // issue #16732 — hooks fire only for the shell tool), and the payload
-        // carries `tool_input.command` (the raw patch), not a `file_path`, so a
-        // bare mapping would capture only "Edited unknown". Add an `apply_patch`
-        // arm plus patch path-extraction in `summarize_post_tool_use` once Codex
-        // fires the event and exposes the edited path. See rb-* follow-up note.
+        // OpenCode's file-edit tool `apply_patch` (also Codex's, though Codex
+        // does not yet fire PostToolUse for it — openai/codex#16732). The payload
+        // carries a V4A `patchText`, not `file_path`; `edited_path` parses the
+        // `*** <op> File: <path>` directive so the touched path is captured
+        // instead of "Edited unknown". Codex is simply unreached until upstream
+        // fires the event; no separate arm is needed.
+        "apply_patch" => "Edit",
         _ => "",
     }
 }
@@ -152,20 +154,59 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
     input.get(key).and_then(|v| v.as_str()).unwrap_or("unknown")
 }
 
+/// Resolve the file path a file-mutation tool touched. `Edit`/`Write` carry it
+/// directly as `file_path`; an `apply_patch` tool instead carries a V4A patch
+/// whose `*** Add|Update|Delete File: <path>` directive names the target. OpenCode puts that
+/// patch under `patchText`; Codex's field is unverified (speculated `command`)
+/// and latent until openai/codex#16732 ships PostToolUse for `apply_patch`. Both
+/// share the V4A format, so one parser covers either field. Falls back to
+/// `"unknown"` (matching `str_field`) so an unidentified file touch is still
+/// recorded rather than silently dropped.
+fn edited_path(tool_input: &serde_json::Value) -> String {
+    if let Some(p) = tool_input.get("file_path").and_then(|v| v.as_str()) {
+        return p.to_string();
+    }
+    for field in ["patchText", "command"] {
+        if let Some(patch) = tool_input.get(field).and_then(|v| v.as_str()) {
+            if let Some(p) = v4a_patch_path(patch) {
+                return p;
+            }
+        }
+    }
+    str_field(tool_input, "file_path").to_string()
+}
+
+/// Parse the target path out of a V4A `apply_patch` patchText — the first
+/// `*** Add|Update|Delete File: <path>` directive. Returns `None` when no such
+/// directive is present (caller then falls back to `"unknown"`).
+fn v4a_patch_path(patch_text: &str) -> Option<String> {
+    for line in patch_text.lines() {
+        let line = line.trim_start();
+        for op in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
+            if let Some(rest) = line.strip_prefix(op) {
+                let path = rest.trim();
+                if !path.is_empty() {
+                    return Some(path.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Map a mutation tool to the scratch observation it records: file mutations
 /// record the touched path, `Bash` records the command. Normalizes first so
 /// lowercase (OpenCode) and snake-case (Gemini) names produce the same
-/// observation as Claude's capitalized names. Returns `None` for a tool we do
-/// not capture (the caller continues without recording).
+/// observation as Claude's capitalized names. OpenCode `apply_patch` carries a
+/// V4A `patchText`; [`edited_path`] parses its `*** <op> File: <path>`
+/// directive. Returns `None` for a tool we do not capture (the caller continues
+/// without recording).
 fn tool_observation(
     tool_name: &str,
     tool_input: &serde_json::Value,
 ) -> Option<(scratch::Kind, String)> {
     match normalize_tool(tool_name) {
-        "Edit" | "Write" => Some((
-            scratch::Kind::File,
-            str_field(tool_input, "file_path").to_string(),
-        )),
+        "Edit" | "Write" => Some((scratch::Kind::File, edited_path(tool_input))),
         "NotebookEdit" => Some((
             scratch::Kind::File,
             str_field(tool_input, "notebook_path").to_string(),
@@ -978,6 +1019,7 @@ mod tests {
             "edit",
             "bash",
             "patch",
+            "apply_patch",
             "write_file",
             "replace",
             "run_shell_command",
@@ -1000,14 +1042,49 @@ mod tests {
     }
 
     #[test]
-    fn codex_apply_patch_stays_blocked_without_a_real_fixture() {
+    fn apply_patch_captures_edited_path_from_v4a_patchtext() {
+        // Gap B: OpenCode fires PostToolUse for `apply_patch` with a V4A
+        // `patchText` (no `file_path`); the edited path is the
+        // `*** <op> File: <path>` directive. File edits must be captured.
+        let add = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** Add File: notes.txt\n+recorded\n*** End Patch"
+        });
+        assert_eq!(
+            tool_observation("apply_patch", &add),
+            Some((scratch::Kind::File, "notes.txt".to_string()))
+        );
+        let upd = serde_json::json!({
+            "patchText": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
+        });
+        assert_eq!(
+            tool_observation("apply_patch", &upd),
+            Some((scratch::Kind::File, "src/lib.rs".to_string()))
+        );
+        // A path-less / non-V4A patch still records a file touch ("unknown"),
+        // never a silent drop. Codex stays unrepresented at the EVENT level
+        // (openai/codex#16732 — it does not fire PostToolUse for apply_patch),
+        // not at the normalization level this unit covers.
+        let bare = serde_json::json!({"patchText": "not a v4a patch"});
+        assert_eq!(
+            tool_observation("apply_patch", &bare),
+            Some((scratch::Kind::File, "unknown".to_string()))
+        );
+    }
+
+    #[test]
+    #[ignore = "pending a real Codex apply_patch fixture; command field name is unverified (openai/codex#16732)"]
+    fn codex_apply_patch_command_field_captures_path_pending_real_fixture() {
+        // STUB: Codex's apply_patch is speculated to carry the V4A patch under
+        // `tool_input.command` (not OpenCode's `patchText`). `edited_path` checks
+        // both fields, so this passes today — but the field name is UNVERIFIED, so
+        // the test stays #[ignore] until a real Codex fixture confirms the shape.
+        // Un-ignore (and adjust the field name) once openai/codex#16732 ships.
         let input = serde_json::json!({
-            "command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch\n"
+            "command": "*** Begin Patch\n*** Update File: codex/src/lib.rs\n@@\n-old\n+new\n*** End Patch"
         });
         assert_eq!(
             tool_observation("apply_patch", &input),
-            None,
-            "apply_patch must not capture until a real Codex PostToolUse fixture proves the payload"
+            Some((scratch::Kind::File, "codex/src/lib.rs".to_string()))
         );
     }
 

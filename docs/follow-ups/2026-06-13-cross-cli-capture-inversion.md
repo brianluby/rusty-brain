@@ -2,14 +2,15 @@
 
 - **Date:** 2026-06-13
 - **Area:** `rb-agents` adapters (Gemini / Codex / OpenCode) + `rb-hooks` capture
-- **Status:** Resolution in progress — see
-  [cross-CLI terminus mapping plan](../plans/2026-06-26-cross-cli-terminus-mapping.md).
-  The recovery mechanism (`SessionCheckpoint` + `FoldMode::Checkpoint`) already
-  existed but was dormant; OpenCode's terminus mapping (Gap A) is now **landed**
-  (`session.idle` → `SessionCheckpoint`, fixture-backed lifecycle test). Full
-  OpenCode capture restoration still needs the separate `apply_patch`
-  tool-coverage fix (Gap B). Codex remains fixture-gated; Gemini is descoped
-  (2026-06-27).
+- **Status:** OpenCode capture **restored** — both gaps landed. The recovery
+  mechanism (`SessionCheckpoint` + `FoldMode::Checkpoint`) already existed but
+  was dormant; OpenCode's terminus mapping (Gap A) landed first (`session.idle`
+  → `SessionCheckpoint`, fixture-backed lifecycle test), and the `apply_patch`
+  tool-coverage fix (Gap B) followed: `normalize_tool` maps `apply_patch` →
+  `Edit` and `edited_path` parses the V4A `patchText` `*** <op> File: <path>`
+  directive. The `opencode` capability row graduated capture `Partial` →
+  `Supported`. Codex remains fixture-gated; Gemini is descoped (2026-06-27).
+  Scorecard enablement for OpenCode is still a separate, larger task.
 - **Severity:** Medium — a capture **regression** for non-Claude CLIs until resolved
 
 ## Summary
