@@ -5,7 +5,7 @@
 - **CLI:** 1.17.5
 - **Captured:** 2026-06-23, Darwin 25.5.0
 - **Captured by:** scripts/record-agent-fixtures.sh
-- **Events:** session_created, session_idle, tool_execute_after
+- **Events:** session_created, session_idle, tool_execute_after (bash), tool_execute_after_apply_patch (file edit)
 
 ## Recording Recipe
 
@@ -46,7 +46,8 @@ Multi-turn verdict: **ambiguous** (see the run shape in the recipe; evidence, no
 |---|---|
 | `session_created.json` | `session_created` |
 | `session_idle.json` | `session_idle` |
-| `tool_execute_after.json` | `tool_execute_after` |
+| `tool_execute_after.json` | `tool_execute_after` (bash) |
+| `tool_execute_after_apply_patch.json` | `tool_execute_after` (apply_patch file edit — derived from `result.jsonl:10`; proves Gap B capture) |
 
 ## Fields present / absent
 

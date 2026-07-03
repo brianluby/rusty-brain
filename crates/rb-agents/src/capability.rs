@@ -81,7 +81,7 @@ const CAPABILITIES: &[AgentCapability] = &[
     AgentCapability {
         agent: "opencode",
         adapter_status: AdapterStatus::Experimental,
-        capture: SupportLevel::Partial,
+        capture: SupportLevel::Supported,
         retrieval: SupportLevel::Unsupported,
         config: SupportLevel::Unsupported,
         scorecard: SupportLevel::Unsupported,
@@ -89,7 +89,7 @@ const CAPABILITIES: &[AgentCapability] = &[
         limitations: &[
             "Hook adapter exists, but rb-install plugin support is deferred.",
             "session.idle maps to canonical SessionCheckpoint (fixture-backed lifecycle test; multi-fire checkpoint-safe, one-run observation fired=2, verdict ambiguous); session.deleted remains Other.",
-            "Capture stays Partial: bash-command capture folds, but file edits via apply_patch are not yet captured (Gap B / apply_patch normalization pending).",
+            "bash and apply_patch file-edit capture both fold via the session.idle checkpoint (fixture-backed lifecycle tests); retrieval/config/scorecard remain unsupported.",
         ],
     },
     AgentCapability {
@@ -163,11 +163,22 @@ mod tests {
 
     #[test]
     fn non_claude_capture_is_not_claimed_as_full_parity() {
-        for agent in ["codex", "opencode", "gemini"] {
+        // codex/gemini remain fixture/descoped-gated at Partial. opencode graduated
+        // to Supported once both capture gaps closed (see test below).
+        for agent in ["codex", "gemini"] {
             let capability = capability_for_agent(agent).expect("agent row");
             assert_eq!(capability.capture, SupportLevel::Partial);
             assert_ne!(capability.capture, SupportLevel::Supported);
         }
+    }
+
+    #[test]
+    fn opencode_capture_is_supported_after_apply_patch_gap_b() {
+        // OpenCode capture graduated Partial -> Supported once session.idle folded
+        // (Gap A) AND apply_patch file-edit capture landed (Gap B). Both are
+        // fixture-backed by lifecycle tests under fixtures/opencode/.
+        let capability = capability_for_agent("opencode").expect("opencode row");
+        assert_eq!(capability.capture, SupportLevel::Supported);
     }
 
     #[test]

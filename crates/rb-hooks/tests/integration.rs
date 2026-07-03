@@ -28,6 +28,8 @@ const REAL_SESSION_END: &str = include_str!("fixtures/claude_code/session_end.js
 // `echo hi`): it pins bash-command capture only, NOT file-edit capture (Gap B /
 // `apply_patch`, tracked separately).
 const OPENCODE_TOOL_EXECUTE_AFTER: &str = include_str!("fixtures/opencode/tool_execute_after.json");
+const OPENCODE_TOOL_EXECUTE_AFTER_APPLY_PATCH: &str =
+    include_str!("fixtures/opencode/tool_execute_after_apply_patch.json");
 const OPENCODE_SESSION_IDLE: &str = include_str!("fixtures/opencode/session_idle.json");
 
 fn hooks_command() -> std::process::Command {
@@ -501,6 +503,39 @@ fn opencode_session_idle_folds_tool_scratch_into_one_checkpoint_summary() {
     assert!(
         content.contains("Commands run"),
         "the summary must carry a commands section: {content}"
+    );
+}
+
+#[test]
+fn opencode_apply_patch_file_edit_folds_into_checkpoint_summary() {
+    // Gap B end-to-end: OpenCode's file edits go through the `apply_patch` tool,
+    // whose payload carries a V4A `patchText` (no `file_path`). The edited path
+    // must be captured into the scratch and folded by the following session.idle
+    // checkpoint — otherwise every OpenCode file edit silently drops on the
+    // floor. Replays the REAL recorded apply_patch payload (result.jsonl:10,
+    // re-shaped to the per-event hook format); it shares the recorded session id
+    // with session_idle.json so the scratch aligns.
+    let (observed, _stdout) = observe_sequence_against_mock_daemon(
+        &[
+            OPENCODE_TOOL_EXECUTE_AFTER_APPLY_PATCH,
+            OPENCODE_SESSION_IDLE,
+        ],
+        Some("rb-it-opencode-apply-patch"),
+        "opencode",
+    );
+    assert!(
+        observed.saw_remember,
+        "OpenCode session.idle must fold the apply_patch file edit into a checkpoint summary"
+    );
+    assert_eq!(observed.identity_agent.as_deref(), Some("opencode"));
+    let content = observed.content.as_deref().unwrap_or_default();
+    assert!(
+        content.contains("notes.txt"),
+        "the checkpoint summary must fold the apply_patch-ed file: {content}"
+    );
+    assert!(
+        content.contains("Files touched"),
+        "the summary must carry a files section: {content}"
     );
 }
 

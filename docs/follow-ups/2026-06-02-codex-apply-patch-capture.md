@@ -7,6 +7,16 @@
 
 ## Summary
 
+> **Update 2026-07-02:** the `"apply_patch" => "Edit"` arm and V4A `patchText`
+> path extraction (`edited_path`) now **exist** in `normalize_tool`, landed for
+> OpenCode (which fires the event today). Codex is still **upstream-blocked from
+> firing** the event at all (openai/codex#16732), so the arm is simply unreached
+> for Codex. The remaining Codex-specific risk below is the unverified
+> **payload shape** — if Codex exposes the patch as `tool_input.command` rather
+> than OpenCode's `patchText`, `edited_path`'s `patchText` lookup misses and the
+> capture falls back to `"unknown"`; verify against a real Codex fixture before
+> declaring Codex capture restored.
+
 Codex's file-edit tool `apply_patch` is **not** recognized by
 `rb_hooks::capture::normalize_tool`, so a Codex `apply_patch` PostToolUse event
 would degrade to a no-op capture. This is intentionally deferred — see the inline

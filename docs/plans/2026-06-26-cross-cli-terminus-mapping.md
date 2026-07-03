@@ -5,13 +5,15 @@
   (Codex / OpenCode; Gemini descoped 2026-06-27) by mapping each CLI's terminal
   native event onto a canonical event that actually folds the session scratch
   into a memory.
-- **Status:** Design + scaffolding. OpenCode's terminus mapping is decidable now
-  (multi-fire checkpoint-safe), but restoring OpenCode capture also requires a
-  separate `apply_patch` tool-coverage fix (Gap B), and scorecard enablement is a
-  larger task than a flag flip — do NOT implement OpenCode end-to-end from the
-  terminus decision alone. Codex's decision is fixture-gated (decision tree
-  below). **Gemini is descoped** (2026-06-27) — removed from active scope; it
-  stays on canonical `Stop`. This is "Worker C" per the sequencing PRD.
+- **Status:** OpenCode capture **restored** (2026-07-02): Gap A (`session.idle` →
+  `SessionCheckpoint`) and Gap B (`apply_patch` → `Edit` + V4A `patchText` path
+  extraction in `edited_path`) both landed, with fixture-backed lifecycle tests;
+  the `opencode` capability row graduated capture `Partial` → `Supported`.
+  Scorecard enablement is still a separate, larger task than a flag flip — do NOT
+  flip it from the capture work alone. Codex's decision is fixture-gated
+  (decision tree below). **Gemini is descoped** (2026-06-27) — removed from
+  active scope; it stays on canonical `Stop`. This is "Worker C" per the
+  sequencing PRD.
 - **Related:**
   [cross-cli-capture-inversion follow-up](../follow-ups/2026-06-13-cross-cli-capture-inversion.md),
   [cross-agent fixture-recording spec](../specs/2026-06-23-cross-agent-fixture-recording.md),
@@ -121,7 +123,11 @@ terminus"):** map `session.idle` → canonical **`SessionCheckpoint`** (today `S
 become a memory instead of ageing out. OpenCode exposes no cleaner terminus
 (`session.deleted` is not emitted on a normal headless run).
 
-**Gap B — tool coverage (BLOCKS "capture restored").** The terminus mapping only
+**Gap B — tool coverage (BLOCKS "capture restored").** [LANDED 2026-07-02]
+`normalize_tool` now maps `apply_patch` → `Edit`, and `edited_path` parses the
+V4A `patchText` `*** <op> File: <path>` directive; a fixture-backed lifecycle
+test (`opencode_apply_patch_file_edit_folds_into_checkpoint_summary`) replays the
+real `result.jsonl:10` payload. Original rationale retained below for reference. The terminus mapping only
 folds what the scratch already contains, and OpenCode's file edits are NOT being
 captured into the scratch. The recorded run created `notes.txt` via the
 **`apply_patch`** tool (`crates/rb-hooks/tests/fixtures/opencode/result.jsonl:10`,
