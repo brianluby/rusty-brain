@@ -7,22 +7,28 @@
 
 ## Summary
 
-> **Update 2026-07-02:** the `"apply_patch" => "Edit"` arm and V4A `patchText`
-> path extraction (`edited_path`) now **exist** in `normalize_tool`, landed for
-> OpenCode (which fires the event today). Codex is still **upstream-blocked from
-> firing** the event at all (openai/codex#16732), so the arm is simply unreached
-> for Codex. The remaining Codex-specific risk below is the unverified
-> **payload shape** — if Codex exposes the patch as `tool_input.command` rather
-> than OpenCode's `patchText`, `edited_path`'s `patchText` lookup misses and the
-> capture falls back to `"unknown"`; verify against a real Codex fixture before
-> declaring Codex capture restored.
+> **Update 2026-07-02:** the `"apply_patch" => "Edit"` arm and V4A path extraction
+> (`edited_path`, which checks both `patchText` and `command`) now **exist** in
+> `normalize_tool`, landed for OpenCode (which fires the event today). Codex is
+> still **upstream-blocked from firing** the event at all (openai/codex#16732), so
+> the arm is simply unreached for Codex. The remaining Codex-specific risk is the
+> unverified **payload shape**: if Codex carries the patch under a field other
+> than `patchText`/`command`, or in a non-V4A format, `edited_path` falls back to
+> `"unknown"` (still captured as an unidentified file touch, never dropped).
+> Verify against a real Codex fixture before declaring Codex capture restored.
 
-Codex's file-edit tool `apply_patch` is **not** recognized by
-`rb_hooks::capture::normalize_tool`, so a Codex `apply_patch` PostToolUse event
-would degrade to a no-op capture. This is intentionally deferred — see the inline
-note in `crates/rb-hooks/src/capture.rs` (the `normalize_tool` match).
+Codex's file-edit tool `apply_patch` shares its name with OpenCode's, and
+`rb_hooks::capture::normalize_tool` now maps `"apply_patch" => "Edit"` (landed for
+OpenCode, which fires the event today). Codex itself does not yet emit
+PreToolUse/PostToolUse for `apply_patch` — hooks fire only for the shell (Bash)
+tool — so for Codex the arm is present but unreached, and this remains deferred
+behind openai/codex#16732.
 
 ## Verified facts (2026-06-02)
+
+_Snapshot of the pre-arm state; the `apply_patch => Edit` arm + `edited_path`
+landed 2026-07-02 (see the update above). The blocker below — Codex not firing
+the event — is unchanged._
 
 - Codex's **shell** tool reports `tool_name: "Bash"` — Claude-style. Codex shell
   capture therefore **already works** today via the existing `"bash" => "Bash"`

@@ -156,7 +156,7 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
 
 /// Resolve the file path a file-mutation tool touched. `Edit`/`Write` carry it
 /// directly as `file_path`; an `apply_patch` tool instead carries a V4A patch
-/// whose `*** <op> File: <path>` directive names the target. OpenCode puts that
+/// whose `*** Add|Update|Delete File: <path>` directive names the target. OpenCode puts that
 /// patch under `patchText`; Codex's field is unverified (speculated `command`)
 /// and latent until openai/codex#16732 ships PostToolUse for `apply_patch`. Both
 /// share the V4A format, so one parser covers either field. Falls back to
