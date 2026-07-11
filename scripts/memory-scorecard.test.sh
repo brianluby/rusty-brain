@@ -67,6 +67,7 @@ _source_pure_functions() {
   }
 
   # scorecard_skip_phase — earliest blocked pipeline stage per agent
+  # (capture|config|scoring; retrieval gaps never block the harness)
   scorecard_skip_phase() {
     case "$1" in
       codex)           printf 'capture' ;;

@@ -81,8 +81,10 @@ scorecard_skip_detail() { # agent
   esac
 }
 
-# The earliest blocked pipeline stage (capture|retrieval|config|scoring) for an
-# unsupported agent, so machine-readable skips triage to the real gate:
+# The earliest blocked pipeline stage (capture|config|scoring) for an
+# unsupported agent, so machine-readable skips triage to the real gate.
+# `retrieval` gaps never appear here: a missing injection channel does not stop
+# the harness from running; capture/config gaps do.
 #   codex    -> capture (terminus/apply_patch fixture-gated; see capability.rs)
 #   opencode -> config  (rb-install JS/TS plugin path deferred; adapter works)
 #   hermes   -> config  (discovery-gated; no verified config path to install)

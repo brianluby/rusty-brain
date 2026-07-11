@@ -266,8 +266,8 @@ notifications).
 CLI's hook configuration so that file edits, session starts/stops, and similar events
 are captured into memory automatically. The hooks are **fail-open**: any error
 degrades silently and never blocks the agent. The agent surface is
-**cross-agentic**: OpenCode and Codex are first-class targets alongside Claude
-Code, with Hermes discovery-gated. Per-agent setup, validation commands, and
+**cross-agentic**: OpenCode and Codex are first-priority targets alongside
+Claude Code, with Hermes discovery-gated. Per-agent setup, validation commands, and
 troubleshooting live in [docs/AGENTS.md](docs/AGENTS.md).
 
 Current agent capability matrix:

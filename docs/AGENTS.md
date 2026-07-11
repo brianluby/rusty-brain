@@ -1,8 +1,8 @@
 # Agent Support
 
 rusty-brain is a cross-agentic memory system: the current sprint targets
-OpenCode and Codex as first-class agents alongside Claude Code, with Hermes as
-a discovery-gated candidate (see
+OpenCode and Codex as first-priority agents alongside Claude Code, with Hermes
+as a discovery-gated candidate (see
 `docs/prds/2026-06-23-cross-agentic-agent-parity.md`).
 
 The source of truth for per-agent support is the capability matrix in
