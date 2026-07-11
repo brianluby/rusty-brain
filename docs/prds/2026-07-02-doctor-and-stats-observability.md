@@ -76,7 +76,8 @@ actionable guidance:
 - embedding-model identity matches DB meta (the W0.2 fail-closed contract).
 - WAL checkpoint health; oversized-WAL warning with remediation hint.
 - hooks installed + wiring drift (delegates to installer `status` where
-  available).
+  available). DEFERRED: `rusty-brain-install` exposes no `status` surface
+  yet; doctor gains this check when it does.
 
 ### DOC-4. Protocol addition (additive, no CONTRACT_VERSION bump)
 
@@ -118,12 +119,14 @@ seeded feedback distribution.
 
 ## Implementation Checklist
 
-- [ ] Extend `status` payload + output.
-- [ ] Add `Stats` request/response (additive, no bump).
-- [ ] Implement read-only aggregations in the store/read pool.
-- [ ] Add `doctor` with exit codes + guidance.
-- [ ] Assert zero-writer-ops on the stats path.
-- [ ] Add JSON + human output and tests.
+- [x] Extend `status` payload + output.
+- [x] Add `Stats` request/response (additive, no bump).
+- [x] Implement read-only aggregations in the store/read pool
+      (`rb-store/src/store/stats.rs`, inherent-impl module — the store split
+      landed in PR #54, so there is no monolithic `store.rs` anymore).
+- [x] Add `doctor` with exit codes + guidance.
+- [x] Assert zero-writer-ops on the stats path.
+- [x] Add JSON + human output and tests.
 
 ## Roadmap Fit
 

@@ -322,6 +322,13 @@ mod tests {
                     redacted: 0,
                     reembed_pending: 0,
                 },
+                // No MCP tool maps to the stats observability op; the arm
+                // exists only to keep this fake total over `Request`.
+                Request::Stats { .. } => Response::Stats {
+                    stats: rb_types::MemoryStats::default(),
+                    provider_model: String::new(),
+                    writer_alive: true,
+                },
             })
         }
     }

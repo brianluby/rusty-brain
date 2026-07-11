@@ -542,3 +542,171 @@ fn export_then_restore_round_trips_and_redacts() {
         "backup file must not contain the secret"
     );
 }
+
+#[test]
+fn stats_and_status_report_value_signals_through_the_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    // Seed two memories and one helpful-feedback event.
+    let remembered = cli(&exe, &socket, &db, dir.path(), "stats-e2e")
+        .args(["--json", "remember", "alpha decision"])
+        .output()
+        .expect("run remember");
+    assert!(remembered.status.success());
+    let id = serde_json::from_slice::<serde_json::Value>(&remembered.stdout).unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    assert!(cli(&exe, &socket, &db, dir.path(), "stats-e2e")
+        .args(["remember", "beta pattern"])
+        .output()
+        .expect("run remember")
+        .status
+        .success());
+    assert!(cli(&exe, &socket, &db, dir.path(), "stats-e2e")
+        .args(["feedback", &id, "--kind", "helpful"])
+        .output()
+        .expect("run feedback")
+        .status
+        .success());
+
+    // `stats --json`: the seeded distribution comes back, counts + ids only.
+    let stats = cli(&exe, &socket, &db, dir.path(), "stats-e2e")
+        .args(["--json", "stats", "--window-days", "7"])
+        .output()
+        .expect("run stats");
+    assert!(
+        stats.status.success(),
+        "stats failed: stderr={:?}",
+        String::from_utf8_lossy(&stats.stderr)
+    );
+    let parsed: serde_json::Value = serde_json::from_slice(&stats.stdout).unwrap();
+    assert_eq!(parsed["stats"]["live"].as_u64(), Some(2));
+    assert_eq!(parsed["stats"]["window_days"].as_u64(), Some(7));
+    assert_eq!(parsed["stats"]["feedback"]["helpful"].as_u64(), Some(1));
+    assert_eq!(parsed["stats"]["feedback"]["net"].as_i64(), Some(1));
+    assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
+    assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
+    let text = String::from_utf8_lossy(&stats.stdout);
+    assert!(
+        !text.contains("alpha decision"),
+        "stats must never leak memory content: {text}"
+    );
+
+    // Extended `status --json` (DOC-1): one health payload.
+    let status = cli(&exe, &socket, &db, dir.path(), "stats-e2e")
+        .args(["--json", "status"])
+        .output()
+        .expect("run status");
+    assert!(status.status.success());
+    let parsed: serde_json::Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert_eq!(parsed["ok"].as_bool(), Some(true));
+    assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
+    assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
+    assert_eq!(parsed["db"]["file_mode"].as_str(), Some("0600"));
+    assert_eq!(parsed["memories"]["live"].as_u64(), Some(2));
+    assert_eq!(parsed["namespace"].as_str(), Some("project:stats-e2e"));
+}
+
+#[test]
+fn doctor_healthy_system_exits_zero() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    let doctor = cli(&exe, &socket, &db, dir.path(), "doctor-e2e")
+        .arg("doctor")
+        .output()
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        doctor.status.success(),
+        "doctor must exit 0 on a healthy system; stdout={stdout} stderr={:?}",
+        String::from_utf8_lossy(&doctor.stderr)
+    );
+    assert!(stdout.contains("no problems"), "{stdout}");
+    // The offline fallback is active in this test env: warned, not failed.
+    assert!(stdout.to_lowercase().contains("deterministic"), "{stdout}");
+}
+
+#[test]
+fn doctor_fails_with_guidance_on_wrong_db_mode() {
+    use std::os::unix::fs::PermissionsExt as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    // A completed round trip proves the daemon is fully initialized (writer
+    // AND read pool opened — each open re-tightens the DB to 0600), so the
+    // chmod below cannot race a late open that would undo it.
+    assert!(cli(&exe, &socket, &db, dir.path(), "doctor-e2e")
+        .args(["remember", "mode probe"])
+        .output()
+        .expect("run remember")
+        .status
+        .success());
+
+    // Loosen the DB file mode behind the daemon's back.
+    std::fs::set_permissions(&db, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    let doctor = cli(&exe, &socket, &db, dir.path(), "doctor-e2e")
+        .arg("doctor")
+        .output()
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        !doctor.status.success(),
+        "doctor must exit non-zero on a world-readable DB; stdout={stdout}"
+    );
+    assert!(stdout.contains("db-file-mode"), "{stdout}");
+    assert!(stdout.contains("0644"), "observed mode shown: {stdout}");
+    assert!(
+        stdout.contains(&format!("chmod 600 {}", db.display())),
+        "actionable guidance shown: {stdout}"
+    );
+}
+
+#[test]
+fn doctor_fails_with_guidance_on_model_mismatch_against_db_meta() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+
+    // A DB whose meta records a real embedding model, with NO daemon running:
+    // serve would fail closed (W0.2), and doctor must diagnose exactly that.
+    // (This env has no VOYAGE_API_KEY, so the expected provider is the
+    // deterministic fallback — a mismatch with the recorded 'voyage-3'.)
+    drop(rb_store::SqliteStore::open_with_model(&db, 8, "voyage-3").unwrap());
+
+    let doctor = cli(&exe, &socket, &db, dir.path(), "doctor-e2e")
+        .arg("doctor")
+        .output()
+        .expect("run doctor");
+    let stdout = String::from_utf8_lossy(&doctor.stdout);
+    assert!(
+        !doctor.status.success(),
+        "doctor must exit non-zero on a model mismatch; stdout={stdout}"
+    );
+    assert!(stdout.contains("embedding-model"), "{stdout}");
+    assert!(
+        stdout.contains("voyage-3"),
+        "the recorded model is named: {stdout}"
+    );
+    assert!(
+        stdout.contains("--accept-model-change"),
+        "guidance names the opt-in: {stdout}"
+    );
+}

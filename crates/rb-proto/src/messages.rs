@@ -190,6 +190,20 @@ pub enum Request {
         id: MemoryId,
         kind: FeedbackKind,
     },
+    /// Namespace-scoped observability aggregate (doctor/stats PRD): recall
+    /// volume, feedback ratios, top/never-recalled, contested count, corpus
+    /// growth, re-embed backlog. Scoped to the connection's handshake
+    /// namespace like `Context` (NOT an admin op); computed entirely on the
+    /// daemon's read pool — the stats path issues ZERO writer ops (W1.8).
+    /// `window_days` bounds the windowed fields; `None` uses the daemon
+    /// default. Additive variant per the `Feedback` precedent: an old daemon
+    /// fails to decode it and closes the connection (no CONTRACT_VERSION
+    /// bump), and the `#[serde(default)]`/`skip_serializing_if` pair keeps a
+    /// window-less frame byte-identical to a bare unit variant.
+    Stats {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        window_days: Option<u32>,
+    },
 }
 
 /// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
@@ -286,6 +300,19 @@ pub enum Response {
     /// send the request.
     FeedbackRecorded {
         confidence: f32,
+    },
+    /// Reply to `Request::Stats`: the namespace-scoped aggregate plus two
+    /// daemon-side health facts the store cannot know — the running embedding
+    /// provider's model identity and writer-thread liveness (both
+    /// `#[serde(default)]` so the payload stays additive). Counts and ids
+    /// only, never memory content. Additive variant; old clients never see it
+    /// because they never send the request.
+    Stats {
+        stats: rb_types::MemoryStats,
+        #[serde(default)]
+        provider_model: String,
+        #[serde(default)]
+        writer_alive: bool,
     },
     Error {
         kind: String,
@@ -590,6 +617,10 @@ mod tests {
                 id: MemoryId::new(),
                 kind: rb_types::FeedbackKind::Wrong,
             },
+            Request::Stats { window_days: None },
+            Request::Stats {
+                window_days: Some(14),
+            },
         ]
     }
 
@@ -685,6 +716,24 @@ mod tests {
                 scanned: 200,
                 redacted: 3,
                 reembed_pending: 2,
+            },
+            Response::Stats {
+                stats: rb_types::MemoryStats {
+                    namespace: "global".to_string(),
+                    window_days: 30,
+                    live: 2,
+                    top_recalled: vec![rb_types::TopRecalled {
+                        id: MemoryId::new(),
+                        access_count: 4,
+                    }],
+                    created_per_day: vec![rb_types::GrowthBucket {
+                        day: "2026-07-10".to_string(),
+                        count: 1,
+                    }],
+                    ..Default::default()
+                },
+                provider_model: "deterministic".to_string(),
+                writer_alive: true,
             },
         ]
     }
@@ -824,6 +873,85 @@ mod tests {
         assert_eq!(json, r#"{"result":"Lagged","dropped":7}"#);
         let back: Response = serde_json::from_str(&json).unwrap();
         assert_eq!(serde_json::to_string(&back).unwrap(), json);
+    }
+
+    #[test]
+    fn stats_request_uses_op_tag_and_window_days_is_additive() {
+        // A window-less Stats request stays byte-identical to a bare
+        // unit-variant frame (the `Subscribe.since` precedent), and the bare
+        // frame decodes to `None` — no CONTRACT_VERSION bump.
+        let json = serde_json::to_string(&Request::Stats { window_days: None }).unwrap();
+        assert_eq!(json, r#"{"op":"Stats"}"#);
+        let back: Request = serde_json::from_str(r#"{"op":"Stats"}"#).unwrap();
+        assert!(matches!(back, Request::Stats { window_days: None }));
+
+        let json = serde_json::to_string(&Request::Stats {
+            window_days: Some(7),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"op":"Stats","window_days":7}"#);
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            back,
+            Request::Stats {
+                window_days: Some(7)
+            }
+        ));
+    }
+
+    #[test]
+    fn stats_response_round_trips_with_result_tag() {
+        let resp = Response::Stats {
+            stats: rb_types::MemoryStats {
+                namespace: "project:rusty-brain".to_string(),
+                window_days: 30,
+                live: 10,
+                feedback: rb_types::FeedbackTotals {
+                    helpful: 3,
+                    wrong: 1,
+                    stale: 0,
+                },
+                ..Default::default()
+            },
+            provider_model: "deterministic".to_string(),
+            writer_alive: true,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "Stats");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::Stats {
+                stats,
+                provider_model,
+                writer_alive,
+            } => {
+                assert_eq!(stats.live, 10);
+                assert_eq!(stats.feedback.helpful, 3);
+                assert_eq!(provider_model, "deterministic");
+                assert!(writer_alive);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stats_response_daemon_fields_are_additive() {
+        // A frame carrying only the stats payload (a peer predating the
+        // daemon-side fields) must decode with zero-valued defaults.
+        let back: Response = serde_json::from_str(r#"{"result":"Stats","stats":{}}"#).unwrap();
+        match back {
+            Response::Stats {
+                stats,
+                provider_model,
+                writer_alive,
+            } => {
+                assert_eq!(stats, rb_types::MemoryStats::default());
+                assert_eq!(provider_model, "");
+                assert!(!writer_alive);
+            }
+            other => panic!("expected Stats, got {other:?}"),
+        }
     }
 
     #[test]

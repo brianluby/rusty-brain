@@ -366,6 +366,164 @@ pub fn render_context(
     out
 }
 
+/// Threshold below which the feedback ratio gets a low-N caveat instead of
+/// being presented as a confident signal (doctor/stats PRD risk mitigation).
+const FEEDBACK_LOW_N: u64 = 10;
+
+/// Render the `stats` payload: value/health aggregates for one namespace.
+/// Counts and ids only — never memory content. JSON: `{stats, provider_model,
+/// writer_alive}` with a derived `feedback.net`.
+pub fn render_stats(
+    stats: &rb_types::MemoryStats,
+    provider_model: &str,
+    writer_alive: bool,
+    json: bool,
+) -> String {
+    if json {
+        let mut value = serde_json::json!({
+            "stats": stats,
+            "provider_model": provider_model,
+            "writer_alive": writer_alive,
+        });
+        // Derived net trend rides along so scripts need no client-side math.
+        if let Some(fb) = value
+            .pointer_mut("/stats/feedback")
+            .and_then(|v| v.as_object_mut())
+        {
+            fb.insert("net".to_string(), serde_json::json!(stats.feedback.net()));
+        }
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render stats JSON");
+            "{}".to_string()
+        });
+    }
+
+    let mut out = format!(
+        "Memory stats for {} (last {} days)\n\n",
+        stats.namespace, stats.window_days
+    );
+    out.push_str(&format!(
+        "corpus: {} live, {} archived, {} vectors\n",
+        stats.live, stats.archived, stats.vectors
+    ));
+    out.push_str(&format!(
+        "recall: {} total accesses; {} recalled in window; {} never recalled\n",
+        stats.total_accesses, stats.accessed_in_window, stats.never_recalled_live
+    ));
+    let fb = &stats.feedback;
+    if fb.total() == 0 {
+        out.push_str(
+            "feedback: no feedback recorded yet (use `rusty-brain feedback <id> --kind ...`)\n",
+        );
+    } else {
+        out.push_str(&format!(
+            "feedback: {} helpful, {} wrong, {} stale (net {:+})\n",
+            fb.helpful,
+            fb.wrong,
+            fb.stale,
+            fb.net()
+        ));
+        if fb.total() < FEEDBACK_LOW_N {
+            out.push_str(&format!(
+                "  note: only {} feedback event(s) — low-confidence signal\n",
+                fb.total()
+            ));
+        }
+    }
+    out.push_str(&format!("contested: {}\n", stats.contested));
+    out.push_str(&format!("re-embed backlog: {}\n", stats.reembed_pending));
+    if !stats.top_recalled.is_empty() {
+        out.push_str("top recalled:\n");
+        for t in &stats.top_recalled {
+            out.push_str(&format!("  {}x {}\n", t.access_count, t.id));
+        }
+    }
+    if !stats.created_per_day.is_empty() {
+        out.push_str("growth (created per day):\n");
+        for b in &stats.created_per_day {
+            out.push_str(&format!("  {}: {}\n", b.day, b.count));
+        }
+    }
+    out.trim_end().to_string()
+}
+
+/// Everything the extended `status` line-up needs (DOC-1), gathered by the
+/// caller: the ping reply, the stats payload, and a client-side stat of the
+/// DB file mode (`None` when the file could not be inspected).
+pub struct StatusView<'a> {
+    pub contract_version: u32,
+    pub recall_channels: Option<rb_proto::RecallChannelTotals>,
+    pub stats: &'a rb_types::MemoryStats,
+    pub provider_model: &'a str,
+    pub writer_alive: bool,
+    pub db_file_mode: Option<u32>,
+}
+
+/// Render the extended `status` payload (daemon up, writer health, embedding
+/// identity, DB path/mode, WAL size, corpus counts, namespace).
+pub fn render_status(view: &StatusView<'_>, json: bool) -> String {
+    let mode_str = view.db_file_mode.map(|m| format!("{m:04o}"));
+    if json {
+        let value = serde_json::json!({
+            "ok": true,
+            "contract_version": view.contract_version,
+            "writer_alive": view.writer_alive,
+            "provider_model": view.provider_model,
+            "db": {
+                "path": view.stats.db_path,
+                "file_mode": mode_str,
+                "wal_bytes": view.stats.wal_bytes,
+                "embedding_model": view.stats.db_embedding_model,
+            },
+            "memories": {
+                "live": view.stats.live,
+                "archived": view.stats.archived,
+            },
+            "vectors": view.stats.vectors,
+            "namespace": view.stats.namespace,
+            "recall_channels": view.recall_channels.map(|c| serde_json::json!({
+                "recalls": c.recalls,
+                "fts_hits": c.fts_hits,
+                "vector_hits": c.vector_hits,
+                "graph_hits": c.graph_hits,
+            })),
+        });
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render status JSON");
+            "{}".to_string()
+        });
+    }
+
+    let mut out = format!("daemon: ok (contract v{})\n", view.contract_version);
+    out.push_str(&format!(
+        "writer: {}\n",
+        if view.writer_alive { "alive" } else { "DEAD" }
+    ));
+    out.push_str(&format!(
+        "embedding: {} (db meta: {})\n",
+        view.provider_model,
+        view.stats.db_embedding_model.as_deref().unwrap_or("none")
+    ));
+    out.push_str(&format!(
+        "db: {} (mode {})\n",
+        view.stats.db_path,
+        mode_str.as_deref().unwrap_or("unknown")
+    ));
+    out.push_str(&format!("wal: {} bytes\n", view.stats.wal_bytes));
+    out.push_str(&format!(
+        "memories: {} live, {} archived (namespace {})\n",
+        view.stats.live, view.stats.archived, view.stats.namespace
+    ));
+    out.push_str(&format!("vectors: {}\n", view.stats.vectors));
+    if let Some(c) = view.recall_channels {
+        out.push_str(&format!(
+            "recalls={} fts_hits={} vector_hits={} graph_hits={}\n",
+            c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+        ));
+    }
+    out.trim_end().to_string()
+}
+
 /// Render one streamed subscribe item (a change event or a lagged notice).
 /// JSON: a flat object. Human: a single line.
 pub fn render_change(item: &rb_proto::SubscribeItem, json: bool) -> String {
@@ -664,6 +822,145 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert!((parsed["confidence"].as_f64().unwrap() - 0.4).abs() < 1e-6);
         assert!(render_feedback(0.4, false).contains("0.40"));
+    }
+
+    fn sample_stats() -> rb_types::MemoryStats {
+        rb_types::MemoryStats {
+            namespace: "project:rusty-brain".to_string(),
+            window_days: 30,
+            db_path: "/tmp/rb.db".to_string(),
+            live: 42,
+            archived: 3,
+            vectors: 42,
+            wal_bytes: 12_288,
+            db_embedding_model: Some("deterministic".to_string()),
+            feedback: rb_types::FeedbackTotals {
+                helpful: 5,
+                wrong: 1,
+                stale: 2,
+            },
+            total_accesses: 120,
+            accessed_in_window: 7,
+            top_recalled: vec![rb_types::TopRecalled {
+                id: rb_types::MemoryId::new(),
+                access_count: 9,
+            }],
+            never_recalled_live: 12,
+            contested: 1,
+            created_per_day: vec![rb_types::GrowthBucket {
+                day: "2026-07-10".to_string(),
+                count: 2,
+            }],
+            reembed_pending: 3,
+        }
+    }
+
+    #[test]
+    fn human_stats_shows_value_signals_and_low_n_caveat() {
+        let stats = sample_stats();
+        let out = render_stats(&stats, "deterministic", true, false);
+        assert!(out.contains("project:rusty-brain"), "namespace: {out}");
+        assert!(out.contains("30"), "window: {out}");
+        assert!(out.contains("42"), "live count: {out}");
+        assert!(out.contains("5 helpful"), "feedback counts: {out}");
+        assert!(out.contains("1 wrong"), "{out}");
+        assert!(out.contains("2 stale"), "{out}");
+        assert!(out.contains("net +2"), "net trend: {out}");
+        assert!(out.contains("12"), "never recalled: {out}");
+        assert!(out.contains(&stats.top_recalled[0].id.to_string()), "{out}");
+        assert!(out.contains("2026-07-10"), "growth bucket: {out}");
+        // 8 total events < 10: raw counts get a low-N caveat, not a confident
+        // ratio (PRD risk mitigation).
+        assert!(
+            out.contains("low") || out.contains("few"),
+            "low-N caveat: {out}"
+        );
+        // Counts and ids only — never memory content.
+        assert!(!out.contains("content"), "{out}");
+    }
+
+    #[test]
+    fn human_stats_without_feedback_says_so() {
+        let mut stats = sample_stats();
+        stats.feedback = rb_types::FeedbackTotals::default();
+        let out = render_stats(&stats, "deterministic", true, false);
+        assert!(
+            out.to_lowercase().contains("no feedback"),
+            "empty-feedback state must be explicit: {out}"
+        );
+    }
+
+    #[test]
+    fn json_stats_is_parseable_and_carries_daemon_fields() {
+        let stats = sample_stats();
+        let out = render_stats(&stats, "deterministic", true, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["stats"]["live"].as_u64(), Some(42));
+        assert_eq!(parsed["stats"]["feedback"]["helpful"].as_u64(), Some(5));
+        assert_eq!(parsed["stats"]["feedback"]["net"].as_i64(), Some(2));
+        assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
+        assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn status_renders_health_payload_in_both_modes() {
+        let stats = sample_stats();
+        let view = StatusView {
+            contract_version: 2,
+            recall_channels: Some(rb_proto::RecallChannelTotals {
+                recalls: 4,
+                fts_hits: 9,
+                vector_hits: 11,
+                graph_hits: 2,
+            }),
+            stats: &stats,
+            provider_model: "deterministic",
+            writer_alive: true,
+            db_file_mode: Some(0o600),
+        };
+        let human = render_status(&view, false);
+        assert!(human.contains("ok (contract v2)"), "{human}");
+        assert!(human.contains("writer: alive"), "{human}");
+        assert!(human.contains("deterministic"), "{human}");
+        assert!(human.contains("/tmp/rb.db"), "{human}");
+        assert!(human.contains("0600"), "db file mode: {human}");
+        assert!(human.contains("42 live"), "{human}");
+        assert!(human.contains("3 archived"), "{human}");
+        assert!(human.contains("project:rusty-brain"), "{human}");
+        assert!(human.contains("recalls=4"), "{human}");
+
+        let json = render_status(&view, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["ok"].as_bool(), Some(true));
+        assert_eq!(parsed["contract_version"].as_u64(), Some(2));
+        assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
+        assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
+        assert_eq!(parsed["db"]["path"].as_str(), Some("/tmp/rb.db"));
+        assert_eq!(parsed["db"]["file_mode"].as_str(), Some("0600"));
+        assert_eq!(parsed["db"]["wal_bytes"].as_u64(), Some(12_288));
+        assert_eq!(parsed["memories"]["live"].as_u64(), Some(42));
+        assert_eq!(parsed["memories"]["archived"].as_u64(), Some(3));
+        assert_eq!(parsed["vectors"].as_u64(), Some(42));
+        assert_eq!(parsed["namespace"].as_str(), Some("project:rusty-brain"));
+        assert_eq!(parsed["recall_channels"]["recalls"].as_u64(), Some(4));
+    }
+
+    #[test]
+    fn status_marks_a_dead_writer() {
+        let stats = sample_stats();
+        let view = StatusView {
+            contract_version: 2,
+            recall_channels: None,
+            stats: &stats,
+            provider_model: "deterministic",
+            writer_alive: false,
+            db_file_mode: None,
+        };
+        let human = render_status(&view, false);
+        assert!(
+            human.contains("writer: DEAD"),
+            "a dead writer must be loud: {human}"
+        );
     }
 
     #[test]

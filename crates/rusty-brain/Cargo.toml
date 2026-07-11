@@ -28,6 +28,7 @@ rb-daemon = { path = "../rb-daemon" }
 rb-embed = { path = "../rb-embed" }
 rb-mcp = { path = "../rb-mcp" }
 rb-redact = { path = "../rb-redact" }
+rb-store = { path = "../rb-store" }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 clap = { workspace = true }

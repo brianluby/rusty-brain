@@ -50,6 +50,12 @@ const REEMBED_MAX_LIMIT: usize = 10_000;
 const HOOK_NEAR_DUP_THRESHOLD: f32 = 0.97;
 /// Max existing hook near-dups absorbed per write (bounds the extra reads).
 const HOOK_NEAR_DUP_LIMIT: usize = 8;
+/// Default window for the stats aggregate when a `Stats` request omits one.
+const STATS_DEFAULT_WINDOW_DAYS: u32 = 30;
+/// Hard cap on the stats window so a client cannot force an unbounded scan.
+const STATS_MAX_WINDOW_DAYS: u32 = 365;
+/// Bound on the top-recalled id list in a stats reply (ids + counts only).
+const STATS_TOP_RECALLED_LIMIT: usize = 5;
 /// Maximum number of simultaneous client connections.
 const MAX_CONNECTIONS: usize = 256;
 /// Oplog rows fetched per replay batch on a `subscribe --since` reconnect.
@@ -590,6 +596,7 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Delete { .. }
         | Request::Context
         | Request::Subscribe { .. }
+        | Request::Stats { .. }
         | Request::Ping => false,
     }
 }
@@ -668,6 +675,9 @@ async fn handle_connection(
 
     let store_for_stream = store.clone();
     let job_store = store.clone();
+    // Snapshot the provider identity before the embedder moves into the
+    // engine; the stats path reports it alongside the DB's recorded model.
+    let provider_model = embedder.model_id().to_string();
     let engine = {
         let base =
             MemoryEngine::new(store, embedder, namespace.clone()).with_fusion_mode(fusion_mode);
@@ -700,6 +710,7 @@ async fn handle_connection(
             &provenance,
             &recall_counters,
             &namespace,
+            &provider_model,
             peer,
             req,
         )
@@ -883,6 +894,7 @@ async fn dispatch<P>(
     provenance: &rb_engine::Provenance,
     recall_counters: &RecallChannelCounters,
     namespace: &rb_types::Namespace,
+    provider_model: &str,
     peer: PeerIdentity,
     req: Request,
 ) -> Response
@@ -1060,6 +1072,33 @@ where
             Ok(confidence) => Response::FeedbackRecorded { confidence },
             Err(e) => error_to_response(e),
         },
+        // Namespace-scoped read-only observability aggregate (doctor/stats
+        // PRD). Runs entirely on the read pool — zero writer ops (W1.8). The
+        // window is clamped server-side (never trusted raw); the re-embed
+        // backlog compares against the LIVE provider identity and the current
+        // input composition, mirroring the reembed scan.
+        Request::Stats { window_days } => {
+            let window = window_days
+                .unwrap_or(STATS_DEFAULT_WINDOW_DAYS)
+                .clamp(1, STATS_MAX_WINDOW_DAYS);
+            match job_store
+                .namespace_stats(
+                    namespace.clone(),
+                    window,
+                    provider_model.to_string(),
+                    rb_engine::EMBEDDING_INPUT_VERSION.to_string(),
+                    STATS_TOP_RECALLED_LIMIT,
+                )
+                .await
+            {
+                Ok(stats) => Response::Stats {
+                    stats,
+                    provider_model: provider_model.to_string(),
+                    writer_alive: job_store.writer_alive(),
+                },
+                Err(e) => error_to_response(e),
+            }
+        }
         // Admin op (peer-gated above): retroactive secret redaction across all
         // namespaces through the single writer (W2.4).
         Request::Scrub => match job_store.scrub().await {
@@ -1120,6 +1159,9 @@ mod tests {
                 tags: vec![],
                 limit: 1,
             },
+            // Stats is namespace-scoped by the handshake (read-only, W1.8),
+            // like Context — deliberately NOT peer-gated.
+            Request::Stats { window_days: None },
         ] {
             assert!(!is_admin_op(&not_admin), "{not_admin:?}");
         }
@@ -1306,6 +1348,114 @@ mod tests {
             .expect("daemon must exit its accept loop after writer death")
             .expect("run task must not panic")
             .expect("run must return Ok on writer-death shutdown");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stats_over_the_wire_reflects_seeded_feedback_and_issues_zero_writer_ops() {
+        // Daemon e2e for the PRD verification clause: a seeded feedback
+        // distribution comes back through `Request::Stats`, and serving it
+        // enqueues NOTHING on the writer thread (zero writer ops == zero FTS
+        // writes; every FTS write rides a writer op).
+        use rb_embed::DeterministicProvider;
+        use rb_types::FeedbackKind;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = DaemonConfig {
+            socket_path: dir.path().join("rb.sock"),
+            db_path: dir.path().join("rb.db"),
+            read_pool_size: 2,
+            jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
+        };
+        let socket = config.socket_path.clone();
+        let daemon = Daemon::bind(
+            config,
+            crate::SharedEmbedder::new(DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap();
+        let store = daemon.store.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(daemon.run(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let ns = Namespace::Project("stats-e2e".to_string());
+        let mut client = rb_proto::Client::connect(&socket, ns.clone())
+            .await
+            .unwrap();
+        let mut ids = Vec::new();
+        for body in ["alpha decision", "beta pattern", "gamma insight"] {
+            let id = client
+                .remember(
+                    body.to_string(),
+                    None,
+                    rb_types::MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+        // Seeded distribution: 2 helpful, 1 wrong, 0 stale.
+        client
+            .feedback(ids[0].clone(), FeedbackKind::Helpful)
+            .await
+            .unwrap();
+        client
+            .feedback(ids[1].clone(), FeedbackKind::Helpful)
+            .await
+            .unwrap();
+        client
+            .feedback(ids[2].clone(), FeedbackKind::Wrong)
+            .await
+            .unwrap();
+
+        let ops_before = store.writer_ops_count();
+        let (stats, provider_model, writer_alive) = client.stats(Some(14)).await.unwrap();
+        assert_eq!(
+            store.writer_ops_count(),
+            ops_before,
+            "the stats path must issue ZERO writer ops (and hence zero FTS writes)"
+        );
+
+        assert_eq!(stats.namespace, ns.as_db_string());
+        assert_eq!(stats.window_days, 14);
+        assert_eq!(stats.live, 3);
+        assert_eq!(stats.archived, 0);
+        assert_eq!(stats.vectors, 3);
+        assert_eq!(stats.feedback.helpful, 2);
+        assert_eq!(stats.feedback.wrong, 1);
+        assert_eq!(stats.feedback.stale, 0);
+        assert_eq!(stats.never_recalled_live, 3, "nothing was recalled");
+        assert_eq!(stats.reembed_pending, 0, "stamps match the live provider");
+        assert_eq!(stats.db_embedding_model.as_deref(), Some("deterministic"));
+        assert_eq!(provider_model, "deterministic");
+        assert!(writer_alive);
+
+        // The window is clamped server-side, never trusted raw.
+        let (clamped, _, _) = client.stats(Some(100_000)).await.unwrap();
+        assert_eq!(
+            clamped.window_days, 365,
+            "oversized windows clamp to a year"
+        );
+        let (defaulted, _, _) = client.stats(None).await.unwrap();
+        assert_eq!(defaulted.window_days, 30, "absent window uses the default");
+
+        drop(client);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("daemon must shut down")
+            .expect("run task must not panic")
+            .expect("run must return Ok");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

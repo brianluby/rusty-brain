@@ -16,6 +16,7 @@ mod memory_id;
 mod memory_type;
 mod namespace;
 mod query;
+mod stats;
 mod validate;
 
 pub use change::{ChangeKind, MemoryChanged};
@@ -29,4 +30,5 @@ pub use memory_id::MemoryId;
 pub use memory_type::MemoryType;
 pub use namespace::Namespace;
 pub use query::{ChannelHits, MemoryUpdates, SearchQuery, SearchResult};
+pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 pub use validate::{validate_confidence, validate_importance};

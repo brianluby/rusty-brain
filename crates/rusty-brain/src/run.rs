@@ -71,8 +71,30 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
         Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)
             .await
             .context("mcp adapter failed"),
+        // Doctor diagnoses the system AS IT IS: it must not auto-start the
+        // daemon (run_client would), so it is dispatched before it.
+        Command::Doctor => {
+            crate::doctor::run_doctor(
+                &socket_path,
+                &db_path,
+                namespace,
+                effective.embed_backend.clone(),
+                effective.local_model.clone(),
+                cli.json,
+            )
+            .await
+        }
         other => run_client(other, cli.json, namespace, &socket_path, &db_path).await,
     }
+}
+
+/// Permission bits (0o777-masked) of `path`, or `None` when it cannot be
+/// inspected (missing file, permission error).
+fn file_mode(path: &Path) -> Option<u32> {
+    use std::os::unix::fs::PermissionsExt as _;
+    std::fs::metadata(path)
+        .ok()
+        .map(|m| m.permissions().mode() & 0o777)
 }
 
 /// Connect to the daemon and dispatch a single client request, scoped to the
@@ -99,6 +121,7 @@ async fn run_client(
     match command {
         Command::Serve { .. } => anyhow::bail!("internal: serve must be handled before run_client"),
         Command::Mcp => anyhow::bail!("internal: mcp must be handled before run_client"),
+        Command::Doctor => anyhow::bail!("internal: doctor must be handled before run_client"),
         Command::Init {
             yes,
             dry_run,
@@ -482,23 +505,64 @@ async fn run_client(
         }
         Command::Status => {
             let (version, channels) = client.ping_stats().await.context("status/ping failed")?;
-            if json {
-                match channels {
-                    Some(c) => println!(
-                        "{{\"contract_version\":{version},\"ok\":true,\"recall_channels\":{{\"recalls\":{},\"fts_hits\":{},\"vector_hits\":{},\"graph_hits\":{}}}}}",
-                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
-                    ),
-                    None => println!("{{\"contract_version\":{version},\"ok\":true}}"),
+            // DOC-1: one health payload — writer health, embedding identity,
+            // DB path/mode, WAL size, corpus counts. Falls back to the legacy
+            // ping-only line against a daemon that predates the stats op (it
+            // closes the connection on the unknown frame).
+            match client.stats(None).await {
+                Ok((stats, provider_model, writer_alive)) => {
+                    let view = output::StatusView {
+                        contract_version: version,
+                        recall_channels: channels,
+                        stats: &stats,
+                        provider_model: &provider_model,
+                        writer_alive,
+                        db_file_mode: file_mode(Path::new(&stats.db_path)),
+                    };
+                    println!("{}", output::render_status(&view, json));
                 }
-            } else {
-                match channels {
-                    Some(c) => println!(
-                        "ok (contract v{version}) recalls={} fts_hits={} vector_hits={} graph_hits={}",
-                        c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
-                    ),
-                    None => println!("ok (contract v{version})"),
+                Err(e) => {
+                    // stderr so `--json` stdout stays machine-parseable.
+                    eprintln!(
+                        "note: daemon did not answer the stats request ({e}); \
+                         it may predate this binary — restart it for full status"
+                    );
+                    if json {
+                        let mut value = serde_json::json!({
+                            "contract_version": version,
+                            "ok": true,
+                        });
+                        if let (Some(c), Some(obj)) = (channels, value.as_object_mut()) {
+                            obj.insert(
+                                "recall_channels".to_string(),
+                                serde_json::json!({
+                                    "recalls": c.recalls,
+                                    "fts_hits": c.fts_hits,
+                                    "vector_hits": c.vector_hits,
+                                    "graph_hits": c.graph_hits,
+                                }),
+                            );
+                        }
+                        println!("{value}");
+                    } else {
+                        match channels {
+                            Some(c) => println!(
+                                "ok (contract v{version}) recalls={} fts_hits={} vector_hits={} graph_hits={}",
+                                c.recalls, c.fts_hits, c.vector_hits, c.graph_hits
+                            ),
+                            None => println!("ok (contract v{version})"),
+                        }
+                    }
                 }
             }
+        }
+        Command::Stats { window_days } => {
+            let (stats, provider_model, writer_alive) =
+                client.stats(window_days).await.context("stats failed")?;
+            println!(
+                "{}",
+                output::render_stats(&stats, &provider_model, writer_alive, json)
+            );
         }
         Command::Evolve { job } => {
             let kind = rb_types::JobKind::parse(&job)
