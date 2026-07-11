@@ -81,10 +81,24 @@ scorecard_skip_detail() { # agent
   esac
 }
 
+# The earliest blocked pipeline stage (capture|retrieval|config|scoring) for an
+# unsupported agent, so machine-readable skips triage to the real gate:
+#   codex    -> capture (terminus/apply_patch fixture-gated; see capability.rs)
+#   opencode -> config  (rb-install JS/TS plugin path deferred; adapter works)
+#   hermes   -> config  (discovery-gated; no verified config path to install)
+#   gemini   -> scoring (adapter/capture exist; scorecard support unimplemented)
+scorecard_skip_phase() { # agent
+  case "$1" in
+    codex)           printf 'capture' ;;
+    opencode|hermes) printf 'config' ;;
+    *)               printf 'scoring' ;;
+  esac
+}
+
 scorecard_skip_line() { # agent
   local agent="$1"
-  printf 'agent=%s\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=%s\tdetail=%s\n' \
-    "$agent" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
+  printf 'agent=%s\tdimension=all\tscenario=all\tphase=%s\tstatus=skip\treason=%s\tdetail=%s\n' \
+    "$agent" "$(scorecard_skip_phase "$agent")" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
 }
 
 # ---- pure judge (P: gate's substring judge; exercised by --self-test) --------
@@ -533,12 +547,32 @@ self_test() {
     echo "BUG: reach identity layout"; fail=1
   fi
 
+  # Skip lines are a machine contract: phase names the earliest blocked pipeline
+  # stage (capture/retrieval/config/scoring), not a blanket phase=scoring.
   local skip_line
   skip_line="$(scorecard_skip_line codex)"
-  if printf '%s' "$skip_line" | grep -qF $'agent=codex\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=scorecard_unsupported_codex_fixture_gated'; then
-    echo "ok: scorecard unsupported agent skip is machine-readable"
+  if printf '%s' "$skip_line" | grep -qF $'agent=codex\tdimension=all\tscenario=all\tphase=capture\tstatus=skip\treason=scorecard_unsupported_codex_fixture_gated'; then
+    echo "ok: scorecard codex skip is machine-readable and names the capture gate"
   else
-    echo "BUG: scorecard unsupported agent skip line"; printf '%s\n' "$skip_line"; fail=1
+    echo "BUG: scorecard codex skip line"; printf '%s\n' "$skip_line"; fail=1
+  fi
+  skip_line="$(scorecard_skip_line opencode)"
+  if printf '%s' "$skip_line" | grep -qF $'agent=opencode\tdimension=all\tscenario=all\tphase=config\tstatus=skip\treason=scorecard_unsupported_opencode_plugin_deferred'; then
+    echo "ok: scorecard opencode skip is machine-readable and names the config gate"
+  else
+    echo "BUG: scorecard opencode skip line"; printf '%s\n' "$skip_line"; fail=1
+  fi
+  skip_line="$(scorecard_skip_line hermes)"
+  if printf '%s' "$skip_line" | grep -qF $'agent=hermes\tdimension=all\tscenario=all\tphase=config\tstatus=skip\treason=scorecard_unsupported_hermes_discovery_gated'; then
+    echo "ok: scorecard hermes skip is machine-readable and names the config gate"
+  else
+    echo "BUG: scorecard hermes skip line"; printf '%s\n' "$skip_line"; fail=1
+  fi
+  skip_line="$(scorecard_skip_line gemini)"
+  if printf '%s' "$skip_line" | grep -qF $'agent=gemini\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=scorecard_unsupported_gemini_not_first_priority'; then
+    echo "ok: scorecard gemini skip is machine-readable (scorecard itself unimplemented)"
+  else
+    echo "BUG: scorecard gemini skip line"; printf '%s\n' "$skip_line"; fail=1
   fi
   if scorecard_agent_supported claude-code && ! scorecard_agent_supported codex; then
     echo "ok: only claude-code is currently scorecard-supported"
