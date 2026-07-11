@@ -129,14 +129,21 @@ impl SqliteStore {
         // (rebuilding under a wrong dim would commit a malformed table).
         seed_or_verify_dim(&conn, embedding_dim)?;
 
+        // Verify the model invariant BEFORE touching the vector table too:
+        // `ensure_vector_schema`'s rebuild path prunes/reinserts vectors and
+        // rescues-or-drops similarity links in its own committed transaction,
+        // which must not happen on a DB we are about to reject for a model
+        // mismatch. `seed_or_verify_model` only reads/writes `meta`, so it has
+        // no dependency on the vector table existing first.
+        if let Some(model) = embedding_model {
+            seed_or_verify_model(&conn, model)?;
+        }
+
         // Dynamic-dimension vector table (vec0 needs the literal dim baked in),
         // created at the current vector schema version — or rebuilt in place
         // from a previous version (W1.1 cosine metric + W1.7 namespace
         // partition, one combined rebuild).
         ensure_vector_schema(&conn, embedding_dim)?;
-        if let Some(model) = embedding_model {
-            seed_or_verify_model(&conn, model)?;
-        }
         let site_id = seed_or_get_site_id(&conn)?;
 
         Ok(Self {
@@ -414,28 +421,27 @@ fn rebuild_vector_table(conn: &rusqlite::Connection, embedding_dim: usize) -> Re
 }
 /// Seed `meta.embedding_dim` on first init, or verify it matches on re-open.
 /// Fails closed with `Error::DimensionMismatch` on disagreement.
+///
+/// `INSERT OR IGNORE` + re-read (same idiom as [`seed_or_get_site_id`]): two
+/// connections racing the first open both end up validating against the
+/// single stored value instead of the second racer's plain `INSERT` hitting
+/// `meta`'s PK-uniqueness constraint on `key`.
 fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
-    let existing = meta_value(conn, "embedding_dim")?;
-
-    match existing {
-        Some(v) => {
-            let stored: usize = v.parse().map_err(|_| {
-                Error::Storage(format!("meta.embedding_dim is not an integer: {v:?}"))
-            })?;
-            if stored != embedding_dim {
-                return Err(Error::DimensionMismatch {
-                    expected: stored,
-                    got: embedding_dim,
-                });
-            }
-        }
-        None => {
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('embedding_dim', ?1)",
-                rusqlite::params![embedding_dim.to_string()],
-            )
-            .map_err(storage_err)?;
-        }
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('embedding_dim', ?1)",
+        rusqlite::params![embedding_dim.to_string()],
+    )
+    .map_err(storage_err)?;
+    let v = meta_value(conn, "embedding_dim")?
+        .ok_or_else(|| Error::Storage("meta.embedding_dim missing after seed".to_string()))?;
+    let stored: usize = v
+        .parse()
+        .map_err(|_| Error::Storage(format!("meta.embedding_dim is not an integer: {v:?}")))?;
+    if stored != embedding_dim {
+        return Err(Error::DimensionMismatch {
+            expected: stored,
+            got: embedding_dim,
+        });
     }
     Ok(())
 }
@@ -443,23 +449,22 @@ fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Resu
 /// created before the key existed), or verify it matches on re-open. A
 /// same-dim provider swap would silently mix vector spaces, so this fails
 /// closed with the explicit remediation.
+///
+/// `INSERT OR IGNORE` + re-read, same race-safe idiom as
+/// [`seed_or_verify_dim`] / [`seed_or_get_site_id`].
 fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> Result<()> {
-    match meta_value(conn, "embedding_model")? {
-        Some(stored) => {
-            if stored != embedding_model {
-                return Err(Error::Storage(format!(
-                    "embedding model changed (stored: {stored}, configured: {embedding_model}); \
-                     run with --accept-model-change to mark the corpus for re-embedding"
-                )));
-            }
-        }
-        None => {
-            conn.execute(
-                "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)",
-                rusqlite::params![embedding_model],
-            )
-            .map_err(storage_err)?;
-        }
+    conn.execute(
+        "INSERT OR IGNORE INTO meta (key, value) VALUES ('embedding_model', ?1)",
+        rusqlite::params![embedding_model],
+    )
+    .map_err(storage_err)?;
+    let stored = meta_value(conn, "embedding_model")?
+        .ok_or_else(|| Error::Storage("meta.embedding_model missing after seed".to_string()))?;
+    if stored != embedding_model {
+        return Err(Error::Storage(format!(
+            "embedding model changed (stored: {stored}, configured: {embedding_model}); \
+             run with --accept-model-change to mark the corpus for re-embedding"
+        )));
     }
     Ok(())
 }
