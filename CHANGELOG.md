@@ -5,6 +5,24 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Contract-drift guard (W5a.4 operationalized)
+
+- **`rb-contract-guard` + `contract-drift` CI job**: the wire surface
+  (rb-proto messages plus the rb-types payload shapes they embed) and the
+  rb-store migrations are digested (syn-normalized item tokens: doc comments,
+  regular comments, and formatting never trip the guard) and compared against
+  the checked-in `contract-snapshot.toml`. Any drift fails CI until the PR
+  records a deliberate decision: `update --intent additive` (serde-default
+  change, no `CONTRACT_VERSION` bump — the tool refuses a bumped version) or
+  `update --intent breaking` (the tool demands the bump). The note lands in
+  the snapshot's append-only `[[log]]` so reviewers see the decision in the
+  diff. Also bound into `cargo test --workspace` and `scripts/ci-local.sh`.
+  See `docs/specs/2026-07-11-contract-drift-guard.md`.
+- **N-1 handshake fixture (W5a.4)**: rb-daemon e2e now pins version-skew
+  behavior — with no dual-support window open, an N-1 client handshake gets a
+  graceful `HandshakeAck { ok: false }` naming both versions, then a closed
+  connection.
+
 ### Added — Cross-agent capability status
 
 - **Agent capability matrix**: `rb-agents` now exposes the current support state
