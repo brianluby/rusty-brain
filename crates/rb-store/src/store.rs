@@ -2429,6 +2429,15 @@ impl Store for SqliteStore {
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
         // Transaction: the link INSERT and its oplog row commit (or roll back)
         // together (an FK failure on a missing endpoint rolls back both).
+        //
+        // memory_links carries no namespace column, so this accepts edges
+        // whose endpoints live in different namespaces without complaint.
+        // Isolation is enforced read-side only (e.g. `active_contradicts`
+        // requires both endpoints active AND in the query namespace) — a
+        // cross-namespace edge written here is silently inert until read
+        // paths change. A future feature that walks the full link graph
+        // without that namespace filter would inherit a cross-namespace
+        // leak from this insert.
         immediate_tx(&self.conn, || {
             self.conn
                 .execute(

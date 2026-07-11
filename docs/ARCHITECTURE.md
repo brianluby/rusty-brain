@@ -25,7 +25,7 @@ left as guidelines.
 | Fail-closed boundaries | Namespace isolation and the embedding-dimension contract refuse to run on doubt. |
 | Fail-open capture | Best-effort capture hooks degrade silently and never block an agent session. |
 | Reproducible from git | File-discovered, checksummed migrations; a CI gate rebuilds a fresh DB from committed SQL and exercises every query path. |
-| Substrate, not orchestrator | Stores and retrieves memory; has no tasks, scheduling, or agent lifecycle. |
+| Substrate, not orchestrator | Stores and retrieves memory; has no agent lifecycle and no LLM-driven evolution. The in-process job scheduler (consolidation, link-decay) is in-scope maintenance on the substrate itself, not agent orchestration. |
 
 ## Crate boundaries
 
