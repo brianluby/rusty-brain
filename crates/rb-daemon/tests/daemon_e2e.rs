@@ -1384,3 +1384,58 @@ async fn near_dup_suppression_never_touches_non_hook_memories() {
 
     daemon.stop().await;
 }
+
+/// W5a.4 protocol-evolution fixture: an N-1 client handshake. The daemon's
+/// CURRENT policy window is exact-match (no breaking bump is in flight, so no
+/// N/N-1 dual-support window is open) — an N-1 handshake must be REJECTED
+/// GRACEFULLY: a HandshakeAck { ok: false } that names both versions, then a
+/// closed connection. If a future bump opens a dual-support window, this test
+/// is the seam to flip: it pins the version-skew behavior either way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn n_minus_one_handshake_is_rejected_gracefully() {
+    let n_minus_one = rb_proto::CONTRACT_VERSION
+        .checked_sub(1)
+        .expect("N-1 fixture requires CONTRACT_VERSION >= 1");
+    let daemon = RunningDaemon::start(2).await;
+
+    let stream = tokio::net::UnixStream::connect(&daemon.socket)
+        .await
+        .unwrap();
+    let mut framed = rb_proto::bounded_framed(stream);
+    rb_proto::write_frame(
+        &mut framed,
+        &rb_proto::Handshake {
+            contract_version: n_minus_one,
+            namespace: Namespace::Project("skew".to_string()),
+            identity: None,
+        },
+    )
+    .await
+    .unwrap();
+
+    let ack: rb_proto::HandshakeAck = rb_proto::read_frame(&mut framed).await.unwrap();
+    assert!(!ack.ok, "N-1 handshake must be refused, got ack: {ack:?}");
+    assert_eq!(
+        ack.contract_version,
+        rb_proto::CONTRACT_VERSION,
+        "the nack advertises the server's version so the client can report skew"
+    );
+    let message = ack.message.expect("nack carries a diagnostic message");
+    assert!(
+        message.contains(&rb_proto::CONTRACT_VERSION.to_string())
+            && message.contains(&n_minus_one.to_string()),
+        "diagnostic names both versions: {message}"
+    );
+
+    // After the nack the daemon closes the connection: no further frame ever
+    // arrives (read yields EOF/error rather than hanging).
+    let eof = tokio::time::timeout(
+        Duration::from_secs(5),
+        rb_proto::read_frame::<_, rb_proto::HandshakeAck>(&mut framed),
+    )
+    .await
+    .expect("connection must be closed promptly after a version nack");
+    assert!(eof.is_err(), "no frames after a version nack, got: {eof:?}");
+
+    daemon.stop().await;
+}

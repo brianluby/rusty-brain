@@ -18,6 +18,7 @@ members = [
     "crates/rb-eval",
     "crates/rb-redact",
     "crates/rb-tokens",
+    "crates/rb-contract-guard",
 ]
 
 [workspace.package]
@@ -62,6 +63,11 @@ predicates = "3"
 # true artifact path regardless of profile.
 escargot = "0.5"
 toml = "0.8"
+# Contract-drift guard (rb-contract-guard): parses the wire-shape-defining
+# sources with syn to digest type definitions, so comment/formatting-only
+# edits never trip the guard.
+syn = { version = "2", default-features = false, features = ["full", "parsing", "printing"] }
+quote = "1"
 # W3.3 token economy: a faithful BPE token counter (o200k_base) used to enforce
 # the SessionStart injection budget at runtime and to gate the token-accounting
 # CI test. Embeds its vocab (no network at runtime).

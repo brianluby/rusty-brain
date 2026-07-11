@@ -26,6 +26,9 @@ step "agent: build"      cargo build -p rb-agents -p rb-hooks -p rb-install
 step "agent: clippy"     cargo clippy -p rb-agents -p rb-hooks -p rb-install --all-targets -- -D warnings
 step "agent: test"       cargo test -p rb-agents -p rb-hooks -p rb-install
 
+# --- contract drift guard job (W5a.4) ---
+step "contract-drift"    cargo run -p rb-contract-guard -- check
+
 # --- cargo-deny / cargo-audit jobs ---
 step "cargo-deny"        cargo deny check
 step "cargo-audit"       cargo audit
