@@ -273,9 +273,9 @@ Current agent capability matrix:
 | Agent | Adapter | Capture | Retrieval | Config | Scorecard | Lifecycle source / limitation |
 |---|---|---|---|---|---|---|
 | `claude-code` | stable | supported | supported | supported | supported | Fixture-backed `SessionEnd` lifecycle under `crates/rb-hooks/tests/fixtures/claude_code/`. |
-| `codex` | experimental | partial | unsupported | partial | unsupported | `Stop` remains a no-op boundary until real fixtures prove a checkpoint or terminus; `apply_patch` capture is blocked. |
-| `opencode` | experimental | partial | unsupported | unsupported | unsupported | Adapter exists, but installer/plugin support and lifecycle fixtures are still deferred. |
-| `gemini` | experimental | partial | unsupported | partial | unsupported | Native `SessionEnd` remains canonical `Stop` until real fixtures prove a safer boundary. |
+| `codex` | experimental | partial | unsupported | partial | unsupported | `Stop` remains a no-op boundary until real fixtures prove a checkpoint or terminus; `apply_patch` capture is upstream-blocked ([openai/codex#16732](https://github.com/openai/codex/issues/16732)). |
+| `opencode` | experimental | supported | unsupported | unsupported | unsupported | `session.idle` folds via canonical `SessionCheckpoint`; bash and `apply_patch` file-edit capture are fixture-backed. Installer/plugin support is deferred. |
+| `gemini` | experimental | partial | unsupported | partial | unsupported | Native `SessionEnd` remains canonical `Stop`; terminus mapping is descoped from the cross-CLI track. |
 | `hermes` | discovery | unknown | unknown | unknown | unsupported | Discovery-gated; no hook names or config paths are hard-coded. |
 
 The scorecard runner is target-aware:
