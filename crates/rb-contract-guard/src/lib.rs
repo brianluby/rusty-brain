@@ -27,11 +27,26 @@ use anyhow::{Context, Result};
 use std::collections::BTreeMap;
 use std::path::Path;
 
+/// A directory whose `.rs` files are ALL wire-shape-defining unless excluded.
+///
+/// Scanning a directory instead of listing files guards NEW files by default —
+/// the PR #56 lesson: `MemoryStats` landed in a brand-new `rb-types/src/stats.rs`
+/// that an explicit file list would have silently missed.
+#[derive(Debug, Clone)]
+pub struct WireDir {
+    /// Directory relative to the repo root (scanned non-recursively).
+    pub dir: String,
+    /// File names within `dir` that are NOT part of the wire surface.
+    pub exclude: Vec<String>,
+}
+
 /// Which files define the contract surface, relative to the repo root.
 #[derive(Debug, Clone)]
 pub struct SurfaceConfig {
     /// Rust sources whose type definitions shape the wire contract.
     pub wire_files: Vec<String>,
+    /// Directories whose `.rs` files are wire-shape-defining unless excluded.
+    pub wire_dirs: Vec<WireDir>,
     /// The file declaring `CONTRACT_VERSION` (also listed in `wire_files`).
     pub version_file: String,
     /// Directory of on-disk schema migrations (`NNN_*.sql`).
@@ -44,21 +59,17 @@ impl SurfaceConfig {
     /// The rusty-brain contract surface: rb-proto wire messages, the rb-types
     /// payload shapes they embed (the v2 bump — `MemoryNote.contested` — lived
     /// in rb-types, so rb-proto alone is not enough), and rb-store migrations.
+    /// rb-types is scanned as a whole directory so new payload files (e.g. the
+    /// PR #56 `stats.rs`) are guarded by default; only `error.rs` is excluded
+    /// (its enum maps to wire error strings in rb-daemon, it is not serialized
+    /// itself).
     pub fn default_paths() -> Self {
         Self {
-            wire_files: vec![
-                "crates/rb-proto/src/messages.rs".to_string(),
-                "crates/rb-types/src/change.rs".to_string(),
-                "crates/rb-types/src/feedback_kind.rs".to_string(),
-                "crates/rb-types/src/job.rs".to_string(),
-                "crates/rb-types/src/link.rs".to_string(),
-                "crates/rb-types/src/link_type.rs".to_string(),
-                "crates/rb-types/src/memory.rs".to_string(),
-                "crates/rb-types/src/memory_id.rs".to_string(),
-                "crates/rb-types/src/memory_type.rs".to_string(),
-                "crates/rb-types/src/namespace.rs".to_string(),
-                "crates/rb-types/src/query.rs".to_string(),
-            ],
+            wire_files: vec!["crates/rb-proto/src/messages.rs".to_string()],
+            wire_dirs: vec![WireDir {
+                dir: "crates/rb-types/src".to_string(),
+                exclude: vec!["error.rs".to_string()],
+            }],
             version_file: "crates/rb-proto/src/messages.rs".to_string(),
             migrations_dir: "crates/rb-store/migrations".to_string(),
             snapshot_file: "contract-snapshot.toml".to_string(),
@@ -88,6 +99,23 @@ pub fn observe(root: &Path, cfg: &SurfaceConfig) -> Result<Observed> {
         let source = std::fs::read_to_string(&path)
             .with_context(|| format!("reading wire file {}", path.display()))?;
         wire.extend(extract::extract_wire_items(rel, &source)?);
+    }
+
+    for wire_dir in &cfg.wire_dirs {
+        let dir_path = root.join(&wire_dir.dir);
+        let entries = std::fs::read_dir(&dir_path)
+            .with_context(|| format!("reading wire dir {}", dir_path.display()))?;
+        for entry in entries {
+            let entry = entry.with_context(|| format!("listing {}", dir_path.display()))?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if !name.ends_with(".rs") || wire_dir.exclude.iter().any(|e| e == &name) {
+                continue;
+            }
+            let rel = format!("{}/{name}", wire_dir.dir);
+            let source = std::fs::read_to_string(entry.path())
+                .with_context(|| format!("reading wire file {}", entry.path().display()))?;
+            wire.extend(extract::extract_wire_items(&rel, &source)?);
+        }
     }
 
     let version_path = root.join(&cfg.version_file);
@@ -132,6 +160,7 @@ mod tests {
     fn tiny_config() -> SurfaceConfig {
         SurfaceConfig {
             wire_files: vec!["src/messages.rs".to_string()],
+            wire_dirs: vec![],
             version_file: "src/messages.rs".to_string(),
             migrations_dir: "migrations".to_string(),
             snapshot_file: "contract-snapshot.toml".to_string(),
@@ -183,6 +212,73 @@ mod tests {
         assert!(
             err.to_string().contains("migrations"),
             "error names the missing dir, got: {err:#}"
+        );
+    }
+
+    fn dir_config() -> SurfaceConfig {
+        SurfaceConfig {
+            wire_dirs: vec![WireDir {
+                dir: "types/src".to_string(),
+                exclude: vec!["error.rs".to_string()],
+            }],
+            ..tiny_config()
+        }
+    }
+
+    #[test]
+    fn observe_scans_wire_dirs_so_new_files_are_guarded_by_default() {
+        // The PR #56 lesson: MemoryStats landed in a brand-new rb-types file
+        // (stats.rs). An explicit file list silently misses new files; a
+        // scanned directory guards them by default.
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/messages.rs", MESSAGES);
+        write(
+            dir.path(),
+            "migrations/001_init.sql",
+            "CREATE TABLE t (id);",
+        );
+        write(dir.path(), "types/src/memory.rs", "pub struct MemoryNote;");
+        write(
+            dir.path(),
+            "types/src/error.rs",
+            "pub enum Error { Io(String) }",
+        );
+        write(dir.path(), "types/src/notes.txt", "not rust");
+
+        let obs = observe(dir.path(), &dir_config()).unwrap();
+        assert!(
+            obs.wire.contains_key("types/src/memory.rs::MemoryNote"),
+            "scanned-dir items observed: {:?}",
+            obs.wire.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !obs.wire.keys().any(|k| k.contains("error.rs")),
+            "excluded files are not observed"
+        );
+
+        // A NEW file appearing later is picked up without a config change.
+        write(dir.path(), "types/src/stats.rs", "pub struct MemoryStats;");
+        let after = observe(dir.path(), &dir_config()).unwrap();
+        assert!(
+            after.wire.contains_key("types/src/stats.rs::MemoryStats"),
+            "new wire file guarded by default: {:?}",
+            after.wire.keys().collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn observe_fails_closed_on_missing_wire_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        write(dir.path(), "src/messages.rs", MESSAGES);
+        write(
+            dir.path(),
+            "migrations/001_init.sql",
+            "CREATE TABLE t (id);",
+        );
+        let err = observe(dir.path(), &dir_config()).unwrap_err();
+        assert!(
+            err.to_string().contains("types/src"),
+            "error names the missing wire dir, got: {err:#}"
         );
     }
 }

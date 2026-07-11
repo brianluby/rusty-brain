@@ -178,6 +178,33 @@ fn additive_marker_unblocks_an_additive_change() {
 }
 
 #[test]
+fn brand_new_rb_types_wire_file_is_guarded_by_default() {
+    // The PR #56 lesson: doctor/stats added MemoryStats in a NEW rb-types
+    // file (stats.rs). The guard must catch shapes in files that did not
+    // exist when the snapshot was taken.
+    let repo = fixture_repo();
+    init(repo.path());
+    write(
+        repo.path(),
+        "crates/rb-types/src/stats.rs",
+        "pub struct MemoryStats {\n    pub total: u64,\n}\n",
+    );
+    check_drifts(repo.path(), &["crates/rb-types/src/stats.rs::MemoryStats"]);
+    guard(
+        repo.path(),
+        &[
+            "update",
+            "--intent",
+            "additive",
+            "--note",
+            "MemoryStats payload",
+        ],
+    )
+    .success();
+    check_ok(repo.path());
+}
+
+#[test]
 fn rb_types_payload_shape_change_is_also_guarded() {
     let repo = fixture_repo();
     init(repo.path());

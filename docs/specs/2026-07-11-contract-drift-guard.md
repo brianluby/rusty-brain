@@ -11,10 +11,14 @@ used to live in prose only, enforced by reviewer diligence. The
   `crates/rb-proto/src/messages.rs` (`CONTRACT_VERSION`, `Handshake`,
   `HandshakeAck`, `ClientIdentity`, `Request`, `Response`,
   `RecallChannelTotals`) plus the rb-types payload shapes those frames embed
-  (`MemoryNote`, `SearchResult`, `MemoryChanged`, `Namespace`, enums, ...).
-  rb-types is included deliberately: the v2 bump (`MemoryNote.contested`)
-  happened in rb-types, so guarding rb-proto alone would have missed the only
-  historical breaking change.
+  (`MemoryNote`, `SearchResult`, `MemoryStats`, `MemoryChanged`, `Namespace`,
+  enums, ...). rb-types is included deliberately: the v2 bump
+  (`MemoryNote.contested`) happened in rb-types, so guarding rb-proto alone
+  would have missed the only historical breaking change. The whole
+  `crates/rb-types/src` directory is scanned (only `error.rs` is excluded), so
+  a NEW payload file is guarded by default — the PR #56 lesson, where
+  `MemoryStats` landed in a brand-new `stats.rs` that an explicit file list
+  would have silently missed.
 - **Persistence surface**: every `crates/rb-store/migrations/NNN_*.sql` file
   (name + sha256).
 
