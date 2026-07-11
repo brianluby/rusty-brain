@@ -81,6 +81,26 @@ jobs:
       - name: Test rb-embed local (offline only; real-model tests are #[ignore])
         run: cargo test -p rb-embed --features local
 
+  # W5a.4 protocol-evolution policy, operationalized: the wire surface
+  # (rb-proto messages + the rb-types payload shapes they embed) and the
+  # rb-store migrations are digested and compared against the checked-in
+  # contract-snapshot.toml. Any drift fails until the PR records a deliberate
+  # decision: `update --intent additive` (serde-default change, no
+  # CONTRACT_VERSION bump) or `update --intent breaking` (after bumping it).
+  contract-drift:
+    name: contract drift guard
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Check contract surface against snapshot
+        run: cargo run -p rb-contract-guard -- check
+
   deny:
     name: cargo-deny
     runs-on: ubuntu-latest
@@ -129,9 +149,9 @@ jobs:
       - name: Assert dev/measurement crates stay out of the default rusty-brain closure
         run: |
           set -euo pipefail
-          if cargo tree -e no-dev -p rusty-brain | grep -E "rb-agents|rb-hooks|rb-install|rb-eval"; then
+          if cargo tree -e no-dev -p rusty-brain | grep -E "rb-agents|rb-hooks|rb-install|rb-eval|rb-contract-guard"; then
             echo "ERROR: a dev/measurement crate leaked into the default rusty-brain (non-dev) dependency closure." >&2
-            echo "The rusty-brain binary must NEVER depend on rb-agents/rb-hooks/rb-install/rb-eval." >&2
+            echo "The rusty-brain binary must NEVER depend on rb-agents/rb-hooks/rb-install/rb-eval/rb-contract-guard." >&2
             exit 1
           fi
-          echo "OK: rb-agents/rb-hooks/rb-install/rb-eval are absent from the default rusty-brain closure."
+          echo "OK: rb-agents/rb-hooks/rb-install/rb-eval/rb-contract-guard are absent from the default rusty-brain closure."
