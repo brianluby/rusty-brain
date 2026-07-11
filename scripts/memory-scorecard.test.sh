@@ -55,7 +55,7 @@ _source_pure_functions() {
         printf 'OpenCode scorecard is blocked until the JS/TS plugin config path and lifecycle fixtures are implemented.'
         ;;
       gemini)
-        printf 'Gemini has an adapter, but the cross-agentic scorecard currently targets Claude Code, Codex, and OpenCode.'
+        printf 'Gemini has an adapter, but the cross-agentic scorecard currently supports only Claude Code; Gemini scorecard support is not yet implemented.'
         ;;
       hermes)
         printf 'Hermes is discovery-gated; no hook names, config paths, or lifecycle semantics are verified.'
@@ -66,11 +66,21 @@ _source_pure_functions() {
     esac
   }
 
-  # scorecard_skip_line — lines 84-88
+  # scorecard_skip_phase — earliest blocked pipeline stage per agent
+  # (capture|config|scoring; retrieval gaps never block the harness)
+  scorecard_skip_phase() {
+    case "$1" in
+      codex)           printf 'capture' ;;
+      opencode|hermes) printf 'config' ;;
+      *)               printf 'scoring' ;;
+    esac
+  }
+
+  # scorecard_skip_line
   scorecard_skip_line() {
     local agent="$1"
-    printf 'agent=%s\tdimension=all\tscenario=all\tphase=scoring\tstatus=skip\treason=%s\tdetail=%s\n' \
-      "$agent" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
+    printf 'agent=%s\tdimension=all\tscenario=all\tphase=%s\tstatus=skip\treason=%s\tdetail=%s\n' \
+      "$agent" "$(scorecard_skip_phase "$agent")" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
   }
 }
 _source_pure_functions
@@ -161,6 +171,12 @@ pass "scorecard_skip_detail returns non-empty fallback for unknown agent"
 for agent in codex opencode gemini hermes; do
   skip_line="$(scorecard_skip_line "$agent")"
 
+  case "$agent" in
+    codex)           expected_phase="capture" ;;
+    opencode|hermes) expected_phase="config" ;;
+    *)               expected_phase="scoring" ;;
+  esac
+
   printf '%s' "$skip_line" | grep -qF "agent=$agent" \
     || fail "$agent skip line missing 'agent=$agent': $skip_line"
 
@@ -170,8 +186,8 @@ for agent in codex opencode gemini hermes; do
   printf '%s' "$skip_line" | grep -qF "scenario=all" \
     || fail "$agent skip line missing 'scenario=all': $skip_line"
 
-  printf '%s' "$skip_line" | grep -qF "phase=scoring" \
-    || fail "$agent skip line missing 'phase=scoring': $skip_line"
+  printf '%s' "$skip_line" | grep -qF "phase=$expected_phase" \
+    || fail "$agent skip line missing 'phase=$expected_phase': $skip_line"
 
   printf '%s' "$skip_line" | grep -qF "status=skip" \
     || fail "$agent skip line missing 'status=skip': $skip_line"
@@ -190,7 +206,7 @@ done
 #    (regression test matching the --self-test assertion inside the script)
 # ---------------------------------------------------------------------------
 codex_skip="$(scorecard_skip_line codex)"
-expected_codex_prefix="agent=codex	dimension=all	scenario=all	phase=scoring	status=skip	reason=scorecard_unsupported_codex_fixture_gated"
+expected_codex_prefix="agent=codex	dimension=all	scenario=all	phase=capture	status=skip	reason=scorecard_unsupported_codex_fixture_gated"
 printf '%s' "$codex_skip" | grep -qF "$expected_codex_prefix" \
   || fail "codex skip line does not match expected prefix. got: $codex_skip"
 pass "scorecard_skip_line codex matches machine-readable prefix exactly"

@@ -2,7 +2,16 @@
 
 ## Status
 
-New sprint task, draft. This is the task requested on 2026-06-23 after confirming the current sprint is still Claude-heavy.
+Delivered 2026-07-11 (Vikunja #380), on top of the groundwork landed via PRs #43/#45/#49/#54. All acceptance criteria are met; the items that remain open are deliberately fixture- or upstream-gated, not unfinished work:
+
+- Codex capture fold (terminus mapping): gated on a recorded Codex lifecycle fixture (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`); `apply_patch` additionally upstream-blocked ([openai/codex#16732](https://github.com/openai/codex/issues/16732)).
+- Codex/OpenCode prompt-time retrieval: no native prompt event is mapped until a recorded fixture proves its shape (CA6 "documented gap" path).
+- OpenCode installer: explicitly deferred by decision — OpenCode needs a JS/TS plugin, so the JSON installer fails closed with `[E_INSTALL_AGENT_DEFERRED]`; the adapter path is validated without it (CA2's sanctioned alternative).
+- OpenCode/Codex scorecard runs: skipped with machine-readable per-agent lines naming the blocked phase; enablement is a follow-on runner task.
+
+User-facing support levels, setup, and troubleshooting: `docs/AGENTS.md`; source of truth: `crates/rb-agents/src/capability.rs` (README table drift-guarded by `crates/rb-agents/tests/capability_docs.rs`).
+
+Originally: new sprint task requested on 2026-06-23 after confirming the current sprint was still Claude-heavy.
 
 ## Owner Area
 
@@ -224,18 +233,18 @@ Unsupported targets must produce clear skip output rather than ambiguous success
 
 ## Implementation Checklist
 
-- [ ] Audit W3.1, W3.2, and W3.5 for Claude-specific assumptions.
-- [ ] Define capability matrix.
-- [ ] Verify OpenCode capture path.
-- [ ] Verify OpenCode retrieval path or document unsupported status.
-- [ ] Verify Codex capture path.
-- [ ] Verify Codex retrieval path or document unsupported status.
-- [ ] Link Codex `apply_patch` readiness gate.
-- [ ] Decide OpenCode installer/plugin scope.
-- [ ] Extend scorecard agent target selection.
-- [ ] Add per-agent scorecard output.
-- [ ] Add or update tests for unsupported/skipped capabilities.
-- [ ] Add Hermes discovery record.
-- [ ] Update setup and troubleshooting docs.
-- [ ] Run Claude, Codex, and OpenCode validation.
-- [ ] Add board/status updates for remaining unsupported gaps.
+- [x] Audit W3.1, W3.2, and W3.5 for Claude-specific assumptions (Claude-only runner paths documented in `docs/plans/2026-06-26-cross-cli-terminus-mapping.md`).
+- [x] Define capability matrix (`crates/rb-agents/src/capability.rs`; README copy drift-guarded).
+- [x] Verify OpenCode capture path (`session.idle` → `SessionCheckpoint` fold + `apply_patch` V4A path extraction, fixture-backed; PR #54).
+- [x] Verify OpenCode retrieval path or document unsupported status (documented unsupported: no prompt event mapped; `docs/AGENTS.md`).
+- [x] Verify Codex capture path (shell capture works; terminus fold fixture-gated at `capture: Partial`).
+- [x] Verify Codex retrieval path or document unsupported status (documented unsupported; `SessionStart` injection is the closest active equivalent).
+- [x] Link Codex `apply_patch` readiness gate (`docs/follow-ups/2026-06-02-codex-apply-patch-capture.md`, openai/codex#16732).
+- [x] Decide OpenCode installer/plugin scope (deferred by decision: `[E_INSTALL_AGENT_DEFERRED]` fails closed; adapter path validated; plugin install is a follow-on).
+- [x] Extend scorecard agent target selection (`--agent claude-code|codex|opencode|gemini|hermes|all`).
+- [x] Add per-agent scorecard output (skip lines carry agent/dimension/scenario/phase/reason/detail; `phase` names the earliest blocked stage).
+- [x] Add or update tests for unsupported/skipped capabilities (`--self-test` skip assertions for all four agents; `scripts/memory-scorecard.test.sh`; `capability_docs.rs`).
+- [x] Add Hermes discovery record (`docs/follow-ups/2026-06-23-hermes-discovery.md`; no invented hook names).
+- [x] Update setup and troubleshooting docs (`docs/AGENTS.md`, README cross-agentic framing).
+- [x] Run Claude, Codex, and OpenCode validation (`cargo test -p rb-agents -p rb-hooks -p rb-install`; `--self-test`; all four skip targets; Claude live scorecard unchanged and budget-gated).
+- [x] Add board/status updates for remaining unsupported gaps (Status section above).
