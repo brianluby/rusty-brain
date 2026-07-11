@@ -16,6 +16,7 @@ impl SqliteStore {
             .prepare(
                 "SELECT source_id, target_id, link_type, strength, base_strength, created_at
                  FROM memory_links
+                 ORDER BY source_id, target_id, link_type
                  LIMIT ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;

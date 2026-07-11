@@ -193,10 +193,12 @@ impl SqliteStore {
 pub struct ScrubOutcome {
     /// Rows examined (every memory, active and archived).
     pub scanned: u64,
-    /// Rows whose content/summary/context had a secret redacted out.
+    /// Rows whose content/summary/context/keywords/tags had a secret
+    /// redacted out.
     pub redacted: u64,
-    /// Of `redacted`, rows whose embedding-feeding text (content/context)
-    /// changed and were therefore marked stale for re-embedding.
+    /// Of `redacted`, rows whose embedding-feeding text (content/context/
+    /// keywords/tags — everything except `summary`) changed and were
+    /// therefore marked stale for re-embedding.
     pub reembed_pending: u64,
 }
 #[cfg(test)]

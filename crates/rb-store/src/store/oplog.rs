@@ -19,10 +19,13 @@ impl SqliteStore {
     }
     /// Replay the durable oplog as change events: every entry in `namespace`
     /// with `seq > after`, oldest first, capped at `limit` (W2.7
-    /// replay-on-reconnect). Ops that do not describe a single memory's
-    /// change (`rename_namespace`) are skipped; `insert` maps to `Created`,
-    /// `archive`/`supersede` to `Archived`, and every other mutation
-    /// (`update`, `link`, `unlink`, `set_*`) to `Updated`.
+    /// replay-on-reconnect). Bulk admin ops that do not describe a single
+    /// memory's change (`namespace_rename`, `scrub`) are skipped — detected
+    /// by their empty `memory_id` sentinel, not by op string, so a future
+    /// bulk op is skipped automatically without needing to extend this list;
+    /// `insert` maps to `Created`, `archive`/`supersede` to `Archived`, and
+    /// every other mutation (`update`, `link`, `unlink`, `set_*`) to
+    /// `Updated`.
     pub fn oplog_changes_since(
         &self,
         namespace: &rb_types::Namespace,
