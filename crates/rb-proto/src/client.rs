@@ -478,6 +478,27 @@ impl Client {
         }
     }
 
+    /// Namespace-scoped observability aggregate (doctor/stats PRD). Returns
+    /// `(stats, provider_model, writer_alive)`: the read-pool aggregate for
+    /// this connection's namespace, the daemon's running embedding-model
+    /// identity, and writer-thread liveness. `window_days` bounds the windowed
+    /// fields (`None` = daemon default). Read-only server-side: the stats path
+    /// issues zero writer ops (W1.8).
+    pub async fn stats(
+        &mut self,
+        window_days: Option<u32>,
+    ) -> Result<(rb_types::MemoryStats, String, bool)> {
+        let resp = self.request(Request::Stats { window_days }).await?;
+        match resp {
+            Resp::Stats {
+                stats,
+                provider_model,
+                writer_alive,
+            } => Ok((stats, provider_model, writer_alive)),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// One-time namespace rename (W0.3 carryover): re-scope every memory from
     /// `old` to `new` in one daemon writer transaction. Refused with
     /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
@@ -770,6 +791,17 @@ mod wrapper_tests {
                     redacted: 0,
                     reembed_pending: 0,
                 },
+                // Canned payload keyed on `window_days` so the typed-wrapper
+                // test can prove the window rides the wire.
+                Request::Stats { window_days } => Response::Stats {
+                    stats: rb_types::MemoryStats {
+                        window_days: window_days.unwrap_or(30),
+                        live: 5,
+                        ..Default::default()
+                    },
+                    provider_model: "deterministic".to_string(),
+                    writer_alive: true,
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -869,6 +901,16 @@ mod wrapper_tests {
             .await
             .unwrap();
         assert_eq!((moved, vectors), (7, 2));
+
+        // The fake server echoes the window into the payload, proving the
+        // window rides the wire and the payload comes back typed.
+        let (stats, provider_model, writer_alive) = c.stats(Some(7)).await.unwrap();
+        assert_eq!(stats.window_days, 7);
+        assert_eq!(stats.live, 5);
+        assert_eq!(provider_model, "deterministic");
+        assert!(writer_alive);
+        let (stats, _, _) = c.stats(None).await.unwrap();
+        assert_eq!(stats.window_days, 30, "None uses the daemon default");
 
         drop(c);
         server.await.unwrap();

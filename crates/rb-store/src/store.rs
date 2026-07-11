@@ -8,6 +8,7 @@ mod oplog;
 mod reembed;
 mod rename;
 mod scrub;
+mod stats;
 
 use rb_types::{
     Error, MemoryId, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result,
@@ -164,3 +165,4 @@ pub use link_decay::LinkRow;
 pub use oplog::OplogReplayPage;
 pub use rename::NamespaceRenameOutcome;
 pub use scrub::ScrubOutcome;
+pub use stats::read_meta_embedding_model;

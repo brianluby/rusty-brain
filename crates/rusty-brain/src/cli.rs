@@ -332,8 +332,23 @@ pub enum Command {
         since: Option<u64>,
     },
 
-    /// Ping the daemon and report its contract version.
+    /// Ping the daemon and report its health: contract version, writer
+    /// health, embedding model, DB path/mode, WAL size, corpus counts.
     Status,
+
+    /// Show value/health aggregates for the current namespace: recall volume,
+    /// feedback ratios, top/never-recalled memories, contested count, corpus
+    /// growth, re-embed backlog. Read-only — issues zero writer ops.
+    Stats {
+        /// Window in days for the windowed aggregates (recent accesses,
+        /// growth buckets). Server-clamped to 1-365; default 30.
+        #[arg(long = "window-days", value_parser = value_parser!(u32).range(1..=365))]
+        window_days: Option<u32>,
+    },
+
+    /// Run health checks (daemon, socket/DB permissions, embedding model vs
+    /// DB meta, WAL size) and exit non-zero if any check fails.
+    Doctor,
 
     /// Trigger one bounded evolution-job pass on the running daemon.
     Evolve {
@@ -789,6 +804,41 @@ mod tests {
         // --kind is required.
         let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id"]);
         assert!(res.is_err(), "--kind is required for feedback");
+    }
+
+    #[test]
+    fn parses_stats_with_optional_window() {
+        let cli = Cli::parse_from(["rusty-brain", "stats"]);
+        assert!(
+            matches!(cli.command, Command::Stats { window_days: None }),
+            "`rusty-brain stats` must parse with no window (daemon default)"
+        );
+        let cli = Cli::parse_from(["rusty-brain", "stats", "--window-days", "7"]);
+        assert!(matches!(
+            cli.command,
+            Command::Stats {
+                window_days: Some(7)
+            }
+        ));
+        // Global --json applies to stats.
+        let cli = Cli::parse_from(["rusty-brain", "--json", "stats"]);
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::Stats { .. }));
+    }
+
+    #[test]
+    fn stats_rejects_a_zero_window_at_parse_time() {
+        let res = Cli::try_parse_from(["rusty-brain", "stats", "--window-days", "0"]);
+        assert!(res.is_err(), "a zero-day window is meaningless");
+    }
+
+    #[test]
+    fn parses_doctor_subcommand() {
+        let cli = Cli::parse_from(["rusty-brain", "doctor"]);
+        assert!(
+            matches!(cli.command, Command::Doctor),
+            "`rusty-brain doctor` must parse to Command::Doctor"
+        );
     }
 
     #[test]

@@ -482,6 +482,32 @@ impl StoreHandle {
             .await
     }
 
+    /// Namespace-scoped observability aggregate (doctor/stats PRD). Goes
+    /// through the bounded read pool — the stats path issues zero writer ops
+    /// (W1.8) by construction. `model`/`input_version` are the CURRENT
+    /// embedding stamp (for the re-embed backlog count); `top_limit` bounds
+    /// the top-recalled list.
+    pub async fn namespace_stats(
+        &self,
+        namespace: Namespace,
+        window_days: u32,
+        model: String,
+        input_version: String,
+        top_limit: usize,
+    ) -> Result<rb_types::MemoryStats> {
+        self.with_read(move |store| {
+            store.namespace_stats(&namespace, window_days, &model, &input_version, top_limit)
+        })
+        .await
+    }
+
+    /// Whether the writer thread is alive (i.e. has not died ABNORMALLY).
+    /// Snapshot of the same watch [`StoreHandle::writer_died`] resolves on;
+    /// surfaced on the stats/status path so a zombie-adjacent state is visible.
+    pub fn writer_alive(&self) -> bool {
+        !*self.writer_death.borrow()
+    }
+
     /// Gracefully close the write queue and join the dedicated writer thread.
     pub async fn shutdown(self) {
         // Final access flush (W1.8): persist whatever the interval flusher has
@@ -2640,6 +2666,74 @@ mod tests {
         );
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn namespace_stats_runs_on_the_read_pool_with_zero_writer_ops() {
+        // W1.8 mirror for the stats path (doctor/stats PRD hard constraint):
+        // the whole aggregation runs on the read pool and must enqueue NOTHING
+        // on the writer thread — which also proves it triggers zero FTS writes
+        // (every FTS write rides a writer op).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("zero-writer-stats".to_string());
+
+        let a = note(&ns, "stats aggregate over feedback");
+        let b = note(&ns, "stats aggregate over accesses");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+        handle
+            .record_feedback(ns.clone(), aid, rb_types::FeedbackKind::Helpful, None)
+            .await
+            .unwrap();
+        handle
+            .record_feedback(ns.clone(), bid.clone(), rb_types::FeedbackKind::Wrong, None)
+            .await
+            .unwrap();
+        handle
+            .record_feedback(ns.clone(), bid, rb_types::FeedbackKind::Stale, None)
+            .await
+            .unwrap();
+
+        let ops_before = handle.writer_ops_count();
+        let stats = handle
+            .namespace_stats(ns.clone(), 30, String::new(), String::new(), 5)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before,
+            "stats must issue ZERO writer-thread ops (W1.8)"
+        );
+
+        assert_eq!(stats.namespace, ns.as_db_string());
+        assert_eq!(stats.live, 2);
+        assert_eq!(stats.feedback.helpful, 1);
+        assert_eq!(stats.feedback.wrong, 1);
+        assert_eq!(stats.feedback.stale, 1);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_alive_reports_liveness_and_flips_on_death() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        assert!(handle.writer_alive(), "a fresh handle has a live writer");
+
+        handle.kill_writer_for_test().await;
+        // The death watch flips asynchronously with the thread exit; poll.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while handle.writer_alive() && std::time::Instant::now() < deadline {
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(
+            !handle.writer_alive(),
+            "an abnormally dead writer must report not-alive"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

@@ -2994,6 +2994,7 @@ dependencies = [
  "rb-mcp",
  "rb-proto",
  "rb-redact",
+ "rb-store",
  "rb-types",
  "serde",
  "serde_json",

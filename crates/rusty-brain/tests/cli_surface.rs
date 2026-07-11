@@ -23,7 +23,18 @@ fn help_lists_all_subcommands() {
         .stdout(predicate::str::contains("graph"))
         .stdout(predicate::str::contains("delete"))
         .stdout(predicate::str::contains("context"))
-        .stdout(predicate::str::contains("status"));
+        .stdout(predicate::str::contains("status"))
+        .stdout(predicate::str::contains("stats"))
+        .stdout(predicate::str::contains("doctor"));
+}
+
+#[test]
+fn stats_help_shows_window_flag() {
+    bin()
+        .args(["stats", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--window-days"));
 }
 
 #[test]

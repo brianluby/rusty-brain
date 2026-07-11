@@ -489,6 +489,20 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
             }),
             false,
         ),
+        // Stats is a CLI observability surface (doctor/stats PRD) with no MCP
+        // tool yet; projected anyway so the mapping stays total.
+        Response::Stats {
+            stats,
+            provider_model,
+            writer_alive,
+        } => ToolContent::json(
+            json!({
+                "stats": stats,
+                "provider_model": provider_model,
+                "writer_alive": writer_alive,
+            }),
+            false,
+        ),
         Response::Error { kind, message } => ToolContent::json(
             json!({ "error": { "kind": kind, "message": message } }),
             true,
