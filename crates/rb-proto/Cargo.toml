@@ -23,6 +23,7 @@ futures = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }
+chrono = { workspace = true }
 
 [lints]
 workspace = true

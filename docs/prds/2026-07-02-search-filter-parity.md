@@ -2,10 +2,31 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. Discovery of what is
-stored is weak: recall/list filters are inconsistent and incomplete across
-the CLI and MCP surfaces. This is a hygiene/consistency PRD that makes the
-existing surfaces first-class.
+Delivered 2026-07-11 (Vikunja #458). One unified `rb_types::RecallFilter`
+now flows CLI -> proto -> daemon -> engine -> store, additive on the wire
+(serde-default `filter` field on `Recall`/`List`; empty filters keep the
+pre-filter byte shape) with NO CONTRACT_VERSION bump. Deliberate scoping:
+
+- Anchor filters: the MODEL plumbing shipped (`RecallFilter.anchors`,
+  `AnchorFilter`/`AnchorKind`), so typed code anchors (PRD 4 / #464) needs no
+  second wire change; EVALUATION is gated on PRD 4's `memory_anchors` table —
+  until it lands, a non-empty anchor filter fails fast with `InvalidArgument`
+  (never silently unfiltered), and the CLI `--file`/`--commit`/`--symbol`
+  flags + MCP anchor params land with PRD 4.
+- `since`/`until` are timestamps (RFC 3339, date, or relative age `7d`/`36h`
+  on the CLI). The "or seq" alternative is deferred: oplog seq is not a
+  memory column, so a seq bound needs an oplog join with no user story yet.
+- Archived recall rides the keyword channel only (archived vectors are
+  pruned on archive — the live-only vec0 partition invariant); `list`
+  honors `state` fully in SQL.
+- `contested` filtering is resolved by the engine through the ONE
+  `active_contradicts` source of truth (fail-closed for the filter,
+  fail-open for the annotation), over a bounded 4x over-fetch on `list`.
+
+Originally: draft from the 2026-07-02 senior-PM product review. Discovery of
+what is stored is weak: recall/list filters are inconsistent and incomplete
+across the CLI and MCP surfaces. This is a hygiene/consistency PRD that makes
+the existing surfaces first-class.
 
 ## Owner Area
 
@@ -107,12 +128,16 @@ Plus a parametrized e2e asserting each filter and their composition.
 
 ## Implementation Checklist
 
-- [ ] Define the unified `RecallFilter` model.
-- [ ] Extend store filter queries for every field.
-- [ ] Add CLI flags to `recall`/`list` (parity).
-- [ ] Add MCP params to `recall`/`list` (parity).
-- [ ] Assert token budget with the W3.3 accounting test.
-- [ ] Parametrized filter + composition e2e.
+- [x] Define the unified `RecallFilter` model.
+- [x] Extend store filter queries for every field (metadata dimensions in
+      SQL; `contested` via the engine's `active_contradicts` single source of
+      truth; `anchors` fail-fast until PRD 4).
+- [x] Add CLI flags to `recall`/`list` (parity; anchor flags land with PRD 4).
+- [x] Add MCP params to `recall`/`list` (parity).
+- [x] Assert token budget with the W3.3 accounting test (893/900 after the
+      recall schema additions).
+- [x] Parametrized filter + composition e2e (`rb-daemon` wire e2e + binary
+      e2e in `crates/rusty-brain/tests/end_to_end.rs`).
 
 ## Roadmap Fit
 

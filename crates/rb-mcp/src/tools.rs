@@ -103,6 +103,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                           BEFORE starting a task, or whenever the user references a past \
                           decision, prior work, or \"how we do X here\", to retrieve relevant \
                           prior context. Returns ranked memories.",
+            // The unified filter params (PRD 2026-07-02 search-filter parity)
+            // are deliberately TERSE: recall is in the default advertised set,
+            // so every schema byte counts against the W3.3 token budget.
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -112,7 +115,17 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "type": { "type": "string", "enum": memory_type_enum(),
                               "description": "Restrict to a memory type." },
                     "tags": { "type": "array", "items": { "type": "string" },
-                              "description": "Filter by tags." }
+                              "description": "Filter by tags." },
+                    "min_importance": { "type": "integer" },
+                    "max_importance": { "type": "integer" },
+                    "min_confidence": { "type": "number" },
+                    "max_confidence": { "type": "number" },
+                    "since": { "type": "string", "format": "date-time" },
+                    "until": { "type": "string", "format": "date-time" },
+                    "source": { "type": "array",
+                                "items": { "enum": ["hook", "mcp", "cli", "job"] } },
+                    "contested": { "type": "boolean" },
+                    "archived": { "type": "boolean" }
                 },
                 "required": ["query"]
             }),
@@ -132,16 +145,35 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "list",
-            description: "List memories in the current namespace (optionally filtered by \
-                          importance). Use to browse what is stored when you have no specific \
-                          query; prefer recall when you do.",
+            description: "List memories in the current namespace, filtered by the same \
+                          optional params as recall. Use to browse what is stored when you \
+                          have no specific query; prefer recall when you do.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "limit": { "type": "integer", "minimum": 1,
                                "description": "Max results (default: 20)." },
+                    "type": { "type": "string", "enum": memory_type_enum(),
+                              "description": "Restrict to a memory type." },
+                    "tags": { "type": "array", "items": { "type": "string" },
+                              "description": "Filter by tags." },
                     "min_importance": { "type": "integer", "minimum": 1, "maximum": 10,
-                                        "description": "Only memories at/above this importance." }
+                                        "description": "Only memories at/above this importance." },
+                    "max_importance": { "type": "integer", "minimum": 1, "maximum": 10 },
+                    "min_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "max_confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0 },
+                    "since": { "type": "string", "format": "date-time",
+                               "description": "Only memories created at/after this instant." },
+                    "until": { "type": "string", "format": "date-time",
+                               "description": "Only memories created at/before this instant." },
+                    "source": { "type": "array",
+                                "items": { "enum": ["hook", "mcp", "cli", "job"] },
+                                "description": "Only memories written by these surfaces." },
+                    "contested": { "type": "boolean",
+                                   "description": "true: only contested; false: only \
+                                                   uncontested." },
+                    "archived": { "type": "boolean",
+                                  "description": "List archived memories instead of active." }
                 }
             }),
         },
@@ -322,6 +354,46 @@ mod tests {
         let all: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
         assert_eq!(full, all, "RB_MCP_FULL_TOOLSET advertises every tool");
         assert!(default.len() < all.len(), "default is a strict subset");
+    }
+
+    #[test]
+    fn recall_and_list_schemas_expose_the_unified_filter_params() {
+        // SRH-3 (PRD 2026-07-02): recall and list advertise the SAME optional
+        // filter params, so the MCP surface reaches parity with the CLI flags.
+        const FILTER_PARAMS: [&str; 11] = [
+            "type",
+            "tags",
+            "min_importance",
+            "max_importance",
+            "min_confidence",
+            "max_confidence",
+            "since",
+            "until",
+            "source",
+            "contested",
+            "archived",
+        ];
+        for tool_name in ["recall", "list"] {
+            let t = tool_definitions()
+                .into_iter()
+                .find(|t| t.name == tool_name)
+                .unwrap();
+            let props = t.input_schema["properties"].as_object().unwrap();
+            for param in FILTER_PARAMS {
+                assert!(
+                    props.contains_key(param),
+                    "{tool_name} schema must expose optional '{param}'"
+                );
+            }
+            // All filters are OPTIONAL params (no new required fields).
+            let required: Vec<&str> = t.input_schema["required"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|v| v.as_str()).collect())
+                .unwrap_or_default();
+            for param in FILTER_PARAMS {
+                assert!(!required.contains(&param), "'{param}' must stay optional");
+            }
+        }
     }
 
     #[test]

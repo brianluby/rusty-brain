@@ -345,7 +345,7 @@ async fn eval_runs_with_evolution_jobs_off() {
 
     let stored = engine
         .backend()
-        .list(eval_namespace(), None, 100)
+        .list(eval_namespace(), rb_types::RecallFilter::default(), 100)
         .await
         .expect("list");
     assert_eq!(stored.len(), 2, "both fixtures stored");

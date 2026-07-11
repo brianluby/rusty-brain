@@ -155,6 +155,110 @@ fn remember_then_recall_round_trips_through_the_binary() {
     );
 }
 
+// PRD 2026-07-02 search-filter parity: the new recall/list filter flags flow
+// through the built binary to the daemon and change which rows come back.
+#[test]
+fn filter_flags_flow_through_the_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let config_home = dir.path();
+
+    let _reap = spawn_daemon(&exe, &socket, &db, config_home);
+    assert!(
+        wait_for_socket(&socket, Duration::from_secs(10)),
+        "daemon socket never appeared at {}",
+        socket.display()
+    );
+
+    let run = |args: &[&str]| {
+        let out = cli(&exe, &socket, &db, config_home, "filter-e2e")
+            .args(args)
+            .output()
+            .expect("run cli");
+        assert!(
+            out.status.success(),
+            "{args:?} failed: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    run(&[
+        "remember",
+        "the flagship decision content",
+        "--importance",
+        "9",
+        "--tags",
+        "core",
+    ]);
+    let low_out = run(&[
+        "--json",
+        "remember",
+        "the low priority scratch content",
+        "--importance",
+        "3",
+        "--tags",
+        "scratch",
+    ]);
+    let low_id = low_out
+        .split('"')
+        .find(|s| s.len() == 36 && s.matches('-').count() == 4)
+        .expect("remember --json must print the new id")
+        .to_string();
+
+    // Importance range on list.
+    let stdout = run(&["list", "--min-importance", "8"]);
+    assert!(stdout.contains("flagship decision"), "got: {stdout}");
+    assert!(!stdout.contains("low priority"), "got: {stdout}");
+
+    // Source filter: both rows were written by the CLI surface.
+    let stdout = run(&["list", "--source", "cli"]);
+    assert!(stdout.contains("flagship decision") && stdout.contains("low priority"));
+    let stdout = run(&["list", "--source", "hook"]);
+    assert!(
+        !stdout.contains("flagship decision") && !stdout.contains("low priority"),
+        "no row was written by a hook; got: {stdout}"
+    );
+
+    // Date window: an --until far in the past excludes everything.
+    let stdout = run(&["list", "--until", "2000-01-01"]);
+    assert!(!stdout.contains("content"), "got: {stdout}");
+
+    // Recall accepts the same flags (importance range narrows the hits).
+    let stdout = run(&["recall", "content", "--min-importance", "8"]);
+    assert!(stdout.contains("flagship decision"), "got: {stdout}");
+    assert!(!stdout.contains("low priority"), "got: {stdout}");
+
+    // Composition: source + importance + since.
+    let stdout = run(&[
+        "list",
+        "--source",
+        "cli",
+        "--min-importance",
+        "8",
+        "--since",
+        "2000-01-01",
+    ]);
+    assert!(stdout.contains("flagship decision") && !stdout.contains("low priority"));
+
+    // Archived state: delete one, then reach it only via --archived.
+    run(&["delete", &low_id]);
+    let stdout = run(&["list"]);
+    assert!(!stdout.contains("low priority"), "got: {stdout}");
+    let stdout = run(&["list", "--archived"]);
+    assert!(
+        stdout.contains("low priority") && !stdout.contains("flagship decision"),
+        "--archived must list ONLY archived rows; got: {stdout}"
+    );
+    let stdout = run(&["recall", "content", "--archived"]);
+    assert!(
+        stdout.contains("low priority") && !stdout.contains("flagship decision"),
+        "recall --archived must reach archived rows via keyword; got: {stdout}"
+    );
+}
+
 #[test]
 fn remember_batch_bulk_loads_lines_from_stdin() {
     use std::io::Write as _;

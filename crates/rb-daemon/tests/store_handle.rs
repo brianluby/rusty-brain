@@ -32,11 +32,19 @@ async fn write_then_read_round_trips_through_pool() {
     assert!(got.is_some(), "written memory must be retrievable");
     assert_eq!(got.unwrap().content, "always one db one transaction");
 
-    let listed = handle.list(ns.clone(), None, 50).await.unwrap();
+    let listed = handle
+        .list(ns.clone(), rb_types::RecallFilter::default(), 50)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), 1, "list returns the one written memory");
 
     let kw = handle
-        .keyword(ns.clone(), "memory".to_string(), 50)
+        .keyword(
+            ns.clone(),
+            "memory".to_string(),
+            50,
+            rb_types::MemoryState::Active,
+        )
         .await
         .unwrap();
     assert_eq!(kw, vec![id.clone()], "keyword search finds it by keyword");
@@ -151,7 +159,10 @@ async fn many_concurrent_writers_lose_nothing() {
         t.await.unwrap().unwrap();
     }
 
-    let listed = handle.list(ns, None, N + 10).await.unwrap();
+    let listed = handle
+        .list(ns, rb_types::RecallFilter::default(), N + 10)
+        .await
+        .unwrap();
     assert_eq!(listed.len(), N, "no writes lost under concurrency");
 
     handle.shutdown().await;
@@ -250,7 +261,9 @@ async fn panicking_read_closure_returns_connection_via_raii() {
     for _ in 0..POOL_SIZE {
         let h = handle.clone();
         let ns = ns.clone();
-        tasks.push(tokio::spawn(async move { h.list(ns, None, 10).await }));
+        tasks.push(tokio::spawn(async move {
+            h.list(ns, rb_types::RecallFilter::default(), 10).await
+        }));
     }
     for t in tasks {
         let listed = tokio::time::timeout(Duration::from_secs(5), t)

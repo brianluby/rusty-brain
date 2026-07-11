@@ -1,6 +1,6 @@
 use rb_types::{
     FeedbackKind, JobKind, LinkType, MemoryChanged, MemoryId, MemoryNote, MemoryType,
-    MemoryUpdates, Namespace, SearchResult,
+    MemoryUpdates, Namespace, RecallFilter, SearchResult,
 };
 use serde::{Deserialize, Serialize};
 
@@ -97,6 +97,19 @@ pub enum Request {
         memory_type: Option<MemoryType>,
         tags: Vec<String>,
         limit: usize,
+        /// Unified recall filter (PRD 2026-07-02 search-filter parity):
+        /// confidence/date ranges, sources, contested, archived state, and the
+        /// anchor plumbing. `memory_type`/`tags` above stay the legacy wire
+        /// slots for the subset old daemons honor; the daemon FOLDS them into
+        /// this filter (`RecallFilter::fold_recall_legacy`). Additive +
+        /// `#[serde(default, skip_serializing_if)]`: an old client's frame (no
+        /// key) decodes to the unconstrained default, and an empty filter
+        /// serializes to nothing — byte-identical to the pre-filter frame, so
+        /// NO CONTRACT_VERSION bump (the `Remember.confidence` precedent). An
+        /// old daemon ignores the unknown field, so a new client degrades
+        /// gracefully to the legacy-slot subset.
+        #[serde(default, skip_serializing_if = "RecallFilter::is_empty")]
+        filter: RecallFilter,
     },
     Get {
         id: MemoryId,
@@ -104,6 +117,11 @@ pub enum Request {
     List {
         min_importance: Option<u8>,
         limit: usize,
+        /// Unified list filter — same model, semantics, and wire-compat story
+        /// as `Recall::filter`; `min_importance` above stays the legacy slot
+        /// (folded via `RecallFilter::fold_list_legacy`).
+        #[serde(default, skip_serializing_if = "RecallFilter::is_empty")]
+        filter: RecallFilter,
     },
     Graph {
         id: MemoryId,
@@ -575,11 +593,35 @@ mod tests {
                 memory_type: Some(MemoryType::BugFix),
                 tags: vec!["sqlite".into()],
                 limit: 10,
+                filter: rb_types::RecallFilter::default(),
+            },
+            Request::Recall {
+                query: "q".into(),
+                memory_type: None,
+                tags: vec![],
+                limit: 10,
+                filter: rb_types::RecallFilter {
+                    min_confidence: Some(0.4),
+                    sources: vec!["hook".into()],
+                    contested: Some(false),
+                    state: rb_types::MemoryState::All,
+                    ..Default::default()
+                },
             },
             Request::Get { id: id.clone() },
             Request::List {
                 min_importance: Some(5),
                 limit: 20,
+                filter: rb_types::RecallFilter::default(),
+            },
+            Request::List {
+                min_importance: None,
+                limit: 20,
+                filter: rb_types::RecallFilter {
+                    since: Some(chrono::Utc::now()),
+                    state: rb_types::MemoryState::Archived,
+                    ..Default::default()
+                },
             },
             Request::Graph {
                 id: id.clone(),
@@ -833,6 +875,166 @@ mod tests {
                 recall_channels, ..
             } => assert_eq!(recall_channels, Some(totals)),
             other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_and_list_filter_round_trips() {
+        use rb_types::{MemoryState, RecallFilter};
+        let filter = RecallFilter {
+            min_confidence: Some(0.4),
+            sources: vec!["hook".to_string()],
+            contested: Some(true),
+            state: MemoryState::All,
+            ..Default::default()
+        };
+        let recall = Request::Recall {
+            query: "q".into(),
+            memory_type: None,
+            tags: vec![],
+            limit: 10,
+            filter: filter.clone(),
+        };
+        let json = serde_json::to_string(&recall).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::Recall { filter: back, .. } => assert_eq!(back, filter),
+            other => panic!("expected Recall, got {other:?}"),
+        }
+
+        let list = Request::List {
+            min_importance: None,
+            limit: 20,
+            filter: filter.clone(),
+        };
+        let json = serde_json::to_string(&list).unwrap();
+        match serde_json::from_str::<Request>(&json).unwrap() {
+            Request::List { filter: back, .. } => assert_eq!(back, filter),
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_and_list_without_filter_key_decode_to_default() {
+        // Wire compat (old client -> new daemon): a pre-filter frame carries no
+        // `filter` key and must decode to the unconstrained default — the
+        // `contested` additive-field precedent, NO CONTRACT_VERSION bump.
+        use rb_types::RecallFilter;
+        let recall: Request = serde_json::from_str(
+            r#"{"op":"Recall","query":"q","memory_type":null,"tags":[],"limit":10}"#,
+        )
+        .unwrap();
+        match recall {
+            Request::Recall { filter, .. } => assert!(filter.is_empty()),
+            other => panic!("expected Recall, got {other:?}"),
+        }
+        let list: Request =
+            serde_json::from_str(r#"{"op":"List","min_importance":5,"limit":20}"#).unwrap();
+        match list {
+            Request::List {
+                min_importance,
+                filter,
+                ..
+            } => {
+                assert_eq!(min_importance, Some(5));
+                assert_eq!(filter, RecallFilter::default());
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn unfiltered_recall_and_list_keep_the_pre_filter_byte_shape() {
+        // A default filter must serialize to NOTHING (skip_serializing_if), so
+        // requests that use no new filters stay byte-identical to the frames an
+        // old daemon already accepts (new client -> old daemon).
+        let json = serde_json::to_string(&Request::Recall {
+            query: "q".into(),
+            memory_type: None,
+            tags: vec![],
+            limit: 10,
+            filter: rb_types::RecallFilter::default(),
+        })
+        .unwrap();
+        assert_eq!(
+            json,
+            r#"{"op":"Recall","query":"q","memory_type":null,"tags":[],"limit":10}"#
+        );
+
+        let json = serde_json::to_string(&Request::List {
+            min_importance: Some(5),
+            limit: 20,
+            filter: rb_types::RecallFilter::default(),
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"op":"List","min_importance":5,"limit":20}"#);
+    }
+
+    #[test]
+    fn old_daemon_shape_tolerates_the_filter_field_on_the_wire() {
+        // The reverse direction (new client -> old daemon) when a filter IS
+        // set: a decoder that does not know `filter` must still accept the
+        // frame — serde ignores unknown fields by default, pinned here for the
+        // Recall/List variants (the `Handshake.identity` precedent).
+        #[derive(serde::Deserialize, Debug)]
+        #[serde(tag = "op")]
+        enum OldRequest {
+            Recall {
+                query: String,
+                memory_type: Option<MemoryType>,
+                tags: Vec<String>,
+                limit: usize,
+            },
+            List {
+                min_importance: Option<u8>,
+                limit: usize,
+            },
+        }
+
+        let json = serde_json::to_string(&Request::Recall {
+            query: "q".into(),
+            memory_type: Some(MemoryType::BugFix),
+            tags: vec!["t".into()],
+            limit: 10,
+            filter: rb_types::RecallFilter {
+                min_confidence: Some(0.4),
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        match serde_json::from_str::<OldRequest>(&json).unwrap() {
+            OldRequest::Recall {
+                query,
+                memory_type,
+                tags,
+                limit,
+            } => {
+                // The legacy slots still carry the old-daemon-honorable subset.
+                assert_eq!(query, "q");
+                assert_eq!(memory_type, Some(MemoryType::BugFix));
+                assert_eq!(tags, vec!["t".to_string()]);
+                assert_eq!(limit, 10);
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+
+        let json = serde_json::to_string(&Request::List {
+            min_importance: Some(5),
+            limit: 20,
+            filter: rb_types::RecallFilter {
+                sources: vec!["hook".into()],
+                ..Default::default()
+            },
+        })
+        .unwrap();
+        match serde_json::from_str::<OldRequest>(&json).unwrap() {
+            OldRequest::List {
+                min_importance,
+                limit,
+            } => {
+                assert_eq!(min_importance, Some(5));
+                assert_eq!(limit, 20);
+            }
+            other => panic!("expected List, got {other:?}"),
         }
     }
 

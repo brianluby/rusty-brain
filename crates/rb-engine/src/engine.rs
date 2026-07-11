@@ -173,17 +173,20 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self.in_namespace(note) && note.archived_at.is_none()
     }
 
-    fn matches_recall_filters(
-        note: &MemoryNote,
-        type_filter: Option<MemoryType>,
-        tags: &[String],
-    ) -> bool {
-        if let Some(ty) = type_filter {
-            if note.memory_type != ty {
-                return false;
-            }
+    /// Fail-fast filter gate shared by `recall` and `list`: range/bound
+    /// validation plus the anchor rejection — the anchors TABLE ships with the
+    /// typed-code-anchors PRD, so until then a non-empty anchor filter is an
+    /// explicit error, never a silently ignored constraint.
+    fn ensure_filter_supported(filter: &rb_types::RecallFilter) -> rb_types::Result<()> {
+        filter.validate()?;
+        if !filter.anchors.is_empty() {
+            return Err(rb_types::Error::InvalidArgument(
+                "anchor filters are not supported yet (the memory_anchors table ships with \
+                 typed code anchors)"
+                    .to_string(),
+            ));
         }
-        tags.iter().all(|t| note.tags.contains(t))
+        Ok(())
     }
 
     async fn get_scoped(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
@@ -356,7 +359,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Hybrid recall: embed the query, gather keyword + vector (+ 1-hop graph)
     /// candidates scoped to the engine namespace, rank with `rb_search`, then
-    /// return ranked `SearchResult`s after applying type/tag filters.
+    /// return ranked `SearchResult`s after applying the unified
+    /// [`rb_types::RecallFilter`] (PRD 2026-07-02 search-filter parity).
     ///
     /// Thin wrapper over [`MemoryEngine::recall_with_status`] that drops the
     /// degraded flag; callers that surface degradation (the daemon's Recall
@@ -365,13 +369,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         &self,
         query: &str,
         limit: usize,
-        type_filter: Option<MemoryType>,
-        tags: &[String],
+        filter: &rb_types::RecallFilter,
     ) -> rb_types::Result<Vec<rb_types::SearchResult>> {
-        Ok(self
-            .recall_with_status(query, limit, type_filter, tags)
-            .await?
-            .results)
+        Ok(self.recall_with_status(query, limit, filter).await?.results)
     }
 
     /// [`MemoryEngine::recall`] plus a degradation flag (W1.6d / F19): when the
@@ -380,14 +380,23 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// down with it — and `degraded` is set so the response can carry a
     /// warning. The vector channel is skipped entirely in that case; ranking
     /// proceeds on the surviving signals.
+    ///
+    /// Filter semantics: metadata dimensions apply per candidate BEFORE
+    /// ranking ([`rb_types::RecallFilter::matches`]); `contested` is resolved
+    /// through one batched `active_contradicts` lookup and FAILS CLOSED (a
+    /// filter must never silently return unfiltered results — unlike the
+    /// best-effort contested ANNOTATION, which stays fail-open); a non-default
+    /// `state` widens the keyword channel to archived rows (their vectors are
+    /// pruned on archive, so archived recall rides keyword+graph only).
     pub async fn recall_with_status(
         &self,
         query: &str,
         limit: usize,
-        type_filter: Option<MemoryType>,
-        tags: &[String],
+        filter: &rb_types::RecallFilter,
     ) -> rb_types::Result<RecallOutcome> {
         use std::collections::HashMap;
+
+        Self::ensure_filter_supported(filter)?;
 
         // Over-fetch candidates so post-filtering still has enough to fill `limit`.
         let candidate_limit = limit.saturating_mul(4).max(limit);
@@ -411,9 +420,16 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         let keyword = self
             .backend
-            .keyword(self.namespace.clone(), query.to_string(), candidate_limit)
+            .keyword(
+                self.namespace.clone(),
+                query.to_string(),
+                candidate_limit,
+                filter.state,
+            )
             .await?;
-        let vector = if degraded {
+        // Archived rows have no vector (pruned on archive: the live-only vec0
+        // partition invariant), so an archived-only recall skips the channel.
+        let vector = if degraded || filter.state == rb_types::MemoryState::Archived {
             Vec::new()
         } else {
             self.backend
@@ -421,14 +437,15 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .await?
         };
 
-        // Bounded 1-hop graph expansion of the top active in-namespace keyword hit only.
+        // Bounded 1-hop graph expansion of the top filter-matching in-namespace
+        // keyword hit only.
         let mut graph_seed = None;
         for id in &keyword {
             if self
                 .get_scoped(id.clone())
                 .await?
                 .as_ref()
-                .is_some_and(|note| self.active_in_namespace(note))
+                .is_some_and(|note| filter.matches(note))
             {
                 graph_seed = Some(id.clone());
                 break;
@@ -462,9 +479,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)> = HashMap::new();
         for note in fetched {
-            if !self.active_in_namespace(&note)
-                || !Self::matches_recall_filters(&note, type_filter, tags)
-            {
+            // `get_many` is already namespace-scoped; `filter.matches` covers
+            // every metadata dimension including the archived-state scope
+            // (default: active-only, the historical behavior).
+            if !self.in_namespace(&note) || !filter.matches(&note) {
                 continue;
             }
             // Carry confidence into ranking (Feature C): low-confidence memories
@@ -475,6 +493,24 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 (note.importance, note.confidence, note.created_at),
             );
             notes.insert(note.id.clone(), note);
+        }
+
+        // Contested filter (tri-state): resolve via ONE batched lookup over the
+        // metadata-surviving candidates and retain the requested side. FAILS
+        // CLOSED — an error here fails the recall rather than silently
+        // returning unfiltered results (the fail-open path below is only the
+        // best-effort annotation). The resolved set also stamps the returned
+        // notes' `contested` flag, so filter and flag can never disagree.
+        let mut contested_for_annotation: Option<std::collections::HashSet<MemoryId>> = None;
+        if let Some(want_contested) = filter.contested {
+            let ids: Vec<MemoryId> = notes.keys().cloned().collect();
+            let contested = self
+                .backend
+                .active_contradicts(self.namespace.clone(), ids)
+                .await?;
+            notes.retain(|id, _| contested.contains(id) == want_contested);
+            meta.retain(|id, _| notes.contains_key(id));
+            contested_for_annotation = Some(contested);
         }
 
         let filtered_keyword: Vec<MemoryId> = keyword
@@ -555,8 +591,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // Contradiction surfacing (Feature C): for the returned (post-ranking,
         // truncated) set only, batch-load active contradicts links and flag each
         // contested memory. FAIL-OPEN: a lookup error leaves results unflagged
-        // rather than failing recall.
-        let contested = self.contested_set(&returned_ids).await;
+        // rather than failing recall. When a contested FILTER already resolved
+        // the set (fail-closed above), reuse it instead of a second lookup.
+        let contested = match contested_for_annotation {
+            Some(set) => set,
+            None => self.contested_set(&returned_ids).await,
+        };
         for r in &mut results {
             r.memory.contested = contested.contains(&r.memory.id);
         }
@@ -707,17 +747,45 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self.get_scoped(id).await
     }
 
-    /// List memories in the engine namespace, most-recent first, optionally
-    /// filtered by a minimum importance.
+    /// List memories in the engine namespace, most-recent first, filtered by
+    /// the unified [`rb_types::RecallFilter`] (PRD 2026-07-02 search-filter
+    /// parity). Metadata dimensions are honored by the backend (SQL on the
+    /// real store); `contested` is resolved here through one batched
+    /// `active_contradicts` lookup over a bounded 4x over-fetch (mirroring
+    /// recall's candidate over-fetch) and FAILS CLOSED — so `list` may return
+    /// fewer than `limit` when contested rows dominate the window, but never
+    /// silently unfiltered results.
     pub async fn list(
         &self,
-        min_importance: Option<u8>,
+        filter: &rb_types::RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
+        Self::ensure_filter_supported(filter)?;
+        let fetch_limit = if filter.contested.is_some() {
+            limit.saturating_mul(4).max(limit)
+        } else {
+            limit
+        };
         let mut notes = self
             .backend
-            .list(self.namespace.clone(), min_importance, limit)
+            .list(self.namespace.clone(), filter.clone(), fetch_limit)
             .await?;
+        if let Some(want_contested) = filter.contested {
+            let ids: Vec<MemoryId> = notes.iter().map(|n| n.id.clone()).collect();
+            // Fail closed (filter), unlike the fail-open annotation below.
+            let contested = self
+                .backend
+                .active_contradicts(self.namespace.clone(), ids)
+                .await?;
+            notes.retain(|n| contested.contains(&n.id) == want_contested);
+            notes.truncate(limit);
+            // Stamp the flag from the SAME resolved set so filter and flag
+            // can never disagree.
+            for n in &mut notes {
+                n.contested = contested.contains(&n.id);
+            }
+            return Ok(notes);
+        }
         // Annotate the contested flag on list result rows (Feature C, fail-open).
         self.annotate_contested(&mut notes).await;
         Ok(notes)
@@ -883,11 +951,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         const IMPORTANT_FLOOR: u8 = 8;
         let mut recent = self
             .backend
-            .list(self.namespace.clone(), None, CONTEXT_LIMIT)
+            .list(
+                self.namespace.clone(),
+                rb_types::RecallFilter::default(),
+                CONTEXT_LIMIT,
+            )
             .await?;
         let mut important = self
             .backend
-            .list(self.namespace.clone(), Some(IMPORTANT_FLOOR), CONTEXT_LIMIT)
+            .list(
+                self.namespace.clone(),
+                rb_types::RecallFilter {
+                    min_importance: Some(IMPORTANT_FLOOR),
+                    ..Default::default()
+                },
+                CONTEXT_LIMIT,
+            )
             .await?;
         let total = recent.len();
         // Annotate contested on both context halves (Feature C, fail-open).
@@ -929,6 +1008,408 @@ mod tests {
             confidence: None,
             provenance: Provenance::default(),
         }
+    }
+
+    /// Store `n` notes shaped by `shape(i, note)` through the backend directly
+    /// (bypassing `remember` so tests control confidence/provenance/timestamps).
+    async fn seed_notes(
+        eng: &MemoryEngine<MockBackend, DeterministicProvider>,
+        n: usize,
+        shape: impl Fn(usize, &mut rb_types::MemoryNote),
+    ) -> Vec<MemoryId> {
+        let mut ids = Vec::new();
+        for i in 0..n {
+            let mut note = rb_types::MemoryNote::new(
+                Namespace::Project("rb".into()),
+                format!("seeded searchable content {i}"),
+                MemoryType::Insight,
+                5,
+            );
+            shape(i, &mut note);
+            ids.push(note.id.clone());
+            eng.backend().insert_note(note);
+        }
+        ids
+    }
+
+    fn only(filter: rb_types::RecallFilter) -> rb_types::RecallFilter {
+        filter
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_confidence_range() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            note.confidence = [0.2f32, 0.6, 0.95][i];
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    min_confidence: Some(0.5),
+                    max_confidence: Some(0.8),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_created_at_window() {
+        let eng = engine();
+        let t0 = chrono::Utc::now();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            note.created_at = t0 - chrono::Duration::days([10, 3, 0][i]);
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    since: Some(t0 - chrono::Duration::days(5)),
+                    until: Some(t0 - chrono::Duration::days(1)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_source() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            note.origin_source =
+                [Some("hook".to_string()), Some("cli".to_string()), None][i].clone();
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    sources: vec!["hook".to_string(), "mcp".to_string()],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn recall_filters_by_importance_range() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            note.importance = [2, 5, 9][i];
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    min_importance: Some(4),
+                    max_importance: Some(6),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[1].clone()]);
+    }
+
+    #[tokio::test]
+    async fn recall_contested_filter_selects_by_contested_state() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |_, _| {}).await;
+        // ids[0] <-> ids[1] contradict each other; ids[2] is uncontested.
+        eng.backend().link_contradicts(&ids[0], &ids[1]);
+
+        let contested_only = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let mut got: Vec<MemoryId> = contested_only.iter().map(|r| r.memory.id.clone()).collect();
+        got.sort_by_key(std::string::ToString::to_string);
+        let mut expected = vec![ids[0].clone(), ids[1].clone()];
+        expected.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(got, expected);
+        assert!(
+            contested_only.iter().all(|r| r.memory.contested),
+            "filtered-to-contested results must carry the contested flag"
+        );
+
+        let uncontested_only = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    contested: Some(false),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = uncontested_only
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect();
+        assert_eq!(got, vec![ids[2].clone()]);
+        assert!(uncontested_only.iter().all(|r| !r.memory.contested));
+    }
+
+    #[tokio::test]
+    async fn recall_contested_filter_fails_closed_on_lookup_error() {
+        // The contested ANNOTATION is fail-open (best-effort enrichment), but a
+        // contested FILTER must fail closed: silently returning unfiltered
+        // results would violate the query.
+        let eng = engine();
+        seed_notes(&eng, 1, |_, _| {}).await;
+        eng.backend().set_fail_contradicts(true);
+        let err = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::Storage(_)));
+    }
+
+    #[tokio::test]
+    async fn recall_state_filter_reaches_archived_memories() {
+        let eng = engine();
+        let t0 = chrono::Utc::now();
+        let ids = seed_notes(&eng, 2, |i, note| {
+            if i == 1 {
+                note.archived_at = Some(t0);
+            }
+        })
+        .await;
+
+        // Default scope stays active-only.
+        let active = eng
+            .recall("seeded", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = active.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[0].clone()]);
+
+        // state=archived surfaces ONLY the archived memory (keyword channel).
+        let archived = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    state: rb_types::MemoryState::Archived,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = archived.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[1].clone()]);
+
+        // state=all surfaces both.
+        let all = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    state: rb_types::MemoryState::All,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_anchor_filters_until_typed_anchors_land() {
+        let eng = engine();
+        let err = eng
+            .recall(
+                "q",
+                10,
+                &only(rb_types::RecallFilter {
+                    anchors: vec![rb_types::AnchorFilter {
+                        kind: rb_types::AnchorKind::File,
+                        value: "src/lib.rs".into(),
+                    }],
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_invalid_filter_bounds() {
+        let eng = engine();
+        let err = eng
+            .recall(
+                "q",
+                10,
+                &only(rb_types::RecallFilter {
+                    min_confidence: Some(0.9),
+                    max_confidence: Some(0.1),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
+    }
+
+    #[tokio::test]
+    async fn recall_filters_compose_across_dimensions() {
+        let eng = engine();
+        let t0 = chrono::Utc::now();
+        let ids = seed_notes(&eng, 4, |i, note| {
+            // Only note 0 satisfies ALL three legs.
+            note.origin_source = Some(if i == 2 { "cli" } else { "hook" }.to_string());
+            note.importance = if i == 3 { 3 } else { 8 };
+            note.created_at = if i == 1 {
+                t0 - chrono::Duration::days(30)
+            } else {
+                t0
+            };
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded",
+                10,
+                &only(rb_types::RecallFilter {
+                    sources: vec!["hook".to_string()],
+                    min_importance: Some(7),
+                    since: Some(t0 - chrono::Duration::days(7)),
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(got, vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn list_honors_the_unified_filter() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            note.origin_source = Some(if i == 0 { "hook" } else { "cli" }.to_string());
+            note.confidence = [0.9f32, 0.9, 0.2][i];
+        })
+        .await;
+        let listed = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    sources: vec!["hook".to_string()],
+                    min_confidence: Some(0.5),
+                    ..Default::default()
+                }),
+                10,
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = listed.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(got, vec![ids[0].clone()]);
+    }
+
+    #[tokio::test]
+    async fn list_contested_filter_selects_by_contested_state() {
+        let eng = engine();
+        let ids = seed_notes(&eng, 3, |_, _| {}).await;
+        eng.backend().link_contradicts(&ids[0], &ids[1]);
+
+        let contested = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                }),
+                10,
+            )
+            .await
+            .unwrap();
+        let mut got: Vec<MemoryId> = contested.iter().map(|n| n.id.clone()).collect();
+        got.sort_by_key(std::string::ToString::to_string);
+        let mut expected = vec![ids[0].clone(), ids[1].clone()];
+        expected.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(got, expected);
+        assert!(contested.iter().all(|n| n.contested));
+
+        let uncontested = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    contested: Some(false),
+                    ..Default::default()
+                }),
+                10,
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = uncontested.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(got, vec![ids[2].clone()]);
+    }
+
+    #[tokio::test]
+    async fn list_rejects_anchor_filters_and_invalid_bounds() {
+        let eng = engine();
+        let err = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    anchors: vec![rb_types::AnchorFilter {
+                        kind: rb_types::AnchorKind::Symbol,
+                        value: "Engine::recall".into(),
+                    }],
+                    ..Default::default()
+                }),
+                10,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
+
+        let err = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    min_importance: Some(9),
+                    max_importance: Some(2),
+                    ..Default::default()
+                }),
+                10,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
     }
 
     #[tokio::test]
@@ -1253,7 +1734,9 @@ mod tests {
         );
 
         eng.remember(input("kind routing note", 5)).await.unwrap();
-        eng.recall("kind routing", 5, None, &[]).await.unwrap();
+        eng.recall("kind routing", 5, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
 
         // A stale row forces reembed to issue one Document-kind embed.
         let mut stale = note(
@@ -1319,7 +1802,7 @@ mod tests {
             .unwrap();
 
         let outcome = eng
-            .recall_with_status("sqlite checkpoint", 10, None, &[])
+            .recall_with_status("sqlite checkpoint", 10, &rb_types::RecallFilter::default())
             .await
             .unwrap();
         assert!(outcome.degraded, "embedder error must flag degradation");
@@ -1338,7 +1821,7 @@ mod tests {
 
         // The thin recall() wrapper serves the same degraded results.
         let results = eng
-            .recall("sqlite checkpoint", 10, None, &[])
+            .recall("sqlite checkpoint", 10, &rb_types::RecallFilter::default())
             .await
             .unwrap();
         assert_eq!(results.len(), outcome.results.len());
@@ -1351,7 +1834,7 @@ mod tests {
             .await
             .unwrap();
         let outcome = eng
-            .recall_with_status("healthy embedder", 10, None, &[])
+            .recall_with_status("healthy embedder", 10, &rb_types::RecallFilter::default())
             .await
             .unwrap();
         assert!(!outcome.degraded, "a healthy embedder never degrades");
@@ -1494,7 +1977,10 @@ mod tests {
         )
         .await;
         seed(&eng, "beta topic about tokio", MemoryType::Insight, 5, &[]).await;
-        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("topic", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         // scores are finite and sorted descending.
         assert!(results.iter().all(|r| r.score.is_finite()));
@@ -1518,7 +2004,10 @@ mod tests {
         eng.backend()
             .set_graph_neighbors(kw.clone(), vec![(graph_only.clone(), 1)]);
 
-        let results = eng.recall("candidate", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("candidate", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 3);
         let channels_of = |id: &rb_types::MemoryId| {
             results
@@ -1560,7 +2049,10 @@ mod tests {
         eng.backend()
             .set_graph_neighbors(id.clone(), vec![(id.clone(), 1)]);
 
-        let results = eng.recall("everywhere", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("everywhere", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         let channels = results[0].channels;
         assert!(channels.fts && channels.vector && channels.graph);
@@ -1579,7 +2071,10 @@ mod tests {
             )
             .await;
         }
-        let results = eng.recall("doc", 2, None, &[]).await.unwrap();
+        let results = eng
+            .recall("doc", 2, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
     }
 
@@ -1596,7 +2091,10 @@ mod tests {
         // Cosine distance 1.0 = orthogonal = zero vector signal (W1.1 scale).
         eng.backend()
             .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
-        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert!(
             results.is_empty(),
             "prior-only candidates must not be returned, got {} results",
@@ -1612,7 +2110,10 @@ mod tests {
         eng.backend().set_keyword_results(vec![]);
         eng.backend()
             .set_vector_results(vec![(strong.clone(), 0.0), (junk.clone(), 1.0)]);
-        let results = eng.recall("query", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(
             results.len(),
             1,
@@ -1633,7 +2134,10 @@ mod tests {
         eng.backend().set_keyword_results(vec![]);
         eng.backend()
             .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
-        let results = eng.recall("unrelated query", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2, "floor disabled -> junk returned again");
     }
 
@@ -1643,7 +2147,14 @@ mod tests {
         seed(&eng, "a bug fix note", MemoryType::BugFix, 5, &[]).await;
         seed(&eng, "an insight note", MemoryType::Insight, 5, &[]).await;
         let results = eng
-            .recall("note", 10, Some(MemoryType::BugFix), &[])
+            .recall(
+                "note",
+                10,
+                &rb_types::RecallFilter {
+                    types: vec![MemoryType::BugFix],
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1656,7 +2167,14 @@ mod tests {
         seed(&eng, "tagged one", MemoryType::Insight, 5, &["x", "y"]).await;
         seed(&eng, "tagged two", MemoryType::Insight, 5, &["x"]).await;
         let results = eng
-            .recall("tagged", 10, None, &["x".to_string(), "y".to_string()])
+            .recall(
+                "tagged",
+                10,
+                &rb_types::RecallFilter {
+                    tags: vec!["x".to_string(), "y".to_string()],
+                    ..Default::default()
+                },
+            )
             .await
             .unwrap();
         assert_eq!(results.len(), 1);
@@ -1712,8 +2230,11 @@ mod tests {
             .recall(
                 "candidate",
                 3,
-                Some(MemoryType::BugFix),
-                &["keep".to_string()],
+                &rb_types::RecallFilter {
+                    types: vec![MemoryType::BugFix],
+                    tags: vec!["keep".to_string()],
+                    ..Default::default()
+                },
             )
             .await
             .unwrap();
@@ -1732,7 +2253,10 @@ mod tests {
         let eng = engine();
         let _low = seed(&eng, "ranking probe content", MemoryType::Insight, 2, &[]).await;
         let _high = seed(&eng, "ranking probe content", MemoryType::Insight, 9, &[]).await;
-        let results = eng.recall("ranking probe", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("ranking probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.score.is_finite()));
         assert!(results[0].score >= results[1].score);
@@ -1757,7 +2281,10 @@ mod tests {
         )
         .await;
         seed(&eng, "beta topic about tokio", MemoryType::Insight, 5, &[]).await;
-        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("topic", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         // RRF path returns ranked results with finite, descending scores.
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| r.score.is_finite()));
@@ -1786,7 +2313,10 @@ mod tests {
         .await;
         eng.backend().link_contradicts(&a, &b);
 
-        let results = eng.recall("alpha", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("alpha", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         // both endpoints of the active contradicts link are contested.
         assert!(results.iter().all(|r| r.memory.contested));
@@ -1797,7 +2327,10 @@ mod tests {
         let eng = engine();
         seed(&eng, "uncontested note one", MemoryType::Insight, 5, &[]).await;
         seed(&eng, "uncontested note two", MemoryType::Insight, 5, &[]).await;
-        let results = eng.recall("note", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("note", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert!(results.iter().all(|r| !r.memory.contested));
     }
@@ -1812,7 +2345,10 @@ mod tests {
         eng.backend().link_contradicts(&a, &b);
         eng.backend().set_fail_contradicts(true);
 
-        let results = eng.recall("claim", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("claim", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2, "recall still succeeds on lookup error");
         assert!(
             results.iter().all(|r| !r.memory.contested),
@@ -1850,7 +2386,10 @@ mod tests {
         eng.backend()
             .set_vector_results(vec![(wrong_id.clone(), 0.2), (correct_id.clone(), 0.2)]);
 
-        let results = eng.recall("probe", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(
             results[0].memory.id, correct_id,
@@ -1880,7 +2419,10 @@ mod tests {
         let a = eng.remember(input("list a", 5)).await.unwrap();
         let b = eng.remember(input("list b", 5)).await.unwrap();
         eng.backend().link_contradicts(&a, &b);
-        let notes = eng.list(None, 10).await.unwrap();
+        let notes = eng
+            .list(&rb_types::RecallFilter::default(), 10)
+            .await
+            .unwrap();
         assert!(notes.iter().find(|n| n.id == a).unwrap().contested);
         assert!(notes.iter().find(|n| n.id == b).unwrap().contested);
     }
@@ -1888,7 +2430,10 @@ mod tests {
     #[tokio::test]
     async fn recall_empty_store_returns_empty() {
         let eng = engine();
-        let results = eng.recall("anything", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("anything", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert!(results.is_empty());
     }
 
@@ -1897,7 +2442,10 @@ mod tests {
         let eng = engine();
         seed(&eng, "alpha sqlite topic", MemoryType::Insight, 5, &[]).await;
         seed(&eng, "beta tokio topic", MemoryType::Insight, 5, &[]).await;
-        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("topic", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 2);
         // each returned id had its access recorded.
         for r in &results {
@@ -1912,7 +2460,10 @@ mod tests {
         seed(&eng, "probe content", MemoryType::Insight, 5, &[]).await;
         eng.backend().set_fail_record_access(true);
         // Recall still returns its results despite record_access failing.
-        let results = eng.recall("probe", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(results.len(), 1);
         // record_access was attempted (best-effort), even though it errored.
         assert!(eng.backend().record_access_count() >= 1);
@@ -1958,11 +2509,23 @@ mod tests {
         let eng = engine();
         seed(&eng, "first", MemoryType::Insight, 3, &[]).await;
         seed(&eng, "second", MemoryType::Insight, 9, &[]).await;
-        let all = eng.list(None, 10).await.unwrap();
+        let all = eng
+            .list(&rb_types::RecallFilter::default(), 10)
+            .await
+            .unwrap();
         assert_eq!(all.len(), 2);
         // most recent first (second was inserted last).
         assert_eq!(all[0].content, "second");
-        let important = eng.list(Some(8), 10).await.unwrap();
+        let important = eng
+            .list(
+                &rb_types::RecallFilter {
+                    min_importance: Some(8),
+                    ..Default::default()
+                },
+                10,
+            )
+            .await
+            .unwrap();
         assert_eq!(important.len(), 1);
         assert_eq!(important[0].importance, 9);
     }
@@ -2388,7 +2951,10 @@ mod tests {
             ],
         );
 
-        let results = eng.recall("topic", 10, None, &[]).await.unwrap();
+        let results = eng
+            .recall("topic", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
 
         assert!(results.iter().all(|r| {
             r.memory.namespace == Namespace::Project("rb".into()) && r.memory.archived_at.is_none()

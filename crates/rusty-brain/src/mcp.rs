@@ -389,11 +389,13 @@ mod tests {
                 memory_type: None,
                 tags: vec![],
                 limit: 5,
+                filter: rb_types::RecallFilter::default(),
             },
             Request::Get { id: id() },
             Request::List {
                 min_importance: None,
                 limit: 10,
+                filter: rb_types::RecallFilter::default(),
             },
             Request::Graph { id: id(), depth: 2 },
             Request::Context,

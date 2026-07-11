@@ -990,6 +990,7 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
             memory_type: None,
             tags: vec![],
             limit: 10,
+            filter: rb_types::RecallFilter::default(),
         },
     )
     .await
@@ -1004,6 +1005,286 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
             );
         }
         other => unreachable!("expected Recalled, got {other:?}"),
+    }
+
+    daemon.stop().await;
+}
+
+// PRD 2026-07-02 search-filter parity e2e: every new filter dimension (and a
+// composition) flows client -> proto -> daemon -> engine -> store over a real
+// socket, and a pre-filter frame (no `filter` key) still decodes and behaves
+// exactly as before — additive, no CONTRACT_VERSION bump.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recall_and_list_filters_flow_over_the_wire() {
+    use rb_types::{MemoryState, RecallFilter};
+
+    let daemon = RunningDaemon::start(4).await;
+    let ns = Namespace::Project("filter-parity".to_string());
+
+    // Two writers with distinct declared sources so the provenance filter has
+    // something to distinguish.
+    let mut cli_client = Client::connect_with_identity(
+        &daemon.socket,
+        ns.clone(),
+        Some(ClientIdentity {
+            source: Some("cli".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+    let mut mcp_client = Client::connect_with_identity(
+        &daemon.socket,
+        ns.clone(),
+        Some(ClientIdentity {
+            source: Some("mcp".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    let cutoff = chrono::Utc::now() - chrono::Duration::hours(1);
+
+    async fn remember_with(
+        client: &mut Client,
+        body: &str,
+        importance: u8,
+        confidence: f32,
+    ) -> rb_types::MemoryId {
+        client
+            .remember(
+                body.to_string(),
+                None,
+                MemoryType::Insight,
+                importance,
+                vec![],
+                vec![],
+                vec![],
+                Some(confidence),
+            )
+            .await
+            .unwrap()
+    }
+    let low_conf = remember_with(&mut cli_client, "filterable low confidence", 3, 0.2).await;
+    let high_conf = remember_with(&mut cli_client, "filterable high confidence", 8, 0.9).await;
+    let from_mcp = remember_with(&mut mcp_client, "filterable from mcp", 8, 0.9).await;
+
+    // Confidence range (recall).
+    let (results, _) = cli_client
+        .recall_filtered_with_status(
+            "filterable".to_string(),
+            RecallFilter {
+                min_confidence: Some(0.5),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    let got: std::collections::HashSet<_> = results.iter().map(|r| r.memory.id.clone()).collect();
+    assert!(got.contains(&high_conf) && got.contains(&from_mcp) && !got.contains(&low_conf));
+
+    // Source (list).
+    let listed = cli_client
+        .list_filtered(
+            RecallFilter {
+                sources: vec!["mcp".to_string()],
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+        vec![from_mcp.clone()]
+    );
+
+    // Date window: everything here was created after `cutoff`; an until-bound
+    // BEFORE the writes excludes everything, a since-bound includes all three.
+    let listed = cli_client
+        .list_filtered(
+            RecallFilter {
+                until: Some(cutoff),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert!(listed.is_empty(), "until-before-writes must exclude all");
+    let listed = cli_client
+        .list_filtered(
+            RecallFilter {
+                since: Some(cutoff),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(listed.len(), 3, "since-before-writes must include all");
+
+    // Composition: source + min_importance + min_confidence.
+    let (results, _) = cli_client
+        .recall_filtered_with_status(
+            "filterable".to_string(),
+            RecallFilter {
+                sources: vec!["cli".to_string()],
+                min_importance: Some(7),
+                min_confidence: Some(0.5),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect::<Vec<_>>(),
+        vec![high_conf.clone()]
+    );
+
+    // Contested (tri-state) over the wire.
+    cli_client
+        .link(
+            high_conf.clone(),
+            from_mcp.clone(),
+            rb_types::LinkType::Contradicts,
+            Some("parity test".to_string()),
+        )
+        .await
+        .unwrap();
+    let contested = cli_client
+        .list_filtered(
+            RecallFilter {
+                contested: Some(true),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    let got: std::collections::HashSet<_> = contested.iter().map(|n| n.id.clone()).collect();
+    assert_eq!(
+        got,
+        [high_conf.clone(), from_mcp.clone()].into_iter().collect()
+    );
+    assert!(contested.iter().all(|n| n.contested));
+    let uncontested = cli_client
+        .list_filtered(
+            RecallFilter {
+                contested: Some(false),
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        uncontested.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+        vec![low_conf.clone()]
+    );
+
+    // Archived state: archive one, then reach it ONLY via the state filter —
+    // through list AND through recall's keyword channel.
+    cli_client.delete(low_conf.clone()).await.unwrap();
+    let active_default = cli_client.list(None, 10).await.unwrap();
+    assert!(active_default.iter().all(|n| n.id != low_conf));
+    let archived_listed = cli_client
+        .list_filtered(
+            RecallFilter {
+                state: MemoryState::Archived,
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_listed
+            .iter()
+            .map(|n| n.id.clone())
+            .collect::<Vec<_>>(),
+        vec![low_conf.clone()]
+    );
+    let (archived_recall, _) = cli_client
+        .recall_filtered_with_status(
+            "filterable".to_string(),
+            RecallFilter {
+                state: MemoryState::Archived,
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        archived_recall
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect::<Vec<_>>(),
+        vec![low_conf.clone()]
+    );
+
+    // Anchor filters fail fast (typed-code-anchors is not shipped yet): the
+    // daemon replies with a client-safe error instead of unfiltered results.
+    let err = cli_client
+        .list_filtered(
+            RecallFilter {
+                anchors: vec![rb_types::AnchorFilter {
+                    kind: rb_types::AnchorKind::File,
+                    value: "src/server.rs".to_string(),
+                }],
+                ..Default::default()
+            },
+            10,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, Error::InvalidArgument(_)),
+        "anchor filter must fail fast over the wire, got {err:?}"
+    );
+
+    // Old-client compatibility: a raw pre-filter frame (NO `filter` key at
+    // all) must decode on the new daemon and behave exactly as before.
+    let stream = tokio::net::UnixStream::connect(&daemon.socket)
+        .await
+        .unwrap();
+    let mut framed = rb_proto::bounded_framed(stream);
+    rb_proto::write_frame(
+        &mut framed,
+        &rb_proto::Handshake {
+            contract_version: rb_proto::CONTRACT_VERSION,
+            namespace: ns.clone(),
+            identity: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ack: rb_proto::HandshakeAck = rb_proto::read_frame(&mut framed).await.unwrap();
+    assert!(ack.ok, "handshake must succeed: {:?}", ack.message);
+    rb_proto::write_frame(
+        &mut framed,
+        &serde_json::json!({ "op": "List", "min_importance": null, "limit": 10 }),
+    )
+    .await
+    .unwrap();
+    let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
+    match resp {
+        rb_proto::Response::Listed { memories } => {
+            let got: std::collections::HashSet<_> = memories.iter().map(|n| n.id.clone()).collect();
+            assert_eq!(
+                got,
+                [high_conf, from_mcp].into_iter().collect(),
+                "an old frame must keep the pre-filter default (active, unfiltered)"
+            );
+        }
+        other => unreachable!("expected Listed, got {other:?}"),
     }
 
     daemon.stop().await;

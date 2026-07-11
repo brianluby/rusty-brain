@@ -689,19 +689,37 @@ impl Store for SqliteStore {
     }
 
     fn keyword_search(&self, ns: &Namespace, query: &str, limit: usize) -> Result<Vec<MemoryId>> {
+        self.keyword_search_in_state(ns, query, limit, rb_types::MemoryState::Active)
+    }
+
+    fn keyword_search_in_state(
+        &self,
+        ns: &Namespace,
+        query: &str,
+        limit: usize,
+        state: rb_types::MemoryState,
+    ) -> Result<Vec<MemoryId>> {
         let match_expr = escape_fts5_query(query);
+        // The archived predicate is one of three FIXED literals (never caller
+        // data), so the composed SQL stays injection-free.
+        let archived_predicate = match state {
+            rb_types::MemoryState::Active => "AND m.archived_at IS NULL",
+            rb_types::MemoryState::Archived => "AND m.archived_at IS NOT NULL",
+            rb_types::MemoryState::All => "",
+        };
+        let sql = format!(
+            "SELECT m.memory_id
+             FROM memories_fts
+             JOIN memories m ON m.rowid = memories_fts.rowid
+             WHERE memories_fts MATCH ?1
+               AND m.namespace = ?2
+               {archived_predicate}
+             ORDER BY rank
+             LIMIT ?3"
+        );
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT m.memory_id
-                 FROM memories_fts
-                 JOIN memories m ON m.rowid = memories_fts.rowid
-                 WHERE memories_fts MATCH ?1
-                   AND m.namespace = ?2
-                   AND m.archived_at IS NULL
-                 ORDER BY rank
-                 LIMIT ?3",
-            )
+            .prepare(&sql)
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
@@ -873,30 +891,160 @@ impl Store for SqliteStore {
         min_importance: Option<u8>,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        let min = min_importance.unwrap_or(0) as i64;
+        let filter = rb_types::RecallFilter::default().fold_list_legacy(min_importance);
+        self.list_filtered(ns, &filter, limit)
+    }
+
+    fn list_filtered(
+        &self,
+        ns: &Namespace,
+        filter: &rb_types::RecallFilter,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>> {
+        // Anchors need the typed-code-anchors table (PRD 2026-07-02); until it
+        // lands, fail fast rather than silently returning unfiltered rows.
+        if !filter.anchors.is_empty() {
+            return Err(Error::InvalidArgument(
+                "anchor filters are not supported yet (the memory_anchors table ships with \
+                 typed code anchors)"
+                    .to_string(),
+            ));
+        }
+        // Defense-in-depth boundary validation, consistent with insert/update.
+        filter.validate()?;
+
+        // Build the WHERE clause dynamically: every fragment below is a FIXED
+        // literal (no caller data is ever interpolated); caller values ride
+        // numbered parameters exclusively.
+        let mut sql = String::from(
+            "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                    keywords, tags, context, memory_type, importance, confidence,
+                    related_files, access_count, last_accessed_at, archived_at,
+                    superseded_by, embedding_model, embedding_input_version,
+                    origin_user, origin_host, origin_agent, origin_source, session_id
+             FROM memories m
+             WHERE m.namespace = ?1",
+        );
+        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ns.as_db_string())];
+        fn push(
+            sql: &mut String,
+            params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+            clause: &str,
+            value: Box<dyn rusqlite::ToSql>,
+        ) {
+            params.push(value);
+            sql.push_str(" AND ");
+            sql.push_str(clause);
+            sql.push_str(&format!("?{}", params.len()));
+        }
+
+        match filter.state {
+            rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
+            rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
+            rb_types::MemoryState::All => {}
+        }
+        if let Some(min) = filter.min_importance {
+            push(
+                &mut sql,
+                &mut params,
+                "m.importance >= ",
+                Box::new(min as i64),
+            );
+        }
+        if let Some(max) = filter.max_importance {
+            push(
+                &mut sql,
+                &mut params,
+                "m.importance <= ",
+                Box::new(max as i64),
+            );
+        }
+        if let Some(min) = filter.min_confidence {
+            push(
+                &mut sql,
+                &mut params,
+                "m.confidence >= ",
+                Box::new(f64::from(min)),
+            );
+        }
+        if let Some(max) = filter.max_confidence {
+            push(
+                &mut sql,
+                &mut params,
+                "m.confidence <= ",
+                Box::new(f64::from(max)),
+            );
+        }
+        if let Some(since) = filter.since {
+            push(
+                &mut sql,
+                &mut params,
+                "m.created_at >= ",
+                Box::new(since.timestamp()),
+            );
+        }
+        if let Some(until) = filter.until {
+            push(
+                &mut sql,
+                &mut params,
+                "m.created_at <= ",
+                Box::new(until.timestamp()),
+            );
+        }
+        if !filter.types.is_empty() {
+            // Any-of over the canonical db strings, one placeholder per type.
+            let start = params.len() + 1;
+            let placeholders: Vec<String> = (0..filter.types.len())
+                .map(|i| format!("?{}", start + i))
+                .collect();
+            sql.push_str(&format!(
+                " AND m.memory_type IN ({})",
+                placeholders.join(", ")
+            ));
+            for t in &filter.types {
+                params.push(Box::new(t.as_str().to_string()));
+            }
+        }
+        if !filter.sources.is_empty() {
+            // Any-of; a NULL origin_source never matches an IN list, so
+            // pre-provenance rows are correctly excluded.
+            let start = params.len() + 1;
+            let placeholders: Vec<String> = (0..filter.sources.len())
+                .map(|i| format!("?{}", start + i))
+                .collect();
+            sql.push_str(&format!(
+                " AND m.origin_source IN ({})",
+                placeholders.join(", ")
+            ));
+            for s in &filter.sources {
+                params.push(Box::new(s.clone()));
+            }
+        }
+        for tag in &filter.tags {
+            // All-of: one EXISTS per required tag over the JSON tags array
+            // (json1 ships with the bundled SQLite).
+            push(
+                &mut sql,
+                &mut params,
+                "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ",
+                Box::new(tag.clone()),
+            );
+            sql.push(')');
+        }
+
+        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+        sql.push_str(&format!(
+            " ORDER BY m.created_at DESC LIMIT ?{}",
+            params.len()
+        ));
+
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         let mut stmt = self
             .conn
-            .prepare(
-                "SELECT memory_id, namespace, created_at, updated_at, content, summary,
-                        keywords, tags, context, memory_type, importance, confidence,
-                        related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id
-                 FROM memories
-                 WHERE namespace = ?1
-                   AND archived_at IS NULL
-                   AND importance >= ?2
-                 ORDER BY created_at DESC
-                 LIMIT ?3",
-            )
+            .prepare(&sql)
             .map_err(|e| Error::Storage(e.to_string()))?;
-
         let mut rows = stmt
-            .query(rusqlite::params![
-                ns.as_db_string(),
-                min,
-                i64::try_from(limit).unwrap_or(i64::MAX)
-            ])
+            .query(refs.as_slice())
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut out = Vec::new();
@@ -2169,6 +2317,338 @@ mod list_tests {
         let res = store.list(&proj, None, 10).unwrap();
         let ids: Vec<_> = res.iter().map(|m| m.id.clone()).collect();
         assert_eq!(ids, vec![keep]);
+    }
+}
+#[cfg(test)]
+mod list_filtered_tests {
+    use super::*;
+    use rb_types::{MemoryNote, MemoryState, MemoryType, Namespace, RecallFilter};
+
+    fn ns() -> Namespace {
+        Namespace::Project("filter".into())
+    }
+
+    fn insert(store: &SqliteStore, f: impl FnOnce(&mut MemoryNote)) -> rb_types::MemoryId {
+        let mut m = MemoryNote::new(ns(), "filterable content".into(), MemoryType::Insight, 5);
+        f(&mut m);
+        let id = m.id.clone();
+        store.insert_memory(&m, None).unwrap();
+        id
+    }
+
+    fn ids(notes: &[MemoryNote]) -> Vec<rb_types::MemoryId> {
+        notes.iter().map(|m| m.id.clone()).collect()
+    }
+
+    #[test]
+    fn state_scopes_archived_rows() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let active = insert(&store, |_| {});
+        let archived = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(10);
+        });
+        store.archive_memory(&archived).unwrap();
+
+        let default_scope = store
+            .list_filtered(&ns(), &RecallFilter::default(), 10)
+            .unwrap();
+        assert_eq!(ids(&default_scope), vec![active.clone()]);
+
+        let archived_scope = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    state: MemoryState::Archived,
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&archived_scope), vec![archived.clone()]);
+
+        let all_scope = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    state: MemoryState::All,
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&all_scope), vec![active, archived]);
+    }
+
+    #[test]
+    fn filters_by_importance_and_confidence_ranges() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let _low = insert(&store, |m| {
+            m.importance = 2;
+            m.confidence = 0.2;
+        });
+        let mid = insert(&store, |m| {
+            m.importance = 5;
+            m.confidence = 0.6;
+        });
+        let _high = insert(&store, |m| {
+            m.importance = 9;
+            m.confidence = 0.95;
+        });
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    min_importance: Some(4),
+                    max_importance: Some(6),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![mid.clone()]);
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    min_confidence: Some(0.5),
+                    max_confidence: Some(0.8),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![mid]);
+    }
+
+    #[test]
+    fn filters_by_created_at_window() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let t0 = chrono::Utc::now();
+        let _old = insert(&store, |m| m.created_at = t0 - chrono::Duration::days(10));
+        let recent = insert(&store, |m| m.created_at = t0 - chrono::Duration::days(2));
+        let _newest = insert(&store, |m| m.created_at = t0);
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    since: Some(t0 - chrono::Duration::days(5)),
+                    until: Some(t0 - chrono::Duration::days(1)),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![recent]);
+    }
+
+    #[test]
+    fn filters_by_types_and_sources() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let bug = insert(&store, |m| {
+            m.memory_type = MemoryType::BugFix;
+            m.origin_source = Some("hook".into());
+        });
+        let _insight = insert(&store, |m| {
+            m.origin_source = Some("cli".into());
+            m.created_at -= chrono::Duration::seconds(5);
+        });
+        let constraint = insert(&store, |m| {
+            m.memory_type = MemoryType::Constraint;
+            // No provenance: must never match a source constraint.
+            m.origin_source = None;
+            m.created_at -= chrono::Duration::seconds(10);
+        });
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    types: vec![MemoryType::BugFix, MemoryType::Constraint],
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![bug.clone(), constraint]);
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    sources: vec!["hook".into(), "mcp".into()],
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![bug]);
+    }
+
+    #[test]
+    fn requires_every_tag() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let both = insert(&store, |m| m.tags = vec!["a".into(), "b".into()]);
+        let _only_a = insert(&store, |m| {
+            m.tags = vec!["a".into()];
+            m.created_at -= chrono::Duration::seconds(5);
+        });
+        let _untagged = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(10);
+        });
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    tags: vec!["a".into(), "b".into()],
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![both]);
+    }
+
+    #[test]
+    fn composes_dimensions_and_respects_limit_and_namespace() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let hit = insert(&store, |m| {
+            m.importance = 8;
+            m.origin_source = Some("hook".into());
+            m.tags = vec!["x".into()];
+        });
+        // Fails the importance leg.
+        let _low = insert(&store, |m| {
+            m.importance = 3;
+            m.origin_source = Some("hook".into());
+            m.tags = vec!["x".into()];
+            m.created_at -= chrono::Duration::seconds(5);
+        });
+        // Fails the source leg.
+        let _cli = insert(&store, |m| {
+            m.importance = 8;
+            m.origin_source = Some("cli".into());
+            m.tags = vec!["x".into()];
+            m.created_at -= chrono::Duration::seconds(10);
+        });
+        // Out-of-namespace row never surfaces.
+        let mut foreign =
+            MemoryNote::new(Namespace::Global, "foreign".into(), MemoryType::Insight, 8);
+        foreign.origin_source = Some("hook".into());
+        foreign.tags = vec!["x".into()];
+        store.insert_memory(&foreign, None).unwrap();
+
+        let filter = RecallFilter {
+            min_importance: Some(7),
+            sources: vec!["hook".into()],
+            tags: vec!["x".into()],
+            ..Default::default()
+        };
+        let got = store.list_filtered(&ns(), &filter, 10).unwrap();
+        assert_eq!(ids(&got), vec![hit.clone()]);
+
+        // LIMIT still applies under a filter.
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    tags: vec!["x".into()],
+                    ..Default::default()
+                },
+                1,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), vec![hit]);
+    }
+
+    #[test]
+    fn unfiltered_list_filtered_matches_legacy_list() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert(&store, |_| {});
+        let b = insert(&store, |m| {
+            m.importance = 8;
+            m.created_at -= chrono::Duration::seconds(5);
+        });
+
+        let legacy = store.list(&ns(), None, 10).unwrap();
+        let unified = store
+            .list_filtered(&ns(), &RecallFilter::default(), 10)
+            .unwrap();
+        assert_eq!(ids(&legacy), ids(&unified));
+        assert_eq!(ids(&unified), vec![a, b.clone()]);
+
+        let legacy_min = store.list(&ns(), Some(7), 10).unwrap();
+        let unified_min = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    min_importance: Some(7),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&legacy_min), ids(&unified_min));
+        assert_eq!(ids(&unified_min), vec![b]);
+    }
+
+    #[test]
+    fn rejects_anchor_filters_until_typed_anchors_land() {
+        // Fail fast, never silently unfiltered: the anchors table belongs to
+        // the typed-code-anchors PRD; until it lands a non-empty anchor filter
+        // is an InvalidArgument, not an ignored constraint.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let err = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    anchors: vec![rb_types::AnchorFilter {
+                        kind: rb_types::AnchorKind::File,
+                        value: "src/lib.rs".into(),
+                    }],
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn keyword_search_in_state_scopes_archived_rows() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let active = insert(&store, |m| m.content = "tokio runtime decision".into());
+        let archived = insert(&store, |m| m.content = "tokio executor decision".into());
+        store.archive_memory(&archived).unwrap();
+
+        let default_scope = store
+            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::Active)
+            .unwrap();
+        assert_eq!(default_scope, vec![active.clone()]);
+        // The legacy method stays active-only.
+        assert_eq!(
+            store.keyword_search(&ns(), "tokio", 10).unwrap(),
+            default_scope
+        );
+
+        let archived_scope = store
+            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::Archived)
+            .unwrap();
+        assert_eq!(archived_scope, vec![archived.clone()]);
+
+        let mut all_scope = store
+            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::All)
+            .unwrap();
+        all_scope.sort_by_key(std::string::ToString::to_string);
+        let mut expected = vec![active, archived];
+        expected.sort_by_key(std::string::ToString::to_string);
+        assert_eq!(all_scope, expected);
     }
 }
 #[cfg(test)]

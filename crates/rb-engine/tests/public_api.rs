@@ -2,7 +2,9 @@
 
 use rb_embed::DeterministicProvider;
 use rb_engine::{MemoryBackend, MemoryEngine, RememberInput};
-use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace};
+use rb_types::{
+    MemoryId, MemoryNote, MemoryState, MemoryType, MemoryUpdates, Namespace, RecallFilter,
+};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -33,6 +35,7 @@ impl MemoryBackend for VecBackend {
         ns: Namespace,
         _query: String,
         limit: usize,
+        state: MemoryState,
     ) -> rb_types::Result<Vec<MemoryId>> {
         let mut v: Vec<MemoryNote> = self
             .notes
@@ -40,6 +43,7 @@ impl MemoryBackend for VecBackend {
             .unwrap()
             .values()
             .filter(|n| n.namespace == ns)
+            .filter(|n| state.admits_archived(n.archived_at.is_some()))
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
@@ -67,7 +71,7 @@ impl MemoryBackend for VecBackend {
     async fn list(
         &self,
         ns: Namespace,
-        min_importance: Option<u8>,
+        filter: RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
         let mut v: Vec<MemoryNote> = self
@@ -76,7 +80,7 @@ impl MemoryBackend for VecBackend {
             .unwrap()
             .values()
             .filter(|n| n.namespace == ns)
-            .filter(|n| min_importance.map(|m| n.importance >= m).unwrap_or(true))
+            .filter(|n| filter.matches(n))
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
@@ -259,7 +263,10 @@ async fn full_flow_through_public_api() {
     assert_eq!(note.context, "architecture");
 
     // recall finds it.
-    let results = engine.recall("writer", 10, None, &[]).await.unwrap();
+    let results = engine
+        .recall("writer", 10, &RecallFilter::default())
+        .await
+        .unwrap();
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory.id, id);
 

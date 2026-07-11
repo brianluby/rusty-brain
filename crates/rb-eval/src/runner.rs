@@ -309,7 +309,9 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
 
     for q in &corpus.golden_queries {
         let started = Instant::now();
-        let results = engine.recall(&q.query, RECALL_LIMIT, None, &[]).await?;
+        let results = engine
+            .recall(&q.query, RECALL_LIMIT, &rb_types::RecallFilter::default())
+            .await?;
         latencies_us.push(started.elapsed().as_micros() as u64);
 
         let ranked: Vec<String> = results.iter().map(|r| r.memory.id.to_string()).collect();

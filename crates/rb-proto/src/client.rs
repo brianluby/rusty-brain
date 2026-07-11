@@ -286,12 +286,30 @@ impl Client {
         tags: Vec<String>,
         limit: usize,
     ) -> Result<(Vec<SearchResult>, bool)> {
+        let filter = rb_types::RecallFilter::default().fold_recall_legacy(memory_type, tags);
+        self.recall_filtered_with_status(query, filter, limit).await
+    }
+
+    /// [`Client::recall_with_status`] over the unified [`rb_types::RecallFilter`]
+    /// (PRD 2026-07-02 search-filter parity). Wire strategy: the dimensions a
+    /// pre-filter frame can express (a single type + tags) are SPLIT into the
+    /// legacy request slots so an old daemon still honors them; only the new
+    /// dimensions ride the additive `filter` field (which an old daemon
+    /// ignores — graceful degradation to the legacy subset).
+    pub async fn recall_filtered_with_status(
+        &mut self,
+        query: String,
+        filter: rb_types::RecallFilter,
+        limit: usize,
+    ) -> Result<(Vec<SearchResult>, bool)> {
+        let (memory_type, tags, filter) = filter.split_recall_legacy();
         let resp = self
             .request(Request::Recall {
                 query,
                 memory_type,
                 tags,
                 limit,
+                filter,
             })
             .await?;
         match resp {
@@ -315,10 +333,25 @@ impl Client {
         min_importance: Option<u8>,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
+        let filter = rb_types::RecallFilter::default().fold_list_legacy(min_importance);
+        self.list_filtered(filter, limit).await
+    }
+
+    /// [`Client::list`] over the unified [`rb_types::RecallFilter`] — the same
+    /// legacy-slot split as [`Client::recall_filtered_with_status`]:
+    /// `min_importance` rides the pre-filter wire slot (old daemons honor it),
+    /// the new dimensions ride the additive `filter` field.
+    pub async fn list_filtered(
+        &mut self,
+        filter: rb_types::RecallFilter,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>> {
+        let (min_importance, filter) = filter.split_list_legacy();
         let resp = self
             .request(Request::List {
                 min_importance,
                 limit,
+                filter,
             })
             .await?;
         match resp {
@@ -734,22 +767,78 @@ mod wrapper_tests {
                 Request::Remember { .. } => Response::Remembered {
                     id: fixed_id.clone(),
                 },
-                Request::Recall { query, .. } => Response::Recalled {
-                    results: vec![SearchResult {
-                        memory: note(),
-                        score: 0.5,
-                        channels: rb_types::ChannelHits::default(),
-                    }],
-                    // Keyed on the query so the typed-wrapper test can prove
-                    // the W1.6d flag rides the wire to `recall_with_status`.
-                    degraded: query == "degraded",
-                },
+                Request::Recall {
+                    query,
+                    memory_type,
+                    tags,
+                    filter,
+                    ..
+                } => {
+                    let hit = || {
+                        vec![SearchResult {
+                            memory: note(),
+                            score: 0.5,
+                            channels: rb_types::ChannelHits::default(),
+                        }]
+                    };
+                    // Filter-parity probes: a hit comes back ONLY when the
+                    // dimensions rode the wire in the expected slot, proving
+                    // `recall_filtered_with_status` splits legacy vs additive.
+                    let results = match query.as_str() {
+                        "probe-legacy" => {
+                            if memory_type == Some(MemoryType::BugFix)
+                                && tags == vec!["t".to_string()]
+                                && filter.is_empty()
+                            {
+                                hit()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        "probe-filter" => {
+                            if memory_type.is_none()
+                                && filter.min_confidence == Some(0.9)
+                                && filter.sources == vec!["hook".to_string()]
+                            {
+                                hit()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        _ => hit(),
+                    };
+                    Response::Recalled {
+                        results,
+                        // Keyed on the query so the typed-wrapper test can prove
+                        // the W1.6d flag rides the wire to `recall_with_status`.
+                        degraded: query == "degraded",
+                    }
+                }
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),
                 },
-                Request::List { .. } => Response::Listed {
-                    memories: vec![note()],
-                },
+                Request::List {
+                    min_importance,
+                    limit,
+                    filter,
+                } => {
+                    // Filter-parity probe (keyed on limit=42): a note comes
+                    // back ONLY when min_importance rode the legacy slot and
+                    // the new dimensions rode the additive filter.
+                    let memories = if limit == 42 {
+                        if min_importance == Some(6)
+                            && filter.min_importance.is_none()
+                            && filter.state == rb_types::MemoryState::Archived
+                        {
+                            vec![note()]
+                        } else {
+                            Vec::new()
+                        }
+                    } else {
+                        vec![note()]
+                    };
+                    Response::Listed { memories }
+                }
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],
                 },
@@ -809,6 +898,65 @@ mod wrapper_tests {
 
     async fn connect(path: &std::path::Path) -> Client {
         Client::connect(path, Namespace::Global).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn filtered_wrappers_split_legacy_slots_from_the_additive_filter() {
+        use rb_types::{MemoryState, RecallFilter};
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut c = connect(&path).await;
+
+        // A single type + tags are expressible pre-filter, so they must ride
+        // the LEGACY wire slots (old daemons keep honoring them) and the
+        // additive filter must stay off the frame.
+        let (results, _) = c
+            .recall_filtered_with_status(
+                "probe-legacy".into(),
+                RecallFilter {
+                    types: vec![MemoryType::BugFix],
+                    tags: vec!["t".into()],
+                    ..Default::default()
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "legacy slots must carry type+tags");
+
+        // New dimensions ride the additive filter field.
+        let (results, _) = c
+            .recall_filtered_with_status(
+                "probe-filter".into(),
+                RecallFilter {
+                    min_confidence: Some(0.9),
+                    sources: vec!["hook".into()],
+                    ..Default::default()
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "new dimensions must ride the filter");
+
+        // List: min_importance rides the legacy slot; state rides the filter.
+        let listed = c
+            .list_filtered(
+                RecallFilter {
+                    min_importance: Some(6),
+                    state: MemoryState::Archived,
+                    ..Default::default()
+                },
+                42,
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1, "legacy min_importance + filtered state");
+
+        drop(c);
+        server.await.unwrap();
     }
 
     #[tokio::test]

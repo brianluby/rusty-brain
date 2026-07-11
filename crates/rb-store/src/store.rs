@@ -11,13 +11,26 @@ mod scrub;
 mod stats;
 
 use rb_types::{
-    Error, MemoryId, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace, Result,
+    Error, MemoryId, MemoryLink, MemoryNote, MemoryState, MemoryType, MemoryUpdates, Namespace,
+    RecallFilter, Result,
 };
 
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>>;
     fn keyword_search(&self, ns: &Namespace, query: &str, limit: usize) -> Result<Vec<MemoryId>>;
+    /// [`Store::keyword_search`] with an explicit archived-state scope (PRD
+    /// 2026-07-02 search-filter parity). `keyword_search` is the active-only
+    /// convenience; recall with a `state` filter routes here so archived
+    /// memories stay reachable through the FTS channel (their vectors are
+    /// pruned on archive, so keyword+graph are the only archived channels).
+    fn keyword_search_in_state(
+        &self,
+        ns: &Namespace,
+        query: &str,
+        limit: usize,
+        state: MemoryState,
+    ) -> Result<Vec<MemoryId>>;
     fn vector_search(
         &self,
         ns: &Namespace,
@@ -34,6 +47,22 @@ pub trait Store {
         &self,
         ns: &Namespace,
         min_importance: Option<u8>,
+        limit: usize,
+    ) -> Result<Vec<MemoryNote>>;
+    /// [`Store::list`] over the unified [`RecallFilter`] (PRD 2026-07-02
+    /// search-filter parity): every METADATA dimension — types, tags,
+    /// importance/confidence ranges, created-at window, sources, archived
+    /// state — is honored in SQL with the same inclusive/any-of/all-of
+    /// semantics as [`RecallFilter::matches`], ordered newest first, bounded
+    /// by `limit`. Two dimensions are intentionally NOT evaluated here:
+    /// `contested` needs the link lookup and is applied by the engine (the
+    /// `active_contradicts` single source of truth), and a non-empty `anchors`
+    /// filter is rejected fail-closed with `InvalidArgument` until the
+    /// typed-code-anchors table lands.
+    fn list_filtered(
+        &self,
+        ns: &Namespace,
+        filter: &RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>>;
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()>;

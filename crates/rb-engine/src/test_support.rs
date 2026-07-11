@@ -2,7 +2,7 @@
 
 use crate::backend::MemoryBackend;
 use crate::enricher::{Enricher, Enrichment};
-use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
+use rb_types::{MemoryId, MemoryNote, MemoryState, MemoryUpdates, Namespace, RecallFilter};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -130,6 +130,7 @@ impl MemoryBackend for MockBackend {
         ns: Namespace,
         _query: String,
         limit: usize,
+        state: MemoryState,
     ) -> rb_types::Result<Vec<MemoryId>> {
         if let Some(ids) = self.keyword_results.lock().unwrap().clone() {
             return Ok(ids.into_iter().take(limit).collect());
@@ -140,6 +141,8 @@ impl MemoryBackend for MockBackend {
             .unwrap()
             .values()
             .filter(|n| n.namespace == ns)
+            // Mirror the store: the FTS channel scopes on archived state.
+            .filter(|n| state.admits_archived(n.archived_at.is_some()))
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
@@ -194,7 +197,7 @@ impl MemoryBackend for MockBackend {
     async fn list(
         &self,
         ns: Namespace,
-        min_importance: Option<u8>,
+        filter: RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
         let mut v: Vec<MemoryNote> = self
@@ -203,7 +206,8 @@ impl MemoryBackend for MockBackend {
             .unwrap()
             .values()
             .filter(|n| n.namespace == ns)
-            .filter(|n| min_importance.map(|m| n.importance >= m).unwrap_or(true))
+            // Mirror the store: every metadata dimension via the ONE predicate.
+            .filter(|n| filter.matches(n))
             .cloned()
             .collect();
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));

@@ -47,6 +47,58 @@ fn parse_confidence(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// Parse a `--since`/`--until` bound: an RFC 3339 timestamp
+/// (`2026-07-10T12:00:00Z`), a date (`2026-07-01`, midnight UTC), or a
+/// now-relative age (`7d`, `36h`, `45m`, `10s`).
+fn parse_time_bound(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    if let Ok(ts) = chrono::DateTime::parse_from_rfc3339(s) {
+        return Ok(ts.with_timezone(&chrono::Utc));
+    }
+    if let Ok(date) = chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d") {
+        let midnight = date
+            .and_hms_opt(0, 0, 0)
+            .ok_or_else(|| format!("invalid date '{s}'"))?;
+        return Ok(chrono::DateTime::from_naive_utc_and_offset(
+            midnight,
+            chrono::Utc,
+        ));
+    }
+    // Relative age: <number><unit> with unit d/h/m/s.
+    if let Some((digits, unit)) = s.split_at_checked(s.len().saturating_sub(1)) {
+        if let Ok(n) = digits.parse::<i64>() {
+            let duration = match unit {
+                "d" => Some(chrono::Duration::days(n)),
+                "h" => Some(chrono::Duration::hours(n)),
+                "m" => Some(chrono::Duration::minutes(n)),
+                "s" => Some(chrono::Duration::seconds(n)),
+                _ => None,
+            };
+            if let Some(duration) = duration {
+                if n < 0 {
+                    return Err(format!("relative age '{s}' must be non-negative"));
+                }
+                return Ok(chrono::Utc::now() - duration);
+            }
+        }
+    }
+    Err(format!(
+        "invalid time bound '{s}': expected RFC 3339 (2026-07-10T12:00:00Z), a date \
+         (2026-07-01), or a relative age (7d, 36h, 45m, 10s)"
+    ))
+}
+
+/// Parse a `--source` producer surface; the daemon only ever stamps these four.
+fn parse_source(s: &str) -> Result<String, String> {
+    const SOURCES: [&str; 4] = ["hook", "mcp", "cli", "job"];
+    if SOURCES.contains(&s) {
+        Ok(s.to_string())
+    } else {
+        Err(format!(
+            "unknown source '{s}': expected one of hook, mcp, cli, job"
+        ))
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(
     name = "rusty-brain",
@@ -234,9 +286,40 @@ pub enum Command {
         /// Restrict to a memory type (db string).
         #[arg(long = "type", value_parser = parse_memory_type)]
         memory_type: Option<MemoryType>,
-        /// Filter by tags (repeatable).
+        /// Filter by tags (repeatable; all must be present).
         #[arg(long)]
         tags: Vec<String>,
+        /// Only memories with at least this importance (1-10).
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
+        min_importance: Option<u8>,
+        /// Only memories with at most this importance (1-10).
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
+        max_importance: Option<u8>,
+        /// Only memories with at least this confidence (0.0-1.0).
+        #[arg(long, value_parser = parse_confidence)]
+        min_confidence: Option<f32>,
+        /// Only memories with at most this confidence (0.0-1.0).
+        #[arg(long, value_parser = parse_confidence)]
+        max_confidence: Option<f32>,
+        /// Only memories created at/after this bound: RFC 3339, a date, or a
+        /// relative age (7d, 36h).
+        #[arg(long, value_parser = parse_time_bound)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only memories created at/before this bound (same forms as --since).
+        #[arg(long, value_parser = parse_time_bound)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only memories written by this producer surface: hook, mcp, cli, or
+        /// job (repeatable; any listed source matches).
+        #[arg(long = "source", value_parser = parse_source)]
+        source: Vec<String>,
+        /// Only contested memories (`--contested`), or only uncontested ones
+        /// (`--contested false`). Absent: no constraint.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        contested: Option<bool>,
+        /// Search archived memories instead of active ones (keyword channel
+        /// only: archived vectors are pruned).
+        #[arg(long)]
+        archived: bool,
     },
 
     /// Fetch a single memory by id.
@@ -250,9 +333,42 @@ pub enum Command {
         /// Maximum number of results.
         #[arg(long, default_value_t = 20)]
         limit: usize,
-        /// Only memories with at least this importance.
+        /// Restrict to a memory type (db string).
+        #[arg(long = "type", value_parser = parse_memory_type)]
+        memory_type: Option<MemoryType>,
+        /// Filter by tags (repeatable; all must be present).
+        #[arg(long)]
+        tags: Vec<String>,
+        /// Only memories with at least this importance (1-10).
         #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
         min_importance: Option<u8>,
+        /// Only memories with at most this importance (1-10).
+        #[arg(long, value_parser = value_parser!(u8).range(1..=10))]
+        max_importance: Option<u8>,
+        /// Only memories with at least this confidence (0.0-1.0).
+        #[arg(long, value_parser = parse_confidence)]
+        min_confidence: Option<f32>,
+        /// Only memories with at most this confidence (0.0-1.0).
+        #[arg(long, value_parser = parse_confidence)]
+        max_confidence: Option<f32>,
+        /// Only memories created at/after this bound: RFC 3339, a date, or a
+        /// relative age (7d, 36h).
+        #[arg(long, value_parser = parse_time_bound)]
+        since: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only memories created at/before this bound (same forms as --since).
+        #[arg(long, value_parser = parse_time_bound)]
+        until: Option<chrono::DateTime<chrono::Utc>>,
+        /// Only memories written by this producer surface: hook, mcp, cli, or
+        /// job (repeatable; any listed source matches).
+        #[arg(long = "source", value_parser = parse_source)]
+        source: Vec<String>,
+        /// Only contested memories (`--contested`), or only uncontested ones
+        /// (`--contested false`). Absent: no constraint.
+        #[arg(long, num_args = 0..=1, default_missing_value = "true")]
+        contested: Option<bool>,
+        /// List archived memories instead of active ones.
+        #[arg(long)]
+        archived: bool,
     },
 
     /// Show memories connected to an id by graph links.
@@ -433,6 +549,212 @@ mod tests {
         let cli = Cli::parse_from(["rusty-brain", "--json", "subscribe"]);
         assert!(cli.json, "--json is a global flag and applies to subscribe");
         assert!(matches!(cli.command, Command::Subscribe { .. }));
+    }
+
+    #[test]
+    fn recall_parses_the_unified_filter_flags() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "recall",
+            "query text",
+            "--type",
+            "bug_fix",
+            "--tags",
+            "sqlite",
+            "--min-importance",
+            "3",
+            "--max-importance",
+            "9",
+            "--min-confidence",
+            "0.2",
+            "--max-confidence",
+            "0.9",
+            "--since",
+            "2026-07-01",
+            "--until",
+            "2026-07-10T12:00:00Z",
+            "--source",
+            "hook",
+            "--source",
+            "mcp",
+            "--contested",
+            "--archived",
+        ]);
+        match cli.command {
+            Command::Recall {
+                query,
+                memory_type,
+                tags,
+                min_importance,
+                max_importance,
+                min_confidence,
+                max_confidence,
+                since,
+                until,
+                source,
+                contested,
+                archived,
+                ..
+            } => {
+                assert_eq!(query, "query text");
+                assert_eq!(memory_type, Some(MemoryType::BugFix));
+                assert_eq!(tags, vec!["sqlite".to_string()]);
+                assert_eq!(min_importance, Some(3));
+                assert_eq!(max_importance, Some(9));
+                assert_eq!(min_confidence, Some(0.2));
+                assert_eq!(max_confidence, Some(0.9));
+                assert_eq!(
+                    since,
+                    Some(
+                        "2026-07-01T00:00:00Z"
+                            .parse::<chrono::DateTime<chrono::Utc>>()
+                            .unwrap()
+                    )
+                );
+                assert_eq!(
+                    until,
+                    Some(
+                        "2026-07-10T12:00:00Z"
+                            .parse::<chrono::DateTime<chrono::Utc>>()
+                            .unwrap()
+                    )
+                );
+                assert_eq!(source, vec!["hook".to_string(), "mcp".to_string()]);
+                assert_eq!(contested, Some(true));
+                assert!(archived);
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_parses_the_same_filter_flags_as_recall() {
+        // SRH-2 parity: `list` accepts the identical filter set, including the
+        // type/tags flags recall already had.
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "list",
+            "--type",
+            "constraint",
+            "--tags",
+            "infra",
+            "--min-importance",
+            "5",
+            "--max-importance",
+            "8",
+            "--min-confidence",
+            "0.5",
+            "--source",
+            "cli",
+            "--contested",
+            "false",
+        ]);
+        match cli.command {
+            Command::List {
+                memory_type,
+                tags,
+                min_importance,
+                max_importance,
+                min_confidence,
+                max_confidence,
+                source,
+                contested,
+                archived,
+                ..
+            } => {
+                assert_eq!(memory_type, Some(MemoryType::Constraint));
+                assert_eq!(tags, vec!["infra".to_string()]);
+                assert_eq!(min_importance, Some(5));
+                assert_eq!(max_importance, Some(8));
+                assert_eq!(min_confidence, Some(0.5));
+                assert_eq!(max_confidence, None);
+                assert_eq!(source, vec!["cli".to_string()]);
+                assert_eq!(
+                    contested,
+                    Some(false),
+                    "--contested false selects uncontested"
+                );
+                assert!(!archived);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn contested_flag_is_tri_state() {
+        // Absent -> no constraint; bare flag -> contested-only; explicit false
+        // -> uncontested-only.
+        let absent = Cli::parse_from(["rusty-brain", "list"]);
+        match absent.command {
+            Command::List { contested, .. } => assert_eq!(contested, None),
+            other => panic!("expected List, got {other:?}"),
+        }
+        let bare = Cli::parse_from(["rusty-brain", "recall", "q", "--contested"]);
+        match bare.command {
+            Command::Recall { contested, .. } => assert_eq!(contested, Some(true)),
+            other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn since_accepts_relative_ages() {
+        // "7d" (and h/m suffixes) parse as now-relative bounds — the "age"
+        // half of the PRD's date/age filter.
+        let before = chrono::Utc::now() - chrono::Duration::days(7);
+        let cli = Cli::parse_from(["rusty-brain", "recall", "q", "--since", "7d"]);
+        let after = chrono::Utc::now() - chrono::Duration::days(7);
+        match cli.command {
+            Command::Recall { since, .. } => {
+                let since = since.expect("--since 7d must parse");
+                assert!(since >= before && since <= after, "since={since}");
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+        for ok in ["36h", "45m", "10s"] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "list", "--until", ok]).is_ok(),
+                "relative age {ok} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn time_bounds_reject_garbage() {
+        for bad in ["yesterdayish", "2026-13-40", "7x", "d7", ""] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "recall", "q", "--since", bad]).is_err(),
+                "--since {bad:?} must be rejected at parse time"
+            );
+        }
+    }
+
+    #[test]
+    fn source_rejects_unknown_producers() {
+        for ok in ["hook", "mcp", "cli", "job"] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "list", "--source", ok]).is_ok(),
+                "source {ok} must parse"
+            );
+        }
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "list", "--source", "carrier-pigeon"]).is_err(),
+            "unknown --source must be rejected at parse time"
+        );
+    }
+
+    #[test]
+    fn confidence_bounds_reject_out_of_range_at_parse_time() {
+        for bad in ["-0.1", "1.5", "NaN"] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "recall", "q", "--min-confidence", bad])
+                    .is_err(),
+                "--min-confidence {bad} must fail to parse"
+            );
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "list", "--max-confidence", bad]).is_err(),
+                "--max-confidence {bad} must fail to parse"
+            );
+        }
     }
 
     #[test]

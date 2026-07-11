@@ -27,6 +27,44 @@ pub fn parse_namespace_arg(s: &str) -> rb_types::Result<rb_types::Namespace> {
     Ok(rb_types::Namespace::Project(trimmed.to_string()))
 }
 
+/// Assemble the unified [`rb_types::RecallFilter`] from the (identical)
+/// `recall`/`list` filter flags — PRD 2026-07-02 search-filter parity. The
+/// client splits the legacy-expressible subset back into the pre-filter wire
+/// slots, so old daemons keep honoring type/tags/min-importance.
+#[allow(clippy::too_many_arguments)]
+fn build_recall_filter(
+    memory_type: Option<rb_types::MemoryType>,
+    tags: Vec<String>,
+    min_importance: Option<u8>,
+    max_importance: Option<u8>,
+    min_confidence: Option<f32>,
+    max_confidence: Option<f32>,
+    since: Option<chrono::DateTime<chrono::Utc>>,
+    until: Option<chrono::DateTime<chrono::Utc>>,
+    source: Vec<String>,
+    contested: Option<bool>,
+    archived: bool,
+) -> rb_types::RecallFilter {
+    rb_types::RecallFilter {
+        types: memory_type.into_iter().collect(),
+        tags,
+        min_importance,
+        max_importance,
+        min_confidence,
+        max_confidence,
+        since,
+        until,
+        sources: source,
+        contested,
+        state: if archived {
+            rb_types::MemoryState::Archived
+        } else {
+            rb_types::MemoryState::Active
+        },
+        anchors: Vec::new(),
+    }
+}
+
 /// Execute the parsed CLI with a pre-resolved `namespace` (resolved OFF the
 /// async runtime by `main`, since detection shells out to git and reads files).
 /// `serve` blocks until Ctrl-C; client commands connect (auto-starting the
@@ -380,9 +418,31 @@ async fn run_client(
             limit,
             memory_type,
             tags,
+            min_importance,
+            max_importance,
+            min_confidence,
+            max_confidence,
+            since,
+            until,
+            source,
+            contested,
+            archived,
         } => {
+            let filter = build_recall_filter(
+                memory_type,
+                tags,
+                min_importance,
+                max_importance,
+                min_confidence,
+                max_confidence,
+                since,
+                until,
+                source,
+                contested,
+                archived,
+            );
             let (results, degraded) = client
-                .recall_with_status(query, memory_type, tags, limit)
+                .recall_filtered_with_status(query, filter, limit)
                 .await
                 .context("recall failed")?;
             if degraded {
@@ -403,10 +463,33 @@ async fn run_client(
         }
         Command::List {
             limit,
+            memory_type,
+            tags,
             min_importance,
+            max_importance,
+            min_confidence,
+            max_confidence,
+            since,
+            until,
+            source,
+            contested,
+            archived,
         } => {
+            let filter = build_recall_filter(
+                memory_type,
+                tags,
+                min_importance,
+                max_importance,
+                min_confidence,
+                max_confidence,
+                since,
+                until,
+                source,
+                contested,
+                archived,
+            );
             let notes = client
-                .list(min_importance, limit)
+                .list_filtered(filter, limit)
                 .await
                 .context("list failed")?;
             println!("{}", output::render_notes(&notes, json));
