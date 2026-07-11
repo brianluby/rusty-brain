@@ -11,8 +11,8 @@ contract_version = 2
 "crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "09b1c1de35d4a2331beeb72fce279bbc689969cffa4b0aec3226c09183120a32"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
-"crates/rb-proto/src/messages.rs::Request" = "9dfb140e260ca4098975bf3fe0831be6326a0ca4f0f037a7dc8b3bad432ce957"
-"crates/rb-proto/src/messages.rs::Response" = "824c05193069fbbeae24d95444cb02bbe359599a4fdb9047f28c59d5ebcd0210"
+"crates/rb-proto/src/messages.rs::Request" = "cbca30891389d98ab42c4778302754f1bcd9603b3eeea4b63c6ae7f2c5de2465"
+"crates/rb-proto/src/messages.rs::Response" = "383bd0e8b99c07bb4ce785c8c5cab9097a20549372cba77186d684b083a78971"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
 "crates/rb-types/src/feedback_kind.rs::FeedbackKind" = "8ca2edbd8aca8e2b087ea630e10209a51a307efdf1a84b0bbccc74a06f2da7b6"
@@ -27,6 +27,10 @@ contract_version = 2
 "crates/rb-types/src/query.rs::MemoryUpdates" = "06e908ddd047725e8997facef27fbf79dcba980db9c0058151ffe6834ed1cd4e"
 "crates/rb-types/src/query.rs::SearchQuery" = "09cf14ba050d24ee74a6757b4b30eb8dd9baa81b6df9e5c1f50340f2b402197b"
 "crates/rb-types/src/query.rs::SearchResult" = "6553d26249a902d241e3377a24777ed772ab9ecb4451c708b3a34507a684b171"
+"crates/rb-types/src/stats.rs::FeedbackTotals" = "ab6a1ea796d5866a566a9372536caed43217046b16245604cf41225963bbcd23"
+"crates/rb-types/src/stats.rs::GrowthBucket" = "552aa8d7fcb065ccc8275263b55fb0b5e1aad3493bbffa4e1c695bcd14174de6"
+"crates/rb-types/src/stats.rs::MemoryStats" = "4cf5bf4353a5783f4e9ca712060e560833e3a844547d6782c0957025058fdcf7"
+"crates/rb-types/src/stats.rs::TopRecalled" = "8d416dd284f9995cd45563cfe7d9fa56db1ca81e211dce44e09b45e850db8dd6"
 
 [migrations]
 "001_initial_schema.sql" = "f1c767719094a249947a56426590c95732a3ea373470dc62a5c5692e4b369731"
@@ -42,3 +46,8 @@ contract_version = 2
 contract_version = 2
 intent = "initial"
 note = "baseline: v2 wire surface (rb-proto messages + rb-types payload shapes) and rb-store migrations 001-008"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "PR #56 doctor/stats: Request::Stats/Response::Stats + rb-types MemoryStats (no bump, additive per W5a.4)"
