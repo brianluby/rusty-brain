@@ -550,7 +550,7 @@ self_test() {
   fi
 
   # Skip lines are a machine contract: phase names the earliest blocked pipeline
-  # stage (capture/retrieval/config/scoring), not a blanket phase=scoring.
+  # stage (capture/config/scoring), not a blanket phase=scoring.
   local skip_line
   skip_line="$(scorecard_skip_line codex)"
   if printf '%s' "$skip_line" | grep -qF $'agent=codex\tdimension=all\tscenario=all\tphase=capture\tstatus=skip\treason=scorecard_unsupported_codex_fixture_gated'; then

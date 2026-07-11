@@ -137,9 +137,10 @@ that invokes `rusty-brain-hooks --agent opencode` instead;
 **Capture is `partial` for my agent — where did my session go?** `partial`
 means per-tool observations reach the per-session scratch, but no fold event
 fires, so no session summary is written; the scratch ages out after 24h
-(`scratch::prune_stale`). This is the documented state for Codex and Gemini
-until their terminus events are fixture-verified. Existing memories still
-recall and inject normally.
+(`scratch::prune_stale`). This is the documented state for Codex (until its
+terminus event is fixture-verified) and for Gemini (deliberately descoped —
+no fixture or mapping work is planned). Existing memories still recall and
+inject normally.
 
 **Scorecard prints one line and exits 0.** That is a machine-readable skip,
 not a silent success. Fields: `agent`, `dimension`, `scenario`, `phase` (the
