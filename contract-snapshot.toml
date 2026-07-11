@@ -1,0 +1,44 @@
+# Contract-drift guard snapshot (rb-contract-guard). DO NOT EDIT BY HAND.
+# Regenerate after a deliberate contract decision (W5a.4):
+#   cargo run -p rb-contract-guard -- update --intent additive --note "..."   # serde-default addition, no bump
+#   cargo run -p rb-contract-guard -- update --intent breaking --note "..."   # after bumping CONTRACT_VERSION
+
+contract_version = 2
+
+[wire]
+"crates/rb-proto/src/messages.rs::CONTRACT_VERSION" = "3f9208b6b23ee097c0f8177f4e0c94696a2c17f0cc02d4f3db93854566d67791"
+"crates/rb-proto/src/messages.rs::ClientIdentity" = "4c817d16fbee936cf94e023e4d4ddf9330df312bc4e3bd7ce98f0b983de35fa1"
+"crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
+"crates/rb-proto/src/messages.rs::HandshakeAck" = "09b1c1de35d4a2331beeb72fce279bbc689969cffa4b0aec3226c09183120a32"
+"crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
+"crates/rb-proto/src/messages.rs::Request" = "9dfb140e260ca4098975bf3fe0831be6326a0ca4f0f037a7dc8b3bad432ce957"
+"crates/rb-proto/src/messages.rs::Response" = "824c05193069fbbeae24d95444cb02bbe359599a4fdb9047f28c59d5ebcd0210"
+"crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
+"crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
+"crates/rb-types/src/feedback_kind.rs::FeedbackKind" = "8ca2edbd8aca8e2b087ea630e10209a51a307efdf1a84b0bbccc74a06f2da7b6"
+"crates/rb-types/src/job.rs::JobKind" = "1d37fe458aaade8a2fdc2291c14e68eb54102c358e12274ea347f3645c23b986"
+"crates/rb-types/src/link.rs::MemoryLink" = "7e1c5377ec99d7e609c289b14fed82fa2a2c5275650bb688ea1afbe03fb37f4d"
+"crates/rb-types/src/link_type.rs::LinkType" = "2394c0b6dc86235d55ce3e3bb9b7d5d8b058672f07b1e57532930e897ca644f2"
+"crates/rb-types/src/memory.rs::MemoryNote" = "bc882adf4a7f6269ac42aa76d07fc2c906bab2d27eec1c9cf75b1f04c3cd0764"
+"crates/rb-types/src/memory_id.rs::MemoryId" = "688b5e41d43d9004ae80916922636c569b7dceb0e4b9ab80e1e83d9d1ed622f0"
+"crates/rb-types/src/memory_type.rs::MemoryType" = "238c3095d32261dc60d19ec7e787249c1f3a0e1bfd40917a5e670fa8e4270ac3"
+"crates/rb-types/src/namespace.rs::Namespace" = "7ba4f747be391c0b6b298ddc89b0654e92a7cd13e69f54c6debf3c01116c7c51"
+"crates/rb-types/src/query.rs::ChannelHits" = "34168a59378e913813f5c759c87925242ee72ef8a2fb107e4d460a6e87d3b298"
+"crates/rb-types/src/query.rs::MemoryUpdates" = "06e908ddd047725e8997facef27fbf79dcba980db9c0058151ffe6834ed1cd4e"
+"crates/rb-types/src/query.rs::SearchQuery" = "09cf14ba050d24ee74a6757b4b30eb8dd9baa81b6df9e5c1f50340f2b402197b"
+"crates/rb-types/src/query.rs::SearchResult" = "6553d26249a902d241e3377a24777ed772ab9ecb4451c708b3a34507a684b171"
+
+[migrations]
+"001_initial_schema.sql" = "f1c767719094a249947a56426590c95732a3ea373470dc62a5c5692e4b369731"
+"002_link_base_strength.sql" = "b09a52ddd2eb456643d65318bb5aba4ca573698faf0225ab1992b19b655293f2"
+"003_embedding_input_version.sql" = "effe50d59e6ba2a5662529ef90f77adf00e962641576fc9dd59f87c2a53f9957"
+"004_provenance.sql" = "e63d4fe90cdaaa2093b8b61d8672599ce6bdffdf0115d5f82df48e87af7e86a4"
+"005_fts_porter_tokenizer.sql" = "5733ae37f2aa52201cdf60b7c2b6823a668a5454d3ba418fdf099f5d7f436780"
+"006_narrow_mem_au.sql" = "1803fb5199302bc5e5910e870ef81b80ddb940c4b3a4df3113d6a319a3933299"
+"007_base_importance.sql" = "be04183c1209fdb8adfdcbd66dc96ecf6125b79a45cd4a65f40388b6cca6586b"
+"008_memory_feedback.sql" = "64901f555624da4b738e437877d6b2b60579dbd5051f55ab476390015a67b70b"
+
+[[log]]
+contract_version = 2
+intent = "initial"
+note = "baseline: v2 wire surface (rb-proto messages + rb-types payload shapes) and rb-store migrations 001-008"

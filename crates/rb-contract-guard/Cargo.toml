@@ -1,0 +1,35 @@
+[package]
+name = "rb-contract-guard"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+description = "CI contract-drift guard: detects wire-shape (rb-proto/rb-types) and rb-store migration drift and requires a deliberate CONTRACT_VERSION decision (W5a.4)."
+
+[lib]
+name = "rb_contract_guard"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rb-contract-guard"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+quote = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+syn = { workspace = true }
+toml = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+# Integrity check only: the snapshot's recorded contract_version must equal the
+# const rb-proto actually compiles (catches a hand-edited snapshot).
+rb-proto = { path = "../rb-proto" }
+tempfile = { workspace = true }
+
+[lints]
+workspace = true
