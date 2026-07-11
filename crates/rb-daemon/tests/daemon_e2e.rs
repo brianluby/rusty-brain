@@ -1393,6 +1393,9 @@ async fn near_dup_suppression_never_touches_non_hook_memories() {
 /// is the seam to flip: it pins the version-skew behavior either way.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn n_minus_one_handshake_is_rejected_gracefully() {
+    let n_minus_one = rb_proto::CONTRACT_VERSION
+        .checked_sub(1)
+        .expect("N-1 fixture requires CONTRACT_VERSION >= 1");
     let daemon = RunningDaemon::start(2).await;
 
     let stream = tokio::net::UnixStream::connect(&daemon.socket)
@@ -1402,7 +1405,7 @@ async fn n_minus_one_handshake_is_rejected_gracefully() {
     rb_proto::write_frame(
         &mut framed,
         &rb_proto::Handshake {
-            contract_version: rb_proto::CONTRACT_VERSION - 1,
+            contract_version: n_minus_one,
             namespace: Namespace::Project("skew".to_string()),
             identity: None,
         },
@@ -1420,7 +1423,7 @@ async fn n_minus_one_handshake_is_rejected_gracefully() {
     let message = ack.message.expect("nack carries a diagnostic message");
     assert!(
         message.contains(&rb_proto::CONTRACT_VERSION.to_string())
-            && message.contains(&(rb_proto::CONTRACT_VERSION - 1).to_string()),
+            && message.contains(&n_minus_one.to_string()),
         "diagnostic names both versions: {message}"
     );
 

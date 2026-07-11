@@ -5,9 +5,17 @@
 //! - `struct` and `enum` definitions, including all their attributes — serde
 //!   attrs (`tag`, `default`, `skip_serializing_if`, `rename_all`, ...) ARE the
 //!   wire shape;
+//! - `type` aliases (a wire field can reference one; retargeting it changes
+//!   the serialized shape while the struct digest stays put);
 //! - explicit `impl Serialize/Deserialize for T` blocks (none exist today; the
 //!   guard must not go blind if one appears);
 //! - the `CONTRACT_VERSION` const.
+//!
+//! Inline modules (`pub mod v2 { ... }`) are recursed into, with
+//! module-qualified keys; `#[cfg(test)]` modules and items are skipped. Only
+//! the exact `#[cfg(test)]` predicate is treated as test-only — `not(test)`,
+//! `feature = "..."`, `all(...)`, etc. stay in the digest (conservative
+//! inclusion: the guard must never silently drop a real wire item).
 //!
 //! What is normalized away (never trips the guard):
 //! - doc comments (`///`, `#[doc = ...]`) anywhere on/inside an item;
@@ -34,10 +42,16 @@ fn is_doc(attr: &Attribute) -> bool {
     attr.path().is_ident("doc")
 }
 
+/// True only for the exact `#[cfg(test)]` attribute. Anything else —
+/// `cfg(not(test))`, `cfg(feature = "latest")`, `cfg(all(test, ...))` — is
+/// treated as live wire surface: excluding on a substring match silently
+/// dropped real items (`"latest"` contains `"test"`), and over-inclusion is
+/// the safe direction for a drift guard.
 fn is_cfg_test(attrs: &[Attribute]) -> bool {
-    attrs
-        .iter()
-        .any(|a| a.path().is_ident("cfg") && a.to_token_stream().to_string().contains("test"))
+    attrs.iter().any(|a| {
+        a.path().is_ident("cfg")
+            && matches!(a.parse_args::<syn::Meta>(), Ok(syn::Meta::Path(p)) if p.is_ident("test"))
+    })
 }
 
 fn strip_docs(attrs: &mut Vec<Attribute>) {
@@ -62,8 +76,8 @@ fn digest_tokens(tokens: &impl ToTokens) -> String {
     sha256_hex(tokens.to_token_stream().to_string().as_bytes())
 }
 
-/// Extract `"<rel_path>::<item name>"` -> digest for every shape-defining item
-/// in `source`.
+/// Extract `"<rel_path>::<module path>::<item name>"` -> digest for every
+/// shape-defining item in `source`, recursing into inline modules.
 pub fn extract_wire_items(rel_path: &str, source: &str) -> Result<BTreeMap<String, String>> {
     let file: syn::File = match syn::parse_file(source) {
         Ok(f) => f,
@@ -71,7 +85,19 @@ pub fn extract_wire_items(rel_path: &str, source: &str) -> Result<BTreeMap<Strin
     };
 
     let mut out = BTreeMap::new();
-    for item in file.items {
+    collect_items(rel_path, "", file.items, &mut out);
+    Ok(out)
+}
+
+/// Walk `items` (one inline-module level; `prefix` is the `"mod::"`-style
+/// module path accumulated so far), digesting the shape-defining ones.
+fn collect_items(
+    rel_path: &str,
+    prefix: &str,
+    items: Vec<Item>,
+    out: &mut BTreeMap<String, String>,
+) {
+    for item in items {
         match item {
             Item::Struct(mut s) => {
                 if is_cfg_test(&s.attrs) {
@@ -79,7 +105,10 @@ pub fn extract_wire_items(rel_path: &str, source: &str) -> Result<BTreeMap<Strin
                 }
                 strip_docs(&mut s.attrs);
                 strip_docs_in_fields(&mut s.fields);
-                out.insert(format!("{rel_path}::{}", s.ident), digest_tokens(&s));
+                out.insert(
+                    format!("{rel_path}::{prefix}{}", s.ident),
+                    digest_tokens(&s),
+                );
             }
             Item::Enum(mut e) => {
                 if is_cfg_test(&e.attrs) {
@@ -90,14 +119,30 @@ pub fn extract_wire_items(rel_path: &str, source: &str) -> Result<BTreeMap<Strin
                     strip_docs(&mut variant.attrs);
                     strip_docs_in_fields(&mut variant.fields);
                 }
-                out.insert(format!("{rel_path}::{}", e.ident), digest_tokens(&e));
+                out.insert(
+                    format!("{rel_path}::{prefix}{}", e.ident),
+                    digest_tokens(&e),
+                );
+            }
+            Item::Type(mut t) => {
+                if is_cfg_test(&t.attrs) {
+                    continue;
+                }
+                strip_docs(&mut t.attrs);
+                out.insert(
+                    format!("{rel_path}::{prefix}{}", t.ident),
+                    digest_tokens(&t),
+                );
             }
             Item::Const(mut c) => {
                 if is_cfg_test(&c.attrs) || c.ident != "CONTRACT_VERSION" {
                     continue;
                 }
                 strip_docs(&mut c.attrs);
-                out.insert(format!("{rel_path}::{}", c.ident), digest_tokens(&c));
+                out.insert(
+                    format!("{rel_path}::{prefix}{}", c.ident),
+                    digest_tokens(&c),
+                );
             }
             Item::Impl(mut imp) => {
                 if is_cfg_test(&imp.attrs) {
@@ -114,14 +159,26 @@ pub fn extract_wire_items(rel_path: &str, source: &str) -> Result<BTreeMap<Strin
                 }
                 let ty = imp.self_ty.to_token_stream().to_string();
                 out.insert(
-                    format!("{rel_path}::impl {trait_name} for {ty}"),
+                    format!("{rel_path}::{prefix}impl {trait_name} for {ty}"),
                     digest_tokens(&imp),
                 );
+            }
+            // Inline modules are recursed into (the module-axis analogue of
+            // scanning whole directories): a wire type wrapped in `pub mod v2`
+            // must not vanish from the digest. `mod foo;` declarations have no
+            // inline content to visit — their bodies live in separate files,
+            // which the directory scan already observes.
+            Item::Mod(m) => {
+                if is_cfg_test(&m.attrs) {
+                    continue;
+                }
+                if let Some((_, inner)) = m.content {
+                    collect_items(rel_path, &format!("{prefix}{}::", m.ident), inner, out);
+                }
             }
             _ => {}
         }
     }
-    Ok(out)
 }
 
 /// Parse the integer value of `const CONTRACT_VERSION: u32 = N;` in `source`.
@@ -287,6 +344,89 @@ mod tests {
             map.keys().collect::<Vec<_>>()
         );
         assert_eq!(map.len(), 2, "struct + serde impl, no inherent impl");
+    }
+
+    #[test]
+    fn cfg_not_test_and_feature_gated_items_are_extracted() {
+        // Reviewer-reproduced bug: substring matching on the cfg tokens
+        // misclassified #[cfg(not(test))] and #[cfg(feature = "latest")]
+        // ("latest" contains "test") as test-only, silently dropping REAL
+        // wire items from the digest.
+        let src = r#"
+            #[cfg(not(test))]
+            pub struct ProdOnly { pub a: u8 }
+            #[cfg(feature = "latest")]
+            pub struct Gated { pub b: u8 }
+            #[cfg(test)]
+            pub struct TestOnly { pub c: u8 }
+        "#;
+        let map = items(src);
+        assert!(
+            map.contains_key("f.rs::ProdOnly"),
+            "cfg(not(test)) items are wire shape: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            map.contains_key("f.rs::Gated"),
+            "cfg(feature = \"latest\") items are wire shape: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !map.contains_key("f.rs::TestOnly"),
+            "item-level cfg(test) items are still excluded"
+        );
+    }
+
+    #[test]
+    fn items_inside_inline_modules_are_extracted() {
+        // The module-axis variant of the new-file blind spot: a wire type
+        // wrapped in `pub mod v2 { ... }` must not vanish from the digest.
+        let src = r#"
+            pub mod v2 {
+                pub struct Wrapped { pub a: u8 }
+                pub mod deeper {
+                    pub enum Inner { A, B }
+                }
+            }
+            #[cfg(test)]
+            mod tests {
+                pub struct NotWire;
+            }
+        "#;
+        let map = items(src);
+        assert!(
+            map.contains_key("f.rs::v2::Wrapped"),
+            "inline-module items are digested under a module-qualified key: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            map.contains_key("f.rs::v2::deeper::Inner"),
+            "nesting recurses: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        assert!(
+            !map.keys().any(|k| k.contains("NotWire")),
+            "cfg(test) modules stay excluded"
+        );
+    }
+
+    #[test]
+    fn type_aliases_are_digested() {
+        // A wire struct field can reference an alias; retargeting the alias
+        // changes the serialized shape while the struct digest stays put.
+        let with_alias = "pub type Tags = Vec<String>;\npub struct Note { pub tags: Tags }";
+        let map = items(with_alias);
+        assert!(
+            map.contains_key("f.rs::Tags"),
+            "type aliases are digested: {:?}",
+            map.keys().collect::<Vec<_>>()
+        );
+        let changed = items("pub type Tags = Vec<u64>;\npub struct Note { pub tags: Tags }");
+        assert_ne!(
+            map.get("f.rs::Tags"),
+            changed.get("f.rs::Tags"),
+            "an alias retarget changes the digest"
+        );
     }
 
     #[test]

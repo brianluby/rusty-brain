@@ -25,8 +25,14 @@ used to live in prose only, enforced by reviewer diligence. The
 `crates/rb-contract-guard` parses the sources with `syn` and digests each
 item's normalized tokens: doc comments, regular comments, and formatting are
 stripped, `#[cfg(test)]` items are skipped, and serde attributes are kept
-(they ARE the wire shape). Comment- or formatting-only edits never trip the
-guard. The digests live in the checked-in `contract-snapshot.toml`.
+(they ARE the wire shape). Structs, enums, `type` aliases, explicit serde
+impls, and `CONTRACT_VERSION` are digested; inline modules
+(`pub mod v2 { ... }`) are recursed into with module-qualified keys. Only the
+exact `#[cfg(test)]` predicate is treated as test-only — `cfg(not(test))`,
+`cfg(feature = "...")`, `cfg(all(test, ...))` etc. stay in the digest
+(conservative inclusion: the guard must never silently drop a real wire
+item). Comment- or formatting-only edits never trip the guard. The digests
+live in the checked-in `contract-snapshot.toml`.
 
 ## What happens on a PR
 
@@ -73,3 +79,8 @@ release per W5a.4), that test is the seam to flip.
 - Framing (`rb-proto/src/frame.rs`, `codec.rs`) is not digested: its wire
   behavior lives in function bodies, which would make every refactor a false
   positive; it is covered by the round-trip tests instead.
+- Non-doc attribute edits that cannot change the wire shape — e.g. rewording a
+  `#[deprecated(note = "...")]` — DO trip the guard: attributes are digested
+  whole because serde attrs must be, and special-casing "harmless" attrs is
+  not worth the complexity. The resolution is the same one-command additive
+  marker.
