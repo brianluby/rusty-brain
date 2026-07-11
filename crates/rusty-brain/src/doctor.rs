@@ -146,11 +146,23 @@ pub fn check_mode(name: &'static str, path: &Path, expected: u32) -> DoctorCheck
 pub fn check_wal(db_path: &Path) -> DoctorCheck {
     let wal = wal_path(db_path);
     match std::fs::metadata(&wal) {
-        Err(_) => DoctorCheck {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => DoctorCheck {
             name: "wal",
             status: CheckStatus::Ok,
             detail: "no -wal sidecar (fully checkpointed)".to_string(),
             hint: None,
+        },
+        // Any other stat error means WAL health is unknown, not healthy: the
+        // sidecar may exist but be unreadable (e.g. a permission problem).
+        Err(e) => DoctorCheck {
+            name: "wal",
+            status: CheckStatus::Warn,
+            detail: format!("cannot stat {}: {e}", wal.display()),
+            hint: Some(
+                "WAL health is unknown; fix permissions on the DB directory \
+                 so doctor can inspect the sidecar"
+                    .to_string(),
+            ),
         },
         Ok(meta) if meta.len() <= WAL_WARN_BYTES => DoctorCheck {
             name: "wal",
@@ -414,23 +426,21 @@ fn check_embedding_identity(
                         detail: format!("cannot read DB meta: {e}"),
                         hint: None,
                     });
-                    None
+                    return;
                 }
             };
-            if let Some(meta) = meta {
-                let expected = expected_offline_provider_model(
-                    std::env::var("VOYAGE_API_KEY").ok(),
-                    embed_backend,
-                    local_model,
-                );
-                if let Some(p) = expected.as_deref() {
-                    checks.push(check_provider(p));
-                }
-                checks.push(check_model_identity(
-                    expected.as_deref(),
-                    Some(meta.as_str()),
-                ));
+            // A legacy DB without a stamp still gets an identity check —
+            // `check_model_identity` routes `None` meta to its Warn/Skipped
+            // arms, mirroring the daemon-up path.
+            let expected = expected_offline_provider_model(
+                std::env::var("VOYAGE_API_KEY").ok(),
+                embed_backend,
+                local_model,
+            );
+            if let Some(p) = expected.as_deref() {
+                checks.push(check_provider(p));
             }
+            checks.push(check_model_identity(expected.as_deref(), meta.as_deref()));
         }
         None => {}
     }
@@ -528,6 +538,56 @@ mod tests {
         assert!(
             hint.contains("checkpoint") || hint.contains("restart"),
             "remediation: {hint}"
+        );
+    }
+
+    #[test]
+    fn check_wal_flags_an_uninspectable_sidecar_instead_of_claiming_checkpointed() {
+        let dir = tempfile::tempdir().unwrap();
+        let locked = dir.path().join("locked");
+        std::fs::create_dir(&locked).unwrap();
+        let db = locked.join("rb.db");
+        std::fs::write(&db, b"x").unwrap();
+        std::fs::write(locked.join("rb.db-wal"), b"wal").unwrap();
+
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Root ignores directory modes; the EACCES this test needs never fires.
+        if std::fs::metadata(locked.join("rb.db-wal")).is_ok() {
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            return;
+        }
+        let check = check_wal(&db);
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(check.status, CheckStatus::Warn, "{check:?}");
+        assert!(check.detail.contains("cannot stat"), "{check:?}");
+        assert!(
+            check.hint.is_some(),
+            "an uninspectable WAL carries guidance"
+        );
+    }
+
+    #[test]
+    fn offline_identity_check_still_reports_a_legacy_db_without_a_model_stamp() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        // `open` (unlike `open_with_model`) leaves the embedding_model meta
+        // unstamped — the legacy-DB shape.
+        drop(rb_store::SqliteStore::open(&db, 8).unwrap());
+
+        let mut checks = Vec::new();
+        check_embedding_identity(&None, &db, None, None, &mut checks);
+
+        let identity = checks
+            .iter()
+            .find(|c| c.name == "embedding-model")
+            .expect("a legacy DB still gets an embedding-model check offline");
+        // Warn when the offline provider is knowable (deterministic), Skipped
+        // when it is not (VOYAGE_API_KEY present in the ambient env) — never
+        // silently absent.
+        assert!(
+            matches!(identity.status, CheckStatus::Warn | CheckStatus::Skipped),
+            "{identity:?}"
         );
     }
 
