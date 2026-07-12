@@ -1,13 +1,52 @@
 # codex Fixture Status
 
-> **Status: awaiting live re-record.** The local `result.jsonl` / `terminus.json`
-> (untracked working-tree artifacts) are from a pre-fix run that captured ZERO
-> hook events (the old harness ran codex in a bare throwaway HOME with no
-> `CODEX_HOME`, no auth, and an untrusted directory/hooks — `result.jsonl` shows
-> *"Not inside a trusted directory"*). The recorder has since been redesigned to
-> use a stable recorder home with copied auth + persisted trust (see Recording
-> Recipe). The operator runs `--setup-trust codex` once, then `--agent codex`, to
-> produce the real committed payloads.
+> **Status: full lifecycle recording still awaiting live re-record.** The local
+> `result.jsonl` / `terminus.json` (untracked working-tree artifacts) are from a
+> pre-fix run that captured ZERO hook events (the old harness ran codex in a
+> bare throwaway HOME with no `CODEX_HOME`, no auth, and an untrusted
+> directory/hooks — `result.jsonl` shows *"Not inside a trusted directory"*).
+> The recorder has since been redesigned to use a stable recorder home with
+> copied auth + persisted trust (see Recording Recipe). The operator runs
+> `--setup-trust codex` once, then `--agent codex`, to produce the real
+> committed lifecycle payloads.
+>
+> The two committed `post_tool_use_apply_patch*.json` payloads below are REAL
+> live captures from a separate, targeted 2026-07-12 run (see "apply_patch
+> capture provenance") — they are hand-committed, so a future full
+> `record-agent-fixtures.sh --agent codex` run (which clears non-README
+> fixtures) must preserve or re-record them.
+
+## apply_patch capture provenance (2026-07-12)
+
+Codex emits `PostToolUse` for `apply_patch` since 0.123.0 (openai/codex#16732,
+shipped via openai/codex#18391). The two committed payloads were live-captured
+from **codex-cli 0.144.1** (Darwin 25.5.0) with a one-off targeted run,
+separate from the full recorder harness:
+
+- Isolated scratch `CODEX_HOME` (outside the repo) with a read-only copy of the
+  operator's `~/.codex/auth.json`, hand-written directory trust, and
+  self-authored stdin-dumping hooks (`cat >> <raw>/<event>.json`) in the
+  scratch project's `.codex/hooks.json`.
+- `codex exec --json -C <proj> -s workspace-write --skip-git-repo-check
+  -c approval_policy="never" --dangerously-bypass-hook-trust "<prompt>"`.
+  The bypass flag was used ONLY because per-hook `trusted_hash` trust cannot be
+  persisted non-interactively; the hooks it bypassed trust for are the
+  self-authored one-line stdin dumps above (a vetted source — the flag's
+  documented intended use). The full recorder harness policy (interactive
+  `--setup-trust`, no bypass flag) is unchanged.
+- The prompt forced one single-file `apply_patch` edit and one multi-file
+  `apply_patch` edit (a single patch adding two files), producing exactly two
+  `PostToolUse` events.
+- Sanitization: the scratch recorder home path was rewritten to
+  `/private/tmp/rb-codex-capture` (mirroring the claude_code fixture
+  convention); the payloads carry no secrets. Payload shape cross-checked
+  against the `rust-v0.144.1` upstream sources
+  (`post-tool-use.command.input.schema.json`, `handlers/apply_patch.rs`).
+
+Both events carry `tool_name: "apply_patch"` and the raw V4A patch under
+`tool_input.command`; `tool_response` is a plain string. The multifile payload
+proves ONE `apply_patch` call can touch several files, which is why capture
+records one observation per `*** <op> File:` directive.
 
 ## Provenance
 
@@ -53,7 +92,11 @@ Multi-turn verdict: **ambiguous** (see the run shape in the recipe; evidence, no
 
 | File | Event stem |
 |---|---|
-| _(none recorded)_ | |
+| `post_tool_use_apply_patch.json` | `post_tool_use` (apply_patch, single-file V4A patch — live-captured 2026-07-12, codex-cli 0.144.1) |
+| `post_tool_use_apply_patch_multifile.json` | `post_tool_use` (apply_patch, ONE call whose single V4A patch adds TWO files) |
+
+Lifecycle stems (`session_start`, `stop`, `pre_compact`, bash `post_tool_use`)
+remain unrecorded pending the full recorder run.
 
 ## Fields present / absent
 

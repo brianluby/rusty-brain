@@ -5,6 +5,25 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Codex `apply_patch` file-edit capture (follow-up 2026-06-02)
+
+- **Codex `apply_patch` capture is live**: openai/codex#16732 shipped in Codex
+  0.123.0 — Codex now emits `PostToolUse` for `apply_patch` with the raw V4A
+  patch under `tool_input.command`, verified against a live codex-cli 0.144.1
+  capture (committed as sanitized fixtures under
+  `crates/rb-hooks/tests/fixtures/codex/`). Codex file edits now land in the
+  per-session capture scratch; the scratch still awaits the fixture-gated
+  `Stop` terminus mapping to fold (capture stays `partial` in the matrix).
+- **Multi-file `apply_patch` patches record every touched path**: one
+  `apply_patch` call can add/update/delete several files in a single V4A
+  patch (the live capture proves it); capture now records one observation per
+  `*** <op> File:` directive — in patch order, deduplicated — instead of only
+  the first, for Codex and OpenCode alike. Malformed/non-V4A payloads still
+  fail open to a single `unknown` file touch.
+- **Cross-adapter test uses the real Codex tool name**: the Codex PostToolUse
+  fixture in `crates/rb-agents/tests/cross_adapter.rs` asserts `apply_patch`
+  (mirroring the live-recorded payload) instead of the `Write` placeholder.
+
 ### Added — Guided contradiction/dedup review (PRD 2026-07-02)
 
 - **`rusty-brain review`**: one guided sweep over the trust backlog. The

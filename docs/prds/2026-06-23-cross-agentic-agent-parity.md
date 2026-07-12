@@ -4,7 +4,7 @@
 
 Delivered 2026-07-11 (Vikunja #380), on top of the groundwork landed via PRs #43/#45/#49/#54. All acceptance criteria are met; the items that remain open are deliberately fixture- or upstream-gated, not unfinished work:
 
-- Codex capture fold (terminus mapping): gated on a recorded Codex lifecycle fixture (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`); `apply_patch` additionally upstream-blocked ([openai/codex#16732](https://github.com/openai/codex/issues/16732)).
+- Codex capture fold (terminus mapping): gated on a recorded Codex lifecycle fixture (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`). _Update 2026-07-12:_ the `apply_patch` upstream gate cleared — [openai/codex#16732](https://github.com/openai/codex/issues/16732) shipped in Codex 0.123.0 and `apply_patch` capture landed live-fixture-verified (`docs/follow-ups/2026-06-02-codex-apply-patch-capture.md`); only the terminus fold remains fixture-gated.
 - Codex/OpenCode prompt-time retrieval: no native prompt event is mapped until a recorded fixture proves its shape (CA6 "documented gap" path).
 - OpenCode installer: explicitly deferred by decision — OpenCode needs a JS/TS plugin, so the JSON installer fails closed with `[E_INSTALL_AGENT_DEFERRED]`; the adapter path is validated without it (CA2's sanctioned alternative).
 - OpenCode/Codex scorecard runs: skipped with machine-readable per-agent lines naming the blocked phase; enablement is a follow-on runner task.

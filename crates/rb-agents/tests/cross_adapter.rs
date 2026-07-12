@@ -36,13 +36,19 @@ fn post_tool_payload(id: AgentId) -> serde_json::Value {
             "tool_input": {"file_path": "/x"},
             "tool_response": {"ok": true}
         }),
+        // Codex's file-edit tool is `apply_patch`, carrying the raw V4A patch
+        // under `tool_input.command` (NO `file_path`). This mirrors the REAL
+        // payload live-captured from codex-cli 0.144.1 (see
+        // rb-hooks/tests/fixtures/codex/post_tool_use_apply_patch.json) —
+        // Codex fires PostToolUse for apply_patch since 0.123.0
+        // (openai/codex#16732).
         AgentId::Codex => serde_json::json!({
             "hook_event_name": "PostToolUse",
             "cwd": "/proj",
             "session_id": "s",
-            "tool_name": "Write",
-            "tool_input": {"file_path": "/x"},
-            "tool_response": {"ok": true}
+            "tool_name": "apply_patch",
+            "tool_input": {"command": "*** Begin Patch\n*** Add File: notes.txt\n+recorded.\n*** End Patch\n"},
+            "tool_response": "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA notes.txt\n"
         }),
     }
 }
@@ -50,14 +56,15 @@ fn post_tool_payload(id: AgentId) -> serde_json::Value {
 #[test]
 fn all_four_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
     // Every dialect maps its post-tool event to canonical `PostToolUse`. The
-    // adapter preserves the CLI's *native* tool-name casing verbatim (Claude/
-    // Gemini/Codex capitalize `Write`; OpenCode reports lowercase `write`);
-    // case-folding to a single canonical name is the capture layer's job.
+    // adapter preserves the CLI's *native* tool-name spelling verbatim
+    // (Claude/Gemini capitalize `Write`; OpenCode reports lowercase `write`;
+    // Codex reports `apply_patch` for file edits); normalizing to a single
+    // canonical name is the capture layer's job.
     let cases = [
         (AgentId::ClaudeCode, "Write"),
         (AgentId::OpenCode, "write"),
         (AgentId::Gemini, "Write"),
-        (AgentId::Codex, "Write"),
+        (AgentId::Codex, "apply_patch"),
     ];
     for (id, expected) in cases {
         let cli = agent_for(id);

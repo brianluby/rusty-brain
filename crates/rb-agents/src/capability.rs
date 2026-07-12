@@ -75,7 +75,8 @@ const CAPABILITIES: &[AgentCapability] = &[
         verified_lifecycle_source: "crates/rb-hooks/tests/fixtures/codex/README.md",
         limitations: &[
             "Native Stop remains canonical Stop until a real lifecycle fixture proves a checkpoint or terminus boundary.",
-            "UserPromptSubmit retrieval and apply_patch capture are fixture-gated.",
+            "apply_patch file-edit capture is live-fixture-verified (openai/codex#16732 shipped in Codex 0.123.0; recorded on codex-cli 0.144.1), but the scratch never folds until the Stop boundary is verified.",
+            "UserPromptSubmit retrieval is fixture-gated.",
         ],
     },
     AgentCapability {

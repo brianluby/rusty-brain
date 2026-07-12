@@ -130,10 +130,11 @@ fn readme_matrix_matches_capability_source_of_truth() {
 /// The prose cell is an editorial summary, not a verbatim render of
 /// `AgentCapability::limitations` (which would bloat the table), so the guard
 /// pins the load-bearing caveat of each row instead: the fixture backing for
-/// claude-code, the upstream blocker for codex, the fold event + install
-/// deferral for opencode, the descoping decision for gemini, and the
-/// discovery gate for hermes. Dropping one of these in a rewrite is exactly
-/// the stale-prose failure this test exists to catch.
+/// claude-code, the resolved upstream gate (openai/codex#16732, shipped in
+/// Codex 0.123.0) plus the remaining terminus fixture gate for codex, the
+/// fold event + install deferral for opencode, the descoping decision for
+/// gemini, and the discovery gate for hermes. Dropping one of these in a
+/// rewrite is exactly the stale-prose failure this test exists to catch.
 fn limitation_markers(agent: &str) -> &'static [&'static str] {
     match agent {
         "claude-code" => &["crates/rb-hooks/tests/fixtures/claude_code/"],
