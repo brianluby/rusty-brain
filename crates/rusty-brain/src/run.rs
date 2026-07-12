@@ -878,22 +878,61 @@ async fn run_client(
             }
         }
         Command::Scrub => {
-            let (scanned, redacted, reembed_pending) =
-                client.scrub().await.context("scrub failed")?;
+            let outcome = client
+                .scrub_with_checkpoint()
+                .await
+                .context("scrub failed")?;
+            let checkpoint = outcome.wal_checkpoint;
+            let plaintext_may_remain = outcome.plaintext_may_remain_in_wal();
+            let warning = "the WAL checkpoint was busy or its status was unavailable; \
+                           pre-redaction plaintext may remain in the WAL";
+            let remediation = "close long-lived rusty-brain database readers, then rerun \
+                               `rusty-brain scrub` to retry the truncating WAL checkpoint";
             if json {
                 println!(
-                    "{{\"scanned\":{scanned},\"redacted\":{redacted},\"reembed_pending\":{reembed_pending}}}"
+                    "{}",
+                    serde_json::json!({
+                        "scanned": outcome.scanned,
+                        "redacted": outcome.redacted,
+                        "reembed_pending": outcome.reembed_pending,
+                        "wal_checkpoint": checkpoint.map(|status| serde_json::json!({
+                            "busy": status.busy,
+                            "log_frames": status.log_frames,
+                            "checkpointed_frames": status.checkpointed_frames,
+                        })),
+                        "plaintext_may_remain_in_wal": plaintext_may_remain,
+                        "warning": plaintext_may_remain.then_some(warning),
+                        "remediation": plaintext_may_remain.then_some(remediation),
+                    })
                 );
             } else {
+                let checkpoint_status = checkpoint.map_or_else(
+                    || "unavailable".to_string(),
+                    |status| {
+                        format!(
+                            "{} log_frames={} checkpointed_frames={}",
+                            if status.busy { "busy" } else { "complete" },
+                            status.log_frames,
+                            status.checkpointed_frames
+                        )
+                    },
+                );
                 println!(
-                    "scrub: scanned={scanned} redacted={redacted} reembed_pending={reembed_pending}"
+                    "scrub: scanned={} redacted={} reembed_pending={} wal_checkpoint={checkpoint_status}",
+                    outcome.scanned, outcome.redacted, outcome.reembed_pending
                 );
             }
-            if reembed_pending > 0 {
+            if plaintext_may_remain {
+                // stderr keeps JSON stdout machine-parseable while the JSON
+                // payload independently exposes the same risk/remediation.
+                eprintln!("warning: {warning}; {remediation}");
+            }
+            if outcome.reembed_pending > 0 {
                 // stderr so `--json` stdout stays machine-parseable.
                 eprintln!(
-                    "note: {reembed_pending} memories need re-embedding; run \
-                     `rusty-brain reembed` until changed=0 to recompute their vectors"
+                    "note: {} memories need re-embedding; run \
+                     `rusty-brain reembed` until changed=0 to recompute their vectors",
+                    outcome.reembed_pending
                 );
             }
         }

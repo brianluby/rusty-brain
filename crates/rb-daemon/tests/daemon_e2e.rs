@@ -617,10 +617,17 @@ async fn scrub_over_the_wire_redacts_an_unredacted_stored_secret() {
     assert!(before.content.contains(&secret));
 
     // Same-uid test client is admin, so the gate admits the op.
-    let (scanned, redacted, reembed_pending) = client.scrub().await.unwrap();
-    assert!(scanned >= 1);
-    assert_eq!(redacted, 1);
-    assert_eq!(reembed_pending, 1, "content changed -> needs reembed");
+    let outcome = client.scrub_with_checkpoint().await.unwrap();
+    assert!(outcome.scanned >= 1);
+    assert_eq!(outcome.redacted, 1);
+    assert_eq!(
+        outcome.reembed_pending, 1,
+        "content changed -> needs reembed"
+    );
+    assert!(
+        !outcome.wal_checkpoint.unwrap().busy,
+        "wire response must carry the completed at-rest checkpoint"
+    );
 
     let after = client.get(id).await.unwrap().unwrap();
     assert!(

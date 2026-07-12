@@ -371,6 +371,35 @@ pub struct RecallChannelTotals {
     pub graph_hits: u64,
 }
 
+/// Result of the truncating WAL checkpoint performed after a scrub.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubCheckpoint {
+    /// Whether a concurrent reader or writer prevented complete truncation.
+    pub busy: bool,
+    /// Frames observed in the WAL (`-1` when the database has no WAL).
+    pub log_frames: i64,
+    /// Frames copied into the main database (`-1` when there is no WAL).
+    pub checkpointed_frames: i64,
+}
+
+/// Typed result of a scrub request, including its at-rest checkpoint status.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScrubResult {
+    pub scanned: u64,
+    pub redacted: u64,
+    pub reembed_pending: u64,
+    /// `None` when talking to an older daemon that predates checkpoint status.
+    pub wal_checkpoint: Option<ScrubCheckpoint>,
+}
+
+impl ScrubResult {
+    /// Conservatively reports risk when the checkpoint was busy or unavailable.
+    #[must_use]
+    pub fn plaintext_may_remain_in_wal(self) -> bool {
+        self.wal_checkpoint.is_none_or(|checkpoint| checkpoint.busy)
+    }
+}
+
 /// One response per request. Internally tagged on `result`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[allow(clippy::large_enum_variant)]
@@ -441,6 +470,9 @@ pub enum Response {
         scanned: u64,
         redacted: u64,
         reembed_pending: u64,
+        /// Additive and optional for old-daemon/new-client compatibility.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wal_checkpoint: Option<ScrubCheckpoint>,
     },
     /// Acknowledges a `Request::Feedback` (W3.7): `confidence` is the target
     /// memory's trust prior AFTER the bounded nudge, so the caller can surface
@@ -1091,6 +1123,11 @@ mod tests {
                 scanned: 200,
                 redacted: 3,
                 reembed_pending: 2,
+                wal_checkpoint: Some(ScrubCheckpoint {
+                    busy: false,
+                    log_frames: 0,
+                    checkpointed_frames: 0,
+                }),
             },
             Response::Stats {
                 stats: rb_types::MemoryStats {
@@ -1641,6 +1678,34 @@ mod tests {
         assert_eq!(json, format!(r#"{{"op":"History","id":"{id}","depth":3}}"#));
         let back: Request = serde_json::from_str(&json).unwrap();
         assert!(matches!(back, Request::History { depth: Some(3), .. }));
+    }
+
+    #[test]
+    fn scrub_checkpoint_status_is_additive_and_old_payload_defaults_to_none() {
+        let old = r#"{"result":"Scrubbed","scanned":10,"redacted":2,"reembed_pending":1}"#;
+        let decoded: Response = serde_json::from_str(old).unwrap();
+        assert!(matches!(
+            decoded,
+            Response::Scrubbed {
+                wal_checkpoint: None,
+                ..
+            }
+        ));
+
+        let response = Response::Scrubbed {
+            scanned: 10,
+            redacted: 2,
+            reembed_pending: 1,
+            wal_checkpoint: Some(ScrubCheckpoint {
+                busy: true,
+                log_frames: 7,
+                checkpointed_frames: 3,
+            }),
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert_eq!(value["wal_checkpoint"]["busy"], true);
+        assert_eq!(value["wal_checkpoint"]["log_frames"], 7);
+        assert_eq!(value["wal_checkpoint"]["checkpointed_frames"], 3);
     }
 
     #[test]

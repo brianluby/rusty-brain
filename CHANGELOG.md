@@ -5,6 +5,15 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Scrub reports blocked WAL cleanup (Vikunja #53)
+
+- `rusty-brain scrub` now inspects the full result of its truncating WAL
+  checkpoint instead of treating SQLite's successful-but-busy pragma as
+  complete at-rest cleanup. Human and JSON output report checkpoint status,
+  warn when pre-redaction plaintext may remain in the WAL, and tell operators
+  to close long-lived database readers and rerun scrub. A no-change rerun now
+  retries the checkpoint so that remediation can complete.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing

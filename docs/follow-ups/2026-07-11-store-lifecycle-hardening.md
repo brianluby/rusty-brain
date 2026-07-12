@@ -68,6 +68,12 @@ policy.
 
 ## 3. `scrub`'s WAL checkpoint discards the `(busy, log, checkpointed)` result
 
+**Resolved (Vikunja #53):** scrub now returns the checkpoint result through
+the daemon protocol, human and JSON CLI surfaces warn on a busy or unavailable
+status, and a no-change rerun retries `TRUNCATE` after blocking readers close.
+A concurrent-reader regression test pins both the busy result and successful
+retry.
+
 `crates/rb-store/src/store/scrub.rs`, `scrub`: the post-redaction
 `PRAGMA wal_checkpoint(TRUNCATE)` runs via `execute_batch`, which discards
 the pragma's result row. A blocked checkpoint (e.g. a long-lived reader

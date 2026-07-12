@@ -615,11 +615,13 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
             scanned,
             redacted,
             reembed_pending,
+            wal_checkpoint,
         } => ToolContent::json(
             json!({
                 "scanned": scanned,
                 "redacted": redacted,
                 "reembed_pending": reembed_pending,
+                "wal_checkpoint": wal_checkpoint,
             }),
             false,
         ),

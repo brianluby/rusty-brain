@@ -5,7 +5,7 @@
 
 use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
-use crate::messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
+use crate::messages::{Handshake, HandshakeAck, Request, Response, ScrubResult, CONTRACT_VERSION};
 use crate::{response_error_to_error, Response as Resp};
 use rb_types::{
     Error, FeedbackKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
@@ -627,13 +627,26 @@ where
     /// afterward to recompute vectors for the changed rows. Admin op: a
     /// non-admin peer is rejected with `Error::PermissionDenied`.
     pub async fn scrub(&mut self) -> Result<(u64, u64, u64)> {
+        let result = self.scrub_with_checkpoint().await?;
+        Ok((result.scanned, result.redacted, result.reembed_pending))
+    }
+
+    /// Retroactively redact secrets and return the post-scrub WAL checkpoint
+    /// status. Prefer this over [`Self::scrub`] when reporting at-rest safety.
+    pub async fn scrub_with_checkpoint(&mut self) -> Result<ScrubResult> {
         let resp = self.request(Request::Scrub).await?;
         match resp {
             Resp::Scrubbed {
                 scanned,
                 redacted,
                 reembed_pending,
-            } => Ok((scanned, redacted, reembed_pending)),
+                wal_checkpoint,
+            } => Ok(ScrubResult {
+                scanned,
+                redacted,
+                reembed_pending,
+                wal_checkpoint,
+            }),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -1183,6 +1196,7 @@ mod wrapper_tests {
                     scanned: 0,
                     redacted: 0,
                     reembed_pending: 0,
+                    wal_checkpoint: None,
                 },
                 // Canned payload keyed on `window_days` so the typed-wrapper
                 // test can prove the window rides the wire.

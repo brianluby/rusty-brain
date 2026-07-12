@@ -246,7 +246,13 @@ posture).
      assume away. The backstops are file permissions (`0600`), the retroactive
      `rusty-brain scrub` (re-runs the same pass over an existing DB: rewrites
      content/summary/context, resyncs FTS, marks affected rows for
-     re-embedding), and hard-delete/purge (W5b.3). A base64 secret containing
+     re-embedding), and hard-delete/purge (W5b.3). Scrub also attempts a
+     truncating WAL checkpoint and reports its `(busy, log, checkpointed)`
+     status. If a long-lived reader makes that checkpoint busy, scrub's row
+     rewrites still commit but its CLI and JSON output warn that old plaintext
+     may remain in the WAL; close those readers and rerun scrub (a no-change
+     pass retries the checkpoint) before treating the file as clean at rest.
+     A base64 secret containing
      `/` is split by the entropy sweep (paths are deliberately token
      separators, to avoid eating every absolute path) and only fires if a
      segment still clears the length gate — a known residual miss.

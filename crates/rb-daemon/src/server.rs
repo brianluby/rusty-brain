@@ -1773,6 +1773,13 @@ where
                 scanned: outcome.scanned,
                 redacted: outcome.redacted,
                 reembed_pending: outcome.reembed_pending,
+                wal_checkpoint: outcome.wal_checkpoint.map(|checkpoint| {
+                    rb_proto::ScrubCheckpoint {
+                        busy: checkpoint.busy,
+                        log_frames: checkpoint.log_frames,
+                        checkpointed_frames: checkpoint.checkpointed_frames,
+                    }
+                }),
             },
             Err(e) => error_to_response(e),
         },
