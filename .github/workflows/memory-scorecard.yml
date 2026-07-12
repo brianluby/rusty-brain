@@ -97,15 +97,18 @@ jobs:
           probe_home="$(mktemp -d)"
           printf '{"hasCompletedOnboarding": true}\n' > "${probe_home}/.claude.json"
           probe_proj="$(mktemp -d)"
-          set +e
+          # No `timeout` wrapper: macOS runners lack GNU timeout (the scorecard
+          # script falls back to gtimeout for the same reason); the job-level
+          # timeout bounds this step instead.
           (
             export HOME="$probe_home"
             cd "$probe_proj"
-            timeout 120 claude -p 'reply with exactly: ok' \
+            claude -p 'reply with exactly: ok' \
               --model haiku --max-budget-usd 0.50 \
-              --output-format stream-json --verbose </dev/null
+              --output-format stream-json --verbose </dev/null || true
           ) | python3 -c '
           import sys, json
+          seen = 0
           for line in sys.stdin:
               try:
                   r = json.loads(line)
@@ -113,15 +116,19 @@ jobs:
                   continue
               t = r.get("type")
               if t == "system" and r.get("subtype") == "init":
+                  seen += 1
                   print("apiKeySource:", r.get("apiKeySource"), "| model:", r.get("model"))
               if t == "result":
+                  seen += 1
                   print("result subtype:", r.get("subtype"),
                         "| is_error:", r.get("is_error"),
                         "| turns:", r.get("num_turns"),
                         "| cost_usd:", r.get("total_cost_usd"))
                   print("result text:", str(r.get("result"))[:300])
+          if seen == 0:
+              print("PROBE FAILURE: no parseable stream-json records at all", file=sys.stderr)
+              sys.exit(1)
           '
-          set -e
 
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
