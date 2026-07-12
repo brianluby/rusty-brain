@@ -1231,7 +1231,9 @@ async fn recall_and_list_filters_flow_over_the_wire() {
     );
 
     // Anchor filters fail fast (typed-code-anchors is not shipped yet): the
-    // daemon replies with a client-safe error instead of unfiltered results.
+    // client wrapper rejects them BEFORE sending (so even an old daemon that
+    // ignores the additive filter field can never return unfiltered results);
+    // the daemon-side rejection is covered by engine/store unit tests.
     let err = cli_client
         .list_filtered(
             RecallFilter {

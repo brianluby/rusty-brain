@@ -83,6 +83,14 @@ impl MemoryBackend for VecBackend {
             .filter(|n| filter.matches(n))
             .cloned()
             .collect();
+        // Trait contract: contested resolves before the limit via this
+        // backend's own active_contradicts (which returns the empty set here,
+        // so contested=true yields nothing and contested=false everything).
+        if let Some(want) = filter.contested {
+            let ids: Vec<MemoryId> = v.iter().map(|n| n.id.clone()).collect();
+            let contested = self.active_contradicts(ns, ids).await?;
+            v.retain(|n| contested.contains(&n.id) == want);
+        }
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
         v.truncate(limit);
         Ok(v)

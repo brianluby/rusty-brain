@@ -202,10 +202,12 @@ fn filter_flags_flow_through_the_binary() {
         "--tags",
         "scratch",
     ]);
-    let low_id = low_out
-        .split('"')
-        .find(|s| s.len() == 36 && s.matches('-').count() == 4)
-        .expect("remember --json must print the new id")
+    // Parse the machine-readable output as JSON (the `--json` contract is
+    // `{"id":"<uuid>"}`) instead of scanning for a quoted UUID shape.
+    let low_id = serde_json::from_str::<serde_json::Value>(low_out.trim())
+        .expect("remember --json must print valid JSON")["id"]
+        .as_str()
+        .expect("remember --json output must carry a string `id`")
         .to_string();
 
     // Importance range on list.

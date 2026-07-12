@@ -976,14 +976,16 @@ impl Store for SqliteStore {
             );
         }
         if let Some(since) = filter.since {
-            push(
-                &mut sql,
-                &mut params,
-                "m.created_at >= ",
-                Box::new(since.timestamp()),
-            );
+            // `created_at` is stored whole-second, so a FRACTIONAL lower bound
+            // rounds UP: flooring 12:00:00.5 would wrongly admit a row created
+            // at 12:00:00 (which `RecallFilter::matches` rejects).
+            let bound = since.timestamp() + i64::from(since.timestamp_subsec_nanos() > 0);
+            push(&mut sql, &mut params, "m.created_at >= ", Box::new(bound));
         }
         if let Some(until) = filter.until {
+            // Flooring the UPPER bound is exact for whole-second storage: a
+            // stored second <= floor(until) is <= until, and floor(until)+1
+            // is > until whenever `until` carries a fraction.
             push(
                 &mut sql,
                 &mut params,
@@ -1030,6 +1032,42 @@ impl Store for SqliteStore {
                 Box::new(tag.clone()),
             );
             sql.push(')');
+        }
+        if let Some(want_contested) = filter.contested {
+            // Contested is resolved INSIDE the bounded query (PR #58 review):
+            // post-filtering a fetch window silently drops matches past the
+            // window, so `limit` could under-fill despite more matches
+            // existing. The predicate is the SQL expression of
+            // `active_contradicts` (an active `contradicts` edge whose far
+            // endpoint is active AND in-namespace, and whose LOCAL endpoint is
+            // active — an archived memory is never contested, so under
+            // `contested=false` archived rows count as uncontested). Kept in
+            // lockstep by the `contested_filter_agrees_with_active_contradicts`
+            // drift test; change one without the other and that test fails.
+            params.push(Box::new(ns.as_db_string()));
+            let ns_param = params.len();
+            let contested_expr = format!(
+                "(m.archived_at IS NULL AND (EXISTS (
+                     SELECT 1 FROM memory_links l
+                       JOIN memories far ON far.memory_id = l.target_id
+                     WHERE l.link_type = 'contradicts'
+                       AND l.source_id = m.memory_id
+                       AND far.archived_at IS NULL
+                       AND far.namespace = ?{ns_param}
+                 ) OR EXISTS (
+                     SELECT 1 FROM memory_links l
+                       JOIN memories far ON far.memory_id = l.source_id
+                     WHERE l.link_type = 'contradicts'
+                       AND l.target_id = m.memory_id
+                       AND far.archived_at IS NULL
+                       AND far.namespace = ?{ns_param}
+                 )))"
+            );
+            if want_contested {
+                sql.push_str(&format!(" AND {contested_expr}"));
+            } else {
+                sql.push_str(&format!(" AND NOT {contested_expr}"));
+            }
         }
 
         params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
@@ -2593,6 +2631,178 @@ mod list_filtered_tests {
             .unwrap();
         assert_eq!(ids(&legacy_min), ids(&unified_min));
         assert_eq!(ids(&unified_min), vec![b]);
+    }
+
+    fn contradict(store: &SqliteStore, a: &rb_types::MemoryId, b: &rb_types::MemoryId) {
+        store
+            .add_link(&rb_types::MemoryLink {
+                source_id: a.clone(),
+                target_id: b.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "test contradiction".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn contested_filter_fills_limit_beyond_any_bounded_window() {
+        // Regression (PR #58 review): contested filtering must be resolved
+        // INSIDE the bounded query, not by post-filtering a fetch window — 20
+        // uncontested rows are newer than the 4 contested ones, so any
+        // "over-fetch 4x limit then retain" scheme would return NOTHING here.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut uncontested = Vec::new();
+        for i in 0..20 {
+            uncontested.push(insert(&store, |m| {
+                m.created_at -= chrono::Duration::seconds(i);
+            }));
+        }
+        let mut contested = Vec::new();
+        for i in 0..4 {
+            contested.push(insert(&store, |m| {
+                m.created_at -= chrono::Duration::seconds(100 + i);
+            }));
+        }
+        contradict(&store, &contested[0], &contested[1]);
+        contradict(&store, &contested[2], &contested[3]);
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                },
+                2,
+            )
+            .unwrap();
+        assert_eq!(
+            ids(&got),
+            vec![contested[0].clone(), contested[1].clone()],
+            "limit must fill with contested matches even past a 4x window"
+        );
+
+        let got = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    contested: Some(false),
+                    ..Default::default()
+                },
+                30,
+            )
+            .unwrap();
+        assert_eq!(ids(&got), uncontested, "contested=false keeps the others");
+    }
+
+    #[test]
+    fn contested_filter_agrees_with_active_contradicts() {
+        // Drift guard: the SQL contested predicate and `active_contradicts`
+        // are two expressions of ONE semantics (active contradicts edge, both
+        // endpoints active + in-namespace). If either changes alone, this
+        // fails. The archived pair exercises the far-endpoint-active rule; the
+        // cross-namespace pair exercises namespace purity.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert(&store, |_| {});
+        let b = insert(&store, |m| m.created_at -= chrono::Duration::seconds(1));
+        let c = insert(&store, |m| m.created_at -= chrono::Duration::seconds(2));
+        let gone = insert(&store, |m| m.created_at -= chrono::Duration::seconds(3));
+        let mut foreign =
+            MemoryNote::new(Namespace::Global, "foreign".into(), MemoryType::Insight, 5);
+        let foreign_id = foreign.id.clone();
+        foreign.created_at -= chrono::Duration::seconds(4);
+        store.insert_memory(&foreign, None).unwrap();
+
+        contradict(&store, &a, &b); // both active, in-ns -> contested
+        contradict(&store, &c, &gone); // far endpoint archived -> NOT contested
+        contradict(&store, &c, &foreign_id); // far endpoint out-of-ns -> NOT contested
+        store.archive_memory(&gone).unwrap();
+
+        let all_ids = vec![a.clone(), b.clone(), c.clone(), gone.clone()];
+        let expected = store.active_contradicts(&ns(), &all_ids).unwrap();
+        assert_eq!(
+            expected,
+            [a.clone(), b.clone()].into_iter().collect(),
+            "precondition: active_contradicts flags exactly a and b"
+        );
+
+        let contested_rows = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        let got: std::collections::HashSet<_> = ids(&contested_rows).into_iter().collect();
+        assert_eq!(
+            got, expected,
+            "SQL predicate must agree with active_contradicts"
+        );
+
+        let uncontested_rows = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    contested: Some(false),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            ids(&uncontested_rows),
+            vec![c.clone()],
+            "uncontested = active rows minus the contested set"
+        );
+    }
+
+    #[test]
+    fn fractional_since_bound_excludes_the_floored_second() {
+        // Regression (PR #58 review): created_at is stored whole-second, so a
+        // fractional `since` must round UP — flooring 12:00:00.5 to 12:00:00
+        // would wrongly admit a row created at 12:00:00 (disagreeing with
+        // RecallFilter::matches). A fractional `until` floors EXACTLY right
+        // for whole-second storage, pinned here too.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let whole = chrono::DateTime::from_timestamp(1_780_000_000, 0).unwrap();
+        let row = insert(&store, |m| m.created_at = whole);
+        let fractional = whole + chrono::Duration::milliseconds(500);
+
+        let since_hits = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    since: Some(fractional),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert!(
+            since_hits.is_empty(),
+            "a row at 12:00:00 is BEFORE since=12:00:00.5 and must not match"
+        );
+
+        let until_hits = store
+            .list_filtered(
+                &ns(),
+                &RecallFilter {
+                    until: Some(fractional),
+                    ..Default::default()
+                },
+                10,
+            )
+            .unwrap();
+        assert_eq!(
+            ids(&until_hits),
+            vec![row],
+            "a row at 12:00:00 is BEFORE until=12:00:00.5 and must match"
+        );
     }
 
     #[test]

@@ -210,6 +210,14 @@ impl MemoryBackend for MockBackend {
             .filter(|n| filter.matches(n))
             .cloned()
             .collect();
+        // Trait contract: contested resolves BEFORE the limit (the store does
+        // it inside the bounded query), via this backend's own
+        // active_contradicts — errors propagate (fail-closed filter).
+        if let Some(want) = filter.contested {
+            let ids: Vec<MemoryId> = v.iter().map(|n| n.id.clone()).collect();
+            let contested = self.active_contradicts(ns, ids).await?;
+            v.retain(|n| contested.contains(&n.id) == want);
+        }
         v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
         v.truncate(limit);
         Ok(v)

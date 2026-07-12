@@ -749,40 +749,28 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// List memories in the engine namespace, most-recent first, filtered by
     /// the unified [`rb_types::RecallFilter`] (PRD 2026-07-02 search-filter
-    /// parity). Metadata dimensions are honored by the backend (SQL on the
-    /// real store); `contested` is resolved here through one batched
-    /// `active_contradicts` lookup over a bounded 4x over-fetch (mirroring
-    /// recall's candidate over-fetch) and FAILS CLOSED — so `list` may return
-    /// fewer than `limit` when contested rows dominate the window, but never
-    /// silently unfiltered results.
+    /// parity). EVERY dimension — metadata AND the contested tri-state — is
+    /// honored by the backend's bounded query (SQL on the real store), so
+    /// `limit` fills with actual matches no matter how deep they sit; a
+    /// backend error under a contested filter fails the list (fail-closed —
+    /// never silently unfiltered results). Anchors are rejected until typed
+    /// code anchors land.
     pub async fn list(
         &self,
         filter: &rb_types::RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
         Self::ensure_filter_supported(filter)?;
-        let fetch_limit = if filter.contested.is_some() {
-            limit.saturating_mul(4).max(limit)
-        } else {
-            limit
-        };
         let mut notes = self
             .backend
-            .list(self.namespace.clone(), filter.clone(), fetch_limit)
+            .list(self.namespace.clone(), filter.clone(), limit)
             .await?;
         if let Some(want_contested) = filter.contested {
-            let ids: Vec<MemoryId> = notes.iter().map(|n| n.id.clone()).collect();
-            // Fail closed (filter), unlike the fail-open annotation below.
-            let contested = self
-                .backend
-                .active_contradicts(self.namespace.clone(), ids)
-                .await?;
-            notes.retain(|n| contested.contains(&n.id) == want_contested);
-            notes.truncate(limit);
-            // Stamp the flag from the SAME resolved set so filter and flag
-            // can never disagree.
+            // The backend already guaranteed every returned row satisfies the
+            // contested filter; stamp the flag from that same guarantee so
+            // filter and flag can never disagree.
             for n in &mut notes {
-                n.contested = contested.contains(&n.id);
+                n.contested = want_contested;
             }
             return Ok(notes);
         }
@@ -1378,6 +1366,43 @@ mod tests {
             .unwrap();
         let got: Vec<MemoryId> = uncontested.iter().map(|n| n.id.clone()).collect();
         assert_eq!(got, vec![ids[2].clone()]);
+    }
+
+    #[tokio::test]
+    async fn list_contested_filter_fills_limit_beyond_any_bounded_window() {
+        // Regression (PR #58 review): 20 uncontested rows are NEWER than the 2
+        // contested ones, so an "over-fetch 4x limit then retain" scheme would
+        // return nothing for limit=2. Contested filtering belongs to the
+        // backend's bounded query; the engine must not re-window it.
+        let eng = engine();
+        let t0 = chrono::Utc::now();
+        let _noise = seed_notes(&eng, 20, |i, note| {
+            note.created_at = t0 - chrono::Duration::seconds(i as i64);
+        })
+        .await;
+        let old = seed_notes(&eng, 2, |i, note| {
+            note.created_at = t0 - chrono::Duration::seconds(100 + i as i64);
+        })
+        .await;
+        eng.backend().link_contradicts(&old[0], &old[1]);
+
+        let listed = eng
+            .list(
+                &only(rb_types::RecallFilter {
+                    contested: Some(true),
+                    ..Default::default()
+                }),
+                2,
+            )
+            .await
+            .unwrap();
+        let got: Vec<MemoryId> = listed.iter().map(|n| n.id.clone()).collect();
+        assert_eq!(
+            got,
+            vec![old[0].clone(), old[1].clone()],
+            "limit must fill with contested matches even past a 4x window"
+        );
+        assert!(listed.iter().all(|n| n.contested));
     }
 
     #[tokio::test]

@@ -290,18 +290,37 @@ impl Client {
         self.recall_filtered_with_status(query, filter, limit).await
     }
 
+    /// Fail-fast gate shared by the filtered wrappers: anchor filters are not
+    /// evaluable anywhere yet (the `memory_anchors` table ships with typed
+    /// code anchors), and an OLD contract-v2 daemon silently IGNORES the
+    /// additive `filter` field — so a frame carrying anchors could come back
+    /// unfiltered instead of erroring. Rejecting locally keeps the anchor
+    /// fail-fast guarantee independent of the daemon version.
+    fn ensure_filter_sendable(filter: &rb_types::RecallFilter) -> Result<()> {
+        if !filter.anchors.is_empty() {
+            return Err(Error::InvalidArgument(
+                "anchor filters are not supported yet (the memory_anchors table ships with \
+                 typed code anchors)"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// [`Client::recall_with_status`] over the unified [`rb_types::RecallFilter`]
     /// (PRD 2026-07-02 search-filter parity). Wire strategy: the dimensions a
     /// pre-filter frame can express (a single type + tags) are SPLIT into the
     /// legacy request slots so an old daemon still honors them; only the new
     /// dimensions ride the additive `filter` field (which an old daemon
-    /// ignores — graceful degradation to the legacy subset).
+    /// ignores — graceful degradation to the legacy subset). Non-empty anchor
+    /// filters are rejected BEFORE sending (see `ensure_filter_sendable`).
     pub async fn recall_filtered_with_status(
         &mut self,
         query: String,
         filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<(Vec<SearchResult>, bool)> {
+        Self::ensure_filter_sendable(&filter)?;
         let (memory_type, tags, filter) = filter.split_recall_legacy();
         let resp = self
             .request(Request::Recall {
@@ -340,12 +359,14 @@ impl Client {
     /// [`Client::list`] over the unified [`rb_types::RecallFilter`] — the same
     /// legacy-slot split as [`Client::recall_filtered_with_status`]:
     /// `min_importance` rides the pre-filter wire slot (old daemons honor it),
-    /// the new dimensions ride the additive `filter` field.
+    /// the new dimensions ride the additive `filter` field. Non-empty anchor
+    /// filters are rejected BEFORE sending (see `ensure_filter_sendable`).
     pub async fn list_filtered(
         &mut self,
         filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
+        Self::ensure_filter_sendable(&filter)?;
         let (min_importance, filter) = filter.split_list_legacy();
         let resp = self
             .request(Request::List {
@@ -898,6 +919,47 @@ mod wrapper_tests {
 
     async fn connect(path: &std::path::Path) -> Client {
         Client::connect(path, Namespace::Global).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn filtered_wrappers_reject_anchor_filters_before_sending() {
+        // An OLD contract-v2 daemon ignores the additive `filter` field, so a
+        // frame carrying an anchor filter would come back silently UNFILTERED
+        // — violating the fail-fast anchor guarantee across daemon versions.
+        // The client must reject non-empty anchors LOCALLY, before any frame
+        // is sent. (The fake server here would happily return a hit for any
+        // recall/list, so an Err proves the request never round-tripped.)
+        use rb_types::{AnchorFilter, AnchorKind, RecallFilter};
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut c = connect(&path).await;
+        let anchored = RecallFilter {
+            anchors: vec![AnchorFilter {
+                kind: AnchorKind::File,
+                value: "src/lib.rs".into(),
+            }],
+            ..Default::default()
+        };
+
+        let err = c
+            .recall_filtered_with_status("q".into(), anchored.clone(), 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "recall must fail fast client-side, got {err:?}"
+        );
+
+        let err = c.list_filtered(anchored, 5).await.unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "list must fail fast client-side, got {err:?}"
+        );
+
+        drop(c);
+        server.await.unwrap();
     }
 
     #[tokio::test]

@@ -63,20 +63,24 @@ fn parse_time_bound(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
             chrono::Utc,
         ));
     }
-    // Relative age: <number><unit> with unit d/h/m/s.
+    // Relative age: <number><unit> with unit d/h/m/s. The try_* constructors
+    // (chrono 0.4.44) are the FALLIBLE forms — `Duration::days` etc. panic on
+    // out-of-range values, and argv must never be able to panic the process.
     if let Some((digits, unit)) = s.split_at_checked(s.len().saturating_sub(1)) {
         if let Ok(n) = digits.parse::<i64>() {
             let duration = match unit {
-                "d" => Some(chrono::Duration::days(n)),
-                "h" => Some(chrono::Duration::hours(n)),
-                "m" => Some(chrono::Duration::minutes(n)),
-                "s" => Some(chrono::Duration::seconds(n)),
+                "d" => Some(chrono::TimeDelta::try_days(n)),
+                "h" => Some(chrono::TimeDelta::try_hours(n)),
+                "m" => Some(chrono::TimeDelta::try_minutes(n)),
+                "s" => Some(chrono::TimeDelta::try_seconds(n)),
                 _ => None,
             };
             if let Some(duration) = duration {
                 if n < 0 {
                     return Err(format!("relative age '{s}' must be non-negative"));
                 }
+                let duration =
+                    duration.ok_or_else(|| format!("relative age '{s}' is out of range"))?;
                 return Ok(chrono::Utc::now() - duration);
             }
         }
@@ -714,6 +718,23 @@ mod tests {
             assert!(
                 Cli::try_parse_from(["rusty-brain", "list", "--until", ok]).is_ok(),
                 "relative age {ok} must parse"
+            );
+        }
+    }
+
+    #[test]
+    fn time_bounds_reject_overflowing_relative_age() {
+        // chrono's panicking Duration constructors must never be reachable
+        // from argv: an absurd relative age is a clean parse ERROR, not an
+        // exit-101 panic.
+        for bad in ["200000000000d", "999999999999999h", "99999999999999999m"] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "recall", "q", "--since", bad]).is_err(),
+                "--since {bad} must be rejected, not panic"
+            );
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "list", "--until", bad]).is_err(),
+                "--until {bad} must be rejected, not panic"
             );
         }
     }

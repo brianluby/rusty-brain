@@ -37,13 +37,17 @@ pub trait MemoryBackend: Send + Sync {
         id: MemoryId,
         depth: u8,
     ) -> rb_types::Result<Vec<(MemoryId, u8)>>;
-    /// List up to `limit` memories matching the METADATA dimensions of
-    /// `filter` (the [`RecallFilter::matches`] semantics: types, tags,
-    /// importance/confidence ranges, created-at window, sources, archived
-    /// state), newest first. `contested` and `anchors` are NOT evaluated here
-    /// — the engine applies `contested` via [`MemoryBackend::active_contradicts`]
-    /// (one source of truth) and rejects `anchors` until typed code anchors
-    /// land.
+    /// List up to `limit` memories matching `filter`, newest first: the
+    /// metadata dimensions (the [`RecallFilter::matches`] semantics: types,
+    /// tags, importance/confidence ranges, created-at window, sources,
+    /// archived state) AND the contested tri-state. Contested must be
+    /// resolved INSIDE the bounded query — post-filtering a fetch window
+    /// silently drops matches past the window, under-filling `limit` — with
+    /// the SAME semantics as [`MemoryBackend::active_contradicts`] (the store
+    /// pins the two with a drift test; in-memory impls delegate to their own
+    /// `active_contradicts`). An error resolving contested fails the list
+    /// (fail-closed). `anchors` is NOT evaluated here — the engine rejects it
+    /// until typed code anchors land.
     async fn list(
         &self,
         ns: Namespace,
@@ -214,7 +218,7 @@ mod tests {
         }
         async fn list(
             &self,
-            _ns: Namespace,
+            ns: Namespace,
             filter: RecallFilter,
             limit: usize,
         ) -> rb_types::Result<Vec<MemoryNote>> {
@@ -226,6 +230,13 @@ mod tests {
                 .filter(|n| filter.matches(n))
                 .cloned()
                 .collect();
+            // Trait contract: contested resolves BEFORE the limit, via this
+            // backend's own active_contradicts (single source per backend).
+            if let Some(want) = filter.contested {
+                let ids: Vec<MemoryId> = v.iter().map(|n| n.id.clone()).collect();
+                let contested = self.active_contradicts(ns, ids).await?;
+                v.retain(|n| contested.contains(&n.id) == want);
+            }
             v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
             v.truncate(limit);
             Ok(v)

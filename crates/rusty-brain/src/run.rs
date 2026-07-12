@@ -31,6 +31,9 @@ pub fn parse_namespace_arg(s: &str) -> rb_types::Result<rb_types::Namespace> {
 /// `recall`/`list` filter flags — PRD 2026-07-02 search-filter parity. The
 /// client splits the legacy-expressible subset back into the pre-filter wire
 /// slots, so old daemons keep honoring type/tags/min-importance.
+// One positional arg per clap flag, 1:1 and same order as the `Recall`/`List`
+// variants — a params struct here would just be a second, drift-prone copy of
+// `RecallFilter` itself.
 #[allow(clippy::too_many_arguments)]
 fn build_recall_filter(
     memory_type: Option<rb_types::MemoryType>,

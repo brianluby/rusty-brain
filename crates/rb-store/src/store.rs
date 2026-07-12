@@ -50,14 +50,16 @@ pub trait Store {
         limit: usize,
     ) -> Result<Vec<MemoryNote>>;
     /// [`Store::list`] over the unified [`RecallFilter`] (PRD 2026-07-02
-    /// search-filter parity): every METADATA dimension — types, tags,
-    /// importance/confidence ranges, created-at window, sources, archived
-    /// state — is honored in SQL with the same inclusive/any-of/all-of
-    /// semantics as [`RecallFilter::matches`], ordered newest first, bounded
-    /// by `limit`. Two dimensions are intentionally NOT evaluated here:
-    /// `contested` needs the link lookup and is applied by the engine (the
-    /// `active_contradicts` single source of truth), and a non-empty `anchors`
-    /// filter is rejected fail-closed with `InvalidArgument` until the
+    /// search-filter parity): every dimension is honored INSIDE the bounded
+    /// SQL query — the metadata dimensions (types, tags, importance/
+    /// confidence ranges, created-at window, sources, archived state) with
+    /// the same inclusive/any-of/all-of semantics as
+    /// [`RecallFilter::matches`], AND the contested tri-state, expressed as
+    /// the SQL form of [`Store::active_contradicts`] so `limit` fills with
+    /// real matches no matter how deep they sit (the two expressions are
+    /// pinned together by the `contested_filter_agrees_with_active_contradicts`
+    /// drift test). Ordered newest first. A non-empty `anchors` filter is
+    /// rejected fail-closed with `InvalidArgument` until the
     /// typed-code-anchors table lands.
     fn list_filtered(
         &self,
