@@ -17,6 +17,44 @@ pub enum MemoryType {
 }
 
 impl MemoryType {
+    /// Every variant, in declaration order — the canonical list that
+    /// doc-anchoring tests (e.g. `rb-agents/tests/cognition_docs.rs`) and
+    /// round-trip tests derive from instead of hand-maintaining copies.
+    ///
+    /// Compiler-pinned: every element is produced through `pin`, whose
+    /// exhaustive match stops compiling the moment a variant is added — the
+    /// error lands HERE, and the fix is to extend the match, the returned
+    /// array, and the array length in this signature in the same edit.
+    pub fn all() -> [MemoryType; 9] {
+        // The identity match is the point: `t` would compile through a new
+        // variant silently, the exhaustive match cannot.
+        #[allow(clippy::needless_match)]
+        const fn pin(t: MemoryType) -> MemoryType {
+            match t {
+                MemoryType::ArchitectureDecision => MemoryType::ArchitectureDecision,
+                MemoryType::CodePattern => MemoryType::CodePattern,
+                MemoryType::BugFix => MemoryType::BugFix,
+                MemoryType::Configuration => MemoryType::Configuration,
+                MemoryType::Constraint => MemoryType::Constraint,
+                MemoryType::Entity => MemoryType::Entity,
+                MemoryType::Insight => MemoryType::Insight,
+                MemoryType::Reference => MemoryType::Reference,
+                MemoryType::Preference => MemoryType::Preference,
+            }
+        }
+        [
+            pin(MemoryType::ArchitectureDecision),
+            pin(MemoryType::CodePattern),
+            pin(MemoryType::BugFix),
+            pin(MemoryType::Configuration),
+            pin(MemoryType::Constraint),
+            pin(MemoryType::Entity),
+            pin(MemoryType::Insight),
+            pin(MemoryType::Reference),
+            pin(MemoryType::Preference),
+        ]
+    }
+
     /// Stable db string. MUST stay in lockstep with the SQL CHECK constraint.
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -55,17 +93,19 @@ mod tests {
     use super::*;
     use crate::error::Error;
 
-    const ALL: [MemoryType; 9] = [
-        MemoryType::ArchitectureDecision,
-        MemoryType::CodePattern,
-        MemoryType::BugFix,
-        MemoryType::Configuration,
-        MemoryType::Constraint,
-        MemoryType::Entity,
-        MemoryType::Insight,
-        MemoryType::Reference,
-        MemoryType::Preference,
-    ];
+    #[test]
+    fn all_is_duplicate_free() {
+        // `all()` is compiler-pinned for MISSING variants (the exhaustive
+        // `pin` match); this pins the other failure shape — the same variant
+        // listed twice while another is dropped from the returned array.
+        let all = MemoryType::all();
+        let distinct: std::collections::HashSet<&str> = all.iter().map(|t| t.as_str()).collect();
+        assert_eq!(
+            distinct.len(),
+            all.len(),
+            "MemoryType::all() repeats a variant"
+        );
+    }
 
     #[test]
     fn as_str_matches_sql_check_values() {
@@ -85,7 +125,7 @@ mod tests {
 
     #[test]
     fn parse_is_inverse_of_as_str_for_all_variants() {
-        for mt in ALL {
+        for mt in MemoryType::all() {
             assert_eq!(MemoryType::parse(mt.as_str()).unwrap(), mt);
         }
     }
