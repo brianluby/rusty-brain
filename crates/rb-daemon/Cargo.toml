@@ -23,6 +23,8 @@ tokio = { workspace = true }
 tokio-util = { workspace = true }
 tracing = { workspace = true }
 serde = { workspace = true }
+# HTTP body encoding (HTTP PRD) + review_resolve / review_sweep oplog detail
+# payloads (PRD 2026-07-02 review).
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }

@@ -647,6 +647,15 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         // the model fetched it deliberately, so keep the full JSON as text
         // (the `get` convention).
         Response::History { history } => ToolContent::json(json!({ "history": history }), false),
+        // Review is DELIBERATELY not an MCP tool (the forget precedent): a
+        // destructive surface stays off the model-facing toolset (and the
+        // tools/list budget sits at 897/900). Projected anyway so the
+        // mapping stays total.
+        Response::ReviewPlanned { plan } => ToolContent::json(json!({ "plan": plan }), false),
+        Response::ReviewDone { outcome } => ToolContent::json(json!({ "outcome": outcome }), false),
+        Response::Resolved { resolution } => {
+            ToolContent::json(json!({ "resolution": resolution }), false)
+        }
         Response::Error { kind, message } => ToolContent::json(
             json!({ "error": { "kind": kind, "message": message } }),
             true,

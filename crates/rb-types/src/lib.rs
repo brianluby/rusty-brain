@@ -19,6 +19,7 @@ mod memory_type;
 mod namespace;
 mod query;
 mod retention;
+mod review;
 mod stats;
 mod validate;
 
@@ -44,6 +45,13 @@ pub use query::{
 pub use retention::{
     ForgetCandidate, ForgetMode, ForgetOutcome, ForgetPlan, ForgetRule, RetentionPolicy,
     DEFAULT_BATCH_LIMIT, DEFAULT_IMPORTANCE_FLOOR, MAX_BATCH_LIMIT,
+};
+pub use review::{
+    review_item_key, MemberConfidence, PlannedResolution, ReviewAction, ReviewItem, ReviewMember,
+    ReviewOutcome, ReviewPlan, ReviewPolicy, ReviewReason, ReviewResolution, ReviewTotals,
+    REVIEW_DEFAULT_LIMIT, REVIEW_DEFAULT_SNOOZE_DAYS, REVIEW_DEFAULT_THRESHOLD, REVIEW_DEMOTE_STEP,
+    REVIEW_KEEP_BUMP, REVIEW_LOW_CONFIDENCE_BOUND, REVIEW_MAX_LIMIT, REVIEW_MAX_SNOOZE_DAYS,
+    REVIEW_MIN_THRESHOLD, REVIEW_STALE_DAYS,
 };
 pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 pub use validate::{validate_confidence, validate_importance};

@@ -701,7 +701,10 @@ fn is_admin_op(req: &Request) -> bool {
         // like Delete) and dry-runs of either mode are read-only, so none of
         // those are admin.
         Request::Forget { mode, dry_run, .. } => *mode == rb_types::ForgetMode::Hard && !dry_run,
-        // Namespace-scoped by the handshake: not admin.
+        // Namespace-scoped by the handshake: not admin. Review/Resolve
+        // (PRD 2026-07-02) are deliberately non-admin: every review action is
+        // reversible (supersede/archive are soft, demote is an update) and
+        // namespace-scoped — the Forget APPLY precedent, not the hard purge.
         Request::Remember { .. }
         | Request::Recall { .. }
         | Request::Get { .. }
@@ -715,6 +718,8 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Subscribe { .. }
         | Request::Stats { .. }
         | Request::History { .. }
+        | Request::Review { .. }
+        | Request::Resolve { .. }
         | Request::Ping => false,
     }
 }
@@ -1013,6 +1018,292 @@ async fn suppress_hook_near_duplicates<P>(
     }
 }
 
+/// Apply ONE review resolution (PRD 2026-07-02 REV-2) through the existing
+/// atomic primitives. Fail-closed order: validate the action shape against
+/// the member ids, resolve every member through the namespace-scoped engine
+/// (`peek` — a maintenance read must not pollute the W3.7 access signal; a
+/// foreign or missing id is `NotFound` before any write), mutate, then record
+/// the `review_resolve` audit row (REV-4).
+///
+/// Merge is the W3.1 update-as-supersede composition: store the combined
+/// memory FIRST (through the engine, so it is embedded, linked, and stamped
+/// with the caller's provenance), then supersede each original through the
+/// existing atomic supersede — a failure between the steps leaves the new
+/// memory stored and the un-superseded original live, never a partial or
+/// corrupt state (the `Remember.supersedes` argument); the pair simply
+/// resurfaces on the next sweep.
+async fn apply_review_action<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    reason: rb_types::ReviewReason,
+    ids: &[rb_types::MemoryId],
+    action: &rb_types::ReviewAction,
+) -> Result<rb_types::ReviewResolution>
+where
+    P: EmbeddingProvider,
+{
+    use rb_types::{MemberConfidence, ReviewAction};
+
+    action.validate(ids)?;
+    let key = rb_types::review_item_key(reason, ids);
+    let mut notes = Vec::with_capacity(ids.len());
+    for id in ids {
+        match engine.peek(id.clone()).await? {
+            Some(note) => notes.push(note),
+            None => return Err(Error::NotFound(id.clone())),
+        }
+    }
+
+    let mut resolution = rb_types::ReviewResolution {
+        key: key.clone(),
+        action: action.kind_str().to_string(),
+        ..Default::default()
+    };
+
+    match action {
+        ReviewAction::Keep { bump } => {
+            if *bump {
+                for note in &notes {
+                    let confidence = (note.confidence + rb_types::REVIEW_KEEP_BUMP).clamp(0.0, 1.0);
+                    engine
+                        .update(
+                            note.id.clone(),
+                            rb_types::MemoryUpdates {
+                                confidence: Some(confidence),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    resolution.confidence.push(MemberConfidence {
+                        id: note.id.clone(),
+                        confidence,
+                    });
+                }
+            }
+        }
+        ReviewAction::Merge => {
+            // Merging requires both originals ACTIVE: superseding an already
+            // archived row would overwrite its existing supersede identity.
+            for note in &notes {
+                if note.archived_at.is_some() {
+                    return Err(Error::InvalidArgument(format!(
+                        "cannot merge {}: it is already archived; re-run review \
+                         for a fresh queue",
+                        note.id
+                    )));
+                }
+            }
+            let (a, b) = (&notes[0], &notes[1]);
+            // Deterministic combine: identical contents collapse to one;
+            // otherwise both bodies are kept, first member first. Metadata
+            // keeps the strongest signal (max importance/confidence) and the
+            // union of keywords/tags/files/anchors.
+            let content = if a.content == b.content {
+                a.content.clone()
+            } else {
+                format!("{}\n\n---\n\n{}", a.content, b.content)
+            };
+            let mut keywords = a.keywords.clone();
+            for k in &b.keywords {
+                if !keywords.contains(k) {
+                    keywords.push(k.clone());
+                }
+            }
+            let mut tags = a.tags.clone();
+            for t in &b.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+            let mut related_files = a.related_files.clone();
+            for f in &b.related_files {
+                if !related_files.contains(f) {
+                    related_files.push(f.clone());
+                }
+            }
+            let mut anchors = a.anchors.clone();
+            for an in &b.anchors {
+                if !anchors.contains(an) {
+                    anchors.push(an.clone());
+                }
+            }
+            let context = [&a.context, &b.context]
+                .into_iter()
+                .find(|c| !c.is_empty())
+                .cloned();
+            let memory_type = if b.importance > a.importance {
+                b.memory_type
+            } else {
+                a.memory_type
+            };
+            let new_id = engine
+                .remember(rb_engine::RememberInput {
+                    content,
+                    context,
+                    memory_type,
+                    importance: a.importance.max(b.importance),
+                    keywords,
+                    tags,
+                    related_files,
+                    confidence: Some(a.confidence.max(b.confidence)),
+                    provenance: provenance.clone(),
+                    anchors,
+                })
+                .await?;
+            job_store
+                .supersede(namespace.clone(), a.id.clone(), new_id.clone())
+                .await?;
+            job_store
+                .supersede(namespace.clone(), b.id.clone(), new_id.clone())
+                .await?;
+            resolution.merged_into = Some(new_id);
+        }
+        ReviewAction::Archive { id } => {
+            engine.delete(id.clone()).await?;
+        }
+        ReviewAction::Demote { id } => {
+            // `validate` proved membership; the note is in `notes`.
+            if let Some(note) = notes.iter().find(|n| &n.id == id) {
+                let confidence = (note.confidence - rb_types::REVIEW_DEMOTE_STEP).clamp(0.0, 1.0);
+                engine
+                    .update(
+                        id.clone(),
+                        rb_types::MemoryUpdates {
+                            confidence: Some(confidence),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                resolution.confidence.push(MemberConfidence {
+                    id: id.clone(),
+                    confidence,
+                });
+            }
+        }
+        ReviewAction::Snooze { days } => {
+            let details = serde_json::json!({
+                "key": key,
+                "action": "snooze",
+                "days": days,
+            })
+            .to_string();
+            // The snooze op writes its own `review_resolve` oplog row inside
+            // the same transaction as the review_state upsert.
+            let until = job_store
+                .review_snooze(namespace.clone(), key.clone(), *days, details)
+                .await?;
+            resolution.snoozed_until = Some(until);
+            return Ok(resolution);
+        }
+    }
+
+    // REV-4: every non-snooze resolution stamps reviewed_at (clearing any
+    // snooze — the user acted) and appends one `review_resolve` oplog row.
+    // The per-memory mutations above already wrote their own oplog rows
+    // through the existing primitives.
+    let details = serde_json::json!({
+        "key": key,
+        "action": action.kind_str(),
+        "ids": ids.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+        "merged_into": resolution.merged_into.as_ref().map(std::string::ToString::to_string),
+    })
+    .to_string();
+    job_store
+        .record_review_resolution(namespace.clone(), key, details)
+        .await?;
+    Ok(resolution)
+}
+
+/// One bounded review apply pass (REV-3 `--apply --policy`): recompute the
+/// queue, derive the plan through the pure `ReviewPolicy::plan_action` (the
+/// SAME mapping a dry-run shows), and apply each planned action through
+/// [`apply_review_action`]. The `ForgetOutcome` failure shape (PR #60):
+/// every completed item's transactions are durable — a mid-batch failure is
+/// captured into `outcome.failure` instead of discarding the pass, and the
+/// bulk `review_sweep` oplog row is written unconditionally so a zero-change
+/// or partial pass is still an auditable run.
+async fn run_review_sweep<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    policy: rb_types::ReviewPolicy,
+    params: rb_store::ReviewQueueParams,
+) -> Result<rb_types::ReviewOutcome>
+where
+    P: EmbeddingProvider,
+{
+    let plan = job_store.review_plan(namespace.clone(), params).await?;
+    let mut outcome = rb_types::ReviewOutcome {
+        policy: Some(policy),
+        total_items: plan.items.len() as u64,
+        ..Default::default()
+    };
+    let mut failure: Option<String> = None;
+    for item in &plan.items {
+        let Some(action) = policy.plan_action(item) else {
+            outcome.skipped += 1;
+            continue;
+        };
+        let ids: Vec<rb_types::MemoryId> = item.members.iter().map(|m| m.id.clone()).collect();
+        match apply_review_action(
+            engine,
+            job_store,
+            provenance,
+            namespace,
+            item.reason,
+            &ids,
+            &action,
+        )
+        .await
+        {
+            Ok(_) => match action {
+                rb_types::ReviewAction::Keep { .. } => outcome.kept += 1,
+                rb_types::ReviewAction::Merge => outcome.merged += 1,
+                rb_types::ReviewAction::Archive { .. } => outcome.archived += 1,
+                rb_types::ReviewAction::Demote { .. } => outcome.demoted += 1,
+                rb_types::ReviewAction::Snooze { .. } => outcome.snoozed += 1,
+            },
+            Err(e) => {
+                // The failed item's own steps rolled back or stand alone;
+                // earlier items are committed. Stop (re-runnable), report
+                // the partial pass.
+                failure = Some(format!("{} of {} failed: {e}", action.kind_str(), item.key));
+                break;
+            }
+        }
+    }
+    // The bulk row records the RUN unconditionally (the retention_sweep
+    // precedent): a zero-change or partial pass is still a durable, auditable
+    // run. A failure recording it never erases the completed batch.
+    let details = serde_json::json!({
+        "policy": policy.as_str(),
+        "merged": outcome.merged,
+        "archived": outcome.archived,
+        "demoted": outcome.demoted,
+        "kept": outcome.kept,
+        "snoozed": outcome.snoozed,
+        "skipped": outcome.skipped,
+        "total_items": outcome.total_items,
+        "failure": failure,
+    })
+    .to_string();
+    if let Err(e) = job_store
+        .record_review_sweep(namespace.clone(), details)
+        .await
+    {
+        let msg = format!("recording the sweep run: {e}");
+        failure = Some(match failure {
+            Some(prior) => format!("{prior}; {msg}"),
+            None => msg,
+        });
+    }
+    outcome.failure = failure;
+    Ok(outcome)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
@@ -1309,6 +1600,88 @@ where
                 .await
             {
                 Ok(history) => Response::History { history },
+                Err(e) => error_to_response(e),
+            }
+        }
+        // Guided review (PRD 2026-07-02), namespace-scoped by the handshake.
+        // Dry-run generates the queue on the read pool (zero writer ops) and,
+        // when a policy is named, derives the per-item plan through the pure
+        // `ReviewPolicy::plan_action` — the SAME mapping the apply pass
+        // executes, so preview and mutation cannot diverge (REV-3). Execute
+        // requires an explicit policy (never auto-resolve without consent).
+        // The knobs are clamped server-side: a wire threshold can never drop
+        // below the conservative floor (false-positive merge risk).
+        Request::Review {
+            policy,
+            dry_run,
+            since,
+            limit,
+            threshold,
+        } => {
+            let params = rb_store::ReviewQueueParams {
+                threshold: match threshold {
+                    Some(t) if t.is_finite() => t.clamp(rb_types::REVIEW_MIN_THRESHOLD, 1.0),
+                    _ => rb_types::REVIEW_DEFAULT_THRESHOLD,
+                },
+                limit: limit
+                    .unwrap_or(rb_types::REVIEW_DEFAULT_LIMIT)
+                    .clamp(1, rb_types::REVIEW_MAX_LIMIT) as usize,
+                since,
+            };
+            if dry_run {
+                match job_store.review_plan(namespace.clone(), params).await {
+                    Ok(mut plan) => {
+                        if let Some(policy) = policy {
+                            plan.policy = Some(policy);
+                            plan.planned = plan
+                                .items
+                                .iter()
+                                .filter_map(|item| {
+                                    policy.plan_action(item).map(|action| {
+                                        rb_types::PlannedResolution {
+                                            key: item.key.clone(),
+                                            action,
+                                        }
+                                    })
+                                })
+                                .collect();
+                        }
+                        Response::ReviewPlanned { plan }
+                    }
+                    Err(e) => error_to_response(e),
+                }
+            } else {
+                let Some(policy) = policy else {
+                    return error_to_response(Error::InvalidArgument(
+                        "review execute requires an explicit policy (REV-3: never \
+                         auto-resolve without consent); name one or use the dry-run \
+                         preview"
+                            .to_string(),
+                    ));
+                };
+                match run_review_sweep(engine, job_store, provenance, namespace, policy, params)
+                    .await
+                {
+                    Ok(outcome) => Response::ReviewDone { outcome },
+                    Err(e) => error_to_response(e),
+                }
+            }
+        }
+        // One per-item resolution (REV-2 interactive mode). Validation is
+        // fail-closed at this boundary: the action shape against the member
+        // ids, then every member resolved through the namespace-scoped
+        // engine (a foreign or missing id is NotFound before any write).
+        Request::Resolve {
+            reason,
+            ids,
+            action,
+        } => {
+            match apply_review_action(
+                engine, job_store, provenance, namespace, reason, &ids, &action,
+            )
+            .await
+            {
+                Ok(resolution) => Response::Resolved { resolution },
                 Err(e) => error_to_response(e),
             }
         }

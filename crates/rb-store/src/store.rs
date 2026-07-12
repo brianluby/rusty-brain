@@ -9,6 +9,7 @@ mod oplog;
 mod reembed;
 mod rename;
 mod retention;
+mod review;
 mod scrub;
 mod stats;
 
@@ -199,5 +200,6 @@ pub use link_decay::LinkRow;
 pub use oplog::OplogReplayPage;
 pub use rename::NamespaceRenameOutcome;
 pub use retention::RetentionSweepEffects;
+pub use review::ReviewQueueParams;
 pub use scrub::ScrubOutcome;
 pub use stats::read_meta_embedding_model;

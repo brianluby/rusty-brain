@@ -11,8 +11,8 @@ contract_version = 2
 "crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
-"crates/rb-proto/src/messages.rs::Request" = "af5a8ce05ce48088d2e862964f847e1a243095ed58c2cc53c41c1d920fefa870"
-"crates/rb-proto/src/messages.rs::Response" = "267061d0c21b7a996d9be0c70f7f753ec2c71859dcb055981a3b8ba80d98b341"
+"crates/rb-proto/src/messages.rs::Request" = "a355c43db067c79b6adce7e0823a6229b8c96add1698cb8388019637c5d32b8c"
+"crates/rb-proto/src/messages.rs::Response" = "9db3b5b9faf7163bcc85a93568856cb254ee85abb1fe2f947f5a47aaeb418d5e"
 "crates/rb-types/src/anchor.rs::MemoryAnchor" = "db65d4fee2c23b5628270cdcb7b19ce99056eb3656de73aa0e50fc77090a9277"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
@@ -41,9 +41,20 @@ contract_version = 2
 "crates/rb-types/src/retention.rs::ForgetPlan" = "6211f4307be6ddac772b354e4430b794994b2c34f98566a6b0405b6f32785984"
 "crates/rb-types/src/retention.rs::ForgetRule" = "c7054d9aa7e213a2f3ef3dd9af26f0d81b365174ee51a95187c110af34302abd"
 "crates/rb-types/src/retention.rs::RetentionPolicy" = "bff5adcdadc3efbcf99ba4c2cbeb725c16f968f79acd5df84020f6984179c48a"
+"crates/rb-types/src/review.rs::MemberConfidence" = "4b62c5e265ee2304c28c2b7ca61fac86ed423d18d52c8d53f65d86035c91ac65"
+"crates/rb-types/src/review.rs::PlannedResolution" = "16462e1f7e7e5dff6c06aba8b5faba932ea89315869d9decad0e53880d731ef3"
+"crates/rb-types/src/review.rs::ReviewAction" = "f376ccefa1bb9d25ec4c55b1f421bff880574c3ba7f8f83faa284a85b662abb3"
+"crates/rb-types/src/review.rs::ReviewItem" = "0e9850bce1622ac0f8a09e4f233b02d4c8354e3b5b005db67b0bdda5b8b2099b"
+"crates/rb-types/src/review.rs::ReviewMember" = "5473f402c9704d37747bb1031fcb7f28cd0371e62b7fb648d887b7812b0b6588"
+"crates/rb-types/src/review.rs::ReviewOutcome" = "2388dc58f480caf6b0df7a81d467a8b430062a3619090f464db4a681534cf456"
+"crates/rb-types/src/review.rs::ReviewPlan" = "c17af0851f1b651910f5650c350fd8bac8954bb1d265e646724b462359f411c4"
+"crates/rb-types/src/review.rs::ReviewPolicy" = "d16e28f9323ea9c32dbf5852536112459766583788b9f1a847c6a18bd8de5374"
+"crates/rb-types/src/review.rs::ReviewReason" = "37eb2d83f358bca5209cd609f6aa41404b4e1c572049c77100553b64aba4f306"
+"crates/rb-types/src/review.rs::ReviewResolution" = "86028eeb5d8bff0514cb84c606bb62b63b933d871b80fa5fc5330c430d679b39"
+"crates/rb-types/src/review.rs::ReviewTotals" = "24036939b87eb2632d012eee8db2df6ef41a93511c2bf5c0802e2096461df8f9"
 "crates/rb-types/src/stats.rs::FeedbackTotals" = "ab6a1ea796d5866a566a9372536caed43217046b16245604cf41225963bbcd23"
 "crates/rb-types/src/stats.rs::GrowthBucket" = "552aa8d7fcb065ccc8275263b55fb0b5e1aad3493bbffa4e1c695bcd14174de6"
-"crates/rb-types/src/stats.rs::MemoryStats" = "3d041a5431a380be4602f14a8f6ec9eb68bef017166c80d2663f337ddf9fc90e"
+"crates/rb-types/src/stats.rs::MemoryStats" = "ed42bc5a916a5f0ac3f939e516e89d7770cff334c8d06b033200bbcba1bc045d"
 "crates/rb-types/src/stats.rs::TopRecalled" = "8d416dd284f9995cd45563cfe7d9fa56db1ca81e211dce44e09b45e850db8dd6"
 
 [migrations]
@@ -56,6 +67,7 @@ contract_version = 2
 "007_base_importance.sql" = "be04183c1209fdb8adfdcbd66dc96ecf6125b79a45cd4a65f40388b6cca6586b"
 "008_memory_feedback.sql" = "64901f555624da4b738e437877d6b2b60579dbd5051f55ab476390015a67b70b"
 "009_memory_anchors.sql" = "d65aa99503a1573dfc55e65c60eb4045087e26680e2e6e426fdd6b9be1b3f6eb"
+"010_review_state.sql" = "a174de82d5ebbf75cd68e28369b1ef7ce549daa9874d5d497a5efde067b86d45"
 
 [[log]]
 contract_version = 2
@@ -91,3 +103,8 @@ note = "PR #60 retention/forget: Request::Forget + retention payloads (no bump, 
 contract_version = 2
 intent = "additive"
 note = "PR #61 decision history timeline: Request/Response::History + rb-types history payloads (no bump, additive per W5a.4)"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "PR: review sweep — Request::Review/Resolve + Response::ReviewPlanned/ReviewDone/Resolved, rb-types review payloads (ReviewPlan/Item/Member/Action/Policy/Outcome/Resolution/Totals), MemoryStats.low_confidence_live, migration 010_review_state (no bump, additive per W5a.4)"
