@@ -8,6 +8,7 @@
 
 mod change;
 mod error_map;
+mod http;
 mod jobs;
 mod server;
 mod shared_embedder;
@@ -23,6 +24,7 @@ pub use jobs::{
 pub use rb_config::{default_db_path, default_socket_path};
 // FusionMode re-exported so `serve` can fill `DaemonConfig::fusion_mode`
 // without a direct rb-engine dependency (W2.2).
+pub use http::HttpListenerConfig;
 pub use rb_engine::FusionMode;
 pub use server::{Daemon, DaemonConfig, EnrichEndpoint};
 pub use shared_embedder::SharedEmbedder;

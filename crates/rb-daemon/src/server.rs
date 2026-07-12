@@ -154,6 +154,13 @@ pub struct DaemonConfig {
     /// `FusionMode::Linear` is the default; the default flip to RRF is
     /// deferred to W4.1 eval evidence.
     pub fusion_mode: rb_engine::FusionMode,
+    /// Opt-in loopback HTTP listener (HTTP PRD HTTP-1/HTTP-2). `None` (the
+    /// default posture) means ZERO footprint: no TCP socket is bound and no
+    /// listener task is spawned. The bind address is re-validated at
+    /// [`Daemon::bind`] — a non-loopback address fails closed even if the
+    /// caller skipped config-layer validation. See docs/THREAT_MODEL.md,
+    /// "The opt-in HTTP listener".
+    pub http: Option<crate::http::HttpListenerConfig>,
 }
 
 /// An OpenAI-compatible enrichment endpoint (no credentials here; see
@@ -177,6 +184,11 @@ pub struct Daemon {
     retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
     fusion_mode: rb_engine::FusionMode,
+    /// Bound opt-in HTTP listener + its config; `None` when disabled (the
+    /// default): nothing is bound and `run` spawns no HTTP task.
+    http: Option<(tokio::net::TcpListener, crate::http::HttpListenerConfig)>,
+    /// Actual bound HTTP address (resolves port 0), for logs and callers.
+    http_addr: Option<std::net::SocketAddr>,
 }
 
 impl std::fmt::Debug for Daemon {
@@ -193,6 +205,13 @@ impl Daemon {
     /// Bind the daemon socket and initialize the backing store.
     pub async fn bind(config: DaemonConfig, embedder: SharedEmbedder) -> Result<Self> {
         let dim = embedder.dim();
+
+        // Fail closed on a non-loopback HTTP bind BEFORE any filesystem or
+        // socket work: the daemon re-validates the address itself and never
+        // trusts the caller's config layer to have done so.
+        if let Some(http_config) = config.http.as_ref() {
+            crate::http::validate_bind(http_config)?;
+        }
 
         if let Some(parent) = config.db_path.parent() {
             prepare_db_dir(parent)?;
@@ -223,6 +242,22 @@ impl Daemon {
         fs::set_permissions(&config.socket_path, fs::Permissions::from_mode(0o600))
             .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", config.socket_path.display())))?;
         bind_guard.mark_socket_bound();
+
+        // Opt-in HTTP listener (HTTP PRD): bound here (fail closed on any
+        // bind error, e.g. a taken port), served in `run` beside the UDS
+        // accept loop. Disabled means untouched: no socket, no task. Bound
+        // BEFORE the store starts so a bind failure never strands the
+        // writer thread.
+        let (http, http_addr) = match config.http {
+            None => (None, None),
+            Some(http_config) => {
+                let http_listener = crate::http::bind_listener(&http_config).await?;
+                let addr = http_listener
+                    .local_addr()
+                    .map_err(|e| Error::Io(format!("http local_addr: {e}")))?;
+                (Some((http_listener, http_config)), Some(addr))
+            }
+        };
 
         // Bind the embedder's model identity into every store open so a
         // same-dim provider swap fails closed instead of mixing vector spaces.
@@ -275,7 +310,16 @@ impl Daemon {
             retention_policy: config.retention_policy,
             request_idle_timeout,
             fusion_mode: config.fusion_mode,
+            http,
+            http_addr,
         })
+    }
+
+    /// The actual bound address of the opt-in HTTP listener (port 0 resolved),
+    /// or `None` when HTTP is disabled — the zero-footprint contract.
+    #[must_use]
+    pub fn http_addr(&self) -> Option<std::net::SocketAddr> {
+        self.http_addr
     }
 
     /// Run until `shutdown` resolves, then drain connections and clean up.
@@ -292,6 +336,8 @@ impl Daemon {
             retention_policy,
             request_idle_timeout,
             fusion_mode,
+            http,
+            http_addr: _http_addr,
         } = self;
         tokio::pin!(shutdown);
         // Writer-death signal (W1.6c): resolves only on an ABNORMAL writer
@@ -304,8 +350,33 @@ impl Daemon {
             jobs::scheduler::spawn(store.clone(), jobs_config.clone(), retention_policy.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
-        // Daemon-lifetime recall channel counters, shared by every connection.
+        // Daemon-lifetime recall channel counters, shared by every connection
+        // (UDS and HTTP alike — one status truth).
         let recall_counters = Arc::new(RecallChannelCounters::default());
+
+        // Opt-in HTTP listener task, beside the UDS accept loop. Zero
+        // footprint when disabled: no channel subscriber, no task. Shutdown
+        // is signalled through the watch channel below and JOINED before the
+        // store shuts down, so the HTTP path is covered by graceful shutdown.
+        let (http_shutdown_tx, http_shutdown_rx) = tokio::sync::watch::channel(false);
+        let http_task = http.map(|(http_listener, http_config)| {
+            let state = Arc::new(crate::http::HttpState {
+                store: store.clone(),
+                embedder: embedder.clone(),
+                enricher: enricher.clone(),
+                jobs_config: jobs_config.clone(),
+                retention_policy: retention_policy.clone(),
+                recall_counters: recall_counters.clone(),
+                fusion_mode,
+                provider_model: embedder.model_id().to_string(),
+            });
+            tokio::spawn(crate::http::run(
+                http_listener,
+                http_config,
+                state,
+                http_shutdown_rx,
+            ))
+        });
 
         loop {
             tokio::select! {
@@ -370,6 +441,15 @@ impl Daemon {
         }
 
         drop(listener);
+        // Stop the HTTP listener FIRST and wait for it to finish: its accept
+        // loop drops the TCP socket and aborts its connections, so no HTTP
+        // request can race the store shutdown below.
+        let _ = http_shutdown_tx.send(true);
+        if let Some(task) = http_task {
+            if let Err(e) = task.await {
+                warn!(error = %e, "http listener task failed during shutdown");
+            }
+        }
         scheduler.abort();
         conns.shutdown().await;
         store.shutdown().await;
@@ -559,11 +639,19 @@ async fn probe_live(path: &Path) -> bool {
 /// authorization decisions. The handshake identity remains provenance
 /// metadata only.
 #[derive(Debug, Clone, Copy)]
-struct PeerIdentity {
+pub(crate) struct PeerIdentity {
     uid: Option<u32>,
 }
 
 impl PeerIdentity {
+    /// A peer with NO kernel-verified credential — never admin (fail
+    /// closed). This is every HTTP connection's identity: TCP loopback has
+    /// no `SO_PEERCRED`/`getpeereid`, so the HTTP surface is gated exactly
+    /// like a UDS connection whose peer credentials could not be read.
+    pub(crate) fn untrusted() -> Self {
+        Self { uid: None }
+    }
+
     fn from_stream(stream: &UnixStream) -> Self {
         match stream.peer_cred() {
             Ok(cred) => Self {
@@ -858,7 +946,7 @@ async fn stream_changes(
     }
 }
 
-fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namespace> {
+pub(crate) fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_types::Namespace> {
     let encoded = namespace.as_db_string();
     let parsed = rb_types::Namespace::parse_db_string(&encoded)?;
     if parsed == namespace {
@@ -926,7 +1014,7 @@ async fn suppress_hook_near_duplicates<P>(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn dispatch<P>(
+pub(crate) async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
@@ -1404,6 +1492,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            http: None,
         };
         assert_eq!(
             config
@@ -1481,6 +1570,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            http: None,
         };
         let daemon = Daemon::bind(
             config,
@@ -1523,6 +1613,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            http: None,
         };
         let socket = config.socket_path.clone();
         let daemon = Daemon::bind(
@@ -1631,6 +1722,7 @@ mod tests {
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
             retention_policy: None,
+            http: None,
         };
         let socket = config.socket_path.clone();
         let daemon = Daemon::bind(

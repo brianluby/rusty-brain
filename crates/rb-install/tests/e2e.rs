@@ -49,6 +49,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            http: None,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();

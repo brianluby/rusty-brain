@@ -45,6 +45,12 @@ tokio-util = { version = "0.7", features = ["codec"] }
 tokio-stream = "0.1"
 async-trait = "0.1"
 reqwest = { version = "0.12", features = ["json", "rustls-tls", "blocking"], default-features = false }
+# Opt-in loopback HTTP listener (HTTP PRD 2026-07-02). Minimal feature set:
+# http1 + server only — no TLS (the listener is loopback-only by design), no
+# http2, no client. Already in the dependency graph transitively via reqwest.
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+http-body-util = "0.1"
 futures = "0.3"
 bytes = "1"
 secrecy = "0.10"
