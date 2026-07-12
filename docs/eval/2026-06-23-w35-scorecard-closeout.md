@@ -98,3 +98,14 @@ State values are intentionally restricted to `measured`, `landed, unmeasured`,
 - It cannot claim Phase 5 pilot validation, team adoption, or two-machine proof.
 - It cannot treat a future Class B red result as a release blocker unless the
   run shows memory-induced errors; capture fidelity is tracked evidence.
+
+## Addendum (2026-07-12): the deferred N>=5 read has been taken
+
+The "landed, unmeasured" state above is closed:
+`docs/eval/2026-07-12-w35-scorecard-n5-run.md` records the first full N=5
+measured run (Classes A, B, C, R; run 29203432198). Headlines: ADR-3
+**ratified** (Opt 3), capture fidelity 100% (the expected-red that wasn't),
+reach 33% vs 0% realistic, and the safety gate **fired** (2 memory-induced
+errors, `fresh-test-runner`) — tracked as Vikunja #502. Vikunja #381/#382/#383
+(the follow-ups filed by this closeout as #13/#14/#15) are delivered by that
+artifact.
