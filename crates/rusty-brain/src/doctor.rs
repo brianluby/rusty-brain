@@ -220,10 +220,16 @@ pub fn check_model_identity(provider: Option<&str>, meta: Option<&str>) -> Docto
         (Some(_), None) => DoctorCheck {
             name: "embedding-model",
             status: CheckStatus::Warn,
-            detail: "DB has no recorded embedding model (legacy DB; it is \
-                     seeded at the next daemon start)"
+            detail: "DB has no recorded embedding model (legacy DB; startup \
+                     reconciles it against per-row model stamps)"
                 .to_string(),
-            hint: None,
+            hint: Some(
+                "startup adopts the configured model only for an empty corpus \
+                 or when every row already uses it; otherwise restore the \
+                 matching provider or run `rusty-brain serve \
+                 --accept-model-change` followed by `rusty-brain reembed`"
+                    .to_string(),
+            ),
         },
         (None, meta) => DoctorCheck {
             name: "embedding-model",
@@ -706,6 +712,13 @@ mod tests {
         // Legacy DB without a stamp: warn, not fail.
         let legacy = check_model_identity(Some("deterministic"), None);
         assert_eq!(legacy.status, CheckStatus::Warn, "{legacy:?}");
+        assert!(
+            legacy
+                .hint
+                .as_deref()
+                .is_some_and(|hint| hint.contains("--accept-model-change")),
+            "legacy recovery carries explicit remediation: {legacy:?}"
+        );
 
         // Provider identity unknown (offline with a remote provider): skip.
         let skipped = check_model_identity(None, Some("voyage-3"));

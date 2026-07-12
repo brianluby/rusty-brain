@@ -445,21 +445,77 @@ fn seed_or_verify_dim(conn: &rusqlite::Connection, embedding_dim: usize) -> Resu
     }
     Ok(())
 }
-/// Seed `meta.embedding_model` on first init (or on the first open of a DB
-/// created before the key existed), or verify it matches on re-open. A
-/// same-dim provider swap would silently mix vector spaces, so this fails
-/// closed with the explicit remediation.
+/// Seed `meta.embedding_model` on first init, or verify it on re-open.
 ///
-/// `INSERT OR IGNORE` + re-read, same race-safe idiom as
-/// [`seed_or_verify_dim`] / [`seed_or_get_site_id`].
+/// A legacy DB may have per-row model stamps but no global marker. Recovery is
+/// conservative: an empty corpus adopts the configured model, and a populated
+/// corpus adopts it only when every row already carries that same model. A
+/// disagreement or mixed-model corpus fails closed and requires the explicit
+/// `accept_model_change` + re-embed path.
+///
+/// The common, already-seeded path is read-only. Missing-marker recovery takes
+/// an immediate transaction and re-reads the marker under the write lock, so
+/// concurrent first opens cannot race the row-stamp check and seed.
 fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> Result<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO meta (key, value) VALUES ('embedding_model', ?1)",
-        rusqlite::params![embedding_model],
-    )
-    .map_err(storage_err)?;
-    let stored = meta_value(conn, "embedding_model")?
-        .ok_or_else(|| Error::Storage("meta.embedding_model missing after seed".to_string()))?;
+    if let Some(stored) = meta_value(conn, "embedding_model")? {
+        return verify_configured_model(&stored, embedding_model);
+    }
+
+    immediate_tx(conn, || {
+        // Re-check after acquiring the write lock: another opener may have
+        // seeded the marker after the optimistic read above.
+        if let Some(stored) = meta_value(conn, "embedding_model")? {
+            return verify_configured_model(&stored, embedding_model);
+        }
+
+        // At most two values are needed to distinguish empty, uniform, and
+        // mixed corpora; keep recovery bounded even if row stamps are corrupt.
+        let row_models = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT DISTINCT embedding_model
+                     FROM memories
+                     ORDER BY embedding_model
+                     LIMIT 2",
+                )
+                .map_err(storage_err)?;
+            let models = stmt
+                .query_map([], |row| row.get::<_, String>(0))
+                .map_err(storage_err)?
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .map_err(storage_err)?;
+            models
+        };
+
+        match row_models.as_slice() {
+            [] => {}
+            [stored] if stored == embedding_model => {}
+            [stored] => {
+                return Err(Error::Storage(format!(
+                    "embedding model changed (meta.embedding_model is missing, stored rows use: \
+                     {stored}, configured: {embedding_model}); run with --accept-model-change \
+                     to mark the corpus for re-embedding"
+                )))
+            }
+            models => {
+                return Err(Error::Storage(format!(
+                    "meta.embedding_model is missing and stored rows contain mixed embedding \
+                     models {models:?}; run with --accept-model-change to adopt \
+                     {embedding_model} and re-embed the corpus"
+                )))
+            }
+        }
+
+        conn.execute(
+            "INSERT INTO meta (key, value) VALUES ('embedding_model', ?1)",
+            rusqlite::params![embedding_model],
+        )
+        .map_err(storage_err)?;
+        Ok(())
+    })
+}
+
+fn verify_configured_model(stored: &str, embedding_model: &str) -> Result<()> {
     if stored != embedding_model {
         return Err(Error::Storage(format!(
             "embedding model changed (stored: {stored}, configured: {embedding_model}); \
@@ -487,6 +543,18 @@ fn seed_or_get_site_id(conn: &rusqlite::Connection) -> Result<String> {
 mod open_tests {
     #![allow(clippy::panic)]
     use super::*;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+
+    fn insert_memory_with_model(store: &SqliteStore, model: &str, content: &str) {
+        let mut note = MemoryNote::new(
+            Namespace::Project("model-recovery".to_string()),
+            content.to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        note.embedding_model = model.to_string();
+        store.insert_memory(&note, Some(&[0.1f32; 8])).unwrap();
+    }
 
     #[test]
     fn open_in_memory_creates_schema_and_seeds_dim() {
@@ -632,6 +700,95 @@ mod open_tests {
         // ...and a later swap is then refused.
         let err = SqliteStore::open_with_model(&path, 8, "other-model").unwrap_err();
         assert!(err.to_string().contains("embedding model changed"), "{err}");
+    }
+
+    #[test]
+    fn missing_model_marker_with_compatible_rows_is_recovered() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            insert_memory_with_model(&store, "model-a", "compatible row");
+            assert!(store.meta_value("embedding_model").unwrap().is_none());
+        }
+
+        let recovered = SqliteStore::open_with_model(&path, 8, "model-a").unwrap();
+        assert_eq!(
+            recovered.meta_value("embedding_model").unwrap().as_deref(),
+            Some("model-a")
+        );
+        drop(recovered);
+
+        SqliteStore::open_with_model(&path, 8, "model-a").unwrap();
+    }
+
+    #[test]
+    fn missing_model_marker_with_incompatible_rows_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            insert_memory_with_model(&store, "model-a", "incompatible row");
+        }
+
+        let err = SqliteStore::open_with_model(&path, 8, "model-b").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("meta.embedding_model is missing"), "{msg}");
+        assert!(
+            msg.contains("stored rows use: model-a") && msg.contains("configured: model-b"),
+            "{msg}"
+        );
+
+        let legacy = SqliteStore::open(&path, 8).unwrap();
+        assert!(legacy.meta_value("embedding_model").unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_model_marker_with_mixed_rows_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            insert_memory_with_model(&store, "model-a", "first model");
+            insert_memory_with_model(&store, "model-b", "second model");
+        }
+
+        let err = SqliteStore::open_with_model(&path, 8, "model-a").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("mixed embedding models"), "{msg}");
+        assert!(msg.contains("model-a") && msg.contains("model-b"), "{msg}");
+
+        let legacy = SqliteStore::open(&path, 8).unwrap();
+        assert!(legacy.meta_value("embedding_model").unwrap().is_none());
+    }
+
+    #[test]
+    fn explicit_accept_recovers_missing_marker_with_incompatible_rows() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            insert_memory_with_model(&store, "model-a", "accept this change");
+        }
+        assert!(SqliteStore::open_with_model(&path, 8, "model-b").is_err());
+
+        let legacy = SqliteStore::open(&path, 8).unwrap();
+        assert!(!legacy.accept_model_change("model-b").unwrap());
+        assert_eq!(
+            legacy
+                .memories_for_reembed("model-b", "v2-composite", 10)
+                .unwrap()
+                .len(),
+            1,
+            "the accepted legacy row remains queued for re-embedding"
+        );
+        drop(legacy);
+
+        SqliteStore::open_with_model(&path, 8, "model-b").unwrap();
     }
 
     #[test]
