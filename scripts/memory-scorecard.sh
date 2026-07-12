@@ -926,7 +926,27 @@ fi
 cleanup() { rm -rf "$WORKROOT" 2>/dev/null || true; }
 trap cleanup EXIT
 
-seed_home() { mkdir -p "$1"; printf '{"hasCompletedOnboarding": true}\n' > "$1/.claude.json"; }
+seed_home() { # home [proj]
+  # claude >= 2.1.x ignores project settings (hooks, permissions.allow, MCP)
+  # in a workspace with no recorded trust decision, and `-p` mode cannot show
+  # the trust dialog — so a generated project must be pre-trusted in the
+  # home's .claude.json (keyed by the project's REAL path; macOS tmpdirs
+  # resolve /var -> /private/var).
+  mkdir -p "$1"
+  if [ -n "${2:-}" ]; then
+    mkdir -p "$2"
+    python3 - "$1/.claude.json" "$2" <<'PY'
+import json, os, sys
+path, proj = sys.argv[1], os.path.realpath(sys.argv[2])
+json.dump(
+    {"hasCompletedOnboarding": True,
+     "projects": {proj: {"hasTrustDialogAccepted": True}}},
+    open(path, "w"), indent=2)
+PY
+  else
+    printf '{"hasCompletedOnboarding": true}\n' > "$1/.claude.json"
+  fi
+}
 
 run_session() { # home proj prompt log [extra args...]
   local home="$1" proj="$2" prompt="$3" log="$4"; shift 4
@@ -1142,7 +1162,7 @@ run_scenario() { # row
     # shared work home/project here is only set up for the non-reach dimensions.
     local wh="$mb/hw" wp="$mb/wp"
     if [ "$dim" != "reach" ]; then
-      seed_home "$wh"; mkdir -p "$wp"
+      seed_home "$wh" "$wp"
       install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
     fi
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
@@ -1191,7 +1211,7 @@ run_scenario() { # row
         local ha pa hb pb
         IFS=$'\t' read -r ha pa hb pb < <(reach_identity_paths "$mb")
         : "$pa" # tab-split placeholder; A needs no project dir
-        seed_home "$ha"; seed_home "$hb"; mkdir -p "$pb"
+        seed_home "$ha"; seed_home "$hb" "$pb"
         install_rusty_brain "$hb" "$pb"; rm -f "$pb/CLAUDE.md"; rm -rf "$pb/.claude/skills"
         plant_explicit "$ha" "$facts"
         score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale"
@@ -1202,7 +1222,7 @@ run_scenario() { # row
           plant_corpus_distractors "$wh" "$id" "$corpus"
         elif [ "$plant_mode" = "auto-capture" ]; then
           local ph="$mb/hp" pp="$mb/pp" plog="$mb/plant.jsonl"
-          seed_home "$ph"; mkdir -p "$pp"
+          seed_home "$ph" "$pp"
           install_rusty_brain_hooks_only "$ph" "$pp"; rm -f "$pp/CLAUDE.md"; rm -rf "$pp/.claude/skills"
           # Auto-capture plant: a real Claude Code session whose SessionEnd hook
           # (no MCP) is the only path that writes memory for this dimension.
@@ -1225,15 +1245,15 @@ run_scenario() { # row
     # target is the ONLY difference: steelman holds target + distractors (diligent
     # human), realistic holds distractors only (target omitted — the common
     # "nobody wrote it down" reality).
-    local rb="$base/realistic"; seed_home "$rb/h"; mkdir -p "$rb/p"
+    local rb="$base/realistic"; seed_home "$rb/h" "$rb/p"
     write_claude_md "$rb/p/CLAUDE.md" "$realistic" "$distractors"
     score_session "$dim" "$id" "realistic-baseline" "$run" "$rb/p" "$rb/h" "$work" "$expect" "$forbid" "$stale"
 
-    local sb="$base/steelman"; seed_home "$sb/h"; mkdir -p "$sb/p"
+    local sb="$base/steelman"; seed_home "$sb/h" "$sb/p"
     write_claude_md "$sb/p/CLAUDE.md" "$steelman" "$distractors"
     score_session "$dim" "$id" "steelman-baseline" "$run" "$sb/p" "$sb/h" "$work" "$expect" "$forbid" "$stale"
 
-    local ob="$base/off"; seed_home "$ob/h"; mkdir -p "$ob/p"
+    local ob="$base/off"; seed_home "$ob/h" "$ob/p"
     score_session "$dim" "$id" "memory-off" "$run" "$ob/p" "$ob/h" "$work" "$expect" "$forbid" "$stale"
 
     run=$((run + 1))
