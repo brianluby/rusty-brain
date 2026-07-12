@@ -2591,7 +2591,11 @@ name = "rb-daemon"
 version = "0.0.1"
 dependencies = [
  "async-trait",
+ "bytes",
  "chrono",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
  "libc",
  "rb-config",
  "rb-embed",

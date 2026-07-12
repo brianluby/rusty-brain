@@ -99,6 +99,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
         Command::Serve {
             jobs_config,
             accept_model_change,
+            http,
         } => {
             // Flag > env > config file (effective.jobs_config already encodes
             // env > file, so the flag/env composition stays authoritative).
@@ -115,6 +116,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 4,
                 jobs_config_path,
                 accept_model_change,
+                http,
                 shutdown,
             )
             .await

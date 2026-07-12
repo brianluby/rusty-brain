@@ -381,6 +381,64 @@ fn resolve_retention(
     Ok(Some(policy))
 }
 
+/// Default bind for an enabled `[http]` section with no explicit `bind`:
+/// loopback, ephemeral port (HTTP PRD HTTP-1).
+pub const DEFAULT_HTTP_BIND: &str = "127.0.0.1:0";
+
+/// Resolved opt-in HTTP listener config (HTTP PRD HTTP-1/HTTP-2). Present
+/// only when `[http] enabled = true` AND the bind validated as a literal
+/// loopback address — a non-loopback value fails resolution closed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HttpConfig {
+    /// Validated loopback socket address to bind (port 0 = ephemeral).
+    pub bind: std::net::SocketAddr,
+}
+
+/// Validate an HTTP bind value: it must parse as a LITERAL `ip:port`
+/// (`SocketAddr` — hostnames never parse, so no DNS lookup can decide where
+/// the daemon listens) and the IP must be loopback (`127.0.0.0/8` / `::1`).
+/// Anything else fails closed — v1 has no non-loopback opt-in at all (the
+/// PRD's multi-host posture is Phase 5a; see docs/THREAT_MODEL.md).
+///
+/// Single source of truth for bind validation: the config-file resolve below
+/// and the CLI `serve --http [bind]` flag both go through here.
+pub fn validate_http_bind(raw: &str) -> Result<std::net::SocketAddr> {
+    let trimmed = raw.trim();
+    let addr: std::net::SocketAddr = trimmed.parse().map_err(|_| {
+        Error::InvalidArgument(format!(
+            "invalid http bind {trimmed:?}: want a literal loopback ip:port \
+             like \"127.0.0.1:7777\" or \"[::1]:0\" (hostnames are not \
+             resolved)"
+        ))
+    })?;
+    if !addr.ip().is_loopback() {
+        return Err(Error::InvalidArgument(format!(
+            "refusing non-loopback http bind {addr}: the HTTP listener is \
+             loopback-only (127.0.0.1/::1); multi-host exposure is not \
+             supported (see docs/THREAT_MODEL.md)"
+        )));
+    }
+    Ok(addr)
+}
+
+/// Resolve the `[http]` section into a validated listener config (HTTP PRD
+/// HTTP-1/HTTP-2). Config-file-only knob (plus the `serve --http` flag above
+/// this layer) — no env equivalent, per the "new knobs land in the file only"
+/// rule. Off by default at every layer: an absent section, `enabled = false`,
+/// or a bare `bind` without `enabled = true` all resolve to `None`.
+/// DELIBERATE deviation from warn-and-ignore: an invalid or non-loopback
+/// bind FAILS resolution — a network listener is never silently repointed.
+fn resolve_http(file_value: &Option<file::HttpFileConfig>) -> Result<Option<HttpConfig>> {
+    let Some(section) = file_value else {
+        return Ok(None);
+    };
+    if section.enabled != Some(true) {
+        return Ok(None);
+    }
+    let bind = validate_http_bind(section.bind.as_deref().unwrap_or(DEFAULT_HTTP_BIND))?;
+    Ok(Some(HttpConfig { bind }))
+}
+
 /// The fully resolved per-process configuration: env var > user config file >
 /// built-in default, per knob (CLI flags are applied above this by the
 /// binaries). Resolved identically by the CLI, the hooks, and the daemon —
@@ -416,6 +474,10 @@ pub struct EffectiveConfig {
     /// (forgetting stays a no-op — retention PRD RET-1). Fail-closed: an
     /// invalid section aborts resolution instead of warning.
     pub retention: Option<rb_types::RetentionPolicy>,
+    /// Validated `[http]` listener config; `None` unless `enabled = true`
+    /// with a loopback bind (HTTP PRD HTTP-1/HTTP-2). Fail-closed: an
+    /// invalid or non-loopback bind aborts resolution instead of warning.
+    pub http: Option<HttpConfig>,
     /// Non-fatal findings (unknown config keys, ignored invalid values).
     /// Callers surface these (`tracing::warn!`); they never fail resolution.
     pub warnings: Vec<String>,
@@ -450,6 +512,7 @@ impl EffectiveConfig {
             idle_timeout_secs,
             fusion_mode,
             retention: resolve_retention(&config.retention)?,
+            http: resolve_http(&config.http)?,
             warnings,
         })
     }
@@ -832,6 +895,159 @@ mod tests {
         );
         let err = EffectiveConfig::resolve().unwrap_err();
         assert!(err.to_string().contains("max_age_days"), "{err}");
+    }
+
+    // HTTP PRD HTTP-1/HTTP-2: off by default at every layer — no [http]
+    // section means no listener config resolves at all.
+    #[test]
+    fn absent_http_section_resolves_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "");
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert!(effective.http.is_none());
+    }
+
+    // A section without the explicit master opt-in stays OFF: a bind value
+    // alone must never enable the listener (mirrors "no section" vs
+    // "disabled policy" distinguishability from the retention precedent).
+    #[test]
+    fn http_bind_without_enabled_resolves_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [http]
+            bind = "127.0.0.1:7777"
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert!(effective.http.is_none(), "bind alone must not enable HTTP");
+    }
+
+    #[test]
+    fn http_disabled_section_resolves_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [http]
+            enabled = false
+            bind = "127.0.0.1:7777"
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert!(effective.http.is_none());
+    }
+
+    // enabled=true with no bind uses the loopback ephemeral-port default.
+    #[test]
+    fn http_enabled_defaults_to_loopback_ephemeral_port() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [http]
+            enabled = true
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        let http = effective.http.expect("http resolved");
+        assert!(http.bind.ip().is_loopback());
+        assert_eq!(http.bind.port(), 0);
+    }
+
+    #[test]
+    fn http_enabled_with_loopback_bind_resolves() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [http]
+            enabled = true
+            bind = "127.0.0.1:7777"
+            "#,
+        );
+        let http = EffectiveConfig::resolve().unwrap().http.expect("resolved");
+        assert_eq!(http.bind.to_string(), "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn http_ipv6_loopback_bind_resolves() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [http]
+            enabled = true
+            bind = "[::1]:7777"
+            "#,
+        );
+        let http = EffectiveConfig::resolve().unwrap().http.expect("resolved");
+        assert!(http.bind.ip().is_loopback());
+        assert_eq!(http.bind.port(), 7777);
+    }
+
+    // SECURITY (fail closed, threat-model requirement): a non-loopback bind
+    // value must abort resolution — never silently bind, never silently fall
+    // back to the loopback default. v1 has no non-loopback opt-in at all.
+    #[test]
+    fn non_loopback_http_bind_fails_resolution_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        for bind in [
+            "0.0.0.0:8080",
+            "192.168.1.5:8080",
+            "[::]:8080",
+            "8.8.8.8:1",
+            "[2001:db8::1]:443",
+        ] {
+            write_config(
+                &confdir,
+                &format!("[http]\nenabled = true\nbind = \"{bind}\"\n"),
+            );
+            let err = EffectiveConfig::resolve().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("loopback"), "{bind}: {msg}");
+        }
+    }
+
+    // Hostnames (including "localhost") never parse: bind is a literal
+    // SocketAddr so no DNS lookup can ever decide where the daemon listens
+    // (a poisoned resolver must not be able to move the listener).
+    #[test]
+    fn hostname_http_bind_fails_resolution_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        for bind in ["localhost:8080", "example.com:80", "not a socket addr"] {
+            write_config(
+                &confdir,
+                &format!("[http]\nenabled = true\nbind = \"{bind}\"\n"),
+            );
+            let err = EffectiveConfig::resolve().unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("ip:port") || msg.contains("loopback"),
+                "{bind}: {msg}"
+            );
+        }
+    }
+
+    // The pure validator is the single source of truth shared with the CLI
+    // `serve --http` flag: loopback literals pass, everything else fails.
+    #[test]
+    fn validate_http_bind_accepts_only_loopback_literals() {
+        assert!(validate_http_bind("127.0.0.1:0").is_ok());
+        assert!(validate_http_bind("127.0.0.1:7777").is_ok());
+        assert!(validate_http_bind("[::1]:0").is_ok());
+        for bad in ["0.0.0.0:80", "localhost:80", "10.0.0.1:80", "", "  "] {
+            assert!(validate_http_bind(bad).is_err(), "{bad:?} must fail");
+        }
     }
 
     // W2.2: the fusion-mode knob follows the same env > file > default

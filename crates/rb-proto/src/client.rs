@@ -1,4 +1,7 @@
-//! Async client for the rusty-brain daemon over a Unix domain socket.
+//! Async client for the rusty-brain daemon: generic over any async stream
+//! (W5a.3 / HTTP PRD HTTP-3), with a Unix-domain-socket connect path as the
+//! default. The framing, handshake, and every typed wrapper are shared across
+//! transports so the wire contract stays single-sourced.
 
 use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
@@ -9,13 +12,20 @@ use rb_types::{
     Result, SearchResult,
 };
 use std::path::Path;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::UnixStream;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 /// A connected, handshaken client. Sends one `Request`, reads one `Response`.
+///
+/// Generic over the transport stream `S` (W5a.3, pulled forward by the HTTP
+/// PRD): `UnixStream` is the default (and the only transport with a public
+/// `connect`); any other `AsyncRead + AsyncWrite` stream goes through
+/// [`Client::handshake`]. All request/response methods are transport-agnostic
+/// so the two paths can never drift.
 #[derive(Debug)]
-pub struct Client {
-    framed: Framed<UnixStream, LengthDelimitedCodec>,
+pub struct Client<S = UnixStream> {
+    framed: Framed<S, LengthDelimitedCodec>,
     /// Whether the daemon advertised [`crate::CAP_ANCHORS`] at handshake —
     /// i.e. it evaluates typed code anchors instead of silently dropping
     /// (`Remember.anchors`) or ignoring (pre-filter daemons) them. Gates the
@@ -54,6 +64,24 @@ impl Client {
         let stream = UnixStream::connect(socket_path)
             .await
             .map_err(|e| Error::from_io(&e))?;
+        Client::handshake(stream, namespace, identity).await
+    }
+}
+
+impl<S> Client<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
+    /// Perform the versioned handshake over an ALREADY-CONNECTED stream and
+    /// verify the daemon speaks `CONTRACT_VERSION`. Fails closed on any
+    /// version drift or a non-ok ack — identical semantics to the UDS
+    /// [`connect`](Self::connect) path, which delegates here (W5a.3: one
+    /// handshake implementation for every transport).
+    pub async fn handshake(
+        stream: S,
+        namespace: Namespace,
+        identity: Option<crate::ClientIdentity>,
+    ) -> Result<Client<S>> {
         let mut framed = bounded_framed(stream);
 
         let handshake = Handshake {
@@ -161,7 +189,10 @@ impl Client {
     }
 }
 
-impl Client {
+impl<S> Client<S>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     /// Helper: turn an unexpected response (including a wire `Error`) into an
     /// `Err`. The daemon's `Response::Error` is mapped back to a domain error;
     /// any other unexpected variant is a protocol violation -> `Error::Storage`.
