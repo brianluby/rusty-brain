@@ -596,6 +596,11 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Reembed { .. }
         | Request::NamespaceRename { .. }
         | Request::Scrub => true,
+        // Forget: only the HARD EXECUTE purges irreversibly — peer-gated
+        // like Scrub. Apply-execute archives (reversible, namespace-scoped
+        // like Delete) and dry-runs of either mode are read-only, so none of
+        // those are admin.
+        Request::Forget { mode, dry_run, .. } => *mode == rb_types::ForgetMode::Hard && !dry_run,
         // Namespace-scoped by the handshake: not admin.
         Request::Remember { .. }
         | Request::Recall { .. }
@@ -1072,15 +1077,16 @@ where
         Request::Subscribe { .. } => error_to_response(Error::InvalidArgument(
             "Subscribe is a streaming op, not a single request".to_string(),
         )),
-        Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config, retention_policy).await
-        {
-            Ok(summary) => Response::JobRan {
-                scanned: summary.scanned,
-                changed: summary.changed,
-                skipped: summary.skipped,
-            },
-            Err(e) => error_to_response(e),
-        },
+        Request::RunJob { job } => {
+            match jobs::run_once(job, job_store, jobs_config, retention_policy).await {
+                Ok(summary) => Response::JobRan {
+                    scanned: summary.scanned,
+                    changed: summary.changed,
+                    skipped: summary.skipped,
+                },
+                Err(e) => error_to_response(e),
+            }
+        }
         Request::Reembed { limit } => {
             // Bounded, idempotent re-embed batch (P5 Feature A). Cross-namespace
             // maintenance driven through the engine (it owns the embedder); the
@@ -1130,6 +1136,9 @@ where
                     provider_model.to_string(),
                     rb_engine::EMBEDDING_INPUT_VERSION.to_string(),
                     STATS_TOP_RECALLED_LIMIT,
+                    // RET-4: eligible-forgetting gauge under the daemon's
+                    // resolved [retention] policy (None when unconfigured).
+                    retention_policy.cloned(),
                 )
                 .await
             {
@@ -1139,6 +1148,44 @@ where
                     writer_alive: job_store.writer_alive(),
                 },
                 Err(e) => error_to_response(e),
+            }
+        }
+        // Retention/forget pass (retention PRD RET-2), namespace-scoped by
+        // the handshake. Hard-EXECUTE was peer-gated above (is_admin_op);
+        // everything below holds for any peer. The wire policy is validated
+        // fail-closed FIRST — never trust a client-supplied policy — and the
+        // execute path additionally requires enabled=true here (the store
+        // refuses a disabled sweep too: defense in depth for off-by-default).
+        Request::Forget {
+            policy,
+            mode,
+            dry_run,
+        } => {
+            if let Err(e) = policy.validate() {
+                return error_to_response(e);
+            }
+            if dry_run {
+                match job_store
+                    .retention_plan(namespace.clone(), policy, mode)
+                    .await
+                {
+                    Ok(plan) => Response::ForgetPlanned { plan },
+                    Err(e) => error_to_response(e),
+                }
+            } else if !policy.enabled {
+                error_to_response(Error::InvalidArgument(
+                    "retention is not enabled (retention.enabled = false): refusing to \
+                     mutate; use a dry-run to preview, or enable it in [retention]"
+                        .to_string(),
+                ))
+            } else {
+                match job_store
+                    .retention_sweep(namespace.clone(), policy, mode)
+                    .await
+                {
+                    Ok(outcome) => Response::ForgetDone { outcome },
+                    Err(e) => error_to_response(e),
+                }
             }
         }
         // Admin op (peer-gated above): retroactive secret redaction across all
@@ -1205,9 +1252,28 @@ mod tests {
             // Stats is namespace-scoped by the handshake (read-only, W1.8),
             // like Context — deliberately NOT peer-gated.
             Request::Stats { window_days: None },
+            // Forget apply-execute is namespace-scoped and reversible
+            // (archive); dry-runs (either mode) are read-only. Only
+            // hard-EXECUTE is admin (asserted below).
+            Request::Forget {
+                policy: rb_types::RetentionPolicy::default(),
+                mode: rb_types::ForgetMode::Apply,
+                dry_run: false,
+            },
+            Request::Forget {
+                policy: rb_types::RetentionPolicy::default(),
+                mode: rb_types::ForgetMode::Hard,
+                dry_run: true,
+            },
         ] {
             assert!(!is_admin_op(&not_admin), "{not_admin:?}");
         }
+        // Hard-execute purges irreversibly: peer-gated like Scrub.
+        assert!(is_admin_op(&Request::Forget {
+            policy: rb_types::RetentionPolicy::default(),
+            mode: rb_types::ForgetMode::Hard,
+            dry_run: false,
+        }));
     }
 
     // W2.6: the admin decision is the kernel-verified uid equaling the

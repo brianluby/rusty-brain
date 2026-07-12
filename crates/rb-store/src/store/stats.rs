@@ -53,6 +53,7 @@ impl SqliteStore {
         model: &str,
         input_version: &str,
         top_limit: usize,
+        retention: Option<&rb_types::RetentionPolicy>,
     ) -> Result<MemoryStats> {
         let ns_str = ns.as_db_string();
         let cutoff = chrono::Utc::now().timestamp() - i64::from(window_days) * 86_400;
@@ -205,6 +206,12 @@ impl SqliteStore {
                 .unwrap_or(0)
         };
 
+        // RET-4 visibility: computed before `ns_str` moves into the struct.
+        let retention_eligible = retention
+            .map(|policy| self.retention_eligible_count(ns, policy))
+            .transpose()?;
+        let last_forget_at = last_forget_at(&self.conn, &ns_str)?;
+
         Ok(MemoryStats {
             namespace: ns_str,
             window_days,
@@ -226,10 +233,29 @@ impl SqliteStore {
             contested,
             created_per_day,
             reembed_pending,
-            retention_eligible: None,
-            last_forget_at: None,
+            // RET-4 visibility: apply-mode eligible count under the daemon's
+            // policy (None = no [retention] configured — distinguishable from
+            // "0 eligible"), via the SAME candidate WHERE the sweep executes.
+            // Apply-mode eligible count under the daemon's policy (None = no
+            // [retention] configured — distinguishable from "0 eligible"),
+            // via the SAME candidate WHERE the sweep executes; last-forget is
+            // the bulk `retention_sweep` oplog row (reported even without a
+            // live policy — history is history).
+            retention_eligible,
+            last_forget_at,
         })
     }
+}
+
+/// Unix seconds of the namespace's most recent bulk `retention_sweep` oplog
+/// row; `None` when no sweep ever ran (retention PRD RET-4).
+fn last_forget_at(conn: &rusqlite::Connection, ns_str: &str) -> Result<Option<i64>> {
+    conn.query_row(
+        "SELECT MAX(at) FROM memory_oplog WHERE op = 'retention_sweep' AND namespace = ?1",
+        rusqlite::params![ns_str],
+        |r| r.get::<_, Option<i64>>(0),
+    )
+    .map_err(|e| Error::Storage(e.to_string()))
 }
 
 #[cfg(test)]
@@ -339,7 +365,7 @@ mod tests {
             .unwrap();
 
         let stats = store
-            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 10)
+            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 10, None)
             .unwrap();
 
         assert_eq!(stats.namespace, ns.as_db_string());
@@ -386,7 +412,7 @@ mod tests {
 
         // The other namespace sees only its own signals.
         let other_stats = store
-            .namespace_stats(&other, 30, MODEL, INPUT_VERSION, 10)
+            .namespace_stats(&other, 30, MODEL, INPUT_VERSION, 10, None)
             .unwrap();
         assert_eq!(other_stats.live, 2);
         assert_eq!(other_stats.feedback.helpful, 1);
@@ -430,7 +456,7 @@ mod tests {
             .unwrap();
 
         let stats = store
-            .namespace_stats(&ns, 7, MODEL, INPUT_VERSION, 10)
+            .namespace_stats(&ns, 7, MODEL, INPUT_VERSION, 10, None)
             .unwrap();
         assert_eq!(stats.window_days, 7);
         // Growth buckets only cover the 7-day window: the 10-day-old row is out.
@@ -442,7 +468,7 @@ mod tests {
 
         // A wider window sees both buckets, oldest first.
         let wide = store
-            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 10)
+            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 10, None)
             .unwrap();
         assert_eq!(wide.created_per_day.len(), 2);
         assert!(wide.created_per_day[0].day < wide.created_per_day[1].day);
@@ -467,7 +493,7 @@ mod tests {
         store.record_access_bumps(&bumps).unwrap();
 
         let stats = store
-            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 2)
+            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 2, None)
             .unwrap();
         assert_eq!(stats.top_recalled.len(), 2, "LIMIT bounds the list");
         assert_eq!(stats.top_recalled[0].access_count, 3);

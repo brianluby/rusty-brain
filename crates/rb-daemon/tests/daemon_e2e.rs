@@ -43,7 +43,7 @@ impl RunningDaemon {
             db_path: db,
             read_pool_size: pool_size,
             jobs_config: rb_daemon::JobsConfig::default(),
-        retention_policy: None,
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
@@ -1788,4 +1788,209 @@ async fn n_minus_one_handshake_is_rejected_gracefully() {
     assert!(eof.is_err(), "no frames after a version nack, got: {eof:?}");
 
     daemon.stop().await;
+}
+
+// Retention PRD verification e2e: seed aged + high-importance + protected +
+// contested memories, then drive dry-run / apply / hard over a real socket
+// and assert eligibility honors every guard. The same-uid client passes the
+// hard-execute admin gate (the scrub precedent); the guardrail memories
+// SURVIVE every pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn retention_forget_flow_over_the_wire_respects_guards() {
+    use rb_engine::MemoryBackend as _;
+
+    let dir = tempdir();
+    let socket = dir.path().join("runtime").join("sock");
+    let db = dir.path().join("memory.db");
+    let ns = Namespace::Project("retention-e2e".to_string());
+
+    // Seed BEFORE the daemon starts: `remember` stamps created_at = now, so
+    // aged rows must be written directly through a store handle.
+    let seed = |content: &str, importance: u8, days: i64, tags: Vec<String>| {
+        let mut m = rb_types::MemoryNote::new(
+            ns.clone(),
+            content.to_string(),
+            MemoryType::Insight,
+            importance,
+        );
+        m.created_at = chrono::Utc::now() - chrono::Duration::days(days);
+        m.tags = tags;
+        m
+    };
+    let old_low = seed("stale scratch detail", 2, 60, vec![]);
+    let old_high = seed("author-vital decision", 9, 60, vec![]);
+    let old_protected = seed(
+        "protected by tag",
+        2,
+        60,
+        vec!["architecture_decision".to_string()],
+    );
+    let contested_a = seed("contested claim", 2, 60, vec![]);
+    let contested_b = seed("contradicting claim", 2, 60, vec![]);
+    let young_low = seed("fresh scratch", 2, 0, vec![]);
+    let (old_low_id, old_high_id, old_protected_id) = (
+        old_low.id.clone(),
+        old_high.id.clone(),
+        old_protected.id.clone(),
+    );
+    let (contested_a_id, contested_b_id, young_id) = (
+        contested_a.id.clone(),
+        contested_b.id.clone(),
+        young_low.id.clone(),
+    );
+    {
+        let handle = rb_daemon::StoreHandle::start_with_model(
+            db.clone(),
+            DIM,
+            "deterministic".to_string(),
+            1,
+        )
+        .unwrap();
+        for m in [
+            old_low,
+            old_high,
+            old_protected,
+            contested_a,
+            contested_b,
+            young_low,
+        ] {
+            handle.write(m, Some(vec![0.1f32; DIM])).await.unwrap();
+        }
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: contested_a_id.clone(),
+                target_id: contested_b_id.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "e2e contradiction".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+        handle.shutdown().await;
+    }
+
+    let cfg = DaemonConfig {
+        socket_path: socket.clone(),
+        db_path: db,
+        read_pool_size: 2,
+        jobs_config: rb_daemon::JobsConfig::default(),
+        retention_policy: None,
+        request_idle_timeout: None,
+        enrich: None,
+        fusion_mode: rb_engine::FusionMode::Linear,
+    };
+    let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
+    let daemon = Daemon::bind(cfg, embedder).await.unwrap();
+    let (tx, rx) = oneshot::channel::<()>();
+    let task = tokio::spawn(async move {
+        daemon
+            .run(async move {
+                let _ = rx.await;
+            })
+            .await
+            .unwrap();
+    });
+    for _ in 0..200 {
+        if tokio::net::UnixStream::connect(&socket).await.is_ok() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+
+    let mut client = Client::connect(&socket, ns.clone()).await.unwrap();
+    let mut policy = rb_types::RetentionPolicy {
+        enabled: false,
+        max_age_days: Some(30),
+        protected_tags: vec!["architecture_decision".to_string()],
+        ..rb_types::RetentionPolicy::default()
+    };
+
+    // Dry-run works while DISABLED (read-only preview) and honors every
+    // guard: exactly the old, low-importance, unprotected, uncontested row.
+    let plan = client
+        .forget_plan(policy.clone(), rb_types::ForgetMode::Apply)
+        .await
+        .unwrap();
+    assert_eq!(plan.total_eligible, 1);
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].id, old_low_id);
+
+    // Execute while disabled: refused, nothing changed.
+    let err = client
+        .forget_execute(policy.clone(), rb_types::ForgetMode::Apply)
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("enabled"),
+        "disabled policy must refuse execution: {err}"
+    );
+    assert!(client
+        .get(old_low_id.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_none());
+
+    // Enabled apply: archives the planned set — and ONLY it.
+    policy.enabled = true;
+    let outcome = client
+        .forget_execute(policy.clone(), rb_types::ForgetMode::Apply)
+        .await
+        .unwrap();
+    assert_eq!((outcome.archived, outcome.purged), (1, 0));
+    assert!(client
+        .get(old_low_id.clone())
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
+
+    // Hard plan: the archived row is now the sole purge candidate.
+    let plan = client
+        .forget_plan(policy.clone(), rb_types::ForgetMode::Hard)
+        .await
+        .unwrap();
+    assert_eq!(plan.candidates.len(), 1);
+    assert_eq!(plan.candidates[0].id, old_low_id);
+    assert!(plan.candidates[0].archived);
+
+    // Hard execute (same-uid peer passes the admin gate, like scrub): purged
+    // from the DB — get returns None.
+    let outcome = client
+        .forget_execute(policy.clone(), rb_types::ForgetMode::Hard)
+        .await
+        .unwrap();
+    assert_eq!((outcome.archived, outcome.purged), (0, 1));
+    assert!(client.get(old_low_id.clone()).await.unwrap().is_none());
+
+    // Every guardrail memory SURVIVED all three passes, active and intact.
+    for (id, label) in [
+        (&old_high_id, "importance >= floor"),
+        (&old_protected_id, "protected tag"),
+        (&contested_a_id, "contested (local)"),
+        (&contested_b_id, "contested (far)"),
+        (&young_id, "younger than max_age_days"),
+    ] {
+        let got = client.get(id.clone()).await.unwrap();
+        assert!(
+            got.is_some_and(|m| m.archived_at.is_none()),
+            "{label} memory must survive the sweeps"
+        );
+    }
+
+    // RET-4 visibility: the sweep is recorded even though this daemon has no
+    // [retention] policy of its own (eligible gauge stays None).
+    let (stats, _, _) = client.stats(None).await.unwrap();
+    assert!(stats.last_forget_at.is_some(), "last-forget recorded");
+    assert_eq!(stats.retention_eligible, None, "no daemon-side policy");
+
+    drop(client);
+    let _ = tx.send(());
+    tokio::time::timeout(Duration::from_secs(5), task)
+        .await
+        .expect("daemon shutdown")
+        .expect("daemon task ok");
 }

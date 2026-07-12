@@ -22,7 +22,10 @@ pub const RETENTION_JOB_INTERVAL_SECS: u64 = 86_400;
 /// the policy's `batch_limit`. `scanned` counts the memories eligible at
 /// sweep time, `changed` the ones actually archived, `skipped` the eligible
 /// overflow left for the next pass.
-pub async fn run(store: &StoreHandle, policy: Option<&RetentionPolicy>) -> rb_types::Result<JobSummary> {
+pub async fn run(
+    store: &StoreHandle,
+    policy: Option<&RetentionPolicy>,
+) -> rb_types::Result<JobSummary> {
     let Some(policy) = policy else {
         return Ok(JobSummary::default());
     };
@@ -111,7 +114,11 @@ mod tests {
         assert_eq!(summary.changed, 2, "one archive per namespace");
         assert_eq!(summary.scanned, 2);
 
-        let got_a = handle.get(ns_a.clone(), victim_a.clone()).await.unwrap().unwrap();
+        let got_a = handle
+            .get(ns_a.clone(), victim_a.clone())
+            .await
+            .unwrap()
+            .unwrap();
         let got_b = handle.get(ns_b, victim_b).await.unwrap().unwrap();
         assert!(got_a.archived_at.is_some(), "archived, not purged");
         assert!(got_b.archived_at.is_some(), "archived, not purged");

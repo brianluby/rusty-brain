@@ -507,9 +507,17 @@ impl StoreHandle {
         model: String,
         input_version: String,
         top_limit: usize,
+        retention: Option<rb_types::RetentionPolicy>,
     ) -> Result<rb_types::MemoryStats> {
         self.with_read(move |store| {
-            store.namespace_stats(&namespace, window_days, &model, &input_version, top_limit)
+            store.namespace_stats(
+                &namespace,
+                window_days,
+                &model,
+                &input_version,
+                top_limit,
+                retention.as_ref(),
+            )
         })
         .await
     }
@@ -914,7 +922,8 @@ impl StoreHandle {
     /// Every namespace with memory rows, for the scheduled retention job's
     /// per-namespace pass. Reads via the pool.
     pub async fn retention_namespaces(&self) -> Result<Vec<Namespace>> {
-        self.with_read(move |store| store.retention_namespaces()).await
+        self.with_read(move |store| store.retention_namespaces())
+            .await
     }
 
     /// Execute one bounded retention sweep through the single writer
@@ -1589,8 +1598,12 @@ fn writer_loop(
                     embedding_dim,
                     embedding_model.as_deref(),
                     |s| {
-                        payload =
-                            Some(s.retention_sweep(&namespace, &policy, mode, chrono::Utc::now())?);
+                        payload = Some(s.retention_sweep(
+                            &namespace,
+                            &policy,
+                            mode,
+                            chrono::Utc::now(),
+                        )?);
                         Ok(())
                     },
                 );
@@ -2831,7 +2844,7 @@ mod tests {
 
         let ops_before = handle.writer_ops_count();
         let stats = handle
-            .namespace_stats(ns.clone(), 30, String::new(), String::new(), 5)
+            .namespace_stats(ns.clone(), 30, String::new(), String::new(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2988,8 +3001,14 @@ mod tests {
         );
         foreign.created_at = chrono::Utc::now() - chrono::Duration::days(60);
         let foreign_id = foreign.id.clone();
-        handle.write(old_low, Some(vec![0.1f32; DIM])).await.unwrap();
-        handle.write(foreign, Some(vec![0.2f32; DIM])).await.unwrap();
+        handle
+            .write(old_low, Some(vec![0.1f32; DIM]))
+            .await
+            .unwrap();
+        handle
+            .write(foreign, Some(vec![0.2f32; DIM]))
+            .await
+            .unwrap();
 
         let policy = rb_types::RetentionPolicy {
             enabled: true,

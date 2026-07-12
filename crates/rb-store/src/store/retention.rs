@@ -324,6 +324,32 @@ impl SqliteStore {
         ))
     }
 
+    /// Apply-mode eligible count under `policy` — the stats gauge (RET-4).
+    /// Shares `retention_where` with the plan/sweep so the reported number
+    /// can never disagree with what a sweep would actually touch.
+    pub(crate) fn retention_eligible_count(
+        &self,
+        ns: &Namespace,
+        policy: &RetentionPolicy,
+    ) -> Result<u64> {
+        policy.validate()?;
+        let Some((where_sql, params)) =
+            retention_where(ns, policy, ForgetMode::Apply, chrono::Utc::now())?
+        else {
+            return Ok(0);
+        };
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+        let total: i64 = self
+            .conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM memories m WHERE {where_sql}"),
+                refs.as_slice(),
+                |r| r.get(0),
+            )
+            .map_err(storage_err)?;
+        Ok(u64::try_from(total).unwrap_or(0))
+    }
+
     /// Latest oplog seq recorded for `id` — the row the sweep just wrote for
     /// it. Lets the daemon stamp each per-memory change event with its OWN
     /// replay cursor instead of the batch-final `last_oplog_seq()`: stamping
@@ -1100,6 +1126,43 @@ mod retention_tests {
         // surviving event for it is the purge marker, replayed as Archived.
         assert_eq!(purge_events.len(), 1);
         assert_eq!(purge_events[0].kind, rb_types::ChangeKind::Archived);
+    }
+
+    // RET-4 visibility: stats report the apply-mode eligible count under the
+    // daemon's policy (None = no policy) and the last sweep timestamp.
+    #[test]
+    fn stats_report_retention_eligibility_and_last_forget() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        insert_aged(&store, 60, 2, |_| {});
+        insert_aged(&store, 1, 2, |_| {}); // young: never eligible
+
+        let stats = store
+            .namespace_stats(&ns(), 30, "m", "v", 5, Some(&policy()))
+            .unwrap();
+        assert_eq!(stats.retention_eligible, Some(1));
+        assert_eq!(stats.last_forget_at, None, "never swept yet");
+
+        let without_policy = store.namespace_stats(&ns(), 30, "m", "v", 5, None).unwrap();
+        assert_eq!(
+            without_policy.retention_eligible, None,
+            "no policy is distinguishable from 0 eligible"
+        );
+
+        store
+            .retention_sweep(&ns(), &policy(), ForgetMode::Apply, chrono::Utc::now())
+            .unwrap();
+        let stats = store
+            .namespace_stats(&ns(), 30, "m", "v", 5, Some(&policy()))
+            .unwrap();
+        assert_eq!(stats.retention_eligible, Some(0), "candidate was archived");
+        assert!(
+            stats.last_forget_at.is_some(),
+            "sweep row drives last-forget"
+        );
+
+        // The timestamp survives even without a policy (history is history).
+        let stats = store.namespace_stats(&ns(), 30, "m", "v", 5, None).unwrap();
+        assert!(stats.last_forget_at.is_some());
     }
 
     // The scheduled job sweeps per namespace: the enumeration lists every

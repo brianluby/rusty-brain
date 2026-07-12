@@ -628,6 +628,50 @@ impl Client {
         }
     }
 
+    /// Dry-run forget (retention PRD RET-2): the exact candidate set one
+    /// sweep pass under `policy` in `mode` would touch, computed server-side
+    /// by the same query the sweep executes. Read-only; allowed for a
+    /// disabled policy.
+    pub async fn forget_plan(
+        &mut self,
+        policy: rb_types::RetentionPolicy,
+        mode: rb_types::ForgetMode,
+    ) -> Result<rb_types::ForgetPlan> {
+        let resp = self
+            .request(Request::Forget {
+                policy,
+                mode,
+                dry_run: true,
+            })
+            .await?;
+        match resp {
+            Resp::ForgetPlanned { plan } => Ok(plan),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// Execute one bounded forget pass (retention PRD RET-2): archive (apply)
+    /// or purge (hard) the current candidate set, bounded by the policy's
+    /// `batch_limit`. Requires `policy.enabled`; hard mode is an admin op
+    /// like `scrub` (a non-admin peer gets `Error::PermissionDenied`).
+    pub async fn forget_execute(
+        &mut self,
+        policy: rb_types::RetentionPolicy,
+        mode: rb_types::ForgetMode,
+    ) -> Result<rb_types::ForgetOutcome> {
+        let resp = self
+            .request(Request::Forget {
+                policy,
+                mode,
+                dry_run: false,
+            })
+            .await?;
+        match resp {
+            Resp::ForgetDone { outcome } => Ok(outcome),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// One-time namespace rename (W0.3 carryover): re-scope every memory from
     /// `old` to `new` in one daemon writer transaction. Refused with
     /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
@@ -1023,6 +1067,34 @@ mod wrapper_tests {
                     provider_model: "deterministic".to_string(),
                     writer_alive: true,
                 },
+
+                // Canned payloads keyed on dry_run/mode so the typed-wrapper
+                // test can prove both flags ride the wire.
+                Request::Forget {
+                    policy,
+                    mode,
+                    dry_run,
+                } => {
+                    if dry_run {
+                        Response::ForgetPlanned {
+                            plan: rb_types::ForgetPlan {
+                                mode,
+                                candidates: vec![],
+                                total_eligible: u64::from(policy.enabled),
+                            },
+                        }
+                    } else {
+                        Response::ForgetDone {
+                            outcome: rb_types::ForgetOutcome {
+                                mode,
+                                archived: u64::from(mode == rb_types::ForgetMode::Apply),
+                                purged: u64::from(mode == rb_types::ForgetMode::Hard),
+                                total_eligible: 1,
+                                remaining: 0,
+                            },
+                        }
+                    }
+                }
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -1030,6 +1102,41 @@ mod wrapper_tests {
 
     async fn connect(path: &std::path::Path) -> Client {
         Client::connect(path, Namespace::Global).await.unwrap()
+    }
+
+    #[tokio::test]
+    async fn forget_wrappers_carry_mode_and_dry_run_over_the_wire() {
+        let (_dir, sock) = socket_path();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut client = connect(&sock).await;
+        let policy = rb_types::RetentionPolicy {
+            enabled: true,
+            max_age_days: Some(30),
+            ..rb_types::RetentionPolicy::default()
+        };
+        // Plan: dry_run=true rode the wire (the fake keys total on enabled).
+        let plan = client
+            .forget_plan(policy.clone(), rb_types::ForgetMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!(plan.total_eligible, 1);
+        assert_eq!(plan.mode, rb_types::ForgetMode::Apply);
+        // Execute: mode rides the wire (the fake keys counts on it).
+        let outcome = client
+            .forget_execute(policy.clone(), rb_types::ForgetMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!((outcome.archived, outcome.purged), (1, 0));
+        let outcome = client
+            .forget_execute(policy, rb_types::ForgetMode::Hard)
+            .await
+            .unwrap();
+        assert_eq!((outcome.archived, outcome.purged), (0, 1));
+
+        drop(client);
+        server.await.unwrap();
     }
 
     #[tokio::test]
