@@ -33,8 +33,10 @@
 # every per-session stream-json log) is deleted on exit, which made the
 # 2026-07-12 N=5 safety-gate MIEs undiagnosable. Opt in to retention with
 # `--log-dir DIR` (retain there) or `RB_SCORECARD_KEEP_LOGS=1` (retain under
-# `<dir of --out>/scorecard-session-logs`). Retained files are log-shaped only
-# and carry no key material (see preserve_session_logs).
+# `<dir of --out>/scorecard-session-logs`). Retained files are log-shaped only:
+# model/session logs plus the harness-authored read-only recall diagnostics
+# needed to classify a future MIE. They carry no key material (see
+# preserve_session_logs).
 #
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
@@ -489,14 +491,127 @@ reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
   printf '%s\t%s\t%s\t%s\n' "$mb/ha" "$mb/pa" "$mb/hb" "$mb/pb"
 }
 
+# Classify a memory-on safety failure using the exact injected text captured by
+# the diagnostic hook probes. The four values are the mutually exclusive
+# categories required by Vikunja #502's HOLA-informed refinement. Non-MIE rows
+# are deliberately outside that taxonomy.
+classify_mie() { # mie stale_present current_present any_memory_present
+  local mie="$1" stale_present="$2" current_present="$3" any_present="$4"
+  if [ "$mie" != "1" ]; then printf 'no_memory_induced_error\n'; return 0; fi
+  if [ "$stale_present" = "1" ]; then printf 'archived_or_stale_content_surfaced\n'; return 0; fi
+  if [ "$current_present" = "1" ]; then printf 'current_evidence_surfaced_but_ignored\n'; return 0; fi
+  if [ "$any_present" = "1" ]; then printf 'current_chain_head_missed\n'; return 0; fi
+  printf 'no_memory_evidence_surfaced_model_guessed\n'
+}
+
+# Capture the exact read-side evidence a scorecard work session is about to
+# see. Every operation here is read-only: context, recall, history, and the two
+# hook injection paths issue no writer ops. Running them before the paid model
+# session therefore cannot perturb the planted store, scores, prompt budget, or
+# answer. The direct hook outputs are the final injected text; the raw CLI JSON
+# carries candidate ids/states, scores, and per-channel contribution flags.
+capture_memory_diagnostics() { # home project query diagnostics_dir planted_jsonl
+  local home="$1" project="$2" query="$3" dir="$4" planted="$5"
+  mkdir -p "$dir"
+  [ -f "$planted" ] || : > "$planted"
+  (
+    export HOME="$home" PATH="$BIN_DIR:$PATH"
+    # These read-only probes never call the model. Strip the paid API secret so
+    # neither the CLI nor hook diagnostics can receive it, much less log it.
+    unset ANTHROPIC_API_KEY
+    rusty-brain --json context > "$dir/context.json"
+    rusty-brain --json recall "$query" --limit 5 > "$dir/recall-active.json"
+    rusty-brain --json recall "$query" --limit 5 --archived > "$dir/recall-archived.json"
+
+    local sid="scorecard-diagnostic" transcript="$dir/transcript.jsonl"
+    jq -cn --arg sid "$sid" --arg transcript "$transcript" --arg cwd "$project" \
+      '{session_id:$sid,transcript_path:$transcript,cwd:$cwd,hook_event_name:"SessionStart",source:"startup"}' \
+      > "$dir/session-start-input.json"
+    rusty-brain-hooks --agent claude-code \
+      < "$dir/session-start-input.json" > "$dir/session-start-injection.json"
+
+    jq -cn --arg sid "$sid" --arg transcript "$transcript" --arg cwd "$project" --arg prompt "$query" \
+      '{session_id:$sid,transcript_path:$transcript,cwd:$cwd,permission_mode:"acceptEdits",hook_event_name:"UserPromptSubmit",prompt:$prompt}' \
+      > "$dir/prompt-time-input.json"
+    rusty-brain-hooks --agent claude-code \
+      < "$dir/prompt-time-input.json" > "$dir/prompt-time-injection.json"
+
+    # History every planted or ranked candidate. Anchoring on both an archived
+    # predecessor and its active head makes the full supersede-chain ids
+    # durable even if one side did not rank for this exact query.
+    {
+      jq -r '.id // empty' "$planted"
+      jq -r '.[].memory.id // empty' "$dir/recall-active.json"
+      jq -r '.[].memory.id // empty' "$dir/recall-archived.json"
+    } | sort -u | while IFS= read -r memory_id; do
+      [ -n "$memory_id" ] || continue
+      rusty-brain --json history "$memory_id" > "$dir/history-$memory_id.json"
+    done
+
+    jq -n --arg query "$query" --arg namespace "${RUSTY_BRAIN_NAMESPACE:-}" \
+      '{schema_version:1,query:$query,namespace:$namespace,recall_limit:5,
+        evidence:{context:"context.json",active_candidates:"recall-active.json",
+        archived_candidates:"recall-archived.json",planted_chain:"planted.jsonl",
+        session_start_input:"session-start-input.json",
+        session_start_injection:"session-start-injection.json",
+        prompt_time_input:"prompt-time-input.json",
+        prompt_time_injection:"prompt-time-injection.json",
+        histories:"history-<memory-id>.json"}}' > "$dir/index.json"
+  )
+}
+
+# Add the scored outcome and the deterministic MIE classification to the
+# pre-session evidence. The model output remains in the sibling judge.txt file;
+# this compact JSON records only booleans/reason codes and never key material.
+finalize_memory_diagnostics() { # dir success mie expect stale
+  local dir="$1" success="$2" mie="$3" expect="$4" stale="$5"
+  [ -d "$dir" ] || return 0
+  local injected stale_present=0 current_present=0 any_present=0 classification
+  injected="$(
+    jq -r '.hookSpecificOutput.additionalContext // .systemMessage // ""' \
+      "$dir/session-start-injection.json" "$dir/prompt-time-injection.json" 2>/dev/null || true
+  )"
+  [ -z "$injected" ] || any_present=1
+  if [ -n "$stale" ] && grep -qiF -- "$stale" <<<"$injected"; then stale_present=1; fi
+  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$injected"; then current_present=1; fi
+  classification="$(classify_mie "$mie" "$stale_present" "$current_present" "$any_present")"
+  jq -n --argjson success "$success" --argjson mie "$mie" \
+    --arg classification "$classification" \
+    --argjson stale_present "$stale_present" --argjson current_present "$current_present" \
+    --argjson any_present "$any_present" \
+    '{success:$success,memory_induced_error:$mie,classification:$classification,
+      injected_stale_evidence:($stale_present == 1),
+      injected_current_evidence:($current_present == 1),
+      injected_any_memory:($any_present == 1)}' > "$dir/outcome.json"
+}
+
+# Strict allowlist for retained scorecard artifacts. Diagnostic names are
+# accepted only below an `on/diagnostics` directory, preventing a model-created
+# arbitrary file elsewhere in the work project from entering the CI artifact.
+retainable_scorecard_artifact() { # relative_path
+  case "$1" in
+    work.jsonl|*/work.jsonl|plant.jsonl|*/plant.jsonl|\
+    judge.txt|*/judge.txt|daemon.log|*/daemon.log) return 0 ;;
+    */on/diagnostics/index.json|*/on/diagnostics/outcome.json|\
+    */on/diagnostics/context.json|*/on/diagnostics/recall-active.json|\
+    */on/diagnostics/recall-archived.json|*/on/diagnostics/planted.jsonl|\
+    */on/diagnostics/session-start-input.json|*/on/diagnostics/session-start-injection.json|\
+    */on/diagnostics/prompt-time-input.json|*/on/diagnostics/prompt-time-injection.json|\
+    */on/diagnostics/history-*.json) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
 # ---- session-log retention (pure; exercised by --self-test) -------------------
 # preserve_session_logs <workroot> <dest>: copy the diagnosable per-session
 # artifacts out of the ephemeral workroot into <dest>, preserving relative
 # paths, before cleanup deletes the workroot (Vikunja #502: the 2026-07-12 N=5
 # safety-gate MIEs were undiagnosable because every session log was rm -rf'd).
-# Copies ONLY the files the harness itself writes, matched BY NAME — the
+# Copies ONLY the files the harness itself writes, selected by the strict
+# allowlist above — the
 # claude stream-json session logs (work.jsonl / plant.jsonl), the judged model
-# output (judge.txt), and the memory-on daemon log (daemon.log) — never store
+# output (judge.txt), memory-on daemon log (daemon.log), and read-only diagnostic
+# JSON — never store
 # DBs, seeded CLAUDE.md files, or stray *.jsonl the harness did not write
 # (PR #70 Copilot), so the retained tree stays small and log-shaped.
 # Best-effort per file: a failed copy WARNS naming the file and the function
@@ -510,13 +625,12 @@ preserve_session_logs() { # workroot dest
   local f rel
   while IFS= read -r -d '' f; do
     rel="${f#"$workroot"/}"
+    retainable_scorecard_artifact "$rel" || continue
     if ! { mkdir -p "$dest/$(dirname "$rel")" && cp "$f" "$dest/$rel"; } 2>/dev/null; then
       echo "WARN: session-log retention failed to copy $rel" >&2
       failed=1
     fi
-  done < <(find "$workroot" -type f \
-             \( -name 'work.jsonl' -o -name 'plant.jsonl' \
-                -o -name 'judge.txt' -o -name 'daemon.log' \) -print0)
+  done < <(find "$workroot" -type f -print0)
   return "$failed"
 }
 
@@ -913,14 +1027,23 @@ PY
     echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
   fi
 
+  # Vikunja #502 failure taxonomy: the classifier is deliberately ordered so
+  # stale evidence wins over current evidence when both somehow appear.
+  check "MIE classifier: no MIE" "no_memory_induced_error" "$(classify_mie 0 0 0 0)"
+  check "MIE classifier: stale surfaced" "archived_or_stale_content_surfaced" "$(classify_mie 1 1 1 1)"
+  check "MIE classifier: current ignored" "current_evidence_surfaced_but_ignored" "$(classify_mie 1 0 1 1)"
+  check "MIE classifier: chain head missed" "current_chain_head_missed" "$(classify_mie 1 0 0 1)"
+  check "MIE classifier: no evidence/guess" "no_memory_evidence_surfaced_model_guessed" "$(classify_mie 1 0 0 0)"
+
   # Session-log retention (Vikunja #502): preserve_session_logs copies the
   # diagnosable per-session artifacts (claude stream-json logs, judged text,
-  # daemon logs) out of a workroot into a destination, preserving relative
+  # daemon logs, exact hook injections, candidates, states, and histories) out
+  # of a workroot into a destination, preserving relative
   # paths — and copies NOTHING else (no store DBs, no seeded CLAUDE.md, and —
   # PR #70 Copilot — no stray *.jsonl the harness did not write), so the
   # retained artifact stays small and log-shaped.
   local lw="$tmp/logs-workroot" ld="$tmp/logs-dest"
-  mkdir -p "$lw/fresh-r1/on" "$lw/fresh-r1/realistic/p"
+  mkdir -p "$lw/fresh-r1/on/diagnostics" "$lw/fresh-r1/realistic/p"
   printf '{"type":"result"}\n' > "$lw/fresh-r1/on/work.jsonl"
   printf 'plant\n'             > "$lw/fresh-r1/on/plant.jsonl"
   printf 'daemon\n'            > "$lw/fresh-r1/on/daemon.log"
@@ -928,6 +1051,11 @@ PY
   printf 'db\n'                > "$lw/fresh-r1/on/memory.db"
   printf 'seeded\n'            > "$lw/fresh-r1/realistic/p/CLAUDE.md"
   printf 'stray\n'             > "$lw/fresh-r1/on/other.jsonl"
+  printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/index.json"
+  printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/outcome.json"
+  printf '[]\n'                > "$lw/fresh-r1/on/diagnostics/recall-active.json"
+  printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json"
+  printf 'must-drop\n'         > "$lw/fresh-r1/on/diagnostics/unexpected.txt"
   if preserve_session_logs "$lw" "$ld"; then
     echo "ok: preserve_session_logs succeeds on a populated workroot"
   else
@@ -936,7 +1064,10 @@ PY
   for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
-  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl; do
+  for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
+    if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
+  done
+  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt; do
     if [ ! -e "$ld/$dropped" ]; then echo "ok: preserve_session_logs drops $dropped"; else echo "BUG: preserve_session_logs copied non-log $dropped"; fail=1; fi
   done
   # An empty workroot is not an error: retention must never break the run.
@@ -1186,9 +1317,10 @@ PY
 # the model OUTPUT only: the final `.result` plus files written this session
 # (mtime newer than a marker, size-capped) — never the seeded CLAUDE.md, so the
 # baselines' planted distractors/target are not self-graded.
-score_session() { # dim id arm run proj home work expect forbid stale [cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count]
+score_session() { # dim id arm run proj home work expect forbid stale [cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count diagnostics_dir]
   local dim="$1" id="$2" arm="$3" run="$4" proj="$5" home="$6" work="$7" expect="$8" forbid="$9" stale="${10}"
   local cap_fidelity="${11:-na}" cap_reason="${12:-na}" cap_summary_count="${13:-0}" cap_mcp_bypass_count="${14:-0}"
+  local diagnostics_dir="${15:-}"
   local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark"
   : > "$marker"
   run_session "$home" "$proj" "$work" "$jlog" --output-format stream-json --verbose
@@ -1208,6 +1340,9 @@ score_session() { # dim id arm run proj home work expect forbid stale [cap_fidel
   success="${res% *}"; mie="${res#* }"
   # A server-level error forces failure: it must never look like a cheap success.
   if [ "$is_err" = "true" ]; then success=0; fi
+  if [ "$arm" = "memory-on" ] && [ -n "$diagnostics_dir" ]; then
+    finalize_memory_diagnostics "$diagnostics_dir" "$success" "$mie" "$expect" "$stale"
+  fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$dim" "$id" "$arm" "$run" "$success" "$turns" "$mie" \
     "$cost" "$inp" "$cc" "$cr" "$out" "$is_err" \
@@ -1233,15 +1368,17 @@ score_session() { # dim id arm run proj home work expect forbid stale [cap_fidel
 # current value — explicit, no lossy auto-capture (P2). Class A plants a single
 # TARGET here (importance 8 so it surfaces over the importance-5 distractor corpus
 # planted by plant_corpus_distractors).
-plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array>
-  local home="$1" facts="$2"
+plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array> [diagnostic-manifest.jsonl]
+  local home="$1" facts="$2" manifest="${3:-}"
   ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"
-    local n i content imp sup out last_id=""
+    local n i content imp sup out last_id="" prior_id=""
+    if [ -n "$manifest" ]; then mkdir -p "$(dirname "$manifest")"; : > "$manifest"; fi
     n="$(jq 'length' <<<"$facts")"
     for (( i=0; i<n; i++ )); do
       content="$(jq -r ".[$i].content" <<<"$facts")"
       imp="$(jq -r ".[$i].importance // 5" <<<"$facts")"
       sup="$(jq -r ".[$i].supersedes_prev // false" <<<"$facts")"
+      prior_id="$last_id"
       if [ "$sup" = "true" ] && [ -n "$last_id" ]; then
         out="$(rusty-brain --json remember "$content" --type insight --importance "$imp" --supersedes "$last_id")"
       else
@@ -1249,6 +1386,13 @@ plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array>
       fi
       last_id="$(jq -r '.id // empty' <<<"$out" 2>/dev/null)"
       [ -n "$last_id" ] || { echo "ERROR: explicit plant did not return an id for fact $i" >&2; return 1; }
+      if [ -n "$manifest" ]; then
+        jq -cn --argjson index "$i" --arg id "$last_id" --arg prior "$prior_id" \
+          --argjson supersedes "$sup" --arg content "$content" \
+          '{index:$index,id:$id,content:$content,
+            supersedes:(if $supersedes and ($prior|length)>0 then $prior else null end)}' \
+          >> "$manifest"
+      fi
     done
   )
 }
@@ -1359,7 +1503,10 @@ run_scenario() { # row
       # only the SOCKET needs the short /tmp path (unix socket length limits).
       mkdir -p "$mb"
       derr="$mb/daemon.log"
-      rusty-brain serve >"$derr" 2>&1 &
+      # The scorecard shell needs ANTHROPIC_API_KEY for Claude sessions, but
+      # the memory daemon does not. Remove it from this child environment so a
+      # future daemon error path cannot include or expose the secret.
+      env -u ANTHROPIC_API_KEY rusty-brain serve >"$derr" 2>&1 &
       dpid=$!
       # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
       cleanup_memory_on() {
@@ -1385,6 +1532,9 @@ run_scenario() { # row
         exit 1
       fi
       local cap_fidelity="na" cap_reason="na" cap_summary_count="0" cap_mcp_bypass_count="0"
+      local diagnostics_dir="$mb/diagnostics" plant_manifest="$mb/diagnostics/planted.jsonl"
+      mkdir -p "$diagnostics_dir"
+      : > "$plant_manifest"
       if [ "$dim" = "reach" ]; then
         # Identity A plants from its home only (plant_explicit needs no project),
         # so pa is intentionally unused; only B gets a project to be scored in.
@@ -1393,11 +1543,13 @@ run_scenario() { # row
         : "$pa" # tab-split placeholder; A needs no project dir
         seed_home "$ha"; seed_home "$hb" "$pb"
         install_rusty_brain "$hb" "$pb"; rm -f "$pb/CLAUDE.md"; rm -rf "$pb/.claude/skills"
-        plant_explicit "$ha" "$facts"
-        score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale"
+        plant_explicit "$ha" "$facts" "$plant_manifest"
+        capture_memory_diagnostics "$hb" "$pb" "$work" "$diagnostics_dir" "$plant_manifest"
+        score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale" \
+          "na" "na" "0" "0" "$diagnostics_dir"
       else
         if [ "$plant_mode" = "explicit" ]; then
-          plant_explicit "$wh" "$facts"
+          plant_explicit "$wh" "$facts" "$plant_manifest"
           # Class A: bury the planted target under the distractor corpus (bulk-load).
           plant_corpus_distractors "$wh" "$id" "$corpus"
         elif [ "$plant_mode" = "auto-capture" ]; then
@@ -1414,8 +1566,9 @@ run_scenario() { # row
           echo "ERROR: unknown plant_mode '$plant_mode' for $id" >&2
           exit 1
         fi
+        capture_memory_diagnostics "$wh" "$wp" "$work" "$diagnostics_dir" "$plant_manifest"
         score_session "$dim" "$id" "memory-on" "$run" "$wp" "$wh" "$work" "$expect" "$forbid" "$stale" \
-          "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count"
+          "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count" "$diagnostics_dir"
       fi
     )
     rm -rf "$sockdir" 2>/dev/null || true
