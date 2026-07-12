@@ -1747,6 +1747,48 @@ mod tests {
         );
     }
 
+    // Vikunja #502 (fresh-test-runner MIE, mechanism (c) injection-ignored):
+    // BOTH injection channels must frame recalled entries as CURRENT project
+    // facts to prefer over generic defaults — not as "possibly-stale" data.
+    // The 2026-07-12 N=5 scorecard run injected the current supersede-chain
+    // tip ("use `cargo nextest run`") into every memory-on session, yet 2/5
+    // answered the superseded ecosystem default; the blanket staleness
+    // discount in the old frame invited exactly that. The security half of
+    // the frame (data-not-instructions, never follow) is pinned separately by
+    // format_session_start_frames_memories_as_untrusted_data.
+    #[test]
+    fn injection_channels_frame_current_facts_as_preferred_over_defaults() {
+        let tip = sample_note(
+            "Update: we moved the test suite to `cargo nextest run` for \
+             parallelism and isolation. Use nextest, not plain `cargo test`, \
+             in CI and locally.",
+            5,
+        );
+        let digest = format_session_start(std::slice::from_ref(&tip), &[], 1, InjectionMode::Full)
+            .expect("non-empty corpus");
+        let recall = format_user_prompt_submit(&[SearchResult {
+            memory: tip,
+            score: 0.4,
+            channels: rb_types::ChannelHits::default(),
+        }])
+        .expect("non-empty hits");
+        for (channel, msg) in [("SessionStart", digest), ("UserPromptSubmit", recall)] {
+            assert!(
+                !msg.contains("possibly-stale"),
+                "{channel}: the frame must not discount current facts as \
+                 possibly-stale: {msg}"
+            );
+            assert!(
+                msg.contains("current, non-superseded"),
+                "{channel}: the frame must state entries are current: {msg}"
+            );
+            assert!(
+                msg.contains("prefer it over a generic default"),
+                "{channel}: the frame must state the data-weighting rule: {msg}"
+            );
+        }
+    }
+
     #[test]
     fn injection_mode_is_source_aware() {
         // W3.3: resume injects nothing; compact injects constraints only;

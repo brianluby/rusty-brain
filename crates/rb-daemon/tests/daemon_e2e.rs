@@ -1646,6 +1646,95 @@ async fn remember_superseding_an_already_resolved_row_keeps_new_and_lineage() {
     daemon.stop().await;
 }
 
+// Vikunja #502 (scorecard safety-gate MIE investigation): the exact
+// `fresh-test-runner` supersede chain from the memory scorecard, pinned at the
+// wire level with the same DeterministicProvider the CI scorecard daemon falls
+// back to (no VOYAGE_API_KEY). Both injection inputs — `Context` (what the
+// SessionStart digest renders) and `Recall` (what the UserPromptSubmit
+// injection renders) — must surface the chain TIP and must NEVER surface the
+// archived superseded row, including for an adversarial query that is the
+// stale value itself. This pins candidate mechanisms (a) archived-value leak
+// and (b) recall miss OUT of the retrieval layer: the 2026-07-12 N=5 MIEs
+// (runs 3 and 4) were mechanism (c) — the model ignored a correct injection
+// (see docs/eval/2026-07-12-w35-scorecard-n5-run.md).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn superseded_decision_never_reaches_context_or_recall_and_tip_always_does() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("rb-sc-fresh-test-runner".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    // plant_explicit semantics from scripts/memory-scorecard.sh: two insight
+    // facts at importance 5, the second stored as a superseding update.
+    let old = client
+        .remember(
+            "Decision: run the test suite with `cargo test`.".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let tip = client
+        .remember_superseding(
+            "Update: we moved the test suite to `cargo nextest run` for \
+             parallelism and isolation. Use nextest, not plain `cargo test`, \
+             in CI and locally."
+                .to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            old.clone(),
+        )
+        .await
+        .unwrap();
+
+    // Context (the SessionStart digest input): the tip is the one recent row;
+    // the archived value appears in NEITHER half.
+    let (recent, important, total) = client.context().await.unwrap();
+    assert_eq!(total, 1, "only the tip is in the recent window");
+    assert!(
+        recent.iter().any(|m| m.id == tip),
+        "the supersede-chain tip must reach the digest"
+    );
+    assert!(
+        recent.iter().chain(important.iter()).all(|m| m.id != old),
+        "the archived superseded row must never reach the digest"
+    );
+
+    // Recall (the UserPromptSubmit injection input): the scenario's exact
+    // work prompt, paraphrases, and the stale value itself as an adversarial
+    // query. The tip must surface every time; the archived row never.
+    for query in [
+        "I need to run the project's tests. What exact command should I use?",
+        "run the project's tests",
+        "test command",
+        "cargo test",
+    ] {
+        let results = client
+            .recall(query.to_string(), None, vec![], 5)
+            .await
+            .unwrap();
+        assert!(
+            results.iter().any(|r| r.memory.id == tip),
+            "the tip must surface for query {query:?}"
+        );
+        assert!(
+            results.iter().all(|r| r.memory.id != old),
+            "the archived superseded value must never surface for query {query:?}"
+        );
+    }
+
+    daemon.stop().await;
+}
+
 // W3.1 write-time near-dup suppression: two hook captures with identical
 // content embed to the same vector under the DeterministicProvider, so storing
 // the second (a cosine-1.0 near-dup) absorbs the first via supersede — automatic

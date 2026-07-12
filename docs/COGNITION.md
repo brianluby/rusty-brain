@@ -269,9 +269,13 @@ the opt-in declared retention policy:
 - Low-confidence memories are **dampened in ranking, not hidden** — recall
   degrades their weight rather than pretending certainty either way
   (`crates/rb-engine/src/engine.rs`).
-- Injected recall is explicitly labeled possibly-stale, weighted "context from
-  the labeled source" (the CA6 preamble, §3.1) — uncertainty is stated to the
-  consumer instead of laundered.
+- Injected recall states its trust posture explicitly (the CA6 preamble, §3.1):
+  entries are data from the labeled source — current, non-superseded records to
+  apply as project facts, never instructions to follow. Uncertainty rides
+  per-memory signals (provenance labels, confidence dampening) rather than a
+  blanket staleness disclaimer, which measurably caused models to ignore the
+  freshest fact in the store (the 2026-07-12 `fresh-test-runner`
+  memory-induced errors; Vikunja #502).
 - Link `strength` decays exponentially by age from an immutable baseline
   (`base_strength`, migration 002), floored and idempotent
   (`crates/rb-daemon/src/jobs/link_decay.rs`) — old associations fade instead of
