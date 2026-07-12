@@ -79,6 +79,7 @@ pub async fn run_serve(
     read_pool_size: usize,
     jobs_config_path: Option<PathBuf>,
     accept_model_change: bool,
+    http_flag: Option<String>,
     shutdown: impl std::future::Future<Output = ()>,
 ) -> Result<()> {
     let jobs_config = rb_daemon::JobsConfig::load(jobs_config_path.as_deref())?;
@@ -91,6 +92,7 @@ pub async fn run_serve(
         ),
     );
     let accept = accept_model_change || accept_model_change_from_env();
+    let http = resolve_http_listener(http_flag, effective.http)?;
     let config = DaemonConfig {
         socket_path: effective.socket_path,
         db_path: effective.db_path,
@@ -112,8 +114,32 @@ pub async fn run_serve(
             Some("rrf") => rb_daemon::FusionMode::Rrf,
             _ => rb_daemon::FusionMode::Linear,
         },
+        // Opt-in loopback HTTP listener (HTTP PRD): flag > config file, both
+        // through the same loopback-only fail-closed validator. `None` =
+        // zero footprint.
+        http,
     };
     run_with_kind(kind, config, effective.local_model, accept, shutdown).await
+}
+
+/// Resolve the opt-in HTTP listener: `--http [bind]` flag > `[http]` config
+/// file section > off. The flag's bind value goes through the SAME
+/// loopback-only validator as the config file
+/// ([`rb_config::validate_http_bind`]) and fails closed on anything that is
+/// not a literal loopback ip:port — the daemon is never started with a
+/// non-loopback listener (HTTP PRD HTTP-2; docs/THREAT_MODEL.md).
+fn resolve_http_listener(
+    http_flag: Option<String>,
+    file_config: Option<rb_config::HttpConfig>,
+) -> Result<Option<rb_daemon::HttpListenerConfig>> {
+    let bind = match http_flag {
+        Some(raw) => Some(rb_config::validate_http_bind(&raw)?),
+        None => file_config.map(|h| h.bind),
+    };
+    Ok(bind.map(|bind| rb_daemon::HttpListenerConfig {
+        bind,
+        ..Default::default()
+    }))
 }
 
 /// Construct the concrete provider for `kind` and run the daemon to shutdown.
@@ -268,6 +294,58 @@ mod tests {
         );
     }
 
+    // HTTP PRD HTTP-1/HTTP-2: the `--http` flag and the `[http]` config file
+    // section resolve into the daemon listener config with flag > file
+    // precedence, through the SAME loopback-only validator (fail closed).
+    #[test]
+    fn http_config_is_off_when_neither_flag_nor_file_enable_it() {
+        assert!(resolve_http_listener(None, None).unwrap().is_none());
+    }
+
+    #[test]
+    fn http_flag_enables_the_listener_with_a_validated_bind() {
+        let cfg = resolve_http_listener(Some("127.0.0.1:7777".to_string()), None)
+            .unwrap()
+            .expect("flag enables http");
+        assert_eq!(cfg.bind.to_string(), "127.0.0.1:7777");
+    }
+
+    #[test]
+    fn http_flag_overrides_the_file_bind() {
+        let file = rb_config::HttpConfig {
+            bind: "127.0.0.1:1111".parse().unwrap(),
+        };
+        let cfg = resolve_http_listener(Some("127.0.0.1:2222".to_string()), Some(file))
+            .unwrap()
+            .expect("http enabled");
+        assert_eq!(cfg.bind.port(), 2222, "flag wins over file");
+    }
+
+    #[test]
+    fn file_config_enables_the_listener_without_a_flag() {
+        let file = rb_config::HttpConfig {
+            bind: "127.0.0.1:3333".parse().unwrap(),
+        };
+        let cfg = resolve_http_listener(None, Some(file))
+            .unwrap()
+            .expect("http enabled");
+        assert_eq!(cfg.bind.port(), 3333);
+    }
+
+    // SECURITY: a non-loopback flag value fails closed at resolution — the
+    // daemon is never started with it.
+    #[test]
+    fn non_loopback_http_flag_fails_closed() {
+        for bad in ["0.0.0.0:80", "192.168.1.4:9999", "example.com:80"] {
+            let err = resolve_http_listener(Some(bad.to_string()), None).unwrap_err();
+            let msg = err.to_string();
+            assert!(
+                msg.contains("loopback") || msg.contains("ip:port"),
+                "{bad}: {msg}"
+            );
+        }
+    }
+
     #[cfg(not(feature = "local"))]
     #[tokio::test(flavor = "multi_thread")]
     async fn local_selected_without_feature_is_an_embedding_error() {
@@ -284,6 +362,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            http: None,
         };
         let err = run_with_kind(
             ProviderKind::Local,

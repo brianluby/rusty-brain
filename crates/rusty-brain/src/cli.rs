@@ -188,6 +188,21 @@ pub enum Command {
         /// Env equivalent (for auto-start): `RB_ACCEPT_MODEL_CHANGE`.
         #[arg(long = "accept-model-change")]
         accept_model_change: bool,
+
+        /// Also serve an opt-in LOOPBACK-ONLY HTTP listener mirroring the
+        /// CLI/MCP operations (HTTP PRD). Bare `--http` binds 127.0.0.1 on an
+        /// ephemeral port; an explicit value must be a literal loopback
+        /// ip:port (e.g. `--http 127.0.0.1:7777`) — anything else refuses to
+        /// start. Config-file equivalent: `[http] enabled/bind`. Admin ops
+        /// are always denied over HTTP (no peer credential over TCP); see
+        /// docs/THREAT_MODEL.md.
+        #[arg(
+            long = "http",
+            value_name = "BIND",
+            num_args = 0..=1,
+            default_missing_value = "127.0.0.1:0"
+        )]
+        http: Option<String>,
     },
 
     /// Run the MCP (Model Context Protocol) stdio server for agents.
@@ -1527,9 +1542,11 @@ mod tests {
             Command::Serve {
                 jobs_config,
                 accept_model_change,
+                http,
             } => {
                 assert_eq!(jobs_config.as_deref(), Some("/tmp/jobs.toml"));
                 assert!(!accept_model_change, "opt-in flag defaults to off");
+                assert!(http.is_none(), "http listener defaults to off");
             }
             other => panic!("expected Serve, got {other:?}"),
         }
@@ -1543,6 +1560,29 @@ mod tests {
                 accept_model_change,
                 ..
             } => assert!(accept_model_change),
+            other => panic!("expected Serve, got {other:?}"),
+        }
+    }
+
+    // HTTP PRD HTTP-1: `serve --http [bind]` opts into the loopback listener;
+    // the bare flag uses the loopback ephemeral-port default. Bind VALUES are
+    // validated at run time by the shared rb-config validator (loopback-only,
+    // fail closed), not by clap.
+    #[test]
+    fn serve_accepts_the_http_flag_with_and_without_a_bind() {
+        let cli = Cli::parse_from(["rusty-brain", "serve", "--http"]);
+        match cli.command {
+            Command::Serve { http, .. } => {
+                assert_eq!(http.as_deref(), Some("127.0.0.1:0"));
+            }
+            other => panic!("expected Serve, got {other:?}"),
+        }
+
+        let cli = Cli::parse_from(["rusty-brain", "serve", "--http", "127.0.0.1:7777"]);
+        match cli.command {
+            Command::Serve { http, .. } => {
+                assert_eq!(http.as_deref(), Some("127.0.0.1:7777"));
+            }
             other => panic!("expected Serve, got {other:?}"),
         }
     }
