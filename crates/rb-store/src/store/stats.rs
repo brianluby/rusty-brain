@@ -162,6 +162,18 @@ impl SqliteStore {
             rusqlite::params![ns_str],
         )?;
 
+        // Review-queue tier-3 trend (PRD 2026-07-02 REV-4): live rows below
+        // the review bound (exclusive). Shares the constant with the review
+        // queue's low-confidence tier; the
+        // `low_confidence_gauge_agrees_with_the_review_queue_tier` drift test
+        // pins the agreement.
+        let low_confidence_live = count_query(
+            &self.conn,
+            "SELECT COUNT(*) FROM memories
+             WHERE namespace = ?1 AND archived_at IS NULL AND confidence < ?2",
+            rusqlite::params![ns_str, f64::from(rb_types::REVIEW_LOW_CONFIDENCE_BOUND)],
+        )?;
+
         let created_per_day = {
             let mut stmt = self
                 .conn
@@ -231,6 +243,7 @@ impl SqliteStore {
             top_recalled,
             never_recalled_live,
             contested,
+            low_confidence_live,
             created_per_day,
             reembed_pending,
             // RET-4 visibility: apply-mode eligible count under the daemon's
@@ -528,5 +541,52 @@ mod tests {
         let _ = crate::read_meta_embedding_model(&path).unwrap();
         let after = std::fs::metadata(&path).unwrap().modified().unwrap();
         assert_eq!(before, after, "a read-only open must not touch the file");
+    }
+
+    /// DRIFT TEST: the stats `low_confidence_live` gauge (the review-queue
+    /// tier-3 trend, PRD 2026-07-02 REV-4) must count exactly what the
+    /// review queue's low-confidence tier reports.
+    #[test]
+    fn low_confidence_gauge_agrees_with_the_review_queue_tier() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("stats-low-conf".to_string());
+
+        let mut low = MemoryNote::new(ns.clone(), "shaky".into(), MemoryType::Insight, 5);
+        low.confidence = 0.2;
+        store.insert_memory(&low, None).unwrap();
+        let mut edge = MemoryNote::new(
+            ns.clone(),
+            "exactly at bound".into(),
+            MemoryType::Insight,
+            5,
+        );
+        edge.confidence = 0.4; // the bound is EXCLUSIVE (< 0.4)
+        store.insert_memory(&edge, None).unwrap();
+        let mut dead = MemoryNote::new(ns.clone(), "archived shaky".into(), MemoryType::Insight, 5);
+        dead.confidence = 0.1;
+        let dead_id = dead.id.clone();
+        store.insert_memory(&dead, None).unwrap();
+        store.archive_memory(&dead_id).unwrap();
+
+        let stats = store
+            .namespace_stats(&ns, 30, MODEL, INPUT_VERSION, 10, None)
+            .unwrap();
+        assert_eq!(stats.low_confidence_live, 1, "one live row below the bound");
+
+        let plan = store
+            .review_queue(
+                &ns,
+                &crate::ReviewQueueParams {
+                    threshold: 0.95,
+                    limit: 50,
+                    since: None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert_eq!(
+            stats.low_confidence_live, plan.totals.low_confidence,
+            "the stats gauge and the review tier share one predicate"
+        );
     }
 }

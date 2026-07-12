@@ -193,6 +193,51 @@ enum WriteCommand {
         mode: rb_types::ForgetMode,
         reply: oneshot::Sender<Result<rb_types::ForgetOutcome>>,
     },
+    /// Persist one review snooze (REV-2): upsert `review_state` + the
+    /// `review_resolve` oplog row in one store transaction. Typed reply
+    /// carries the snooze expiry (the RenameNamespace/Scrub pattern). No
+    /// `MemoryChanged` event: a snooze changes no memory row.
+    ReviewSnooze {
+        namespace: Namespace,
+        key: String,
+        days: u32,
+        details: String,
+        reply: oneshot::Sender<Result<i64>>,
+    },
+    /// Atomically merge a near-duplicate pair (PRD 2026-07-02 review; the
+    /// PR #63 atomicity fix): ONE store transaction re-validates the pair,
+    /// inserts the pre-composed combined memory, copies the originals'
+    /// external edges, supersedes both originals behind the pointer guard,
+    /// and writes the audit row. Single-writer serialization makes two
+    /// concurrent merges of the same pair impossible — the loser gets
+    /// `Error::StalePlan`.
+    ReviewMerge {
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+        min_similarity: f32,
+        note: Box<MemoryNote>,
+        embedding: Option<Vec<f32>>,
+        details: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Stamp `reviewed_at` + append the `review_resolve` oplog row (REV-4)
+    /// for a non-snooze resolution. The mutation itself already ran through
+    /// the existing primitives (each publishing its own event).
+    ReviewResolutionRecord {
+        namespace: Namespace,
+        key: String,
+        details: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
+    /// Append the bulk `review_sweep` oplog row (the `retention_sweep`
+    /// bulk-row precedent: written unconditionally, empty memory-id sentinel
+    /// so replay skips it).
+    ReviewSweepRecord {
+        namespace: Namespace,
+        details: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -984,6 +1029,130 @@ impl StoreHandle {
         self.with_read(move |store| store.candidates_for_consolidation(limit))
             .await
     }
+
+    /// The review queue (PRD 2026-07-02 contradiction/dedup review): the
+    /// priority-ordered candidate set for `namespace`. Read-only, via the
+    /// bounded read pool — queue generation never reaches the writer (W1.8;
+    /// pinned by `review_plan_runs_on_the_read_pool_with_zero_writer_ops`).
+    pub async fn review_plan(
+        &self,
+        namespace: Namespace,
+        params: rb_store::ReviewQueueParams,
+    ) -> Result<rb_types::ReviewPlan> {
+        self.with_read(move |store| store.review_queue(&namespace, &params, chrono::Utc::now()))
+            .await
+    }
+
+    /// Is there still an active contradiction between exactly `a` and `b` in
+    /// `namespace`? The resolve-time revalidation for contradiction items
+    /// (PR #63 TOCTOU fix). Read-only, via the bounded read pool.
+    pub async fn contradiction_pair_active(
+        &self,
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+    ) -> Result<bool> {
+        self.with_read(move |store| store.contradiction_pair_active(&namespace, &a, &b))
+            .await
+    }
+
+    /// Atomically merge a near-duplicate pair through the single writer (PRD
+    /// 2026-07-02 review; the PR #63 atomicity fix): one all-or-nothing store
+    /// transaction — see [`rb_store::SqliteStore::review_merge`]. On success
+    /// the arm publishes `Created` for the combined memory and `Archived` for
+    /// both originals.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn review_merge(
+        &self,
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+        min_similarity: f32,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        details: String,
+    ) -> Result<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::ReviewMerge {
+                namespace,
+                a,
+                b,
+                min_similarity,
+                note: Box::new(note),
+                embedding,
+                details,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
+    /// Persist one review snooze (REV-2) through the single writer: upsert
+    /// the item's `review_state` row and append the `review_resolve` oplog
+    /// row in one store transaction. Returns the snooze expiry (unix secs).
+    pub async fn review_snooze(
+        &self,
+        namespace: Namespace,
+        key: String,
+        days: u32,
+        details: String,
+    ) -> Result<i64> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::ReviewSnooze {
+                namespace,
+                key,
+                days,
+                details,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
+    /// Record one non-snooze review resolution (REV-4 audit): stamp
+    /// `reviewed_at` (clearing any snooze) and append the `review_resolve`
+    /// oplog row — one store transaction through the single writer. The
+    /// mutation itself runs through the existing primitives beforehand.
+    pub async fn record_review_resolution(
+        &self,
+        namespace: Namespace,
+        key: String,
+        details: String,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::ReviewResolutionRecord {
+            namespace,
+            key,
+            details,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Append the bulk `review_sweep` oplog row (REV-4) — written
+    /// unconditionally after a policy apply pass, the `retention_sweep`
+    /// bulk-row precedent.
+    pub async fn record_review_sweep(&self, namespace: Namespace, details: String) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::ReviewSweepRecord {
+            namespace,
+            details,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
 }
 
 struct StoreOpReport {
@@ -1657,6 +1826,137 @@ fn writer_loop(
                     outcome
                 });
                 let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ReviewSnooze {
+                namespace,
+                key,
+                days,
+                details,
+                reply,
+            } => {
+                // Typed payload via the RenameNamespace/Scrub pattern. No
+                // MemoryChanged event: a snooze changes no memory row — the
+                // oplog row (empty-sentinel) is the durable record.
+                let mut payload = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        payload = Some(s.snooze_review_item(
+                            &namespace,
+                            &key,
+                            days,
+                            &details,
+                            chrono::Utc::now(),
+                        )?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    payload.ok_or_else(|| {
+                        Error::Storage("review snooze completed without an expiry".to_string())
+                    })
+                });
+                let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ReviewMerge {
+                namespace,
+                a,
+                b,
+                min_similarity,
+                note,
+                embedding,
+                details,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        s.review_merge(
+                            &namespace,
+                            &a,
+                            &b,
+                            min_similarity,
+                            &note,
+                            embedding.as_deref(),
+                            &details,
+                            chrono::Utc::now(),
+                        )
+                    },
+                );
+                let merged = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if merged {
+                    // Subscribers observe the merge as one Created (the
+                    // combined memory) plus two Archived events, each stamped
+                    // with its own oplog seq (the retention-sweep rule).
+                    publish_change_stamped(
+                        &events,
+                        store.as_ref(),
+                        note.id.clone(),
+                        namespace.clone(),
+                        ChangeKind::Created,
+                    );
+                    for old in [a, b] {
+                        publish_change_stamped(
+                            &events,
+                            store.as_ref(),
+                            old,
+                            namespace.clone(),
+                            ChangeKind::Archived,
+                        );
+                    }
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ReviewResolutionRecord {
+                namespace,
+                key,
+                details,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.record_review_resolution(&namespace, &key, &details, chrono::Utc::now()),
+                );
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ReviewSweepRecord {
+                namespace,
+                details,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| s.record_review_sweep(&namespace, &details, chrono::Utc::now()),
+                );
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
                 if !writer_usable {
                     break;
                 }
@@ -3132,6 +3432,122 @@ mod tests {
                 Namespace::Project("retention".to_string())
             ]
         );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_plan_runs_on_the_read_pool_with_zero_writer_ops() {
+        // The review queue is a read-side aggregate (W1.8): generating it
+        // must enqueue NOTHING on the writer thread — the stats/history
+        // proof, extended to the review path.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("review-read-pool".to_string());
+
+        let a = note(&ns, "sqlite is the only database");
+        let b = note(&ns, "postgres is the only database");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, None).await.unwrap();
+        handle.write(b, None).await.unwrap();
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "test".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let ops_before = handle.writer_ops_count();
+        let plan = handle
+            .review_plan(
+                ns.clone(),
+                rb_store::ReviewQueueParams {
+                    threshold: 0.95,
+                    limit: 50,
+                    since: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.items.len(), 1, "the seeded pair surfaces");
+        assert_eq!(plan.items[0].reason, rb_types::ReviewReason::Contradiction);
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before,
+            "review-plan generation must issue ZERO writer-thread ops"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_snooze_and_records_go_through_the_writer_and_hide_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("review-snooze".to_string());
+
+        let a = note(&ns, "one side");
+        let b = note(&ns, "other side");
+        let (aid, bid) = (a.id.clone(), b.id.clone());
+        handle.write(a, None).await.unwrap();
+        handle.write(b, None).await.unwrap();
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: aid.clone(),
+                target_id: bid.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "test".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let params = rb_store::ReviewQueueParams {
+            threshold: 0.95,
+            limit: 50,
+            since: None,
+        };
+        let key = rb_types::review_item_key(
+            rb_types::ReviewReason::Contradiction,
+            &[aid.clone(), bid.clone()],
+        );
+
+        let ops_before = handle.writer_ops_count();
+        let until = handle
+            .review_snooze(ns.clone(), key.clone(), 7, "{}".to_string())
+            .await
+            .unwrap();
+        assert!(until > chrono::Utc::now().timestamp(), "future expiry");
+        assert!(
+            handle.writer_ops_count() > ops_before,
+            "snooze persistence is a writer op"
+        );
+
+        let plan = handle.review_plan(ns.clone(), params).await.unwrap();
+        assert!(
+            plan.items.is_empty(),
+            "snoozed item hidden: {:?}",
+            plan.items
+        );
+        assert_eq!(plan.totals.snoozed, 1);
+
+        // The audit records go through the writer without error.
+        handle
+            .record_review_resolution(ns.clone(), key, r#"{"action":"keep"}"#.to_string())
+            .await
+            .unwrap();
+        handle
+            .record_review_sweep(ns.clone(), r#"{"policy":"auto-merge-dups"}"#.to_string())
+            .await
+            .unwrap();
 
         handle.shutdown().await;
     }

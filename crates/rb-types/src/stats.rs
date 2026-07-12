@@ -61,6 +61,14 @@ pub struct MemoryStats {
     /// endpoints are active and in this namespace (the `contested` read flag).
     #[serde(default)]
     pub contested: u64,
+    /// Live memories with confidence below the review bound
+    /// (`REVIEW_LOW_CONFIDENCE_BOUND`, exclusive) — with `contested` and
+    /// `never_recalled_live`, the review-queue trend (PRD 2026-07-02 REV-4;
+    /// the near-dup tier is deliberately not counted here: it would cost one
+    /// KNN probe per live memory on every stats call). Additive
+    /// `#[serde(default)]` field, the `retention_eligible` precedent.
+    #[serde(default)]
+    pub low_confidence_live: u64,
     /// Corpus growth: memories created per UTC day inside the window, oldest
     /// first. Days with no writes are omitted.
     #[serde(default)]
@@ -152,6 +160,7 @@ mod tests {
             }],
             never_recalled_live: 4,
             contested: 1,
+            low_confidence_live: 2,
             created_per_day: vec![GrowthBucket {
                 day: "2026-07-10".to_string(),
                 count: 2,

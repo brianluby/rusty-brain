@@ -282,10 +282,61 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         depth: Option<u32>,
     },
+    /// Review-queue generation / policy sweep (PRD 2026-07-02
+    /// contradiction/dedup review). Namespace-scoped by the handshake.
+    /// `dry_run: true` (the serde default — an absent flag must PREVIEW,
+    /// never execute) returns the priority-ordered queue plus, when `policy`
+    /// is named, the per-item plan; `dry_run: false` requires a `policy` and
+    /// executes one bounded apply pass. Every action is reversible
+    /// (supersede/archive are soft, demote is an update), so apply is NOT
+    /// admin-gated — the `Forget` apply precedent. `since`/`limit`/
+    /// `threshold` are optional knobs, server-clamped. Additive variant per
+    /// the `Forget` precedent: an old daemon fails to decode it and closes
+    /// the connection (no CONTRACT_VERSION bump).
+    Review {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<rb_types::ReviewPolicy>,
+        #[serde(default = "default_review_dry_run")]
+        dry_run: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        since: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        limit: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f32>,
+    },
+    /// Apply ONE review resolution (REV-2 interactive mode): keep / merge /
+    /// archive / demote / snooze on the item identified by `reason` + member
+    /// `ids` (the daemon recomputes the canonical key server-side — the key
+    /// never travels as free text). Namespace-scoped like `Update`/`Link`
+    /// (NOT an admin op): the daemon verifies every id lives in the
+    /// connection's namespace, validates the action shape fail-closed
+    /// (`ReviewAction::validate`), and orchestrates the existing atomic
+    /// supersede/archive/confidence primitives. Additive variant per the
+    /// `Review` precedent (no CONTRACT_VERSION bump).
+    Resolve {
+        reason: rb_types::ReviewReason,
+        ids: Vec<MemoryId>,
+        action: rb_types::ReviewAction,
+        /// Near-dup similarity bound for the resolve-time MERGE revalidation
+        /// (the plan->resolve TOCTOU fix): the daemon re-checks that the pair
+        /// still qualifies as near-duplicates at this threshold inside the
+        /// atomic merge transaction. `None` uses the conservative default;
+        /// server-clamped like `Review.threshold`. Additive +
+        /// `#[serde(default, skip_serializing_if)]` — an old frame decodes to
+        /// the default and a `None` stays off the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f32>,
+    },
 }
 
 /// An absent `dry_run` on the wire must PREVIEW, never execute.
 fn default_forget_dry_run() -> bool {
+    true
+}
+
+/// An absent review `dry_run` must PREVIEW, never execute (the Forget rule).
+fn default_review_dry_run() -> bool {
     true
 }
 
@@ -429,6 +480,26 @@ pub enum Response {
     /// never see it because they never send the request.
     History {
         history: rb_types::MemoryHistory,
+    },
+    /// Reply to a dry-run `Request::Review`: the priority-ordered queue plus
+    /// the per-item plan when a policy was named — computed by the same
+    /// queue generator the apply pass executes. Every payload field is
+    /// `#[serde(default)]` so the shape stays additive. Additive variant;
+    /// old clients never see it because they never send the request.
+    ReviewPlanned {
+        plan: rb_types::ReviewPlan,
+    },
+    /// Reply to an executed `Request::Review`: what the bounded policy pass
+    /// did (the `ForgetDone` shape, including the partial-failure slot).
+    /// Additive variant; old clients never see it.
+    ReviewDone {
+        outcome: rb_types::ReviewOutcome,
+    },
+    /// Reply to a `Request::Resolve`: what the single resolution did (the
+    /// merged-into id, post-nudge confidences, or the snooze expiry).
+    /// Additive variant; old clients never see it.
+    Resolved {
+        resolution: rb_types::ReviewResolution,
     },
     Error {
         kind: String,
@@ -1698,5 +1769,165 @@ mod tests {
             json,
             r#"{"result":"JobRan","scanned":1,"changed":0,"skipped":1}"#
         );
+    }
+
+    #[test]
+    fn review_request_defaults_to_dry_run_and_minimal_frame_is_bare() {
+        // SAFETY DEFAULT (the Forget precedent): an absent `dry_run` on the
+        // wire must PREVIEW, never execute a policy.
+        let back: Request = serde_json::from_str(r#"{"op":"Review"}"#).unwrap();
+        match back {
+            Request::Review {
+                policy,
+                dry_run,
+                since,
+                limit,
+                threshold,
+            } => {
+                assert!(dry_run, "absent dry_run must decode to a preview");
+                assert!(policy.is_none());
+                assert!(since.is_none() && limit.is_none() && threshold.is_none());
+            }
+            other => panic!("expected Review, got {other:?}"),
+        }
+        // The default-shaped request keeps every optional key off the frame.
+        let json = serde_json::to_string(&Request::Review {
+            policy: None,
+            dry_run: true,
+            since: None,
+            limit: None,
+            threshold: None,
+        })
+        .unwrap();
+        assert_eq!(json, r#"{"op":"Review","dry_run":true}"#);
+    }
+
+    #[test]
+    fn review_request_round_trips_with_every_field() {
+        let req = Request::Review {
+            policy: Some(rb_types::ReviewPolicy::AutoMergeDups),
+            dry_run: false,
+            since: Some(42),
+            limit: Some(10),
+            threshold: Some(0.97),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["op"], "Review");
+        assert_eq!(value["policy"], "auto_merge_dups");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Review {
+                policy,
+                dry_run,
+                since,
+                limit,
+                threshold,
+            } => {
+                assert_eq!(policy, Some(rb_types::ReviewPolicy::AutoMergeDups));
+                assert!(!dry_run);
+                assert_eq!(since, Some(42));
+                assert_eq!(limit, Some(10));
+                assert_eq!(threshold, Some(0.97));
+            }
+            other => panic!("expected Review, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_request_round_trips_reason_ids_and_action() {
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let req = Request::Resolve {
+            reason: rb_types::ReviewReason::NearDuplicate,
+            ids: vec![a.clone(), b.clone()],
+            action: rb_types::ReviewAction::Archive { id: b.clone() },
+            threshold: Some(0.9),
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["op"], "Resolve");
+        assert_eq!(value["action"]["action"], "archive");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Resolve {
+                reason,
+                ids,
+                action,
+                threshold,
+            } => {
+                assert_eq!(reason, rb_types::ReviewReason::NearDuplicate);
+                assert_eq!(ids, vec![a, b.clone()]);
+                assert_eq!(action, rb_types::ReviewAction::Archive { id: b });
+                assert_eq!(threshold, Some(0.9));
+            }
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+        // Additive: a frame WITHOUT the threshold key decodes to None (the
+        // server then revalidates a merge at the conservative default).
+        let mut value = value;
+        value.as_object_mut().unwrap().remove("threshold");
+        let back: Request = serde_json::from_value(value).unwrap();
+        match back {
+            Request::Resolve { threshold, .. } => assert_eq!(threshold, None),
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn review_responses_round_trip_and_payloads_are_additive() {
+        let resp = Response::ReviewPlanned {
+            plan: rb_types::ReviewPlan {
+                totals: rb_types::ReviewTotals {
+                    contradictions: 2,
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "ReviewPlanned");
+        match serde_json::from_str::<Response>(&json).unwrap() {
+            Response::ReviewPlanned { plan } => assert_eq!(plan.totals.contradictions, 2),
+            other => panic!("expected ReviewPlanned, got {other:?}"),
+        }
+
+        // Additive payloads: empty-object payloads decode to defaults (the
+        // Stats/History precedent).
+        match serde_json::from_str::<Response>(r#"{"result":"ReviewPlanned","plan":{}}"#).unwrap() {
+            Response::ReviewPlanned { plan } => assert_eq!(plan, rb_types::ReviewPlan::default()),
+            other => panic!("expected ReviewPlanned, got {other:?}"),
+        }
+        match serde_json::from_str::<Response>(r#"{"result":"ReviewDone","outcome":{}}"#).unwrap() {
+            Response::ReviewDone { outcome } => {
+                assert_eq!(outcome, rb_types::ReviewOutcome::default());
+            }
+            other => panic!("expected ReviewDone, got {other:?}"),
+        }
+        match serde_json::from_str::<Response>(r#"{"result":"Resolved","resolution":{}}"#).unwrap()
+        {
+            Response::Resolved { resolution } => {
+                assert_eq!(resolution, rb_types::ReviewResolution::default());
+            }
+            other => panic!("expected Resolved, got {other:?}"),
+        }
+
+        let done = Response::ReviewDone {
+            outcome: rb_types::ReviewOutcome {
+                policy: Some(rb_types::ReviewPolicy::DemoteLowConfidence),
+                demoted: 3,
+                failure: Some("injected".to_string()),
+                ..Default::default()
+            },
+        };
+        let back: Response = serde_json::from_str(&serde_json::to_string(&done).unwrap()).unwrap();
+        match back {
+            Response::ReviewDone { outcome } => {
+                assert_eq!(outcome.demoted, 3);
+                assert_eq!(outcome.failure.as_deref(), Some("injected"));
+            }
+            other => panic!("expected ReviewDone, got {other:?}"),
+        }
     }
 }

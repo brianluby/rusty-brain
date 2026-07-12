@@ -816,3 +816,138 @@ fn doctor_fails_with_guidance_on_model_mismatch_against_db_meta() {
         "guidance names the opt-in: {stdout}"
     );
 }
+
+#[test]
+fn review_flow_lists_gates_and_applies_through_the_binary() {
+    // PRD 2026-07-02 (contradiction/dedup review) through the real binary:
+    // seed a contradiction and a near-dup pair, list the queue (dry-run,
+    // zero writes), verify the piped --apply refusal without --yes, then
+    // apply auto-merge-dups with --yes and assert the merge + history.
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let ns = "review-e2e";
+
+    let _reap = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(
+        wait_for_socket(&socket, Duration::from_secs(10)),
+        "daemon socket never appeared at {}",
+        socket.display()
+    );
+
+    let remember_json = |text: &str| -> String {
+        let out = cli(&exe, &socket, &db, dir.path(), ns)
+            .args(["--json", "remember", text])
+            .output()
+            .expect("run remember");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let v: serde_json::Value =
+            serde_json::from_slice(&out.stdout).expect("remember --json output");
+        v["id"].as_str().expect("id").to_string()
+    };
+
+    // Identical contents => cosine-1.0 near-dups under the deterministic
+    // provider (CLI-sourced writes are never suppressed at write time).
+    let dup_a = remember_json("standup notes are kept in the team channel");
+    let dup_b = remember_json("standup notes are kept in the team channel");
+    let con_a = remember_json("releases are cut from main every Monday");
+    let con_b = remember_json("releases are cut from release branches only");
+    let link = cli(&exe, &socket, &db, dir.path(), ns)
+        .args(["link", &con_a, &con_b, "--type", "contradicts"])
+        .output()
+        .expect("run link");
+    assert!(
+        link.status.success(),
+        "{}",
+        String::from_utf8_lossy(&link.stderr)
+    );
+
+    // Bare review: a dry-run listing, in priority order, with zero writes.
+    let listing = cli(&exe, &socket, &db, dir.path(), ns)
+        .args(["review"])
+        .output()
+        .expect("run review");
+    assert!(
+        listing.status.success(),
+        "{}",
+        String::from_utf8_lossy(&listing.stderr)
+    );
+    let text = String::from_utf8_lossy(&listing.stdout);
+    assert!(text.contains("contradiction"), "{text}");
+    assert!(text.contains("near-duplicate"), "{text}");
+    let contra_pos = text.find("contradiction").unwrap();
+    let dup_pos = text.find("near-duplicate").unwrap();
+    assert!(
+        contra_pos < dup_pos,
+        "priority order in the listing: {text}"
+    );
+    assert!(
+        String::from_utf8_lossy(&listing.stderr).contains("dry-run only"),
+        "the safety posture is announced"
+    );
+
+    // Piped --apply without --yes refuses loudly (never ride a pipeline by
+    // accident) and writes nothing.
+    let refused = cli(&exe, &socket, &db, dir.path(), ns)
+        .args(["review", "--apply", "--policy", "auto-merge-dups"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("run review --apply");
+    assert!(
+        !refused.status.success(),
+        "piped apply without --yes must refuse"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("--yes"),
+        "{}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // --apply --policy auto-merge-dups --yes merges the dup pair.
+    let applied = cli(&exe, &socket, &db, dir.path(), ns)
+        .args([
+            "--json",
+            "review",
+            "--apply",
+            "--policy",
+            "auto-merge-dups",
+            "--yes",
+        ])
+        .output()
+        .expect("run review apply");
+    assert!(
+        applied.status.success(),
+        "{}",
+        String::from_utf8_lossy(&applied.stderr)
+    );
+    let outcome: serde_json::Value = serde_json::from_slice(&applied.stdout).expect("outcome json");
+    assert_eq!(outcome["merged"], 1, "{outcome}");
+    assert_eq!(outcome["skipped"], 1, "{outcome}");
+
+    // The originals are archived into one superseding memory; history shows it.
+    let history = cli(&exe, &socket, &db, dir.path(), ns)
+        .args(["--json", "history", &dup_a])
+        .output()
+        .expect("run history");
+    assert!(
+        history.status.success(),
+        "{}",
+        String::from_utf8_lossy(&history.stderr)
+    );
+    let h: serde_json::Value = serde_json::from_slice(&history.stdout).expect("history json");
+    let chain = h["chain"].as_array().expect("chain");
+    assert!(chain.len() >= 2, "supersede chain reaches the merge: {h}");
+    let dup_b_in_queue = {
+        let listing = cli(&exe, &socket, &db, dir.path(), ns)
+            .args(["review"])
+            .output()
+            .expect("run review again");
+        String::from_utf8_lossy(&listing.stdout).contains(&dup_b)
+    };
+    assert!(!dup_b_in_queue, "the merged pair does not resurface");
+}

@@ -194,6 +194,32 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
+        let (note, embedding) = self.compose_note(input).await?;
+        let id = note.id.clone();
+        // Keep a copy of the embedding for candidate search before the note moves.
+        let embedding_for_links = embedding.clone();
+        self.backend.write(note, embedding).await?;
+
+        // Best-effort link generation: never fails the remember.
+        if let Some(emb) = embedding_for_links {
+            if let Err(e) = self.generate_links(&id, emb).await {
+                tracing::warn!(error = %e, memory_id = %id, "link generation failed; continuing");
+            }
+        }
+        Ok(id)
+    }
+
+    /// Compose a fully-stamped memory (validation, enrichment, summary /
+    /// keyword derivation, provenance, embedding-model stamps, and the
+    /// composite-document embedding) WITHOUT writing it. `remember` is
+    /// compose + write + link generation; the review merge composes here and
+    /// hands the note to the store's single atomic merge transaction
+    /// (PRD 2026-07-02 review) — the two paths cannot drift on how a memory
+    /// is built.
+    pub async fn compose_note(
+        &self,
+        input: RememberInput,
+    ) -> rb_types::Result<(MemoryNote, Option<Vec<f32>>)> {
         rb_types::validate_importance(input.importance)?;
         // Fail-closed confidence range check on an EXPLICIT caller prior
         // (mirrors the storage CHECK, but surfaces as a clean validation error
@@ -296,19 +322,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let input = crate::embed_input::embedding_input(&note);
         let mut embeddings = self.embedder.embed(&[input], EmbedKind::Document).await?;
         let embedding = embeddings.pop();
-
-        let id = note.id.clone();
-        // Keep a copy of the embedding for candidate search before the note moves.
-        let embedding_for_links = embedding.clone();
-        self.backend.write(note, embedding).await?;
-
-        // Best-effort link generation: never fails the remember.
-        if let Some(emb) = embedding_for_links {
-            if let Err(e) = self.generate_links(&id, emb).await {
-                tracing::warn!(error = %e, memory_id = %id, "link generation failed; continuing");
-            }
-        }
-        Ok(id)
+        Ok((note, embedding))
     }
 
     /// Vector-search for candidates similar to the just-written memory, fetch

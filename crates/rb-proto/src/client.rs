@@ -722,6 +722,84 @@ where
         }
     }
 
+    /// Dry-run review (PRD 2026-07-02 contradiction/dedup review): the
+    /// priority-ordered queue for this connection's namespace plus, when
+    /// `policy` is named, the per-item plan one apply pass would execute.
+    /// Read-only server-side: the queue path issues zero writer ops (W1.8).
+    pub async fn review_plan(
+        &mut self,
+        policy: Option<rb_types::ReviewPolicy>,
+        since: Option<u64>,
+        limit: Option<u32>,
+        threshold: Option<f32>,
+    ) -> Result<rb_types::ReviewPlan> {
+        let resp = self
+            .request(Request::Review {
+                policy,
+                dry_run: true,
+                since,
+                limit,
+                threshold,
+            })
+            .await?;
+        match resp {
+            Resp::ReviewPlanned { plan } => Ok(plan),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// Execute one bounded review apply pass under `policy` (REV-3): the
+    /// daemon recomputes the queue, derives the SAME plan a dry-run shows
+    /// (`ReviewPolicy::plan_action` is the single mapping), and applies it
+    /// through the existing atomic primitives. Partial failures ride
+    /// `ReviewOutcome::failure`; completed items stay committed.
+    pub async fn review_apply(
+        &mut self,
+        policy: rb_types::ReviewPolicy,
+        since: Option<u64>,
+        limit: Option<u32>,
+        threshold: Option<f32>,
+    ) -> Result<rb_types::ReviewOutcome> {
+        let resp = self
+            .request(Request::Review {
+                policy: Some(policy),
+                dry_run: false,
+                since,
+                limit,
+                threshold,
+            })
+            .await?;
+        match resp {
+            Resp::ReviewDone { outcome } => Ok(outcome),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
+    /// Apply one per-item review resolution (REV-2 interactive mode). The
+    /// item is identified by `reason` + member `ids`; the daemon recomputes
+    /// the canonical key, validates the action fail-closed, and applies it
+    /// atomically through the existing primitives.
+    pub async fn resolve_review_item(
+        &mut self,
+        reason: rb_types::ReviewReason,
+        ids: Vec<MemoryId>,
+        action: rb_types::ReviewAction,
+        threshold: Option<f32>,
+    ) -> Result<rb_types::ReviewResolution> {
+        let resp = self
+            .request(Request::Resolve {
+                reason,
+                ids,
+                action,
+                threshold,
+            })
+            .await?;
+        match resp {
+            Resp::Resolved { resolution } => Ok(resolution),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// One-time namespace rename (W0.3 carryover): re-scope every memory from
     /// `old` to `new` in one daemon writer transaction. Refused with
     /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
@@ -1171,6 +1249,52 @@ mod wrapper_tests {
                         truncated: false,
                     },
                 },
+                // Canned payloads keyed on dry_run/policy/since/limit so the
+                // typed-wrapper test can prove every knob rides the wire.
+                Request::Review {
+                    policy,
+                    dry_run,
+                    since,
+                    limit,
+                    ..
+                } => {
+                    if dry_run {
+                        Response::ReviewPlanned {
+                            plan: rb_types::ReviewPlan {
+                                policy,
+                                totals: rb_types::ReviewTotals {
+                                    contradictions: 1,
+                                    near_duplicates: since.unwrap_or(0),
+                                    low_confidence: u64::from(limit.unwrap_or(0)),
+                                    ..Default::default()
+                                },
+                                ..Default::default()
+                            },
+                        }
+                    } else {
+                        Response::ReviewDone {
+                            outcome: rb_types::ReviewOutcome {
+                                policy,
+                                merged: 1,
+                                ..Default::default()
+                            },
+                        }
+                    }
+                }
+                // Echo the canonical key + action so the wrapper test can
+                // prove reason/ids/action ride the wire.
+                Request::Resolve {
+                    reason,
+                    ids,
+                    action,
+                    ..
+                } => Response::Resolved {
+                    resolution: rb_types::ReviewResolution {
+                        key: rb_types::review_item_key(reason, &ids),
+                        action: action.kind_str().to_string(),
+                        ..Default::default()
+                    },
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -1210,6 +1334,60 @@ mod wrapper_tests {
             .await
             .unwrap();
         assert_eq!((outcome.archived, outcome.purged), (0, 1));
+
+        drop(client);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn review_wrappers_carry_policy_dry_run_and_resolution_over_the_wire() {
+        let (_dir, sock) = socket_path();
+        let listener = UnixListener::bind(&sock).unwrap();
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+
+        let mut client = connect(&sock).await;
+
+        // Plan: dry_run=true rode the wire (the fake keys the totals on it)
+        // and the knobs echo back through the canned payload.
+        let plan = client
+            .review_plan(
+                Some(rb_types::ReviewPolicy::AutoMergeDups),
+                Some(7),
+                Some(3),
+                Some(0.97),
+            )
+            .await
+            .unwrap();
+        assert_eq!(plan.policy, Some(rb_types::ReviewPolicy::AutoMergeDups));
+        assert_eq!(plan.totals.contradictions, 1, "dry_run rode the wire");
+        assert_eq!(plan.totals.near_duplicates, 7, "since rode the wire");
+        assert_eq!(plan.totals.low_confidence, 3, "limit rode the wire");
+
+        // Apply: dry_run=false rides the wire and the outcome comes back typed.
+        let outcome = client
+            .review_apply(rb_types::ReviewPolicy::AutoMergeDups, None, None, None)
+            .await
+            .unwrap();
+        assert_eq!(outcome.policy, Some(rb_types::ReviewPolicy::AutoMergeDups));
+        assert_eq!(outcome.merged, 1, "apply keyed the canned outcome");
+
+        // Per-item resolve: reason/ids/action ride the wire.
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let resolution = client
+            .resolve_review_item(
+                rb_types::ReviewReason::NearDuplicate,
+                vec![a.clone(), b.clone()],
+                rb_types::ReviewAction::Snooze { days: 9 },
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(resolution.action, "snooze");
+        assert_eq!(
+            resolution.key,
+            rb_types::review_item_key(rb_types::ReviewReason::NearDuplicate, &[a, b])
+        );
 
         drop(client);
         server.await.unwrap();

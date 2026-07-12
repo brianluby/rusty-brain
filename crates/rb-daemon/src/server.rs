@@ -701,7 +701,10 @@ fn is_admin_op(req: &Request) -> bool {
         // like Delete) and dry-runs of either mode are read-only, so none of
         // those are admin.
         Request::Forget { mode, dry_run, .. } => *mode == rb_types::ForgetMode::Hard && !dry_run,
-        // Namespace-scoped by the handshake: not admin.
+        // Namespace-scoped by the handshake: not admin. Review/Resolve
+        // (PRD 2026-07-02) are deliberately non-admin: every review action is
+        // reversible (supersede/archive are soft, demote is an update) and
+        // namespace-scoped — the Forget APPLY precedent, not the hard purge.
         Request::Remember { .. }
         | Request::Recall { .. }
         | Request::Get { .. }
@@ -715,6 +718,8 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Subscribe { .. }
         | Request::Stats { .. }
         | Request::History { .. }
+        | Request::Review { .. }
+        | Request::Resolve { .. }
         | Request::Ping => false,
     }
 }
@@ -1013,6 +1018,361 @@ async fn suppress_hook_near_duplicates<P>(
     }
 }
 
+/// Apply ONE review resolution (PRD 2026-07-02 REV-2). Fail-closed order:
+/// validate the action shape against the item's REASON and member ids
+/// (merge is near-duplicate-only), re-validate the planned relationship at
+/// resolve time (the PR #63 TOCTOU fix — a contradiction item must still be
+/// an active contradiction pair; a near-dup merge re-proves similarity
+/// inside the writer transaction), resolve every member through the
+/// namespace-scoped engine (`peek` — a maintenance read must not pollute the
+/// W3.7 access signal; a foreign or missing id is `NotFound` before any
+/// write), mutate, then record the `review_resolve` audit row (REV-4).
+///
+/// Merge is ONE writer transaction end to end (the PR #63 atomicity fix):
+/// the combined memory is COMPOSED through the engine (validated, enriched,
+/// embedded, provenance-stamped — `MemoryEngine::compose_note`, the same
+/// construction `remember` commits) and handed to
+/// `StoreHandle::review_merge`, whose single store transaction re-validates,
+/// inserts, copies the originals' external edges, supersedes both originals
+/// behind the pointer guard, and writes the audit row. Any failure rolls the
+/// WHOLE merge back — no orphaned combined memory, no split chain; a raced
+/// resolution loses with the distinct [`Error::StalePlan`], which the policy
+/// sweep treats as skip-and-continue.
+#[allow(clippy::too_many_arguments)] // the resolve context is irreducible here
+async fn apply_review_action<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    reason: rb_types::ReviewReason,
+    ids: &[rb_types::MemoryId],
+    action: &rb_types::ReviewAction,
+    threshold: f32,
+) -> Result<rb_types::ReviewResolution>
+where
+    P: EmbeddingProvider,
+{
+    use rb_types::{MemberConfidence, ReviewAction};
+
+    action.validate(reason, ids)?;
+    let key = rb_types::review_item_key(reason, ids);
+
+    // Resolve-time revalidation of the claimed relationship (PR #63 TOCTOU
+    // fix). Contradiction items are re-proved here for EVERY action; a
+    // near-dup MERGE is re-proved inside the atomic store transaction below
+    // (where the guard is race-free). Non-merge actions on other reasons are
+    // individually-targeted, reversible primitives.
+    if reason == rb_types::ReviewReason::Contradiction {
+        if let [a, b] = ids {
+            let still = job_store
+                .contradiction_pair_active(namespace.clone(), a.clone(), b.clone())
+                .await?;
+            if !still {
+                return Err(Error::StalePlan(format!(
+                    "{a} and {b} no longer form an active contradiction; re-run \
+                     review for a fresh queue"
+                )));
+            }
+        }
+    }
+
+    let mut notes = Vec::with_capacity(ids.len());
+    for id in ids {
+        match engine.peek(id.clone()).await? {
+            Some(note) => notes.push(note),
+            None => return Err(Error::NotFound(id.clone())),
+        }
+    }
+
+    let mut resolution = rb_types::ReviewResolution {
+        key: key.clone(),
+        action: action.kind_str().to_string(),
+        ..Default::default()
+    };
+
+    match action {
+        ReviewAction::Keep { bump } => {
+            if *bump {
+                for note in &notes {
+                    let confidence = (note.confidence + rb_types::REVIEW_KEEP_BUMP).clamp(0.0, 1.0);
+                    engine
+                        .update(
+                            note.id.clone(),
+                            rb_types::MemoryUpdates {
+                                confidence: Some(confidence),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                    resolution.confidence.push(MemberConfidence {
+                        id: note.id.clone(),
+                        confidence,
+                    });
+                }
+            }
+        }
+        ReviewAction::Merge => {
+            let (a, b) = (&notes[0], &notes[1]);
+            // Deterministic combine: identical contents collapse to one;
+            // otherwise both bodies are kept, first member first. Metadata
+            // keeps the strongest signal (max importance/confidence) and the
+            // union of keywords/tags/files/anchors; the graph edges are
+            // unioned inside the store transaction.
+            let content = if a.content == b.content {
+                a.content.clone()
+            } else {
+                format!("{}\n\n---\n\n{}", a.content, b.content)
+            };
+            let mut keywords = a.keywords.clone();
+            for k in &b.keywords {
+                if !keywords.contains(k) {
+                    keywords.push(k.clone());
+                }
+            }
+            let mut tags = a.tags.clone();
+            for t in &b.tags {
+                if !tags.contains(t) {
+                    tags.push(t.clone());
+                }
+            }
+            let mut related_files = a.related_files.clone();
+            for f in &b.related_files {
+                if !related_files.contains(f) {
+                    related_files.push(f.clone());
+                }
+            }
+            let mut anchors = a.anchors.clone();
+            for an in &b.anchors {
+                if !anchors.contains(an) {
+                    anchors.push(an.clone());
+                }
+            }
+            let context = [&a.context, &b.context]
+                .into_iter()
+                .find(|c| !c.is_empty())
+                .cloned();
+            let memory_type = if b.importance > a.importance {
+                b.memory_type
+            } else {
+                a.memory_type
+            };
+            let (note, embedding) = engine
+                .compose_note(rb_engine::RememberInput {
+                    content,
+                    context,
+                    memory_type,
+                    importance: a.importance.max(b.importance),
+                    keywords,
+                    tags,
+                    related_files,
+                    confidence: Some(a.confidence.max(b.confidence)),
+                    provenance: provenance.clone(),
+                    anchors,
+                })
+                .await?;
+            let new_id = note.id.clone();
+            let details = serde_json::json!({
+                "key": key,
+                "action": "merge",
+                "ids": ids.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                "merged_into": new_id.to_string(),
+            })
+            .to_string();
+            job_store
+                .review_merge(
+                    namespace.clone(),
+                    a.id.clone(),
+                    b.id.clone(),
+                    threshold,
+                    note,
+                    embedding,
+                    details,
+                )
+                .await?;
+            resolution.merged_into = Some(new_id);
+            // The audit row was written INSIDE the merge transaction.
+            return Ok(resolution);
+        }
+        ReviewAction::Archive { id } => {
+            engine.delete(id.clone()).await?;
+        }
+        ReviewAction::Demote { id } => {
+            // `validate` proved membership; the note is in `notes`.
+            if let Some(note) = notes.iter().find(|n| &n.id == id) {
+                let confidence = (note.confidence - rb_types::REVIEW_DEMOTE_STEP).clamp(0.0, 1.0);
+                engine
+                    .update(
+                        id.clone(),
+                        rb_types::MemoryUpdates {
+                            confidence: Some(confidence),
+                            ..Default::default()
+                        },
+                    )
+                    .await?;
+                resolution.confidence.push(MemberConfidence {
+                    id: id.clone(),
+                    confidence,
+                });
+            }
+        }
+        ReviewAction::Snooze { days } => {
+            let details = serde_json::json!({
+                "key": key,
+                "action": "snooze",
+                "days": days,
+            })
+            .to_string();
+            // The snooze op writes its own `review_resolve` oplog row inside
+            // the same transaction as the review_state upsert.
+            let until = job_store
+                .review_snooze(namespace.clone(), key.clone(), *days, details)
+                .await?;
+            resolution.snoozed_until = Some(until);
+            return Ok(resolution);
+        }
+    }
+
+    // REV-4: every non-snooze resolution stamps reviewed_at (clearing any
+    // snooze — the user acted) and appends one `review_resolve` oplog row.
+    // The per-memory mutations above already wrote their own oplog rows
+    // through the existing primitives.
+    let details = serde_json::json!({
+        "key": key,
+        "action": action.kind_str(),
+        "ids": ids.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+    })
+    .to_string();
+    job_store
+        .record_review_resolution(namespace.clone(), key, details)
+        .await?;
+    Ok(resolution)
+}
+
+/// Execute an already-generated review plan under `policy` (the apply half of
+/// `run_review_sweep`, split out so plan staleness is testable): derive each
+/// item's action through the pure `ReviewPolicy::plan_action` (the SAME
+/// mapping a dry-run shows) and apply it via [`apply_review_action`].
+///
+/// Failure semantics (PR #60 partial-outcome shape + the PR #63 refinement):
+/// a distinct [`Error::StalePlan`] — the item was resolved concurrently or
+/// its relationship dissolved between plan and apply — is a benign collision:
+/// counted as `skipped`, the pass continues. Any OTHER error stops the pass
+/// re-runnably; completed items stay committed. The bulk `review_sweep` oplog
+/// row is written unconditionally.
+async fn execute_review_plan<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    policy: rb_types::ReviewPolicy,
+    plan: &rb_types::ReviewPlan,
+    threshold: f32,
+) -> Result<rb_types::ReviewOutcome>
+where
+    P: EmbeddingProvider,
+{
+    let mut outcome = rb_types::ReviewOutcome {
+        policy: Some(policy),
+        total_items: plan.items.len() as u64,
+        ..Default::default()
+    };
+    let mut failure: Option<String> = None;
+    for item in &plan.items {
+        let Some(action) = policy.plan_action(item) else {
+            outcome.skipped += 1;
+            continue;
+        };
+        let ids: Vec<rb_types::MemoryId> = item.members.iter().map(|m| m.id.clone()).collect();
+        match apply_review_action(
+            engine,
+            job_store,
+            provenance,
+            namespace,
+            item.reason,
+            &ids,
+            &action,
+            threshold,
+        )
+        .await
+        {
+            Ok(_) => match action {
+                rb_types::ReviewAction::Keep { .. } => outcome.kept += 1,
+                rb_types::ReviewAction::Merge => outcome.merged += 1,
+                rb_types::ReviewAction::Archive { .. } => outcome.archived += 1,
+                rb_types::ReviewAction::Demote { .. } => outcome.demoted += 1,
+                rb_types::ReviewAction::Snooze { .. } => outcome.snoozed += 1,
+            },
+            Err(Error::StalePlan(reason)) => {
+                // Benign collision: someone resolved the item (or its
+                // relationship dissolved) between plan and apply. Skip it —
+                // the rest of the batch must still complete.
+                tracing::debug!(key = %item.key, %reason, "review item went stale; skipping");
+                outcome.skipped += 1;
+            }
+            Err(e) => {
+                // The failed item's own steps rolled back or stand alone;
+                // earlier items are committed. Stop (re-runnable), report
+                // the partial pass.
+                failure = Some(format!("{} of {} failed: {e}", action.kind_str(), item.key));
+                break;
+            }
+        }
+    }
+    // The bulk row records the RUN unconditionally (the retention_sweep
+    // precedent): a zero-change or partial pass is still a durable, auditable
+    // run. A failure recording it never erases the completed batch.
+    let details = serde_json::json!({
+        "policy": policy.as_str(),
+        "merged": outcome.merged,
+        "archived": outcome.archived,
+        "demoted": outcome.demoted,
+        "kept": outcome.kept,
+        "snoozed": outcome.snoozed,
+        "skipped": outcome.skipped,
+        "total_items": outcome.total_items,
+        "failure": failure,
+    })
+    .to_string();
+    if let Err(e) = job_store
+        .record_review_sweep(namespace.clone(), details)
+        .await
+    {
+        let msg = format!("recording the sweep run: {e}");
+        failure = Some(match failure {
+            Some(prior) => format!("{prior}; {msg}"),
+            None => msg,
+        });
+    }
+    outcome.failure = failure;
+    Ok(outcome)
+}
+
+/// One bounded review apply pass (REV-3 `--apply --policy`): recompute the
+/// queue, then execute it via [`execute_review_plan`].
+async fn run_review_sweep<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    policy: rb_types::ReviewPolicy,
+    params: rb_store::ReviewQueueParams,
+) -> Result<rb_types::ReviewOutcome>
+where
+    P: EmbeddingProvider,
+{
+    let plan = job_store.review_plan(namespace.clone(), params).await?;
+    execute_review_plan(
+        engine,
+        job_store,
+        provenance,
+        namespace,
+        policy,
+        &plan,
+        params.threshold,
+    )
+    .await
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
@@ -1309,6 +1669,96 @@ where
                 .await
             {
                 Ok(history) => Response::History { history },
+                Err(e) => error_to_response(e),
+            }
+        }
+        // Guided review (PRD 2026-07-02), namespace-scoped by the handshake.
+        // Dry-run generates the queue on the read pool (zero writer ops) and,
+        // when a policy is named, derives the per-item plan through the pure
+        // `ReviewPolicy::plan_action` — the SAME mapping the apply pass
+        // executes, so preview and mutation cannot diverge (REV-3). Execute
+        // requires an explicit policy (never auto-resolve without consent).
+        // The knobs are clamped server-side: a wire threshold can never drop
+        // below the conservative floor (false-positive merge risk).
+        Request::Review {
+            policy,
+            dry_run,
+            since,
+            limit,
+            threshold,
+        } => {
+            let params = rb_store::ReviewQueueParams {
+                threshold: match threshold {
+                    Some(t) if t.is_finite() => t.clamp(rb_types::REVIEW_MIN_THRESHOLD, 1.0),
+                    _ => rb_types::REVIEW_DEFAULT_THRESHOLD,
+                },
+                limit: limit
+                    .unwrap_or(rb_types::REVIEW_DEFAULT_LIMIT)
+                    .clamp(1, rb_types::REVIEW_MAX_LIMIT) as usize,
+                since,
+            };
+            if dry_run {
+                match job_store.review_plan(namespace.clone(), params).await {
+                    Ok(mut plan) => {
+                        if let Some(policy) = policy {
+                            plan.policy = Some(policy);
+                            plan.planned = plan
+                                .items
+                                .iter()
+                                .filter_map(|item| {
+                                    policy.plan_action(item).map(|action| {
+                                        rb_types::PlannedResolution {
+                                            key: item.key.clone(),
+                                            action,
+                                        }
+                                    })
+                                })
+                                .collect();
+                        }
+                        Response::ReviewPlanned { plan }
+                    }
+                    Err(e) => error_to_response(e),
+                }
+            } else {
+                let Some(policy) = policy else {
+                    return error_to_response(Error::InvalidArgument(
+                        "review execute requires an explicit policy (REV-3: never \
+                         auto-resolve without consent); name one or use the dry-run \
+                         preview"
+                            .to_string(),
+                    ));
+                };
+                match run_review_sweep(engine, job_store, provenance, namespace, policy, params)
+                    .await
+                {
+                    Ok(outcome) => Response::ReviewDone { outcome },
+                    Err(e) => error_to_response(e),
+                }
+            }
+        }
+        // One per-item resolution (REV-2 interactive mode). Validation is
+        // fail-closed at this boundary: the action shape against the item
+        // reason and member ids, the resolve-time relationship revalidation
+        // (PR #63 TOCTOU fix), then every member resolved through the
+        // namespace-scoped engine (a foreign or missing id is NotFound
+        // before any write). The merge-revalidation threshold is clamped
+        // exactly like Review's.
+        Request::Resolve {
+            reason,
+            ids,
+            action,
+            threshold,
+        } => {
+            let threshold = match threshold {
+                Some(t) if t.is_finite() => t.clamp(rb_types::REVIEW_MIN_THRESHOLD, 1.0),
+                _ => rb_types::REVIEW_DEFAULT_THRESHOLD,
+            };
+            match apply_review_action(
+                engine, job_store, provenance, namespace, reason, &ids, &action, threshold,
+            )
+            .await
+            {
+                Ok(resolution) => Response::Resolved { resolution },
                 Err(e) => error_to_response(e),
             }
         }
@@ -1910,5 +2360,92 @@ mod tests {
         );
 
         store.shutdown().await;
+    }
+
+    /// PR #63 MEDIUM: a policy sweep must skip-and-continue past a BENIGN
+    /// stale-plan collision (an item resolved concurrently between plan and
+    /// apply) instead of aborting the whole batch; real errors still stop
+    /// the pass (proved by the mid-batch-failure e2e).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_sweep_skips_stale_items_and_completes_the_rest() {
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, 8, 2).unwrap();
+        let ns = Namespace::Project("sweep-stale".to_string());
+        let engine = rb_engine::MemoryEngine::new(
+            handle.clone(),
+            SharedEmbedder::new(DeterministicProvider::new(8)),
+            ns.clone(),
+        );
+        let provenance = rb_engine::Provenance {
+            origin_source: Some("cli".to_string()),
+            ..Default::default()
+        };
+
+        // Two independent dup pairs => two planned merges.
+        let mut ids = Vec::new();
+        for content in [
+            "first duplicated remark",
+            "first duplicated remark",
+            "second duplicated remark",
+            "second duplicated remark",
+        ] {
+            let id = engine
+                .remember(rb_engine::RememberInput {
+                    content: content.to_string(),
+                    context: None,
+                    memory_type: rb_types::MemoryType::Insight,
+                    importance: 5,
+                    keywords: vec![],
+                    tags: vec![],
+                    related_files: vec![],
+                    confidence: Some(1.0),
+                    provenance: provenance.clone(),
+                    anchors: vec![],
+                })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        let params = rb_store::ReviewQueueParams {
+            threshold: rb_types::REVIEW_DEFAULT_THRESHOLD,
+            limit: 50,
+            since: None,
+        };
+        let plan = handle.review_plan(ns.clone(), params).await.unwrap();
+        let dup_items = plan
+            .items
+            .iter()
+            .filter(|i| i.reason == rb_types::ReviewReason::NearDuplicate)
+            .count();
+        assert_eq!(dup_items, 2, "both pairs planned: {plan:?}");
+
+        // Concurrent-resolution simulation: archive one member of the FIRST
+        // planned pair after the plan was generated.
+        let stale_member = plan.items[0].members[0].id.clone();
+        engine.delete(stale_member).await.unwrap();
+
+        let outcome = execute_review_plan(
+            &engine,
+            &handle,
+            &provenance,
+            &ns,
+            rb_types::ReviewPolicy::AutoMergeDups,
+            &plan,
+            params.threshold,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.failure, None,
+            "a benign collision must not fail the pass: {outcome:?}"
+        );
+        assert_eq!(outcome.merged, 1, "the live pair still merges");
+        assert_eq!(outcome.skipped, 1, "the stale item is counted as skipped");
+
+        handle.shutdown().await;
     }
 }

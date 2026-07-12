@@ -1,6 +1,6 @@
 //! End-to-end daemon tests over a real Unix socket with the offline
 //! DeterministicProvider (no network).
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -1998,4 +1998,702 @@ async fn retention_forget_flow_over_the_wire_respects_guards() {
         .await
         .expect("daemon shutdown")
         .expect("daemon task ok");
+}
+
+// ---------------------------------------------------------------------------
+// Guided review (PRD 2026-07-02 contradiction/dedup review)
+// ---------------------------------------------------------------------------
+
+/// Store one CLI-sourced memory with explicit confidence and NO tags/keywords
+/// (so the composite embedding is exactly the content — identical contents
+/// become cosine-1.0 near-dups under the DeterministicProvider, distinct
+/// contents stay far apart).
+async fn store_plain(client: &mut Client, text: &str, confidence: f32) -> rb_types::MemoryId {
+    client
+        .remember(
+            text.to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(confidence),
+        )
+        .await
+        .unwrap()
+}
+
+async fn cli_client(socket: &std::path::Path, ns: &Namespace) -> rb_types::Result<Client> {
+    Client::connect_with_identity(
+        socket,
+        ns.clone(),
+        Some(ClientIdentity {
+            source: Some("cli".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_queue_surfaces_seeded_items_in_priority_order() {
+    // PRD acceptance 1: `review` surfaces a seeded contradiction and a
+    // near-dup pair in priority order; dry-run makes zero writes.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-queue".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+
+    // Tier 3 first so insertion order cannot fake priority order.
+    let low = store_plain(&mut client, "half remembered hunch about the cache", 0.2).await;
+    // Tier 2: identical contents => cosine-1.0 twins (write-time suppression
+    // is hook-gated, so both CLI writes stay live).
+    let dup_a = store_plain(&mut client, "release trains depart every Tuesday", 1.0).await;
+    let dup_b = store_plain(&mut client, "release trains depart every Tuesday", 1.0).await;
+    // Tier 1: an explicit contradiction.
+    let con_a = store_plain(
+        &mut client,
+        "the daemon owns exactly one writer thread",
+        1.0,
+    )
+    .await;
+    let con_b = store_plain(
+        &mut client,
+        "every connection writes straight to sqlite",
+        1.0,
+    )
+    .await;
+    client
+        .link(
+            con_a.clone(),
+            con_b.clone(),
+            rb_types::LinkType::Contradicts,
+            Some("seeded".to_string()),
+        )
+        .await
+        .unwrap();
+
+    let plan = client.review_plan(None, None, None, None).await.unwrap();
+    let reasons: Vec<rb_types::ReviewReason> = plan.items.iter().map(|i| i.reason).collect();
+    assert_eq!(
+        reasons,
+        vec![
+            rb_types::ReviewReason::Contradiction,
+            rb_types::ReviewReason::NearDuplicate,
+            rb_types::ReviewReason::LowConfidence,
+        ],
+        "priority order: contradictions, dups, low-confidence — got {plan:?}"
+    );
+    let contra_ids: Vec<&rb_types::MemoryId> =
+        plan.items[0].members.iter().map(|m| &m.id).collect();
+    assert!(contra_ids.contains(&&con_a) && contra_ids.contains(&&con_b));
+    let dup_ids: Vec<&rb_types::MemoryId> = plan.items[1].members.iter().map(|m| &m.id).collect();
+    assert!(dup_ids.contains(&&dup_a) && dup_ids.contains(&&dup_b));
+    assert!(
+        plan.items[1].similarity.unwrap() >= 0.95,
+        "near-dup similarity rides the item"
+    );
+    assert_eq!(plan.items[2].members[0].id, low);
+    assert_eq!(
+        plan.items[2].members[0].origin_source.as_deref(),
+        Some("cli"),
+        "members carry provenance for the human decision"
+    );
+    assert!(plan.policy.is_none() && plan.planned.is_empty());
+
+    // With a policy, the dry-run plans EXACTLY the policy's actions (the
+    // shared-plan determinism the apply pass executes).
+    let planned = client
+        .review_plan(
+            Some(rb_types::ReviewPolicy::AutoMergeDups),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(planned.policy, Some(rb_types::ReviewPolicy::AutoMergeDups));
+    assert_eq!(planned.planned.len(), 1, "one dup pair to merge");
+    assert_eq!(planned.planned[0].action, rb_types::ReviewAction::Merge);
+    assert_eq!(planned.planned[0].key, planned.items[1].key);
+
+    // Dry-runs made zero writes: everything is still live and unchanged.
+    for id in [&low, &dup_a, &dup_b, &con_a, &con_b] {
+        let m = client.get((*id).clone()).await.unwrap().unwrap();
+        assert!(m.archived_at.is_none(), "{id} was mutated by a dry-run");
+    }
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_apply_auto_merge_dups_merges_pair_and_feeds_history() {
+    // PRD acceptance 2: `--apply --policy auto-merge-dups` merges a dup pair
+    // into one superseding memory (originals archived), recording provenance
+    // and feeding the history timeline.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-apply".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+
+    let dup_a = store_plain(&mut client, "retro notes live in the shared drive", 0.9).await;
+    let dup_b = store_plain(&mut client, "retro notes live in the shared drive", 0.6).await;
+    let con_a = store_plain(&mut client, "use tabs in this repository", 1.0).await;
+    let con_b = store_plain(&mut client, "use spaces in this repository", 1.0).await;
+    client
+        .link(
+            con_a.clone(),
+            con_b.clone(),
+            rb_types::LinkType::Contradicts,
+            None,
+        )
+        .await
+        .unwrap();
+
+    let outcome = client
+        .review_apply(rb_types::ReviewPolicy::AutoMergeDups, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.policy, Some(rb_types::ReviewPolicy::AutoMergeDups));
+    assert_eq!(outcome.merged, 1, "one dup pair merged: {outcome:?}");
+    assert_eq!(
+        outcome.skipped, 1,
+        "the contradiction is out of policy scope"
+    );
+    assert_eq!(outcome.total_items, 2);
+    assert_eq!(outcome.failure, None);
+
+    // Both originals archived and superseded by ONE combined memory.
+    let a = client.get(dup_a.clone()).await.unwrap().unwrap();
+    let b = client.get(dup_b.clone()).await.unwrap().unwrap();
+    assert!(a.archived_at.is_some() && b.archived_at.is_some());
+    let merged_id = a.superseded_by.clone().expect("a points at the merge");
+    assert_eq!(b.superseded_by, Some(merged_id.clone()), "one survivor");
+    let merged = client.get(merged_id.clone()).await.unwrap().unwrap();
+    assert!(merged.archived_at.is_none(), "the combined memory is live");
+    assert!(
+        merged
+            .content
+            .contains("retro notes live in the shared drive"),
+        "combined content carries the originals"
+    );
+    assert!(
+        (merged.confidence - 0.9).abs() < 1e-6,
+        "merge keeps the strongest confidence, got {}",
+        merged.confidence
+    );
+    assert_eq!(
+        merged.origin_source.as_deref(),
+        Some("cli"),
+        "REV-4: the resolution records the standard provenance"
+    );
+
+    // The contradiction pair is untouched.
+    for id in [&con_a, &con_b] {
+        let m = client.get((*id).clone()).await.unwrap().unwrap();
+        assert!(m.archived_at.is_none());
+    }
+
+    // History (PRD 5 integration): the original's timeline walks forward to
+    // the merged memory.
+    let history = client.history(dup_a.clone(), None).await.unwrap();
+    let chain_ids: Vec<&rb_types::MemoryId> = history.chain.iter().map(|e| &e.id).collect();
+    assert!(
+        chain_ids.contains(&&merged_id),
+        "the merge shows up in the supersede chain: {history:?}"
+    );
+
+    // The queue converges: re-running review no longer surfaces the dup pair.
+    let plan = client.review_plan(None, None, None, None).await.unwrap();
+    assert!(
+        plan.items
+            .iter()
+            .all(|i| i.reason != rb_types::ReviewReason::NearDuplicate),
+        "merged pair must not resurface: {plan:?}"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_resolve_actions_apply_atomically_over_the_wire() {
+    // PRD acceptance 3/4: interactive per-item actions apply atomically;
+    // snoozed items do not reappear.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-resolve".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+
+    let con_a = store_plain(&mut client, "deploy on fridays is fine", 0.8).await;
+    let con_b = store_plain(&mut client, "never deploy on fridays", 0.8).await;
+    client
+        .link(
+            con_a.clone(),
+            con_b.clone(),
+            rb_types::LinkType::Contradicts,
+            None,
+        )
+        .await
+        .unwrap();
+    let low = store_plain(&mut client, "possibly the cache is per host", 0.2).await;
+
+    // keep --bump nudges every member up by the documented delta.
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::Contradiction,
+            vec![con_a.clone(), con_b.clone()],
+            rb_types::ReviewAction::Keep { bump: true },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolution.action, "keep");
+    assert_eq!(resolution.confidence.len(), 2);
+    for mc in &resolution.confidence {
+        assert!(
+            (mc.confidence - 0.85).abs() < 1e-6,
+            "0.8 + 0.05 bump, got {}",
+            mc.confidence
+        );
+    }
+    let bumped = client.get(con_a.clone()).await.unwrap().unwrap();
+    assert!((bumped.confidence - 0.85).abs() < 1e-6, "bump persisted");
+
+    // demote lowers the target's confidence by the documented step.
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::LowConfidence,
+            vec![low.clone()],
+            rb_types::ReviewAction::Demote { id: low.clone() },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolution.action, "demote");
+    let demoted = client.get(low.clone()).await.unwrap().unwrap();
+    assert!(
+        (demoted.confidence - 0.05).abs() < 1e-6,
+        "0.2 - 0.15 step, got {}",
+        demoted.confidence
+    );
+
+    // archive soft-deletes the chosen loser and leaves the winner live.
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::Contradiction,
+            vec![con_a.clone(), con_b.clone()],
+            rb_types::ReviewAction::Archive { id: con_b.clone() },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolution.action, "archive");
+    let loser = client.get(con_b.clone()).await.unwrap().unwrap();
+    assert!(loser.archived_at.is_some(), "loser archived");
+    let winner = client.get(con_a.clone()).await.unwrap().unwrap();
+    assert!(winner.archived_at.is_none(), "winner untouched");
+
+    // snooze hides the remaining low-confidence item from the queue.
+    let before = client.review_plan(None, None, None, None).await.unwrap();
+    assert!(
+        before
+            .items
+            .iter()
+            .any(|i| i.reason == rb_types::ReviewReason::LowConfidence),
+        "low-confidence item present before snooze: {before:?}"
+    );
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::LowConfidence,
+            vec![low.clone()],
+            rb_types::ReviewAction::Snooze { days: 3 },
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(resolution.action, "snooze");
+    let until = resolution.snoozed_until.expect("expiry returned");
+    assert!(until > chrono::Utc::now().timestamp());
+    let after = client.review_plan(None, None, None, None).await.unwrap();
+    assert!(
+        after
+            .items
+            .iter()
+            .all(|i| i.reason != rb_types::ReviewReason::LowConfidence),
+        "snoozed item must not reappear: {after:?}"
+    );
+    assert_eq!(after.totals.snoozed, 1);
+
+    // Fail-closed validation: malformed resolutions never mutate.
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![con_a.clone()],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+    let outsider = store_plain(&mut client, "an unrelated bystander", 1.0).await;
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::Contradiction,
+            vec![con_a.clone(), con_b.clone()],
+            rb_types::ReviewAction::Archive { id: outsider },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::InvalidArgument(_)), "{err:?}");
+
+    // Namespace isolation: a foreign-namespace member fails closed (NotFound
+    // at the daemon, surfaced as a wire error the client maps to
+    // Error::Storage — the update/delete isolation convention) and nothing
+    // is written.
+    let other = Namespace::Project("review-resolve-other".to_string());
+    let mut foreign_client = cli_client(&daemon.socket, &other).await.unwrap();
+    let foreign = store_plain(&mut foreign_client, "foreign namespace memory", 1.0).await;
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::LowConfidence,
+            vec![foreign.clone()],
+            rb_types::ReviewAction::Archive {
+                id: foreign.clone(),
+            },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(&err, Error::Storage(msg) if msg.contains("not found")),
+        "foreign-namespace resolve must fail closed, got {err:?}"
+    );
+    let untouched = foreign_client.get(foreign).await.unwrap().unwrap();
+    assert!(untouched.archived_at.is_none());
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_execute_requires_policy_and_absent_dry_run_previews() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-gate".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+    store_plain(&mut client, "just one memory", 0.2).await;
+
+    // Raw frame path (an old or hand-rolled client): executing without a
+    // policy is refused — REV-3 requires an explicit policy filter.
+    let stream = tokio::net::UnixStream::connect(&daemon.socket)
+        .await
+        .unwrap();
+    let mut framed = rb_proto::bounded_framed(stream);
+    rb_proto::write_frame(
+        &mut framed,
+        &rb_proto::Handshake {
+            contract_version: rb_proto::CONTRACT_VERSION,
+            namespace: ns.clone(),
+            identity: None,
+        },
+    )
+    .await
+    .unwrap();
+    let ack: rb_proto::HandshakeAck = rb_proto::read_frame(&mut framed).await.unwrap();
+    assert!(ack.ok);
+
+    let raw: serde_json::Value = serde_json::json!({"op": "Review", "dry_run": false});
+    rb_proto::write_frame(&mut framed, &raw).await.unwrap();
+    let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
+    match resp {
+        rb_proto::Response::Error { kind, message } => {
+            assert_eq!(kind, "invalid_argument", "{message}");
+            assert!(message.contains("policy"), "{message}");
+        }
+        other => panic!("execute without a policy must be refused, got {other:?}"),
+    }
+
+    // A frame with NO dry_run key at all must PREVIEW (the serde default),
+    // never execute.
+    let raw: serde_json::Value = serde_json::json!({"op": "Review"});
+    rb_proto::write_frame(&mut framed, &raw).await.unwrap();
+    let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
+    match resp {
+        rb_proto::Response::ReviewPlanned { plan } => {
+            assert_eq!(plan.totals.low_confidence, 1);
+        }
+        other => panic!("an absent dry_run must preview, got {other:?}"),
+    }
+
+    daemon.stop().await;
+}
+
+/// Delegates to the DeterministicProvider until the test ARMS a bounded
+/// document-embed budget; once the budget is spent every further document
+/// embed fails — injecting a mid-batch failure between two planned merges.
+struct ArmableFailingProvider {
+    inner: DeterministicProvider,
+    budget: std::sync::Arc<std::sync::atomic::AtomicI64>,
+}
+
+#[async_trait::async_trait]
+impl rb_embed::EmbeddingProvider for ArmableFailingProvider {
+    fn model_id(&self) -> &str {
+        self.inner.model_id()
+    }
+
+    fn dim(&self) -> usize {
+        DIM
+    }
+
+    async fn embed(
+        &self,
+        texts: &[String],
+        kind: rb_embed::EmbedKind,
+    ) -> rb_types::Result<Vec<Vec<f32>>> {
+        if kind == rb_embed::EmbedKind::Document
+            && self
+                .budget
+                .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+                <= 0
+        {
+            return Err(Error::Embedding(
+                "document embed outage (injected)".to_string(),
+            ));
+        }
+        self.inner.embed(texts, kind).await
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_apply_reports_partial_outcome_on_mid_batch_failure() {
+    // The ForgetOutcome shape (PR #60): completed per-item work is never
+    // disowned by a mid-batch failure — the first merge stays committed, the
+    // failure is reported, and the pass is re-runnable.
+    let budget = std::sync::Arc::new(std::sync::atomic::AtomicI64::new(i64::MAX));
+    let embedder = SharedEmbedder::new(ArmableFailingProvider {
+        inner: DeterministicProvider::new(DIM),
+        budget: std::sync::Arc::clone(&budget),
+    });
+    let daemon = RunningDaemon::start_with_embedder(2, embedder).await;
+    let ns = Namespace::Project("review-partial".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+
+    // Two independent dup pairs => two planned merges, in deterministic
+    // (oldest-anchor-first) order.
+    let a1 = store_plain(&mut client, "standups happen at nine thirty", 1.0).await;
+    let a2 = store_plain(&mut client, "standups happen at nine thirty", 1.0).await;
+    let b1 = store_plain(&mut client, "the staging box lives in the closet", 1.0).await;
+    let b2 = store_plain(&mut client, "the staging box lives in the closet", 1.0).await;
+
+    // Arm the outage: exactly ONE more document embed may succeed (the first
+    // merge's combined memory); the second merge's embed fails.
+    budget.store(1, std::sync::atomic::Ordering::SeqCst);
+
+    let outcome = client
+        .review_apply(rb_types::ReviewPolicy::AutoMergeDups, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.merged, 1, "the first merge committed: {outcome:?}");
+    let failure = outcome
+        .failure
+        .expect("the second merge's failure is reported");
+    assert!(failure.contains("injected"), "{failure}");
+
+    // Exactly ONE pair merged (which one is timing-dependent: seeds written
+    // within the same unix second tie on created_at, so the anchor order
+    // falls to the random-id tiebreak), and the other pair is fully intact.
+    let mut merged_pairs = 0;
+    for (x, y) in [(&a1, &a2), (&b1, &b2)] {
+        let first = client.get((*x).clone()).await.unwrap().unwrap();
+        let second = client.get((*y).clone()).await.unwrap().unwrap();
+        if first.superseded_by.is_some() {
+            merged_pairs += 1;
+            assert!(
+                first.archived_at.is_some() && second.archived_at.is_some(),
+                "a merged pair archives both originals"
+            );
+            assert_eq!(
+                second.superseded_by, first.superseded_by,
+                "both originals point at the one combined memory"
+            );
+        } else {
+            assert!(
+                first.archived_at.is_none()
+                    && second.archived_at.is_none()
+                    && second.superseded_by.is_none(),
+                "the failed merge left its pair untouched"
+            );
+        }
+    }
+    assert_eq!(merged_pairs, 1, "completed merge stays committed");
+
+    // Disarm: the pass is re-runnable and converges.
+    budget.store(i64::MAX, std::sync::atomic::Ordering::SeqCst);
+    let outcome = client
+        .review_apply(rb_types::ReviewPolicy::AutoMergeDups, None, None, None)
+        .await
+        .unwrap();
+    assert_eq!(outcome.merged, 1, "re-run completes the remaining pair");
+    assert_eq!(outcome.failure, None);
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_merges_of_the_same_pair_resolve_exactly_once() {
+    // PR #63 CRITICAL: two concurrent resolutions of the same pair (e.g. an
+    // interactive session racing a policy sweep) must never split the chain.
+    // The whole merge is ONE writer transaction, so the loser re-validates
+    // inside its own tx, finds the members claimed, and fails with the
+    // distinct stale-plan error while the winner's chain stays single.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-race".to_string());
+    let mut seeder = cli_client(&daemon.socket, &ns).await.unwrap();
+    let a = store_plain(&mut seeder, "the same fact twice", 1.0).await;
+    let b = store_plain(&mut seeder, "the same fact twice", 1.0).await;
+
+    let mut c1 = cli_client(&daemon.socket, &ns).await.unwrap();
+    let mut c2 = cli_client(&daemon.socket, &ns).await.unwrap();
+    let ids = vec![a.clone(), b.clone()];
+    let (r1, r2) = tokio::join!(
+        c1.resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            ids.clone(),
+            rb_types::ReviewAction::Merge,
+            None,
+        ),
+        c2.resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            ids.clone(),
+            rb_types::ReviewAction::Merge,
+            None,
+        ),
+    );
+    let (ok, err) = match (r1, r2) {
+        (Ok(ok), Err(err)) | (Err(err), Ok(ok)) => (ok, err),
+        (Ok(x), Ok(y)) => panic!("BOTH merges succeeded — split chain: {x:?} / {y:?}"),
+        (Err(x), Err(y)) => panic!("both merges failed: {x:?} / {y:?}"),
+    };
+    assert!(
+        matches!(err, Error::StalePlan(_)),
+        "the loser gets the distinct stale-plan error, got {err:?}"
+    );
+    let merged_id = ok.merged_into.expect("winner reports the combined id");
+
+    // Single, consistent chain: both originals point at the ONE combined
+    // memory; exactly one combined row is live.
+    let a_row = seeder.get(a).await.unwrap().unwrap();
+    let b_row = seeder.get(b).await.unwrap().unwrap();
+    assert_eq!(a_row.superseded_by, Some(merged_id.clone()));
+    assert_eq!(b_row.superseded_by, Some(merged_id.clone()));
+    assert!(a_row.archived_at.is_some() && b_row.archived_at.is_some());
+    let live: Vec<_> = seeder.list(None, 50).await.unwrap();
+    assert_eq!(
+        live.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec![merged_id],
+        "exactly one live memory: the winner's combined row"
+    );
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn resolve_revalidates_the_planned_relationship() {
+    // PR #63 HIGH (TOCTOU): a Resolve must prove the (reason, ids) claim at
+    // resolve time — the wire must not accept Merge for two arbitrary active
+    // ids, a broken contradiction, or a pair someone already resolved.
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("review-stale".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+
+    // Merge of two DISTINCT (non-near-dup) actives: stale plan, no writes.
+    let x = store_plain(&mut client, "topic one entirely", 1.0).await;
+    let y = store_plain(&mut client, "a different topic altogether", 1.0).await;
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![x.clone(), y.clone()],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::StalePlan(_)), "{err:?}");
+    for id in [&x, &y] {
+        let m = client.get((*id).clone()).await.unwrap().unwrap();
+        assert!(m.archived_at.is_none() && m.superseded_by.is_none());
+    }
+
+    // Merge after a member was resolved (archived): stale plan.
+    let d1 = store_plain(&mut client, "duplicated remark", 1.0).await;
+    let d2 = store_plain(&mut client, "duplicated remark", 1.0).await;
+    client.delete(d2.clone()).await.unwrap();
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![d1.clone(), d2.clone()],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::StalePlan(_)), "{err:?}");
+
+    // A contradiction action after the pair stopped contradicting (one side
+    // archived): stale plan, nothing mutated.
+    let c1 = store_plain(&mut client, "always squash merge", 0.8).await;
+    let c2 = store_plain(&mut client, "never squash merge", 0.8).await;
+    client
+        .link(
+            c1.clone(),
+            c2.clone(),
+            rb_types::LinkType::Contradicts,
+            None,
+        )
+        .await
+        .unwrap();
+    client.delete(c2.clone()).await.unwrap();
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::Contradiction,
+            vec![c1.clone(), c2.clone()],
+            rb_types::ReviewAction::Keep { bump: true },
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, Error::StalePlan(_)), "{err:?}");
+    let untouched = client.get(c1.clone()).await.unwrap().unwrap();
+    assert!(
+        (untouched.confidence - 0.8).abs() < 1e-6,
+        "the stale keep-bump must not nudge confidence"
+    );
+
+    // Merge on a Contradiction item is rejected outright (reason-restricted).
+    let e1 = store_plain(&mut client, "tabs are correct", 1.0).await;
+    let e2 = store_plain(&mut client, "spaces are correct", 1.0).await;
+    client
+        .link(
+            e1.clone(),
+            e2.clone(),
+            rb_types::LinkType::Contradicts,
+            None,
+        )
+        .await
+        .unwrap();
+    let err = client
+        .resolve_review_item(
+            rb_types::ReviewReason::Contradiction,
+            vec![e1, e2],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    match &err {
+        Error::InvalidArgument(msg) => {
+            assert!(msg.contains("near-duplicate"), "{msg}");
+        }
+        other => panic!("merge on a contradiction must be invalid, got {other:?}"),
+    }
+
+    daemon.stop().await;
 }

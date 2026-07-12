@@ -2,10 +2,22 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. `contested` flags and
-write-time near-dup suppression exist, but resolution is left to manual
-commands. This surfaces the W2.2 trust machinery to the user instead of
-leaving it latent.
+Delivered 2026-07-11 (branch `claude/review-sweep`, Vikunja #461). From the
+2026-07-02 senior-PM product review. `contested` flags and write-time
+near-dup suppression exist, but resolution is left to manual commands. This
+surfaces the W2.2 trust machinery to the user instead of leaving it latent.
+
+Delivery notes: near-dup detection reuses `near_duplicates()` (the one
+similarity definition; conservative 0.95 default, floor 0.80); contradiction
+pairs are the pairwise expression of `active_contradicts`, pinned by a drift
+test; snooze persists in the additive `review_state` table (migration 010);
+`--apply` follows the forget UX (dry-run default, TTY default-NO
+confirmation, `--yes` for automation, `ForgetOutcome`-shaped partial
+reporting); no MCP surface (the forget precedent: destructive surface,
+tools/list budget at 897/900); stats gains the `low_confidence_live` gauge
+(with `contested`/`never_recalled_live`, the review-queue trend — the
+near-dup tier is deliberately uncounted: one KNN probe per live memory per
+stats call).
 
 ## Owner Area
 
@@ -124,12 +136,12 @@ Plus an e2e seeding a contradiction + dup cluster and asserting the
 
 ## Implementation Checklist
 
-- [ ] Add `Review` subcommand with queue generator.
-- [ ] Implement interactive + `--apply --policy` + `--dry-run` modes.
-- [ ] Wire actions to existing supersede/link/confidence primitives.
-- [ ] Add snooze/reviewed_at tracking (additive, minimal).
-- [ ] Record provenance + oplog for every resolution.
-- [ ] E2E for contradiction + dup resolution.
+- [x] Add `Review` subcommand with queue generator.
+- [x] Implement interactive + `--apply --policy` + `--dry-run` modes.
+- [x] Wire actions to existing supersede/link/confidence primitives.
+- [x] Add snooze/reviewed_at tracking (additive, minimal).
+- [x] Record provenance + oplog for every resolution.
+- [x] E2E for contradiction + dup resolution.
 
 ## Roadmap Fit
 

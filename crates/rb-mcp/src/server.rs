@@ -328,6 +328,16 @@ mod tests {
                 Request::Forget { .. } => Response::ForgetPlanned {
                     plan: rb_types::ForgetPlan::default(),
                 },
+                // No MCP tool maps to the review ops either (the forget
+                // precedent: destructive surface, and the tools/list budget
+                // sits at 897/900); the arms exist only to keep this fake
+                // total over `Request`.
+                Request::Review { .. } => Response::ReviewPlanned {
+                    plan: rb_types::ReviewPlan::default(),
+                },
+                Request::Resolve { .. } => Response::Resolved {
+                    resolution: rb_types::ReviewResolution::default(),
+                },
                 // The `history` tool maps here (full-toolset-gated); echo the
                 // requested id so dispatch tests can assert the payload.
                 Request::History { ref id, .. } => Response::History {

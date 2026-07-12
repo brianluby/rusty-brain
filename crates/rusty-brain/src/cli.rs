@@ -47,6 +47,27 @@ fn parse_confidence(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// Parse a review `--policy` name (kebab or snake case) into the documented
+/// [`rb_types::ReviewPolicy`]; a typo fails at parse time listing the options.
+fn parse_review_policy(s: &str) -> Result<rb_types::ReviewPolicy, String> {
+    rb_types::ReviewPolicy::parse(s).map_err(|e| e.to_string())
+}
+
+/// Clap range check for review `--threshold`: finite raw cosine similarity in
+/// the conservative `0.80..=1.0` band (the server clamps too — this just
+/// fails fast locally with a clear message).
+fn parse_review_threshold(s: &str) -> Result<f32, String> {
+    let v: f32 = s.parse().map_err(|e| format!("not a number: {e}"))?;
+    if !v.is_finite() || !(rb_types::REVIEW_MIN_THRESHOLD..=1.0).contains(&v) {
+        return Err(format!(
+            "threshold must be within {}..=1.0 (raw cosine similarity; lower \
+             values mis-flag distinct memories as duplicates)",
+            rb_types::REVIEW_MIN_THRESHOLD
+        ));
+    }
+    Ok(v)
+}
+
 /// Parse a `--since`/`--until` bound: an RFC 3339 timestamp
 /// (`2026-07-10T12:00:00Z`), a date (`2026-07-01`, midnight UTC), or a
 /// now-relative age (`7d`, `36h`, `45m`, `10s`).
@@ -625,6 +646,53 @@ pub enum Command {
         yes: bool,
     },
 
+    /// Guided review of contradictions, near-duplicates, and low-confidence
+    /// memories (PRD 2026-07-02). With no flags this is a DRY-RUN listing of
+    /// the priority-ordered queue and writes NOTHING; add --policy to preview
+    /// what that policy would do. --interactive walks the queue item by item
+    /// (keep / bump / merge / archive / demote / snooze). --apply --policy
+    /// executes one bounded pass non-interactively; every action is
+    /// reversible (merge/archive supersede or soft-archive, demote lowers
+    /// confidence).
+    Review {
+        /// Preview only (the default posture even without this flag).
+        /// Conflicts with --apply and --interactive: an invocation that says
+        /// "preview" must never be able to mutate (PR #63 Copilot finding).
+        #[arg(long, conflicts_with_all = ["interactive", "apply"])]
+        dry_run: bool,
+        /// Execute one bounded pass under --policy (required with this flag).
+        #[arg(long, requires = "policy", conflicts_with = "interactive")]
+        apply: bool,
+        /// Documented policy: auto-merge-dups (merge every near-dup pair
+        /// into one combined superseding memory) or demote-low-confidence
+        /// (lower every low-confidence item's confidence one step).
+        #[arg(long, value_parser = parse_review_policy, conflicts_with = "interactive")]
+        policy: Option<rb_types::ReviewPolicy>,
+        /// Walk the queue item by item on this terminal.
+        #[arg(long, short = 'i')]
+        interactive: bool,
+        /// Only review memories touched after this oplog sequence number
+        /// (REV-3 recent-changes scope).
+        #[arg(long)]
+        since: Option<u64>,
+        /// Max queue items per sweep (server-clamped).
+        #[arg(long)]
+        limit: Option<u32>,
+        /// Near-duplicate similarity threshold (raw cosine similarity,
+        /// 0.80..=1.0; default 0.95 — the conservative consolidation bound).
+        #[arg(long, value_parser = parse_review_threshold)]
+        threshold: Option<f32>,
+        /// Snooze window in days for interactive snoozes.
+        #[arg(long, default_value_t = rb_types::REVIEW_DEFAULT_SNOOZE_DAYS,
+              value_parser = clap::value_parser!(u32).range(1..=rb_types::REVIEW_MAX_SNOOZE_DAYS as i64))]
+        snooze_days: u32,
+        /// Skip the interactive confirmation --apply otherwise requires (the
+        /// import-confirmation precedent). Without it, a non-interactive
+        /// invocation (--json or piped stdin) refuses instead of sweeping.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+
     /// Retroactively redact secrets from every stored memory (W2.4). Rewrites
     /// content/summary/context in place and marks affected rows for
     /// re-embedding; follow with `rusty-brain reembed` until changed=0. Admin
@@ -890,6 +958,132 @@ mod tests {
         );
         assert!(Cli::try_parse_from(["rusty-brain", "forget", "--nonsense"]).is_err());
         assert!(Cli::try_parse_from(["rusty-brain", "forget", "extra-positional"]).is_err());
+    }
+
+    #[test]
+    fn review_defaults_to_dry_run_posture_and_flags_compose() {
+        // Bare `review` is a DRY-RUN listing (the forget safety posture).
+        let cli = Cli::parse_from(["rusty-brain", "review"]);
+        match cli.command {
+            Command::Review {
+                dry_run,
+                apply,
+                policy,
+                interactive,
+                since,
+                limit,
+                threshold,
+                snooze_days,
+                yes,
+            } => {
+                assert!(!dry_run && !apply && !interactive && !yes);
+                assert!(policy.is_none() && since.is_none() && limit.is_none());
+                assert!(threshold.is_none());
+                assert_eq!(snooze_days, rb_types::REVIEW_DEFAULT_SNOOZE_DAYS);
+            }
+            other => panic!("expected Review, got {other:?}"),
+        }
+        for args in [
+            ["rusty-brain", "review", "--dry-run"].as_slice(),
+            ["rusty-brain", "review", "--interactive"].as_slice(),
+            ["rusty-brain", "review", "-i"].as_slice(),
+            [
+                "rusty-brain",
+                "review",
+                "--apply",
+                "--policy",
+                "auto-merge-dups",
+            ]
+            .as_slice(),
+            [
+                "rusty-brain",
+                "review",
+                "--policy",
+                "demote_low_confidence",
+                "--dry-run",
+            ]
+            .as_slice(),
+            [
+                "rusty-brain",
+                "review",
+                "--since",
+                "42",
+                "--limit",
+                "10",
+                "--threshold",
+                "0.97",
+            ]
+            .as_slice(),
+            [
+                "rusty-brain",
+                "review",
+                "--apply",
+                "--policy",
+                "auto-merge-dups",
+                "-y",
+            ]
+            .as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?}");
+        }
+    }
+
+    #[test]
+    fn review_apply_requires_a_policy_and_interactive_conflicts() {
+        // REV-3: --apply without an explicit policy must fail at parse time.
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "review", "--apply"]).is_err(),
+            "--apply requires --policy"
+        );
+        // Interactive and scripted modes are mutually exclusive.
+        for args in [
+            [
+                "rusty-brain",
+                "review",
+                "-i",
+                "--apply",
+                "--policy",
+                "auto-merge-dups",
+            ]
+            .as_slice(),
+            ["rusty-brain", "review", "-i", "--policy", "auto-merge-dups"].as_slice(),
+            ["rusty-brain", "review", "-i", "--dry-run"].as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
+        // Copilot finding (PR #63): --dry-run --apply must be a PARSE error —
+        // an invocation that says "preview" must never be able to mutate.
+        assert!(
+            Cli::try_parse_from([
+                "rusty-brain",
+                "review",
+                "--dry-run",
+                "--apply",
+                "--policy",
+                "auto-merge-dups"
+            ])
+            .is_err(),
+            "--dry-run conflicts with --apply"
+        );
+    }
+
+    #[test]
+    fn review_rejects_garbage_without_panicking() {
+        // Garbage argv is a clean parse error, never a panic (the forget
+        // precedent).
+        for args in [
+            ["rusty-brain", "review", "--policy", "delete-everything"].as_slice(),
+            ["rusty-brain", "review", "--threshold", "banana"].as_slice(),
+            ["rusty-brain", "review", "--threshold", "0.2"].as_slice(),
+            ["rusty-brain", "review", "--threshold", "NaN"].as_slice(),
+            ["rusty-brain", "review", "--since", "-3"].as_slice(),
+            ["rusty-brain", "review", "--snooze-days", "0"].as_slice(),
+            ["rusty-brain", "review", "--snooze-days", "9999"].as_slice(),
+            ["rusty-brain", "review", "--nonsense"].as_slice(),
+            ["rusty-brain", "review", "extra-positional"].as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
+        }
     }
 
     #[test]
