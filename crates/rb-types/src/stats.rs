@@ -69,6 +69,15 @@ pub struct MemoryStats {
     /// `(model, input_version)` — the re-embed backlog (P5 Feature A scan).
     #[serde(default)]
     pub reembed_pending: u64,
+    /// Apply-mode forget candidates under the daemon's `[retention]` policy
+    /// (retention PRD RET-4). `None` = no policy configured (distinguishes
+    /// "no policy" from "0 eligible").
+    #[serde(default)]
+    pub retention_eligible: Option<u64>,
+    /// Unix seconds of the namespace's last retention sweep (from the bulk
+    /// `retention_sweep` oplog row). `None` = never swept.
+    #[serde(default)]
+    pub last_forget_at: Option<i64>,
 }
 
 /// All-time helpful/wrong/stale counts from the `memory_feedback` event log.
@@ -148,6 +157,8 @@ mod tests {
                 count: 2,
             }],
             reembed_pending: 3,
+            retention_eligible: Some(4),
+            last_forget_at: Some(1_700_000_000),
         };
         let json = serde_json::to_string(&stats).unwrap();
         let back: MemoryStats = serde_json::from_str(&json).unwrap();
@@ -164,6 +175,22 @@ mod tests {
         assert_eq!(back.feedback.helpful, 0);
         assert!(back.top_recalled.is_empty());
         assert!(back.db_embedding_model.is_none());
+    }
+
+    #[test]
+    fn retention_fields_are_additive_and_default_to_none() {
+        // A stats payload from a daemon that predates the retention PRD (or
+        // has no [retention] policy) must decode with both fields None —
+        // distinguishing "no policy" from "0 eligible".
+        let back: MemoryStats = serde_json::from_str("{}").unwrap();
+        assert_eq!(back.retention_eligible, None);
+        assert_eq!(back.last_forget_at, None);
+
+        let with: MemoryStats =
+            serde_json::from_str(r#"{"retention_eligible": 4, "last_forget_at": 1700000000}"#)
+                .unwrap();
+        assert_eq!(with.retention_eligible, Some(4));
+        assert_eq!(with.last_forget_at, Some(1_700_000_000));
     }
 
     #[test]

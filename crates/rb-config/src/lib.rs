@@ -347,6 +347,36 @@ fn resolve_fusion_mode(
     normalize(file_value, "search.fusion in config file")
 }
 
+/// Resolve the `[retention]` section into a validated policy (retention PRD
+/// RET-1). Config-file-only knob — no env equivalent, per the "new knobs land
+/// in the file only" rule. An absent section is `None` (retention stays a
+/// no-op). DELIBERATE deviation from the warn-and-ignore precedent: an
+/// invalid policy FAILS resolution — a section that authorizes mutating
+/// memories is never silently repaired or partially applied.
+fn resolve_retention(
+    file_value: &Option<file::RetentionFileConfig>,
+) -> Result<Option<rb_types::RetentionPolicy>> {
+    let Some(section) = file_value else {
+        return Ok(None);
+    };
+    let defaults = rb_types::RetentionPolicy::default();
+    let policy = rb_types::RetentionPolicy {
+        enabled: section.enabled.unwrap_or(defaults.enabled),
+        max_age_days: section.max_age_days,
+        archive_after_days: section.archive_after_days,
+        importance_floor: section
+            .importance_floor
+            .unwrap_or(defaults.importance_floor),
+        protected_tags: section
+            .protected_tags
+            .clone()
+            .unwrap_or(defaults.protected_tags),
+        batch_limit: section.batch_limit.unwrap_or(defaults.batch_limit),
+    };
+    policy.validate()?;
+    Ok(Some(policy))
+}
+
 /// The fully resolved per-process configuration: env var > user config file >
 /// built-in default, per knob (CLI flags are applied above this by the
 /// binaries). Resolved identically by the CLI, the hooks, and the daemon —
@@ -378,6 +408,10 @@ pub struct EffectiveConfig {
     /// (the idle-timeout precedent). The daemon parses this into its
     /// `FusionMode` — rb-config stays a leaf over rb-types.
     pub fusion_mode: Option<String>,
+    /// Validated `[retention]` policy; `None` when the section is absent
+    /// (forgetting stays a no-op — retention PRD RET-1). Fail-closed: an
+    /// invalid section aborts resolution instead of warning.
+    pub retention: Option<rb_types::RetentionPolicy>,
     /// Non-fatal findings (unknown config keys, ignored invalid values).
     /// Callers surface these (`tracing::warn!`); they never fail resolution.
     pub warnings: Vec<String>,
@@ -411,6 +445,7 @@ impl EffectiveConfig {
             jobs_config: env_override(JOBS_CONFIG_ENV).or_else(|| file_path(&config.jobs_config)),
             idle_timeout_secs,
             fusion_mode,
+            retention: resolve_retention(&config.retention)?,
             warnings,
         })
     }
@@ -660,6 +695,114 @@ mod tests {
         assert_eq!(effective.idle_timeout_secs, None);
         assert_eq!(effective.fusion_mode, None);
         assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    // Retention PRD RET-1: a [retention] section resolves into a validated
+    // policy on EffectiveConfig (config-file-only knob — no env equivalent).
+    #[test]
+    fn retention_section_resolves_to_a_validated_policy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            enabled = true
+            max_age_days = 365
+            archive_after_days = 90
+            protected_tags = ["architecture_decision"]
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        let policy = effective.retention.expect("policy resolved");
+        assert!(policy.enabled);
+        assert_eq!(policy.max_age_days, Some(365));
+        assert_eq!(policy.archive_after_days, Some(90));
+        // Unset knobs take the rb-types defaults.
+        assert_eq!(policy.importance_floor, rb_types::DEFAULT_IMPORTANCE_FLOOR);
+        assert_eq!(policy.batch_limit, rb_types::DEFAULT_BATCH_LIMIT);
+        assert_eq!(
+            policy.protected_tags,
+            vec!["architecture_decision".to_string()]
+        );
+        assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    #[test]
+    fn absent_retention_section_resolves_to_none() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "");
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert!(effective.retention.is_none());
+    }
+
+    // DELIBERATE deviation from warn-and-ignore (the fusion/idle-timeout
+    // precedent): an out-of-range retention value fails resolution closed —
+    // a policy that mutates memories is never silently repaired.
+    #[test]
+    fn out_of_range_retention_value_fails_resolution_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            enabled = true
+            max_age_days = 365
+            importance_floor = 11
+            "#,
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(
+            err.to_string().contains("importance_floor"),
+            "must name the offending key: {err}"
+        );
+    }
+
+    // enabled=true with no age rule is an incoherent policy: fail closed.
+    #[test]
+    fn enabled_retention_without_rules_fails_resolution_closed() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            enabled = true
+            "#,
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(err.to_string().contains("max_age_days"), "{err}");
+    }
+
+    // A disabled-but-present section still resolves (so dry-run can preview
+    // a policy before the user enables it) and still validates its values.
+    #[test]
+    fn disabled_retention_section_resolves_and_validates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            max_age_days = 180
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        let policy = effective.retention.expect("policy resolved");
+        assert!(!policy.enabled, "enabled defaults to false");
+        assert_eq!(policy.max_age_days, Some(180));
+
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            max_age_days = 0
+            "#,
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(err.to_string().contains("max_age_days"), "{err}");
     }
 
     // W2.2: the fusion-mode knob follows the same env > file > default

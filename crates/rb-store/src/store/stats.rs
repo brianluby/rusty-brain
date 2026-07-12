@@ -226,6 +226,8 @@ impl SqliteStore {
             contested,
             created_per_day,
             reembed_pending,
+            retention_eligible: None,
+            last_forget_at: None,
         })
     }
 }

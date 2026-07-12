@@ -61,6 +61,11 @@ pub struct FileConfig {
     /// `[search]` section: recall ranking knobs.
     #[serde(default)]
     pub search: SearchFileConfig,
+    /// `[retention]` section: the declarative forgetting policy (retention
+    /// PRD RET-1). `None` when the section is absent — retention is opt-in,
+    /// and "no section" must stay distinguishable from "disabled policy".
+    #[serde(default)]
+    pub retention: Option<RetentionFileConfig>,
 }
 
 /// `[embed]` section of the config file.
@@ -96,6 +101,38 @@ pub struct SearchFileConfig {
     /// equivalent: `RB_FUSION_MODE`. Unknown values warn and are ignored.
     #[serde(default)]
     pub fusion: Option<String>,
+}
+
+/// `[retention]` section of the config file (retention PRD RET-1).
+///
+/// DELIBERATE strictness deviation: unlike every other section, unknown keys
+/// here fail closed (`deny_unknown_fields`) instead of warn-and-ignore. This
+/// section drives a policy that mutates memories — a typo'd rule that
+/// silently no-ops is a data-loss footgun in reverse, and a typo that
+/// silently drops a guard is the real footgun. Range/coherence validation
+/// happens at resolve time via `rb_types::RetentionPolicy::validate` and
+/// fails resolution (never warn-and-repair).
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RetentionFileConfig {
+    /// Master opt-in; absent means `false` (forgetting stays off).
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Forget horizon in days (archive on apply, purge on hard).
+    #[serde(default)]
+    pub max_age_days: Option<u32>,
+    /// Archive horizon in days (soft stage before forget).
+    #[serde(default)]
+    pub archive_after_days: Option<u32>,
+    /// Never forget at/above this importance (1..=10; default 6).
+    #[serde(default)]
+    pub importance_floor: Option<u8>,
+    /// Tags that exempt a memory from forgetting entirely.
+    #[serde(default)]
+    pub protected_tags: Option<Vec<String>>,
+    /// Per-pass sweep bound (default 500).
+    #[serde(default)]
+    pub batch_limit: Option<u32>,
 }
 
 /// A loaded (or absent) config file plus any non-fatal warnings produced while
@@ -179,10 +216,14 @@ fn warn_unknown_keys(table: &toml::Table, source: &Path, warnings: &mut Vec<Stri
         "embed",
         "enrich",
         "search",
+        "retention",
     ];
     const EMBED: &[&str] = &["backend", "local_model"];
     const ENRICH: &[&str] = &["base_url", "model"];
     const SEARCH: &[&str] = &["fusion"];
+    // No RETENTION list here: `[retention]` unknown keys FAIL CLOSED via
+    // `deny_unknown_fields` on `RetentionFileConfig` (see its doc comment),
+    // so the warn path never applies to them.
 
     for key in table.keys() {
         if !TOP_LEVEL.contains(&key.as_str()) {
@@ -348,6 +389,71 @@ mod tests {
         let err = parse_file_config("idle_timeout_secs = \"soon\"", &src()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("/test/config.toml"), "{msg}");
+    }
+
+    // Retention PRD RET-1: the [retention] section parses every knob.
+    #[test]
+    fn retention_section_parses_every_knob() {
+        let text = r#"
+            [retention]
+            enabled = true
+            max_age_days = 365
+            archive_after_days = 90
+            importance_floor = 5
+            protected_tags = ["architecture_decision", "postmortem"]
+            batch_limit = 200
+        "#;
+        let (config, warnings) = parse_file_config(text, &src()).unwrap();
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+        let retention = config.retention.expect("[retention] section present");
+        assert_eq!(retention.enabled, Some(true));
+        assert_eq!(retention.max_age_days, Some(365));
+        assert_eq!(retention.archive_after_days, Some(90));
+        assert_eq!(retention.importance_floor, Some(5));
+        assert_eq!(
+            retention.protected_tags,
+            Some(vec![
+                "architecture_decision".to_string(),
+                "postmortem".to_string()
+            ])
+        );
+        assert_eq!(retention.batch_limit, Some(200));
+    }
+
+    #[test]
+    fn absent_retention_section_parses_to_none() {
+        let (config, _) = parse_file_config("", &src()).unwrap();
+        assert!(config.retention.is_none());
+    }
+
+    // DELIBERATE deviation from the warn-and-ignore rule: [retention] mutates
+    // memories, so a typo'd key must fail closed, not silently no-op (data
+    // loss in reverse) or silently drop a guard (the real footgun).
+    #[test]
+    fn unknown_key_in_retention_fails_closed() {
+        let text = r#"
+            [retention]
+            enabled = true
+            max_age_dayz = 30
+        "#;
+        let err = parse_file_config(text, &src()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/test/config.toml"), "{msg}");
+        assert!(
+            msg.contains("max_age_dayz"),
+            "must name the typo'd key: {msg}"
+        );
+    }
+
+    // Wrong-typed retention values fail closed like every wrong-typed value.
+    #[test]
+    fn wrong_typed_retention_value_fails_closed() {
+        let text = r#"
+            [retention]
+            max_age_days = "a year"
+        "#;
+        let err = parse_file_config(text, &src()).unwrap_err();
+        assert!(err.to_string().contains("/test/config.toml"), "{err}");
     }
 
     // The user config location is derived from XDG/HOME exclusively — never

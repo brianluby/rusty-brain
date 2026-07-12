@@ -10,6 +10,10 @@ pub enum JobKind {
     LinkDecay,
     Consolidation,
     ImportanceRecalibration,
+    /// Retention/forget sweep (retention PRD). The scheduled/on-demand job is
+    /// ALWAYS apply-mode (archive): hard purge is never reachable through a
+    /// job, only through the admin-gated `Forget` op.
+    Retention,
 }
 
 impl JobKind {
@@ -20,6 +24,7 @@ impl JobKind {
             JobKind::LinkDecay => "link_decay",
             JobKind::Consolidation => "consolidation",
             JobKind::ImportanceRecalibration => "importance_recalibration",
+            JobKind::Retention => "retention",
         }
     }
 
@@ -29,6 +34,7 @@ impl JobKind {
             "link_decay" => Ok(JobKind::LinkDecay),
             "consolidation" => Ok(JobKind::Consolidation),
             "importance_recalibration" => Ok(JobKind::ImportanceRecalibration),
+            "retention" => Ok(JobKind::Retention),
             other => Err(Error::InvalidArgument(format!("unknown job: {other}"))),
         }
     }
@@ -39,10 +45,11 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    const ALL: [JobKind; 3] = [
+    const ALL: [JobKind; 4] = [
         JobKind::LinkDecay,
         JobKind::Consolidation,
         JobKind::ImportanceRecalibration,
+        JobKind::Retention,
     ];
 
     #[test]
@@ -58,6 +65,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&JobKind::ImportanceRecalibration).unwrap(),
             r#""importance_recalibration""#
+        );
+        assert_eq!(
+            serde_json::to_string(&JobKind::Retention).unwrap(),
+            r#""retention""#
         );
     }
 
