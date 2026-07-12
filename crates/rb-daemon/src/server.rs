@@ -124,6 +124,12 @@ pub struct DaemonConfig {
     pub db_path: PathBuf,
     pub read_pool_size: usize,
     pub jobs_config: JobsConfig,
+    /// Resolved `[retention]` policy from the user config (retention PRD).
+    /// `None` = retention unconfigured: the scheduled job never spawns, the
+    /// `RunJob(retention)` arm is a zero-work no-op, and the daemon-side
+    /// policy is absent for stats. Following the C1 rule the daemon library
+    /// never reads the config file itself — the serve binary resolves this.
+    pub retention_policy: Option<rb_types::RetentionPolicy>,
     /// Per-connection request idle timeout between request frames; `None`
     /// uses the built-in 60s default.
     pub request_idle_timeout: Option<std::time::Duration>,
@@ -156,6 +162,7 @@ pub struct Daemon {
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
     jobs_config: JobsConfig,
+    retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
     fusion_mode: rb_engine::FusionMode,
 }
@@ -253,6 +260,7 @@ impl Daemon {
             pidfile_path,
             bind_guard,
             jobs_config: config.jobs_config,
+            retention_policy: config.retention_policy,
             request_idle_timeout,
             fusion_mode: config.fusion_mode,
         })
@@ -269,6 +277,7 @@ impl Daemon {
             pidfile_path: _pidfile_path,
             mut bind_guard,
             jobs_config,
+            retention_policy,
             request_idle_timeout,
             fusion_mode,
         } = self;
@@ -279,7 +288,8 @@ impl Daemon {
         // fails with "writer thread unavailable" (F17).
         let writer_died = store.writer_died();
         tokio::pin!(writer_died);
-        let scheduler = jobs::scheduler::spawn(store.clone(), jobs_config.clone());
+        let scheduler =
+            jobs::scheduler::spawn(store.clone(), jobs_config.clone(), retention_policy.clone());
         let mut conns: JoinSet<()> = JoinSet::new();
         let conn_sem = Arc::new(Semaphore::new(MAX_CONNECTIONS));
         // Daemon-lifetime recall channel counters, shared by every connection.
@@ -305,6 +315,7 @@ impl Daemon {
                             let embedder = embedder.clone();
                             let enricher = enricher.clone();
                             let jobs_config = jobs_config.clone();
+                            let retention_policy = retention_policy.clone();
                             let recall_counters = recall_counters.clone();
                             // Acquire a connection permit before spawning. If
                             // all permits are taken, drop the newly accepted
@@ -326,6 +337,7 @@ impl Daemon {
                                     embedder,
                                     enricher,
                                     jobs_config,
+                                    retention_policy,
                                     request_idle_timeout,
                                     recall_counters,
                                     fusion_mode,
@@ -608,6 +620,7 @@ async fn handle_connection(
     embedder: SharedEmbedder,
     enricher: Option<Arc<dyn Enricher>>,
     jobs_config: JobsConfig,
+    retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
     recall_counters: Arc<RecallChannelCounters>,
     fusion_mode: rb_engine::FusionMode,
@@ -714,6 +727,7 @@ async fn handle_connection(
             &engine,
             &job_store,
             &jobs_config,
+            retention_policy.as_ref(),
             &provenance,
             &recall_counters,
             &namespace,
@@ -898,6 +912,7 @@ async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     jobs_config: &JobsConfig,
+    retention_policy: Option<&rb_types::RetentionPolicy>,
     provenance: &rb_engine::Provenance,
     recall_counters: &RecallChannelCounters,
     namespace: &rb_types::Namespace,
@@ -1057,7 +1072,8 @@ where
         Request::Subscribe { .. } => error_to_response(Error::InvalidArgument(
             "Subscribe is a streaming op, not a single request".to_string(),
         )),
-        Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config).await {
+        Request::RunJob { job } => match jobs::run_once(job, job_store, jobs_config, retention_policy).await
+        {
             Ok(summary) => Response::JobRan {
                 scanned: summary.scanned,
                 changed: summary.changed,
@@ -1276,6 +1292,7 @@ mod tests {
             db_path: PathBuf::from("/unused/db"),
             read_pool_size: 1,
             jobs_config: JobsConfig::default(),
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
@@ -1352,6 +1369,7 @@ mod tests {
             db_path: dir.path().join("rb.db"),
             read_pool_size: 1,
             jobs_config: JobsConfig::default(),
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
@@ -1393,6 +1411,7 @@ mod tests {
             db_path: dir.path().join("rb.db"),
             read_pool_size: 2,
             jobs_config: JobsConfig::default(),
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
@@ -1526,7 +1545,7 @@ mod tests {
             ..Default::default()
         };
 
-        let summary = run_once(JobKind::Consolidation, &store, &config)
+        let summary = run_once(JobKind::Consolidation, &store, &config, None)
             .await
             .unwrap();
         assert_eq!(

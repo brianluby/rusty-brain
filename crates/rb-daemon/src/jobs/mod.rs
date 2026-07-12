@@ -5,6 +5,7 @@ mod config;
 pub mod consolidation;
 mod importance;
 mod link_decay;
+pub mod retention;
 pub mod scheduler;
 
 pub use config::{ConsolidationConfig, ImportanceConfig, JobsConfig, LinkDecayConfig};
@@ -26,15 +27,23 @@ pub struct JobSummary {
 /// mutation goes through `store` (the single writer). Fail-safe: returns `Err`
 /// on failure without leaving partial state (each write is its own txn); never
 /// panics. Dispatches to the per-job `run` with the matching sub-config.
+///
+/// `retention` is the resolved user-config `[retention]` policy (NOT part of
+/// the jobs TOML — one declarative policy, one location): `None` or a
+/// disabled policy makes the retention arm a zero-work no-op even though
+/// `RunJob` ignores the scheduler's enabled gate for every other job — a
+/// forgetting pass must never run un-configured.
 pub async fn run_once(
     kind: JobKind,
     store: &StoreHandle,
     config: &JobsConfig,
+    retention: Option<&rb_types::RetentionPolicy>,
 ) -> rb_types::Result<JobSummary> {
     match kind {
         JobKind::LinkDecay => link_decay::run(store, &config.link_decay).await,
         JobKind::Consolidation => consolidation::run(store, &config.consolidation).await,
         JobKind::ImportanceRecalibration => importance::run(store, &config.importance).await,
+        JobKind::Retention => retention::run(store, retention).await,
     }
 }
 
@@ -70,7 +79,9 @@ mod tests {
         let store = crate::StoreHandle::start(db, 8, 1).unwrap();
         let config = JobsConfig::default();
 
-        let summary = run_once(JobKind::LinkDecay, &store, &config).await.unwrap();
+        let summary = run_once(JobKind::LinkDecay, &store, &config, None)
+            .await
+            .unwrap();
         assert_eq!(summary, JobSummary::default());
 
         store.shutdown().await;

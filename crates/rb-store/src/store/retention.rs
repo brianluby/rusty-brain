@@ -324,6 +324,43 @@ impl SqliteStore {
         ))
     }
 
+    /// Latest oplog seq recorded for `id` — the row the sweep just wrote for
+    /// it. Lets the daemon stamp each per-memory change event with its OWN
+    /// replay cursor instead of the batch-final `last_oplog_seq()`: stamping
+    /// a whole burst with the final seq would let a subscriber that cursors
+    /// past it mid-burst skip replaying a later item it never received.
+    pub fn latest_oplog_seq_for(&self, id: &MemoryId) -> Result<Option<u64>> {
+        let seq: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT MAX(seq) FROM memory_oplog WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(storage_err)?;
+        Ok(seq.and_then(|s| u64::try_from(s).ok()))
+    }
+
+    /// Every namespace that still has memory rows — the scheduled retention
+    /// job iterates these, applying the one user-global policy per namespace
+    /// (the sweep itself is strictly namespace-scoped). Unparseable namespace
+    /// strings fail closed rather than being silently skipped.
+    pub fn retention_namespaces(&self) -> Result<Vec<Namespace>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT DISTINCT namespace FROM memories ORDER BY namespace")
+            .map_err(storage_err)?;
+        let rows = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .map_err(storage_err)?;
+        let mut out = Vec::new();
+        for row in rows {
+            let s = row.map_err(storage_err)?;
+            out.push(Namespace::parse_db_string(&s)?);
+        }
+        Ok(out)
+    }
+
     /// Hard-purge one memory and every sidecar in ONE transaction: links
     /// (both directions — the FK has no ON DELETE), dangling `superseded_by`
     /// references, the vec0 row, feedback rows, the memory's own oplog
@@ -1063,6 +1100,21 @@ mod retention_tests {
         // surviving event for it is the purge marker, replayed as Archived.
         assert_eq!(purge_events.len(), 1);
         assert_eq!(purge_events[0].kind, rb_types::ChangeKind::Archived);
+    }
+
+    // The scheduled job sweeps per namespace: the enumeration lists every
+    // namespace that still has rows.
+    #[test]
+    fn retention_namespaces_lists_distinct_namespaces() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        insert_aged(&store, 1, 5, |_| {});
+        insert_aged(&store, 2, 5, |_| {});
+        let foreign = MemoryNote::new(Namespace::Global, "g".into(), MemoryType::Insight, 5);
+        store.insert_memory(&foreign, None).unwrap();
+
+        let mut got = store.retention_namespaces().unwrap();
+        got.sort_by_key(|n| n.as_db_string());
+        assert_eq!(got, vec![Namespace::Global, ns()]);
     }
 
     // Purging a memory that superseded another must not leave the old row's
