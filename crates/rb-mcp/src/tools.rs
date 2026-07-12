@@ -29,10 +29,10 @@ fn memory_type_enum() -> Value {
 }
 
 /// The default tools advertised to the model (W3.3 token economy). The rest —
-/// `list`, `graph`, `link`, `delete`, `poll_changes` — are gated behind
-/// `RB_MCP_FULL_TOOLSET` so the per-turn `tools/list` the model pays for stays
-/// small. (All tools remain ROUTABLE if called; gating only trims the advertised
-/// set.)
+/// `list`, `graph`, `link`, `delete`, `history`, `poll_changes` — are gated
+/// behind `RB_MCP_FULL_TOOLSET` so the per-turn `tools/list` the model pays for
+/// stays small. (All tools remain ROUTABLE if called; gating only trims the
+/// advertised set.)
 ///
 /// Single source of truth for the default advertised set: the installer's
 /// `permissions.allow` allowlist (rb-install) is drift-tested against this, so
@@ -288,6 +288,24 @@ pub fn tool_definitions() -> Vec<ToolDef> {
             }),
         },
         ToolDef {
+            name: "history",
+            description: "Decision-history timeline for a memory: its supersede chain \
+                          (prior and newer versions) plus active contradicts/extends/\
+                          references links, with a current-truth pointer and \
+                          archived/contested flags. Read-only. Use to audit how a \
+                          decision evolved before trusting or changing it.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": { "type": "string", "description": "Memory id (UUID)." },
+                    "depth": { "type": "integer", "minimum": 1,
+                               "description": "Max supersede hops per direction \
+                                               (default: server cap)." }
+                },
+                "required": ["id"]
+            }),
+        },
+        ToolDef {
             name: "poll_changes",
             description: "Drain buffered change notifications for the current \
                           namespace since the last poll. Returns up to `max` events, \
@@ -313,7 +331,7 @@ mod tests {
     use std::collections::BTreeSet;
 
     #[test]
-    fn exposes_exactly_the_eleven_tools() {
+    fn exposes_exactly_the_twelve_tools() {
         let names: BTreeSet<&str> = tool_definitions().iter().map(|t| t.name).collect();
         let expected: BTreeSet<&str> = [
             "remember",
@@ -327,14 +345,39 @@ mod tests {
             "context",
             "memory_feedback",
             "poll_changes",
+            "history",
         ]
         .into_iter()
         .collect();
         assert_eq!(
             names, expected,
-            "tool set must be the 8 spine tools + link + memory_feedback + poll_changes"
+            "tool set must be the 8 spine tools + link + memory_feedback + \
+             poll_changes + history"
         );
-        assert_eq!(tool_definitions().len(), 11);
+        assert_eq!(tool_definitions().len(), 12);
+    }
+
+    #[test]
+    fn history_is_gated_out_of_the_default_toolset() {
+        // PRD 2026-07-02 HIST-3: the history tool is full-toolset-gated so the
+        // default tools/list the model pays for every turn is unchanged.
+        assert!(!DEFAULT_TOOLS.contains(&"history"));
+        let default: Vec<&str> = advertised_tool_definitions_for(false)
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(!default.contains(&"history"), "{default:?}");
+        let full: Vec<&str> = advertised_tool_definitions_for(true)
+            .iter()
+            .map(|t| t.name)
+            .collect();
+        assert!(full.contains(&"history"), "{full:?}");
+        // The gated tool requires only the id; depth stays optional.
+        let t = tool_definitions()
+            .into_iter()
+            .find(|t| t.name == "history")
+            .unwrap();
+        assert_eq!(t.input_schema["required"][0], "id");
     }
 
     #[test]

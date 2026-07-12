@@ -328,6 +328,32 @@ mod tests {
                 Request::Forget { .. } => Response::ForgetPlanned {
                     plan: rb_types::ForgetPlan::default(),
                 },
+                // The `history` tool maps here (full-toolset-gated); echo the
+                // requested id so dispatch tests can assert the payload.
+                Request::History { ref id, .. } => Response::History {
+                    history: rb_types::MemoryHistory {
+                        namespace: "project:p".to_string(),
+                        depth: 100,
+                        chain: vec![rb_types::HistoryEntry {
+                            id: id.clone(),
+                            summary: "current decision".to_string(),
+                            importance: 6,
+                            confidence: 1.0,
+                            created_at: chrono::Utc::now(),
+                            archived: false,
+                            contested: false,
+                            current: true,
+                            is_target: true,
+                            superseded_by: None,
+                            origin_user: None,
+                            origin_host: None,
+                            origin_agent: None,
+                            origin_source: None,
+                        }],
+                        edges: Vec::new(),
+                        truncated: false,
+                    },
+                },
                 // No MCP tool maps to the stats observability op; the arm
                 // exists only to keep this fake total over `Request`.
                 Request::Stats { .. } => Response::Stats {

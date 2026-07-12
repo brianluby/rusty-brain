@@ -82,6 +82,34 @@ All notable changes to rusty-brain are documented here. The format is based on
   an absent `dry_run` decodes to a preview (never an execute). Deliberately
   NO MCP tool: a destructive surface stays off the model-facing toolset.
 
+### Added — Decision history and audit timeline (PRD 2026-07-02)
+
+- **`rusty-brain history <id>` (+ `--depth`, `--json`)**: read-only timeline of
+  a memory's evolution — the supersede chain in BOTH directions (prior and
+  newer versions, oldest first) plus active `contradicts`/`extends`/
+  `references` edges, each hop carrying summary, importance, confidence,
+  created-at age, and `origin_*` provenance, with `current`/`superseded`/
+  `contested` markers and a current-truth pointer. Derived entirely from
+  existing rows (`memories.superseded_by` + `memory_links`): no schema change,
+  no new persistence, and the whole path runs on the daemon's READ pool —
+  zero writer ops (W1.8), asserted at the StoreHandle level and over a real
+  socket. Each direction is one bounded recursive CTE (the `graph_neighbors`
+  shape), walked independently so an ancestor entering a supersede cycle is
+  still found; cycles in user-creatable data cannot hang the walk (SQL hop
+  bound + `MIN(hop)` dedup; server depth clamp of 100 hops per direction,
+  chain membership and edge list each capped at 200, with exact
+  depth-truncation reporting), and traversal never crosses namespaces (both
+  chain hops and both edge endpoints are namespace-scoped, the
+  `active_contradicts` rigor). A corrupt out-of-band `importance` fails
+  closed instead of decoding as 0.
+- **Additive wire op `Request::History`/`Response::History`** with
+  `rb_types::{MemoryHistory, HistoryEntry, HistoryEdge}` payloads — every
+  top-level field serde-default, no `CONTRACT_VERSION` bump (recorded in the
+  contract-drift snapshot as an additive decision).
+- **MCP `history` tool (full-toolset-gated)**: exposed only under
+  `RB_MCP_FULL_TOOLSET` per HIST-3, so the default `tools/list` token budget
+  is unchanged; the tool remains routable when called directly.
+
 ### Added — Contract-drift guard (W5a.4 operationalized)
 
 - **`rb-contract-guard` + `contract-drift` CI job**: the wire surface

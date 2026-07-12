@@ -672,6 +672,25 @@ impl Client {
         }
     }
 
+    /// Decision-history timeline for one memory (PRD 2026-07-02): the
+    /// supersede chain in both directions plus active
+    /// contradicts/extends/references edges, scoped to this connection's
+    /// namespace. `depth` bounds the chain walk per direction (`None` =
+    /// daemon safety cap). Read-only server-side: the history path issues
+    /// zero writer ops (W1.8). A missing (or foreign-namespace) id is
+    /// `Error::NotFound`.
+    pub async fn history(
+        &mut self,
+        id: rb_types::MemoryId,
+        depth: Option<u32>,
+    ) -> Result<rb_types::MemoryHistory> {
+        let resp = self.request(Request::History { id, depth }).await?;
+        match resp {
+            Resp::History { history } => Ok(history),
+            other => Err(Self::unexpected(other)),
+        }
+    }
+
     /// One-time namespace rename (W0.3 carryover): re-scope every memory from
     /// `old` to `new` in one daemon writer transaction. Refused with
     /// `Error::InvalidArgument` when `new` already has rows unless `merge` is
@@ -1067,7 +1086,6 @@ mod wrapper_tests {
                     provider_model: "deterministic".to_string(),
                     writer_alive: true,
                 },
-
                 // Canned payloads keyed on dry_run/mode so the typed-wrapper
                 // test can prove both flags ride the wire.
                 Request::Forget {
@@ -1096,6 +1114,32 @@ mod wrapper_tests {
                         }
                     }
                 }
+                // Canned payload echoing `id` and keyed on `depth` so the
+                // typed-wrapper test can prove both ride the wire.
+                Request::History { id, depth } => Response::History {
+                    history: rb_types::MemoryHistory {
+                        namespace: "global".to_string(),
+                        depth: depth.unwrap_or(100),
+                        chain: vec![rb_types::HistoryEntry {
+                            id,
+                            summary: "canned".to_string(),
+                            importance: 5,
+                            confidence: 1.0,
+                            created_at: chrono::Utc::now(),
+                            archived: false,
+                            contested: false,
+                            current: true,
+                            is_target: true,
+                            superseded_by: None,
+                            origin_user: None,
+                            origin_host: None,
+                            origin_agent: None,
+                            origin_source: None,
+                        }],
+                        edges: Vec::new(),
+                        truncated: false,
+                    },
+                },
             };
             write_frame(&mut framed, &resp).await.unwrap();
         }
@@ -1471,6 +1515,16 @@ mod wrapper_tests {
         assert!(writer_alive);
         let (stats, _, _) = c.stats(None).await.unwrap();
         assert_eq!(stats.window_days, 30, "None uses the daemon default");
+
+        // The fake server echoes the id and depth into the payload, proving
+        // both ride the wire and the timeline comes back typed.
+        let history = c.history(fixed_id.clone(), Some(3)).await.unwrap();
+        assert_eq!(history.depth, 3);
+        assert_eq!(history.chain.len(), 1);
+        assert_eq!(history.chain[0].id, fixed_id);
+        assert!(history.chain[0].is_target && history.chain[0].current);
+        let history = c.history(fixed_id.clone(), None).await.unwrap();
+        assert_eq!(history.depth, 100, "None uses the daemon safety cap");
 
         drop(c);
         server.await.unwrap();

@@ -529,6 +529,11 @@ async fn run_client(
             let notes = client.graph(id, depth).await.context("graph failed")?;
             println!("{}", output::render_notes(&notes, json));
         }
+        Command::History { id, depth } => {
+            let id = parse_id(&id).context("invalid memory id")?;
+            let history = client.history(id, depth).await.context("history failed")?;
+            println!("{}", output::render_history(&history, json));
+        }
         Command::Update {
             id,
             summary,

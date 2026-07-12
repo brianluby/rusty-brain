@@ -1,6 +1,7 @@
 //! `SqliteStore`: the concrete `Store` backed by SQLite + sqlite-vec.
 
 mod core;
+mod history;
 mod internal;
 mod lifecycle;
 mod link_decay;

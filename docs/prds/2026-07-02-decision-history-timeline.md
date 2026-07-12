@@ -2,11 +2,39 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. The supersede chain and
+Delivered 2026-07-11 (branch `claude/decision-history-timeline`, Vikunja
+#456). From the 2026-07-02 senior-PM product review. The supersede chain and
 `contradicts` links already exist but are not surfaced as a *story*. Surfacing
 the evolution of a decision turns memory from a flat store into an
 institutional decision journal - the strongest single differentiator vs
 flat-recall competitors.
+
+Delivery notes:
+
+- The chain walk is `memories.superseded_by` based (the atomic supersede's
+  artifact) — no `supersedes` link rows exist in storage, and the supersede
+  op records no per-hop *reason* anywhere (the oplog `details` carry only the
+  replacement id). HIST-1's "supersede `reason`" therefore has nothing to
+  derive from in v1 storage; chain hops carry no reason field. Link edges DO
+  carry their stored `reason`.
+- Server bounds: depth clamps to 100 hops per direction (an absent `--depth`
+  uses the cap, per HIST-3's "default unbounded but capped"); the edge list
+  and the TOTAL chain membership each cap at 200 (depth bounds hops, not
+  width — near-dup fan-in can point many predecessors at one id). All report
+  `truncated`; depth-truncation is exact (a boundary coinciding with a
+  dangling/cross-namespace pointer or a cycle revisit does not claim it).
+- Traversal is one bounded recursive CTE per direction (the `graph_neighbors`
+  shape): the directions are walked independently, so an ancestor entering a
+  supersede cycle is still found, and cycle handling lives in SQL
+  (`MIN(hop) GROUP BY id` + the hop bound).
+- Supersede-writer hygiene (rejecting `old == new` and re-supersede of an
+  archived row at the source) is follow-up Vikunja #501 — out of this PRD's
+  read-only scope; the timeline defends against such rows regardless.
+- "Active" edges follow the `contested` semantics exactly: both endpoints
+  non-archived AND in the request namespace (the `active_contradicts`
+  double-endpoint scoping), so edges on archived chain members do not render.
+- The MCP `history` tool ships full-toolset-gated (HIST-3): the default
+  `tools/list` token budget is unchanged.
 
 ## Owner Area
 
@@ -107,12 +135,12 @@ asserting the rendered timeline.
 
 ## Implementation Checklist
 
-- [ ] Add `History` subcommand + additive `History` request/response.
-- [ ] Implement derivation over existing supersede/link queries.
-- [ ] Add cycle handling + depth cap.
-- [ ] Human + JSON output with age/contested/superseded markers.
-- [ ] Optional MCP `history` tool behind `RB_MCP_FULL_TOOLSET`.
-- [ ] Zero-writer-ops + chain e2e tests.
+- [x] Add `History` subcommand + additive `History` request/response.
+- [x] Implement derivation over existing supersede/link queries.
+- [x] Add cycle handling + depth cap.
+- [x] Human + JSON output with age/contested/superseded markers.
+- [x] Optional MCP `history` tool behind `RB_MCP_FULL_TOOLSET`.
+- [x] Zero-writer-ops + chain e2e tests.
 
 ## Roadmap Fit
 

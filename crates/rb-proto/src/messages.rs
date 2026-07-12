@@ -266,6 +266,22 @@ pub enum Request {
         #[serde(default = "default_forget_dry_run")]
         dry_run: bool,
     },
+    /// Decision-history timeline for one memory (PRD 2026-07-02): the
+    /// supersede chain in both directions plus active
+    /// contradicts/extends/references edges, derived entirely from existing
+    /// rows. Scoped to the connection's handshake namespace like `Get`/`Stats`
+    /// (NOT an admin op); computed on the daemon's read pool — the history
+    /// path issues ZERO writer ops (W1.8). `depth` bounds the chain walk per
+    /// direction; `None` uses the daemon's safety cap. Additive variant per
+    /// the `Stats` precedent: an old daemon fails to decode it and closes the
+    /// connection (no CONTRACT_VERSION bump), and the
+    /// `#[serde(default)]`/`skip_serializing_if` pair keeps a depth-less frame
+    /// minimal.
+    History {
+        id: MemoryId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        depth: Option<u32>,
+    },
 }
 
 /// An absent `dry_run` on the wire must PREVIEW, never execute.
@@ -406,6 +422,13 @@ pub enum Response {
     /// Additive variant; old clients never see it.
     ForgetDone {
         outcome: rb_types::ForgetOutcome,
+    },
+    /// Reply to `Request::History`: the derived decision-history timeline.
+    /// Every payload field is `#[serde(default)]` (the `MemoryStats`
+    /// precedent) so the shape stays additive. Additive variant; old clients
+    /// never see it because they never send the request.
+    History {
+        history: rb_types::MemoryHistory,
     },
     Error {
         kind: String,
@@ -894,6 +917,14 @@ mod tests {
             Request::Stats {
                 window_days: Some(14),
             },
+            Request::History {
+                id: MemoryId::new(),
+                depth: None,
+            },
+            Request::History {
+                id: MemoryId::new(),
+                depth: Some(3),
+            },
         ]
     }
 
@@ -1007,6 +1038,40 @@ mod tests {
                 },
                 provider_model: "deterministic".to_string(),
                 writer_alive: true,
+            },
+            Response::History {
+                history: rb_types::MemoryHistory {
+                    namespace: "global".to_string(),
+                    depth: 100,
+                    chain: vec![rb_types::HistoryEntry {
+                        id: MemoryId::new(),
+                        summary: "we use kafka".to_string(),
+                        importance: 7,
+                        confidence: 0.9,
+                        created_at: chrono::Utc::now(),
+                        archived: false,
+                        contested: true,
+                        current: true,
+                        is_target: true,
+                        superseded_by: None,
+                        origin_user: Some("alice".to_string()),
+                        origin_host: None,
+                        origin_agent: None,
+                        origin_source: Some("cli".to_string()),
+                    }],
+                    edges: vec![rb_types::HistoryEdge {
+                        link_type: rb_types::LinkType::Contradicts,
+                        local: MemoryId::new(),
+                        other: MemoryId::new(),
+                        outbound: false,
+                        reason: "disagrees".to_string(),
+                        other_summary: "kafka too slow".to_string(),
+                        other_confidence: 0.5,
+                        other_contested: true,
+                        created_at: chrono::Utc::now(),
+                    }],
+                    truncated: false,
+                },
             },
         ]
     }
@@ -1473,6 +1538,94 @@ mod tests {
                 assert!(!writer_alive);
             }
             other => panic!("expected Stats, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_request_uses_op_tag_and_depth_is_additive() {
+        // A depth-less History request carries only the op tag and the id
+        // (the `Stats.window_days` precedent), and a frame without the depth
+        // key decodes to `None` — no CONTRACT_VERSION bump.
+        let id = MemoryId::new();
+        let json = serde_json::to_string(&Request::History {
+            id: id.clone(),
+            depth: None,
+        })
+        .unwrap();
+        assert_eq!(json, format!(r#"{{"op":"History","id":"{id}"}}"#));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::History { id: got, depth } => {
+                assert_eq!(got, id);
+                assert_eq!(depth, None);
+            }
+            other => panic!("expected History, got {other:?}"),
+        }
+
+        let json = serde_json::to_string(&Request::History {
+            id: id.clone(),
+            depth: Some(3),
+        })
+        .unwrap();
+        assert_eq!(json, format!(r#"{{"op":"History","id":"{id}","depth":3}}"#));
+        let back: Request = serde_json::from_str(&json).unwrap();
+        assert!(matches!(back, Request::History { depth: Some(3), .. }));
+    }
+
+    #[test]
+    fn history_response_round_trips_with_result_tag() {
+        let id = MemoryId::new();
+        let resp = Response::History {
+            history: rb_types::MemoryHistory {
+                namespace: "project:rusty-brain".to_string(),
+                depth: 100,
+                chain: vec![rb_types::HistoryEntry {
+                    id: id.clone(),
+                    summary: "we use kafka".to_string(),
+                    importance: 7,
+                    confidence: 0.9,
+                    created_at: chrono::Utc::now(),
+                    archived: false,
+                    contested: true,
+                    current: true,
+                    is_target: true,
+                    superseded_by: None,
+                    origin_user: None,
+                    origin_host: None,
+                    origin_agent: None,
+                    origin_source: None,
+                }],
+                edges: Vec::new(),
+                truncated: true,
+            },
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "History");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::History { history } => {
+                assert_eq!(history.chain.len(), 1);
+                assert_eq!(history.chain[0].id, id);
+                assert!(history.chain[0].current);
+                assert!(history.truncated);
+            }
+            other => panic!("expected History, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn history_response_payload_fields_are_additive() {
+        // A frame carrying an empty history object (a peer predating — or
+        // postdating — any field) must decode to the zero-valued default:
+        // old-daemon/new-client tolerance without a CONTRACT_VERSION bump.
+        let back: Response = serde_json::from_str(r#"{"result":"History","history":{}}"#).unwrap();
+        match back {
+            Response::History { history } => {
+                assert_eq!(history, rb_types::MemoryHistory::default());
+                assert!(history.chain.is_empty());
+            }
+            other => panic!("expected History, got {other:?}"),
         }
     }
 

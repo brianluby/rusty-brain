@@ -462,6 +462,19 @@ pub enum Command {
         depth: u8,
     },
 
+    /// Show a memory's decision history: the supersede chain in both
+    /// directions (prior and newer versions) plus active contradicts/extends/
+    /// references links, with current/superseded/contested markers. Read-only
+    /// — issues zero writer ops.
+    History {
+        /// Memory id (UUID).
+        id: String,
+        /// Maximum supersede hops walked per direction (server-clamped to
+        /// 1-100; default: the server safety cap).
+        #[arg(long, value_parser = value_parser!(u32).range(1..=100))]
+        depth: Option<u32>,
+    },
+
     /// Apply a partial update to a memory (only provided fields change).
     /// Content cannot be updated — store a new memory so embeddings stay
     /// consistent.
@@ -1429,6 +1442,38 @@ mod tests {
         // --kind is required.
         let res = Cli::try_parse_from(["rusty-brain", "feedback", "an-id"]);
         assert!(res.is_err(), "--kind is required for feedback");
+    }
+
+    #[test]
+    fn parses_history_with_optional_depth() {
+        let id = "0c8e7f76-3a4f-4f7e-9d3a-111111111111";
+        let cli = Cli::parse_from(["rusty-brain", "history", id]);
+        match cli.command {
+            Command::History { id: got, depth } => {
+                assert_eq!(got, id);
+                assert_eq!(depth, None, "absent depth defers to the server cap");
+            }
+            other => panic!("expected History, got {other:?}"),
+        }
+        let cli = Cli::parse_from(["rusty-brain", "history", id, "--depth", "3"]);
+        assert!(matches!(
+            cli.command,
+            Command::History { depth: Some(3), .. }
+        ));
+        // Global --json applies to history.
+        let cli = Cli::parse_from(["rusty-brain", "--json", "history", id]);
+        assert!(cli.json);
+        assert!(matches!(cli.command, Command::History { .. }));
+    }
+
+    #[test]
+    fn history_rejects_out_of_range_depth_at_parse_time() {
+        for bad in ["0", "101"] {
+            let res = Cli::try_parse_from(["rusty-brain", "history", "some-id", "--depth", bad]);
+            assert!(res.is_err(), "--depth {bad} must be rejected at parse time");
+        }
+        // An id argument is required.
+        assert!(Cli::try_parse_from(["rusty-brain", "history"]).is_err());
     }
 
     #[test]
