@@ -416,6 +416,52 @@ fn load_links(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<MemoryLi
     }
     Ok(links)
 }
+/// Load a memory's typed code anchors (PRD 2026-07-02), decoded from the
+/// kind-split columns: `path` carries a file anchor's value, `ref` a
+/// commit/symbol's. Ordered by insertion (rowid) so round-trips preserve the
+/// caller's anchor order.
+fn load_anchors(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<rb_types::MemoryAnchor>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, path, start_line, end_line, ref
+             FROM memory_anchors WHERE memory_id = ?1 ORDER BY id",
+        )
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let rows = stmt
+        .query_map(rusqlite::params![id.to_string()], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, Option<String>>(1)?,
+                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
+                row.get::<_, Option<String>>(4)?,
+            ))
+        })
+        .map_err(|e| Error::Storage(e.to_string()))?;
+
+    let mut anchors = Vec::new();
+    for r in rows {
+        let (kind, path, start, end, reference) = r.map_err(|e| Error::Storage(e.to_string()))?;
+        let kind = rb_types::parse_anchor_kind(&kind)?;
+        let value = path.or(reference).ok_or_else(|| {
+            Error::Storage("memory_anchors row carries neither path nor ref".to_string())
+        })?;
+        let to_line = |v: Option<i64>| -> Result<Option<u32>> {
+            v.map(|n| {
+                u32::try_from(n)
+                    .map_err(|_| Error::Storage("anchor line out of range in DB".to_string()))
+            })
+            .transpose()
+        };
+        anchors.push(rb_types::MemoryAnchor {
+            kind,
+            value,
+            start_line: to_line(start)?,
+            end_line: to_line(end)?,
+        });
+    }
+    Ok(anchors)
+}
 fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<MemoryNote> {
     let id = parse_id(
         &row.get::<_, String>("memory_id")
@@ -441,8 +487,11 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         row.get::<_, Option<String>>(c)
             .map_err(|e| Error::Storage(e.to_string()))
     };
-    // TODO(P1): batch link loading (avoid N+1 load_links per row in list/get_memory).
+    // TODO(P1): batch relation loading — BOTH load_links and load_anchors are
+    // per-row queries (N+1 in list/get_many paths) and candidates for a single
+    // batched IN-list fetch per page of rows.
     let links = load_links(conn, &id)?;
+    let anchors = load_anchors(conn, &id)?;
     Ok(MemoryNote {
         id,
         namespace,
@@ -493,6 +542,7 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         origin_agent: go("origin_agent")?,
         origin_source: go("origin_source")?,
         session_id: go("session_id")?,
+        anchors,
     })
 }
 /// Build a safe FTS5 MATCH expression from raw user text (W1.2).
@@ -548,6 +598,223 @@ fn escape_fts5_query(query: &str) -> String {
     }
     expr
 }
+/// Build the filtered-list SELECT — the exact SQL + positional params
+/// `list_filtered` executes — for `ns`, `filter`, `limit`. Split out so
+/// tests can `EXPLAIN QUERY PLAN` the real query (the anchor semi-join
+/// index guarantee). Every fragment is a FIXED literal (no caller data is
+/// ever interpolated); caller values ride numbered parameters exclusively.
+/// Performs the same defense-in-depth `filter.validate()` as the execution
+/// path (this also rejects empty anchor-filter values fail-closed).
+#[allow(clippy::vec_box)]
+fn build_list_filtered_query(
+    ns: &Namespace,
+    filter: &rb_types::RecallFilter,
+    limit: usize,
+) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    filter.validate()?;
+
+    let mut sql = String::from(
+        "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                keywords, tags, context, memory_type, importance, confidence,
+                related_files, access_count, last_accessed_at, archived_at,
+                superseded_by, embedding_model, embedding_input_version,
+                origin_user, origin_host, origin_agent, origin_source, session_id
+         FROM memories m
+         WHERE m.namespace = ?1",
+    );
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ns.as_db_string())];
+    fn push(
+        sql: &mut String,
+        params: &mut Vec<Box<dyn rusqlite::ToSql>>,
+        clause: &str,
+        value: Box<dyn rusqlite::ToSql>,
+    ) {
+        params.push(value);
+        sql.push_str(" AND ");
+        sql.push_str(clause);
+        sql.push_str(&format!("?{}", params.len()));
+    }
+
+    match filter.state {
+        rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
+        rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
+        rb_types::MemoryState::All => {}
+    }
+    if let Some(min) = filter.min_importance {
+        push(
+            &mut sql,
+            &mut params,
+            "m.importance >= ",
+            Box::new(min as i64),
+        );
+    }
+    if let Some(max) = filter.max_importance {
+        push(
+            &mut sql,
+            &mut params,
+            "m.importance <= ",
+            Box::new(max as i64),
+        );
+    }
+    if let Some(min) = filter.min_confidence {
+        push(
+            &mut sql,
+            &mut params,
+            "m.confidence >= ",
+            Box::new(f64::from(min)),
+        );
+    }
+    if let Some(max) = filter.max_confidence {
+        push(
+            &mut sql,
+            &mut params,
+            "m.confidence <= ",
+            Box::new(f64::from(max)),
+        );
+    }
+    if let Some(since) = filter.since {
+        // `created_at` is stored whole-second, so a FRACTIONAL lower bound
+        // rounds UP: flooring 12:00:00.5 would wrongly admit a row created
+        // at 12:00:00 (which `RecallFilter::matches` rejects).
+        let bound = since.timestamp() + i64::from(since.timestamp_subsec_nanos() > 0);
+        push(&mut sql, &mut params, "m.created_at >= ", Box::new(bound));
+    }
+    if let Some(until) = filter.until {
+        // Flooring the UPPER bound is exact for whole-second storage: a
+        // stored second <= floor(until) is <= until, and floor(until)+1
+        // is > until whenever `until` carries a fraction.
+        push(
+            &mut sql,
+            &mut params,
+            "m.created_at <= ",
+            Box::new(until.timestamp()),
+        );
+    }
+    if !filter.types.is_empty() {
+        // Any-of over the canonical db strings, one placeholder per type.
+        let start = params.len() + 1;
+        let placeholders: Vec<String> = (0..filter.types.len())
+            .map(|i| format!("?{}", start + i))
+            .collect();
+        sql.push_str(&format!(
+            " AND m.memory_type IN ({})",
+            placeholders.join(", ")
+        ));
+        for t in &filter.types {
+            params.push(Box::new(t.as_str().to_string()));
+        }
+    }
+    if !filter.sources.is_empty() {
+        // Any-of; a NULL origin_source never matches an IN list, so
+        // pre-provenance rows are correctly excluded.
+        let start = params.len() + 1;
+        let placeholders: Vec<String> = (0..filter.sources.len())
+            .map(|i| format!("?{}", start + i))
+            .collect();
+        sql.push_str(&format!(
+            " AND m.origin_source IN ({})",
+            placeholders.join(", ")
+        ));
+        for s in &filter.sources {
+            params.push(Box::new(s.clone()));
+        }
+    }
+    for tag in &filter.tags {
+        // All-of: one EXISTS per required tag over the JSON tags array
+        // (json1 ships with the bundled SQLite).
+        push(
+            &mut sql,
+            &mut params,
+            "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ",
+            Box::new(tag.clone()),
+        );
+        sql.push(')');
+    }
+    for anchor in &filter.anchors {
+        // All-of (like tags): one namespace-scoped IN semi-join per
+        // anchor constraint, probing the kind-matched value column
+        // (`path` for file anchors, `ref` for commit/symbol — the same
+        // split insert_memory writes). A semi-join, NOT a correlated
+        // EXISTS (PR #59 review, EXPLAIN-verified at 100k rows): the
+        // correlated form was always planned as a full `memories` scan
+        // with a per-row idx_memory_anchors_memory probe, so a selective
+        // anchor filter cost O(active memories); the IN subquery is
+        // evaluated once via idx_memory_anchors_path / _ref — O(matching
+        // anchors) — which is what the wide indexes exist for (pinned by
+        // `anchor_filters_probe_the_wide_anchor_indexes`). Scoping the
+        // subquery on `a.namespace` (which mirrors memories.namespace;
+        // rename re-keys both) is what makes the leading index column
+        // usable and never changes the result set. Values compare by
+        // plain equality because BOTH sides are normalized: stored
+        // values at insert, the filter value here. Semantics are pinned
+        // to `RecallFilter::matches` by the
+        // `anchor_filter_agrees_with_recall_filter_matches` drift test.
+        let value_col = if anchor.kind == rb_types::AnchorKind::File {
+            "path"
+        } else {
+            "ref"
+        };
+        params.push(Box::new(ns.as_db_string()));
+        let ns_param = params.len();
+        params.push(Box::new(rb_types::anchor_kind_str(anchor.kind).to_string()));
+        let kind_param = params.len();
+        params.push(Box::new(rb_types::normalize_anchor_value(
+            anchor.kind,
+            &anchor.value,
+        )));
+        let value_param = params.len();
+        sql.push_str(&format!(
+            " AND m.memory_id IN (SELECT a.memory_id FROM memory_anchors a
+                   WHERE a.namespace = ?{ns_param}
+                     AND a.kind = ?{kind_param}
+                     AND a.{value_col} = ?{value_param})"
+        ));
+    }
+    if let Some(want_contested) = filter.contested {
+        // Contested is resolved INSIDE the bounded query (PR #58 review):
+        // post-filtering a fetch window silently drops matches past the
+        // window, so `limit` could under-fill despite more matches
+        // existing. The predicate is the SQL expression of
+        // `active_contradicts` (an active `contradicts` edge whose far
+        // endpoint is active AND in-namespace, and whose LOCAL endpoint is
+        // active — an archived memory is never contested, so under
+        // `contested=false` archived rows count as uncontested). Kept in
+        // lockstep by the `contested_filter_agrees_with_active_contradicts`
+        // drift test; change one without the other and that test fails.
+        params.push(Box::new(ns.as_db_string()));
+        let ns_param = params.len();
+        let contested_expr = format!(
+            "(m.archived_at IS NULL AND (EXISTS (
+                     SELECT 1 FROM memory_links l
+                       JOIN memories far ON far.memory_id = l.target_id
+                     WHERE l.link_type = 'contradicts'
+                       AND l.source_id = m.memory_id
+                       AND far.archived_at IS NULL
+                       AND far.namespace = ?{ns_param}
+                 ) OR EXISTS (
+                     SELECT 1 FROM memory_links l
+                       JOIN memories far ON far.memory_id = l.source_id
+                     WHERE l.link_type = 'contradicts'
+                       AND l.target_id = m.memory_id
+                       AND far.archived_at IS NULL
+                       AND far.namespace = ?{ns_param}
+                 )))"
+        );
+        if want_contested {
+            sql.push_str(&format!(" AND {contested_expr}"));
+        } else {
+            sql.push_str(&format!(" AND NOT {contested_expr}"));
+        }
+    }
+
+    params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
+    sql.push_str(&format!(
+        " ORDER BY m.created_at DESC LIMIT ?{}",
+        params.len()
+    ));
+    Ok((sql, params))
+}
+
 impl Store for SqliteStore {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
@@ -557,6 +824,12 @@ impl Store for SqliteStore {
         // must be validation-class (InvalidArgument travels verbatim over the
         // wire; Storage is replaced with an opaque "internal error").
         rb_types::validate_confidence(note.confidence)?;
+        // Anchors are validated fail-closed BEFORE the transaction opens (the
+        // SQL CHECKs are the backstop); the engine already validated, but the
+        // store is its own boundary.
+        for anchor in &note.anchors {
+            anchor.validate()?;
+        }
 
         // Take the write lock at BEGIN (IMMEDIATE) instead of deferring it to the
         // first write. This avoids a deferred-transaction upgrade racing another
@@ -611,6 +884,46 @@ impl Store for SqliteStore {
                 .map_err(|e| Error::Storage(e.to_string()))?;
 
             append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
+
+            // Typed code anchors (PRD 2026-07-02): kind-split value columns
+            // (`path` for file anchors, `ref` for commit/symbol — the 009
+            // CHECK pins the split). Values are stored NORMALIZED
+            // (rb_types::normalize_anchor_value) so the anchor-filter SQL can
+            // compare by plain equality. Exact duplicates (post-normalization,
+            // incl. the line range) collapse to ONE row here — repeated CLI
+            // flags / `--batch` fan-out must not accumulate copies, and a
+            // UNIQUE constraint cannot do it (SQLite treats the NULL
+            // path/ref/line columns as pairwise distinct). First-seen order
+            // is preserved.
+            let mut seen_anchors = std::collections::HashSet::new();
+            for anchor in &note.anchors {
+                let value = rb_types::normalize_anchor_value(anchor.kind, &anchor.value);
+                if !seen_anchors.insert((
+                    rb_types::anchor_kind_str(anchor.kind),
+                    value.clone(),
+                    anchor.start_line,
+                    anchor.end_line,
+                )) {
+                    continue;
+                }
+                let is_file = anchor.kind == rb_types::AnchorKind::File;
+                self.conn
+                    .execute(
+                        "INSERT INTO memory_anchors
+                            (memory_id, namespace, kind, path, start_line, end_line, ref)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            note.id.to_string(),
+                            note.namespace.as_db_string(),
+                            rb_types::anchor_kind_str(anchor.kind),
+                            is_file.then_some(value.as_str()),
+                            anchor.start_line.map(i64::from),
+                            anchor.end_line.map(i64::from),
+                            (!is_file).then_some(value.as_str()),
+                        ],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            }
 
             if let Some(emb) = embedding {
                 // The namespace partition key MUST mirror memories.namespace
@@ -901,181 +1214,7 @@ impl Store for SqliteStore {
         filter: &rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        // Anchors need the typed-code-anchors table (PRD 2026-07-02); until it
-        // lands, fail fast rather than silently returning unfiltered rows.
-        if !filter.anchors.is_empty() {
-            return Err(Error::InvalidArgument(
-                "anchor filters are not supported yet (the memory_anchors table ships with \
-                 typed code anchors)"
-                    .to_string(),
-            ));
-        }
-        // Defense-in-depth boundary validation, consistent with insert/update.
-        filter.validate()?;
-
-        // Build the WHERE clause dynamically: every fragment below is a FIXED
-        // literal (no caller data is ever interpolated); caller values ride
-        // numbered parameters exclusively.
-        let mut sql = String::from(
-            "SELECT memory_id, namespace, created_at, updated_at, content, summary,
-                    keywords, tags, context, memory_type, importance, confidence,
-                    related_files, access_count, last_accessed_at, archived_at,
-                    superseded_by, embedding_model, embedding_input_version,
-                    origin_user, origin_host, origin_agent, origin_source, session_id
-             FROM memories m
-             WHERE m.namespace = ?1",
-        );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ns.as_db_string())];
-        fn push(
-            sql: &mut String,
-            params: &mut Vec<Box<dyn rusqlite::ToSql>>,
-            clause: &str,
-            value: Box<dyn rusqlite::ToSql>,
-        ) {
-            params.push(value);
-            sql.push_str(" AND ");
-            sql.push_str(clause);
-            sql.push_str(&format!("?{}", params.len()));
-        }
-
-        match filter.state {
-            rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
-            rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
-            rb_types::MemoryState::All => {}
-        }
-        if let Some(min) = filter.min_importance {
-            push(
-                &mut sql,
-                &mut params,
-                "m.importance >= ",
-                Box::new(min as i64),
-            );
-        }
-        if let Some(max) = filter.max_importance {
-            push(
-                &mut sql,
-                &mut params,
-                "m.importance <= ",
-                Box::new(max as i64),
-            );
-        }
-        if let Some(min) = filter.min_confidence {
-            push(
-                &mut sql,
-                &mut params,
-                "m.confidence >= ",
-                Box::new(f64::from(min)),
-            );
-        }
-        if let Some(max) = filter.max_confidence {
-            push(
-                &mut sql,
-                &mut params,
-                "m.confidence <= ",
-                Box::new(f64::from(max)),
-            );
-        }
-        if let Some(since) = filter.since {
-            // `created_at` is stored whole-second, so a FRACTIONAL lower bound
-            // rounds UP: flooring 12:00:00.5 would wrongly admit a row created
-            // at 12:00:00 (which `RecallFilter::matches` rejects).
-            let bound = since.timestamp() + i64::from(since.timestamp_subsec_nanos() > 0);
-            push(&mut sql, &mut params, "m.created_at >= ", Box::new(bound));
-        }
-        if let Some(until) = filter.until {
-            // Flooring the UPPER bound is exact for whole-second storage: a
-            // stored second <= floor(until) is <= until, and floor(until)+1
-            // is > until whenever `until` carries a fraction.
-            push(
-                &mut sql,
-                &mut params,
-                "m.created_at <= ",
-                Box::new(until.timestamp()),
-            );
-        }
-        if !filter.types.is_empty() {
-            // Any-of over the canonical db strings, one placeholder per type.
-            let start = params.len() + 1;
-            let placeholders: Vec<String> = (0..filter.types.len())
-                .map(|i| format!("?{}", start + i))
-                .collect();
-            sql.push_str(&format!(
-                " AND m.memory_type IN ({})",
-                placeholders.join(", ")
-            ));
-            for t in &filter.types {
-                params.push(Box::new(t.as_str().to_string()));
-            }
-        }
-        if !filter.sources.is_empty() {
-            // Any-of; a NULL origin_source never matches an IN list, so
-            // pre-provenance rows are correctly excluded.
-            let start = params.len() + 1;
-            let placeholders: Vec<String> = (0..filter.sources.len())
-                .map(|i| format!("?{}", start + i))
-                .collect();
-            sql.push_str(&format!(
-                " AND m.origin_source IN ({})",
-                placeholders.join(", ")
-            ));
-            for s in &filter.sources {
-                params.push(Box::new(s.clone()));
-            }
-        }
-        for tag in &filter.tags {
-            // All-of: one EXISTS per required tag over the JSON tags array
-            // (json1 ships with the bundled SQLite).
-            push(
-                &mut sql,
-                &mut params,
-                "EXISTS (SELECT 1 FROM json_each(m.tags) WHERE json_each.value = ",
-                Box::new(tag.clone()),
-            );
-            sql.push(')');
-        }
-        if let Some(want_contested) = filter.contested {
-            // Contested is resolved INSIDE the bounded query (PR #58 review):
-            // post-filtering a fetch window silently drops matches past the
-            // window, so `limit` could under-fill despite more matches
-            // existing. The predicate is the SQL expression of
-            // `active_contradicts` (an active `contradicts` edge whose far
-            // endpoint is active AND in-namespace, and whose LOCAL endpoint is
-            // active — an archived memory is never contested, so under
-            // `contested=false` archived rows count as uncontested). Kept in
-            // lockstep by the `contested_filter_agrees_with_active_contradicts`
-            // drift test; change one without the other and that test fails.
-            params.push(Box::new(ns.as_db_string()));
-            let ns_param = params.len();
-            let contested_expr = format!(
-                "(m.archived_at IS NULL AND (EXISTS (
-                     SELECT 1 FROM memory_links l
-                       JOIN memories far ON far.memory_id = l.target_id
-                     WHERE l.link_type = 'contradicts'
-                       AND l.source_id = m.memory_id
-                       AND far.archived_at IS NULL
-                       AND far.namespace = ?{ns_param}
-                 ) OR EXISTS (
-                     SELECT 1 FROM memory_links l
-                       JOIN memories far ON far.memory_id = l.source_id
-                     WHERE l.link_type = 'contradicts'
-                       AND l.target_id = m.memory_id
-                       AND far.archived_at IS NULL
-                       AND far.namespace = ?{ns_param}
-                 )))"
-            );
-            if want_contested {
-                sql.push_str(&format!(" AND {contested_expr}"));
-            } else {
-                sql.push_str(&format!(" AND NOT {contested_expr}"));
-            }
-        }
-
-        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-        sql.push_str(&format!(
-            " ORDER BY m.created_at DESC LIMIT ?{}",
-            params.len()
-        ));
-
+        let (sql, params) = build_list_filtered_query(ns, filter, limit)?;
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
         let mut stmt = self
             .conn
@@ -2805,29 +2944,368 @@ mod list_filtered_tests {
         );
     }
 
+    fn anchor_only(kind: rb_types::AnchorKind, value: &str) -> RecallFilter {
+        RecallFilter {
+            anchors: vec![rb_types::AnchorFilter {
+                kind,
+                value: value.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn rejects_anchor_filters_until_typed_anchors_land() {
-        // Fail fast, never silently unfiltered: the anchors table belongs to
-        // the typed-code-anchors PRD; until it lands a non-empty anchor filter
-        // is an InvalidArgument, not an ignored constraint.
+    fn anchors_round_trip_through_insert_get_and_get_many() {
         let store = SqliteStore::open_in_memory(8).unwrap();
-        let err = store
+        let anchors = vec![
+            rb_types::MemoryAnchor::parse_file_spec("src/server.rs:12-40").unwrap(),
+            rb_types::MemoryAnchor::parse_file_spec("src/lib.rs").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc123").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Engine::recall").unwrap(),
+        ];
+        let with = insert(&store, |m| m.anchors = anchors.clone());
+        let without = insert(&store, |m| m.created_at -= chrono::Duration::seconds(1));
+
+        let got = store.get_memory(&with).unwrap().unwrap();
+        assert_eq!(got.anchors, anchors, "get must load anchors with the row");
+        let bare = store.get_memory(&without).unwrap().unwrap();
+        assert!(
+            bare.anchors.is_empty(),
+            "pre-anchor rows load an empty list"
+        );
+
+        let many = store
+            .get_many(&ns(), &[with.clone(), without.clone()])
+            .unwrap();
+        assert_eq!(many[0].anchors, anchors, "get_many loads anchors too");
+        assert!(many[1].anchors.is_empty());
+    }
+
+    #[test]
+    fn insert_rejects_invalid_anchors_fail_closed() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut m = MemoryNote::new(ns(), "bad anchor".into(), MemoryType::Insight, 5);
+        m.anchors = vec![rb_types::MemoryAnchor {
+            kind: rb_types::AnchorKind::File,
+            value: String::new(),
+            start_line: None,
+            end_line: None,
+        }];
+        let err = store.insert_memory(&m, None).unwrap_err();
+        assert!(
+            matches!(err, Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert!(
+            store.get_memory(&m.id).unwrap().is_none(),
+            "a rejected insert must write nothing"
+        );
+    }
+
+    #[test]
+    fn anchor_filters_scope_by_kind_and_value() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let on_server = insert(&store, |m| {
+            m.anchors = vec![rb_types::MemoryAnchor::parse_file_spec("src/server.rs").unwrap()];
+        });
+        let on_commit = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(1);
+            m.anchors =
+                vec![rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc123").unwrap()];
+        });
+        let on_symbol = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(2);
+            m.anchors =
+                vec![
+                    rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Engine::recall")
+                        .unwrap(),
+                ];
+        });
+        let _bare = insert(&store, |m| m.created_at -= chrono::Duration::seconds(3));
+
+        // The PRD acceptance criterion: present under its own file, absent
+        // under a different file.
+        let hits = store
             .list_filtered(
                 &ns(),
-                &RecallFilter {
-                    anchors: vec![rb_types::AnchorFilter {
-                        kind: rb_types::AnchorKind::File,
-                        value: "src/lib.rs".into(),
-                    }],
-                    ..Default::default()
-                },
+                &anchor_only(rb_types::AnchorKind::File, "src/server.rs"),
                 10,
             )
+            .unwrap();
+        assert_eq!(ids(&hits), vec![on_server.clone()]);
+        let miss = store
+            .list_filtered(
+                &ns(),
+                &anchor_only(rb_types::AnchorKind::File, "src/other.rs"),
+                10,
+            )
+            .unwrap();
+        assert!(miss.is_empty());
+
+        let hits = store
+            .list_filtered(
+                &ns(),
+                &anchor_only(rb_types::AnchorKind::Commit, "abc123"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&hits), vec![on_commit.clone()]);
+
+        let hits = store
+            .list_filtered(
+                &ns(),
+                &anchor_only(rb_types::AnchorKind::Symbol, "Engine::recall"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&hits), vec![on_symbol.clone()]);
+
+        // Kinds never cross-match on an equal value.
+        let cross = store
+            .list_filtered(
+                &ns(),
+                &anchor_only(rb_types::AnchorKind::Symbol, "abc123"),
+                10,
+            )
+            .unwrap();
+        assert!(cross.is_empty(), "commit value must not match as a symbol");
+    }
+
+    #[test]
+    fn anchor_filter_normalizes_values_and_ignores_line_ranges() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Stored WITH a line range and a ./ prefix in the filter: still one
+        // path-level anchor (normalization on both sides; v1 matches by path).
+        let ranged = insert(&store, |m| {
+            m.anchors = vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs:12-40").unwrap()];
+        });
+        let hits = store
+            .list_filtered(
+                &ns(),
+                &anchor_only(rb_types::AnchorKind::File, "./src/a.rs"),
+                10,
+            )
+            .unwrap();
+        assert_eq!(ids(&hits), vec![ranged]);
+    }
+
+    #[test]
+    fn anchor_filters_compose_all_of_and_with_metadata() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let both = insert(&store, |m| {
+            m.importance = 8;
+            m.tags = vec!["infra".to_string()];
+            m.anchors = vec![
+                rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap(),
+                rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Foo::bar").unwrap(),
+            ];
+        });
+        let file_only = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(1);
+            m.importance = 8;
+            m.tags = vec!["infra".to_string()];
+            m.anchors = vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()];
+        });
+        let _low = insert(&store, |m| {
+            m.created_at -= chrono::Duration::seconds(2);
+            m.importance = 2;
+            m.anchors = vec![
+                rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap(),
+                rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Foo::bar").unwrap(),
+            ];
+        });
+
+        // All-of over multiple anchor filters.
+        let filter = RecallFilter {
+            anchors: vec![
+                rb_types::AnchorFilter {
+                    kind: rb_types::AnchorKind::File,
+                    value: "src/a.rs".to_string(),
+                },
+                rb_types::AnchorFilter {
+                    kind: rb_types::AnchorKind::Symbol,
+                    value: "Foo::bar".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let hits = store.list_filtered(&ns(), &filter, 10).unwrap();
+        assert_eq!(
+            ids(&hits),
+            vec![both.clone(), _low.clone()],
+            "every anchor filter must match (all-of)"
+        );
+
+        // Anchors compose with --type/--tags/--min-importance (PRD acceptance).
+        let composed = RecallFilter {
+            types: vec![MemoryType::Insight],
+            tags: vec!["infra".to_string()],
+            min_importance: Some(7),
+            anchors: vec![rb_types::AnchorFilter {
+                kind: rb_types::AnchorKind::File,
+                value: "src/a.rs".to_string(),
+            }],
+            ..Default::default()
+        };
+        let hits = store.list_filtered(&ns(), &composed, 10).unwrap();
+        assert_eq!(ids(&hits), vec![both, file_only]);
+    }
+
+    #[test]
+    fn anchor_filter_rejects_empty_values_fail_closed() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let err = store
+            .list_filtered(&ns(), &anchor_only(rb_types::AnchorKind::File, "  "), 10)
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
             "expected InvalidArgument, got {err:?}"
         );
+    }
+
+    #[test]
+    fn anchor_filters_probe_the_wide_anchor_indexes() {
+        // Reviewer finding (PR #59, verified with EXPLAIN QUERY PLAN at 100k
+        // rows): the original correlated-EXISTS anchor probe was ALWAYS
+        // planned as a full `memories` SCAN plus a per-row
+        // idx_memory_anchors_memory lookup — the wide (namespace, kind,
+        // path|ref) indexes were never chosen, so a selective anchor filter
+        // cost O(active memories), not O(matching anchors). The filter is a
+        // namespace-scoped IN semi-join precisely so those indexes drive it;
+        // this test EXPLAINs the EXACT query `list_filtered` executes and
+        // pins the index choice for every anchor kind.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let _ = insert(&store, |m| {
+            m.anchors = vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()];
+        });
+        for (filter, index) in [
+            (
+                anchor_only(rb_types::AnchorKind::File, "src/a.rs"),
+                "idx_memory_anchors_path",
+            ),
+            (
+                anchor_only(rb_types::AnchorKind::Commit, "abc123"),
+                "idx_memory_anchors_ref",
+            ),
+            (
+                anchor_only(rb_types::AnchorKind::Symbol, "Foo::bar"),
+                "idx_memory_anchors_ref",
+            ),
+        ] {
+            let (sql, params) = build_list_filtered_query(&ns(), &filter, 10).unwrap();
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = store
+                .conn
+                .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+                .unwrap();
+            let plan: Vec<String> = stmt
+                .query_map(refs.as_slice(), |row| row.get::<_, String>(3))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            let plan = plan.join("\n");
+            assert!(
+                plan.contains(index),
+                "the anchor subquery must be served by {index}; plan:\n{plan}"
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_anchors_collapse_to_one_row() {
+        // Repeated identical anchors (repeated CLI flags, `--batch` fan-out)
+        // must not accumulate duplicate rows. Dedup is normalization-aware
+        // (`./src/a.rs` == `src/a.rs`) and exact otherwise: a different line
+        // range is a DISTINCT anchor and is kept.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ranged = rb_types::MemoryAnchor::parse_file_spec("src/a.rs:3-9").unwrap();
+        // Same anchor spelled with a `./` prefix, bypassing parse-time
+        // normalization (a raw wire payload could carry this).
+        let ranged_dotted = rb_types::MemoryAnchor {
+            kind: rb_types::AnchorKind::File,
+            value: "./src/a.rs".to_string(),
+            start_line: Some(3),
+            end_line: Some(9),
+        };
+        let rangeless = rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap();
+        let id = insert(&store, |m| {
+            m.anchors = vec![
+                ranged.clone(),
+                ranged_dotted,
+                ranged.clone(),
+                rangeless.clone(),
+            ];
+        });
+        let got = store.get_memory(&id).unwrap().unwrap();
+        assert_eq!(
+            got.anchors,
+            vec![ranged, rangeless],
+            "exact duplicates (post-normalization) collapse; distinct ranges stay"
+        );
+    }
+
+    #[test]
+    fn anchor_filter_agrees_with_recall_filter_matches() {
+        // Drift guard (the `contested_filter_agrees_with_active_contradicts`
+        // pattern): the SQL anchor predicate in `list_filtered` and
+        // `RecallFilter::matches` are two expressions of ONE semantics
+        // (all-of, kind-scoped, normalized-value equality, path-level for
+        // files). If either changes alone, this fails.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut inserted = Vec::new();
+        let variants: Vec<Vec<rb_types::MemoryAnchor>> = vec![
+            vec![],
+            vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()],
+            vec![rb_types::MemoryAnchor::parse_file_spec("./src/a.rs:3-9").unwrap()],
+            vec![rb_types::MemoryAnchor::parse_file_spec("src/b.rs").unwrap()],
+            vec![
+                rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap(),
+                rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc123").unwrap(),
+            ],
+            vec![rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "abc123").unwrap()],
+        ];
+        for (i, anchors) in variants.into_iter().enumerate() {
+            let mut m = MemoryNote::new(ns(), format!("variant {i}"), MemoryType::Insight, 5);
+            m.created_at -= chrono::Duration::seconds(i as i64);
+            m.anchors = anchors;
+            store.insert_memory(&m, None).unwrap();
+            inserted.push(m);
+        }
+
+        let filters = [
+            anchor_only(rb_types::AnchorKind::File, "src/a.rs"),
+            anchor_only(rb_types::AnchorKind::File, "./src/a.rs"),
+            anchor_only(rb_types::AnchorKind::Commit, "abc123"),
+            anchor_only(rb_types::AnchorKind::Symbol, "abc123"),
+            RecallFilter {
+                anchors: vec![
+                    rb_types::AnchorFilter {
+                        kind: rb_types::AnchorKind::File,
+                        value: "src/a.rs".to_string(),
+                    },
+                    rb_types::AnchorFilter {
+                        kind: rb_types::AnchorKind::Commit,
+                        value: "abc123".to_string(),
+                    },
+                ],
+                ..Default::default()
+            },
+        ];
+        for filter in filters {
+            let sql_ids: std::collections::HashSet<_> =
+                ids(&store.list_filtered(&ns(), &filter, 100).unwrap())
+                    .into_iter()
+                    .collect();
+            let matches_ids: std::collections::HashSet<_> = inserted
+                .iter()
+                .filter(|m| filter.matches(m))
+                .map(|m| m.id.clone())
+                .collect();
+            assert_eq!(
+                sql_ids, matches_ids,
+                "SQL anchor predicate must agree with RecallFilter::matches for {filter:?}"
+            );
+        }
     }
 
     #[test]

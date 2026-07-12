@@ -171,6 +171,52 @@ fn opt_sources(args: &Value, key: &str) -> Result<Vec<String>, ToolError> {
     Ok(sources)
 }
 
+/// Parse the optional anchor FILTER params shared by `recall` and `list`
+/// (PRD 2026-07-02 typed-code-anchors): `file` (path only — line ranges are
+/// a clean error, shared rule with the CLI via
+/// `rb_types::parse_file_filter`), `commit`, `symbol`. Each is a single
+/// string; multiple anchor kinds compose all-of.
+fn parse_anchor_filters(args: &Value) -> Result<Vec<rb_types::AnchorFilter>, ToolError> {
+    let mut anchors = Vec::new();
+    if let Some(spec) = opt_string(args, "file")? {
+        anchors.push(rb_types::parse_file_filter(&spec).map_err(|e| invalid(e.to_string()))?);
+    }
+    for (key, kind) in [
+        ("commit", rb_types::AnchorKind::Commit),
+        ("symbol", rb_types::AnchorKind::Symbol),
+    ] {
+        if let Some(value) = opt_string(args, key)? {
+            let filter = rb_types::AnchorFilter { kind, value };
+            filter.validate().map_err(|e| invalid(e.to_string()))?;
+            anchors.push(filter);
+        }
+    }
+    Ok(anchors)
+}
+
+/// Parse the anchor CAPTURE params on `remember` (PRD 2026-07-02): `files`
+/// (`PATH[:LINE[-END]]` specs), `commits`, `symbols` — optional string
+/// arrays, each entry validated fail-closed.
+fn parse_capture_anchors(args: &Value) -> Result<Vec<rb_types::MemoryAnchor>, ToolError> {
+    let mut anchors = Vec::new();
+    for spec in opt_string_vec(args, "files")? {
+        anchors.push(
+            rb_types::MemoryAnchor::parse_file_spec(&spec).map_err(|e| invalid(e.to_string()))?,
+        );
+    }
+    for (key, kind) in [
+        ("commits", rb_types::AnchorKind::Commit),
+        ("symbols", rb_types::AnchorKind::Symbol),
+    ] {
+        for value in opt_string_vec(args, key)? {
+            anchors.push(
+                rb_types::MemoryAnchor::new(kind, &value).map_err(|e| invalid(e.to_string()))?,
+            );
+        }
+    }
+    Ok(anchors)
+}
+
 /// Parse the unified filter dimensions shared by the `recall` and `list` tools
 /// (PRD 2026-07-02 search-filter parity). Does NOT read `type`/`tags` — the
 /// callers route those (legacy wire slots for recall; filter fields for list).
@@ -189,6 +235,7 @@ fn parse_filter(args: &Value) -> Result<rb_types::RecallFilter, ToolError> {
         } else {
             rb_types::MemoryState::Active
         },
+        anchors: parse_anchor_filters(args)?,
         ..Default::default()
     };
     // Fail fast on inverted ranges at the tool boundary (the daemon would
@@ -220,6 +267,7 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 // The MCP `remember` tool stores plainly; update-as-supersede
                 // (W3.1) is driven by the hook capture path, not this tool.
                 supersedes: None,
+                anchors: parse_capture_anchors(args)?,
             })
         }
         "recall" => Ok(Request::Recall {
@@ -796,6 +844,90 @@ mod tests {
             ("recall", json!({ "query": "q", "archived": 1 })),
             ("list", json!({ "until": 12345 })),
             ("list", json!({ "max_importance": 0 })),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code, INVALID_PARAMS,
+                "{tool} {args} must fail closed, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn build_remember_request_parses_anchor_capture_params() {
+        let req = build_request(
+            "remember",
+            &json!({
+                "content": "c",
+                "files": ["src/a.rs:12-40", "./src/b.rs"],
+                "commits": ["abc123"],
+                "symbols": ["Foo::bar"]
+            }),
+        )
+        .unwrap();
+        match req {
+            Request::Remember { anchors, .. } => {
+                assert_eq!(anchors.len(), 4);
+                assert_eq!(anchors[0].kind, rb_types::AnchorKind::File);
+                assert_eq!(anchors[0].value, "src/a.rs");
+                assert_eq!(
+                    (anchors[0].start_line, anchors[0].end_line),
+                    (Some(12), Some(40))
+                );
+                assert_eq!(anchors[1].value, "src/b.rs", "paths normalize");
+                assert_eq!(anchors[2].kind, rb_types::AnchorKind::Commit);
+                assert_eq!(anchors[2].value, "abc123");
+                assert_eq!(anchors[3].kind, rb_types::AnchorKind::Symbol);
+                assert_eq!(anchors[3].value, "Foo::bar");
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+        // Absent params -> no anchors (the pre-anchor behavior).
+        match build_request("remember", &json!({ "content": "c" })).unwrap() {
+            Request::Remember { anchors, .. } => assert!(anchors.is_empty()),
+            other => panic!("expected Remember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn recall_and_list_map_anchor_filter_params() {
+        for tool in ["recall", "list"] {
+            let mut args = json!({
+                "file": "./src/server.rs",
+                "commit": "abc123",
+                "symbol": "Engine::recall"
+            });
+            if tool == "recall" {
+                args["query"] = json!("q");
+            }
+            let req = build_request(tool, &args).unwrap();
+            let filter = match req {
+                Request::Recall { filter, .. } | Request::List { filter, .. } => filter,
+                other => panic!("expected Recall/List, got {other:?}"),
+            };
+            assert_eq!(filter.anchors.len(), 3, "{tool}");
+            assert_eq!(filter.anchors[0].kind, rb_types::AnchorKind::File);
+            assert_eq!(filter.anchors[0].value, "src/server.rs", "normalized");
+            assert_eq!(filter.anchors[1].kind, rb_types::AnchorKind::Commit);
+            assert_eq!(filter.anchors[2].kind, rb_types::AnchorKind::Symbol);
+        }
+    }
+
+    #[test]
+    fn anchor_params_fail_closed_on_garbage() {
+        for (tool, args) in [
+            // Capture: bad line ranges and empty values are clean errors.
+            ("remember", json!({ "content": "c", "files": ["a.rs:12-"] })),
+            ("remember", json!({ "content": "c", "files": ["a.rs:0"] })),
+            ("remember", json!({ "content": "c", "files": [""] })),
+            ("remember", json!({ "content": "c", "commits": ["  "] })),
+            ("remember", json!({ "content": "c", "symbols": [42] })),
+            // Filters: line ranges are capture-only; empty values rejected.
+            ("recall", json!({ "query": "q", "file": "a.rs:12-40" })),
+            ("recall", json!({ "query": "q", "file": "" })),
+            ("recall", json!({ "query": "q", "commit": " " })),
+            ("list", json!({ "file": "a.rs:3" })),
+            ("list", json!({ "symbol": ["not-a-string"] })),
         ] {
             let err = build_request(tool, &args).unwrap_err();
             assert_eq!(

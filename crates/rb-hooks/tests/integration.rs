@@ -151,6 +151,7 @@ struct RememberObs {
     content: String,
     supersedes: Option<String>,
     issued_id: String,
+    anchors: Vec<rb_types::MemoryAnchor>,
 }
 
 /// Record one request into `observed` and build the mock's response. A Remember
@@ -164,6 +165,7 @@ fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
             content,
             context,
             supersedes,
+            anchors,
             ..
         } => {
             let id = MemoryId::new();
@@ -177,6 +179,7 @@ fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
                 content,
                 supersedes: supersedes.map(|m| m.to_string()),
                 issued_id: id.to_string(),
+                anchors,
             });
             Response::Remembered { id }
         }
@@ -245,6 +248,9 @@ async fn serve_remembers(
                 contract_version: CONTRACT_VERSION,
                 ok: true,
                 message: None,
+                // The mock plays a CURRENT daemon: advertise anchor support
+                // so hook-forwarded anchors can be observed by the e2e tests.
+                capabilities: vec![rb_proto::CAP_ANCHORS.to_string()],
             },
         )
         .await;
@@ -536,6 +542,15 @@ fn opencode_apply_patch_file_edit_folds_into_checkpoint_summary() {
     assert!(
         content.contains("Files touched"),
         "the summary must carry a files section: {content}"
+    );
+    // Typed code anchors (ANC-2): the summary is auto-anchored to the touched
+    // file, not just listing it in prose — the queryable link recall filters on.
+    let anchors = &observed.remembers[0].anchors;
+    assert!(
+        anchors
+            .iter()
+            .any(|a| a.kind == rb_types::AnchorKind::File && a.value.contains("notes.txt")),
+        "the summary must carry a file anchor for the touched file: {anchors:?}"
     );
 }
 

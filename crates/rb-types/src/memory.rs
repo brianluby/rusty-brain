@@ -1,3 +1,4 @@
+use crate::anchor::MemoryAnchor;
 use crate::link::MemoryLink;
 use crate::memory_id::MemoryId;
 use crate::memory_type::MemoryType;
@@ -57,6 +58,14 @@ pub struct MemoryNote {
     pub origin_source: Option<String>,
     #[serde(default)]
     pub session_id: Option<String>,
+    /// Typed code anchors (PRD 2026-07-02): structured file/commit/symbol
+    /// links, loaded from `memory_anchors` alongside the row (like `links`).
+    /// Additive + `#[serde(default, skip_serializing_if)]`: pre-anchor
+    /// payloads decode to an empty list, and an anchor-less note serializes
+    /// byte-identical to the pre-anchor shape (the `contested` precedent) —
+    /// NO CONTRACT_VERSION bump.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub anchors: Vec<MemoryAnchor>,
 }
 
 impl MemoryNote {
@@ -97,6 +106,7 @@ impl MemoryNote {
             origin_agent: None,
             origin_source: None,
             session_id: None,
+            anchors: Vec::new(),
         }
     }
 }
@@ -203,6 +213,32 @@ mod tests {
         assert!(back.origin_agent.is_none());
         assert!(back.origin_source.is_none());
         assert!(back.session_id.is_none());
+    }
+
+    #[test]
+    fn anchors_default_empty_absent_from_wire_and_round_trip() {
+        // Pre-anchor payload (no `anchors` key) decodes to an empty list, and
+        // an anchor-less note serializes WITHOUT the key — byte-identical to
+        // the pre-anchor shape (the `contested` additive-field precedent).
+        let m = sample();
+        assert!(m.anchors.is_empty());
+        let value = serde_json::to_value(&m).unwrap();
+        assert!(
+            value.as_object().unwrap().get("anchors").is_none(),
+            "empty anchors must not serialize: {value}"
+        );
+        let back: MemoryNote = serde_json::from_value(value).unwrap();
+        assert!(back.anchors.is_empty());
+
+        // A note WITH anchors round-trips them.
+        let mut anchored = sample();
+        anchored.anchors = vec![
+            crate::MemoryAnchor::parse_file_spec("src/a.rs:3-9").unwrap(),
+            crate::MemoryAnchor::new(crate::AnchorKind::Commit, "abc123").unwrap(),
+        ];
+        let json = serde_json::to_string(&anchored).unwrap();
+        let back: MemoryNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, anchored);
     }
 
     #[test]

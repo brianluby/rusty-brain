@@ -86,15 +86,41 @@ pub enum AnchorKind {
 /// One anchor constraint: scope results to memories anchored to `value`
 /// (a file path, commit SHA, or symbol name, per `kind`).
 ///
-/// Wire plumbing only for now: the filter MODEL ships with search-filter
-/// parity (PRD 2026-07-02) so the contract needs no second change, but
-/// evaluating it requires the `memory_anchors` table from the typed-code-anchors
-/// PRD — until that lands, engines/stores reject a non-empty anchor filter
-/// with `Error::InvalidArgument` (fail fast, never silently unfiltered).
+/// The MODEL shipped with search-filter parity (PRD 2026-07-02); evaluation
+/// shipped with typed code anchors: the value is compared against a memory's
+/// [`crate::MemoryAnchor`]s under the same normalization
+/// ([`crate::normalize_anchor_value`]) on both sides, so `./src/a.rs` and
+/// `src/a.rs` are the same file anchor. Multiple anchor filters compose
+/// all-of (like tags): every listed anchor must match. File filters match by
+/// PATH only — a stored line range never narrows a filter in v1.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AnchorFilter {
     pub kind: AnchorKind,
     pub value: String,
+}
+
+impl AnchorFilter {
+    /// Whether `anchor` satisfies this constraint: same kind, same normalized
+    /// value (file line ranges are ignored — path-level matching in v1).
+    #[must_use]
+    pub fn matches_anchor(&self, anchor: &crate::MemoryAnchor) -> bool {
+        self.kind == anchor.kind
+            && crate::normalize_anchor_value(self.kind, &self.value)
+                == crate::normalize_anchor_value(anchor.kind, &anchor.value)
+    }
+
+    /// Fail-fast boundary validation: the value must be non-empty after
+    /// normalization (an empty anchor filter can never match and is a caller
+    /// mistake, not an empty result set).
+    pub fn validate(&self) -> crate::error::Result<()> {
+        if crate::normalize_anchor_value(self.kind, &self.value).is_empty() {
+            return Err(crate::error::Error::InvalidArgument(format!(
+                "{} anchor filter value must not be empty",
+                crate::anchor_kind_str(self.kind)
+            )));
+        }
+        Ok(())
+    }
 }
 
 /// The unified recall/list filter model (PRD 2026-07-02 search-filter parity):
@@ -108,11 +134,12 @@ pub struct AnchorFilter {
 ///   field), keeping frames byte-identical to the pre-filter shape — additive,
 ///   NO CONTRACT_VERSION bump (the `contested` precedent).
 ///
-/// Semantics: `types`/`sources` are any-of; `tags` is all-of; numeric and time
-/// ranges are inclusive; `contested` is tri-state (`None` = no constraint);
-/// `state` defaults to active-only. `contested` and `anchors` are NOT decided
-/// by [`RecallFilter::matches`] (they need link/anchor lookups) — callers
-/// evaluate those dimensions where the data lives.
+/// Semantics: `types`/`sources` are any-of; `tags` and `anchors` are all-of;
+/// numeric and time ranges are inclusive; `contested` is tri-state (`None` =
+/// no constraint); `state` defaults to active-only. `contested` is NOT
+/// decided by [`RecallFilter::matches`] (it needs a link lookup) — callers
+/// evaluate that dimension where the data lives. `anchors` IS decided by
+/// `matches` (the note carries its anchors since typed code anchors).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct RecallFilter {
     /// Restrict to any of these memory types (empty = no constraint).
@@ -147,8 +174,9 @@ pub struct RecallFilter {
     /// Archived-state scope (default: active-only, the pre-filter behavior).
     #[serde(default, skip_serializing_if = "MemoryState::is_active")]
     pub state: MemoryState,
-    /// Code-anchor constraints (see [`AnchorFilter`]): wire plumbing shipped
-    /// with search-filter parity; evaluation lands with typed code anchors.
+    /// Code-anchor constraints (see [`AnchorFilter`]; all-of, like `tags`):
+    /// wire plumbing shipped with search-filter parity; evaluation shipped
+    /// with typed code anchors (PRD 2026-07-02).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<AnchorFilter>,
 }
@@ -200,15 +228,21 @@ impl RecallFilter {
                 )));
             }
         }
+        for anchor in &self.anchors {
+            anchor.validate()?;
+        }
         Ok(())
     }
 
-    /// Whether `note` satisfies every metadata dimension of this filter:
+    /// Whether `note` satisfies every note-decidable dimension of this filter:
     /// types (any-of), tags (all-of), importance/confidence ranges
-    /// (inclusive), created-at window (inclusive), sources (any-of), and
-    /// archived state. `contested` and `anchors` are intentionally NOT
-    /// evaluated here — they require link/anchor lookups the note does not
-    /// carry, so callers handle those dimensions where the data lives.
+    /// (inclusive), created-at window (inclusive), sources (any-of), archived
+    /// state, and anchors (all-of over `note.anchors`, normalized on both
+    /// sides — kept in lockstep with the store's SQL by the
+    /// `anchor_filter_agrees_with_recall_filter_matches` drift test).
+    /// `contested` is intentionally NOT evaluated here — it requires a link
+    /// lookup the note does not carry, so callers handle it where the data
+    /// lives.
     #[must_use]
     pub fn matches(&self, note: &MemoryNote) -> bool {
         if !self.types.is_empty() && !self.types.contains(&note.memory_type) {
@@ -240,6 +274,15 @@ impl RecallFilter {
                 .origin_source
                 .as_ref()
                 .is_some_and(|s| self.sources.contains(s))
+        {
+            return false;
+        }
+        // All-of (like tags): every anchor constraint must be satisfied by
+        // at least one of the note's anchors.
+        if !self
+            .anchors
+            .iter()
+            .all(|af| note.anchors.iter().any(|a| af.matches_anchor(a)))
         {
             return false;
         }
@@ -625,15 +668,103 @@ mod tests {
     }
 
     #[test]
-    fn matches_ignores_contested_and_anchors_dimensions() {
-        // `contested` needs a link lookup and `anchors` needs the (PRD 4)
-        // anchors table; neither is decidable from the note alone, so
-        // `matches` must not reject on them — callers handle those dimensions.
+    fn matches_ignores_the_contested_dimension() {
+        // `contested` needs a link lookup the note does not carry, so
+        // `matches` must not reject on it — callers handle that dimension.
         let filter = RecallFilter {
             contested: Some(true),
             ..Default::default()
         };
         assert!(filter.matches(&note_with(|_| {})));
+    }
+
+    fn anchor_filter(kind: AnchorKind, value: &str) -> RecallFilter {
+        RecallFilter {
+            anchors: vec![AnchorFilter {
+                kind,
+                value: value.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn matches_filters_by_anchor_per_kind() {
+        let anchored = note_with(|n| {
+            n.anchors = vec![
+                crate::MemoryAnchor::parse_file_spec("src/server.rs:10-20").unwrap(),
+                crate::MemoryAnchor::new(AnchorKind::Commit, "abc123").unwrap(),
+                crate::MemoryAnchor::new(AnchorKind::Symbol, "Engine::recall").unwrap(),
+            ];
+        });
+        let bare = note_with(|_| {});
+
+        // Acceptance criterion (PRD): anchored memory matches its file filter
+        // and is absent under a different file.
+        assert!(anchor_filter(AnchorKind::File, "src/server.rs").matches(&anchored));
+        assert!(!anchor_filter(AnchorKind::File, "src/other.rs").matches(&anchored));
+        assert!(!anchor_filter(AnchorKind::File, "src/server.rs").matches(&bare));
+
+        assert!(anchor_filter(AnchorKind::Commit, "abc123").matches(&anchored));
+        assert!(!anchor_filter(AnchorKind::Commit, "def456").matches(&anchored));
+        assert!(anchor_filter(AnchorKind::Symbol, "Engine::recall").matches(&anchored));
+
+        // Kinds never cross-match, even on an equal value.
+        assert!(!anchor_filter(AnchorKind::Symbol, "abc123").matches(&anchored));
+    }
+
+    #[test]
+    fn matches_normalizes_anchor_values_on_both_sides() {
+        // `./src/a.rs` (filter) matches `src/a.rs` (stored) and vice versa;
+        // a stored line range never narrows a path-level filter (v1).
+        let anchored = note_with(|n| {
+            n.anchors = vec![crate::MemoryAnchor::parse_file_spec("./src/a.rs:5").unwrap()];
+        });
+        assert!(anchor_filter(AnchorKind::File, "src/a.rs").matches(&anchored));
+        assert!(anchor_filter(AnchorKind::File, " ./src/a.rs ").matches(&anchored));
+    }
+
+    #[test]
+    fn matches_requires_every_anchor_filter() {
+        // All-of composition (like tags): both constraints must be satisfied.
+        let filter = RecallFilter {
+            anchors: vec![
+                AnchorFilter {
+                    kind: AnchorKind::File,
+                    value: "src/a.rs".to_string(),
+                },
+                AnchorFilter {
+                    kind: AnchorKind::Symbol,
+                    value: "Foo::bar".to_string(),
+                },
+            ],
+            ..Default::default()
+        };
+        let both = note_with(|n| {
+            n.anchors = vec![
+                crate::MemoryAnchor::new(AnchorKind::File, "src/a.rs").unwrap(),
+                crate::MemoryAnchor::new(AnchorKind::Symbol, "Foo::bar").unwrap(),
+            ];
+        });
+        let file_only = note_with(|n| {
+            n.anchors = vec![crate::MemoryAnchor::new(AnchorKind::File, "src/a.rs").unwrap()];
+        });
+        assert!(filter.matches(&both));
+        assert!(!filter.matches(&file_only));
+    }
+
+    #[test]
+    fn validate_rejects_empty_anchor_filter_values() {
+        for value in ["", "   ", "./"] {
+            let filter = anchor_filter(AnchorKind::File, value);
+            assert!(
+                filter.validate().is_err(),
+                "empty-after-normalization anchor value {value:?} must be rejected"
+            );
+        }
+        assert!(anchor_filter(AnchorKind::File, "src/a.rs")
+            .validate()
+            .is_ok());
     }
 
     #[test]

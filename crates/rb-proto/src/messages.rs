@@ -45,12 +45,28 @@ pub struct ClientIdentity {
     pub source: Option<String>,
 }
 
+/// Capability string a daemon advertises when it evaluates typed code
+/// anchors (the `memory_anchors` table + anchor filters, PRD 2026-07-02).
+/// Pre-anchor daemons never send it, so clients can distinguish "this daemon
+/// evaluates anchors" from "this daemon would silently drop/ignore them"
+/// WITHOUT a CONTRACT_VERSION bump.
+pub const CAP_ANCHORS: &str = "anchors";
+
 /// Daemon reply to a `Handshake`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HandshakeAck {
     pub contract_version: u32,
     pub ok: bool,
     pub message: Option<String>,
+    /// Feature capabilities this daemon supports beyond the bare contract
+    /// version (first: [`CAP_ANCHORS`]). Additive + `#[serde(default,
+    /// skip_serializing_if)]`: an old daemon's ack (no key) decodes to an
+    /// empty list — the client then treats anchor-bearing requests as
+    /// unsupported and fails fast locally — and an empty list serializes to
+    /// nothing, byte-identical to the pre-capability ack (the
+    /// `Handshake.identity` precedent; NO CONTRACT_VERSION bump).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub capabilities: Vec<String>,
 }
 
 /// One request per engine operation. Internally tagged on `op`.
@@ -91,6 +107,16 @@ pub enum Request {
         /// frame, so NO CONTRACT_VERSION bump (the `confidence` precedent).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         supersedes: Option<MemoryId>,
+        /// Typed code anchors to store with the memory (PRD 2026-07-02).
+        /// Additive + `#[serde(default, skip_serializing_if)]`: an old
+        /// client's frame (no key) decodes to no anchors, and an empty list
+        /// serializes to nothing — byte-identical to the pre-anchor frame,
+        /// so NO CONTRACT_VERSION bump. A PRE-ANCHOR daemon would silently
+        /// DROP this field, so new clients gate on the daemon's advertised
+        /// [`CAP_ANCHORS`] capability before sending non-empty anchors
+        /// (see `Client::remember_anchored`).
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        anchors: Vec<rb_types::MemoryAnchor>,
     },
     Recall {
         query: String,
@@ -222,6 +248,20 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_days: Option<u32>,
     },
+}
+
+/// True when `req` carries a typed-code-anchor payload that a PRE-ANCHOR
+/// daemon would silently DROP (`Remember.anchors`) or, on a pre-filter
+/// daemon, silently IGNORE (`Recall`/`List` filter anchors). Raw-`Request`
+/// callers (the MCP adapter) gate on this plus the daemon's advertised
+/// [`CAP_ANCHORS`]; the typed `Client` wrappers gate internally.
+#[must_use]
+pub fn request_uses_anchors(req: &Request) -> bool {
+    match req {
+        Request::Remember { anchors, .. } => !anchors.is_empty(),
+        Request::Recall { filter, .. } | Request::List { filter, .. } => !filter.anchors.is_empty(),
+        _ => false,
+    }
 }
 
 /// Aggregate per-channel recall hit-contribution totals (W1.0), surfaced on
@@ -460,6 +500,7 @@ mod tests {
             related_files: vec![],
             confidence: Some(0.3),
             supersedes: None,
+            anchors: vec![],
         };
         // Some(x) serializes the key and round-trips back to Some(x).
         let json = serde_json::to_value(&explicit).unwrap();
@@ -496,6 +537,7 @@ mod tests {
             related_files: vec![],
             confidence: None,
             supersedes: None,
+            anchors: vec![],
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -520,6 +562,7 @@ mod tests {
             related_files: vec![],
             confidence: None,
             supersedes: Some(old.clone()),
+            anchors: vec![],
         };
         // Some(id) serializes the key and round-trips back to the same id.
         let json = serde_json::to_value(&explicit).unwrap();
@@ -553,6 +596,7 @@ mod tests {
             related_files: vec![],
             confidence: None,
             supersedes: None,
+            anchors: vec![],
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -567,11 +611,162 @@ mod tests {
             contract_version: CONTRACT_VERSION,
             ok: false,
             message: Some("version mismatch".into()),
+            capabilities: vec![],
         };
         let json = serde_json::to_string(&ack).unwrap();
         let back: HandshakeAck = serde_json::from_str(&json).unwrap();
         assert!(!back.ok);
         assert_eq!(back.message.as_deref(), Some("version mismatch"));
+    }
+
+    #[test]
+    fn handshake_ack_capabilities_are_additive_in_both_directions() {
+        // OLD daemon -> NEW client: an ack without the `capabilities` key
+        // decodes to an empty list (the client then treats anchors as
+        // unsupported and fails fast locally).
+        let old = serde_json::json!({
+            "contract_version": CONTRACT_VERSION, "ok": true, "message": null
+        });
+        let back: HandshakeAck = serde_json::from_value(old).unwrap();
+        assert!(back.capabilities.is_empty());
+
+        // An empty capabilities list serializes to NOTHING — byte-identical
+        // to the pre-capability ack shape.
+        let bare = HandshakeAck {
+            contract_version: CONTRACT_VERSION,
+            ok: true,
+            message: None,
+            capabilities: vec![],
+        };
+        let json = serde_json::to_value(&bare).unwrap();
+        assert!(
+            json.as_object().unwrap().get("capabilities").is_none(),
+            "empty capabilities must not serialize: {json}"
+        );
+
+        // NEW daemon -> OLD client: a decoder that does not know the field
+        // must still accept the ack (serde ignores unknown fields).
+        #[derive(serde::Deserialize)]
+        struct OldAck {
+            contract_version: u32,
+            ok: bool,
+            #[allow(dead_code)]
+            message: Option<String>,
+        }
+        let new = HandshakeAck {
+            contract_version: CONTRACT_VERSION,
+            ok: true,
+            message: None,
+            capabilities: vec![CAP_ANCHORS.to_string()],
+        };
+        let json = serde_json::to_string(&new).unwrap();
+        let back: OldAck = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.contract_version, CONTRACT_VERSION);
+        assert!(back.ok);
+    }
+
+    #[test]
+    fn remember_without_anchors_decodes_to_empty_and_empty_omits_the_key() {
+        // Wire compat (typed code anchors): an old payload with no `anchors`
+        // decodes to an empty list, and an empty list serializes WITHOUT the
+        // key — byte-identical to the pre-anchor frame, so no
+        // CONTRACT_VERSION bump (the `confidence`/`supersedes` precedent).
+        let explicit = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+            supersedes: None,
+            anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs:2-4").unwrap()],
+        };
+        let json = serde_json::to_value(&explicit).unwrap();
+        assert!(
+            json.get("anchors").is_some(),
+            "non-empty anchors must serialize the key: {json}"
+        );
+        match serde_json::from_value::<Request>(json.clone()).unwrap() {
+            Request::Remember { anchors, .. } => {
+                assert_eq!(anchors.len(), 1);
+                assert_eq!(anchors[0].value, "src/a.rs");
+                assert_eq!(anchors[0].start_line, Some(2));
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+
+        // Removing the key decodes to an empty list (old client).
+        let mut value = json;
+        value.as_object_mut().unwrap().remove("anchors");
+        match serde_json::from_value::<Request>(value).unwrap() {
+            Request::Remember { anchors, .. } => assert!(anchors.is_empty()),
+            other => panic!("expected Remember, got {other:?}"),
+        }
+
+        // Empty anchors serialize to nothing (no key) — pre-anchor shape.
+        let none = Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+            supersedes: None,
+            anchors: vec![],
+        };
+        let json = serde_json::to_value(&none).unwrap();
+        assert!(
+            json.as_object().unwrap().get("anchors").is_none(),
+            "empty anchors must not serialize: {json}"
+        );
+    }
+
+    #[test]
+    fn request_uses_anchors_flags_exactly_the_anchor_bearing_frames() {
+        let anchored_filter = rb_types::RecallFilter {
+            anchors: vec![rb_types::AnchorFilter {
+                kind: rb_types::AnchorKind::File,
+                value: "src/a.rs".into(),
+            }],
+            ..Default::default()
+        };
+        assert!(request_uses_anchors(&Request::Recall {
+            query: "q".into(),
+            memory_type: None,
+            tags: vec![],
+            limit: 5,
+            filter: anchored_filter.clone(),
+        }));
+        assert!(request_uses_anchors(&Request::List {
+            min_importance: None,
+            limit: 5,
+            filter: anchored_filter,
+        }));
+        assert!(request_uses_anchors(&Request::Remember {
+            content: "c".into(),
+            context: None,
+            memory_type: MemoryType::Insight,
+            importance: 5,
+            keywords: vec![],
+            tags: vec![],
+            related_files: vec![],
+            confidence: None,
+            supersedes: None,
+            anchors: vec![rb_types::MemoryAnchor::parse_file_spec("a.rs").unwrap()],
+        }));
+        // Anchor-free frames are never flagged.
+        assert!(!request_uses_anchors(&Request::Recall {
+            query: "q".into(),
+            memory_type: None,
+            tags: vec![],
+            limit: 5,
+            filter: rb_types::RecallFilter::default(),
+        }));
+        assert!(!request_uses_anchors(&Request::Ping));
     }
 
     fn all_requests() -> Vec<Request> {
@@ -587,6 +782,7 @@ mod tests {
                 related_files: vec!["src/lib.rs".into()],
                 confidence: Some(0.7),
                 supersedes: Some(id.clone()),
+                anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/lib.rs:3-9").unwrap()],
             },
             Request::Recall {
                 query: "q".into(),

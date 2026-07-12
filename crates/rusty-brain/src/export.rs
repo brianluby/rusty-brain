@@ -158,6 +158,10 @@ fn format_markdown(memories: &[MemoryNote]) -> String {
         if m.contested {
             out.push_str("- **Contested:** yes\n");
         }
+        if !m.anchors.is_empty() {
+            let labels: Vec<String> = m.anchors.iter().map(ToString::to_string).collect();
+            out.push_str(&format!("- **Anchors:** {}\n", labels.join(", ")));
+        }
         if !m.context.is_empty() {
             out.push_str(&format!("- **Context:** {}\n", m.context));
         }
@@ -329,6 +333,9 @@ pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
             importance: m.importance,
             source: format!("restore:{}", m.id),
             tags: m.tags,
+            // Anchors survive export/restore (ANC-4): carried verbatim into
+            // the re-remember.
+            anchors: m.anchors,
         });
     }
     Ok(items)
@@ -388,6 +395,7 @@ mod tests {
             origin_agent: Some("cli".to_string()),
             origin_source: Some("cli".to_string()),
             session_id: None,
+            anchors: Vec::new(),
         }
     }
 
@@ -422,6 +430,29 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].summary, "Decision A");
         assert_eq!(items[1].memory_type, MemoryType::ArchitectureDecision);
+    }
+
+    #[test]
+    fn anchors_survive_json_export_and_parse_restore() {
+        // ANC-4: anchors are included in export and round-trip through
+        // restore (carried onto the ImportItem the re-remember consumes).
+        let mut anchored = sample_note("Anchored", "Body", MemoryType::Insight, 6);
+        anchored.anchors = vec![
+            rb_types::MemoryAnchor::parse_file_spec("src/server.rs:12-40").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc123").unwrap(),
+        ];
+        let json = format_json(&[anchored.clone()], "project:test").unwrap();
+        assert!(json.contains("src/server.rs"), "{json}");
+
+        let items = parse_restore(&json).unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].anchors, anchored.anchors);
+
+        // Markdown lists them for the human reader.
+        let md = format_markdown(&[anchored]);
+        assert!(md.contains("**Anchors:**"), "{md}");
+        assert!(md.contains("file:src/server.rs:12-40"), "{md}");
+        assert!(md.contains("commit:abc123"), "{md}");
     }
 
     #[test]

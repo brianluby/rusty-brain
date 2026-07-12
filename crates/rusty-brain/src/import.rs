@@ -42,6 +42,10 @@ pub struct ImportItem {
     /// Per-item tags merged with the batch tag at store time. Empty for file
     /// imports; populated by restore from the original memory's tags.
     pub tags: Vec<String>,
+    /// Typed code anchors (PRD 2026-07-02). Empty for file imports; populated
+    /// by restore from the original memory's anchors so they survive the
+    /// export/restore round-trip (ANC-4).
+    pub anchors: Vec<rb_types::MemoryAnchor>,
 }
 
 /// Counts for an import run.
@@ -181,6 +185,7 @@ pub fn extract_text(
         importance,
         source: label.to_string(),
         tags: Vec::new(),
+        anchors: Vec::new(),
     }
 }
 
@@ -388,6 +393,7 @@ fn recent_decision_commits(root: &Path, limit: usize) -> Vec<ImportItem> {
             importance: 4,
             source: format!("git log {hash}"),
             tags: Vec::new(),
+            anchors: Vec::new(),
         });
     }
     items
@@ -435,7 +441,7 @@ pub async fn store_items(
         tags.extend(item.tags.iter().cloned());
         tags.extend(extra_tags.iter().cloned());
         match client
-            .remember(
+            .remember_anchored(
                 content,
                 Some(context),
                 item.memory_type,
@@ -443,6 +449,8 @@ pub async fn store_items(
                 Vec::new(),
                 tags,
                 Vec::new(),
+                None,
+                item.anchors.clone(),
                 None,
             )
             .await

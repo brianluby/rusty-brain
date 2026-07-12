@@ -91,6 +91,50 @@ fn parse_time_bound(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
     ))
 }
 
+/// Parse a `remember --file` anchor spec: `PATH`, `PATH:LINE`, or
+/// `PATH:START-END` (1-based, inclusive). Garbage ranges (`a.rs:12-`,
+/// `a.rs:0`, inverted, overflow) fail at parse time — argv must never panic
+/// the process (the `parse_time_bound` precedent).
+fn parse_file_anchor(s: &str) -> Result<rb_types::MemoryAnchor, String> {
+    rb_types::MemoryAnchor::parse_file_spec(s).map_err(|e| e.to_string())
+}
+
+/// Parse a `remember --commit` anchor value (a commit SHA string).
+fn parse_commit_anchor(s: &str) -> Result<rb_types::MemoryAnchor, String> {
+    rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, s).map_err(|e| e.to_string())
+}
+
+/// Parse a `remember --symbol` anchor value (a symbol/identifier string).
+fn parse_symbol_anchor(s: &str) -> Result<rb_types::MemoryAnchor, String> {
+    rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, s).map_err(|e| e.to_string())
+}
+
+/// Parse a recall/list `--file` FILTER (path only — filters match by path,
+/// so a `:LINE` range is a clean parse error pointing at capture).
+fn parse_file_filter(s: &str) -> Result<rb_types::AnchorFilter, String> {
+    rb_types::parse_file_filter(s).map_err(|e| e.to_string())
+}
+
+/// Parse a recall/list `--commit` FILTER value.
+fn parse_commit_filter(s: &str) -> Result<rb_types::AnchorFilter, String> {
+    let filter = rb_types::AnchorFilter {
+        kind: rb_types::AnchorKind::Commit,
+        value: s.to_string(),
+    };
+    filter.validate().map_err(|e| e.to_string())?;
+    Ok(filter)
+}
+
+/// Parse a recall/list `--symbol` FILTER value.
+fn parse_symbol_filter(s: &str) -> Result<rb_types::AnchorFilter, String> {
+    let filter = rb_types::AnchorFilter {
+        kind: rb_types::AnchorKind::Symbol,
+        value: s.to_string(),
+    };
+    filter.validate().map_err(|e| e.to_string())?;
+    Ok(filter)
+}
+
 /// Parse a `--source` producer surface; the daemon only ever stamps these four.
 fn parse_source(s: &str) -> Result<String, String> {
     const SOURCES: [&str; 4] = ["hook", "mcp", "cli", "job"];
@@ -269,6 +313,18 @@ pub enum Command {
         /// is the UUID of the memory being replaced.
         #[arg(long)]
         supersedes: Option<String>,
+        /// Anchor this memory to a file (repeatable): PATH, PATH:LINE, or
+        /// PATH:START-END (1-based, inclusive). Recall can then filter with
+        /// `recall --file PATH`.
+        #[arg(long = "file", value_parser = parse_file_anchor)]
+        file: Vec<rb_types::MemoryAnchor>,
+        /// Anchor this memory to a commit SHA (repeatable).
+        #[arg(long = "commit", value_parser = parse_commit_anchor)]
+        commit: Vec<rb_types::MemoryAnchor>,
+        /// Anchor this memory to a symbol/identifier, e.g. `Foo::bar`
+        /// (repeatable). A caller-supplied string, not resolved AST.
+        #[arg(long = "symbol", value_parser = parse_symbol_anchor)]
+        symbol: Vec<rb_types::MemoryAnchor>,
         /// Bulk mode: read one fact per line from stdin and store them all over
         /// a SINGLE daemon connection. The `--type`/`--importance`/`--tags`/
         /// `--context` flags apply uniformly to every fact; blank lines are
@@ -324,6 +380,17 @@ pub enum Command {
         /// only: archived vectors are pruned).
         #[arg(long)]
         archived: bool,
+        /// Only memories anchored to this file path (repeatable; every
+        /// listed anchor must match). Path only — line ranges are for
+        /// capture (`remember --file`).
+        #[arg(long = "file", value_parser = parse_file_filter)]
+        file: Vec<rb_types::AnchorFilter>,
+        /// Only memories anchored to this commit SHA (repeatable).
+        #[arg(long = "commit", value_parser = parse_commit_filter)]
+        commit: Vec<rb_types::AnchorFilter>,
+        /// Only memories anchored to this symbol (repeatable).
+        #[arg(long = "symbol", value_parser = parse_symbol_filter)]
+        symbol: Vec<rb_types::AnchorFilter>,
     },
 
     /// Fetch a single memory by id.
@@ -373,6 +440,17 @@ pub enum Command {
         /// List archived memories instead of active ones.
         #[arg(long)]
         archived: bool,
+        /// Only memories anchored to this file path (repeatable; every
+        /// listed anchor must match). Path only — line ranges are for
+        /// capture (`remember --file`).
+        #[arg(long = "file", value_parser = parse_file_filter)]
+        file: Vec<rb_types::AnchorFilter>,
+        /// Only memories anchored to this commit SHA (repeatable).
+        #[arg(long = "commit", value_parser = parse_commit_filter)]
+        commit: Vec<rb_types::AnchorFilter>,
+        /// Only memories anchored to this symbol (repeatable).
+        #[arg(long = "symbol", value_parser = parse_symbol_filter)]
+        symbol: Vec<rb_types::AnchorFilter>,
     },
 
     /// Show memories connected to an id by graph links.
@@ -938,6 +1016,124 @@ mod tests {
             Cli::try_parse_from(["rusty-brain", "remember", "a fact", "--batch"]).is_err(),
             "--batch must conflict with a positional content argument"
         );
+    }
+
+    #[test]
+    fn remember_parses_anchor_capture_flags() {
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "remember",
+            "we chose tokio here",
+            "--file",
+            "src/server.rs:12-40",
+            "--file",
+            "./src/lib.rs",
+            "--commit",
+            "abc123",
+            "--symbol",
+            "Server::run",
+        ]);
+        match cli.command {
+            Command::Remember {
+                file,
+                commit,
+                symbol,
+                ..
+            } => {
+                assert_eq!(file.len(), 2);
+                assert_eq!(file[0].value, "src/server.rs");
+                assert_eq!((file[0].start_line, file[0].end_line), (Some(12), Some(40)));
+                assert_eq!(file[1].value, "src/lib.rs", "paths normalize");
+                assert_eq!(commit.len(), 1);
+                assert_eq!(commit[0].kind, rb_types::AnchorKind::Commit);
+                assert_eq!(commit[0].value, "abc123");
+                assert_eq!(symbol.len(), 1);
+                assert_eq!(symbol[0].kind, rb_types::AnchorKind::Symbol);
+                assert_eq!(symbol[0].value, "Server::run");
+            }
+            other => panic!("expected Remember, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remember_anchor_flags_reject_garbage_at_parse_time() {
+        // Clean parse errors, never a panic (the parse_time_bound precedent) —
+        // incl. line-number overflow past u32.
+        for bad in [
+            "a.rs:12-",
+            "a.rs:0",
+            "a.rs:40-12",
+            "a.rs:99999999999999999999",
+            "",
+            "./",
+        ] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "remember", "c", "--file", bad]).is_err(),
+                "remember --file {bad:?} must be rejected at parse time"
+            );
+        }
+        for flag in ["--commit", "--symbol"] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "remember", "c", flag, "  "]).is_err(),
+                "remember {flag} with a blank value must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn recall_and_list_parse_anchor_filters() {
+        for cmd in [
+            vec!["rusty-brain", "recall", "q"],
+            vec!["rusty-brain", "list"],
+        ] {
+            let mut argv = cmd.clone();
+            argv.extend([
+                "--file",
+                "./src/server.rs",
+                "--commit",
+                "abc123",
+                "--symbol",
+                "Engine::recall",
+            ]);
+            let cli = Cli::parse_from(argv);
+            let (file, commit, symbol) = match cli.command {
+                Command::Recall {
+                    file,
+                    commit,
+                    symbol,
+                    ..
+                }
+                | Command::List {
+                    file,
+                    commit,
+                    symbol,
+                    ..
+                } => (file, commit, symbol),
+                other => panic!("expected Recall/List, got {other:?}"),
+            };
+            assert_eq!(file.len(), 1);
+            assert_eq!(file[0].kind, rb_types::AnchorKind::File);
+            assert_eq!(file[0].value, "src/server.rs", "filter values normalize");
+            assert_eq!(commit[0].kind, rb_types::AnchorKind::Commit);
+            assert_eq!(symbol[0].kind, rb_types::AnchorKind::Symbol);
+        }
+    }
+
+    #[test]
+    fn recall_file_filter_rejects_line_ranges_and_blanks() {
+        // Filters match by path only: a line range is a clean parse error
+        // pointing at capture, never a silently-widened (or never-matching)
+        // query.
+        for bad in ["src/a.rs:12", "src/a.rs:12-40", "", "  "] {
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "recall", "q", "--file", bad]).is_err(),
+                "recall --file {bad:?} must be rejected at parse time"
+            );
+            assert!(
+                Cli::try_parse_from(["rusty-brain", "list", "--file", bad]).is_err(),
+                "list --file {bad:?} must be rejected at parse time"
+            );
+        }
     }
 
     #[test]

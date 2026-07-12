@@ -716,6 +716,9 @@ async fn fold_session_summary(
         return continue_only();
     };
     let content = redact(&content);
+    // Auto-anchor the summary to the touched files (typed code anchors,
+    // ANC-2): the same union the "Files touched" section lists.
+    let anchors = session_file_anchors(&data, &git_files);
 
     // Only RESET the scratch once the fold is DURABLY stored. A degraded write
     // (no daemon connection, or a store error) leaves the buffer intact so a
@@ -725,7 +728,7 @@ async fn fold_session_summary(
         return continue_only();
     };
     if let Some(new_id) =
-        store_session_summary(client, content, data.prior_summary_id.as_deref()).await
+        store_session_summary(client, content, data.prior_summary_id.as_deref(), anchors).await
     {
         let new_id = new_id.to_string();
         match mode {
@@ -740,13 +743,43 @@ async fn fold_session_summary(
     continue_only()
 }
 
+/// The touched-file union the summary reports AND the auto-anchors mirror:
+/// tool-tracked edits (scratch) first, then working-tree changes (git) not
+/// already listed, first-seen order.
+fn union_touched_files(data: &ScratchData, git_files: &[String]) -> Vec<String> {
+    let mut files = data.files.clone();
+    for f in git_files {
+        if !files.iter().any(|e| e == f) {
+            files.push(f.clone());
+        }
+    }
+    files
+}
+
+/// Derive the summary's file anchors (typed code anchors, ANC-2 auto-anchor):
+/// one `file` anchor per touched file, capped at [`SUMMARY_SECTION_LIMIT`] so
+/// the anchor set mirrors exactly what the "Files touched" section lists.
+/// FAIL-OPEN like the whole hook path: a path that fails anchor validation is
+/// skipped, never an error.
+fn session_file_anchors(data: &ScratchData, git_files: &[String]) -> Vec<rb_types::MemoryAnchor> {
+    union_touched_files(data, git_files)
+        .iter()
+        .take(SUMMARY_SECTION_LIMIT)
+        .filter_map(|f| rb_types::MemoryAnchor::new(rb_types::AnchorKind::File, f).ok())
+        .collect()
+}
+
 /// Store the folded summary, superseding the session's prior summary when one
 /// exists and parses (update-as-supersede); a bad stored id degrades to a plain
-/// store. Returns the new memory id, or `None` on any best-effort failure.
+/// store. The summary is auto-anchored to `anchors` (the touched files) on a
+/// best-effort basis — `DaemonClient` drops them against a daemon without
+/// anchor support rather than losing the summary. Returns the new memory id,
+/// or `None` on any best-effort failure.
 async fn store_session_summary(
     client: &mut DaemonClient,
     content: String,
     prior_summary_id: Option<&str>,
+    anchors: Vec<rb_types::MemoryAnchor>,
 ) -> Option<MemoryId> {
     let tags = vec!["hook".to_string(), "session-summary".to_string()];
     // A non-None id that fails to parse is a (rare) corrupt scratch: log it and
@@ -759,33 +792,18 @@ async fn store_session_summary(
             })
             .ok()
     });
-    match prior {
-        Some(old) => {
-            client
-                .remember_superseding(
-                    content,
-                    None,
-                    MemoryType::Insight,
-                    SESSION_SUMMARY_IMPORTANCE,
-                    tags,
-                    Some(HOOK_CONFIDENCE),
-                    old,
-                )
-                .await
-        }
-        None => {
-            client
-                .remember(
-                    content,
-                    None,
-                    MemoryType::Insight,
-                    SESSION_SUMMARY_IMPORTANCE,
-                    tags,
-                    Some(HOOK_CONFIDENCE),
-                )
-                .await
-        }
-    }
+    client
+        .remember_anchored(
+            content,
+            None,
+            MemoryType::Insight,
+            SESSION_SUMMARY_IMPORTANCE,
+            tags,
+            Some(HOOK_CONFIDENCE),
+            anchors,
+            prior,
+        )
+        .await
 }
 
 /// Assemble a decision-grade session summary from the scratch + transcript +
@@ -802,12 +820,7 @@ fn build_session_summary(
     if data.is_empty() && git_files.is_empty() && transcript.is_empty() {
         return None;
     }
-    let mut files = data.files.clone();
-    for f in git_files {
-        if !files.iter().any(|e| e == f) {
-            files.push(f.clone());
-        }
-    }
+    let files = union_touched_files(data, git_files);
     let mut out = String::from("Session summary.\n");
     if let Some(goal) = transcript.user_prompts.first() {
         out.push_str(&format!("\nGoal: {goal}\n"));
@@ -866,7 +879,7 @@ mod tests {
     /// supersedes) it received, and the id it issued back, in order.
     #[derive(Default)]
     struct MockObserved {
-        remembers: Vec<(String, Option<MemoryId>)>,
+        remembers: Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
         issued: Vec<MemoryId>,
     }
 
@@ -888,6 +901,10 @@ mod tests {
                 contract_version: CONTRACT_VERSION,
                 ok: true,
                 message: None,
+                // The mock plays a CURRENT daemon: advertise anchor support
+                // so the fail-open DaemonClient forwards anchors and the
+                // auto-anchor e2e below can assert them.
+                capabilities: vec![rb_proto::CAP_ANCHORS.to_string()],
             },
         )
         .await;
@@ -896,11 +913,12 @@ mod tests {
                 Request::Remember {
                     content,
                     supersedes,
+                    anchors,
                     ..
                 } => {
                     let id = MemoryId::new();
                     let mut s = state.lock().unwrap();
-                    s.remembers.push((content, supersedes));
+                    s.remembers.push((content, supersedes, anchors));
                     s.issued.push(id.clone());
                     Response::Remembered { id }
                 }
@@ -1922,5 +1940,85 @@ mod tests {
         let result = session_end(None, Some(&scratch), tmp.path(), None).await;
         assert!(result.continue_execution);
         assert!(scratch.read().is_empty());
+    }
+
+    #[tokio::test]
+    async fn session_end_auto_anchors_the_summary_to_touched_files() {
+        // PRD acceptance (typed code anchors, ANC-2): the SessionEnd fold
+        // attaches the touched files to the summary memory as file anchors —
+        // asserted end-to-end over a live (mock) daemon connection whose ack
+        // advertises anchor support.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let state = Arc::new(Mutex::new(MockObserved::default()));
+        let server = tokio::spawn(serve_remembers(listener, Arc::clone(&state)));
+
+        let mut client = DaemonClient::connect(
+            &socket,
+            Namespace::Project("rb-anchor-test".into()),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .expect("connect to the mock daemon");
+
+        let scratch = scratch_at(tmp.path());
+        scratch.append(scratch::Kind::File, "src/server.rs");
+        scratch.append(scratch::Kind::File, "src/lib.rs");
+        scratch.append(scratch::Kind::Command, "cargo test");
+
+        let result = session_end(Some(&mut client), Some(&scratch), tmp.path(), None).await;
+        assert!(result.continue_execution);
+
+        let observed = state.lock().unwrap();
+        assert_eq!(observed.remembers.len(), 1, "one summary Remember");
+        let anchors = &observed.remembers[0].2;
+        let values: Vec<&str> = anchors.iter().map(|a| a.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["src/server.rs", "src/lib.rs"],
+            "the summary must be anchored to the touched files"
+        );
+        assert!(
+            anchors.iter().all(|a| a.kind == rb_types::AnchorKind::File),
+            "auto-anchors are file anchors"
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn session_file_anchors_mirror_the_listed_section_and_fail_open() {
+        // The anchor set mirrors the "Files touched" union (scratch first,
+        // then git-only files), capped at SUMMARY_SECTION_LIMIT, skipping
+        // unanchorable paths instead of erroring (fail-open).
+        let data = ScratchData {
+            files: vec!["src/a.rs".to_string(), "  ".to_string()],
+            ..Default::default()
+        };
+        let git = vec!["src/a.rs".to_string(), "src/b.rs".to_string()];
+        let anchors = session_file_anchors(&data, &git);
+        let values: Vec<&str> = anchors.iter().map(|a| a.value.as_str()).collect();
+        assert_eq!(
+            values,
+            vec!["src/a.rs", "src/b.rs"],
+            "deduped union, blank path skipped (fail-open)"
+        );
+
+        // The cap binds: more touched files than the section limit yields
+        // exactly SUMMARY_SECTION_LIMIT anchors.
+        let many = ScratchData {
+            files: (0..SUMMARY_SECTION_LIMIT + 5)
+                .map(|i| format!("src/f{i}.rs"))
+                .collect(),
+            ..Default::default()
+        };
+        assert_eq!(
+            session_file_anchors(&many, &[]).len(),
+            SUMMARY_SECTION_LIMIT,
+            "anchors are bounded like the listed section"
+        );
     }
 }

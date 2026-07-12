@@ -2,10 +2,23 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. Today memories attach
-only to freeform `context`; the highest-value coding memories are decisions
-about *code locations*, and there is no structured, queryable link from a
-memory to a file/line/commit/symbol.
+Delivered 2026-07-11 (branch `claude/typed-code-anchors`). From the
+2026-07-02 senior-PM product review. Before this, memories attached only to
+freeform `context`; now a memory carries structured, queryable
+file/line/commit/symbol anchors.
+
+Delivery notes:
+
+- The anchor filter MODEL/wire plumbing shipped earlier with search-parity
+  (PR #58); this delivery replaced the three fail-fast stubs (engine, store,
+  client) with real evaluation.
+- Old-daemon compatibility: the daemon advertises an additive `anchors`
+  capability on the handshake ack. Typed clients and the MCP adapter fail
+  fast when anchors are used against a daemon that did not advertise it (a
+  pre-anchor daemon would silently drop/ignore them); the hook path stays
+  fail-open and stores the summary without anchors instead.
+- ANC-3's prompt-time recall BOOST is deferred with the ranking weights to
+  W4.1 evidence, per the Non-Goals/Risks sections (v1 = filter only).
 
 ## Owner Area
 
@@ -71,9 +84,11 @@ per memory. Decoded by name in `row_to_note` with serde defaults (the
 
 - Recall filters: `--file <path>`, `--commit <sha>`, `--symbol <name>`
   (CLI + MCP), scoping candidates before ranking.
-- When the hook performs prompt-time recall (W3.2 channel a), an anchor
-  derived from the active file/context boosts anchor-matching memories (a
-  documented, bounded boost; exact weight deferred to W4.1).
+- DEFERRED (roadmap, not v1 — consistent with Non-Goals/Risks and the Status
+  note): when the hook performs prompt-time recall (W3.2 channel a), an
+  anchor derived from the active file/context boosts anchor-matching
+  memories (a documented, bounded boost). Ships with the W4.1
+  ranking-weight evidence; v1 delivers anchors as a filter only.
 
 ### ANC-4. Graph + provenance parity
 
@@ -118,12 +133,12 @@ Plus a migration-reproducibility test against a populated v-prior fixture.
 
 ## Implementation Checklist
 
-- [ ] Add `memory_anchors` migration + type + decode.
-- [ ] Add anchor params to CLI/MCP `remember`.
-- [ ] Add anchor filters to recall (CLI/MCP).
-- [ ] Auto-anchor SessionEnd summaries to touched files.
-- [ ] Include anchors in `graph` and export/restore.
-- [ ] Migration-reproducibility + recall filter e2e tests.
+- [x] Add `memory_anchors` migration + type + decode.
+- [x] Add anchor params to CLI/MCP `remember`.
+- [x] Add anchor filters to recall (CLI/MCP).
+- [x] Auto-anchor SessionEnd summaries to touched files.
+- [x] Include anchors in `graph` and export/restore.
+- [x] Migration-reproducibility + recall filter e2e tests.
 
 ## Roadmap Fit
 

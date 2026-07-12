@@ -169,6 +169,18 @@ impl DaemonProxy for ClientProxy {
     async fn call(&mut self, request: Request) -> rb_types::Result<Response> {
         let failure = {
             let client = self.ensure_connected().await?;
+            // Anchor-capability gate (typed code anchors): this raw path
+            // bypasses the typed Client wrappers, so it must apply the same
+            // fail-fast rule — a daemon that did not advertise the `anchors`
+            // capability would silently DROP `Remember.anchors` / IGNORE
+            // anchor filters instead of erroring.
+            if rb_proto::request_uses_anchors(&request) && !client.supports_anchors() {
+                return Err(rb_types::Error::InvalidArgument(
+                    "this daemon does not support typed code anchors (no `anchors` \
+                     capability in its handshake); upgrade and restart the daemon"
+                        .to_string(),
+                ));
+            }
             match attempt_call(client, &request).await {
                 Ok(resp) => return Ok(resp),
                 Err(f) => f,
@@ -404,6 +416,7 @@ mod tests {
         }
         for req in [
             Request::Remember {
+                anchors: vec![],
                 content: "c".into(),
                 context: None,
                 memory_type: rb_types::MemoryType::Insight,

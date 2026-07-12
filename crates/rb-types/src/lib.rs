@@ -5,6 +5,7 @@
 //! `MemoryLink`, `SearchQuery`, `SearchResult`, `MemoryUpdates`, `Error`) used
 //! across the engine, store, daemon, and binary.
 
+mod anchor;
 mod change;
 mod error;
 mod feedback_kind;
@@ -19,6 +20,10 @@ mod query;
 mod stats;
 mod validate;
 
+pub use anchor::{
+    kind_str as anchor_kind_str, normalize_anchor_value, parse_file_filter,
+    parse_kind as parse_anchor_kind, MemoryAnchor,
+};
 pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
 pub use feedback_kind::FeedbackKind;

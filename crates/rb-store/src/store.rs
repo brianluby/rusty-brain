@@ -54,13 +54,14 @@ pub trait Store {
     /// SQL query — the metadata dimensions (types, tags, importance/
     /// confidence ranges, created-at window, sources, archived state) with
     /// the same inclusive/any-of/all-of semantics as
-    /// [`RecallFilter::matches`], AND the contested tri-state, expressed as
+    /// [`RecallFilter::matches`], the contested tri-state, expressed as
     /// the SQL form of [`Store::active_contradicts`] so `limit` fills with
     /// real matches no matter how deep they sit (the two expressions are
     /// pinned together by the `contested_filter_agrees_with_active_contradicts`
-    /// drift test). Ordered newest first. A non-empty `anchors` filter is
-    /// rejected fail-closed with `InvalidArgument` until the
-    /// typed-code-anchors table lands.
+    /// drift test), AND anchors (all-of EXISTS probes over `memory_anchors`,
+    /// pinned to `RecallFilter::matches` by the
+    /// `anchor_filter_agrees_with_recall_filter_matches` drift test).
+    /// Ordered newest first.
     fn list_filtered(
         &self,
         ns: &Namespace,

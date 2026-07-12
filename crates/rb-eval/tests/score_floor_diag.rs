@@ -43,6 +43,7 @@ async fn ingest<P: EmbeddingProvider>(
                 related_files: Vec::new(),
                 confidence: None,
                 provenance: Default::default(),
+                anchors: Vec::new(),
             })
             .await
             .expect("remember");
