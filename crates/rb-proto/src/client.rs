@@ -1091,6 +1091,7 @@ mod wrapper_tests {
                                 purged: u64::from(mode == rb_types::ForgetMode::Hard),
                                 total_eligible: 1,
                                 remaining: 0,
+                                failure: None,
                             },
                         }
                     }

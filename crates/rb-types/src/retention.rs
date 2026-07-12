@@ -216,7 +216,7 @@ pub struct ForgetPlan {
 }
 
 /// What a sweep actually did (RET-2/RET-3).
-#[derive(Serialize, Deserialize, Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq, Eq)]
 pub struct ForgetOutcome {
     #[serde(default)]
     pub mode: ForgetMode,
@@ -232,6 +232,13 @@ pub struct ForgetOutcome {
     /// Eligible memories left untouched by the per-pass bound (re-run hint).
     #[serde(default)]
     pub remaining: u64,
+    /// Present when the pass stopped early: the error that aborted it AFTER
+    /// `archived`/`purged` items had already durably committed (each item is
+    /// its own transaction — a later failure never rolls back completed
+    /// work). The pass is re-runnable once the cause is fixed. Additive
+    /// field (PR #60 review).
+    #[serde(default)]
+    pub failure: Option<String>,
 }
 
 #[cfg(test)]
@@ -396,6 +403,7 @@ mod tests {
             purged: 0,
             total_eligible: 9,
             remaining: 4,
+            failure: Some("purge of x failed: injected".to_string()),
         };
         let json = serde_json::to_string(&outcome).unwrap();
         let back: ForgetOutcome = serde_json::from_str(&json).unwrap();
@@ -420,6 +428,7 @@ mod tests {
         assert_eq!(outcome.mode, ForgetMode::Apply);
         assert_eq!(outcome.archived, 0);
         assert_eq!(outcome.purged, 0);
+        assert_eq!(outcome.failure, None, "absent failure decodes to None");
 
         let policy: RetentionPolicy = serde_json::from_str("{}").unwrap();
         assert_eq!(policy, RetentionPolicy::default());

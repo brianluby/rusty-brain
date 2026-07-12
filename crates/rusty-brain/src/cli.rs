@@ -589,6 +589,12 @@ pub enum Command {
         /// user may execute it. With --dry-run, previews the purge set.
         #[arg(long)]
         hard: bool,
+        /// Skip the interactive confirmation that hard EXECUTION otherwise
+        /// requires (the import-confirmation precedent). Without it, a
+        /// non-interactive invocation (--json or piped stdin) refuses
+        /// instead of purging.
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 
     /// Retroactively redact secrets from every stored memory (W2.4). Rewrites
@@ -815,8 +821,9 @@ mod tests {
                 dry_run,
                 apply,
                 hard,
+                yes,
             } => {
-                assert!(!dry_run && !apply && !hard);
+                assert!(!dry_run && !apply && !hard && !yes);
             }
             other => panic!("expected Forget, got {other:?}"),
         }
@@ -829,6 +836,20 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_ok(), "{args:?} must parse");
         }
+    }
+
+    #[test]
+    fn forget_hard_accepts_yes_for_automation() {
+        // PR #60 review (MEDIUM): hard EXECUTE prompts interactively; --yes
+        // is the explicit automation bypass.
+        let cli = Cli::parse_from(["rusty-brain", "forget", "--hard", "--yes"]);
+        match cli.command {
+            Command::Forget { hard, yes, .. } => {
+                assert!(hard && yes);
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
+        assert!(Cli::try_parse_from(["rusty-brain", "forget", "-y", "--hard"]).is_ok());
     }
 
     #[test]

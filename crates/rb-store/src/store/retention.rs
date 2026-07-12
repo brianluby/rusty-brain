@@ -39,6 +39,16 @@ pub struct RetentionSweepEffects {
 /// A built WHERE fragment: the SQL text plus its positional params.
 type WhereClause = (String, Vec<Box<dyn rusqlite::ToSql>>);
 
+/// Fold a post-batch failure into the sweep's failure slot without ever
+/// displacing (or being hidden by) an earlier one — the operator sees the
+/// full chain, and a trailing cleanup error never erases a successful batch.
+fn append_failure(slot: &mut Option<String>, msg: String) {
+    *slot = Some(match slot.take() {
+        Some(prev) => format!("{prev}; then {msg}"),
+        None => msg,
+    });
+}
+
 /// The WHERE clause + params shared by the plan SELECT, the total COUNT, and
 /// the stats eligibility gauge — one builder so they cannot diverge.
 /// `Ok(None)` means the policy has no age rule for this mode ⇒ empty set
@@ -101,13 +111,20 @@ fn retention_where(
         let placeholders: Vec<String> = (0..policy.protected_tags.len())
             .map(|i| format!("?{}", start + i))
             .collect();
+        // An ABSOLUTE guard must not be defeated by user-typed variance
+        // (stored tags are raw input — no write-side normalization exists),
+        // so BOTH sides compare trimmed + case-folded (PR #60 review). The
+        // fold is ASCII on purpose: SQLite's bare `lower()` folds ASCII only,
+        // and Rust's `to_ascii_lowercase` mirrors it exactly — a Unicode fold
+        // on one side would re-open the mismatch for non-ASCII tags, which
+        // instead compare case-sensitively (trimmed) on both sides.
         sql.push_str(&format!(
             " AND NOT EXISTS (SELECT 1 FROM json_each(m.tags) \
-             WHERE json_each.value IN ({}))",
+             WHERE lower(trim(json_each.value)) IN ({}))",
             placeholders.join(", ")
         ));
         for tag in &policy.protected_tags {
-            params.push(Box::new(tag.clone()));
+            params.push(Box::new(tag.trim().to_ascii_lowercase()));
         }
     }
 
@@ -254,60 +271,84 @@ impl SqliteStore {
                 .execute_batch("PRAGMA secure_delete = ON;")
                 .map_err(storage_err)?;
         }
-        let loop_result = (|| {
-            let mut effects = RetentionSweepEffects::default();
-            for cand in &plan.candidates {
-                let details = serde_json::json!({
-                    "cause": "retention",
-                    "mode": mode.as_str(),
-                    "rule": cand.rule,
-                })
-                .to_string();
-                match mode {
-                    ForgetMode::Apply => {
-                        if archive_with_details(&self.conn, &self.site_id, &cand.id, &details)? {
-                            effects.archived_ids.push(cand.id.clone());
-                        }
-                    }
-                    ForgetMode::Hard => {
-                        if self.purge_memory_for_retention(&cand.id, &details)? {
-                            effects.purged_ids.push(cand.id.clone());
-                        }
-                    }
-                }
-            }
-            Ok(effects)
-        })();
-        if mode == ForgetMode::Hard {
-            // Always restore the default, even when the loop failed midway.
-            self.conn
-                .execute_batch("PRAGMA secure_delete = OFF;")
-                .map_err(storage_err)?;
-        }
-        let effects = loop_result?;
-        let archived = effects.archived_ids.len() as u64;
-        let purged = effects.purged_ids.len() as u64;
-        if archived + purged > 0 {
+        // PR #60 review (HIGH): from here on, every completed per-item
+        // transaction is DURABLE, so a later failure must never discard the
+        // partial effects — it is captured into `ForgetOutcome::failure`
+        // instead of an early `Err` return, the bulk oplog row covers what
+        // actually happened, and events for completed items still fire.
+        let mut effects = RetentionSweepEffects::default();
+        let mut failure: Option<String> = None;
+        for cand in &plan.candidates {
             let details = serde_json::json!({
+                "cause": "retention",
                 "mode": mode.as_str(),
-                "archived": archived,
-                "purged": purged,
+                "rule": cand.rule,
             })
             .to_string();
-            self.conn
-                .execute(
-                    "INSERT INTO memory_oplog (site_id, op, memory_id, namespace, at, details)
-                     VALUES (?1, 'retention_sweep', '', ?2, ?3, ?4)",
-                    rusqlite::params![self.site_id, ns.as_db_string(), now.timestamp(), details],
-                )
-                .map_err(storage_err)?;
+            let step = match mode {
+                ForgetMode::Apply => {
+                    archive_with_details(&self.conn, &self.site_id, &cand.id, &details).map(
+                        |changed| {
+                            if changed {
+                                effects.archived_ids.push(cand.id.clone());
+                            }
+                        },
+                    )
+                }
+                ForgetMode::Hard => {
+                    self.purge_memory_for_retention(&cand.id, &details)
+                        .map(|changed| {
+                            if changed {
+                                effects.purged_ids.push(cand.id.clone());
+                            }
+                        })
+                }
+            };
+            if let Err(e) = step {
+                // The failed item's own tx rolled back; earlier items are
+                // committed. Stop (re-runnable), report the partial pass.
+                failure = Some(format!("{} of {} failed: {e}", mode.as_str(), cand.id));
+                break;
+            }
+        }
+        if mode == ForgetMode::Hard {
+            // Always restore the default, even when the loop failed midway —
+            // and never let a failed reset erase a successful batch.
+            if let Err(e) = self.conn.execute_batch("PRAGMA secure_delete = OFF;") {
+                append_failure(&mut failure, format!("resetting secure_delete: {e}"));
+            }
+        }
+        let archived = effects.archived_ids.len() as u64;
+        let purged = effects.purged_ids.len() as u64;
+        // The bulk row records the RUN unconditionally (PR #60 review): a
+        // zero-change pass still advances last_forget_at, and a partial pass
+        // records exactly what committed (plus the failure, for history).
+        let details = serde_json::json!({
+            "mode": mode.as_str(),
+            "archived": archived,
+            "purged": purged,
+            "eligible": plan.total_eligible,
+            "failure": failure,
+        })
+        .to_string();
+        if let Err(e) = self
+            .conn
+            .execute(
+                "INSERT INTO memory_oplog (site_id, op, memory_id, namespace, at, details)
+                 VALUES (?1, 'retention_sweep', '', ?2, ?3, ?4)",
+                rusqlite::params![self.site_id, ns.as_db_string(), now.timestamp(), details],
+            )
+            .map_err(storage_err)
+        {
+            append_failure(&mut failure, format!("recording the sweep run: {e}"));
         }
         if purged > 0 {
             // Purged content must not survive at rest in the -wal sidecar
-            // (the scrub drill rule). Best-effort no-op on in-memory DBs.
-            self.conn
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .map_err(storage_err)?;
+            // (the scrub drill rule). Best-effort no-op on in-memory DBs; a
+            // checkpoint failure is reported without discarding the batch.
+            if let Err(e) = self.conn.execute_batch("PRAGMA wal_checkpoint(TRUNCATE);") {
+                append_failure(&mut failure, format!("checkpointing the WAL: {e}"));
+            }
         }
         Ok((
             ForgetOutcome {
@@ -317,8 +358,10 @@ impl SqliteStore {
                 total_eligible: plan.total_eligible,
                 // The sweep runs on the single-writer connection, so nothing
                 // interleaves between plan and execute: unprocessed = the
-                // overflow past batch_limit.
+                // overflow past batch_limit (plus anything a mid-pass failure
+                // left behind).
                 remaining: plan.total_eligible.saturating_sub(archived + purged),
+                failure,
             },
             effects,
         ))
@@ -629,6 +672,53 @@ mod retention_tests {
             "protected tag must survive the sweep"
         );
         assert!(is_archived(&store, &twin), "unprotected twin was swept");
+    }
+
+    // PR #60 review (HIGH): the protected-tag guard is an ABSOLUTE guard, so
+    // it must be robust to user-typed variance — stored tags are raw input
+    // (no write-side normalization exists). Comparison is trimmed and
+    // ASCII-case-insensitive on BOTH sides.
+    #[test]
+    fn protected_tag_guard_survives_case_and_whitespace_variance() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Stored tag differs from the policy tag by case.
+        let cased = insert_aged(&store, 90, 2, |m| {
+            m.tags = vec!["Architecture_Decision".to_string()];
+        });
+        // Policy tag carries stray whitespace + different case.
+        let spaced = insert_aged(&store, 90, 2, |m| {
+            m.tags = vec!["postmortem".to_string()];
+        });
+        // Stored tag carries stray whitespace.
+        let stored_spaced = insert_aged(&store, 90, 2, |m| {
+            m.tags = vec![" architecture_decision ".to_string()];
+        });
+        let twin = insert_aged(&store, 90, 2, |m| {
+            m.tags = vec!["scratch".to_string()];
+        });
+
+        let mut p = policy();
+        p.protected_tags = vec![
+            "architecture_decision".to_string(),
+            "  POSTMORTEM ".to_string(),
+        ];
+        let (outcome, _) = store
+            .retention_sweep(&ns(), &p, ForgetMode::Apply, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(outcome.archived, 1, "only the unprotected twin is swept");
+        assert!(
+            !is_archived(&store, &cased),
+            "case-variant stored tag must still protect"
+        );
+        assert!(
+            !is_archived(&store, &spaced),
+            "whitespace/case-variant policy tag must still protect"
+        );
+        assert!(
+            !is_archived(&store, &stored_spaced),
+            "whitespace-variant stored tag must still protect"
+        );
+        assert!(is_archived(&store, &twin), "control twin was swept");
     }
 
     // Contested exclusion: a contested memory must never be swept. The fixture
@@ -1006,6 +1096,89 @@ mod retention_tests {
             .unwrap();
         assert_eq!(outcome.purged, 1);
         assert!(store.get_memory(&archived_old).unwrap().is_none());
+    }
+
+    // PR #60 review (HIGH): a mid-batch failure must NOT discard the effects
+    // of items that already durably committed — the outcome carries the
+    // partial counts plus the failure, the bulk oplog row covers what
+    // succeeded, and a re-run (after the cause is fixed) completes the rest.
+    #[test]
+    fn mid_batch_failure_reports_partial_effects_and_stays_rerunnable() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let first = insert_aged(&store, 90, 2, |_| {});
+        let blocked = insert_aged(&store, 80, 2, |_| {});
+        let third = insert_aged(&store, 70, 2, |_| {});
+
+        // Injected failure: a test-local trigger makes the SECOND-oldest
+        // candidate un-purgeable (its per-item tx rolls back).
+        store
+            .conn
+            .execute_batch(&format!(
+                "CREATE TRIGGER test_block_purge BEFORE DELETE ON memories
+                 WHEN old.memory_id = '{blocked}'
+                 BEGIN SELECT RAISE(ABORT, 'injected purge failure'); END;"
+            ))
+            .unwrap();
+
+        let (outcome, effects) = store
+            .retention_sweep(&ns(), &policy(), ForgetMode::Hard, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(outcome.purged, 1, "the first item committed durably");
+        assert_eq!(effects.purged_ids, vec![first.clone()]);
+        let failure = outcome.failure.expect("failure surfaced");
+        assert!(
+            failure.contains(&blocked.to_string()) && failure.contains("injected"),
+            "failure names the item and cause: {failure}"
+        );
+        assert!(store.get_memory(&first).unwrap().is_none(), "first purged");
+        assert!(
+            store.get_memory(&blocked).unwrap().is_some(),
+            "blocked kept"
+        );
+        assert!(store.get_memory(&third).unwrap().is_some(), "loop stopped");
+
+        // The bulk row covers the PARTIAL pass (last_forget_at moves).
+        let details: String = store
+            .conn
+            .query_row(
+                "SELECT details FROM memory_oplog WHERE op = 'retention_sweep'
+                 AND namespace = ?1 ORDER BY seq DESC LIMIT 1",
+                rusqlite::params![ns().as_db_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(details.contains("\"purged\":1"), "{details}");
+
+        // Re-runnable: drop the failpoint, re-run, the rest completes.
+        store
+            .conn
+            .execute_batch("DROP TRIGGER test_block_purge;")
+            .unwrap();
+        let (outcome, _) = store
+            .retention_sweep(&ns(), &policy(), ForgetMode::Hard, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(outcome.purged, 2);
+        assert_eq!(outcome.failure, None);
+        assert!(store.get_memory(&blocked).unwrap().is_none());
+    }
+
+    // PR #60 review (Copilot): a zero-change sweep still records the RUN, so
+    // stats' last_forget_at reflects the last pass, not the last mutation.
+    #[test]
+    fn zero_change_sweep_still_records_the_run() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        insert_aged(&store, 1, 8, |_| {}); // nothing eligible
+        let (outcome, _) = store
+            .retention_sweep(&ns(), &policy(), ForgetMode::Apply, chrono::Utc::now())
+            .unwrap();
+        assert_eq!((outcome.archived, outcome.purged), (0, 0));
+        let stats = store
+            .namespace_stats(&ns(), 30, "m", "v", 5, Some(&policy()))
+            .unwrap();
+        assert!(
+            stats.last_forget_at.is_some(),
+            "the run itself must advance last_forget_at"
+        );
     }
 
     // Bounded per pass and re-runnable (PRD RET-2).

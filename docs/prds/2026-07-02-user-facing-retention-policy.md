@@ -73,7 +73,9 @@ A `[retention]` block in the user config (precedence per existing rules):
   last-recalled, contested flag - contested memories are never auto-forgotten).
 - `forget --apply` archives eligible memories (soft delete; reversible).
 - `forget --hard` performs a hard purge cascading to vectors/FTS/oplog (admin
-  op, requires the peer-cred admin gate like `scrub`).
+  op, requires the peer-cred admin gate like `scrub`; execution additionally
+  requires an interactive confirmation or an explicit `--yes` —
+  non-interactive invocations refuse without it).
 - Bounded per pass; re-runnable.
 
 ### RET-3. Job integration

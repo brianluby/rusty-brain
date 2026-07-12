@@ -1405,6 +1405,7 @@ mod tests {
                 purged: 2,
                 total_eligible: 2,
                 remaining: 0,
+                failure: None,
             },
         };
         let json = serde_json::to_string(&done).unwrap();

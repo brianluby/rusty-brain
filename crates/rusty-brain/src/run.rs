@@ -701,6 +701,7 @@ async fn run_client(
             dry_run,
             apply,
             hard,
+            yes,
         } => {
             // No [retention] section = no policy = nothing to do — a clear
             // error, not a silent no-op (fail closed both ways).
@@ -729,11 +730,46 @@ async fn run_client(
                          retention.enabled = true to allow forgetting"
                     );
                 }
+                // Hard execution is bulk + cascading + irreversible: gate it
+                // on an interactive confirmation or an explicit --yes
+                // (PR #60 review; the import-confirmation precedent). The
+                // preview shown is the SAME plan query the sweep executes.
+                if hard {
+                    use std::io::IsTerminal as _;
+                    match hard_execute_gate(yes, json, std::io::stdin().is_terminal()) {
+                        HardGate::Proceed => {}
+                        HardGate::Refuse(msg) => anyhow::bail!(msg),
+                        HardGate::Prompt => {
+                            let plan = client
+                                .forget_plan(policy.clone(), mode)
+                                .await
+                                .context("forget preview failed")?;
+                            if plan.candidates.is_empty() {
+                                println!("{}", output::render_forget_plan(&plan, false));
+                                return Ok(());
+                            }
+                            eprintln!("{}", output::render_forget_plan(&plan, false));
+                            if !confirm_hard_forget(plan.candidates.len(), plan.total_eligible)? {
+                                println!("Aborted");
+                                return Ok(());
+                            }
+                        }
+                    }
+                }
                 let outcome = client
                     .forget_execute(policy, mode)
                     .await
                     .context("forget failed")?;
                 println!("{}", output::render_forget_outcome(&outcome, json));
+                if let Some(failure) = &outcome.failure {
+                    // The counts above committed durably; exit non-zero so
+                    // automation notices the pass did not complete.
+                    anyhow::bail!(
+                        "forget pass incomplete after {} archived / {} purged: {failure}",
+                        outcome.archived,
+                        outcome.purged
+                    );
+                }
                 if outcome.remaining > 0 {
                     // stderr so `--json` stdout stays machine-parseable.
                     eprintln!(
@@ -832,6 +868,59 @@ async fn run_import_items(
     Ok(())
 }
 
+/// Outcome of the hard-forget confirmation gate (PR #60 review).
+#[derive(Debug)]
+enum HardGate {
+    /// `--yes` was passed: proceed without prompting.
+    Proceed,
+    /// Interactive TTY without `--yes`: show the plan and prompt.
+    Prompt,
+    /// Machine context without `--yes`: refuse with this message.
+    Refuse(String),
+}
+
+/// Decide how a hard EXECUTE may proceed. Pure so the matrix is testable:
+/// `--yes` always proceeds; without it, `--json` and non-TTY stdin refuse
+/// loudly (a purge must never ride an unattended pipeline by accident), and
+/// only an interactive terminal gets the prompt.
+fn hard_execute_gate(yes: bool, json: bool, stdin_is_tty: bool) -> HardGate {
+    if yes {
+        return HardGate::Proceed;
+    }
+    if json {
+        return HardGate::Refuse(
+            "refusing hard forget: --json is non-interactive; pass --yes to confirm the purge"
+                .to_string(),
+        );
+    }
+    if !stdin_is_tty {
+        return HardGate::Refuse(
+            "refusing hard forget: stdin is non-interactive; pass --yes to confirm the purge"
+                .to_string(),
+        );
+    }
+    HardGate::Prompt
+}
+
+/// Interactive confirmation for a hard forget (the `confirm_import`
+/// precedent): default is NO.
+fn confirm_hard_forget(count: usize, total: u64) -> anyhow::Result<bool> {
+    use std::io::Write as _;
+    eprint!(
+        "PERMANENTLY purge {count} memories (of {total} eligible)? \
+         This cannot be undone. [y/N] "
+    );
+    std::io::stderr().flush().context("flushing prompt")?;
+    let mut answer = String::new();
+    std::io::stdin()
+        .read_line(&mut answer)
+        .context("reading confirmation")?;
+    Ok(matches!(
+        answer.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
 fn confirm_import(count: usize) -> anyhow::Result<bool> {
     use std::io::Write as _;
     eprint!("Store {count} imported memories? [y/N] ");
@@ -851,6 +940,38 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use std::str::FromStr;
+
+    #[test]
+    fn hard_forget_gate_requires_confirmation_or_explicit_yes() {
+        // PR #60 review (MEDIUM): bulk + cascading + irreversible warrants
+        // the import-confirmation precedent. --yes proceeds anywhere;
+        // without it, machine contexts (--json or non-TTY stdin) REFUSE with
+        // a clear error instead of hanging or silently proceeding, and only
+        // an interactive TTY gets the prompt.
+        assert!(matches!(
+            hard_execute_gate(true, false, true),
+            HardGate::Proceed
+        ));
+        assert!(matches!(
+            hard_execute_gate(true, true, false),
+            HardGate::Proceed
+        ));
+        assert!(matches!(
+            hard_execute_gate(false, false, true),
+            HardGate::Prompt
+        ));
+        match hard_execute_gate(false, true, true) {
+            HardGate::Refuse(msg) => assert!(msg.contains("--yes"), "{msg}"),
+            other => panic!("json without --yes must refuse, got {other:?}"),
+        }
+        match hard_execute_gate(false, false, false) {
+            HardGate::Refuse(msg) => {
+                assert!(msg.contains("--yes"), "{msg}");
+                assert!(msg.contains("non-interactive"), "{msg}");
+            }
+            other => panic!("non-TTY without --yes must refuse, got {other:?}"),
+        }
+    }
 
     #[test]
     #[allow(clippy::type_complexity)]

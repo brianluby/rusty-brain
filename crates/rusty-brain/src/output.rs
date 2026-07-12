@@ -618,7 +618,22 @@ pub fn render_change(item: &rb_proto::SubscribeItem, json: bool) -> String {
 /// so the user can recognize what a pass would touch before allowing it.
 pub fn render_forget_plan(plan: &rb_types::ForgetPlan, json: bool) -> String {
     if json {
-        return serde_json::to_string_pretty(plan).unwrap_or_else(|e| {
+        // W2.4 consistency (PR #60 review): the JSON branch redacts stored
+        // summaries exactly like the human branch and the sibling renderers —
+        // a dry-run listing must never be the channel that leaks a secret.
+        let redacted = rb_types::ForgetPlan {
+            mode: plan.mode,
+            candidates: plan
+                .candidates
+                .iter()
+                .map(|c| rb_types::ForgetCandidate {
+                    summary: redact(&c.summary),
+                    ..c.clone()
+                })
+                .collect(),
+            total_eligible: plan.total_eligible,
+        };
+        return serde_json::to_string_pretty(&redacted).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "failed to render forget plan JSON");
             "{}".to_string()
         });
@@ -670,14 +685,22 @@ pub fn render_forget_outcome(outcome: &rb_types::ForgetOutcome, json: bool) -> S
             "{}".to_string()
         });
     }
-    format!(
+    let mut out = format!(
         "forget ({}): archived={} purged={} eligible={} remaining={}",
         outcome.mode.as_str(),
         outcome.archived,
         outcome.purged,
         outcome.total_eligible,
         outcome.remaining
-    )
+    );
+    if let Some(failure) = &outcome.failure {
+        // A partial pass is loud: the counts above DID commit durably, and
+        // the pass is re-runnable once the cause is fixed.
+        out.push_str(&format!(
+            "\nFAILED partway (completed work kept): {failure}"
+        ));
+    }
+    out
 }
 
 /// Unix seconds to a short UTC date for the human reason lines.
@@ -1048,7 +1071,69 @@ mod tests {
 
         let json_out = render_forget_plan(&plan, true);
         let parsed: rb_types::ForgetPlan = serde_json::from_str(&json_out).unwrap();
-        assert_eq!(parsed, plan);
+        // Structure round-trips; the summary comes back REDACTED (W2.4 —
+        // pinned separately in the JSON-redaction test).
+        assert_eq!(parsed.total_eligible, plan.total_eligible);
+        assert_eq!(parsed.candidates.len(), 1);
+        assert_eq!(parsed.candidates[0].id, plan.candidates[0].id);
+        assert_eq!(
+            parsed.candidates[0].summary,
+            redact(&plan.candidates[0].summary)
+        );
+    }
+
+    #[test]
+    fn forget_plan_json_redacts_summaries_like_sibling_renderers() {
+        // PR #60 review (Copilot): the JSON branch must not leak a stored
+        // secret that the human branch redacts — W2.4 consistency across
+        // every renderer.
+        let plan = rb_types::ForgetPlan {
+            mode: rb_types::ForgetMode::Apply,
+            candidates: vec![rb_types::ForgetCandidate {
+                id: rb_types::MemoryId::new(),
+                summary: "note with key sk-abc123def456ghi789jkl012mno".to_string(),
+                created_at: 1_700_000_000,
+                age_days: 60,
+                importance: 2,
+                base_importance: 3,
+                last_accessed_at: None,
+                archived: false,
+                rule: rb_types::ForgetRule::MaxAge,
+            }],
+            total_eligible: 1,
+        };
+        let json_out = render_forget_plan(&plan, true);
+        assert!(
+            !json_out.contains("sk-abc123def456ghi789jkl012mno"),
+            "JSON dry-run must redact summaries: {json_out}"
+        );
+        assert!(json_out.contains("REDACTED"), "{json_out}");
+    }
+
+    #[test]
+    fn forget_outcome_failure_is_rendered_in_both_modes() {
+        // PR #60 review (HIGH): a partial pass must be visible — the counts
+        // that committed AND the failure that stopped it.
+        let outcome = rb_types::ForgetOutcome {
+            mode: rb_types::ForgetMode::Hard,
+            archived: 0,
+            purged: 2,
+            total_eligible: 5,
+            remaining: 3,
+            failure: Some("purge of abc failed: injected".to_string()),
+        };
+        let human = render_forget_outcome(&outcome, false);
+        assert!(human.contains("purged=2"), "{human}");
+        assert!(
+            human.contains("FAILED") && human.contains("injected"),
+            "partial failure must be loud: {human}"
+        );
+        let parsed: rb_types::ForgetOutcome =
+            serde_json::from_str(&render_forget_outcome(&outcome, true)).unwrap();
+        assert_eq!(
+            parsed.failure.as_deref(),
+            Some("purge of abc failed: injected")
+        );
     }
 
     #[test]
@@ -1059,6 +1144,7 @@ mod tests {
             purged: 2,
             total_eligible: 3,
             remaining: 1,
+            failure: None,
         };
         let out = render_forget_outcome(&outcome, false);
         assert!(out.contains("hard"), "{out}");

@@ -367,9 +367,13 @@ fn resolve_retention(
         importance_floor: section
             .importance_floor
             .unwrap_or(defaults.importance_floor),
+        // Trimmed so the resolved (and wire-carried) form is canonical; blank
+        // entries still fail validation below. The store guard additionally
+        // compares case-insensitively (PR #60 review).
         protected_tags: section
             .protected_tags
-            .clone()
+            .as_ref()
+            .map(|tags| tags.iter().map(|t| t.trim().to_string()).collect())
             .unwrap_or(defaults.protected_tags),
         batch_limit: section.batch_limit.unwrap_or(defaults.batch_limit),
     };
@@ -726,6 +730,31 @@ mod tests {
             vec!["architecture_decision".to_string()]
         );
         assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    #[test]
+    fn retention_protected_tags_are_trimmed_at_resolve() {
+        // PR #60 review: stray whitespace in a protected tag must not survive
+        // into the resolved policy (the store guard also normalizes — this
+        // keeps the policy displayable and the wire form canonical).
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [retention]
+            max_age_days = 180
+            protected_tags = ["  architecture_decision ", "postmortem"]
+            "#,
+        );
+        let policy = EffectiveConfig::resolve().unwrap().retention.unwrap();
+        assert_eq!(
+            policy.protected_tags,
+            vec![
+                "architecture_decision".to_string(),
+                "postmortem".to_string()
+            ]
+        );
     }
 
     #[test]

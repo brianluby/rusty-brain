@@ -44,11 +44,22 @@ All notable changes to rusty-brain are documented here. The format is based on
 - **`rusty-brain forget`** (RET-2): bare invocation is a DRY-RUN listing
   exactly the set one pass would touch, with reasons (age, effective/author
   importance, last-recalled, archived state, matched rule; summaries pass
-  through the shared redactor). `--apply` archives (soft, reversible, prunes
-  vectors); `--hard` irreversibly purges row/FTS/vectors/feedback/history
-  (one namespace-stamped `purge` oplog marker remains; freed bytes are
-  zeroed via scoped `secure_delete` + WAL truncate, asserted by a raw-bytes
-  drill) and is peer-gated like `scrub`. Bounded per pass and re-runnable.
+  through the shared redactor in BOTH output modes). `--apply` archives
+  (soft, reversible, prunes vectors); `--hard` irreversibly purges
+  row/FTS/vectors/feedback/history (one namespace-stamped `purge` oplog
+  marker remains; freed bytes are zeroed via scoped `secure_delete` + WAL
+  truncate, asserted by a raw-bytes drill), is peer-gated like `scrub`, and
+  its EXECUTION additionally requires an interactive confirmation showing
+  the plan — or an explicit `--yes` for automation; non-interactive
+  invocations (`--json` or piped stdin) refuse without `--yes`. Bounded per
+  pass and re-runnable; a mid-pass failure keeps the completed work (each
+  memory commits in its own transaction), surfaces as a partial outcome
+  ("N archived, M purged, then failed: ..."), exits non-zero, and every run
+  — including zero-change and partial ones — writes the bulk
+  `retention_sweep` oplog row so `last_forget_at` tracks runs, not
+  mutations. Protected-tag matching is trimmed and ASCII-case-insensitive
+  on both sides, so user-typed case/whitespace variance cannot defeat the
+  guard.
   Eligibility guards are absolute: the importance floor gates BOTH the
   effective importance and the author prior (the W1.9 clamp productized —
   an authored importance-10 memory is never eligible), protected tags

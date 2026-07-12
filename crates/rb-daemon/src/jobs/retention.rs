@@ -33,15 +33,38 @@ pub async fn run(
         return Ok(JobSummary::default());
     }
     let mut summary = JobSummary::default();
+    // One failing namespace must not starve the others (the job retries on
+    // its next tick anyway): continue the pass, collect failures, and report
+    // them at the end alongside the committed counts — partial work stays
+    // durable and oplog-recorded either way (PR #60 review).
+    let mut failures: Vec<String> = Vec::new();
     for namespace in store.retention_namespaces().await? {
-        let outcome = store
+        let ns_label = namespace.as_db_string();
+        match store
             .retention_sweep(namespace, policy.clone(), ForgetMode::Apply)
-            .await?;
-        summary.scanned += outcome.total_eligible;
-        summary.changed += outcome.archived;
-        summary.skipped += outcome.remaining;
+            .await
+        {
+            Ok(outcome) => {
+                summary.scanned += outcome.total_eligible;
+                summary.changed += outcome.archived;
+                summary.skipped += outcome.remaining;
+                if let Some(failure) = outcome.failure {
+                    failures.push(format!("{ns_label}: {failure}"));
+                }
+            }
+            Err(e) => failures.push(format!("{ns_label}: {e}")),
+        }
     }
-    Ok(summary)
+    if failures.is_empty() {
+        Ok(summary)
+    } else {
+        Err(rb_types::Error::Storage(format!(
+            "retention pass: {} change(s) committed, but {} namespace pass(es) failed: {}",
+            summary.changed,
+            failures.len(),
+            failures.join("; ")
+        )))
+    }
 }
 
 #[cfg(test)]
@@ -126,6 +149,64 @@ mod tests {
         // Idempotent second pass.
         let summary = run(&handle, Some(&policy())).await.unwrap();
         assert_eq!(summary.changed, 0);
+        handle.shutdown().await;
+    }
+
+    // PR #60 review (HIGH follow-through): one namespace failing mid-pass
+    // must neither abort the other namespaces nor be silently swallowed —
+    // the pass continues, and the job reports the failure at the end.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_continues_past_a_failing_namespace_and_reports_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        // Seed, then install a test-local failpoint: archiving the Global
+        // victim is blocked by a RAISE trigger ("global" sorts before
+        // "project:job-a", so the failing namespace is swept FIRST).
+        let blocked;
+        let healthy;
+        {
+            let handle = StoreHandle::start(db.clone(), DIM, 1).unwrap();
+            blocked = seed_old_low(&handle, &Namespace::Global).await;
+            healthy = seed_old_low(&handle, &Namespace::Project("job-a".to_string())).await;
+            handle.shutdown().await;
+        }
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER test_block_archive BEFORE UPDATE OF archived_at ON memories
+                 WHEN old.memory_id = '{blocked}'
+                 BEGIN SELECT RAISE(ABORT, 'injected archive failure'); END;"
+            ))
+            .unwrap();
+        }
+
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let err = run(&handle, Some(&policy())).await.unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("injected archive failure"),
+            "the cause is surfaced: {msg}"
+        );
+        assert!(
+            msg.contains("1 change"),
+            "committed work is reported alongside the failure: {msg}"
+        );
+
+        let got = handle
+            .get(Namespace::Project("job-a".to_string()), healthy)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            got.archived_at.is_some(),
+            "the healthy namespace was still swept"
+        );
+        let got = handle
+            .get(Namespace::Global, blocked)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.archived_at.is_none(), "the blocked memory survives");
         handle.shutdown().await;
     }
 

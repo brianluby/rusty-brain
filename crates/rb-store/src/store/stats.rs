@@ -235,12 +235,9 @@ impl SqliteStore {
             reembed_pending,
             // RET-4 visibility: apply-mode eligible count under the daemon's
             // policy (None = no [retention] configured — distinguishable from
-            // "0 eligible"), via the SAME candidate WHERE the sweep executes.
-            // Apply-mode eligible count under the daemon's policy (None = no
-            // [retention] configured — distinguishable from "0 eligible"),
-            // via the SAME candidate WHERE the sweep executes; last-forget is
-            // the bulk `retention_sweep` oplog row (reported even without a
-            // live policy — history is history).
+            // "0 eligible"), via the SAME candidate WHERE the sweep executes;
+            // last-forget is the bulk `retention_sweep` oplog row (reported
+            // even without a live policy — history is history).
             retention_eligible,
             last_forget_at,
         })
