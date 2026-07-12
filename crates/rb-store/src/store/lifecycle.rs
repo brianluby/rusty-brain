@@ -36,6 +36,20 @@ impl SqliteStore {
         embedding_dim: usize,
         embedding_model: Option<&str>,
     ) -> Result<Self> {
+        Self::open_inner_with_schema_hook(path, embedding_dim, embedding_model, || {})
+    }
+    /// The real file-open path with a seam that lets concurrency tests pause
+    /// after the optimistic vector-schema check. The production monomorph uses
+    /// a zero-sized no-op closure, so current-schema opens pay no callback cost.
+    fn open_inner_with_schema_hook<F>(
+        path: &Path,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+        after_vector_schema_read: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(),
+    {
         register_vec()?;
         // The DB file holds captured memory text: owner-only (0600), parity with
         // the daemon socket. Pre-create a missing file at 0600 so it is never
@@ -85,7 +99,12 @@ impl SqliteStore {
                 path.display()
             )))
         })?;
-        Self::init(conn, embedding_dim, embedding_model)
+        Self::init_with_schema_hook(
+            conn,
+            embedding_dim,
+            embedding_model,
+            after_vector_schema_read,
+        )
     }
     /// Open an ephemeral in-memory store with the given embedding dimension.
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self> {
@@ -100,6 +119,17 @@ impl SqliteStore {
         embedding_dim: usize,
         embedding_model: Option<&str>,
     ) -> Result<Self> {
+        Self::init_with_schema_hook(conn, embedding_dim, embedding_model, || {})
+    }
+    fn init_with_schema_hook<F>(
+        conn: rusqlite::Connection,
+        embedding_dim: usize,
+        embedding_model: Option<&str>,
+        after_vector_schema_read: F,
+    ) -> Result<Self>
+    where
+        F: FnOnce(),
+    {
         // A zero-dimension embedding produces a malformed `float[0]` vec0 column.
         // Reject it up front rather than letting SQLite fail cryptically later.
         if embedding_dim == 0 {
@@ -143,7 +173,7 @@ impl SqliteStore {
         // created at the current vector schema version — or rebuilt in place
         // from a previous version (W1.1 cosine metric + W1.7 namespace
         // partition, one combined rebuild).
-        ensure_vector_schema(&conn, embedding_dim)?;
+        ensure_vector_schema_with_hook(&conn, embedding_dim, after_vector_schema_read)?;
         let site_id = seed_or_get_site_id(&conn)?;
 
         Ok(Self {
@@ -293,22 +323,39 @@ fn upsert_meta(conn: &rusqlite::Connection, key: &str, value: &str) -> Result<()
 /// - table without marker (v1 layout, OR a half-created fresh DB after a
 ///   crash between CREATE and marker): full rebuild — idempotent because the
 ///   stash SELECT reads only columns both layouts expose.
-fn ensure_vector_schema(conn: &rusqlite::Connection, embedding_dim: usize) -> Result<()> {
+fn ensure_vector_schema_with_hook<F>(
+    conn: &rusqlite::Connection,
+    embedding_dim: usize,
+    after_schema_read: F,
+) -> Result<()>
+where
+    F: FnOnce(),
+{
     if meta_value(conn, "vector_schema_version")?.as_deref() == Some(VECTOR_SCHEMA_VERSION) {
         return Ok(());
     }
 
-    let table_exists: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'memory_vectors'",
-            [],
-            |r| r.get(0),
-        )
-        .map_err(storage_err)?;
+    after_schema_read();
 
-    // One transaction for create-or-rebuild + marker: a crash mid-way rolls
-    // everything back and the next open retries from the same state.
+    // Only the slow path takes a write lock. Re-read every decision input
+    // after BEGIN IMMEDIATE: another opener may have completed initialization
+    // while this connection waited for the lock. Keeping the optimistic check
+    // above means a current-schema open remains read-only and lock-free.
+    // Create-or-rebuild + markers stay in one transaction, so a crash mid-way
+    // rolls everything back and the next open retries from the same state.
     immediate_tx(conn, || {
+        if meta_value(conn, "vector_schema_version")?.as_deref() == Some(VECTOR_SCHEMA_VERSION) {
+            return Ok(());
+        }
+
+        let table_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'memory_vectors'",
+                [],
+                |r| r.get(0),
+            )
+            .map_err(storage_err)?;
         if table_exists > 0 {
             rebuild_vector_table(conn, embedding_dim)?;
         } else {
@@ -1455,6 +1502,130 @@ mod vector_schema_tests {
             .unwrap();
         assert!(ddl.contains("PARTITION KEY"), "ddl: {ddl}");
         assert!(ddl.contains("distance_metric=cosine"), "ddl: {ddl}");
+    }
+
+    #[test]
+    fn concurrent_fresh_vector_schema_opens_agree_on_all_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("concurrent-fresh.db");
+
+        // Leave a genuinely fresh dynamic-vector state: all committed SQL
+        // migrations exist, but dimension/model/site markers and the vec0
+        // table do not. This isolates the vector-schema race from the separate
+        // migration runner while exercising marker seeding in both opens.
+        register_vec().unwrap();
+        {
+            let conn = rusqlite::Connection::open(&path).unwrap();
+            conn.pragma_update(None, "journal_mode", "WAL").unwrap();
+            run_migrations(&conn).unwrap();
+        }
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let spawn_open = |path: std::path::PathBuf, barrier: std::sync::Arc<std::sync::Barrier>| {
+            std::thread::spawn(move || -> std::result::Result<[String; 5], String> {
+                let store = SqliteStore::open_inner_with_schema_hook(
+                    &path,
+                    DIM,
+                    Some("deterministic"),
+                    move || {
+                        barrier.wait();
+                    },
+                )
+                .map_err(|error| error.to_string())?;
+                let value = |key| {
+                    store
+                        .meta_value(key)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("missing meta.{key}"))
+                };
+                Ok([
+                    value("embedding_dim")?,
+                    value("embedding_model")?,
+                    value("vector_schema_version")?,
+                    value("vector_metric")?,
+                    store.site_id().to_string(),
+                ])
+            })
+        };
+
+        let first = spawn_open(path.clone(), std::sync::Arc::clone(&barrier));
+        let second = spawn_open(path, barrier);
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+
+        assert_eq!(first, second, "both opens must observe one committed state");
+        assert_eq!(
+            &first[..4],
+            ["8", "deterministic", VECTOR_SCHEMA_VERSION, "cosine"],
+            "dimension, model, schema version, and metric markers agree"
+        );
+    }
+
+    /// Reproducible task #54 microbenchmark. Run with:
+    /// `cargo test --release -p rb-store vector_schema_current_open_benchmark \
+    /// -- --ignored --nocapture`
+    #[test]
+    #[ignore = "manual release-mode microbenchmark"]
+    fn vector_schema_current_open_benchmark() {
+        const ITERATIONS: u32 = 20_000;
+        const SAMPLES: usize = 7;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("current-schema-bench.db");
+        let store = SqliteStore::open_with_model(&path, DIM, "deterministic").unwrap();
+
+        // Warm SQLite's page cache and both statement paths before timing.
+        for _ in 0..1_000 {
+            ensure_vector_schema_with_hook(&store.conn, DIM, || {}).unwrap();
+            immediate_tx(&store.conn, || {
+                std::hint::black_box(meta_value(&store.conn, "vector_schema_version")?);
+                Ok(())
+            })
+            .unwrap();
+        }
+
+        let measure_optimistic = || {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                ensure_vector_schema_with_hook(&store.conn, DIM, || {}).unwrap();
+            }
+            started.elapsed().as_nanos() as f64 / f64::from(ITERATIONS)
+        };
+        let measure_forced_lock = || {
+            let started = std::time::Instant::now();
+            for _ in 0..ITERATIONS {
+                immediate_tx(&store.conn, || {
+                    std::hint::black_box(meta_value(&store.conn, "vector_schema_version")?);
+                    Ok(())
+                })
+                .unwrap();
+            }
+            started.elapsed().as_nanos() as f64 / f64::from(ITERATIONS)
+        };
+
+        let mut optimistic_samples = Vec::with_capacity(SAMPLES);
+        let mut forced_lock_samples = Vec::with_capacity(SAMPLES);
+        for sample in 0..SAMPLES {
+            // Alternate order to avoid consistently giving either path the
+            // warmer cache or later CPU state.
+            if sample % 2 == 0 {
+                optimistic_samples.push(measure_optimistic());
+                forced_lock_samples.push(measure_forced_lock());
+            } else {
+                forced_lock_samples.push(measure_forced_lock());
+                optimistic_samples.push(measure_optimistic());
+            }
+        }
+        optimistic_samples.sort_by(f64::total_cmp);
+        forced_lock_samples.sort_by(f64::total_cmp);
+        let optimistic_median = optimistic_samples[SAMPLES / 2];
+        let forced_lock_median = forced_lock_samples[SAMPLES / 2];
+        println!(
+            "vector_schema_current_open iterations_per_sample={ITERATIONS} samples={SAMPLES} \
+             optimistic_median_ns_per_op={optimistic_median:.1} \
+             forced_immediate_median_ns_per_op={forced_lock_median:.1} \
+             forced_overhead_ratio={:.2}x",
+            forced_lock_median / optimistic_median
+        );
     }
 
     /// W1.7 acceptance: a namespace whose live rows are <1% of all vectors
