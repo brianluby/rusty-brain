@@ -1659,20 +1659,27 @@ fn writer_loop(
                         // the caller's namespace before mutating, so the primitive can
                         // never merge across namespaces and the Archived event below is
                         // provably published under `old`'s real namespace. Fail closed
-                        // (NotFound) on a missing or cross-namespace target. The
+                        // (NotFound) on a missing or cross-namespace target, NAMING the
+                        // offending id (a foreign row is indistinguishable from a
+                        // missing one on purpose): the consolidation job discriminates
+                        // a purged survivor by the id inside NotFound (#501). The
                         // archived/superseded state guards live in the store itself
                         // (#501, `Store::supersede`): self-supersede is
                         // InvalidArgument; a resolved old row or a non-current new
                         // target is StalePlan — no event is published on any refusal.
-                        match (s.get_memory(&old), s.get_memory(&new)) {
-                            (Ok(Some(o)), Ok(Some(n)))
-                                if o.namespace == namespace && n.namespace == namespace =>
-                            {
-                                s.supersede(&old, &new)
-                            }
-                            (Err(e), _) | (_, Err(e)) => Err(e),
-                            _ => Err(Error::NotFound(old.clone())),
+                        let old_in_ns = s
+                            .get_memory(&old)?
+                            .is_some_and(|m| m.namespace == namespace);
+                        if !old_in_ns {
+                            return Err(Error::NotFound(old.clone()));
                         }
+                        let new_in_ns = s
+                            .get_memory(&new)?
+                            .is_some_and(|m| m.namespace == namespace);
+                        if !new_in_ns {
+                            return Err(Error::NotFound(new.clone()));
+                        }
+                        s.supersede(&old, &new)
                     },
                 );
                 let changed = report.result.is_ok();

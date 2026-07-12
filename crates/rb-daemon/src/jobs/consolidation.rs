@@ -5,6 +5,9 @@
 use crate::jobs::ConsolidationConfig;
 use crate::jobs::JobSummary;
 use crate::StoreHandle;
+// `StoreHandle::get` (the survivor re-read on a guard miss) is a
+// `MemoryBackend` trait method.
+use rb_engine::MemoryBackend as _;
 use rb_types::{MemoryId, Result};
 use std::collections::HashSet;
 
@@ -55,8 +58,13 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
 /// near-duplicates that also appear in this pass's candidate window, pick a
 /// deterministic survivor, and supersede every OTHER member into the survivor,
 /// marking each consumed so it is never revisited. `scanned` counts candidates
-/// examined; `changed` counts supersede writes; `skipped` counts candidates with
-/// no duplicate.
+/// examined; `changed` counts supersede writes; `skipped` counts candidates
+/// with no duplicate PLUS members not merged because a concurrent writer got
+/// there first (#501): a member-side race loss skips just that member
+/// (debug-logged), while a resolved/purged SURVIVOR abandons the whole
+/// cluster (warn-logged with `event = "consolidation_stale_survivor"`) and
+/// leaves its unmerged members eligible to re-cluster around a fresh
+/// survivor on a later anchor or pass.
 ///
 /// Idempotency: a superseded/archived member is excluded from the candidate scan
 /// AND from `near_duplicates` (both filter `archived_at IS NULL`), so a second
@@ -135,58 +143,127 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
         };
 
         // Supersede every member that is not the survivor into the survivor.
+        let mut survivor_stale = false;
         for member in &cluster {
             if member.id == survivor_id {
                 continue;
             }
-            if supersede_member(store, &cand.namespace, &member.id, &survivor_id).await? {
-                summary.changed += 1;
-            } else {
-                summary.skipped += 1;
+            match supersede_member(store, &cand.namespace, &member.id, &survivor_id).await? {
+                MemberOutcome::Changed => {
+                    summary.changed += 1;
+                    consumed.insert(member.id.to_string());
+                }
+                // The member was resolved by a concurrent writer: skip it and
+                // keep absorbing the rest — the survivor is still valid.
+                MemberOutcome::LostRace => {
+                    summary.skipped += 1;
+                    consumed.insert(member.id.to_string());
+                }
+                // The GROUP's target is dead (resolved or purged mid-pass):
+                // abandon the cluster. Unmerged members (and the anchor) stay
+                // UN-consumed so a later anchor in this pass — or the next
+                // scheduled pass — re-clusters them around a fresh survivor
+                // (the job's normal convergence). Distinct warn-level,
+                // structured observability (#501 follow-up): a dead survivor
+                // is rarer and more surprising than a member race.
+                MemberOutcome::StaleSurvivor => {
+                    summary.skipped += 1;
+                    survivor_stale = true;
+                    tracing::warn!(
+                        event = "consolidation_stale_survivor",
+                        survivor = %survivor_id,
+                        member = %member.id,
+                        namespace = %cand.namespace.as_db_string(),
+                        cluster_size = cluster.len(),
+                        "cluster survivor was resolved mid-pass; abandoning the cluster \
+                         so its members re-cluster around a fresh survivor"
+                    );
+                    break;
+                }
             }
-            consumed.insert(member.id.to_string());
         }
-        // The survivor (and the anchor, if it survived) is consumed so it is not
-        // re-clustered as a fresh anchor later in the same pass.
+        // The survivor is always consumed: either it absorbed the cluster, or
+        // it is a dead target that must not anchor a later cluster this pass.
         consumed.insert(survivor_id.to_string());
-        consumed.insert(cand.id.to_string());
+        if !survivor_stale {
+            // The anchor is consumed so it is not re-clustered as a fresh
+            // anchor later in the same pass. On a stale survivor it stays
+            // eligible instead (it may still be active and re-cluster).
+            consumed.insert(cand.id.to_string());
+        }
     }
 
     Ok(summary)
 }
 
+/// How one member's guarded supersede ended (#501): the job discriminates a
+/// benign member-side race loss from a dead GROUP target so `run` can skip
+/// one member vs abandon the whole cluster.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum MemberOutcome {
+    /// The member was superseded into the survivor.
+    Changed,
+    /// The member itself was resolved by a concurrent writer; the survivor
+    /// is still a valid target for the remaining members.
+    LostRace,
+    /// The SURVIVOR is no longer a valid target (resolved or purged
+    /// mid-pass): every remaining supersede into it would also fail.
+    StaleSurvivor,
+}
+
 /// Supersede one cluster member into the survivor, tolerating the read/write
 /// race (#501 caller compatibility): the candidate window and near-dup lookup
-/// are reads, so a live daemon can resolve a member (remember --supersedes, a
-/// review merge, another writer) before this job's write lands. The store's
-/// supersede guard turns that into [`rb_types::Error::StalePlan`]; a bounded
-/// maintenance pass must skip past the benign collision (the review
-/// policy-sweep discipline) instead of aborting — the winner's pointer stays
-/// exactly as the winner wrote it. Every OTHER error (including a vanished
-/// member: `NotFound`) still fails the pass.
+/// are reads, so a live daemon can resolve a member OR the survivor (remember
+/// --supersedes, a review merge, another writer) before this job's write
+/// lands. The store's supersede guard turns both into a refusal; this helper
+/// discriminates them for `run`:
 ///
-/// Returns `Ok(true)` when the member was superseded, `Ok(false)` on a
-/// benign lost race.
+/// - [`MemberOutcome::LostRace`] — `StalePlan` where the survivor is still
+///   current: only this member was claimed; skip it and continue (the review
+///   policy-sweep discipline). The winner's pointer stays exactly as written.
+/// - [`MemberOutcome::StaleSurvivor`] — `StalePlan` where the survivor itself
+///   is archived/superseded, or `NotFound` naming the survivor (purged):
+///   the group's target is dead and the cluster must be abandoned.
+///
+/// Every other error (including a vanished MEMBER: `NotFound` naming it)
+/// still fails the pass.
 async fn supersede_member(
     store: &StoreHandle,
     namespace: &rb_types::Namespace,
     member: &MemoryId,
     survivor: &MemoryId,
-) -> Result<bool> {
+) -> Result<MemberOutcome> {
     match store
         .supersede(namespace.clone(), member.clone(), survivor.clone())
         .await
     {
-        Ok(()) => Ok(true),
+        Ok(()) => Ok(MemberOutcome::Changed),
         Err(rb_types::Error::StalePlan(reason)) => {
-            tracing::debug!(
-                member = %member,
-                survivor = %survivor,
-                %reason,
-                "consolidation lost a supersede race; skipping the member"
-            );
-            Ok(false)
+            // Disambiguate WHICH side went stale by re-reading the survivor:
+            // still current => the member lost a benign race; otherwise the
+            // group's target is dead. (`get` through the read pool; the tiny
+            // read only happens on the rare guard-miss path.)
+            let survivor_current = store
+                .get(namespace.clone(), survivor.clone())
+                .await?
+                .is_some_and(|s| s.archived_at.is_none() && s.superseded_by.is_none());
+            if survivor_current {
+                tracing::debug!(
+                    member = %member,
+                    survivor = %survivor,
+                    %reason,
+                    "consolidation lost a member supersede race; skipping the member"
+                );
+                Ok(MemberOutcome::LostRace)
+            } else {
+                Ok(MemberOutcome::StaleSurvivor)
+            }
         }
+        // A missing SURVIVOR surfaces as NotFound carrying ITS id (the
+        // daemon namespace pre-check and the store both name the offending
+        // side): a purged target is the same dead-end group state, not a
+        // pass-fatal error.
+        Err(rb_types::Error::NotFound(id)) if id == *survivor => Ok(MemberOutcome::StaleSurvivor),
         Err(e) => Err(e),
     }
 }
@@ -316,10 +393,13 @@ mod tests {
             .await
             .unwrap();
 
-        let changed = supersede_member(&handle, &ns, &member_id, &survivor_id)
+        let outcome = supersede_member(&handle, &ns, &member_id, &survivor_id)
             .await
             .unwrap();
-        assert!(changed, "an unresolved member is superseded");
+        assert!(
+            matches!(outcome, MemberOutcome::Changed),
+            "an unresolved member is superseded"
+        );
         let got = handle
             .get(ns.clone(), member_id.clone())
             .await
@@ -362,11 +442,15 @@ mod tests {
             .await
             .unwrap();
 
-        // The job's write loses the race: skipped (Ok(false)), never an Err.
-        let changed = supersede_member(&handle, &ns, &member_id, &survivor_id)
+        // The job's write loses the race: a benign member-side skip
+        // (the survivor is still a valid target), never an Err.
+        let outcome = supersede_member(&handle, &ns, &member_id, &survivor_id)
             .await
             .unwrap();
-        assert!(!changed, "a lost race is a benign skip, not a change");
+        assert!(
+            matches!(outcome, MemberOutcome::LostRace),
+            "a lost member race is a benign skip, not a change"
+        );
         let got = handle
             .get(ns.clone(), member_id.clone())
             .await
@@ -383,6 +467,70 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, rb_types::Error::NotFound(_)), "got {err:?}");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supersede_member_reports_a_stale_survivor_distinctly() {
+        // #501 review follow-up (Copilot): a StalePlan caused by the
+        // SURVIVOR — the group's target was itself resolved mid-pass — is
+        // NOT a benign member skip: every remaining supersede into it would
+        // also fail, and lineage would aim at a dead end. The job must
+        // discriminate it (abandon the cluster; members re-cluster around a
+        // fresh survivor on a later anchor or pass) instead of burning one
+        // guarded write per member on a target known to be dead.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("tolerant".to_string());
+
+        let member = vnote(&ns, "member", 3);
+        let survivor = vnote(&ns, "survivor", 9);
+        let replacement = vnote(&ns, "replacement truth", 9);
+        let (member_id, survivor_id, replacement_id) = (
+            member.id.clone(),
+            survivor.id.clone(),
+            replacement.id.clone(),
+        );
+        for (n, v) in [
+            (member, vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (survivor, vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (replacement, vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ] {
+            handle.write(n, Some(v)).await.unwrap();
+        }
+
+        // The "concurrent" resolution takes out the SURVIVOR itself.
+        handle
+            .supersede(ns.clone(), survivor_id.clone(), replacement_id.clone())
+            .await
+            .unwrap();
+
+        let outcome = supersede_member(&handle, &ns, &member_id, &survivor_id)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MemberOutcome::StaleSurvivor),
+            "a resolved survivor must be reported distinctly, got {outcome:?}"
+        );
+        // The member is untouched: it stays eligible for re-clustering.
+        let got = handle
+            .get(ns.clone(), member_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(got.superseded_by.is_none() && got.archived_at.is_none());
+
+        // A PURGED survivor (NotFound on the new side) is the same dead-end
+        // group state, not a pass-fatal error.
+        let outcome = supersede_member(&handle, &ns, &member_id, &rb_types::MemoryId::new())
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, MemberOutcome::StaleSurvivor),
+            "a vanished survivor is a stale group target, got {outcome:?}"
+        );
 
         handle.shutdown().await;
     }

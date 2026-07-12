@@ -68,7 +68,12 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "enrichment" => Error::Enrichment(unprefixed(message, "enrichment error: ")),
         "invalid_argument" => Error::InvalidArgument(unprefixed(message, "invalid argument: ")),
         "permission_denied" => Error::PermissionDenied(unprefixed(message, "permission denied: ")),
-        "stale_plan" => Error::StalePlan(unprefixed(message, "stale review plan: ")),
+        // The prefix matches `Error::StalePlan`'s Display exactly (#501: it
+        // was generalized from "stale review plan: " when the guarded
+        // supersede became a second producer; the wire KIND is unchanged).
+        // An old peer's "stale review plan: " message strips nothing here --
+        // the documented no-op degradation, cosmetic only.
+        "stale_plan" => Error::StalePlan(unprefixed(message, "stale plan: ")),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),

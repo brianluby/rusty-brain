@@ -35,9 +35,11 @@ pub enum Error {
     /// replacement is no longer current truth). Client-safe guidance.
     /// Distinct variant so tolerant sweeps (review policy, consolidation) can
     /// skip-and-continue past a benign collision while real errors still stop
-    /// the pass. The Display prefix predates the generalization and is kept
-    /// stable: the `stale_plan` wire kind's message round-trip strips it.
-    #[error("stale review plan: {0}")]
+    /// the pass. The Display prefix is subsystem-neutral (it renders in
+    /// daemon logs for non-review paths); the wire KIND string stays
+    /// `stale_plan`, and rb-proto strips this exact prefix on the message
+    /// round-trip — keep the two in lockstep.
+    #[error("stale plan: {0}")]
     StalePlan(String),
     /// An authenticated peer is not authorized for the requested operation
     /// (W2.6: admin ops are gated on the daemon-verified peer identity, not on
@@ -135,6 +137,20 @@ mod tests {
         let id = MemoryId::new();
         let e = Error::NotFound(id.clone());
         assert_eq!(e.to_string(), format!("memory not found: {id}"));
+    }
+
+    #[test]
+    fn stale_plan_display_is_subsystem_neutral() {
+        // #501 review follow-up: StalePlan is produced by review resolutions
+        // AND the guarded supersede (consolidation, remember-fold, near-dup
+        // suppression), so the Display must not claim "review" — operators
+        // grep daemon logs by this rendering. The wire kind stays
+        // `stale_plan`; rb-proto's prefix strip is held in lockstep by its
+        // `stale_plan_round_trips_verbatim` test.
+        assert_eq!(
+            Error::StalePlan("x was already resolved".into()).to_string(),
+            "stale plan: x was already resolved"
+        );
     }
 
     #[test]

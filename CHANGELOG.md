@@ -22,12 +22,25 @@ All notable changes to rusty-brain are documented here. The format is based on
   existing error kinds on existing ops.
 - **Caller compatibility**: the consolidation job now skips-and-continues past
   a lost supersede race (`stale_plan` from a concurrent resolution) instead of
-  aborting the pass, counting it `skipped`; the `remember --supersedes` fold
-  and hook near-dup suppression were already best-effort and now log the
-  refusal instead of silently mutating resolved rows. Previously a re-supersede
-  of an archived row silently planted a lineage pointer on a retired row —
-  that is now a refusal, because a plan formed against a retired row is stale
-  by definition and recording it would fabricate a decision-evolution step.
+  aborting the pass, counting it `skipped`; a resolved/purged SURVIVOR is
+  discriminated from a member-side race loss — the whole cluster is abandoned
+  (warn-logged as `consolidation_stale_survivor`) and its unmerged members
+  stay eligible to re-cluster around a fresh survivor. The
+  `remember --supersedes` fold and hook near-dup suppression were already
+  best-effort and now log the refusal instead of silently mutating resolved
+  rows. Previously a re-supersede of an archived row silently planted a
+  lineage pointer on a retired row — that is now a refusal, because a plan
+  formed against a retired row is stale by definition and recording it would
+  fabricate a decision-evolution step.
+- **All three guards live in the ONE shared primitive**
+  (`SqliteStore::supersede_guarded_in_tx`), each reported as a distinct
+  variant, so acyclicity is structural rather than a caller invariant; the
+  general path and the review merge only map variants to their own errors
+  (exhaustively — a future guard forces every caller to reconsider).
+- **`Error::StalePlan` Display generalized** from `stale review plan:` to
+  the subsystem-neutral `stale plan:` (it now renders in daemon logs for
+  non-review supersede paths); the wire KIND string `stale_plan` is
+  unchanged and rb-proto's message round-trip strip moved in lockstep.
 
 ### Added — Codex `apply_patch` file-edit capture (follow-up 2026-06-02)
 
