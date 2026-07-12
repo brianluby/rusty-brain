@@ -5,6 +5,48 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — HTTP/REST surface and agent-agnostic prompt-time recall (PRD 2026-07-02)
+
+- **Opt-in loopback HTTP listener** (`serve --http [bind]` / `[http]`
+  config): REST endpoints (`GET /ping`, `GET /context`, `GET /memories/:id`,
+  `POST /recall`, `POST /remember`, `POST /feedback`, generic `POST /ops`)
+  that MIRROR the UDS wire ops — same `Request` decode, same `dispatch`,
+  same `Response` JSON, no `CONTRACT_VERSION` change. Off by default at
+  every layer (the `[retention]` precedent): no config → no TCP socket
+  bound, no task spawned. Fail-closed security posture, threat-modeled in
+  `docs/THREAT_MODEL.md` ("The opt-in HTTP listener"): literal-loopback-only
+  bind validated at config resolve AND re-validated at `Daemon::bind`
+  (hostnames never parse — no DNS decides where the daemon listens); admin
+  ops (`RunJob`/`Reembed`/`NamespaceRename`/`Scrub`/hard `Forget`) are
+  ALWAYS denied over HTTP (no kernel peer credential over TCP — the W2.6
+  unreadable-peer-cred fail-closed path); loopback Host/Origin checks
+  (DNS-rebinding and browser cross-origin defense) plus a required
+  `application/json` content type (forces CORS preflight; no CORS headers
+  are ever emitted); 1 MiB body cap (UDS `MAX_FRAME_BYTES` parity, refused
+  from the declared length before buffering); header-read and per-request
+  deadlines; a dedicated connection semaphore so HTTP load cannot starve
+  the UDS path; graceful shutdown covers the listener. The
+  `x-rusty-brain-namespace` header scopes requests (validated like the
+  handshake namespace); HTTP writes are stamped `origin_source = "http"`.
+- **`Client<S>` transport genericization (W5a.3, pulled forward)**:
+  `rb_proto::Client` is now generic over any `AsyncRead + AsyncWrite`
+  stream with `UnixStream` as the default; `Client::handshake(stream, ns,
+  identity)` performs the same versioned handshake over any transport and
+  `connect`/`connect_with_identity` delegate to it. Agreement tests pin the
+  UDS path byte-for-byte against a second transport, so the wire contract
+  stays single-sourced (no `CONTRACT_VERSION` bump; no snapshot change).
+- **CA6 — recall-before-work as an agent capability**: the prompt-time
+  recall injection contract (top-k=5 under budget, ≤200 chars/item, the
+  W2.5 untrusted-data preamble, W3.3 source-aware suppression) is now
+  defined agent-agnostically in `rb_agents::recall_contract`
+  (`PROMPT_TIME_RECALL`); the Claude Code adapter (`rb-hooks`) consumes the
+  contract constants directly so the lead implementation cannot drift.
+  Per-adapter mapping truth stays in the capability matrix (Claude
+  `UserPromptSubmit` supported; codex/opencode/gemini recorded
+  `unsupported` — no invented events); agents without a mapped event get a
+  documented HTTP `/recall` integration path (`docs/AGENTS.md`,
+  "Agent-agnostic prompt-time recall (CA6)").
+
 ### Added — Typed code anchors (PRD 2026-07-02)
 
 - **First-class, queryable code anchors**: a memory can now carry structured

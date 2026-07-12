@@ -106,6 +106,39 @@ facts, unknowns, and next steps live in
 `docs/follow-ups/2026-06-23-hermes-discovery.md`. The scorecard target is
 skipped with `phase=config`.
 
+## Agent-agnostic prompt-time recall (CA6)
+
+Recall-before-work is a product capability, not a Claude implementation
+detail. The injection contract is defined once, independent of any agent's
+event name, in `crates/rb-agents/src/recall_contract.rs`
+(`PROMPT_TIME_RECALL`):
+
+1. **Top-k under a budget** — at most 5 memories per prompt, each displayed
+   at ≤200 chars (summary-or-first-N-chars, the W3.3 projection rule).
+2. **Untrusted-data framing (W2.5)** — the shared data-not-instructions
+   preamble precedes every injected block; each memory is quoted and labeled
+   with provenance.
+3. **Source-aware suppression (W3.3)** — inject nothing when prior context
+   is still present (Claude `resume`) and nothing on zero hits.
+
+Per-adapter mapping (the capability matrix records the truth — never silent
+parity):
+
+| Agent | Mapped event | `retrieval` |
+|---|---|---|
+| claude-code | `UserPromptSubmit` (rb-hooks consumes the contract constants directly) | supported |
+| codex | none — native `UserPromptSubmit` payloads are fixture-gated | unsupported |
+| opencode | none — no prompt-submission event fixture exists | unsupported |
+| gemini | none — descoped | unsupported |
+
+Agents without a mapped event can still get recall-before-work from their
+own tooling via the opt-in loopback HTTP surface (`serve --http`, see the
+README "HTTP listener" section and `docs/THREAT_MODEL.md`): `POST /recall`
+with the prompt as the query, then wrap the results per the contract above
+(cap the item count, apply the untrusted preamble) before injecting them
+into the agent's context. This is a documented integration path, not a
+claim of native support — the matrix rows above stay authoritative.
+
 ## Validation
 
 ```bash
@@ -150,4 +183,7 @@ reports per-run failures with agent and phase.
 
 **No memories injected at prompt time.** Prompt-time retrieval is
 Claude-Code-only today (see the matrix). For Codex, injection happens at
-`SessionStart` only. For OpenCode, no injection channel is active.
+`SessionStart` only. For OpenCode, no injection channel is active. Any agent
+whose tooling can issue an HTTP request can wire recall-before-work itself
+via the opt-in loopback listener — see "Agent-agnostic prompt-time recall
+(CA6)" above.

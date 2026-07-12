@@ -270,6 +270,40 @@ active contradiction links), and `poll_changes` (drains buffered change
 notifications) — are advertised only when `RB_MCP_FULL_TOOLSET` is set, though
 every tool stays routable when called directly.
 
+### Loopback HTTP API (optional, off by default)
+
+For tools that speak neither MCP nor the CLI — dashboards, scripts in other
+languages, non-MCP agents — the daemon can serve an opt-in **loopback-only**
+HTTP listener that mirrors the wire operations:
+
+```bash
+rusty-brain serve --http                 # 127.0.0.1, ephemeral port (logged)
+rusty-brain serve --http 127.0.0.1:7777  # explicit loopback bind
+```
+
+```bash
+curl -s http://127.0.0.1:7777/ping
+curl -s -X POST http://127.0.0.1:7777/recall \
+  -H 'content-type: application/json' \
+  -H 'x-rusty-brain-namespace: project:my-app' \
+  -d '{"query": "auth token refresh decision", "limit": 5, "memory_type": null, "tags": []}'
+```
+
+Endpoints: `GET /ping`, `GET /context`, `GET /memories/:id`, `POST /recall`,
+`POST /remember`, `POST /feedback`, and a generic `POST /ops` that accepts
+the full tagged wire request (`{"op": "Recall", ...}`). Responses are the
+existing wire `Response` types as JSON; errors map by kind (400/403/404/500).
+The `x-rusty-brain-namespace` header scopes a request (default `global`).
+
+Security posture (see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), "The
+opt-in HTTP listener"): off by default at every layer; the bind must be a
+literal loopback `ip:port` — anything else refuses to start; **admin ops are
+always denied over HTTP** (no kernel-verified peer credential over TCP);
+Host/Origin are checked against loopback (DNS-rebinding/browser defense);
+bodies are capped at 1 MiB; v1 is a same-machine, same-user surface and
+explicitly **not an auth boundary** — on a multi-user machine, any local
+account can reach the non-admin surface while it is enabled.
+
 ### Capture hooks (optional)
 
 `rusty-brain-install` wires the `rusty-brain-hooks` binary into a supported agent
@@ -335,7 +369,15 @@ model = "llama3"             # both base_url and model required to activate
 
 [search]
 fusion = "linear"            # or "rrf" (Reciprocal Rank Fusion) for recall ranking
+
+[http]                       # opt-in loopback HTTP listener (off when absent)
+enabled = true               # master opt-in; `bind` alone does NOT enable
+bind = "127.0.0.1:7777"      # literal loopback ip:port only; non-loopback fails closed
 ```
+
+(Exception to warn-and-ignore: unknown keys inside `[retention]` and `[http]`
+**fail closed** — a typo'd key in a section that mutates memories or opens a
+network listener must never silently no-op.)
 
 Two further small files exist for namespace identity (and identity ONLY — a
 repo-committed file must never be able to set sockets, paths, or backends): a

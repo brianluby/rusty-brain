@@ -24,10 +24,12 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    (provenance metadata ONLY)        (the authorization principal)
 ```
 
-1. **The Unix socket is the only network surface, and it is local.** The
-   daemon listens on a Unix domain socket created `0600` inside a `0700`
-   directory. There is no TCP listener. Remote attackers have no direct
-   surface; the threat model starts at local processes.
+1. **The Unix socket is the only network surface by default, and it is
+   local.** The daemon listens on a Unix domain socket created `0600` inside
+   a `0700` directory. There is no TCP listener unless the operator opts
+   into the loopback HTTP listener (its own section below); with no `[http]`
+   config and no `--http` flag, no TCP socket exists. Remote attackers have
+   no direct surface; the threat model starts at local processes.
 
 2. **The OS user is the security principal.** Any process running as the same
    user can connect, read, write, and delete every memory in every namespace.
@@ -61,6 +63,98 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    permissions on open, and the install e2e proves a planted fake secret is
    not greppable from the DB in plaintext *when the redactor catches it*
    (see redaction below).
+
+## The opt-in HTTP listener (HTTP PRD 2026-07-02)
+
+`serve --http [bind]` (or `[http] enabled = true` in the user config) adds a
+LOOPBACK-ONLY HTTP/1.1 listener that mirrors the UDS wire ops — same
+`Request` decode, same `dispatch`, same `Response` serialization
+(`crates/rb-daemon/src/http.rs`). It exists so non-MCP tools, scripts, and
+non-Claude agents can reach memory. It is a new network surface and is
+modeled here as one.
+
+**Assets at risk** are unchanged: the full memory corpus (read AND write, in
+every namespace — namespace is organization, not auth), plus daemon
+availability.
+
+**What changes at the trust boundary:** a UDS connection carries a
+kernel-verified peer uid (`SO_PEERCRED`/`getpeereid`); a loopback TCP
+connection carries nothing. Two consequences, both handled fail-closed:
+
+1. **HTTP is NEVER admin.** Every HTTP request dispatches as an
+   untrusted peer (`PeerIdentity::untrusted()`, uid absent), which the W2.6
+   gate treats exactly like a UDS peer whose credentials could not be read:
+   `RunJob`/`Reembed`/`NamespaceRename`/`Scrub`/hard-execute `Forget` return
+   `permission_denied`. The HTTP surface is strictly MORE gated than UDS,
+   never differently gated (pinned by
+   `admin_ops_over_http_are_denied` in `crates/rb-daemon/tests/http_e2e.rs`).
+2. **Same-machine, cross-user exposure (residual risk, documented).** The
+   `0600` UDS socket keeps other local users out; a loopback TCP port does
+   not — ANY local user or process can connect to 127.0.0.1 while the
+   listener is enabled and use the non-admin surface. v1 deliberately ships
+   no token scheme: it is same-machine/same-user posture and **explicitly
+   not an auth boundary** (the PRD's words). On a multi-user machine,
+   enabling HTTP shares your non-admin memory surface with every local
+   account. The mitigations are default-off (below) and the admin gate; the
+   Phase 5a team-auth work is the real fix and is out of scope here.
+
+**Mitigations, mapped to code and tests:**
+
+- **Default-off at every layer** (the `[retention]` precedent): no `[http]`
+  section → no listener; `bind` without `enabled = true` → no listener;
+  `enabled = false` → no listener. Disabled means ZERO footprint — no TCP
+  socket bound, no task spawned (`Daemon::http_addr() == None`; pinned by
+  `disabled_http_has_zero_footprint`).
+- **Loopback-only, fail closed, validated twice.** The bind must parse as a
+  LITERAL `ip:port` (`SocketAddr` — hostnames never parse, so no DNS lookup
+  can decide where the daemon listens) and the IP must be loopback. A
+  non-loopback value aborts config resolution (`rb_config::validate_http_bind`)
+  AND is re-checked at `Daemon::bind` so an embedded daemon that skipped
+  rb-config cannot bind wide (`non_loopback_bind_fails_closed_at_daemon_bind`).
+  v1 has NO non-loopback opt-in flag at all; the PRD's warned opt-in is
+  deferred to the multi-host phase with real auth.
+- **Browser-origin and DNS-rebinding defenses.** A hostile web page can make
+  a victim's browser fire requests at 127.0.0.1. Three gates:
+  the Host header must name a loopback literal (`127.0.0.1`, `[::1]`,
+  `localhost`; DNS rebinding arrives with the attacker's hostname in Host —
+  refused 403); a present Origin header must be a loopback origin (anything
+  else, including `null`, is refused 403); and POST bodies must declare
+  `application/json`, which forces browsers into a CORS preflight that fails
+  because the listener never emits CORS headers. Pinned by
+  `foreign_or_missing_host_is_rejected`, `foreign_origin_is_rejected`,
+  `post_without_json_content_type_is_415`, and the unit tests on
+  `host_is_loopback`/`origin_is_loopback`.
+- **Bounded requests, fail closed.** Bodies are capped at the UDS frame
+  bound (1 MiB, `MAX_FRAME_BYTES`) — refused from the declared length before
+  reading, and again by a hard cap while reading (chunked bodies), so an
+  oversized body is never buffered (`oversized_body_is_413`). Header reads
+  have a deadline (slowloris; `stalled_connection_is_closed_at_header_deadline`),
+  each request has an overall deadline, malformed JSON / wrong methods /
+  unknown paths return errors without partial processing, and `Subscribe`
+  (a streaming op) is rejected rather than left hanging.
+- **The HTTP path cannot starve the UDS path.** HTTP connections are capped
+  by their own semaphore, separate from (and smaller than) the UDS
+  connection cap; over-cap connections are closed immediately and the UDS
+  surface stays live (`excess_http_connections_are_dropped_and_uds_stays_live`).
+- **No TLS, deliberately.** The listener only ever binds loopback; TLS here
+  would be theater and a certificate-management liability. Multi-host
+  transport security belongs to Phase 5a.
+- **No secrets on this surface.** There is no token, so nothing to leak in
+  URLs or logs; responses carry `Cache-Control: no-store` so memory content
+  is not written to a browser cache, and error bodies reuse the wire-error
+  hygiene (internal detail is logged server-side, an opaque `internal error`
+  goes to the client).
+- **Graceful shutdown covers the listener** — the accept loop is signalled,
+  the TCP socket is dropped, and remaining connections are aborted before
+  the store shuts down (`graceful_shutdown_covers_http_listener`).
+
+**Injection via the write surface:** HTTP clients can store memories, like
+any same-user UDS client. Writes are stamped `origin_source = "http"`
+(provenance), and recall-time injection defenses (W2.5 framing) apply
+unchanged. The redaction pass does NOT run on the HTTP `/remember` path any
+more than it does for direct UDS `Remember` — capture-time redaction is a
+hook-path feature; direct writes are the caller's responsibility (unchanged
+posture).
 
 ## Data-flow exposures (deliberate, user-controlled)
 
@@ -156,3 +250,7 @@ so Phase 5 inherits requirements instead of discovering them:
   vendored and updated.
 - Multi-user sharing of one daemon socket (unsupported today; the peer-cred
   gate exists so loosening this later starts from deny).
+- Authenticating HTTP clients. The opt-in loopback listener is explicitly
+  not an auth boundary in v1 (see its section above): enabling it on a
+  multi-user machine exposes the non-admin surface to all local accounts.
+  Per-client auth is Phase 5a scope.
