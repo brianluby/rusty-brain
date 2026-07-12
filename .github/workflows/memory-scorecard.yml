@@ -63,6 +63,28 @@ jobs:
             exit 1
           fi
 
+      - name: Preflight - verify the key authenticates (status code only)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # Prints ONLY the HTTP status; the key and response body are never
+          # echoed. 200 = key valid; 401 = invalid/revoked or mangled paste.
+          status="$(curl -sS -o /dev/null -w '%{http_code}' \
+            --max-time 30 \
+            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
+            -H "anthropic-version: 2023-06-01" \
+            https://api.anthropic.com/v1/models)"
+          echo "anthropic /v1/models HTTP status: ${status}"
+          key_len="${#ANTHROPIC_API_KEY}"
+          echo "secret length: ${key_len} chars"
+          case "$ANTHROPIC_API_KEY" in
+            *[[:space:]]*) echo "::error::secret contains whitespace (bad paste?)"; exit 1 ;;
+          esac
+          if [ "$status" != "200" ]; then
+            echo "::error::ANTHROPIC_API_KEY did not authenticate (HTTP ${status}); fix the repository secret."
+            exit 1
+          fi
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
