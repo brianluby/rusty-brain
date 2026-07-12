@@ -45,6 +45,7 @@ impl RunningDaemon {
             db_path: db.clone(),
             read_pool_size: 2,
             jobs_config: JobsConfig::default(),
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
