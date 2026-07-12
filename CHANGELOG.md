@@ -5,6 +5,20 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — Release publication gate (Vikunja #510)
+
+- Release tags now pass a deterministic preflight for tag/workspace-version
+  alignment, a corresponding released changelog section, and reachability
+  from `main` before any target builds; a hermetic CI self-test pins its
+  fail-closed cases.
+- Every packaged target is smoke-tested on a matching native GitHub runner
+  before publication, covering fresh auto-start, remember/recall, owner-only
+  database permissions, and a real `PostToolUse` to `SessionEnd` redacted
+  capture fold. Partial matrices cannot publish; checksums and Sigstore
+  build-provenance attestations are preserved.
+- `docs/RELEASING.md` documents preparation, partial-failure handling, safe
+  pre-publication retagging, and fix-forward recovery after publication.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing
