@@ -248,6 +248,29 @@ pub enum Request {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         window_days: Option<u32>,
     },
+    /// Retention/forget pass (retention PRD RET-2). Carries the client's
+    /// RESOLVED `[retention]` policy verbatim so the daemon evaluates exactly
+    /// what the user configured (the daemon re-validates it fail-closed —
+    /// never trust a wire-supplied policy). Namespace-scoped by the
+    /// handshake. `dry_run: true` returns the plan without writes;
+    /// `dry_run: false` executes a bounded sweep. The serde defaults are the
+    /// safety contract: an absent `mode` decodes to Apply (never Hard) and an
+    /// absent `dry_run` decodes to a preview (never an execute). Hard-EXECUTE
+    /// (`mode: hard, dry_run: false`) is admin-gated like `Scrub`. Additive
+    /// variant per the Stats precedent: an old daemon fails to decode it and
+    /// closes the connection (no CONTRACT_VERSION bump).
+    Forget {
+        policy: rb_types::RetentionPolicy,
+        #[serde(default)]
+        mode: rb_types::ForgetMode,
+        #[serde(default = "default_forget_dry_run")]
+        dry_run: bool,
+    },
+}
+
+/// An absent `dry_run` on the wire must PREVIEW, never execute.
+fn default_forget_dry_run() -> bool {
+    true
 }
 
 /// True when `req` carries a typed-code-anchor payload that a PRE-ANCHOR
@@ -371,6 +394,18 @@ pub enum Response {
         provider_model: String,
         #[serde(default)]
         writer_alive: bool,
+    },
+    /// Reply to a dry-run `Request::Forget`: the exact candidate set one
+    /// sweep pass would touch, computed by the same query the sweep executes.
+    /// Additive variant; old clients never see it because they never send
+    /// the request.
+    ForgetPlanned {
+        plan: rb_types::ForgetPlan,
+    },
+    /// Reply to an executed `Request::Forget`: what the bounded pass did.
+    /// Additive variant; old clients never see it.
+    ForgetDone {
+        outcome: rb_types::ForgetOutcome,
     },
     Error {
         kind: String,
@@ -1295,6 +1330,95 @@ mod tests {
                 window_days: Some(7)
             }
         ));
+    }
+
+    #[test]
+    fn forget_request_round_trips_and_absent_fields_are_safe() {
+        // Retention PRD RET-2, additive op per the Stats precedent. Safety of
+        // the serde defaults IS the wire contract here: a frame that omits
+        // `mode` must decode to Apply (never Hard) and one that omits
+        // `dry_run` must decode to a PREVIEW (never an execute).
+        let policy = rb_types::RetentionPolicy {
+            enabled: true,
+            max_age_days: Some(365),
+            ..rb_types::RetentionPolicy::default()
+        };
+        let req = Request::Forget {
+            policy: policy.clone(),
+            mode: rb_types::ForgetMode::Hard,
+            dry_run: false,
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["op"], "Forget");
+        let back: Request = serde_json::from_str(&json).unwrap();
+        match back {
+            Request::Forget {
+                policy: p,
+                mode,
+                dry_run,
+            } => {
+                assert_eq!(p, policy);
+                assert_eq!(mode, rb_types::ForgetMode::Hard);
+                assert!(!dry_run);
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
+
+        let bare: Request =
+            serde_json::from_str(r#"{"op":"Forget","policy":{"enabled":true}}"#).unwrap();
+        match bare {
+            Request::Forget { mode, dry_run, .. } => {
+                assert_eq!(
+                    mode,
+                    rb_types::ForgetMode::Apply,
+                    "absent mode must never escalate to Hard"
+                );
+                assert!(dry_run, "absent dry_run must preview, never execute");
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn forget_responses_round_trip_with_result_tag() {
+        let planned = Response::ForgetPlanned {
+            plan: rb_types::ForgetPlan {
+                mode: rb_types::ForgetMode::Apply,
+                candidates: vec![],
+                total_eligible: 3,
+            },
+        };
+        let json = serde_json::to_string(&planned).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "ForgetPlanned");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::ForgetPlanned { plan } => assert_eq!(plan.total_eligible, 3),
+            other => panic!("expected ForgetPlanned, got {other:?}"),
+        }
+
+        let done = Response::ForgetDone {
+            outcome: rb_types::ForgetOutcome {
+                mode: rb_types::ForgetMode::Hard,
+                archived: 0,
+                purged: 2,
+                total_eligible: 2,
+                remaining: 0,
+                failure: None,
+            },
+        };
+        let json = serde_json::to_string(&done).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["result"], "ForgetDone");
+        let back: Response = serde_json::from_str(&json).unwrap();
+        match back {
+            Response::ForgetDone { outcome } => {
+                assert_eq!(outcome.purged, 2);
+                assert_eq!(outcome.mode, rb_types::ForgetMode::Hard);
+            }
+            other => panic!("expected ForgetDone, got {other:?}"),
+        }
     }
 
     #[test]

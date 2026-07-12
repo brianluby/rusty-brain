@@ -68,6 +68,39 @@ pub(crate) fn append_oplog(
     .map_err(|e| Error::Storage(e.to_string()))?;
     Ok(())
 }
+/// Archive one memory (soft delete) with an oplog `details` payload: sets
+/// `archived_at`/`updated_at`, prunes the vec0 row (W1.7 vector hygiene), and
+/// appends one `archive` oplog row — all inside the caller-independent
+/// `immediate_tx`. Returns whether a row was actually archived (missing or
+/// already-archived ids are `Ok(false)` no-ops that log nothing). The single
+/// mutation body behind both `Store::archive_memory` (empty details) and the
+/// retention sweep (details carry the cause) so the two paths cannot drift.
+pub(crate) fn archive_with_details(
+    conn: &rusqlite::Connection,
+    site_id: &str,
+    id: &MemoryId,
+    details: &str,
+) -> Result<bool> {
+    immediate_tx(conn, || {
+        let affected = conn
+            .execute(
+                "UPDATE memories
+                 SET archived_at = ?1, updated_at = ?1
+                 WHERE memory_id = ?2 AND archived_at IS NULL",
+                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if affected > 0 {
+            conn.execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+            append_oplog(conn, site_id, "archive", id, details)?;
+        }
+        Ok(affected > 0)
+    })
+}
 pub(crate) fn embedding_bytes(embedding: &[f32]) -> Vec<u8> {
     let mut buf = Vec::with_capacity(embedding.len() * 4);
     for f in embedding {

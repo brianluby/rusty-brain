@@ -17,6 +17,7 @@ mod memory_id;
 mod memory_type;
 mod namespace;
 mod query;
+mod retention;
 mod stats;
 mod validate;
 
@@ -37,6 +38,10 @@ pub use namespace::Namespace;
 pub use query::{
     AnchorFilter, AnchorKind, ChannelHits, MemoryState, MemoryUpdates, RecallFilter, SearchQuery,
     SearchResult,
+};
+pub use retention::{
+    ForgetCandidate, ForgetMode, ForgetOutcome, ForgetPlan, ForgetRule, RetentionPolicy,
+    DEFAULT_BATCH_LIMIT, DEFAULT_IMPORTANCE_FLOOR, MAX_BATCH_LIMIT,
 };
 pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 pub use validate::{validate_confidence, validate_importance};

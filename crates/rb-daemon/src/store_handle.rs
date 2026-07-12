@@ -180,6 +180,19 @@ enum WriteCommand {
     Scrub {
         reply: oneshot::Sender<Result<rb_store::ScrubOutcome>>,
     },
+    /// One bounded retention/forget pass (retention PRD RET-2/RET-3). The
+    /// writer recomputes the SAME candidate query the dry-run showed on its
+    /// own connection immediately before mutating, so preview and mutation
+    /// cannot drift (no interleaving exists on the single writer). The store
+    /// enforces every guard (off-by-default, floor + author prior, protected
+    /// tags, contested exclusion); the arm publishes per-memory `Archived`
+    /// events stamped with each item's own oplog seq.
+    RetentionSweep {
+        namespace: Namespace,
+        policy: Box<rb_types::RetentionPolicy>,
+        mode: rb_types::ForgetMode,
+        reply: oneshot::Sender<Result<rb_types::ForgetOutcome>>,
+    },
     #[cfg(test)]
     PanicForTest {
         reply: oneshot::Sender<Result<()>>,
@@ -494,9 +507,17 @@ impl StoreHandle {
         model: String,
         input_version: String,
         top_limit: usize,
+        retention: Option<rb_types::RetentionPolicy>,
     ) -> Result<rb_types::MemoryStats> {
         self.with_read(move |store| {
-            store.namespace_stats(&namespace, window_days, &model, &input_version, top_limit)
+            store.namespace_stats(
+                &namespace,
+                window_days,
+                &model,
+                &input_version,
+                top_limit,
+                retention.as_ref(),
+            )
         })
         .await
     }
@@ -876,6 +897,56 @@ impl StoreHandle {
         let (reply, rx) = oneshot::channel();
         self.writer_tx
             .send(WriteCommand::Scrub { reply })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
+    /// The forget plan (dry-run, RET-2): the exact candidate set one sweep
+    /// pass would touch, computed by the same store query the sweep executes.
+    /// Read-only, via the bounded read pool — a preview never reaches the
+    /// writer. Allowed for a disabled policy (previews are read-only).
+    pub async fn retention_plan(
+        &self,
+        namespace: Namespace,
+        policy: rb_types::RetentionPolicy,
+        mode: rb_types::ForgetMode,
+    ) -> Result<rb_types::ForgetPlan> {
+        self.with_read(move |store| {
+            store.retention_candidates(&namespace, &policy, mode, chrono::Utc::now())
+        })
+        .await
+    }
+
+    /// Every namespace with memory rows, for the scheduled retention job's
+    /// per-namespace pass. Reads via the pool.
+    pub async fn retention_namespaces(&self) -> Result<Vec<Namespace>> {
+        self.with_read(move |store| store.retention_namespaces())
+            .await
+    }
+
+    /// Execute one bounded retention sweep through the single writer
+    /// (RET-2/RET-3). The store refuses a disabled policy (off-by-default is
+    /// enforced at the mutation site, not just the surface); subscribers
+    /// observe each archived/purged memory as an `Archived` change event.
+    pub async fn retention_sweep(
+        &self,
+        namespace: Namespace,
+        policy: rb_types::RetentionPolicy,
+        mode: rb_types::ForgetMode,
+    ) -> Result<rb_types::ForgetOutcome> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::RetentionSweep {
+                namespace,
+                policy: Box::new(policy),
+                mode,
+                reply,
+            })
             .await
             .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
         rx.await
@@ -1503,6 +1574,67 @@ fn writer_loop(
                     outcome.ok_or_else(|| {
                         Error::Storage("scrub completed without an outcome".to_string())
                     })
+                });
+                let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::RetentionSweep {
+                namespace,
+                policy,
+                mode,
+                reply,
+            } => {
+                // The store re-runs the dry-run's candidate query on THIS
+                // connection and enforces every guard (disabled policy,
+                // floor + author prior, protected tags, contested) before
+                // touching a row. Capture the typed payload via the
+                // RenameNamespace/Scrub pattern.
+                let mut payload = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        payload = Some(s.retention_sweep(
+                            &namespace,
+                            &policy,
+                            mode,
+                            chrono::Utc::now(),
+                        )?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    payload.ok_or_else(|| {
+                        Error::Storage("retention sweep completed without an outcome".to_string())
+                    })
+                });
+                let result = result.map(|(outcome, effects)| {
+                    // Subscribers observe every swept memory as Archived (a
+                    // purge is a disappearance too). Each event carries ITS
+                    // OWN oplog seq: stamping the batch-final seq on every
+                    // event would let a subscriber cursor past an item it
+                    // never received.
+                    for id in effects.archived_ids.into_iter().chain(effects.purged_ids) {
+                        let seq = store
+                            .as_ref()
+                            .and_then(|s| s.latest_oplog_seq_for(&id).ok())
+                            .flatten();
+                        publish_change(
+                            &events,
+                            MemoryChanged {
+                                id,
+                                namespace: namespace.clone(),
+                                kind: ChangeKind::Archived,
+                                seq,
+                            },
+                        );
+                    }
+                    outcome
                 });
                 let _ = reply.send(result);
                 if !writer_usable {
@@ -2712,7 +2844,7 @@ mod tests {
 
         let ops_before = handle.writer_ops_count();
         let stats = handle
-            .namespace_stats(ns.clone(), 30, String::new(), String::new(), 5)
+            .namespace_stats(ns.clone(), 30, String::new(), String::new(), 5, None)
             .await
             .unwrap();
         assert_eq!(
@@ -2840,6 +2972,89 @@ mod tests {
         assert_eq!(
             got.access_count, 2,
             "within-call duplicate bumps once; the second call adds one more"
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_retention_plan_and_sweep_are_namespace_scoped_and_publish() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("retention".to_string());
+        let other = Namespace::Project("elsewhere".to_string());
+
+        let mut old_low = MemoryNote::new(
+            ns.clone(),
+            "stale scratch note".to_string(),
+            MemoryType::Insight,
+            2,
+        );
+        old_low.created_at = chrono::Utc::now() - chrono::Duration::days(60);
+        let victim = old_low.id.clone();
+        let mut foreign = MemoryNote::new(
+            other.clone(),
+            "old but out of scope".to_string(),
+            MemoryType::Insight,
+            2,
+        );
+        foreign.created_at = chrono::Utc::now() - chrono::Duration::days(60);
+        let foreign_id = foreign.id.clone();
+        handle
+            .write(old_low, Some(vec![0.1f32; DIM]))
+            .await
+            .unwrap();
+        handle
+            .write(foreign, Some(vec![0.2f32; DIM]))
+            .await
+            .unwrap();
+
+        let policy = rb_types::RetentionPolicy {
+            enabled: true,
+            max_age_days: Some(30),
+            ..rb_types::RetentionPolicy::default()
+        };
+
+        // Read-pool plan: exactly the in-namespace candidate; no writes.
+        let plan = handle
+            .retention_plan(ns.clone(), policy.clone(), rb_types::ForgetMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!(plan.total_eligible, 1);
+        assert_eq!(plan.candidates.len(), 1);
+        assert_eq!(plan.candidates[0].id, victim);
+
+        // Sweep via the single writer; subscribers observe Archived.
+        let mut events = handle.subscribe();
+        let outcome = handle
+            .retention_sweep(ns.clone(), policy.clone(), rb_types::ForgetMode::Apply)
+            .await
+            .unwrap();
+        assert_eq!(outcome.archived, 1);
+        assert_eq!(outcome.purged, 0);
+        let evt = events.recv().await.unwrap();
+        assert_eq!(evt.id, victim);
+        assert_eq!(evt.kind, ChangeKind::Archived);
+        assert_eq!(evt.namespace, ns);
+
+        let got = handle.get(ns.clone(), victim).await.unwrap().unwrap();
+        assert!(got.archived_at.is_some(), "victim archived");
+        let untouched = handle.get(other, foreign_id).await.unwrap().unwrap();
+        assert!(
+            untouched.archived_at.is_none(),
+            "cross-namespace row untouched"
+        );
+
+        // The namespaces enumeration feeds the scheduled job.
+        let mut namespaces = handle.retention_namespaces().await.unwrap();
+        namespaces.sort_by_key(|n| n.as_db_string());
+        assert_eq!(
+            namespaces,
+            vec![
+                Namespace::Project("elsewhere".to_string()),
+                Namespace::Project("retention".to_string())
+            ]
         );
 
         handle.shutdown().await;

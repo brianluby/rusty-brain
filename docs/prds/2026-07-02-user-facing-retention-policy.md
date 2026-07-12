@@ -2,7 +2,16 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. Decay and
+Delivered 2026-07-11 (branch `claude/retention-forget-policy`). All
+functional requirements shipped; see the implementation checklist below and
+the CHANGELOG "User-facing retention and forgetting policy" entry. Two
+deliberate scope decisions: the retention job's interval is a constant
+(daily) rather than a config knob — the PRD defines none, and a tunable
+interval is one more way to typo a destructive surface; and there is NO MCP
+forget tool — the PRD names only the CLI, and a destructive op stays off the
+model-facing toolset (tools/list budget also sits at 893/900).
+
+Originally drafted from the 2026-07-02 senior-PM product review. Decay and
 importance-recalibration exist internally (W1.9, the jobs subsystem) but the
 user has no knob or visibility into *what gets forgotten and when*. Today you
 cannot choose to forget.
@@ -64,7 +73,9 @@ A `[retention]` block in the user config (precedence per existing rules):
   last-recalled, contested flag - contested memories are never auto-forgotten).
 - `forget --apply` archives eligible memories (soft delete; reversible).
 - `forget --hard` performs a hard purge cascading to vectors/FTS/oplog (admin
-  op, requires the peer-cred admin gate like `scrub`).
+  op, requires the peer-cred admin gate like `scrub`; execution additionally
+  requires an interactive confirmation or an explicit `--yes` —
+  non-interactive invocations refuse without it).
 - Bounded per pass; re-runnable.
 
 ### RET-3. Job integration
@@ -115,12 +126,22 @@ asserting the dry-run/apply/hard eligibility.
 
 ## Implementation Checklist
 
-- [ ] Add `[retention]` config block.
-- [ ] Implement `forget` (dry-run/apply/hard) over archive/purge primitives.
-- [ ] Wire the retention job into the jobs subsystem (disabled by default).
-- [ ] Enforce floor + protected tags + contested exclusion + W1.9 clamp.
-- [ ] Surface eligibility in `stats`/`doctor`; record oplog entries.
-- [ ] E2e for eligibility and archive/purge.
+- [x] Add `[retention]` config block (fail-closed: unknown keys and
+      out-of-range values error; `rb-config`).
+- [x] Implement `forget` (dry-run/apply/hard) over archive/purge primitives
+      (`purge_memory_for_retention` is the first hard-delete path; scoped
+      `secure_delete` + WAL truncate keep purged bytes out of the file at
+      rest).
+- [x] Wire the retention job into the jobs subsystem (disabled by default;
+      apply-only; daily; per-namespace under the one user-global policy).
+- [x] Enforce floor + protected tags + contested exclusion + W1.9 clamp
+      (floor gates effective AND author-prior importance; each guard has a
+      survival test).
+- [x] Surface eligibility in `stats`/`doctor`; record oplog entries
+      (per-memory cause details + bulk `retention_sweep` row; purge replays
+      as `Archived`).
+- [x] E2e for eligibility and archive/purge
+      (`retention_forget_flow_over_the_wire_respects_guards`).
 
 ## Roadmap Fit
 

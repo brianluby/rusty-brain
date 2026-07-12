@@ -2600,6 +2600,7 @@ dependencies = [
  "rb-proto",
  "rb-store",
  "rb-types",
+ "rusqlite",
  "serde",
  "serde_json",
  "tempfile",

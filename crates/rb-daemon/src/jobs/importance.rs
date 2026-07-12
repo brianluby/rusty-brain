@@ -475,7 +475,7 @@ mod tests {
         handle.write(m, Some(vec![0.1f32; 8])).await.unwrap();
 
         let config = JobsConfig::default();
-        let summary = run_once(JobKind::ImportanceRecalibration, &handle, &config)
+        let summary = run_once(JobKind::ImportanceRecalibration, &handle, &config, None)
             .await
             .unwrap();
         assert_eq!(

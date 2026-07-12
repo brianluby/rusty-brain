@@ -16,7 +16,11 @@ use tracing::{info, warn};
 /// (and thus the `JoinSet`); a `JoinSet` aborts all of its tasks when dropped, so
 /// every job tick loop is actually cancelled on shutdown. (A bare `JoinHandle`
 /// would only *detach* on drop, leaving the loop running — hence the `JoinSet`.)
-pub fn spawn(store: StoreHandle, config: JobsConfig) -> JoinHandle<()> {
+pub fn spawn(
+    store: StoreHandle,
+    config: JobsConfig,
+    retention: Option<rb_types::RetentionPolicy>,
+) -> JoinHandle<()> {
     tokio::spawn(async move {
         let mut jobs: JoinSet<()> = JoinSet::new();
 
@@ -27,6 +31,7 @@ pub fn spawn(store: StoreHandle, config: JobsConfig) -> JoinHandle<()> {
                 config.link_decay.interval_secs,
                 store.clone(),
                 config.clone(),
+                None,
             );
         }
         if config.consolidation.enabled {
@@ -36,6 +41,7 @@ pub fn spawn(store: StoreHandle, config: JobsConfig) -> JoinHandle<()> {
                 config.consolidation.interval_secs,
                 store.clone(),
                 config.clone(),
+                None,
             );
         }
         if config.importance.enabled {
@@ -45,6 +51,19 @@ pub fn spawn(store: StoreHandle, config: JobsConfig) -> JoinHandle<()> {
                 config.importance.interval_secs,
                 store.clone(),
                 config.clone(),
+                None,
+            );
+        }
+        // Retention (RET-3): scheduled only with an explicitly enabled
+        // [retention] policy — forgetting is opt-in at the scheduler too.
+        if retention.as_ref().is_some_and(|p| p.enabled) {
+            spawn_job(
+                &mut jobs,
+                JobKind::Retention,
+                crate::jobs::retention::RETENTION_JOB_INTERVAL_SECS,
+                store.clone(),
+                config.clone(),
+                retention,
             );
         }
 
@@ -72,6 +91,7 @@ fn spawn_job(
     interval_secs: u64,
     store: StoreHandle,
     config: JobsConfig,
+    retention: Option<rb_types::RetentionPolicy>,
 ) {
     jobs.spawn(async move {
         let period = Duration::from_secs(interval_secs.max(1));
@@ -80,7 +100,7 @@ fn spawn_job(
         // and ticks are seconds apart at minimum.
         loop {
             ticker.tick().await;
-            match run_once(kind, &store, &config).await {
+            match run_once(kind, &store, &config, retention.as_ref()).await {
                 Ok(summary) => info!(
                     job = kind.as_str(),
                     scanned = summary.scanned,
@@ -153,7 +173,7 @@ mod tests {
             ..Default::default()
         };
 
-        let handle = spawn(store.clone(), config);
+        let handle = spawn(store.clone(), config, None);
 
         // Poll until the strength has been reduced by the running job.
         let mut decayed = false;
@@ -182,7 +202,7 @@ mod tests {
 
         // Default config: every job disabled -> the join handle finishes promptly
         // (no jobs scheduled, the supervisor returns immediately).
-        let handle = spawn(store.clone(), JobsConfig::default());
+        let handle = spawn(store.clone(), JobsConfig::default(), None);
         let joined = tokio::time::timeout(std::time::Duration::from_secs(2), handle).await;
         assert!(
             joined.is_ok(),

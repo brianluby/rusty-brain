@@ -80,7 +80,9 @@ impl SqliteStore {
             }
             let kind = match op.as_str() {
                 "insert" => ChangeKind::Created,
-                "archive" | "supersede" => ChangeKind::Archived,
+                // `purge` is a disappearance, not an update: subscribers must
+                // drop the memory exactly as they would an archived one.
+                "archive" | "supersede" | "purge" => ChangeKind::Archived,
                 // update / link / unlink / set_importance / set_confidence /
                 // set_link_strength — and, fail-open, any op string a NEWER
                 // writer invents: a replayed Updated is a safe over-notify.

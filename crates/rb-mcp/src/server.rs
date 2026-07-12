@@ -322,6 +322,12 @@ mod tests {
                     redacted: 0,
                     reembed_pending: 0,
                 },
+                // No MCP tool maps to the forget op (deliberately: it is a
+                // destructive surface); the arm exists only to keep this
+                // fake total over `Request`.
+                Request::Forget { .. } => Response::ForgetPlanned {
+                    plan: rb_types::ForgetPlan::default(),
+                },
                 // No MCP tool maps to the stats observability op; the arm
                 // exists only to keep this fake total over `Request`.
                 Request::Stats { .. } => Response::Stats {

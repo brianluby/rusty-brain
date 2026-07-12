@@ -428,7 +428,7 @@ mod tests {
             consolidation: cfg(0.95, 200),
             ..Default::default()
         };
-        let summary = run_once(JobKind::Consolidation, &handle, &config)
+        let summary = run_once(JobKind::Consolidation, &handle, &config, None)
             .await
             .unwrap();
         assert_eq!(

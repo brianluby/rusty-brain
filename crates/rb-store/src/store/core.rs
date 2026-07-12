@@ -1326,33 +1326,11 @@ impl Store for SqliteStore {
     }
 
     fn archive_memory(&self, id: &MemoryId) -> Result<()> {
-        // Transaction: the archive and its oplog row commit (or roll back) together.
-        immediate_tx(&self.conn, || {
-            let affected = self
-                .conn
-                .execute(
-                    "UPDATE memories
-                     SET archived_at = ?1, updated_at = ?1
-                     WHERE memory_id = ?2 AND archived_at IS NULL",
-                    rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
-                )
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            // Missing or already-archived ids are Ok no-ops and log nothing.
-            if affected > 0 {
-                // Vector hygiene (W1.7): an archived memory must not occupy
-                // KNN candidate slots. Same transaction as the archive so the
-                // row and its vector commit — or roll back — together. A row
-                // stored without an embedding simply deletes nothing.
-                self.conn
-                    .execute(
-                        "DELETE FROM memory_vectors WHERE memory_id = ?1",
-                        rusqlite::params![id.to_string()],
-                    )
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                append_oplog(&self.conn, &self.site_id, "archive", id, "")?;
-            }
-            Ok(())
-        })
+        // Transaction, vector hygiene (W1.7), and the single `archive` oplog
+        // row all live in the shared `archive_with_details` body (also used by
+        // the retention sweep, which stamps a cause into `details`). Missing
+        // or already-archived ids are Ok no-ops and log nothing.
+        archive_with_details(&self.conn, &self.site_id, id, "").map(|_| ())
     }
 
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
