@@ -185,9 +185,15 @@ extract_usage() {
 write_claude_md() { # file body distractors
   local file="$1" body="$2" distractors="$3"
   [ -n "$body" ] || [ -n "$distractors" ] || return 0
+  # Explicit if-blocks, not trailing `[ -n ... ] && ...` guards: a false guard
+  # as the last command makes the group (and under `set -e`, the whole script)
+  # fail silently whenever a scenario has no distractors.
   {
-    [ -n "$body" ] && printf '# Project conventions\n\n%s\n' "$body"
-    [ -n "$distractors" ] && { printf '\n## Other recorded decisions\n\n'; printf '%s\n' "$distractors"; }
+    if [ -n "$body" ]; then printf '# Project conventions\n\n%s\n' "$body"; fi
+    if [ -n "$distractors" ]; then
+      printf '\n## Other recorded decisions\n\n'
+      printf '%s\n' "$distractors"
+    fi
   } > "$file"
 }
 
