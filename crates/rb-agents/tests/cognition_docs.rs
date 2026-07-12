@@ -148,35 +148,28 @@ fn cognition_taxonomy_table_matches_memory_type() {
         );
     }
 
-    // Like `capability_docs::limitation_markers`, the full list is duplicated
-    // deliberately: an ADDED variant updates `MemoryType::parse` but not the
-    // doc, and only an explicit list catches that half of the drift.
-    let all = [
-        "architecture_decision",
-        "code_pattern",
-        "bug_fix",
-        "configuration",
-        "constraint",
-        "entity",
-        "insight",
-        "reference",
-        "preference",
-    ];
+    // The expected set is DERIVED from the canonical `MemoryType::all()`
+    // (which is compiler-pinned to the enum via an exhaustive match), so an
+    // ADDED variant fails this count/row check instead of passing silently —
+    // the same live-source-of-truth posture as `capability_docs`'s
+    // `agent_capabilities()`.
+    let all = MemoryType::all();
     assert_eq!(
         type_rows.len(),
         all.len(),
-        "COGNITION.md taxonomy table has {} type rows, expected {} — if a \
-         MemoryType variant was added or removed, update the doc AND this list",
+        "COGNITION.md taxonomy table has {} type rows, MemoryType::all() has \
+         {} variants — a variant was added or removed without updating the doc",
         type_rows.len(),
         all.len()
     );
     for want in all {
-        let needle = format!("`{want}`");
+        let needle = format!("`{}`", want.as_str());
         assert!(
             type_rows
                 .iter()
                 .any(|row| row.first().map(String::as_str) == Some(needle.as_str())),
-            "COGNITION.md taxonomy table is missing the {want:?} row"
+            "COGNITION.md taxonomy table is missing the {:?} row",
+            want.as_str()
         );
     }
 }
@@ -195,14 +188,19 @@ fn cognition_ranges_and_retention_floor_match_the_code() {
     assert!(validate_importance(0).is_err());
     assert!(validate_importance(11).is_err());
 
-    // Confidence range claim.
+    // Confidence range claim: the doc says FINITE `0.0..=1.0`, so pin the
+    // finiteness half (NaN and both infinities rejected) as well as the range.
     assert!(
-        doc.contains("`0.0..=1.0`"),
-        "COGNITION.md must declare the confidence range as `0.0..=1.0`"
+        doc.contains("finite `0.0..=1.0`"),
+        "COGNITION.md must declare the confidence range as finite `0.0..=1.0`"
     );
     assert!(validate_confidence(0.0).is_ok());
     assert!(validate_confidence(1.0).is_ok());
     assert!(validate_confidence(1.5).is_err());
+    assert!(validate_confidence(-0.1).is_err());
+    assert!(validate_confidence(f32::NAN).is_err());
+    assert!(validate_confidence(f32::INFINITY).is_err());
+    assert!(validate_confidence(f32::NEG_INFINITY).is_err());
 
     // Retention floor default, formatted exactly as the doc states it.
     let floor_claim =
@@ -214,22 +212,22 @@ fn cognition_ranges_and_retention_floor_match_the_code() {
 }
 
 #[test]
-fn cognition_feedback_deltas_match_the_code() {
+fn cognition_feedback_deltas_match_the_code_per_kind() {
+    // The doc states each kind's delta as an adjacent pair — `helpful`
+    // `+0.05` — and the expected pair is DERIVED from the code (`as_str` +
+    // `confidence_delta`), so swapping two documented deltas fails even
+    // though all three literals still appear somewhere in the doc.
     let doc = cognition_text();
-    for (kind, label) in [
-        (FeedbackKind::Helpful, "+0.05"),
-        (FeedbackKind::Wrong, "-0.30"),
-        (FeedbackKind::Stale, "-0.15"),
+    for kind in [
+        FeedbackKind::Helpful,
+        FeedbackKind::Wrong,
+        FeedbackKind::Stale,
     ] {
+        let needle = format!("`{}` `{:+.2}`", kind.as_str(), kind.confidence_delta());
         assert!(
-            doc.contains(&format!("`{label}`")),
-            "COGNITION.md must state the {kind:?} confidence delta as `{label}`"
-        );
-        let want: f32 = label.parse().expect("delta label parses as f32");
-        assert!(
-            (kind.confidence_delta() - want).abs() < f32::EPSILON,
-            "FeedbackKind::{kind:?} delta changed ({} vs doc {label}); update \
-             COGNITION.md and this anchor together",
+            doc.contains(&needle),
+            "COGNITION.md must state the {kind:?} confidence delta as the \
+             adjacent pair {needle:?} (code says {})",
             kind.confidence_delta()
         );
     }

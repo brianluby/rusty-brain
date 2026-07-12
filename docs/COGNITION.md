@@ -124,8 +124,9 @@ between strata (there are no strata, §1). What is enforced:
 - **Usefulness signal** — the `memory_feedback` MCP tool and `rusty-brain feedback`
   CLI record helpful/wrong/stale per memory
   (`crates/rb-store/migrations/008_memory_feedback.sql`, W3.7) and nudge `confidence`
-  (`+0.05` / `-0.30` / `-0.15`, clamped — `FeedbackKind::confidence_delta`,
-  `crates/rb-types/src/feedback_kind.rs`). This is the promotion/demotion *signal*.
+  per kind — `helpful` `+0.05`, `wrong` `-0.30`, `stale` `-0.15`, clamped
+  (`FeedbackKind::confidence_delta`, `crates/rb-types/src/feedback_kind.rs`).
+  This is the promotion/demotion *signal*.
 - **Importance recalibration** — a bounded ±2 modulation of effective importance
   around the immutable `base_importance` from access/recency signals; implemented
   and deliberately shipped **disabled by default** until the usefulness signal has
