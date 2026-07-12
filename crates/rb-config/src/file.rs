@@ -66,6 +66,11 @@ pub struct FileConfig {
     /// and "no section" must stay distinguishable from "disabled policy".
     #[serde(default)]
     pub retention: Option<RetentionFileConfig>,
+    /// `[http]` section: the opt-in loopback HTTP listener (HTTP PRD
+    /// HTTP-1/HTTP-2). `None` when the section is absent — the listener is
+    /// off by default at every layer.
+    #[serde(default)]
+    pub http: Option<HttpFileConfig>,
 }
 
 /// `[embed]` section of the config file.
@@ -133,6 +138,29 @@ pub struct RetentionFileConfig {
     /// Per-pass sweep bound (default 500).
     #[serde(default)]
     pub batch_limit: Option<u32>,
+}
+
+/// `[http]` section of the config file (HTTP PRD HTTP-1/HTTP-2).
+///
+/// DELIBERATE strictness deviation (the `[retention]` precedent): unknown
+/// keys fail closed (`deny_unknown_fields`) instead of warn-and-ignore. This
+/// section opens a NETWORK LISTENER — a typo'd `bind` key that is silently
+/// ignored would leave the daemon listening on the default address while the
+/// user believes their value applied. Bind validation (literal loopback
+/// `ip:port` only) happens at resolve time via
+/// [`crate::validate_http_bind`] and fails resolution, never warn-and-repair.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct HttpFileConfig {
+    /// Master opt-in; absent means `false` (no listener). A `bind` value
+    /// alone never enables the listener.
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    /// Literal loopback `ip:port` to bind (e.g. `"127.0.0.1:7777"`,
+    /// `"[::1]:0"`). Absent means `127.0.0.1:0` (ephemeral port). Hostnames
+    /// never parse — no DNS lookup can decide where the daemon listens.
+    #[serde(default)]
+    pub bind: Option<String>,
 }
 
 /// A loaded (or absent) config file plus any non-fatal warnings produced while
@@ -217,13 +245,14 @@ fn warn_unknown_keys(table: &toml::Table, source: &Path, warnings: &mut Vec<Stri
         "enrich",
         "search",
         "retention",
+        "http",
     ];
     const EMBED: &[&str] = &["backend", "local_model"];
     const ENRICH: &[&str] = &["base_url", "model"];
     const SEARCH: &[&str] = &["fusion"];
-    // No RETENTION list here: `[retention]` unknown keys FAIL CLOSED via
-    // `deny_unknown_fields` on `RetentionFileConfig` (see its doc comment),
-    // so the warn path never applies to them.
+    // No RETENTION or HTTP list here: `[retention]` and `[http]` unknown keys
+    // FAIL CLOSED via `deny_unknown_fields` on their section structs (see
+    // their doc comments), so the warn path never applies to them.
 
     for key in table.keys() {
         if !TOP_LEVEL.contains(&key.as_str()) {
@@ -451,6 +480,56 @@ mod tests {
         let text = r#"
             [retention]
             max_age_days = "a year"
+        "#;
+        let err = parse_file_config(text, &src()).unwrap_err();
+        assert!(err.to_string().contains("/test/config.toml"), "{err}");
+    }
+
+    // HTTP PRD HTTP-1: the [http] section parses every knob.
+    #[test]
+    fn http_section_parses_every_knob() {
+        let text = r#"
+            [http]
+            enabled = true
+            bind = "127.0.0.1:7777"
+        "#;
+        let (config, warnings) = parse_file_config(text, &src()).unwrap();
+        assert!(warnings.is_empty(), "no warnings expected: {warnings:?}");
+        let http = config.http.expect("[http] section present");
+        assert_eq!(http.enabled, Some(true));
+        assert_eq!(http.bind.as_deref(), Some("127.0.0.1:7777"));
+    }
+
+    // Off by default at the file layer: no section means no listener.
+    #[test]
+    fn absent_http_section_parses_to_none() {
+        let (config, _) = parse_file_config("", &src()).unwrap();
+        assert!(config.http.is_none());
+    }
+
+    // DELIBERATE deviation from the warn-and-ignore rule (the [retention]
+    // precedent): [http] opens a network listener, so a typo'd key must fail
+    // closed — a silently ignored `bindd` would listen on the default address
+    // while the user believes their value applied.
+    #[test]
+    fn unknown_key_in_http_fails_closed() {
+        let text = r#"
+            [http]
+            enabled = true
+            bindd = "127.0.0.1:7777"
+        "#;
+        let err = parse_file_config(text, &src()).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("/test/config.toml"), "{msg}");
+        assert!(msg.contains("bindd"), "must name the typo'd key: {msg}");
+    }
+
+    // Wrong-typed [http] values fail closed like every wrong-typed value.
+    #[test]
+    fn wrong_typed_http_value_fails_closed() {
+        let text = r#"
+            [http]
+            enabled = "yes"
         "#;
         let err = parse_file_config(text, &src()).unwrap_err();
         assert!(err.to_string().contains("/test/config.toml"), "{err}");
