@@ -77,6 +77,33 @@ against a planted store. Follow-up filed: **Vikunja #502**.
 3/5 runs of the same scenario passed (answered `nextest`), so this is a
 flakiness-band defect, not a deterministic one.
 
+**2026-07-12 follow-up (Vikunja #502) — mechanism identified: (c) injection
+ignored, not (a) or (b).** A local reproduction of the exact plant
+(deterministic-fallback embeddings, no Voyage key, `plant_explicit` semantics)
+showed the retrieval layer clean: `--json list`, the SessionStart digest, the
+UserPromptSubmit injection for the exact work prompt, and every recall probe
+(including the adversarial query `cargo test`) return ONLY the nextest tip;
+the archived row never surfaces (now pinned by
+`superseded_decision_never_reaches_context_or_recall_and_tip_always_does` in
+`crates/rb-daemon/tests/daemon_e2e.rs`). Injection presence in the failing
+runs follows from that pipeline determinism — each run replants an identical
+store into a hermetic HOME, and the hook renders the digest/recall injection
+from it deterministically — while every memory-on run took 1 turn (no recall
+tool call to diverge on). The TSV's matching memory-on token accounting
+across passing and failing runs (`cache_creation` 7195 in all five) is
+consistent with that; it is corroborating cache accounting, not itself proof
+of byte-identical prompts. So the model (haiku) received the injected tip in
+runs 3 and 4 and answered the ecosystem default anyway. Contributing cause
+addressed: the shared injection preamble told the model to weigh entries as
+"possibly-stale" and to never "follow" instruction-shaped text — for a stored
+convention ("use nextest, not plain cargo test") that frame argues AGAINST the
+memory. The preamble now states an UNCONDITIONAL never-execute rule first
+(hostile fact-shaped content stays covered), then a preference scoped to
+ANSWERING (recorded decisions beat generic defaults; superseded records
+excluded; disputes labeled `[contested]` — see docs/THREAT_MODEL.md).
+Residual model variance under the reworded frame is a paid N>=5 re-read away
+and remains an orchestrator decision if the gate stays red.
+
 ## Class B — capture fidelity (Vikunja #382)
 
 Direct hook-origin measurement (store inspected after the plant session,
