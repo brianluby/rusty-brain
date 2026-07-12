@@ -22,17 +22,26 @@ All notable changes to rusty-brain are documented here. The format is based on
 - **Safety posture (the forget precedent)**: apply requires an explicit
   policy (never auto-resolve without consent); on a TTY it previews the
   SAME plan the pass executes and asks with a default-NO prompt; `--yes`
-  is required for `--json`/piped automation. Every action is reversible —
-  merge stores a combined memory and supersedes both originals (the W3.1
-  update-as-supersede path), archive is a soft delete, demote/bump are
+  is required for `--json`/piped automation; `--dry-run` conflicts with
+  `--apply` at parse time and wins over every mutating flag at runtime.
+  Every action is reversible — merge is restricted to near-duplicate items
+  and runs as ONE writer transaction (re-validate the pair still qualifies
+  at the resolve-time threshold, insert the combined memory, copy the
+  originals' external graph edges, supersede both originals behind a
+  pointer guard, write the audit row — all-or-nothing, so concurrent
+  resolutions of the same pair cannot split the chain: the loser gets the
+  distinct `stale_plan` error); archive is a soft delete; demote/bump are
   bounded confidence nudges (`-0.15` / `+0.05`, the feedback magnitudes).
-  Partial failures follow the `ForgetOutcome` shape: completed items stay
-  committed, the failure is reported, the pass is re-runnable, and the bulk
+  Contradiction actions re-prove the pair is still an active contradiction
+  at resolve time. Partial failures follow the `ForgetOutcome` shape:
+  completed items stay committed, benign stale-plan collisions are skipped
+  (the pass continues), real failures stop re-runnably, and the bulk
   `review_sweep` oplog row is written unconditionally.
 - **Snooze persistence**: the additive `review_state` table (migration 010)
   keyed by the canonical item key (reason + sorted member ids), so a
   snoozed item stays hidden until its window elapses and acting on an item
-  clears its snooze. Every resolution records provenance + a
+  clears its snooze; `namespace rename` re-keys the rows in the same
+  transaction so snoozes survive a rename. Every resolution records provenance + a
   `review_resolve` oplog row (REV-4), so merges surface in the history
   timeline and review activity feeds stats.
 - **Wire surface**: additive `Review`/`Resolve` requests and

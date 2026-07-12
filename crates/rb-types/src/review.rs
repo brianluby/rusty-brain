@@ -221,10 +221,13 @@ impl ReviewAction {
         }
     }
 
-    /// Fail-closed shape validation against the item's member ids — shared by
-    /// the daemon boundary (never trust a wire-supplied resolution) and the
-    /// CLI (reject before the round trip).
-    pub fn validate(&self, member_ids: &[MemoryId]) -> Result<()> {
+    /// Fail-closed shape validation against the item's reason and member ids
+    /// — shared by the daemon boundary (never trust a wire-supplied
+    /// resolution) and the CLI (reject before the round trip). Merge is
+    /// restricted to near-duplicate items: merging a contradiction would
+    /// collapse both sides of a dispute into one memory with no marker of
+    /// the conflict.
+    pub fn validate(&self, reason: ReviewReason, member_ids: &[MemoryId]) -> Result<()> {
         if member_ids.is_empty() || member_ids.len() > 2 {
             return Err(Error::InvalidArgument(format!(
                 "a review item has 1 or 2 members, got {}",
@@ -234,6 +237,13 @@ impl ReviewAction {
         match self {
             ReviewAction::Keep { .. } => Ok(()),
             ReviewAction::Merge => {
+                if reason != ReviewReason::NearDuplicate {
+                    return Err(Error::InvalidArgument(
+                        "merge applies to near-duplicate items only; resolve a \
+                         contradiction with keep, archive, demote, or snooze"
+                            .to_string(),
+                    ));
+                }
                 if member_ids.len() != 2 || member_ids[0] == member_ids[1] {
                     return Err(Error::InvalidArgument(
                         "merge needs exactly two distinct members".to_string(),
@@ -544,21 +554,27 @@ mod tests {
         let a = MemoryId::new();
         let b = MemoryId::new();
         let pair = [a.clone(), b.clone()];
-        ReviewAction::Keep { bump: true }.validate(&pair).unwrap();
-        ReviewAction::Merge.validate(&pair).unwrap();
-        ReviewAction::Archive { id: b.clone() }
-            .validate(&pair)
+        for reason in [ReviewReason::Contradiction, ReviewReason::NearDuplicate] {
+            ReviewAction::Keep { bump: true }
+                .validate(reason, &pair)
+                .unwrap();
+            ReviewAction::Archive { id: b.clone() }
+                .validate(reason, &pair)
+                .unwrap();
+            ReviewAction::Demote { id: a.clone() }
+                .validate(reason, &pair)
+                .unwrap();
+            ReviewAction::Snooze {
+                days: REVIEW_DEFAULT_SNOOZE_DAYS,
+            }
+            .validate(reason, &pair)
             .unwrap();
-        ReviewAction::Demote { id: a.clone() }
-            .validate(&pair)
-            .unwrap();
-        ReviewAction::Snooze {
-            days: REVIEW_DEFAULT_SNOOZE_DAYS,
         }
-        .validate(&pair)
-        .unwrap();
+        ReviewAction::Merge
+            .validate(ReviewReason::NearDuplicate, &pair)
+            .unwrap();
         ReviewAction::Keep { bump: false }
-            .validate(std::slice::from_ref(&a))
+            .validate(ReviewReason::LowConfidence, std::slice::from_ref(&a))
             .unwrap();
     }
 
@@ -566,13 +582,44 @@ mod tests {
     fn merge_requires_exactly_two_distinct_members() {
         let a = MemoryId::new();
         let err = ReviewAction::Merge
-            .validate(std::slice::from_ref(&a))
+            .validate(ReviewReason::NearDuplicate, std::slice::from_ref(&a))
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
         let err = ReviewAction::Merge
-            .validate(&[a.clone(), a.clone()])
+            .validate(ReviewReason::NearDuplicate, &[a.clone(), a.clone()])
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
+    }
+
+    #[test]
+    fn merge_is_restricted_to_near_duplicate_items() {
+        // Review finding: merging a CONTRADICTION collapses two sides of a
+        // dispute into one memory with no marker of the conflict — the
+        // resolution for contradictions is keep/archive/demote/snooze. The
+        // restriction lives in validate (the daemon boundary) so no wire
+        // caller can bypass it.
+        let a = MemoryId::new();
+        let b = MemoryId::new();
+        let pair = [a, b];
+        for reason in [
+            ReviewReason::Contradiction,
+            ReviewReason::LowConfidence,
+            ReviewReason::StaleNeverRecalled,
+        ] {
+            let err = ReviewAction::Merge.validate(reason, &pair).unwrap_err();
+            assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("near-duplicate"),
+                "the error names the restriction: {msg}"
+            );
+            if reason == ReviewReason::Contradiction {
+                assert!(
+                    msg.contains("keep") && msg.contains("archive"),
+                    "contradictions get redirected to the right actions: {msg}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -588,7 +635,9 @@ mod tests {
                 id: outsider.clone(),
             },
         ] {
-            let err = action.validate(&[a.clone(), b.clone()]).unwrap_err();
+            let err = action
+                .validate(ReviewReason::Contradiction, &[a.clone(), b.clone()])
+                .unwrap_err();
             assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
         }
     }
@@ -598,7 +647,7 @@ mod tests {
         let a = MemoryId::new();
         for bad in [0u32, REVIEW_MAX_SNOOZE_DAYS + 1] {
             let err = ReviewAction::Snooze { days: bad }
-                .validate(std::slice::from_ref(&a))
+                .validate(ReviewReason::LowConfidence, std::slice::from_ref(&a))
                 .unwrap_err();
             assert!(
                 matches!(err, crate::Error::InvalidArgument(_)),
@@ -611,11 +660,11 @@ mod tests {
     fn empty_or_oversized_member_lists_fail_closed() {
         let ids: Vec<MemoryId> = (0..3).map(|_| MemoryId::new()).collect();
         let err = ReviewAction::Keep { bump: false }
-            .validate(&[])
+            .validate(ReviewReason::Contradiction, &[])
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
         let err = ReviewAction::Keep { bump: false }
-            .validate(&ids)
+            .validate(ReviewReason::Contradiction, &ids)
             .unwrap_err();
         assert!(matches!(err, crate::Error::InvalidArgument(_)), "{err}");
     }

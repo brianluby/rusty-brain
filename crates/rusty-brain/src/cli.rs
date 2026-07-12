@@ -656,7 +656,9 @@ pub enum Command {
     /// confidence).
     Review {
         /// Preview only (the default posture even without this flag).
-        #[arg(long, conflicts_with = "interactive")]
+        /// Conflicts with --apply and --interactive: an invocation that says
+        /// "preview" must never be able to mutate (PR #63 Copilot finding).
+        #[arg(long, conflicts_with_all = ["interactive", "apply"])]
         dry_run: bool,
         /// Execute one bounded pass under --policy (required with this flag).
         #[arg(long, requires = "policy", conflicts_with = "interactive")]
@@ -1049,6 +1051,20 @@ mod tests {
         ] {
             assert!(Cli::try_parse_from(args).is_err(), "{args:?}");
         }
+        // Copilot finding (PR #63): --dry-run --apply must be a PARSE error —
+        // an invocation that says "preview" must never be able to mutate.
+        assert!(
+            Cli::try_parse_from([
+                "rusty-brain",
+                "review",
+                "--dry-run",
+                "--apply",
+                "--policy",
+                "auto-merge-dups"
+            ])
+            .is_err(),
+            "--dry-run conflicts with --apply"
+        );
     }
 
     #[test]

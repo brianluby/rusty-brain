@@ -19,6 +19,9 @@ pub(crate) fn error_to_response(err: Error) -> Response {
         Error::DimensionMismatch { .. } => ("dimension_mismatch", err.to_string()),
         Error::InvalidArgument(_) => ("invalid_argument", err.to_string()),
         Error::PermissionDenied(_) => ("permission_denied", err.to_string()),
+        // Client-safe: "your plan is stale, re-run review" is caller
+        // guidance, and the distinct kind lets clients classify it.
+        Error::StalePlan(_) => ("stale_plan", err.to_string()),
 
         // Internal: log the real detail, send a generic message to the client.
         Error::Storage(_) => {

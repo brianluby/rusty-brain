@@ -26,6 +26,11 @@ impl SqliteStore {
     /// - `memory_anchors` — namespace mirrors memories.namespace (the 009
     ///   migration's scoping column for anchor-filter lookups), so it is
     ///   re-keyed with a plain UPDATE in the same transaction.
+    /// - `review_state` — namespace scopes the review queue's
+    ///   snooze-exclusion probe (migration 010), so it is re-keyed with a
+    ///   plain UPDATE in the same transaction (a stranded row would let a
+    ///   snoozed item resurface immediately after the rename). Item keys are
+    ///   memory-id based and namespace-free, so no key rewrite is needed.
     /// - `memory_oplog` — ONE `namespace_rename` row recording old, new and
     ///   the row counts; historical oplog rows keep their original namespace
     ///   (the log is history, not state).
@@ -120,6 +125,16 @@ impl SqliteStore {
             self.conn
                 .execute(
                     "UPDATE memory_anchors SET namespace = ?1 WHERE namespace = ?2",
+                    rusqlite::params![new_str, old_str],
+                )
+                .map_err(storage_err)?;
+
+            // Re-key the review snooze/reviewed-at rows (migration 010): the
+            // queue's snooze-exclusion probe scopes by namespace, so a
+            // stranded row would silently un-hide every snoozed item.
+            self.conn
+                .execute(
+                    "UPDATE review_state SET namespace = ?1 WHERE namespace = ?2",
                     rusqlite::params![new_str, old_str],
                 )
                 .map_err(storage_err)?;
@@ -336,6 +351,62 @@ mod namespace_rename_tests {
         assert_eq!(v["moved"], 3);
         assert_eq!(v["vectors"], 2);
         assert_eq!(v["merged_into"], 0);
+    }
+
+    #[test]
+    fn rename_rekeys_review_state_namespace_and_snoozes_survive() {
+        // review_state.namespace scopes the review queue's snooze-exclusion
+        // probe; a rename must re-key it in the same transaction or every
+        // snooze silently evaporates (the item resurfaces immediately under
+        // the new namespace).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = Namespace::Project("review-old".into());
+        let new = Namespace::Project("review-new".into());
+
+        let mut low = MemoryNote::new(old.clone(), "shaky note".into(), MemoryType::Insight, 5);
+        low.confidence = 0.2;
+        let low_id = low.id.clone();
+        store.insert_memory(&low, None).unwrap();
+        let key = rb_types::review_item_key(
+            rb_types::ReviewReason::LowConfidence,
+            std::slice::from_ref(&low_id),
+        );
+        store
+            .snooze_review_item(&old, &key, 7, "{}", chrono::Utc::now())
+            .unwrap();
+
+        store.rename_namespace(&old, &new, false).unwrap();
+
+        let stranded: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE namespace = ?1",
+                rusqlite::params![old.as_db_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            stranded, 0,
+            "no review row may stay under the old namespace"
+        );
+
+        let plan = store
+            .review_queue(
+                &new,
+                &crate::ReviewQueueParams {
+                    threshold: 0.95,
+                    limit: 50,
+                    since: None,
+                },
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        assert!(
+            plan.items.is_empty(),
+            "the snooze must keep hiding the item after the rename: {:?}",
+            plan.items
+        );
+        assert_eq!(plan.totals.snoozed, 1, "the snooze follows the namespace");
     }
 
     #[test]

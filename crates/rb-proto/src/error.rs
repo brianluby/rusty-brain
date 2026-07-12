@@ -34,6 +34,7 @@ fn error_kind(err: &Error) -> &'static str {
         Error::Enrichment(_) => "enrichment",
         Error::InvalidArgument(_) => "invalid_argument",
         Error::PermissionDenied(_) => "permission_denied",
+        Error::StalePlan(_) => "stale_plan",
     }
 }
 
@@ -67,6 +68,7 @@ pub fn response_error_to_error(kind: &str, message: &str) -> Error {
         "enrichment" => Error::Enrichment(unprefixed(message, "enrichment error: ")),
         "invalid_argument" => Error::InvalidArgument(unprefixed(message, "invalid argument: ")),
         "permission_denied" => Error::PermissionDenied(unprefixed(message, "permission denied: ")),
+        "stale_plan" => Error::StalePlan(unprefixed(message, "stale review plan: ")),
         // not_found / dimension_mismatch / anything unrecognized: preserve the
         // message under Storage rather than fabricate structured fields.
         _ => Error::Storage(message.to_string()),
@@ -93,6 +95,26 @@ mod tests {
         match resp {
             Response::Error { kind, message } => response_error_to_error(&kind, &message),
             other => panic!("expected Response::Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stale_plan_round_trips_verbatim() {
+        // The stale-plan error is caller GUIDANCE (re-run review), so it must
+        // travel verbatim and reconstruct to the same variant — policy sweeps
+        // and interactive loops classify on it.
+        let err = Error::StalePlan("members were already resolved".to_string());
+        let resp = error_to_response(&err);
+        match &resp {
+            Response::Error { kind, message } => {
+                assert_eq!(kind, "stale_plan");
+                assert!(message.contains("already resolved"), "{message}");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+        match round_trip(err) {
+            Error::StalePlan(msg) => assert_eq!(msg, "members were already resolved"),
+            other => panic!("expected StalePlan back, got {other:?}"),
         }
     }
 

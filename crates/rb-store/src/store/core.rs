@@ -311,6 +311,156 @@ impl SqliteStore {
         }
         Ok(out)
     }
+
+    /// The insert transaction body (memories row + oplog + anchors + vector +
+    /// links), shared by [`Store::insert_memory`] (which wraps it in its own
+    /// `immediate_tx`) and the atomic review merge (which runs it INSIDE the
+    /// merge's single transaction — PRD 2026-07-02 review, atomicity fix).
+    /// MUST be called inside an open transaction.
+    pub(crate) fn insert_memory_tx_body(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT INTO memories (
+                        memory_id, namespace, created_at, updated_at, content, summary,
+                        keywords, tags, context, memory_type, importance, confidence,
+                        related_files, access_count, last_accessed_at, archived_at,
+                        superseded_by, embedding_model, embedding_input_version,
+                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        base_importance
+                     ) VALUES (
+                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+                     )",
+                rusqlite::params![
+                    note.id.to_string(),
+                    note.namespace.as_db_string(),
+                    ts(note.created_at),
+                    ts(note.updated_at),
+                    note.content,
+                    note.summary,
+                    json_array(&note.keywords)?,
+                    json_array(&note.tags)?,
+                    note.context,
+                    note.memory_type.as_str(),
+                    note.importance as i64,
+                    note.confidence as f64,
+                    json_array(&note.related_files)?,
+                    note.access_count as i64,
+                    opt_ts(note.last_accessed_at),
+                    opt_ts(note.archived_at),
+                    note.superseded_by.as_ref().map(|id| id.to_string()),
+                    note.embedding_model,
+                    note.embedding_input_version,
+                    note.origin_user,
+                    note.origin_host,
+                    note.origin_agent,
+                    note.origin_source,
+                    note.session_id,
+                    // W1.9: the author-set importance prior. Stamped once at
+                    // insert; the recalibration job never writes it, so the
+                    // bounded-delta formula stays anchored to author intent.
+                    note.importance as i64,
+                ],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
+
+        // Typed code anchors (PRD 2026-07-02): kind-split value columns
+        // (`path` for file anchors, `ref` for commit/symbol — the 009
+        // CHECK pins the split). Values are stored NORMALIZED
+        // (rb_types::normalize_anchor_value) so the anchor-filter SQL can
+        // compare by plain equality. Exact duplicates (post-normalization,
+        // incl. the line range) collapse to ONE row here — repeated CLI
+        // flags / `--batch` fan-out must not accumulate copies, and a
+        // UNIQUE constraint cannot do it (SQLite treats the NULL
+        // path/ref/line columns as pairwise distinct). First-seen order
+        // is preserved.
+        let mut seen_anchors = std::collections::HashSet::new();
+        for anchor in &note.anchors {
+            let value = rb_types::normalize_anchor_value(anchor.kind, &anchor.value);
+            if !seen_anchors.insert((
+                rb_types::anchor_kind_str(anchor.kind),
+                value.clone(),
+                anchor.start_line,
+                anchor.end_line,
+            )) {
+                continue;
+            }
+            let is_file = anchor.kind == rb_types::AnchorKind::File;
+            self.conn
+                .execute(
+                    "INSERT INTO memory_anchors
+                            (memory_id, namespace, kind, path, start_line, end_line, ref)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    rusqlite::params![
+                        note.id.to_string(),
+                        note.namespace.as_db_string(),
+                        rb_types::anchor_kind_str(anchor.kind),
+                        is_file.then_some(value.as_str()),
+                        anchor.start_line.map(i64::from),
+                        anchor.end_line.map(i64::from),
+                        (!is_file).then_some(value.as_str()),
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        if let Some(emb) = embedding {
+            // The namespace partition key MUST mirror memories.namespace
+            // (vector_search scopes KNN on it). Any path that mutates a
+            // memory's namespace MUST re-key its memory_vectors row in the
+            // same transaction or vectors strand under the old partition
+            // key — `rename_namespace` (the only such path today) does the
+            // DELETE+INSERT re-key for exactly this reason.
+            self.conn
+                .execute(
+                    "INSERT INTO memory_vectors (memory_id, namespace, embedding)
+                         VALUES (?1, ?2, ?3)",
+                    rusqlite::params![
+                        note.id.to_string(),
+                        note.namespace.as_db_string(),
+                        embedding_bytes(emb)
+                    ],
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+        }
+
+        for link in &note.links {
+            self.conn
+                    .execute(
+                        "INSERT INTO memory_links
+                            (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                        rusqlite::params![
+                            link.source_id.to_string(),
+                            link.target_id.to_string(),
+                            link.link_type.as_str(),
+                            link.strength as f64,
+                            // Baseline equals the created strength; decay never
+                            // mutates it, so the pass stays idempotent.
+                            link.strength as f64,
+                            link.reason,
+                            ts(link.created_at),
+                        ],
+                    )
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+            // One `link` oplog row per edge, same shape as `add_link`'s:
+            // a replay consumer could not reconstruct edges from the bare
+            // `insert` row alone.
+            let details = serde_json::json!({
+                "type": link.link_type.as_str(),
+                "target": link.target_id.to_string(),
+            })
+            .to_string();
+            append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
+        }
+        Ok(())
+    }
 }
 /// One active memory's recalibration inputs: the spine fields the importance
 /// job reads to recompute `importance`. `last_accessed_at` is the raw stored
@@ -836,146 +986,7 @@ impl Store for SqliteStore {
         // writer mid-transaction; the busy_timeout above makes a contended BEGIN
         // wait rather than fail immediately. Atomicity is unchanged: all writes
         // commit together, and any error rolls the whole transaction back.
-        immediate_tx(&self.conn, || {
-            self.conn
-                .execute(
-                    "INSERT INTO memories (
-                        memory_id, namespace, created_at, updated_at, content, summary,
-                        keywords, tags, context, memory_type, importance, confidence,
-                        related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id,
-                        base_importance
-                     ) VALUES (
-                        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
-                     )",
-                    rusqlite::params![
-                        note.id.to_string(),
-                        note.namespace.as_db_string(),
-                        ts(note.created_at),
-                        ts(note.updated_at),
-                        note.content,
-                        note.summary,
-                        json_array(&note.keywords)?,
-                        json_array(&note.tags)?,
-                        note.context,
-                        note.memory_type.as_str(),
-                        note.importance as i64,
-                        note.confidence as f64,
-                        json_array(&note.related_files)?,
-                        note.access_count as i64,
-                        opt_ts(note.last_accessed_at),
-                        opt_ts(note.archived_at),
-                        note.superseded_by.as_ref().map(|id| id.to_string()),
-                        note.embedding_model,
-                        note.embedding_input_version,
-                        note.origin_user,
-                        note.origin_host,
-                        note.origin_agent,
-                        note.origin_source,
-                        note.session_id,
-                        // W1.9: the author-set importance prior. Stamped once at
-                        // insert; the recalibration job never writes it, so the
-                        // bounded-delta formula stays anchored to author intent.
-                        note.importance as i64,
-                    ],
-                )
-                .map_err(|e| Error::Storage(e.to_string()))?;
-
-            append_oplog(&self.conn, &self.site_id, "insert", &note.id, "")?;
-
-            // Typed code anchors (PRD 2026-07-02): kind-split value columns
-            // (`path` for file anchors, `ref` for commit/symbol — the 009
-            // CHECK pins the split). Values are stored NORMALIZED
-            // (rb_types::normalize_anchor_value) so the anchor-filter SQL can
-            // compare by plain equality. Exact duplicates (post-normalization,
-            // incl. the line range) collapse to ONE row here — repeated CLI
-            // flags / `--batch` fan-out must not accumulate copies, and a
-            // UNIQUE constraint cannot do it (SQLite treats the NULL
-            // path/ref/line columns as pairwise distinct). First-seen order
-            // is preserved.
-            let mut seen_anchors = std::collections::HashSet::new();
-            for anchor in &note.anchors {
-                let value = rb_types::normalize_anchor_value(anchor.kind, &anchor.value);
-                if !seen_anchors.insert((
-                    rb_types::anchor_kind_str(anchor.kind),
-                    value.clone(),
-                    anchor.start_line,
-                    anchor.end_line,
-                )) {
-                    continue;
-                }
-                let is_file = anchor.kind == rb_types::AnchorKind::File;
-                self.conn
-                    .execute(
-                        "INSERT INTO memory_anchors
-                            (memory_id, namespace, kind, path, start_line, end_line, ref)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![
-                            note.id.to_string(),
-                            note.namespace.as_db_string(),
-                            rb_types::anchor_kind_str(anchor.kind),
-                            is_file.then_some(value.as_str()),
-                            anchor.start_line.map(i64::from),
-                            anchor.end_line.map(i64::from),
-                            (!is_file).then_some(value.as_str()),
-                        ],
-                    )
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-            }
-
-            if let Some(emb) = embedding {
-                // The namespace partition key MUST mirror memories.namespace
-                // (vector_search scopes KNN on it). Any path that mutates a
-                // memory's namespace MUST re-key its memory_vectors row in the
-                // same transaction or vectors strand under the old partition
-                // key — `rename_namespace` (the only such path today) does the
-                // DELETE+INSERT re-key for exactly this reason.
-                self.conn
-                    .execute(
-                        "INSERT INTO memory_vectors (memory_id, namespace, embedding)
-                         VALUES (?1, ?2, ?3)",
-                        rusqlite::params![
-                            note.id.to_string(),
-                            note.namespace.as_db_string(),
-                            embedding_bytes(emb)
-                        ],
-                    )
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-            }
-
-            for link in &note.links {
-                self.conn
-                    .execute(
-                        "INSERT INTO memory_links
-                            (source_id, target_id, link_type, strength, base_strength, reason, created_at)
-                         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                        rusqlite::params![
-                            link.source_id.to_string(),
-                            link.target_id.to_string(),
-                            link.link_type.as_str(),
-                            link.strength as f64,
-                            // Baseline equals the created strength; decay never
-                            // mutates it, so the pass stays idempotent.
-                            link.strength as f64,
-                            link.reason,
-                            ts(link.created_at),
-                        ],
-                    )
-                    .map_err(|e| Error::Storage(e.to_string()))?;
-                // One `link` oplog row per edge, same shape as `add_link`'s:
-                // a replay consumer could not reconstruct edges from the bare
-                // `insert` row alone.
-                let details = serde_json::json!({
-                    "type": link.link_type.as_str(),
-                    "target": link.target_id.to_string(),
-                })
-                .to_string();
-                append_oplog(&self.conn, &self.site_id, "link", &link.source_id, &details)?;
-            }
-            Ok(())
-        })
+        immediate_tx(&self.conn, || self.insert_memory_tx_body(note, embedding))
     }
 
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>> {

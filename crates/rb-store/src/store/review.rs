@@ -485,6 +485,254 @@ impl SqliteStore {
         self.append_review_oplog(ns, "review_sweep", details, now)
     }
 
+    /// Atomically merge a near-duplicate pair (PRD 2026-07-02 review;
+    /// CRITICAL fix from the PR #63 review): ONE writer transaction that
+    /// re-validates, inserts the combined memory, copies the originals'
+    /// external graph edges, supersedes both originals with a GUARDED
+    /// pointer update, and writes the `review_resolve` audit row —
+    /// all-or-nothing. Combined with single-writer serialization, two
+    /// concurrent resolutions of the same pair cannot interleave: the loser
+    /// re-validates inside its own transaction, finds the members already
+    /// resolved, and fails with the distinct [`Error::StalePlan`] while the
+    /// winner's chain stays single and consistent.
+    ///
+    /// Re-validation (TOCTOU fix): both members must be live (active, not
+    /// superseded, in `ns`) AND still qualify as near-duplicates — their
+    /// stored vectors' cosine similarity must be `>= min_similarity`, the
+    /// same unit `near_duplicates()` reports (pinned by the
+    /// `review_merge_similarity_agrees_with_near_duplicates` drift test). A
+    /// missing vector cannot be re-validated and is a stale plan.
+    ///
+    /// Link union (HIGH fix): every external edge of either original (both
+    /// directions) is COPIED onto the combined memory — copies, not moves,
+    /// so the archived originals keep their history; duplicates collapse via
+    /// the `(source, target, type)` primary key; the intra-pair edge is
+    /// dropped (it would become a self-link) and `supersedes`-type rows are
+    /// never copied (that edge type belongs to the supersede machinery).
+    ///
+    /// Failure semantics: any error rolls back the WHOLE transaction — no
+    /// orphaned combined memory, no half-superseded pair, no audit row for
+    /// work that did not happen (the item-6 rollback contract).
+    #[allow(clippy::too_many_arguments)]
+    pub fn review_merge(
+        &self,
+        ns: &Namespace,
+        a: &MemoryId,
+        b: &MemoryId,
+        min_similarity: f32,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        details: &str,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> Result<()> {
+        if a == b || note.id == *a || note.id == *b {
+            return Err(Error::InvalidArgument(
+                "merge needs two distinct originals and a fresh combined id".to_string(),
+            ));
+        }
+        if note.namespace != *ns {
+            return Err(Error::InvalidArgument(format!(
+                "combined memory namespace {} does not match the merge namespace {}",
+                note.namespace.as_db_string(),
+                ns.as_db_string()
+            )));
+        }
+        let key = review_item_key(ReviewReason::NearDuplicate, &[a.clone(), b.clone()]);
+        immediate_tx(&self.conn, || {
+            // 1. Both members live in `ns`, active, and unresolved.
+            for id in [a, b] {
+                let row: Option<(String, Option<i64>, Option<String>)> = match self.conn.query_row(
+                    "SELECT namespace, archived_at, superseded_by
+                     FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![id.to_string()],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                ) {
+                    Ok(row) => Some(row),
+                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                    Err(e) => return Err(storage_err(e)),
+                };
+                let Some((row_ns, archived_at, superseded_by)) = row else {
+                    return Err(Error::NotFound(id.clone()));
+                };
+                if row_ns != ns.as_db_string() {
+                    return Err(Error::NotFound(id.clone()));
+                }
+                if archived_at.is_some() || superseded_by.is_some() {
+                    return Err(Error::StalePlan(format!(
+                        "{id} was already resolved (archived or superseded), likely by a \
+                         concurrent review; re-run review for a fresh queue"
+                    )));
+                }
+            }
+
+            // 2. The pair still qualifies as near-duplicates AT RESOLVE TIME.
+            let similarity = self.stored_pair_similarity(a, b)?.ok_or_else(|| {
+                Error::StalePlan(format!(
+                    "the pair {a} / {b} can no longer be compared (a stored vector is \
+                     missing); re-run review for a fresh queue"
+                ))
+            })?;
+            if similarity < min_similarity {
+                return Err(Error::StalePlan(format!(
+                    "similarity {similarity:.3} of {a} / {b} is below the {min_similarity} \
+                     threshold; the pair no longer qualifies as near-duplicates"
+                )));
+            }
+
+            // 3. The combined memory (row + oplog + anchors + vector + links),
+            //    via the SAME body `insert_memory` commits.
+            rb_types::validate_importance(note.importance)?;
+            rb_types::validate_confidence(note.confidence)?;
+            for anchor in &note.anchors {
+                anchor.validate()?;
+            }
+            self.insert_memory_tx_body(note, embedding)?;
+
+            // 4. Copy the originals' external edges onto the combined memory
+            //    (both directions; OR IGNORE dedupes on the (source, target,
+            //    type) primary key).
+            let new_str = note.id.to_string();
+            let a_str = a.to_string();
+            let b_str = b.to_string();
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO memory_links
+                        (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                     SELECT ?1, l.target_id, l.link_type, l.strength, l.base_strength, l.reason, l.created_at
+                     FROM memory_links l
+                     WHERE l.source_id IN (?2, ?3)
+                       AND l.target_id NOT IN (?1, ?2, ?3)
+                       AND l.link_type != 'supersedes'",
+                    rusqlite::params![new_str, a_str, b_str],
+                )
+                .map_err(storage_err)?;
+            self.conn
+                .execute(
+                    "INSERT OR IGNORE INTO memory_links
+                        (source_id, target_id, link_type, strength, base_strength, reason, created_at)
+                     SELECT l.source_id, ?1, l.link_type, l.strength, l.base_strength, l.reason, l.created_at
+                     FROM memory_links l
+                     WHERE l.target_id IN (?2, ?3)
+                       AND l.source_id NOT IN (?1, ?2, ?3)
+                       AND l.link_type != 'supersedes'",
+                    rusqlite::params![new_str, a_str, b_str],
+                )
+                .map_err(storage_err)?;
+
+            // 5. Guarded supersede of each original (the minimal pointer
+            //    guard from the review; full source hardening is #501): the
+            //    pointer is taken only if still unset on an active row, so a
+            //    raced resolution fails HERE and rolls everything back.
+            for old in [a, b] {
+                self.supersede_unclaimed_in_tx(old, &note.id, now, &key)?;
+            }
+
+            // 6. The audit trail (REV-4), inside the same transaction.
+            self.upsert_review_state(ns, &key, now.timestamp(), None)?;
+            self.append_review_oplog(ns, "review_resolve", details, now)
+        })
+    }
+
+    /// Is there STILL an active contradiction between exactly `a` and `b` in
+    /// `ns`? The pair-scoped expression of the queue's contradiction listing
+    /// (both endpoints active AND in `ns`, either edge direction) — the
+    /// resolve-time revalidation for contradiction items (PR #63 TOCTOU fix),
+    /// pinned by `contradiction_pair_active_matches_the_queue_semantics`.
+    pub fn contradiction_pair_active(
+        &self,
+        ns: &Namespace,
+        a: &MemoryId,
+        b: &MemoryId,
+    ) -> Result<bool> {
+        let found: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_links l
+                   JOIN memories x ON x.memory_id = l.source_id
+                   JOIN memories y ON y.memory_id = l.target_id
+                 WHERE l.link_type = 'contradicts'
+                   AND x.archived_at IS NULL AND y.archived_at IS NULL
+                   AND x.namespace = ?1 AND y.namespace = ?1
+                   AND ((l.source_id = ?2 AND l.target_id = ?3)
+                     OR (l.source_id = ?3 AND l.target_id = ?2))",
+                rusqlite::params![ns.as_db_string(), a.to_string(), b.to_string()],
+                |r| r.get(0),
+            )
+            .map_err(storage_err)?;
+        Ok(found > 0)
+    }
+
+    /// Cosine similarity of two STORED vectors, in the exact unit
+    /// [`SqliteStore::near_duplicates`] reports (`1 - cosine_distance`,
+    /// clamped to `[0, 1]`). `None` when either vector is missing or
+    /// degenerate (zero norm) — the caller treats that as un-comparable.
+    fn stored_pair_similarity(&self, a: &MemoryId, b: &MemoryId) -> Result<Option<f32>> {
+        let load = |id: &MemoryId| -> Result<Option<Vec<f32>>> {
+            match self.conn.query_row(
+                "SELECT embedding FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![id.to_string()],
+                |r| r.get::<_, Vec<u8>>(0),
+            ) {
+                Ok(blob) => Ok(Some(super::internal::decode_embedding_bytes(&blob)?)),
+                Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
+                Err(e) => Err(storage_err(e)),
+            }
+        };
+        let (Some(va), Some(vb)) = (load(a)?, load(b)?) else {
+            return Ok(None);
+        };
+        if va.len() != vb.len() {
+            return Ok(None);
+        }
+        let dot: f32 = va.iter().zip(&vb).map(|(x, y)| x * y).sum();
+        let na: f32 = va.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = vb.iter().map(|x| x * x).sum::<f32>().sqrt();
+        if na == 0.0 || nb == 0.0 {
+            return Ok(None);
+        }
+        // vec0's cosine DISTANCE is 1 - cos; near_duplicates converts back
+        // with distance_to_similarity (clamp to [0, 1]) — mirror that clamp.
+        Ok(Some((dot / (na * nb)).clamp(0.0, 1.0)))
+    }
+
+    /// The supersede transaction body with the pointer GUARD: pointer,
+    /// archive, vector prune, and one `supersede` oplog row — but only when
+    /// the pointer is still unclaimed on an active row. MUST run inside an
+    /// open transaction; a guard miss is [`Error::StalePlan`] so the whole
+    /// merge rolls back (never a split chain).
+    fn supersede_unclaimed_in_tx(
+        &self,
+        old: &MemoryId,
+        new: &MemoryId,
+        now: chrono::DateTime<chrono::Utc>,
+        key: &str,
+    ) -> Result<()> {
+        let now_ts = now.timestamp();
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET superseded_by = ?1, archived_at = ?2, updated_at = ?2
+                 WHERE memory_id = ?3 AND superseded_by IS NULL AND archived_at IS NULL",
+                rusqlite::params![new.to_string(), now_ts, old.to_string()],
+            )
+            .map_err(storage_err)?;
+        if affected == 0 {
+            return Err(Error::StalePlan(format!(
+                "{old} was claimed by a concurrent resolution of {key}; re-run review \
+                 for a fresh queue"
+            )));
+        }
+        self.conn
+            .execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![old.to_string()],
+            )
+            .map_err(storage_err)?;
+        let details = serde_json::json!({ "new": new.to_string() }).to_string();
+        super::internal::append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
+    }
+
     fn upsert_review_state(
         &self,
         ns: &Namespace,
@@ -1138,6 +1386,436 @@ mod review_tests {
         );
         assert_eq!(namespace, ns().as_db_string());
         assert!(details.contains("auto-merge-dups"));
+    }
+
+    /// DRIFT/agreement: the pair-scoped revalidation predicate must match the
+    /// queue's contradiction listing (and therefore `active_contradicts`).
+    #[test]
+    fn contradiction_pair_active_matches_the_queue_semantics() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let other = Namespace::Project("elsewhere".into());
+
+        let a = insert(&store, &ns(), "a", |_| {});
+        let b = insert(&store, &ns(), "b", |_| {});
+        contradict(&store, &a, &b);
+        assert!(store.contradiction_pair_active(&ns(), &a, &b).unwrap());
+        // Direction-independent (the canonical-pair rule).
+        assert!(store.contradiction_pair_active(&ns(), &b, &a).unwrap());
+
+        // No edge between the pair: not a contradiction item, even though
+        // both are active.
+        let c = insert(&store, &ns(), "c", |_| {});
+        assert!(!store.contradiction_pair_active(&ns(), &a, &c).unwrap());
+
+        // An archived endpoint breaks the pair (the active_contradicts rule).
+        store.archive_memory(&b).unwrap();
+        assert!(!store.contradiction_pair_active(&ns(), &a, &b).unwrap());
+
+        // Cross-namespace edges never count in `ns`.
+        let foreign = insert(&store, &other, "foreign", |_| {});
+        contradict(&store, &a, &foreign);
+        assert!(!store
+            .contradiction_pair_active(&ns(), &a, &foreign)
+            .unwrap());
+    }
+
+    // --- atomic merge (review finding: single-writer, single-transaction) -----
+
+    fn combined_note(namespace: &Namespace, content: &str) -> MemoryNote {
+        let mut m = MemoryNote::new(namespace.clone(), content.into(), MemoryType::Insight, 6);
+        m.summary = content.to_string();
+        m
+    }
+
+    fn v_unit() -> [f32; 8] {
+        [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]
+    }
+
+    fn merge_key(a: &MemoryId, b: &MemoryId) -> String {
+        review_item_key(ReviewReason::NearDuplicate, &[a.clone(), b.clone()])
+    }
+
+    #[test]
+    fn review_merge_supersedes_both_into_the_combined_memory() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        let note = combined_note(&ns(), "combined twin");
+        let now = chrono::Utc::now();
+
+        store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                r#"{"action":"merge"}"#,
+                now,
+            )
+            .unwrap();
+
+        let merged = store.get_memory(&note.id).unwrap().expect("combined row");
+        assert!(merged.archived_at.is_none(), "the combined memory is live");
+        for old in [&a, &b] {
+            let m = store.get_memory(old).unwrap().unwrap();
+            assert!(m.archived_at.is_some(), "{old} archived");
+            assert_eq!(
+                m.superseded_by,
+                Some(note.id.clone()),
+                "{old} points at the merge"
+            );
+        }
+        // The combined memory owns a live vector; the originals' are pruned.
+        let vectors: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM memory_vectors", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(vectors, 1, "one live vector: the combined memory's");
+        // One review_resolve audit row + two supersede rows + the insert.
+        for (op, want) in [("insert", 3i64), ("supersede", 2), ("review_resolve", 1)] {
+            let got: i64 = store
+                .conn
+                .query_row(
+                    "SELECT COUNT(*) FROM memory_oplog WHERE op = ?1",
+                    rusqlite::params![op],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(got, want, "{op} oplog rows");
+        }
+        // reviewed_at stamped for the pair's canonical key.
+        let reviewed: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM review_state WHERE item_key = ?1 AND snooze_until IS NULL",
+                rusqlite::params![merge_key(&a, &b)],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(reviewed, 1);
+    }
+
+    #[test]
+    fn review_merge_is_all_or_nothing_when_a_supersede_pointer_is_taken() {
+        // Review finding (CRITICAL): the guarded pointer UPDATE
+        // (`WHERE superseded_by IS NULL AND archived_at IS NULL`) must fail
+        // the WHOLE transaction — never a split chain, never an orphaned
+        // combined memory (this is also the item-6 rollback proof: the
+        // combined insert happens BEFORE the failing guard and must vanish).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        let other = insert_vec(
+            &store,
+            &ns(),
+            "unrelated",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        // Simulate a concurrent winner: b's pointer is already taken while b
+        // is still active (the exact interleaving the unguarded UPDATE let
+        // through).
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET superseded_by = ?1 WHERE memory_id = ?2",
+                rusqlite::params![other.to_string(), b.to_string()],
+            )
+            .unwrap();
+
+        let note = combined_note(&ns(), "combined twin");
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::StalePlan(_)),
+            "distinct error: {err:?}"
+        );
+
+        // ALL-OR-NOTHING: no combined row, `a` fully untouched, no audit row.
+        assert!(
+            store.get_memory(&note.id).unwrap().is_none(),
+            "insert rolled back"
+        );
+        let a_row = store.get_memory(&a).unwrap().unwrap();
+        assert!(a_row.archived_at.is_none() && a_row.superseded_by.is_none());
+        let audits: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_oplog WHERE op IN ('review_resolve','supersede')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(audits, 0, "no partial audit trail survives the rollback");
+    }
+
+    #[test]
+    fn review_merge_rejects_already_resolved_members_with_stale_plan() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        store.archive_memory(&b).unwrap();
+
+        let note = combined_note(&ns(), "combined twin");
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "{err:?}");
+        assert!(store.get_memory(&note.id).unwrap().is_none());
+
+        // Missing or foreign-namespace members are NotFound (fail closed).
+        let ghost = MemoryId::new();
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &ghost,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+        let other_ns = Namespace::Project("elsewhere".into());
+        let foreign = insert_vec(&store, &other_ns, "foreign twin", v_unit());
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &foreign,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(matches!(err, Error::NotFound(_)), "{err:?}");
+    }
+
+    #[test]
+    fn review_merge_revalidates_similarity_at_resolve_time() {
+        // Review finding (TOCTOU): the wire would otherwise accept Merge for
+        // ANY two active ids — the pair must still qualify as near-duplicates
+        // AT RESOLVE TIME, through the same similarity unit near_duplicates()
+        // reports.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "one thing", v_unit());
+        let b = insert_vec(
+            &store,
+            &ns(),
+            "another thing entirely",
+            [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let note = combined_note(&ns(), "bogus merge");
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::StalePlan(_)),
+            "orthogonal pair: {err:?}"
+        );
+        assert!(store.get_memory(&note.id).unwrap().is_none());
+
+        // A member with no stored vector cannot be revalidated: stale plan.
+        let no_vec = insert(&store, &ns(), "vectorless", |_| {});
+        let err = store
+            .review_merge(
+                &ns(),
+                &a,
+                &no_vec,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap_err();
+        assert!(
+            matches!(err, Error::StalePlan(_)),
+            "missing vector: {err:?}"
+        );
+    }
+
+    /// DRIFT TEST: the merge revalidation and `near_duplicates()` must share
+    /// one similarity unit — a pair near_duplicates() admits at threshold t
+    /// must pass revalidation at the same t.
+    #[test]
+    fn review_merge_similarity_agrees_with_near_duplicates() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        // Similar but not identical: cosine ~0.894.
+        let a = insert_vec(&store, &ns(), "close one", v_unit());
+        let b = insert_vec(
+            &store,
+            &ns(),
+            "close two",
+            [1.0, 0.5, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+        );
+        let dups = store.near_duplicates(&ns(), &a, 0.85, 10).unwrap();
+        let (dup_id, sim) = dups.first().expect("the 0.89 pair is admitted at 0.85");
+        assert_eq!(dup_id, &b);
+
+        // Revalidation at exactly the reported similarity must ADMIT the pair
+        // (>= semantics, same unit)...
+        let note = combined_note(&ns(), "combined close");
+        store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                *sim,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        // ...which also proves the two paths agree on the number itself: a
+        // stricter bound just above it must REJECT (checked on fresh twins in
+        // review_merge_revalidates_similarity_at_resolve_time).
+    }
+
+    #[test]
+    fn review_merge_carries_union_of_external_links() {
+        // Review finding (HIGH): the originals' graph edges must survive the
+        // merge — copied (not moved) onto the combined memory, deduped, with
+        // the intra-pair edge and supersede-machinery edges dropped (a merged
+        // memory must not link to itself or fake a chain).
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        let x = insert(&store, &ns(), "outside x", |_| {});
+        let z = insert(&store, &ns(), "outside z", |_| {});
+
+        let link = |src: &MemoryId, dst: &MemoryId, lt: rb_types::LinkType| {
+            store
+                .add_link(&rb_types::MemoryLink {
+                    source_id: src.clone(),
+                    target_id: dst.clone(),
+                    link_type: lt,
+                    strength: 1.0,
+                    reason: "seeded".to_string(),
+                    created_at: chrono::Utc::now(),
+                })
+                .unwrap();
+        };
+        // Outgoing from a; incoming to b; the SAME edge from both members
+        // (dedupe); the intra-pair edge (dropped); a supersedes row (never
+        // copied — that edge type belongs to the supersede machinery).
+        link(&a, &x, rb_types::LinkType::Extends);
+        link(&z, &b, rb_types::LinkType::References);
+        link(&a, &z, rb_types::LinkType::References);
+        link(&b, &z, rb_types::LinkType::References);
+        link(&a, &b, rb_types::LinkType::Contradicts);
+        link(&b, &x, rb_types::LinkType::Supersedes);
+
+        let note = combined_note(&ns(), "combined twin");
+        store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                chrono::Utc::now(),
+            )
+            .unwrap();
+
+        let count = |sql: &str, p1: &str, p2: &str| -> i64 {
+            store
+                .conn
+                .query_row(sql, rusqlite::params![p1, p2], |r| r.get(0))
+                .unwrap()
+        };
+        let new_str = note.id.to_string();
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                &new_str,
+                &x.to_string()
+            ),
+            1,
+            "outgoing extends edge copied"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                &z.to_string(),
+                &new_str
+            ),
+            1,
+            "incoming references edge copied"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                &new_str,
+                &z.to_string()
+            ),
+            1,
+            "the duplicate a->z / b->z edge collapses to ONE copy"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?1 AND ?2 = ?2",
+                &new_str,
+                &new_str
+            ),
+            0,
+            "the intra-pair edge must not become a self-link"
+        );
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND link_type = 'supersedes' AND ?2 = ?2",
+                &new_str,
+                &new_str
+            ),
+            0,
+            "supersede-machinery edges are never copied"
+        );
+        // Copies, not moves: the archived originals keep their history.
+        assert_eq!(
+            count(
+                "SELECT COUNT(*) FROM memory_links WHERE source_id = ?1 AND target_id = ?2",
+                &a.to_string(),
+                &x.to_string()
+            ),
+            1,
+            "the original's edge stays for the audit trail"
+        );
     }
 
     // --- since ------------------------------------------------------------------

@@ -318,6 +318,15 @@ pub enum Request {
         reason: rb_types::ReviewReason,
         ids: Vec<MemoryId>,
         action: rb_types::ReviewAction,
+        /// Near-dup similarity bound for the resolve-time MERGE revalidation
+        /// (the plan->resolve TOCTOU fix): the daemon re-checks that the pair
+        /// still qualifies as near-duplicates at this threshold inside the
+        /// atomic merge transaction. `None` uses the conservative default;
+        /// server-clamped like `Review.threshold`. Additive +
+        /// `#[serde(default, skip_serializing_if)]` — an old frame decodes to
+        /// the default and a `None` stays off the wire.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        threshold: Option<f32>,
     },
 }
 
@@ -1833,6 +1842,7 @@ mod tests {
             reason: rb_types::ReviewReason::NearDuplicate,
             ids: vec![a.clone(), b.clone()],
             action: rb_types::ReviewAction::Archive { id: b.clone() },
+            threshold: Some(0.9),
         };
         let json = serde_json::to_string(&req).unwrap();
         let value: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -1844,11 +1854,22 @@ mod tests {
                 reason,
                 ids,
                 action,
+                threshold,
             } => {
                 assert_eq!(reason, rb_types::ReviewReason::NearDuplicate);
                 assert_eq!(ids, vec![a, b.clone()]);
                 assert_eq!(action, rb_types::ReviewAction::Archive { id: b });
+                assert_eq!(threshold, Some(0.9));
             }
+            other => panic!("expected Resolve, got {other:?}"),
+        }
+        // Additive: a frame WITHOUT the threshold key decodes to None (the
+        // server then revalidates a merge at the conservative default).
+        let mut value = value;
+        value.as_object_mut().unwrap().remove("threshold");
+        let back: Request = serde_json::from_value(value).unwrap();
+        match back {
+            Request::Resolve { threshold, .. } => assert_eq!(threshold, None),
             other => panic!("expected Resolve, got {other:?}"),
         }
     }

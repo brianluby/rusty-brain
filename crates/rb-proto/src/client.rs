@@ -784,12 +784,14 @@ where
         reason: rb_types::ReviewReason,
         ids: Vec<MemoryId>,
         action: rb_types::ReviewAction,
+        threshold: Option<f32>,
     ) -> Result<rb_types::ReviewResolution> {
         let resp = self
             .request(Request::Resolve {
                 reason,
                 ids,
                 action,
+                threshold,
             })
             .await?;
         match resp {
@@ -1285,6 +1287,7 @@ mod wrapper_tests {
                     reason,
                     ids,
                     action,
+                    ..
                 } => Response::Resolved {
                     resolution: rb_types::ReviewResolution {
                         key: rb_types::review_item_key(reason, &ids),
@@ -1376,6 +1379,7 @@ mod wrapper_tests {
                 rb_types::ReviewReason::NearDuplicate,
                 vec![a.clone(), b.clone()],
                 rb_types::ReviewAction::Snooze { days: 9 },
+                None,
             )
             .await
             .unwrap();

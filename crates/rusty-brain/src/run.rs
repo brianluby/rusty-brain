@@ -801,7 +801,7 @@ async fn run_client(
             }
         }
         Command::Review {
-            dry_run: _,
+            dry_run,
             apply,
             policy,
             interactive,
@@ -813,6 +813,7 @@ async fn run_client(
         } => {
             use std::io::IsTerminal as _;
             match review_gate(
+                dry_run,
                 interactive,
                 apply,
                 yes,
@@ -987,7 +988,7 @@ async fn review_interactive(
                 // EOF (e.g. Ctrl-D): stop cleanly, nothing half-applied.
                 break 'items;
             }
-            match parse_review_choice(&line, item.members.len()) {
+            match parse_review_choice(&line, item.members.len(), item.reason) {
                 Ok(ReviewChoice::Quit) => break 'items,
                 Ok(ReviewChoice::Skip) => continue 'items,
                 Ok(choice) => match choice_to_action(choice, item, snooze_days) {
@@ -1001,7 +1002,10 @@ async fn review_interactive(
             }
         };
         let ids: Vec<rb_types::MemoryId> = item.members.iter().map(|m| m.id.clone()).collect();
-        match client.resolve_review_item(item.reason, ids, action).await {
+        match client
+            .resolve_review_item(item.reason, ids, action, threshold)
+            .await
+        {
             Ok(resolution) => {
                 resolved += 1;
                 println!("{}", output::render_review_resolution(&resolution, false));
@@ -1036,14 +1040,20 @@ enum ReviewGate {
 
 /// Decide how a `review` invocation may proceed. Mirrors `hard_execute_gate`:
 /// a batch mutation must never ride an unattended pipeline by accident, and
-/// the per-item loop needs a human at a terminal.
+/// the per-item loop needs a human at a terminal. An EXPLICIT `--dry-run`
+/// wins over everything (belt-and-suspenders under the clap conflict — a
+/// preview invocation must never mutate; PR #63 Copilot finding).
 fn review_gate(
+    dry_run: bool,
     interactive: bool,
     apply: bool,
     yes: bool,
     json: bool,
     stdin_is_tty: bool,
 ) -> ReviewGate {
+    if dry_run {
+        return ReviewGate::DryRun;
+    }
     if interactive {
         if json {
             return ReviewGate::Refuse(
@@ -1117,10 +1127,16 @@ enum ReviewChoice {
     Quit,
 }
 
-/// Parse one interactive answer against an item with `member_count` members.
-/// Garbage is a clear `Err` message, never a panic and never a silent
-/// mutation; an empty answer skips (the safe default).
-fn parse_review_choice(input: &str, member_count: usize) -> Result<ReviewChoice, String> {
+/// Parse one interactive answer against an item with `member_count` members
+/// and `reason`. Garbage is a clear `Err` message, never a panic and never a
+/// silent mutation; an empty answer skips (the safe default). Merge is
+/// near-duplicate-only (mirroring the daemon's `ReviewAction::validate`
+/// restriction) so the user gets the redirect locally, without a round trip.
+fn parse_review_choice(
+    input: &str,
+    member_count: usize,
+    reason: rb_types::ReviewReason,
+) -> Result<ReviewChoice, String> {
     const HELP: &str = "expected k(eep), b(ump), m(erge), a(rchive) [1|2], d(emote) [1|2], \
                         s(nooze), x/enter to skip, or q(uit)";
     let normalized = input.trim().to_ascii_lowercase();
@@ -1148,6 +1164,13 @@ fn parse_review_choice(input: &str, member_count: usize) -> Result<ReviewChoice,
         ("k" | "keep", None) => Ok(ReviewChoice::Keep),
         ("b" | "bump", None) => Ok(ReviewChoice::KeepBump),
         ("m" | "merge", None) => {
+            if reason != rb_types::ReviewReason::NearDuplicate {
+                return Err(
+                    "merge applies to near-duplicate items only; resolve this one with \
+                     keep, archive, demote, or snooze"
+                        .to_string(),
+                );
+            }
             if member_count == 2 {
                 Ok(ReviewChoice::Merge)
             } else {
@@ -1261,44 +1284,56 @@ mod tests {
     fn review_gate_matrix_mirrors_the_hard_execute_gate() {
         // Interactive mode needs a real terminal and human-readable output.
         assert!(matches!(
-            review_gate(true, false, false, false, true),
+            review_gate(false, true, false, false, false, true),
             ReviewGate::Interactive
         ));
         assert!(matches!(
-            review_gate(true, false, false, true, true),
+            review_gate(false, true, false, false, true, true),
             ReviewGate::Refuse(_)
         ));
         assert!(matches!(
-            review_gate(true, false, false, false, false),
+            review_gate(false, true, false, false, false, false),
             ReviewGate::Refuse(_)
         ));
 
         // Apply: --yes proceeds anywhere; without it, --json and piped stdin
         // refuse loudly, and only a TTY gets the default-NO prompt.
         assert!(matches!(
-            review_gate(false, true, true, true, false),
+            review_gate(false, false, true, true, true, false),
             ReviewGate::ApplyProceed
         ));
         assert!(matches!(
-            review_gate(false, true, false, false, true),
+            review_gate(false, false, true, false, false, true),
             ReviewGate::ApplyPrompt
         ));
-        match review_gate(false, true, false, true, true) {
+        match review_gate(false, false, true, false, true, true) {
             ReviewGate::Refuse(msg) => assert!(msg.contains("--yes"), "{msg}"),
             other => panic!("json apply without --yes must refuse, got {other:?}"),
         }
-        match review_gate(false, true, false, false, false) {
+        match review_gate(false, false, true, false, false, false) {
             ReviewGate::Refuse(msg) => assert!(msg.contains("--yes"), "{msg}"),
             other => panic!("piped apply without --yes must refuse, got {other:?}"),
         }
 
         // Neither flag: the dry-run listing, everywhere.
         assert!(matches!(
-            review_gate(false, false, false, true, false),
+            review_gate(false, false, false, false, true, false),
             ReviewGate::DryRun
         ));
         assert!(matches!(
-            review_gate(false, false, false, false, true),
+            review_gate(false, false, false, false, false, true),
+            ReviewGate::DryRun
+        ));
+
+        // Copilot finding (PR #63), belt-and-suspenders under the clap
+        // conflict: an EXPLICIT --dry-run wins over every mutating flag —
+        // even a hostile flag combination can only preview.
+        assert!(matches!(
+            review_gate(true, false, true, true, false, true),
+            ReviewGate::DryRun
+        ));
+        assert!(matches!(
+            review_gate(true, true, false, false, false, true),
             ReviewGate::DryRun
         ));
     }
@@ -1327,11 +1362,29 @@ mod tests {
             ("quit", C::Quit),
             ("  K  ", C::Keep),
         ] {
-            assert_eq!(parse_review_choice(input, 2), Ok(expected), "{input:?}");
+            assert_eq!(
+                parse_review_choice(input, 2, rb_types::ReviewReason::NearDuplicate),
+                Ok(expected),
+                "{input:?}"
+            );
         }
         // Single-member items: the side index is implicit.
-        assert_eq!(parse_review_choice("a", 1), Ok(C::Archive(0)));
-        assert_eq!(parse_review_choice("d", 1), Ok(C::Demote(0)));
+        let low = rb_types::ReviewReason::LowConfidence;
+        assert_eq!(parse_review_choice("a", 1, low), Ok(C::Archive(0)));
+        assert_eq!(parse_review_choice("d", 1, low), Ok(C::Demote(0)));
+    }
+
+    #[test]
+    fn parse_review_choice_restricts_merge_to_near_duplicates() {
+        // PR #63 review: the interactive loop must mirror the daemon's
+        // reason restriction — merging a contradiction pair gets a clear
+        // redirect instead of a round trip to a daemon rejection.
+        let err = parse_review_choice("m", 2, rb_types::ReviewReason::Contradiction).unwrap_err();
+        assert!(err.contains("near-duplicate"), "{err}");
+        assert!(
+            err.contains("keep") && err.contains("archive"),
+            "the error redirects to the valid actions: {err}"
+        );
     }
 
     #[test]
@@ -1349,7 +1402,7 @@ mod tests {
             ("merge now", 2),              // trailing garbage
             ("a 99999999999999999999", 2), // overflow
         ] {
-            let got = parse_review_choice(input, members);
+            let got = parse_review_choice(input, members, rb_types::ReviewReason::NearDuplicate);
             assert!(got.is_err(), "{input:?} must be rejected, got {got:?}");
         }
     }

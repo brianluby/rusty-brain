@@ -1018,20 +1018,27 @@ async fn suppress_hook_near_duplicates<P>(
     }
 }
 
-/// Apply ONE review resolution (PRD 2026-07-02 REV-2) through the existing
-/// atomic primitives. Fail-closed order: validate the action shape against
-/// the member ids, resolve every member through the namespace-scoped engine
-/// (`peek` — a maintenance read must not pollute the W3.7 access signal; a
-/// foreign or missing id is `NotFound` before any write), mutate, then record
-/// the `review_resolve` audit row (REV-4).
+/// Apply ONE review resolution (PRD 2026-07-02 REV-2). Fail-closed order:
+/// validate the action shape against the item's REASON and member ids
+/// (merge is near-duplicate-only), re-validate the planned relationship at
+/// resolve time (the PR #63 TOCTOU fix — a contradiction item must still be
+/// an active contradiction pair; a near-dup merge re-proves similarity
+/// inside the writer transaction), resolve every member through the
+/// namespace-scoped engine (`peek` — a maintenance read must not pollute the
+/// W3.7 access signal; a foreign or missing id is `NotFound` before any
+/// write), mutate, then record the `review_resolve` audit row (REV-4).
 ///
-/// Merge is the W3.1 update-as-supersede composition: store the combined
-/// memory FIRST (through the engine, so it is embedded, linked, and stamped
-/// with the caller's provenance), then supersede each original through the
-/// existing atomic supersede — a failure between the steps leaves the new
-/// memory stored and the un-superseded original live, never a partial or
-/// corrupt state (the `Remember.supersedes` argument); the pair simply
-/// resurfaces on the next sweep.
+/// Merge is ONE writer transaction end to end (the PR #63 atomicity fix):
+/// the combined memory is COMPOSED through the engine (validated, enriched,
+/// embedded, provenance-stamped — `MemoryEngine::compose_note`, the same
+/// construction `remember` commits) and handed to
+/// `StoreHandle::review_merge`, whose single store transaction re-validates,
+/// inserts, copies the originals' external edges, supersedes both originals
+/// behind the pointer guard, and writes the audit row. Any failure rolls the
+/// WHOLE merge back — no orphaned combined memory, no split chain; a raced
+/// resolution loses with the distinct [`Error::StalePlan`], which the policy
+/// sweep treats as skip-and-continue.
+#[allow(clippy::too_many_arguments)] // the resolve context is irreducible here
 async fn apply_review_action<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
@@ -1040,14 +1047,35 @@ async fn apply_review_action<P>(
     reason: rb_types::ReviewReason,
     ids: &[rb_types::MemoryId],
     action: &rb_types::ReviewAction,
+    threshold: f32,
 ) -> Result<rb_types::ReviewResolution>
 where
     P: EmbeddingProvider,
 {
     use rb_types::{MemberConfidence, ReviewAction};
 
-    action.validate(ids)?;
+    action.validate(reason, ids)?;
     let key = rb_types::review_item_key(reason, ids);
+
+    // Resolve-time revalidation of the claimed relationship (PR #63 TOCTOU
+    // fix). Contradiction items are re-proved here for EVERY action; a
+    // near-dup MERGE is re-proved inside the atomic store transaction below
+    // (where the guard is race-free). Non-merge actions on other reasons are
+    // individually-targeted, reversible primitives.
+    if reason == rb_types::ReviewReason::Contradiction {
+        if let [a, b] = ids {
+            let still = job_store
+                .contradiction_pair_active(namespace.clone(), a.clone(), b.clone())
+                .await?;
+            if !still {
+                return Err(Error::StalePlan(format!(
+                    "{a} and {b} no longer form an active contradiction; re-run \
+                     review for a fresh queue"
+                )));
+            }
+        }
+    }
+
     let mut notes = Vec::with_capacity(ids.len());
     for id in ids {
         match engine.peek(id.clone()).await? {
@@ -1084,22 +1112,12 @@ where
             }
         }
         ReviewAction::Merge => {
-            // Merging requires both originals ACTIVE: superseding an already
-            // archived row would overwrite its existing supersede identity.
-            for note in &notes {
-                if note.archived_at.is_some() {
-                    return Err(Error::InvalidArgument(format!(
-                        "cannot merge {}: it is already archived; re-run review \
-                         for a fresh queue",
-                        note.id
-                    )));
-                }
-            }
             let (a, b) = (&notes[0], &notes[1]);
             // Deterministic combine: identical contents collapse to one;
             // otherwise both bodies are kept, first member first. Metadata
             // keeps the strongest signal (max importance/confidence) and the
-            // union of keywords/tags/files/anchors.
+            // union of keywords/tags/files/anchors; the graph edges are
+            // unioned inside the store transaction.
             let content = if a.content == b.content {
                 a.content.clone()
             } else {
@@ -1138,8 +1156,8 @@ where
             } else {
                 a.memory_type
             };
-            let new_id = engine
-                .remember(rb_engine::RememberInput {
+            let (note, embedding) = engine
+                .compose_note(rb_engine::RememberInput {
                     content,
                     context,
                     memory_type,
@@ -1152,13 +1170,28 @@ where
                     anchors,
                 })
                 .await?;
+            let new_id = note.id.clone();
+            let details = serde_json::json!({
+                "key": key,
+                "action": "merge",
+                "ids": ids.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
+                "merged_into": new_id.to_string(),
+            })
+            .to_string();
             job_store
-                .supersede(namespace.clone(), a.id.clone(), new_id.clone())
-                .await?;
-            job_store
-                .supersede(namespace.clone(), b.id.clone(), new_id.clone())
+                .review_merge(
+                    namespace.clone(),
+                    a.id.clone(),
+                    b.id.clone(),
+                    threshold,
+                    note,
+                    embedding,
+                    details,
+                )
                 .await?;
             resolution.merged_into = Some(new_id);
+            // The audit row was written INSIDE the merge transaction.
+            return Ok(resolution);
         }
         ReviewAction::Archive { id } => {
             engine.delete(id.clone()).await?;
@@ -1207,7 +1240,6 @@ where
         "key": key,
         "action": action.kind_str(),
         "ids": ids.iter().map(std::string::ToString::to_string).collect::<Vec<_>>(),
-        "merged_into": resolution.merged_into.as_ref().map(std::string::ToString::to_string),
     })
     .to_string();
     job_store
@@ -1216,26 +1248,29 @@ where
     Ok(resolution)
 }
 
-/// One bounded review apply pass (REV-3 `--apply --policy`): recompute the
-/// queue, derive the plan through the pure `ReviewPolicy::plan_action` (the
-/// SAME mapping a dry-run shows), and apply each planned action through
-/// [`apply_review_action`]. The `ForgetOutcome` failure shape (PR #60):
-/// every completed item's transactions are durable — a mid-batch failure is
-/// captured into `outcome.failure` instead of discarding the pass, and the
-/// bulk `review_sweep` oplog row is written unconditionally so a zero-change
-/// or partial pass is still an auditable run.
-async fn run_review_sweep<P>(
+/// Execute an already-generated review plan under `policy` (the apply half of
+/// `run_review_sweep`, split out so plan staleness is testable): derive each
+/// item's action through the pure `ReviewPolicy::plan_action` (the SAME
+/// mapping a dry-run shows) and apply it via [`apply_review_action`].
+///
+/// Failure semantics (PR #60 partial-outcome shape + the PR #63 refinement):
+/// a distinct [`Error::StalePlan`] — the item was resolved concurrently or
+/// its relationship dissolved between plan and apply — is a benign collision:
+/// counted as `skipped`, the pass continues. Any OTHER error stops the pass
+/// re-runnably; completed items stay committed. The bulk `review_sweep` oplog
+/// row is written unconditionally.
+async fn execute_review_plan<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     provenance: &rb_engine::Provenance,
     namespace: &rb_types::Namespace,
     policy: rb_types::ReviewPolicy,
-    params: rb_store::ReviewQueueParams,
+    plan: &rb_types::ReviewPlan,
+    threshold: f32,
 ) -> Result<rb_types::ReviewOutcome>
 where
     P: EmbeddingProvider,
 {
-    let plan = job_store.review_plan(namespace.clone(), params).await?;
     let mut outcome = rb_types::ReviewOutcome {
         policy: Some(policy),
         total_items: plan.items.len() as u64,
@@ -1256,6 +1291,7 @@ where
             item.reason,
             &ids,
             &action,
+            threshold,
         )
         .await
         {
@@ -1266,6 +1302,13 @@ where
                 rb_types::ReviewAction::Demote { .. } => outcome.demoted += 1,
                 rb_types::ReviewAction::Snooze { .. } => outcome.snoozed += 1,
             },
+            Err(Error::StalePlan(reason)) => {
+                // Benign collision: someone resolved the item (or its
+                // relationship dissolved) between plan and apply. Skip it —
+                // the rest of the batch must still complete.
+                tracing::debug!(key = %item.key, %reason, "review item went stale; skipping");
+                outcome.skipped += 1;
+            }
             Err(e) => {
                 // The failed item's own steps rolled back or stand alone;
                 // earlier items are committed. Stop (re-runnable), report
@@ -1302,6 +1345,32 @@ where
     }
     outcome.failure = failure;
     Ok(outcome)
+}
+
+/// One bounded review apply pass (REV-3 `--apply --policy`): recompute the
+/// queue, then execute it via [`execute_review_plan`].
+async fn run_review_sweep<P>(
+    engine: &MemoryEngine<StoreHandle, P>,
+    job_store: &StoreHandle,
+    provenance: &rb_engine::Provenance,
+    namespace: &rb_types::Namespace,
+    policy: rb_types::ReviewPolicy,
+    params: rb_store::ReviewQueueParams,
+) -> Result<rb_types::ReviewOutcome>
+where
+    P: EmbeddingProvider,
+{
+    let plan = job_store.review_plan(namespace.clone(), params).await?;
+    execute_review_plan(
+        engine,
+        job_store,
+        provenance,
+        namespace,
+        policy,
+        &plan,
+        params.threshold,
+    )
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1668,16 +1737,24 @@ where
             }
         }
         // One per-item resolution (REV-2 interactive mode). Validation is
-        // fail-closed at this boundary: the action shape against the member
-        // ids, then every member resolved through the namespace-scoped
-        // engine (a foreign or missing id is NotFound before any write).
+        // fail-closed at this boundary: the action shape against the item
+        // reason and member ids, the resolve-time relationship revalidation
+        // (PR #63 TOCTOU fix), then every member resolved through the
+        // namespace-scoped engine (a foreign or missing id is NotFound
+        // before any write). The merge-revalidation threshold is clamped
+        // exactly like Review's.
         Request::Resolve {
             reason,
             ids,
             action,
+            threshold,
         } => {
+            let threshold = match threshold {
+                Some(t) if t.is_finite() => t.clamp(rb_types::REVIEW_MIN_THRESHOLD, 1.0),
+                _ => rb_types::REVIEW_DEFAULT_THRESHOLD,
+            };
             match apply_review_action(
-                engine, job_store, provenance, namespace, reason, &ids, &action,
+                engine, job_store, provenance, namespace, reason, &ids, &action, threshold,
             )
             .await
             {
@@ -2283,5 +2360,92 @@ mod tests {
         );
 
         store.shutdown().await;
+    }
+
+    /// PR #63 MEDIUM: a policy sweep must skip-and-continue past a BENIGN
+    /// stale-plan collision (an item resolved concurrently between plan and
+    /// apply) instead of aborting the whole batch; real errors still stop
+    /// the pass (proved by the mid-batch-failure e2e).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn review_sweep_skips_stale_items_and_completes_the_rest() {
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, 8, 2).unwrap();
+        let ns = Namespace::Project("sweep-stale".to_string());
+        let engine = rb_engine::MemoryEngine::new(
+            handle.clone(),
+            SharedEmbedder::new(DeterministicProvider::new(8)),
+            ns.clone(),
+        );
+        let provenance = rb_engine::Provenance {
+            origin_source: Some("cli".to_string()),
+            ..Default::default()
+        };
+
+        // Two independent dup pairs => two planned merges.
+        let mut ids = Vec::new();
+        for content in [
+            "first duplicated remark",
+            "first duplicated remark",
+            "second duplicated remark",
+            "second duplicated remark",
+        ] {
+            let id = engine
+                .remember(rb_engine::RememberInput {
+                    content: content.to_string(),
+                    context: None,
+                    memory_type: rb_types::MemoryType::Insight,
+                    importance: 5,
+                    keywords: vec![],
+                    tags: vec![],
+                    related_files: vec![],
+                    confidence: Some(1.0),
+                    provenance: provenance.clone(),
+                    anchors: vec![],
+                })
+                .await
+                .unwrap();
+            ids.push(id);
+        }
+
+        let params = rb_store::ReviewQueueParams {
+            threshold: rb_types::REVIEW_DEFAULT_THRESHOLD,
+            limit: 50,
+            since: None,
+        };
+        let plan = handle.review_plan(ns.clone(), params).await.unwrap();
+        let dup_items = plan
+            .items
+            .iter()
+            .filter(|i| i.reason == rb_types::ReviewReason::NearDuplicate)
+            .count();
+        assert_eq!(dup_items, 2, "both pairs planned: {plan:?}");
+
+        // Concurrent-resolution simulation: archive one member of the FIRST
+        // planned pair after the plan was generated.
+        let stale_member = plan.items[0].members[0].id.clone();
+        engine.delete(stale_member).await.unwrap();
+
+        let outcome = execute_review_plan(
+            &engine,
+            &handle,
+            &provenance,
+            &ns,
+            rb_types::ReviewPolicy::AutoMergeDups,
+            &plan,
+            params.threshold,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            outcome.failure, None,
+            "a benign collision must not fail the pass: {outcome:?}"
+        );
+        assert_eq!(outcome.merged, 1, "the live pair still merges");
+        assert_eq!(outcome.skipped, 1, "the stale item is counted as skipped");
+
+        handle.shutdown().await;
     }
 }

@@ -204,6 +204,23 @@ enum WriteCommand {
         details: String,
         reply: oneshot::Sender<Result<i64>>,
     },
+    /// Atomically merge a near-duplicate pair (PRD 2026-07-02 review; the
+    /// PR #63 atomicity fix): ONE store transaction re-validates the pair,
+    /// inserts the pre-composed combined memory, copies the originals'
+    /// external edges, supersedes both originals behind the pointer guard,
+    /// and writes the audit row. Single-writer serialization makes two
+    /// concurrent merges of the same pair impossible — the loser gets
+    /// `Error::StalePlan`.
+    ReviewMerge {
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+        min_similarity: f32,
+        note: Box<MemoryNote>,
+        embedding: Option<Vec<f32>>,
+        details: String,
+        reply: oneshot::Sender<Result<()>>,
+    },
     /// Stamp `reviewed_at` + append the `review_resolve` oplog row (REV-4)
     /// for a non-snooze resolution. The mutation itself already ran through
     /// the existing primitives (each publishing its own event).
@@ -1026,6 +1043,56 @@ impl StoreHandle {
             .await
     }
 
+    /// Is there still an active contradiction between exactly `a` and `b` in
+    /// `namespace`? The resolve-time revalidation for contradiction items
+    /// (PR #63 TOCTOU fix). Read-only, via the bounded read pool.
+    pub async fn contradiction_pair_active(
+        &self,
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+    ) -> Result<bool> {
+        self.with_read(move |store| store.contradiction_pair_active(&namespace, &a, &b))
+            .await
+    }
+
+    /// Atomically merge a near-duplicate pair through the single writer (PRD
+    /// 2026-07-02 review; the PR #63 atomicity fix): one all-or-nothing store
+    /// transaction — see [`rb_store::SqliteStore::review_merge`]. On success
+    /// the arm publishes `Created` for the combined memory and `Archived` for
+    /// both originals.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn review_merge(
+        &self,
+        namespace: Namespace,
+        a: MemoryId,
+        b: MemoryId,
+        min_similarity: f32,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        details: String,
+    ) -> Result<()> {
+        if self.shutting_down.load(Ordering::SeqCst) {
+            return Err(Error::Storage("writer thread unavailable".to_string()));
+        }
+        let (reply, rx) = oneshot::channel();
+        self.writer_tx
+            .send(WriteCommand::ReviewMerge {
+                namespace,
+                a,
+                b,
+                min_similarity,
+                note: Box::new(note),
+                embedding,
+                details,
+                reply,
+            })
+            .await
+            .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        rx.await
+            .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
+    }
+
     /// Persist one review snooze (REV-2) through the single writer: upsert
     /// the item's `review_state` row and append the `review_resolve` oplog
     /// row in one store transaction. Returns the snooze expiry (unix secs).
@@ -1797,6 +1864,62 @@ fn writer_loop(
                     })
                 });
                 let _ = reply.send(result);
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ReviewMerge {
+                namespace,
+                a,
+                b,
+                min_similarity,
+                note,
+                embedding,
+                details,
+                reply,
+            } => {
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        s.review_merge(
+                            &namespace,
+                            &a,
+                            &b,
+                            min_similarity,
+                            &note,
+                            embedding.as_deref(),
+                            &details,
+                            chrono::Utc::now(),
+                        )
+                    },
+                );
+                let merged = report.result.is_ok();
+                let writer_usable = report.writer_usable;
+                let _ = reply.send(report.result);
+                if merged {
+                    // Subscribers observe the merge as one Created (the
+                    // combined memory) plus two Archived events, each stamped
+                    // with its own oplog seq (the retention-sweep rule).
+                    publish_change_stamped(
+                        &events,
+                        store.as_ref(),
+                        note.id.clone(),
+                        namespace.clone(),
+                        ChangeKind::Created,
+                    );
+                    for old in [a, b] {
+                        publish_change_stamped(
+                            &events,
+                            store.as_ref(),
+                            old,
+                            namespace.clone(),
+                            ChangeKind::Archived,
+                        );
+                    }
+                }
                 if !writer_usable {
                     break;
                 }
