@@ -292,7 +292,14 @@ curl -s -X POST http://127.0.0.1:7777/recall \
 Endpoints: `GET /ping`, `GET /context`, `GET /memories/:id`, `POST /recall`,
 `POST /remember`, `POST /feedback`, and a generic `POST /ops` that accepts
 the full tagged wire request (`{"op": "Recall", ...}`). Responses are the
-existing wire `Response` types as JSON; errors map by kind (400/403/404/500).
+existing wire `Response` types as JSON. Wire errors map by kind — 400
+(validation), 403 (`permission_denied`, incl. every admin op), 404
+(`not_found`), 500 (internal, opaque). The HTTP gates add their own
+statuses: 400 for a missing/duplicated Host header or an absolute-form
+request line that disagrees with Host, 403 for a non-loopback Host or
+Origin, 404 for unknown paths, 405 with a per-path `Allow` header for wrong
+methods, 413 for bodies over 1 MiB, 415 for POSTs that are not
+`application/json`, and 503 when a request exceeds the overall deadline.
 The `x-rusty-brain-namespace` header scopes a request (default `global`).
 
 Security posture (see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), "The

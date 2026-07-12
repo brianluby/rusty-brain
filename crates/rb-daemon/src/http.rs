@@ -46,9 +46,11 @@ use crate::{JobsConfig, SharedEmbedder, StoreHandle};
 /// Default deadline for reading a request's headers (also bounds keep-alive
 /// idle time between requests). Overridable per-config for tests only.
 const DEFAULT_HEADER_READ_TIMEOUT: Duration = Duration::from_secs(10);
-/// Overall per-request deadline (headers already read): body read + dispatch
-/// + response serialization. Bounds a client that trickles its body.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default overall per-request deadline (headers already read): body read +
+/// dispatch + response serialization. Bounds a client that trickles its body
+/// (the slowloris phase the header deadline does not cover). Overridable via
+/// [`HttpListenerConfig::request_timeout`] for tests.
+const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// Default cap on simultaneous HTTP connections. Deliberately SEPARATE from
 /// (and smaller than) the UDS `MAX_CONNECTIONS` so a saturated HTTP surface
 /// cannot consume UDS connection slots.
@@ -69,6 +71,12 @@ pub struct HttpListenerConfig {
     /// Header-read deadline override; `None` uses the built-in 10s default.
     /// Exposed for tests (the `request_idle_timeout` precedent).
     pub header_read_timeout: Option<Duration>,
+    /// Overall per-request deadline override (body read + dispatch +
+    /// response serialization — the slowloris-on-body bound); `None` uses
+    /// the built-in 30s default. Exposed for tests (the
+    /// `request_idle_timeout` precedent); deliberately not a config-file
+    /// knob.
+    pub request_timeout: Option<Duration>,
     /// Connection-cap override; `None` uses the built-in default. Exposed
     /// for tests.
     pub max_connections: Option<usize>,
@@ -79,6 +87,7 @@ impl Default for HttpListenerConfig {
         Self {
             bind: SocketAddr::from(([127, 0, 0, 1], 0)),
             header_read_timeout: None,
+            request_timeout: None,
             max_connections: None,
         }
     }
@@ -140,6 +149,7 @@ pub(crate) async fn run(
     let header_read_timeout = config
         .header_read_timeout
         .unwrap_or(DEFAULT_HEADER_READ_TIMEOUT);
+    let request_timeout = config.request_timeout.unwrap_or(DEFAULT_REQUEST_TIMEOUT);
     let max_connections = config.max_connections.unwrap_or(DEFAULT_MAX_CONNECTIONS);
     let conn_sem = Arc::new(Semaphore::new(max_connections));
     let mut conns: JoinSet<()> = JoinSet::new();
@@ -170,7 +180,7 @@ pub(crate) async fn run(
                                 let state = state.clone();
                                 async move {
                                     Ok::<_, std::convert::Infallible>(
-                                        handle_request(req, state).await,
+                                        handle_request(req, state, request_timeout).await,
                                     )
                                 }
                             });
@@ -200,11 +210,16 @@ pub(crate) async fn run(
     info!("http listener shut down");
 }
 
-/// Serve one request under the overall request deadline. Every path returns
-/// a `Response::Error`-shaped JSON body on failure so clients parse ONE
-/// error shape across transports.
-async fn handle_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -> HttpResponse {
-    match tokio::time::timeout(REQUEST_TIMEOUT, process_request(req, state)).await {
+/// Serve one request under the overall request deadline (the trickled-body
+/// bound; pinned by `trickled_body_is_closed_at_request_deadline`). Every
+/// path returns a `Response::Error`-shaped JSON body on failure so clients
+/// parse ONE error shape across transports.
+async fn handle_request(
+    req: hyper::Request<Incoming>,
+    state: Arc<HttpState>,
+    request_timeout: Duration,
+) -> HttpResponse {
+    match tokio::time::timeout(request_timeout, process_request(req, state)).await {
         Ok(resp) => resp,
         Err(_elapsed) => error_response(StatusCode::SERVICE_UNAVAILABLE, "io", "request timed out"),
     }
@@ -212,19 +227,62 @@ async fn handle_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) ->
 
 type HttpResponse = hyper::Response<Full<Bytes>>;
 
-/// Decode, gate, and dispatch one request. Ordering is deliberate: browser /
-/// transport gates first (Host, Origin), then routing, then media-type and
-/// body bounds, then namespace, then the shared `dispatch` — nothing is
-/// partially processed before its gate passes.
+/// Decode, gate, and dispatch one request. Ordering is deliberate and MUST
+/// be preserved by future edits: (1) the Host gate and (2) the Origin gate
+/// run FIRST — before the namespace header is parsed, before routing, and
+/// before a single body byte is read — so a browser-relayed or rebound
+/// request is refused with zero processing; then (3) namespace validation,
+/// (4) routing, (5) media-type + body bounds for POSTs, and only then
+/// (6) the shared `dispatch`. Nothing is partially processed before its
+/// gate passes.
 async fn process_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -> HttpResponse {
     // DNS-rebinding defense: the request must be addressed to a loopback
     // literal (or `localhost`). A hostile page whose DNS re-resolves to
     // 127.0.0.1 arrives with its own hostname in Host — refuse it.
-    let authority = req
-        .uri()
-        .authority()
-        .map(|a| a.to_string())
-        .or_else(|| header_str(&req, hyper::header::HOST).map(str::to_string));
+    //
+    // RFC 7230 §5.4 hygiene first: more than one Host header field is a
+    // hard 400, even when the values agree — duplicate Host is a classic
+    // request-smuggling shape, and "which one applied" must never be a
+    // question.
+    let mut host_values = req.headers().get_all(hyper::header::HOST).iter();
+    let host_header = match (host_values.next(), host_values.next()) {
+        (Some(_), Some(_)) => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "multiple Host headers are not allowed",
+            )
+        }
+        (Some(value), None) => match value.to_str() {
+            Ok(v) => Some(v.to_string()),
+            Err(_) => {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "malformed Host header",
+                )
+            }
+        },
+        (None, _) => None,
+    };
+    // An absolute-form request-target carries its own authority. When a Host
+    // header is ALSO present the two must agree (ASCII case-insensitively;
+    // no port normalization — fail closed on any difference): a mismatched
+    // pair is refused rather than resolved by silently preferring one side.
+    let authority = match (req.uri().authority().map(|a| a.to_string()), host_header) {
+        (Some(authority), Some(host)) => {
+            if !authority.eq_ignore_ascii_case(&host) {
+                return error_response(
+                    StatusCode::BAD_REQUEST,
+                    "invalid_argument",
+                    "request-line authority and Host header disagree",
+                );
+            }
+            Some(authority)
+        }
+        (Some(authority), None) => Some(authority),
+        (None, host) => host,
+    };
     match authority {
         None => {
             return error_response(
@@ -352,7 +410,8 @@ fn route(req: &hyper::Request<Incoming>) -> std::result::Result<Routed, Box<Http
     let path = req.uri().path();
     let method = req.method();
 
-    // (path, allowed method) table for the flat endpoints.
+    // (path, allowed method) table for the flat endpoints. Each arm knows
+    // the ONE method its path supports, so a 405 can advertise it exactly.
     let routed = match path {
         "/ping" => some_get(method, || Routed::Op(Request::Ping)),
         "/context" => some_get(method, || Routed::Op(Request::Context)),
@@ -370,7 +429,7 @@ fn route(req: &hyper::Request<Incoming>) -> std::result::Result<Routed, Box<Http
             }
             Some(id_part) => {
                 if method != Method::GET {
-                    return Err(Box::new(method_not_allowed()));
+                    return Err(Box::new(method_not_allowed(Method::GET)));
                 }
                 match id_part.parse::<rb_types::MemoryId>() {
                     Ok(id) => Some(Routed::Op(Request::Get { id })),
@@ -385,7 +444,15 @@ fn route(req: &hyper::Request<Incoming>) -> std::result::Result<Routed, Box<Http
             }
         },
     };
-    routed.ok_or_else(|| Box::new(method_not_allowed()))
+    routed.ok_or_else(|| {
+        // Every flat endpoint supports exactly one method; GET paths built
+        // an op above, so a miss on them advertises GET, else POST.
+        let allowed = match path {
+            "/ping" | "/context" => Method::GET,
+            _ => Method::POST,
+        };
+        Box::new(method_not_allowed(allowed))
+    })
 }
 
 fn some_get(method: &Method, build: impl FnOnce() -> Routed) -> Option<Routed> {
@@ -396,12 +463,18 @@ fn some_post(method: &Method, kind: BodyKind) -> Option<Routed> {
     (method == Method::POST).then_some(Routed::Body(kind))
 }
 
-fn method_not_allowed() -> HttpResponse {
-    error_response(
+/// 405 advertising the single method `allowed` for the requested path
+/// (per-path, not a blanket list — Copilot review, PR #62).
+fn method_not_allowed(allowed: Method) -> HttpResponse {
+    let mut resp = error_response(
         StatusCode::METHOD_NOT_ALLOWED,
         "invalid_argument",
         "method not allowed for this path",
-    )
+    );
+    if let Ok(value) = hyper::header::HeaderValue::from_str(allowed.as_str()) {
+        resp.headers_mut().insert(hyper::header::ALLOW, value);
+    }
+    resp
 }
 
 /// Read and bound a JSON request body: `application/json` required (forces a
@@ -527,14 +600,11 @@ fn json_response(status: StatusCode, response: &Response) -> HttpResponse {
             );
         }
     };
-    let mut builder = hyper::Response::builder()
+    let builder = hyper::Response::builder()
         .status(status)
         .header(hyper::header::CONTENT_TYPE, "application/json")
         .header(hyper::header::CACHE_CONTROL, "no-store")
         .header("x-content-type-options", "nosniff");
-    if status == StatusCode::METHOD_NOT_ALLOWED {
-        builder = builder.header(hyper::header::ALLOW, "GET, POST");
-    }
     match builder.body(Full::new(Bytes::from(body))) {
         Ok(resp) => resp,
         Err(e) => {

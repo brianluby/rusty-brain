@@ -134,9 +134,10 @@ fn build_request(
     bytes
 }
 
-/// Send raw bytes, read to EOF, return (status, body). `Connection: close`
-/// makes read-to-EOF well-defined.
-async fn raw_round_trip(addr: SocketAddr, request: &[u8]) -> (u16, String) {
+/// Send raw bytes, read to EOF, return (status, head, body). `Connection:
+/// close` makes read-to-EOF well-defined. `head` is the status line plus
+/// response headers (lowercased for case-insensitive header assertions).
+async fn raw_round_trip_full(addr: SocketAddr, request: &[u8]) -> (u16, String, String) {
     let mut stream = TcpStream::connect(addr).await.unwrap();
     stream.write_all(request).await.unwrap();
     let mut buf = Vec::new();
@@ -150,10 +151,16 @@ async fn raw_round_trip(addr: SocketAddr, request: &[u8]) -> (u16, String) {
         .nth(1)
         .and_then(|s| s.parse().ok())
         .unwrap_or_else(|| panic!("no status line in response: {text:?}"));
-    let body = text
+    let (head, body) = text
         .split_once("\r\n\r\n")
-        .map(|(_, b)| b.to_string())
+        .map(|(h, b)| (h.to_ascii_lowercase(), b.to_string()))
         .unwrap_or_default();
+    (status, head, body)
+}
+
+/// Send raw bytes, read to EOF, return (status, body).
+async fn raw_round_trip(addr: SocketAddr, request: &[u8]) -> (u16, String) {
+    let (status, _head, body) = raw_round_trip_full(addr, request).await;
     (status, body)
 }
 
@@ -664,6 +671,65 @@ async fn foreign_or_missing_host_is_rejected() {
     daemon.stop().await;
 }
 
+/// SECURITY (request-smuggling hygiene, RFC 7230 §5.4): a request with more
+/// than one Host header field is refused 400 — even when the values agree —
+/// so no downstream component can ever disagree about which one applied.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn duplicate_host_headers_are_rejected() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let host = addr.to_string();
+
+    // Differing duplicates: the classic smuggling shape.
+    let req = format!(
+        "GET /ping HTTP/1.1\r\nHost: {host}\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n"
+    );
+    let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
+    assert_eq!(status, 400, "differing duplicate Hosts must be 400: {body}");
+
+    // Equal duplicates are ALSO refused (RFC 7230 §5.4 is unconditional).
+    let req =
+        format!("GET /ping HTTP/1.1\r\nHost: {host}\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
+    assert_eq!(status, 400, "equal duplicate Hosts must be 400: {body}");
+
+    daemon.stop().await;
+}
+
+/// SECURITY: an absolute-form request-target carries its own authority; when
+/// a Host header is ALSO present the two must agree, otherwise the request
+/// is refused 400 before any processing — a mismatched pair must never be
+/// resolved by silently preferring one of them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn absolute_uri_and_host_mismatch_is_rejected() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let host = addr.to_string();
+
+    // Loopback authority in the request line, foreign Host header.
+    let req = format!(
+        "GET http://{host}/ping HTTP/1.1\r\nHost: evil.example.com\r\nConnection: close\r\n\r\n"
+    );
+    let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
+    assert_eq!(status, 400, "mismatched authority/Host must be 400: {body}");
+
+    // Foreign authority in the request line, loopback Host header — the
+    // mismatch is refused without ever trusting either value.
+    let req = format!(
+        "GET http://evil.example.com/ping HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n"
+    );
+    let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
+    assert_eq!(status, 400, "mismatched authority/Host must be 400: {body}");
+
+    // A MATCHING absolute-form pair is legitimate and passes.
+    let req =
+        format!("GET http://{host}/ping HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
+    assert_eq!(status, 200, "matching authority/Host must pass: {body}");
+
+    daemon.stop().await;
+}
+
 /// SECURITY (browser-origin defense): a request carrying a non-loopback
 /// Origin header is a cross-origin browser request — refuse it. Requests
 /// without Origin (curl, scripts, native clients) and same-origin loopback
@@ -719,6 +785,92 @@ async fn stalled_connection_is_closed_at_header_deadline() {
         .unwrap_or(0);
     // Either a 408 response or a bare close is acceptable; hanging is not.
     let _ = n;
+    daemon.stop().await;
+}
+
+/// SECURITY (slowloris-on-body defense): a client that completes its headers
+/// with an under-cap Content-Length and then TRICKLES the body is cut off at
+/// the overall request deadline with a 503 — the header deadline alone does
+/// not cover this phase. The UDS path is unaffected throughout.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn trickled_body_is_closed_at_request_deadline() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig {
+        bind: loopback_ephemeral(),
+        request_timeout: Some(Duration::from_millis(300)),
+        ..Default::default()
+    }))
+    .await;
+    let addr = daemon.http_addr();
+    let host = addr.to_string();
+
+    let mut stream = TcpStream::connect(addr).await.unwrap();
+    // Complete headers, body cap respected on paper — then stall mid-body.
+    let head = format!(
+        "POST /recall HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
+         Connection: close\r\nContent-Length: 1000\r\n\r\n"
+    );
+    stream.write_all(head.as_bytes()).await.unwrap();
+    stream.write_all(b"{\"query\":").await.unwrap(); // 9 of 1000 bytes, then silence
+
+    let mut buf = Vec::new();
+    tokio::time::timeout(Duration::from_secs(5), stream.read_to_end(&mut buf))
+        .await
+        .expect("trickled body must be cut off at the request deadline")
+        .unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf);
+    assert!(
+        text.starts_with("HTTP/1.1 503"),
+        "expected a 503 at the request deadline, got {text:?}"
+    );
+
+    // The stalled HTTP request never touched the UDS path.
+    let mut uds = Client::connect(&daemon.socket, Namespace::Global)
+        .await
+        .unwrap();
+    uds.ping().await.unwrap();
+
+    daemon.stop().await;
+}
+
+/// A 405 names the method the path actually supports — per path, not a
+/// blanket list (Copilot review, PR #62).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn method_not_allowed_names_the_paths_allowed_method() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let host = addr.to_string();
+
+    // GET-only paths report Allow: GET.
+    for path in [
+        "/context",
+        &format!("/memories/{}", rb_types::MemoryId::new()),
+    ] {
+        let req = build_request(
+            "POST",
+            path,
+            Some(&host),
+            &[("Content-Type", "application/json")],
+            Some("{}"),
+        );
+        let (status, head, body) = raw_round_trip_full(addr, &req).await;
+        assert_eq!(status, 405, "{path}: {body}");
+        assert!(
+            head.lines().any(|l| l.trim() == "allow: get"),
+            "{path} must advertise exactly Allow: GET, got head {head:?}"
+        );
+    }
+
+    // POST-only paths report Allow: POST.
+    for path in ["/recall", "/ops"] {
+        let req = build_request("GET", path, Some(&host), &[], None);
+        let (status, head, body) = raw_round_trip_full(addr, &req).await;
+        assert_eq!(status, 405, "{path}: {body}");
+        assert!(
+            head.lines().any(|l| l.trim() == "allow: post"),
+            "{path} must advertise exactly Allow: POST, got head {head:?}"
+        );
+    }
+
     daemon.stop().await;
 }
 

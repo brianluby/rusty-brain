@@ -129,9 +129,16 @@ connection carries nothing. Two consequences, both handled fail-closed:
   reading, and again by a hard cap while reading (chunked bodies), so an
   oversized body is never buffered (`oversized_body_is_413`). Header reads
   have a deadline (slowloris; `stalled_connection_is_closed_at_header_deadline`),
-  each request has an overall deadline, malformed JSON / wrong methods /
-  unknown paths return errors without partial processing, and `Subscribe`
-  (a streaming op) is rejected rather than left hanging.
+  and each request has an overall deadline covering the body-read + dispatch
+  phase, so a client that completes its headers and then TRICKLES the body
+  is cut off with a 503 (`trickled_body_is_closed_at_request_deadline`).
+  Malformed JSON / wrong methods / unknown paths return errors without
+  partial processing, and `Subscribe` (a streaming op) is rejected rather
+  than left hanging. Request-smuggling hygiene: more than one Host header
+  field is a hard 400 even when the values agree (RFC 7230 §5.4;
+  `duplicate_host_headers_are_rejected`), and an absolute-form request-line
+  authority that disagrees with the Host header is refused rather than
+  silently preferred (`absolute_uri_and_host_mismatch_is_rejected`).
 - **The HTTP path cannot starve the UDS path.** HTTP connections are capped
   by their own semaphore, separate from (and smaller than) the UDS
   connection cap; over-cap connections are closed immediately and the UDS
