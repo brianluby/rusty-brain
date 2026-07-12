@@ -42,9 +42,13 @@ CREATE TABLE memory_anchors (
   CHECK (end_line IS NULL OR (start_line IS NOT NULL AND end_line >= start_line))
 );
 
--- Per-memory load (row_to_note) and the anchor-filter EXISTS probes.
+-- Per-memory anchor load (row_to_note, alongside load_links).
 CREATE INDEX idx_memory_anchors_memory ON memory_anchors(memory_id);
--- Namespace-scoped anchor lookups by kind+path (file filters).
+-- The anchor-filter semi-join probes (list_filtered builds
+-- `m.memory_id IN (SELECT memory_id FROM memory_anchors WHERE namespace = ?
+-- AND kind = ? AND path|ref = ?)`), so a selective anchor lookup costs
+-- O(matching anchors), not O(active memories) — EXPLAIN-pinned by the
+-- `anchor_filters_probe_the_wide_anchor_indexes` test. Their leading
+-- `namespace` column also serves rename_namespace's re-key UPDATE.
 CREATE INDEX idx_memory_anchors_path ON memory_anchors(namespace, kind, path);
--- Namespace-scoped anchor lookups by kind+ref (commit/symbol filters).
 CREATE INDEX idx_memory_anchors_ref ON memory_anchors(namespace, kind, ref);

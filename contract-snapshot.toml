@@ -46,7 +46,7 @@ contract_version = 2
 "006_narrow_mem_au.sql" = "1803fb5199302bc5e5910e870ef81b80ddb940c4b3a4df3113d6a319a3933299"
 "007_base_importance.sql" = "be04183c1209fdb8adfdcbd66dc96ecf6125b79a45cd4a65f40388b6cca6586b"
 "008_memory_feedback.sql" = "64901f555624da4b738e437877d6b2b60579dbd5051f55ab476390015a67b70b"
-"009_memory_anchors.sql" = "60f223ee485e42e7b55a78027c06afdb36fcecbad136d5f995f8be2f729d3669"
+"009_memory_anchors.sql" = "d65aa99503a1573dfc55e65c60eb4045087e26680e2e6e426fdd6b9be1b3f6eb"
 
 [[log]]
 contract_version = 2
@@ -67,3 +67,8 @@ note = "PR #58 recall/list filter parity: additive filter field on Request::Reca
 contract_version = 2
 intent = "additive"
 note = "PR: typed code anchors — memory_anchors migration (009) + anchor wire additions (MemoryNote.anchors, Remember.anchors, HandshakeAck.capabilities, rb-types MemoryAnchor); no bump, additive per W5a.4"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "PR #59 review: migration 009 comment-only fix — index docs now describe the true access paths (anchor filter is a namespace-scoped semi-join over the wide indexes; memory_id index serves row_to_note); no schema change"

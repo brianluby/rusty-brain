@@ -84,9 +84,11 @@ per memory. Decoded by name in `row_to_note` with serde defaults (the
 
 - Recall filters: `--file <path>`, `--commit <sha>`, `--symbol <name>`
   (CLI + MCP), scoping candidates before ranking.
-- When the hook performs prompt-time recall (W3.2 channel a), an anchor
-  derived from the active file/context boosts anchor-matching memories (a
-  documented, bounded boost; exact weight deferred to W4.1).
+- DEFERRED (roadmap, not v1 — consistent with Non-Goals/Risks and the Status
+  note): when the hook performs prompt-time recall (W3.2 channel a), an
+  anchor derived from the active file/context boosts anchor-matching
+  memories (a documented, bounded boost). Ships with the W4.1
+  ranking-weight evidence; v1 delivers anchors as a filter only.
 
 ### ANC-4. Graph + provenance parity
 

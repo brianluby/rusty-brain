@@ -42,6 +42,13 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
     out.trim_end().to_string()
 }
 
+/// Comma-joined anchor labels (`file:src/a.rs:3-9, commit:abc123`) — the one
+/// formatting shared by every human surface that lists anchors.
+fn anchor_labels(n: &MemoryNote) -> String {
+    let labels: Vec<String> = n.anchors.iter().map(ToString::to_string).collect();
+    labels.join(", ")
+}
+
 /// Compact one-line anchor suffix for human renderings (typed code anchors,
 /// ANC-4: `graph <id>` and friends list anchors): ` [anchors: file:src/a.rs,
 /// commit:abc123]`, or empty when the note has none.
@@ -49,8 +56,7 @@ fn anchors_suffix(n: &MemoryNote) -> String {
     if n.anchors.is_empty() {
         return String::new();
     }
-    let labels: Vec<String> = n.anchors.iter().map(ToString::to_string).collect();
-    format!(" [anchors: {}]", labels.join(", "))
+    format!(" [anchors: {}]", anchor_labels(n))
 }
 
 /// Render a list of notes (used by `list`, `graph`, and the `context` halves).
@@ -102,8 +108,7 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             let anchors = if n.anchors.is_empty() {
                 String::new()
             } else {
-                let labels: Vec<String> = n.anchors.iter().map(ToString::to_string).collect();
-                format!("\nanchors: {}", labels.join(", "))
+                format!("\nanchors: {}", anchor_labels(n))
             };
             format!(
                 "{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
