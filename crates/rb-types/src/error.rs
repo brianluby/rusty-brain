@@ -27,12 +27,16 @@ pub enum Error {
     Enrichment(String),
     #[error("invalid argument: {0}")]
     InvalidArgument(String),
-    /// A review resolution raced a concurrent change (PRD 2026-07-02): the
-    /// item's members were already resolved (archived/superseded) or the
-    /// planned relationship no longer holds at resolve time. Client-safe
-    /// guidance — re-run `review` for a fresh queue. Distinct variant so a
-    /// policy sweep can skip-and-continue past a benign collision while real
-    /// errors still stop the pass.
+    /// A planned mutation raced a concurrent change: the rows it targeted
+    /// were already resolved (archived/superseded) or the planned
+    /// relationship no longer holds at write time. Producers: review
+    /// resolutions (PRD 2026-07-02 — re-run `review` for a fresh queue) and
+    /// the guarded supersede (#501 — the old row was already resolved, or the
+    /// replacement is no longer current truth). Client-safe guidance.
+    /// Distinct variant so tolerant sweeps (review policy, consolidation) can
+    /// skip-and-continue past a benign collision while real errors still stop
+    /// the pass. The Display prefix predates the generalization and is kept
+    /// stable: the `stale_plan` wire kind's message round-trip strips it.
     #[error("stale review plan: {0}")]
     StalePlan(String),
     /// An authenticated peer is not authorized for the requested operation

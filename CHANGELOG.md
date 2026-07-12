@@ -5,6 +5,30 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — Supersede hardened at the source (#501)
+
+- **`Store::supersede` now guards every half of the mutation** (generalizing
+  the PR #63 review-merge pointer guard into ONE shared primitive that the
+  review merge also delegates to): self-supersede (`old == new`) is rejected
+  as `invalid_argument`; an old row that is already archived or superseded is
+  rejected with the distinct `stale_plan` error via a guarded UPDATE
+  (`WHERE superseded_by IS NULL AND archived_at IS NULL` + rows-affected
+  check) — a `superseded_by` lineage pointer is now **set-once** and can never
+  be silently rewritten; and the `new` target must itself be current truth
+  (present, active, not superseded — `not_found` / `stale_plan` otherwise),
+  which is the write-side cycle defense (an A→B then B→A cycle is refused at
+  the second write). The history timeline's read-side cycle defense remains as
+  belt-and-suspenders for direct-DB corruption. No wire shape changes: only
+  existing error kinds on existing ops.
+- **Caller compatibility**: the consolidation job now skips-and-continues past
+  a lost supersede race (`stale_plan` from a concurrent resolution) instead of
+  aborting the pass, counting it `skipped`; the `remember --supersedes` fold
+  and hook near-dup suppression were already best-effort and now log the
+  refusal instead of silently mutating resolved rows. Previously a re-supersede
+  of an archived row silently planted a lineage pointer on a retired row —
+  that is now a refusal, because a plan formed against a retired row is stale
+  by definition and recording it would fabricate a decision-evolution step.
+
 ### Added — Codex `apply_patch` file-edit capture (follow-up 2026-06-02)
 
 - **Codex `apply_patch` capture is live**: openai/codex#16732 shipped in Codex

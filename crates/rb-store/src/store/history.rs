@@ -512,6 +512,24 @@ mod tests {
         id
     }
 
+    /// Plant a supersede pointer with RAW SQL, bypassing the write-side
+    /// guards (#501: `Store::supersede` now rejects self-supersede,
+    /// re-supersede, and non-current targets). Cycle/self-loop fixtures model
+    /// direct DB access, admin scripts, or corruption — exactly the threat
+    /// the read-side cycle defense must survive, which is why these tests
+    /// keep passing as belt-and-suspenders behind the write-side guards.
+    fn force_supersede(store: &SqliteStore, old: &MemoryId, new: &MemoryId) {
+        let now = chrono::Utc::now().timestamp();
+        store
+            .conn
+            .execute(
+                "UPDATE memories SET superseded_by = ?1, archived_at = ?2, updated_at = ?2
+                 WHERE memory_id = ?3",
+                rusqlite::params![new.to_string(), now, old.to_string()],
+            )
+            .unwrap();
+    }
+
     fn link(store: &SqliteStore, from: &MemoryId, to: &MemoryId, lt: LinkType, reason: &str) {
         store
             .add_link(&MemoryLink {
@@ -628,7 +646,7 @@ mod tests {
         let a = seed(&store, &ns, "a");
         let b = seed(&store, &ns, "b");
         store.supersede(&a, &b).unwrap();
-        store.supersede(&b, &a).unwrap(); // closes the cycle A -> B -> A
+        force_supersede(&store, &b, &a); // closes the cycle A -> B -> A (raw SQL: the write path refuses it)
 
         for anchor in [&a, &b] {
             let history = store.memory_history(&ns, anchor, 100, 200, 200).unwrap();
@@ -663,8 +681,8 @@ mod tests {
         let d = seed(&store, &ns, "cycle d");
         store.supersede(&b, &c).unwrap();
         store.supersede(&c, &d).unwrap();
-        store.supersede(&d, &b).unwrap(); // closes the cycle B -> C -> D -> B
-        store.supersede(&a, &c).unwrap(); // the external entry A -> C
+        force_supersede(&store, &d, &b); // closes the cycle B -> C -> D -> B (raw SQL)
+        force_supersede(&store, &a, &c); // the external entry A -> C (raw SQL: C is superseded)
 
         // From D (inside the cycle) and from A (outside, feeding in): every
         // member appears exactly once and nothing is silently dropped.
@@ -726,7 +744,7 @@ mod tests {
         let store = open(&dir.path().join("rb.db"));
         let ns = Namespace::Project("hist-self".to_string());
         let a = seed(&store, &ns, "self-superseded");
-        store.supersede(&a, &a).unwrap();
+        force_supersede(&store, &a, &a); // raw SQL: the write path rejects self-supersede (#501)
 
         let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
         assert_eq!(history.chain.len(), 1, "the self-loop adds no members");
@@ -796,7 +814,7 @@ mod tests {
         let c = seed(&store, &ns, "c");
         let d = seed(&store, &ns, "d");
         store.supersede(&c, &d).unwrap();
-        store.supersede(&d, &c).unwrap();
+        force_supersede(&store, &d, &c); // raw SQL: closes the cycle past the write guard
         let history = store.memory_history(&ns, &c, 1, 200, 200).unwrap();
         assert_eq!(history.chain.len(), 2);
         assert!(

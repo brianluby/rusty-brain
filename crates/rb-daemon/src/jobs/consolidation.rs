@@ -139,14 +139,11 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
             if member.id == survivor_id {
                 continue;
             }
-            store
-                .supersede(
-                    cand.namespace.clone(),
-                    member.id.clone(),
-                    survivor_id.clone(),
-                )
-                .await?;
-            summary.changed += 1;
+            if supersede_member(store, &cand.namespace, &member.id, &survivor_id).await? {
+                summary.changed += 1;
+            } else {
+                summary.skipped += 1;
+            }
             consumed.insert(member.id.to_string());
         }
         // The survivor (and the anchor, if it survived) is consumed so it is not
@@ -156,6 +153,42 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
     }
 
     Ok(summary)
+}
+
+/// Supersede one cluster member into the survivor, tolerating the read/write
+/// race (#501 caller compatibility): the candidate window and near-dup lookup
+/// are reads, so a live daemon can resolve a member (remember --supersedes, a
+/// review merge, another writer) before this job's write lands. The store's
+/// supersede guard turns that into [`rb_types::Error::StalePlan`]; a bounded
+/// maintenance pass must skip past the benign collision (the review
+/// policy-sweep discipline) instead of aborting — the winner's pointer stays
+/// exactly as the winner wrote it. Every OTHER error (including a vanished
+/// member: `NotFound`) still fails the pass.
+///
+/// Returns `Ok(true)` when the member was superseded, `Ok(false)` on a
+/// benign lost race.
+async fn supersede_member(
+    store: &StoreHandle,
+    namespace: &rb_types::Namespace,
+    member: &MemoryId,
+    survivor: &MemoryId,
+) -> Result<bool> {
+    match store
+        .supersede(namespace.clone(), member.clone(), survivor.clone())
+        .await
+    {
+        Ok(()) => Ok(true),
+        Err(rb_types::Error::StalePlan(reason)) => {
+            tracing::debug!(
+                member = %member,
+                survivor = %survivor,
+                %reason,
+                "consolidation lost a supersede race; skipping the member"
+            );
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 #[cfg(test)]
@@ -256,6 +289,102 @@ mod tests {
             similarity_threshold: threshold,
             batch_limit,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supersede_member_reports_changed_on_the_happy_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("tolerant".to_string());
+
+        let member = vnote(&ns, "member", 3);
+        let survivor = vnote(&ns, "survivor", 9);
+        let (member_id, survivor_id) = (member.id.clone(), survivor.id.clone());
+        handle
+            .write(
+                member,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+        handle
+            .write(
+                survivor,
+                Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            )
+            .await
+            .unwrap();
+
+        let changed = supersede_member(&handle, &ns, &member_id, &survivor_id)
+            .await
+            .unwrap();
+        assert!(changed, "an unresolved member is superseded");
+        let got = handle
+            .get(ns.clone(), member_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.superseded_by.as_ref(), Some(&survivor_id));
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn supersede_member_skips_a_concurrently_resolved_member() {
+        // #501 caller-compatibility: the job reads its candidate window, then
+        // writes one supersede per member — a live daemon can resolve a
+        // member in between (remember --supersedes, a review merge, another
+        // job). The store guard turns that race into StalePlan; the job must
+        // treat it as skip-and-continue (the review policy-sweep discipline),
+        // NOT abort the pass, and must never rewrite the winner's pointer.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("tolerant".to_string());
+
+        let member = vnote(&ns, "member", 3);
+        let winner = vnote(&ns, "concurrent winner", 5);
+        let survivor = vnote(&ns, "survivor", 9);
+        let (member_id, winner_id, survivor_id) =
+            (member.id.clone(), winner.id.clone(), survivor.id.clone());
+        for (n, v) in [
+            (member, vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (winner, vec![0.0f32, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+            (survivor, vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]),
+        ] {
+            handle.write(n, Some(v)).await.unwrap();
+        }
+
+        // The "concurrent" resolution lands first: member -> winner.
+        handle
+            .supersede(ns.clone(), member_id.clone(), winner_id.clone())
+            .await
+            .unwrap();
+
+        // The job's write loses the race: skipped (Ok(false)), never an Err.
+        let changed = supersede_member(&handle, &ns, &member_id, &survivor_id)
+            .await
+            .unwrap();
+        assert!(!changed, "a lost race is a benign skip, not a change");
+        let got = handle
+            .get(ns.clone(), member_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            got.superseded_by.as_ref(),
+            Some(&winner_id),
+            "the winner's pointer must never be rewritten"
+        );
+
+        // A real failure still propagates: a vanished member is NOT benign.
+        let err = supersede_member(&handle, &ns, &rb_types::MemoryId::new(), &survivor_id)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::NotFound(_)), "got {err:?}");
+
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

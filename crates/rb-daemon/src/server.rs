@@ -1437,8 +1437,12 @@ where
                     // archive the prior memory through the existing atomic
                     // supersede (separate writer tx). Best-effort — a supersede
                     // failure leaves the new memory stored and `old` un-archived,
-                    // never a partial state. `old == id` is impossible (the id is
-                    // freshly minted) but guarded for clarity.
+                    // never a partial state. That includes the #501 guard misses
+                    // (StalePlan: `old` was already resolved by an earlier fold or
+                    // another writer) — the established lineage pointer is kept
+                    // and only this warn records the refusal. `old == id` is
+                    // impossible (the id is freshly minted) but guarded for
+                    // clarity.
                     if let Some(old) = supersedes {
                         if old != id {
                             if let Err(e) = job_store

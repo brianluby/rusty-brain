@@ -1659,7 +1659,11 @@ fn writer_loop(
                         // the caller's namespace before mutating, so the primitive can
                         // never merge across namespaces and the Archived event below is
                         // provably published under `old`'s real namespace. Fail closed
-                        // (NotFound) on a missing or cross-namespace target.
+                        // (NotFound) on a missing or cross-namespace target. The
+                        // archived/superseded state guards live in the store itself
+                        // (#501, `Store::supersede`): self-supersede is
+                        // InvalidArgument; a resolved old row or a non-current new
+                        // target is StalePlan — no event is published on any refusal.
                         match (s.get_memory(&old), s.get_memory(&new)) {
                             (Ok(Some(o)), Ok(Some(n)))
                                 if o.namespace == namespace && n.namespace == namespace =>
@@ -2744,6 +2748,68 @@ mod tests {
             "no cross-namespace pointer"
         );
         assert!(got_old.archived_at.is_none(), "old untouched: not archived");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_supersede_rejects_self_and_resolved_rows() {
+        // #501 daemon pins: the store-level guards surface unchanged through
+        // the single writer — self-supersede is a validation error, and both
+        // an already-resolved OLD row and a non-current NEW target are the
+        // distinct StalePlan (wire kind `stale_plan`), never a silent mutate.
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("guards".to_string());
+
+        let a = note(&ns, "first truth");
+        let b = note(&ns, "second truth");
+        let c = note(&ns, "third truth");
+        let (a_id, b_id, c_id) = (a.id.clone(), b.id.clone(), c.id.clone());
+        handle.write(a, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(b, Some(vec![0.2f32; DIM])).await.unwrap();
+        handle.write(c, Some(vec![0.3f32; DIM])).await.unwrap();
+
+        // Self-supersede: refused as a validation error.
+        let err = handle
+            .supersede(ns.clone(), a_id.clone(), a_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        // A -> B succeeds; re-superseding A (already resolved) is StalePlan
+        // and the original pointer survives.
+        handle
+            .supersede(ns.clone(), a_id.clone(), b_id.clone())
+            .await
+            .unwrap();
+        let err = handle
+            .supersede(ns.clone(), a_id.clone(), c_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+        let got_a = handle.get(ns.clone(), a_id.clone()).await.unwrap().unwrap();
+        assert_eq!(
+            got_a.superseded_by.as_ref(),
+            Some(&b_id),
+            "lineage never rewritten"
+        );
+
+        // B -> A (the two-hop cycle): refused because A is no longer current.
+        let err = handle
+            .supersede(ns.clone(), b_id.clone(), a_id.clone())
+            .await
+            .unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+        let got_b = handle.get(ns.clone(), b_id.clone()).await.unwrap().unwrap();
+        assert!(got_b.superseded_by.is_none() && got_b.archived_at.is_none());
+
+        // The writer survives every refusal (guard misses are clean errors).
+        handle
+            .supersede(ns.clone(), b_id.clone(), c_id.clone())
+            .await
+            .unwrap();
 
         handle.shutdown().await;
     }
