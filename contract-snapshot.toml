@@ -11,12 +11,15 @@ contract_version = 2
 "crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
-"crates/rb-proto/src/messages.rs::Request" = "31921c2123297d490a311e24dba44df8d7ab76eccf7881e8461984ff0392ef00"
-"crates/rb-proto/src/messages.rs::Response" = "9c284452e2f0464eee8e3a865903273c429a6755ee0dd80f55f889757e675700"
+"crates/rb-proto/src/messages.rs::Request" = "af5a8ce05ce48088d2e862964f847e1a243095ed58c2cc53c41c1d920fefa870"
+"crates/rb-proto/src/messages.rs::Response" = "267061d0c21b7a996d9be0c70f7f753ec2c71859dcb055981a3b8ba80d98b341"
 "crates/rb-types/src/anchor.rs::MemoryAnchor" = "db65d4fee2c23b5628270cdcb7b19ce99056eb3656de73aa0e50fc77090a9277"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
 "crates/rb-types/src/feedback_kind.rs::FeedbackKind" = "8ca2edbd8aca8e2b087ea630e10209a51a307efdf1a84b0bbccc74a06f2da7b6"
+"crates/rb-types/src/history.rs::HistoryEdge" = "2eeaea0b396c0c0e1b4fc9d88088f34c3d701115e0d3af739b335f057c656195"
+"crates/rb-types/src/history.rs::HistoryEntry" = "01c147087fa036cb389172d86036870275dc164578edb7320666e003f3fc6abc"
+"crates/rb-types/src/history.rs::MemoryHistory" = "f87b10e75c2fbf835a6f3d1bec9d36235ec785942af85ab2241edb3ca3ddc6e1"
 "crates/rb-types/src/job.rs::JobKind" = "3a57cc7d386b30a18c67877d0e822f778a36659a4bba51dc314720dd3c84d243"
 "crates/rb-types/src/link.rs::MemoryLink" = "7e1c5377ec99d7e609c289b14fed82fa2a2c5275650bb688ea1afbe03fb37f4d"
 "crates/rb-types/src/link_type.rs::LinkType" = "2394c0b6dc86235d55ce3e3bb9b7d5d8b058672f07b1e57532930e897ca644f2"
@@ -83,3 +86,8 @@ note = "PR #59 review: migration 009 comment-only fix — index docs now describ
 contract_version = 2
 intent = "additive"
 note = "PR #60 retention/forget: Request::Forget + retention payloads (no bump, additive per W5a.4)"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "PR #61 decision history timeline: Request/Response::History + rb-types history payloads (no bump, additive per W5a.4)"
