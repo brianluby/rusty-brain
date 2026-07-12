@@ -19,6 +19,7 @@ pub mod install;
 mod namespace;
 mod opencode;
 pub mod proc;
+pub mod recall_contract;
 
 pub use capability::{
     agent_capabilities, capability_for_agent, AdapterStatus, AgentCapability, SupportLevel,
