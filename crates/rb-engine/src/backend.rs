@@ -1,4 +1,4 @@
-use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
+use rb_types::{MemoryId, MemoryNote, MemoryState, MemoryUpdates, Namespace, RecallFilter};
 
 /// Async store-access abstraction the engine is generic over. The daemon
 /// implements this on top of the synchronous `rb_store::Store` using a
@@ -8,11 +8,17 @@ use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace};
 pub trait MemoryBackend: Send + Sync {
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()>;
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
+    /// Keyword (FTS) candidates scoped to `state` (PRD 2026-07-02
+    /// search-filter parity): `Active` preserves the historical active-only
+    /// scan; `Archived`/`All` let a state-filtered recall reach archived
+    /// memories through this channel (their vectors are pruned on archive, so
+    /// keyword+graph are the only archived channels).
     async fn keyword(
         &self,
         ns: Namespace,
         query: String,
         limit: usize,
+        state: MemoryState,
     ) -> rb_types::Result<Vec<MemoryId>>;
     async fn vector(
         &self,
@@ -31,10 +37,21 @@ pub trait MemoryBackend: Send + Sync {
         id: MemoryId,
         depth: u8,
     ) -> rb_types::Result<Vec<(MemoryId, u8)>>;
+    /// List up to `limit` memories matching `filter`, newest first: the
+    /// metadata dimensions (the [`RecallFilter::matches`] semantics: types,
+    /// tags, importance/confidence ranges, created-at window, sources,
+    /// archived state) AND the contested tri-state. Contested must be
+    /// resolved INSIDE the bounded query — post-filtering a fetch window
+    /// silently drops matches past the window, under-filling `limit` — with
+    /// the SAME semantics as [`MemoryBackend::active_contradicts`] (the store
+    /// pins the two with a drift test; in-memory impls delegate to their own
+    /// `active_contradicts`). An error resolving contested fails the list
+    /// (fail-closed). `anchors` is NOT evaluated here — the engine rejects it
+    /// until typed code anchors land.
     async fn list(
         &self,
         ns: Namespace,
-        min_importance: Option<u8>,
+        filter: RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>>;
     /// Apply metadata-only updates. `MemoryEngine::update` rejects content edits
@@ -154,9 +171,17 @@ mod tests {
             _ns: Namespace,
             _query: String,
             _limit: usize,
+            state: MemoryState,
         ) -> rb_types::Result<Vec<MemoryId>> {
             // Deterministic order (created_at desc) so keyword_rank is reproducible.
-            let mut notes: Vec<MemoryNote> = self.notes.lock().unwrap().values().cloned().collect();
+            let mut notes: Vec<MemoryNote> = self
+                .notes
+                .lock()
+                .unwrap()
+                .values()
+                .filter(|n| state.admits_archived(n.archived_at.is_some()))
+                .cloned()
+                .collect();
             notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
             Ok(notes.into_iter().map(|n| n.id).collect())
         }
@@ -193,8 +218,8 @@ mod tests {
         }
         async fn list(
             &self,
-            _ns: Namespace,
-            min_importance: Option<u8>,
+            ns: Namespace,
+            filter: RecallFilter,
             limit: usize,
         ) -> rb_types::Result<Vec<MemoryNote>> {
             let mut v: Vec<MemoryNote> = self
@@ -202,9 +227,16 @@ mod tests {
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|n| min_importance.map(|m| n.importance >= m).unwrap_or(true))
+                .filter(|n| filter.matches(n))
                 .cloned()
                 .collect();
+            // Trait contract: contested resolves BEFORE the limit, via this
+            // backend's own active_contradicts (single source per backend).
+            if let Some(want) = filter.contested {
+                let ids: Vec<MemoryId> = v.iter().map(|n| n.id.clone()).collect();
+                let contested = self.active_contradicts(ns, ids).await?;
+                v.retain(|n| contested.contains(&n.id) == want);
+            }
             v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
             v.truncate(limit);
             Ok(v)

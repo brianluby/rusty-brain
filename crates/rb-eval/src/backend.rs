@@ -66,9 +66,10 @@ impl MemoryBackend for SqliteBackend {
         ns: Namespace,
         query: String,
         limit: usize,
+        state: rb_types::MemoryState,
     ) -> rb_types::Result<Vec<MemoryId>> {
         let store = self.lock()?;
-        store.keyword_search(&ns, &query, limit)
+        store.keyword_search_in_state(&ns, &query, limit, state)
     }
 
     async fn vector(
@@ -113,11 +114,11 @@ impl MemoryBackend for SqliteBackend {
     async fn list(
         &self,
         ns: Namespace,
-        min_importance: Option<u8>,
+        filter: rb_types::RecallFilter,
         limit: usize,
     ) -> rb_types::Result<Vec<MemoryNote>> {
         let store = self.lock()?;
-        store.list(&ns, min_importance, limit)
+        store.list_filtered(&ns, &filter, limit)
     }
 
     async fn update(

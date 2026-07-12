@@ -977,8 +977,16 @@ where
             memory_type,
             tags,
             limit,
+            filter,
         } => match engine
-            .recall_with_status(&query, limit.min(MAX_LIMIT), memory_type, &tags)
+            .recall_with_status(
+                &query,
+                limit.min(MAX_LIMIT),
+                // One effective filter: the legacy wire slots (type/tags) fold
+                // into the additive unified filter (PRD 2026-07-02 parity), so
+                // old and new clients hit the same engine path.
+                &filter.fold_recall_legacy(memory_type, tags),
+            )
             .await
         {
             Ok(outcome) => {
@@ -1002,7 +1010,16 @@ where
         Request::List {
             min_importance,
             limit,
-        } => match engine.list(min_importance, limit.min(MAX_LIMIT)).await {
+            filter,
+        } => match engine
+            .list(
+                // The legacy min_importance slot folds into the unified filter
+                // (stricter bound wins), mirroring the Recall dispatch above.
+                &filter.fold_list_legacy(min_importance),
+                limit.min(MAX_LIMIT),
+            )
+            .await
+        {
             Ok(memories) => Response::Listed { memories },
             Err(e) => error_to_response(e),
         },
@@ -1158,6 +1175,7 @@ mod tests {
                 memory_type: None,
                 tags: vec![],
                 limit: 1,
+                filter: rb_types::RecallFilter::default(),
             },
             // Stats is namespace-scoped by the handshake (read-only, W1.8),
             // like Context — deliberately NOT peer-gated.

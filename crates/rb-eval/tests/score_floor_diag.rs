@@ -66,7 +66,7 @@ async fn sweep<P: EmbeddingProvider>(label: &str, engine: &MemoryEngine<SqliteBa
     let mut junk_scores: Vec<f64> = Vec::new(); // non-expected returned results
     for q in &corpus.golden_queries {
         let results = engine
-            .recall(&q.query, 10, None, &[])
+            .recall(&q.query, 10, &rb_types::RecallFilter::default())
             .await
             .expect("recall");
         let expected: Vec<String> = q
@@ -153,7 +153,10 @@ async fn sweep<P: EmbeddingProvider>(label: &str, engine: &MemoryEngine<SqliteBa
         "best beaches in portugal for surfing",
         "quantum chromodynamics lattice simulation parameters",
     ] {
-        match engine.recall(junk_q, 10, None, &[]).await {
+        match engine
+            .recall(junk_q, 10, &rb_types::RecallFilter::default())
+            .await
+        {
             Ok(results) => {
                 let scores: Vec<String> =
                     results.iter().map(|r| format!("{:.4}", r.score)).collect();

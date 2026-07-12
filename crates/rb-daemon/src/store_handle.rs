@@ -1582,8 +1582,14 @@ impl MemoryBackend for StoreHandle {
             .await
     }
 
-    async fn keyword(&self, ns: Namespace, query: String, limit: usize) -> Result<Vec<MemoryId>> {
-        self.with_read(move |store| store.keyword_search(&ns, &query, limit))
+    async fn keyword(
+        &self,
+        ns: Namespace,
+        query: String,
+        limit: usize,
+        state: rb_types::MemoryState,
+    ) -> Result<Vec<MemoryId>> {
+        self.with_read(move |store| store.keyword_search_in_state(&ns, &query, limit, state))
             .await
     }
 
@@ -1627,10 +1633,10 @@ impl MemoryBackend for StoreHandle {
     async fn list(
         &self,
         ns: Namespace,
-        min_importance: Option<u8>,
+        filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        self.with_read(move |store| store.list(&ns, min_importance, limit))
+        self.with_read(move |store| store.list_filtered(&ns, &filter, limit))
             .await
     }
 
@@ -1953,7 +1959,10 @@ mod tests {
             handle.get(ns.clone(), after_id).await.unwrap().is_some(),
             "post-panic write must commit on the reopened connection"
         );
-        let listed = handle.list(ns, None, 50).await.unwrap();
+        let listed = handle
+            .list(ns, rb_types::RecallFilter::default(), 50)
+            .await
+            .unwrap();
         assert_eq!(
             listed.len(),
             2,
@@ -2635,7 +2644,11 @@ mod tests {
 
         let ops_before = handle.writer_ops_count();
         let results = engine
-            .recall("writer thread mutations", 5, None, &[])
+            .recall(
+                "writer thread mutations",
+                5,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         assert!(!results.is_empty(), "keyword overlap must return results");

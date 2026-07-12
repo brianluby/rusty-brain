@@ -100,6 +100,7 @@ mod tests {
             memory_type: Some(MemoryType::BugFix),
             tags: vec![],
             limit: 5,
+            filter: rb_types::RecallFilter::default(),
         };
         write_frame(&mut client, &r1).await.unwrap();
         write_frame(&mut client, &r2).await.unwrap();

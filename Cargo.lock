@@ -2737,6 +2737,7 @@ name = "rb-proto"
 version = "0.0.1"
 dependencies = [
  "bytes",
+ "chrono",
  "futures",
  "rb-types",
  "serde",

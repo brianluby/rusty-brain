@@ -132,6 +132,71 @@ fn parse_id(args: &Value) -> Result<MemoryId, ToolError> {
     MemoryId::from_str(raw).map_err(|e| invalid(format!("invalid memory id '{raw}': {e}")))
 }
 
+/// Optional strict boolean argument (no string/number coercion).
+fn opt_bool(args: &Value, key: &str) -> Result<Option<bool>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::Bool(b)) => Ok(Some(*b)),
+        Some(_) => Err(invalid(format!("'{key}' must be a boolean"))),
+    }
+}
+
+/// Optional RFC 3339 timestamp argument.
+fn opt_timestamp(args: &Value, key: &str) -> Result<Option<DateTime<Utc>>, ToolError> {
+    match args.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(s)) => DateTime::parse_from_rfc3339(s)
+            .map(|ts| Some(ts.with_timezone(&Utc)))
+            .map_err(|e| {
+                invalid(format!(
+                    "'{key}' must be an RFC 3339 timestamp (e.g. 2026-07-10T12:00:00Z): {e}"
+                ))
+            }),
+        Some(_) => Err(invalid(format!("'{key}' must be an RFC 3339 string"))),
+    }
+}
+
+/// Optional `source` array, validated against the producer surfaces the daemon
+/// actually stamps (fail closed on typos rather than silently matching nothing).
+fn opt_sources(args: &Value, key: &str) -> Result<Vec<String>, ToolError> {
+    const SOURCES: [&str; 4] = ["hook", "mcp", "cli", "job"];
+    let sources = opt_string_vec(args, key)?;
+    for s in &sources {
+        if !SOURCES.contains(&s.as_str()) {
+            return Err(invalid(format!(
+                "unknown {key} '{s}': expected one of hook, mcp, cli, job"
+            )));
+        }
+    }
+    Ok(sources)
+}
+
+/// Parse the unified filter dimensions shared by the `recall` and `list` tools
+/// (PRD 2026-07-02 search-filter parity). Does NOT read `type`/`tags` — the
+/// callers route those (legacy wire slots for recall; filter fields for list).
+fn parse_filter(args: &Value) -> Result<rb_types::RecallFilter, ToolError> {
+    let filter = rb_types::RecallFilter {
+        min_importance: opt_importance(args, "min_importance")?,
+        max_importance: opt_importance(args, "max_importance")?,
+        min_confidence: opt_confidence(args, "min_confidence")?,
+        max_confidence: opt_confidence(args, "max_confidence")?,
+        since: opt_timestamp(args, "since")?,
+        until: opt_timestamp(args, "until")?,
+        sources: opt_sources(args, "source")?,
+        contested: opt_bool(args, "contested")?,
+        state: if opt_bool(args, "archived")?.unwrap_or(false) {
+            rb_types::MemoryState::Archived
+        } else {
+            rb_types::MemoryState::Active
+        },
+        ..Default::default()
+    };
+    // Fail fast on inverted ranges at the tool boundary (the daemon would
+    // reject them anyway; INVALID_PARAMS is the better surface).
+    filter.validate().map_err(|e| invalid(e.to_string()))?;
+    Ok(filter)
+}
+
 /// Route a `tools/call` (tool name + JSON arguments) to an `rb_proto::Request`.
 /// Unknown tools fail with `METHOD_NOT_FOUND`; bad arguments with `INVALID_PARAMS`.
 pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
@@ -159,17 +224,30 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
         }
         "recall" => Ok(Request::Recall {
             query: require_str(args, "query")?.to_owned(),
+            // A single type + tags ride the LEGACY wire slots (old daemons
+            // keep honoring them); the new dimensions ride the additive filter.
             memory_type: parse_type(args, "type")?,
             tags: opt_string_vec(args, "tags")?,
             limit: opt_usize(args, "limit", 10)?,
+            filter: parse_filter(args)?,
         }),
         "get" => Ok(Request::Get {
             id: parse_id(args)?,
         }),
-        "list" => Ok(Request::List {
-            min_importance: opt_importance(args, "min_importance")?,
-            limit: opt_usize(args, "limit", 20)?,
-        }),
+        "list" => {
+            let mut filter = parse_filter(args)?;
+            // List has no legacy type/tags slots — they ride the filter.
+            filter.types = parse_type(args, "type")?.into_iter().collect();
+            filter.tags = opt_string_vec(args, "tags")?;
+            // min_importance DOES have a legacy slot; split it back out so an
+            // old daemon still honors it (mirrors Client::list_filtered).
+            let (min_importance, filter) = filter.split_list_legacy();
+            Ok(Request::List {
+                min_importance,
+                limit: opt_usize(args, "limit", 20)?,
+                filter,
+            })
+        }
         "graph" => {
             let depth = opt_u8(args, "depth")?.unwrap_or(1);
             Ok(Request::Graph {
@@ -606,6 +684,7 @@ mod tests {
                 memory_type,
                 tags,
                 limit,
+                ..
             } => {
                 assert_eq!(query, "q");
                 assert_eq!(limit, 3);
@@ -613,6 +692,116 @@ mod tests {
                 assert_eq!(tags, vec!["t".to_string()]);
             }
             other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_recall_request_maps_the_unified_filter_params() {
+        // New dimensions ride the additive filter; the single type + tags stay
+        // in the legacy wire slots (old daemons keep honoring them).
+        let req = build_request(
+            "recall",
+            &json!({
+                "query": "q",
+                "type": "insight",
+                "tags": ["t"],
+                "min_importance": 3,
+                "max_importance": 9,
+                "min_confidence": 0.2,
+                "max_confidence": 0.9,
+                "since": "2026-07-01T00:00:00Z",
+                "until": "2026-07-10T12:00:00Z",
+                "source": ["hook", "mcp"],
+                "contested": true,
+                "archived": true
+            }),
+        )
+        .unwrap();
+        match req {
+            Request::Recall {
+                memory_type,
+                tags,
+                filter,
+                ..
+            } => {
+                assert_eq!(memory_type, Some(MemoryType::Insight));
+                assert_eq!(tags, vec!["t".to_string()]);
+                assert!(filter.types.is_empty(), "single type rides the legacy slot");
+                assert!(filter.tags.is_empty(), "tags ride the legacy slot");
+                assert_eq!(filter.min_importance, Some(3));
+                assert_eq!(filter.max_importance, Some(9));
+                assert_eq!(filter.min_confidence, Some(0.2));
+                assert_eq!(filter.max_confidence, Some(0.9));
+                assert_eq!(
+                    filter.since,
+                    Some("2026-07-01T00:00:00Z".parse::<DateTime<Utc>>().unwrap())
+                );
+                assert_eq!(
+                    filter.until,
+                    Some("2026-07-10T12:00:00Z".parse::<DateTime<Utc>>().unwrap())
+                );
+                assert_eq!(filter.sources, vec!["hook".to_string(), "mcp".to_string()]);
+                assert_eq!(filter.contested, Some(true));
+                assert_eq!(filter.state, rb_types::MemoryState::Archived);
+            }
+            other => panic!("expected Recall, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_list_request_maps_the_same_filter_params() {
+        let req = build_request(
+            "list",
+            &json!({
+                "min_importance": 5,
+                "type": "constraint",
+                "tags": ["infra"],
+                "source": ["cli"],
+                "contested": false,
+                "since": "2026-07-01T00:00:00Z"
+            }),
+        )
+        .unwrap();
+        match req {
+            Request::List {
+                min_importance,
+                filter,
+                ..
+            } => {
+                assert_eq!(
+                    min_importance,
+                    Some(5),
+                    "min_importance rides the legacy slot"
+                );
+                assert_eq!(filter.min_importance, None);
+                assert_eq!(filter.types, vec![MemoryType::Constraint]);
+                assert_eq!(filter.tags, vec!["infra".to_string()]);
+                assert_eq!(filter.sources, vec!["cli".to_string()]);
+                assert_eq!(filter.contested, Some(false));
+                assert!(filter.since.is_some());
+                assert_eq!(filter.state, rb_types::MemoryState::Active);
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn filter_params_fail_closed_on_bad_values() {
+        for (tool, args) in [
+            ("recall", json!({ "query": "q", "since": "not-a-time" })),
+            ("recall", json!({ "query": "q", "min_confidence": 1.5 })),
+            ("recall", json!({ "query": "q", "source": "hook" })),
+            ("recall", json!({ "query": "q", "source": ["pigeon"] })),
+            ("recall", json!({ "query": "q", "contested": "yes" })),
+            ("recall", json!({ "query": "q", "archived": 1 })),
+            ("list", json!({ "until": 12345 })),
+            ("list", json!({ "max_importance": 0 })),
+        ] {
+            let err = build_request(tool, &args).unwrap_err();
+            assert_eq!(
+                err.code, INVALID_PARAMS,
+                "{tool} {args} must fail closed, got {err:?}"
+            );
         }
     }
 
@@ -750,6 +939,7 @@ mod tests {
             Request::List {
                 min_importance,
                 limit,
+                ..
             } => {
                 assert!(min_importance.is_none());
                 assert_eq!(limit, 20, "default list limit is 20");
