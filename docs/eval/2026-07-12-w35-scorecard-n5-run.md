@@ -190,8 +190,8 @@ the Phase 5 two-user/two-machine pilot.
 - Closes: Vikunja #381, #382, #383 (the "landed, unmeasured" deferrals from
   the 2026-06-23 closeout) — measured artifacts now exist for A, B, and R.
 - Resolves #502's live safety gate: PR #70 identified mechanism (c), hardened
-  the injection frame, and the recovery reread returned zero MIE. The task can
-  close when the diagnostic-evidence follow-up described above lands.
+  the injection frame, the recovery reread returned zero MIE, and this PR lands
+  the diagnostic-evidence follow-up described above, closing the task.
 - Continues the non-gating quality work under the preregistered production-
   embedding gate: the recovery run's retrieval-at-scale accuracy lost to the
   steelman even though cost remained favorable. Do not treat that signal as a

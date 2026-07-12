@@ -589,17 +589,23 @@ finalize_memory_diagnostics() { # dir success mie expect stale
 # accepted only below an `on/diagnostics` directory, preventing a model-created
 # arbitrary file elsewhere in the work project from entering the CI artifact.
 retainable_scorecard_artifact() { # relative_path
-  case "$1" in
-    work.jsonl|*/work.jsonl|plant.jsonl|*/plant.jsonl|\
-    judge.txt|*/judge.txt|daemon.log|*/daemon.log) return 0 ;;
-    */on/diagnostics/index.json|*/on/diagnostics/outcome.json|\
-    */on/diagnostics/context.json|*/on/diagnostics/recall-active.json|\
-    */on/diagnostics/recall-archived.json|*/on/diagnostics/planted.jsonl|\
-    */on/diagnostics/session-start-input.json|*/on/diagnostics/session-start-injection.json|\
-    */on/diagnostics/prompt-time-input.json|*/on/diagnostics/prompt-time-injection.json|\
-    */on/diagnostics/history-*.json) return 0 ;;
-    *) return 1 ;;
-  esac
+  local rel="$1"
+  # Fixed-depth regexes matter: shell case globs let `*` match `/`, so a path
+  # like `fresh-r1/on/wp/on/diagnostics/index.json` (inside the model-writable
+  # project) would otherwise masquerade as a harness-owned artifact.
+  if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off)/(work\.jsonl|judge\.txt)$ ]]; then
+    return 0
+  fi
+  if [[ "$rel" =~ ^[^/]+/on/(plant\.jsonl|daemon\.log)$ ]]; then
+    return 0
+  fi
+  if [[ "$rel" =~ ^[^/]+/on/diagnostics/(index\.json|outcome\.json|context\.json|recall-active\.json|recall-archived\.json|planted\.jsonl|session-start-input\.json|session-start-injection\.json|prompt-time-input\.json|prompt-time-injection\.json)$ ]]; then
+    return 0
+  fi
+  if [[ "$rel" =~ ^[^/]+/on/diagnostics/history-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}\.json$ ]]; then
+    return 0
+  fi
+  return 1
 }
 
 # ---- session-log retention (pure; exercised by --self-test) -------------------
@@ -1056,6 +1062,9 @@ PY
   printf '[]\n'                > "$lw/fresh-r1/on/diagnostics/recall-active.json"
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json"
   printf 'must-drop\n'         > "$lw/fresh-r1/on/diagnostics/unexpected.txt"
+  mkdir -p "$lw/fresh-r1/on/wp/on/diagnostics"
+  printf 'model-spoof\n'       > "$lw/fresh-r1/on/wp/on/diagnostics/index.json"
+  printf 'model-spoof\n'       > "$lw/fresh-r1/realistic/p/work.jsonl"
   if preserve_session_logs "$lw" "$ld"; then
     echo "ok: preserve_session_logs succeeds on a populated workroot"
   else
@@ -1067,7 +1076,7 @@ PY
   for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
-  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt; do
+  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt fresh-r1/on/wp/on/diagnostics/index.json fresh-r1/realistic/p/work.jsonl; do
     if [ ! -e "$ld/$dropped" ]; then echo "ok: preserve_session_logs drops $dropped"; else echo "BUG: preserve_session_logs copied non-log $dropped"; fail=1; fi
   done
   # An empty workroot is not an error: retention must never break the run.
@@ -1083,9 +1092,9 @@ PY
   # best-effort. An unreadable source file forces the failure deterministically.
   if [ "$(id -u)" != "0" ]; then # root ignores mode bits; skip there
     local lwf="$tmp/logs-fail" ldf="$tmp/logs-fail-dest" perr
-    mkdir -p "$lwf"
-    printf 'ok\n'     > "$lwf/work.jsonl"
-    printf 'secret\n' > "$lwf/daemon.log"; chmod 000 "$lwf/daemon.log"
+    mkdir -p "$lwf/fresh-r1/on"
+    printf 'ok\n'     > "$lwf/fresh-r1/on/work.jsonl"
+    printf 'secret\n' > "$lwf/fresh-r1/on/daemon.log"; chmod 000 "$lwf/fresh-r1/on/daemon.log"
     if perr="$(preserve_session_logs "$lwf" "$ldf" 2>&1)"; then
       echo "BUG: preserve_session_logs must return non-zero when a copy fails"; fail=1
     else
@@ -1096,12 +1105,12 @@ PY
     else
       echo "BUG: preserve_session_logs warning must name the failed file"; printf '%s\n' "$perr"; fail=1
     fi
-    if [ -f "$ldf/work.jsonl" ]; then
+    if [ -f "$ldf/fresh-r1/on/work.jsonl" ]; then
       echo "ok: preserve_session_logs keeps copying past a failed file"
     else
       echo "BUG: preserve_session_logs must not stop at the first failure"; fail=1
     fi
-    chmod 644 "$lwf/daemon.log"
+    chmod 644 "$lwf/fresh-r1/on/daemon.log"
   fi
 
   # resolve_log_dir: the --log-dir/RB_SCORECARD_KEEP_LOGS wiring is a pure
