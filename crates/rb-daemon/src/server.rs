@@ -56,6 +56,14 @@ const STATS_DEFAULT_WINDOW_DAYS: u32 = 30;
 const STATS_MAX_WINDOW_DAYS: u32 = 365;
 /// Bound on the top-recalled id list in a stats reply (ids + counts only).
 const STATS_TOP_RECALLED_LIMIT: usize = 5;
+/// Hard cap on the history chain walk PER DIRECTION (PRD HIST-3: "default
+/// unbounded but capped by an internal safety limit" — an absent depth uses
+/// this cap, and a client cannot exceed it). Also the cycle-defense backstop
+/// alongside the store's visited set.
+const HISTORY_MAX_DEPTH: u32 = 100;
+/// Hard cap on the edge list in a history reply, so a heavily linked chain
+/// cannot balloon one response (the stats window-clamp convention).
+const HISTORY_EDGE_LIMIT: usize = 200;
 /// Maximum number of simultaneous client connections.
 const MAX_CONNECTIONS: usize = 256;
 /// Oplog rows fetched per replay batch on a `subscribe --since` reconnect.
@@ -614,6 +622,7 @@ fn is_admin_op(req: &Request) -> bool {
         | Request::Context
         | Request::Subscribe { .. }
         | Request::Stats { .. }
+        | Request::History { .. }
         | Request::Ping => false,
     }
 }
@@ -1188,6 +1197,23 @@ where
                 }
             }
         }
+        // Namespace-scoped read-only decision-history timeline (PRD
+        // 2026-07-02). Runs entirely on the read pool — zero writer ops
+        // (W1.8). The depth is clamped server-side (never trusted raw) and
+        // the edge list is capped; namespace purity (both chain hops and edge
+        // endpoints) is enforced inside the store query.
+        Request::History { id, depth } => {
+            let depth = depth
+                .unwrap_or(HISTORY_MAX_DEPTH)
+                .clamp(1, HISTORY_MAX_DEPTH);
+            match job_store
+                .memory_history(namespace.clone(), id, depth, HISTORY_EDGE_LIMIT)
+                .await
+            {
+                Ok(history) => Response::History { history },
+                Err(e) => error_to_response(e),
+            }
+        }
         // Admin op (peer-gated above): retroactive secret redaction across all
         // namespaces through the single writer (W2.4).
         Request::Scrub => match job_store.scrub().await {
@@ -1264,6 +1290,12 @@ mod tests {
                 policy: rb_types::RetentionPolicy::default(),
                 mode: rb_types::ForgetMode::Hard,
                 dry_run: true,
+            },
+            // History is namespace-scoped and read-only too (PRD 2026-07-02),
+            // like Get/Stats — deliberately NOT peer-gated.
+            Request::History {
+                id: rb_types::MemoryId::new(),
+                depth: None,
             },
         ] {
             assert!(!is_admin_op(&not_admin), "{not_admin:?}");
@@ -1560,6 +1592,162 @@ mod tests {
         );
         let (defaulted, _, _) = client.stats(None).await.unwrap();
         assert_eq!(defaulted.window_days, 30, "absent window uses the default");
+
+        drop(client);
+        let _ = shutdown_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(10), run)
+            .await
+            .expect("daemon must shut down")
+            .expect("run task must not panic")
+            .expect("run must return Ok");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn history_over_the_wire_walks_the_chain_and_issues_zero_writer_ops() {
+        // Daemon e2e for the decision-history PRD verification clause: a
+        // 3-deep supersede chain (A -> B -> C) plus a contradiction on the
+        // head comes back through `Request::History` as the rendered
+        // timeline, and serving it enqueues NOTHING on the writer thread.
+        use rb_embed::DeterministicProvider;
+
+        let dir = tempfile::tempdir().unwrap();
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let config = DaemonConfig {
+            socket_path: dir.path().join("rb.sock"),
+            db_path: dir.path().join("rb.db"),
+            read_pool_size: 2,
+            jobs_config: JobsConfig::default(),
+            request_idle_timeout: None,
+            enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
+            retention_policy: None,
+        };
+        let socket = config.socket_path.clone();
+        let daemon = Daemon::bind(
+            config,
+            crate::SharedEmbedder::new(DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap();
+        let store = daemon.store.clone();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let run = tokio::spawn(daemon.run(async {
+            let _ = shutdown_rx.await;
+        }));
+
+        let ns = Namespace::Project("history-e2e".to_string());
+        let mut client = rb_proto::Client::connect(&socket, ns.clone())
+            .await
+            .unwrap();
+        let a = client
+            .remember(
+                "decision v1".to_string(),
+                None,
+                rb_types::MemoryType::ArchitectureDecision,
+                7,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        // B supersedes A, C supersedes B (the W3.1 update-as-supersede path).
+        let b = client
+            .remember_superseding(
+                "decision v2".to_string(),
+                None,
+                rb_types::MemoryType::ArchitectureDecision,
+                7,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                a.clone(),
+            )
+            .await
+            .unwrap();
+        let c = client
+            .remember_superseding(
+                "decision v3".to_string(),
+                None,
+                rb_types::MemoryType::ArchitectureDecision,
+                7,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                b.clone(),
+            )
+            .await
+            .unwrap();
+        let rival = client
+            .remember(
+                "rival claim".to_string(),
+                None,
+                rb_types::MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        client
+            .link(
+                rival.clone(),
+                c.clone(),
+                rb_types::LinkType::Contradicts,
+                Some("disputes v3".to_string()),
+            )
+            .await
+            .unwrap();
+
+        let ops_before = store.writer_ops_count();
+        let history = client.history(c.clone(), None).await.unwrap();
+        assert_eq!(
+            store.writer_ops_count(),
+            ops_before,
+            "the history path must issue ZERO writer ops (and hence zero FTS writes)"
+        );
+
+        // Acceptance criteria: `history C` lists A -> B -> C with C flagged
+        // current and A/B flagged superseded (archived).
+        assert_eq!(history.namespace, ns.as_db_string());
+        assert_eq!(history.depth, 100, "absent depth uses the safety cap");
+        let ids: Vec<String> = history.chain.iter().map(|e| e.id.to_string()).collect();
+        assert_eq!(
+            ids,
+            vec![a.to_string(), b.to_string(), c.to_string()],
+            "oldest first: A -> B -> C"
+        );
+        assert!(history.chain[0].archived && history.chain[1].archived);
+        assert!(history.chain[2].current && history.chain[2].is_target);
+        assert!(!history.truncated);
+        // The contradicts edge appears with the far memory's summary and the
+        // contested marker on the head.
+        assert!(history.chain[2].contested, "the head is contested");
+        assert_eq!(history.edges.len(), 1);
+        assert_eq!(history.edges[0].other.to_string(), rival.to_string());
+        assert_eq!(history.edges[0].reason, "disputes v3");
+        assert_eq!(history.edges[0].other_summary, "rival claim");
+
+        // The depth is clamped server-side, never trusted raw.
+        let clamped = client.history(c.clone(), Some(100_000)).await.unwrap();
+        assert_eq!(clamped.depth, 100, "oversized depth clamps to the cap");
+        let bounded = client.history(c.clone(), Some(1)).await.unwrap();
+        assert_eq!(bounded.chain.len(), 2, "depth 1 keeps one ancestor hop");
+        assert!(bounded.truncated);
+
+        // A missing id errors cleanly: the daemon maps NotFound to the stable
+        // `not_found` wire kind with the message preserved (the client
+        // reconstructs unstructured kinds under Storage — the Get precedent).
+        let err = client
+            .history(rb_types::MemoryId::new(), None)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("not found"), "{err:?}");
 
         drop(client);
         let _ = shutdown_tx.send(());

@@ -487,6 +487,131 @@ pub fn render_stats(
     out.trim_end().to_string()
 }
 
+/// Compact relative age for a timeline line, e.g. `just now` / `5m ago` /
+/// `3d ago` / `2w ago` / `4mo ago` / `1y ago` — the W3.3 age-marker
+/// convention (mirrors the rb-mcp projection). Negative deltas (clock skew)
+/// read as `just now`.
+fn relative_age(created_at: chrono::DateTime<chrono::Utc>) -> String {
+    let secs = (chrono::Utc::now() - created_at).num_seconds().max(0);
+    let (n, unit) = if secs < 60 {
+        return "just now".to_string();
+    } else if secs < 3600 {
+        (secs / 60, "m")
+    } else if secs < 86_400 {
+        (secs / 3600, "h")
+    } else if secs < 604_800 {
+        (secs / 86_400, "d")
+    } else if secs < 2_592_000 {
+        (secs / 604_800, "w")
+    } else if secs < 31_536_000 {
+        (secs / 2_592_000, "mo")
+    } else {
+        (secs / 31_536_000, "y")
+    };
+    format!("{n}{unit} ago")
+}
+
+/// The reader-facing verb for a history edge, from the chain member's side.
+fn edge_verb(link_type: rb_types::LinkType, outbound: bool) -> &'static str {
+    use rb_types::LinkType;
+    match (link_type, outbound) {
+        (LinkType::Contradicts, true) => "contradicts",
+        (LinkType::Contradicts, false) => "contradicted by",
+        (LinkType::Extends, true) => "extends",
+        (LinkType::Extends, false) => "extended by",
+        (LinkType::References, true) => "references",
+        (LinkType::References, false) => "referenced by",
+        // The store never emits these on the history edge surface; keep the
+        // mapping total so a future payload renders instead of panicking.
+        (LinkType::Implements, true) => "implements",
+        (LinkType::Implements, false) => "implemented by",
+        (LinkType::Supersedes, true) => "supersedes",
+        (LinkType::Supersedes, false) => "superseded by",
+    }
+}
+
+/// Render the `history` payload: the decision timeline for one memory.
+/// JSON: the raw `MemoryHistory`. Human: one line per chain version (oldest
+/// first) with age and `current`/`superseded`/`contested` markers (the W3.3
+/// projection vocabulary), plus each version's active links indented below it.
+pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(history).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render history JSON");
+            "{}".to_string()
+        });
+    }
+
+    let versions = history.chain.len();
+    let mut out = format!(
+        "Decision history in {} ({} version{})\n",
+        history.namespace,
+        versions,
+        if versions == 1 { "" } else { "s" }
+    );
+    for (i, entry) in history.chain.iter().enumerate() {
+        let marker = if entry.is_target { "->" } else { "  " };
+        let mut flags = String::new();
+        if entry.current {
+            flags.push_str(" [current]");
+        }
+        if entry.archived {
+            flags.push_str(" [superseded]");
+        }
+        if entry.contested {
+            flags.push_str(" [contested]");
+        }
+        let origin = match (&entry.origin_user, &entry.origin_source) {
+            (Some(user), Some(source)) => format!(", by {user} via {source}"),
+            (Some(user), None) => format!(", by {user}"),
+            (None, Some(source)) => format!(", via {source}"),
+            (None, None) => String::new(),
+        };
+        out.push_str(&format!(
+            "{marker} {}. {} (imp {}, conf {:.2}, {}{}){} {}\n",
+            i + 1,
+            entry.id,
+            entry.importance,
+            entry.confidence,
+            relative_age(entry.created_at),
+            origin,
+            flags,
+            entry.summary,
+        ));
+        for edge in history.edges.iter().filter(|e| e.local == entry.id) {
+            let contested = if edge.other_contested {
+                " [contested]"
+            } else {
+                ""
+            };
+            let reason = if edge.reason.is_empty() {
+                String::new()
+            } else {
+                format!(" — {}", edge.reason)
+            };
+            out.push_str(&format!(
+                "       {} {} (conf {:.2}){} {}{}\n",
+                edge_verb(edge.link_type, edge.outbound),
+                edge.other,
+                edge.other_confidence,
+                contested,
+                edge.other_summary,
+                reason,
+            ));
+        }
+    }
+    if !history.chain.iter().any(|e| e.current) {
+        out.push_str("(no current version: every chain member is archived)\n");
+    }
+    if history.truncated {
+        out.push_str(
+            "(truncated: the depth or edge bound was reached — raise --depth, or \
+             anchor `history` on an end-of-chain id to continue)\n",
+        );
+    }
+    out.trim_end().to_string()
+}
+
 /// Everything the extended `status` line-up needs (DOC-1), gathered by the
 /// caller: the ping reply, the stats payload, and a client-side stat of the
 /// DB file mode (`None` when the file could not be inspected).
@@ -1200,6 +1325,133 @@ mod tests {
         assert_eq!(parsed["stats"]["feedback"]["net"].as_i64(), Some(2));
         assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
         assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
+    }
+
+    fn sample_history() -> rb_types::MemoryHistory {
+        let old_id = rb_types::MemoryId::new();
+        let new_id = rb_types::MemoryId::new();
+        let rival_id = rb_types::MemoryId::new();
+        let now = chrono::Utc::now();
+        rb_types::MemoryHistory {
+            namespace: "project:rusty-brain".to_string(),
+            depth: 100,
+            chain: vec![
+                rb_types::HistoryEntry {
+                    id: old_id,
+                    summary: "we use rabbitmq".to_string(),
+                    importance: 7,
+                    confidence: 1.0,
+                    created_at: now - chrono::Duration::days(3),
+                    archived: true,
+                    contested: false,
+                    current: false,
+                    is_target: false,
+                    superseded_by: Some(new_id.clone()),
+                    origin_user: Some("alice".to_string()),
+                    origin_host: None,
+                    origin_agent: None,
+                    origin_source: Some("cli".to_string()),
+                },
+                rb_types::HistoryEntry {
+                    id: new_id.clone(),
+                    summary: "we use kafka".to_string(),
+                    importance: 8,
+                    confidence: 0.9,
+                    created_at: now,
+                    archived: false,
+                    contested: true,
+                    current: true,
+                    is_target: true,
+                    superseded_by: None,
+                    origin_user: None,
+                    origin_host: None,
+                    origin_agent: None,
+                    origin_source: None,
+                },
+            ],
+            edges: vec![rb_types::HistoryEdge {
+                link_type: rb_types::LinkType::Contradicts,
+                local: new_id,
+                other: rival_id,
+                outbound: false,
+                reason: "bench results disagree".to_string(),
+                other_summary: "kafka too slow for us".to_string(),
+                other_confidence: 0.6,
+                other_contested: true,
+                created_at: now,
+            }],
+            truncated: false,
+        }
+    }
+
+    #[test]
+    fn human_history_marks_current_superseded_contested_and_target() {
+        let history = sample_history();
+        let out = render_history(&history, false);
+        assert!(out.contains("project:rusty-brain"), "namespace: {out}");
+        assert!(out.contains("2 versions"), "chain length: {out}");
+        assert!(out.contains("[superseded]"), "archived marker: {out}");
+        assert!(out.contains("[current]"), "current-truth marker: {out}");
+        assert!(out.contains("[contested]"), "contested marker: {out}");
+        assert!(out.contains("->"), "target arrow: {out}");
+        assert!(out.contains("we use rabbitmq"), "old summary: {out}");
+        assert!(out.contains("we use kafka"), "new summary: {out}");
+        assert!(out.contains("3d ago"), "age marker: {out}");
+        assert!(out.contains("by alice via cli"), "provenance: {out}");
+        // The contradiction renders under its chain member with the far
+        // memory's summary and the edge reason (acceptance criterion).
+        assert!(out.contains("contradicted by"), "edge verb: {out}");
+        assert!(out.contains("kafka too slow for us"), "far summary: {out}");
+        assert!(out.contains("bench results disagree"), "edge reason: {out}");
+        assert!(!out.contains("truncated"), "no truncation note: {out}");
+    }
+
+    #[test]
+    fn human_history_orders_oldest_first_with_indices() {
+        let history = sample_history();
+        let out = render_history(&history, false);
+        let old_pos = out.find("we use rabbitmq").unwrap();
+        let new_pos = out.find("we use kafka").unwrap();
+        assert!(old_pos < new_pos, "oldest first: {out}");
+        assert!(out.contains(" 1. "), "indexed timeline: {out}");
+        assert!(out.contains(" 2. "), "indexed timeline: {out}");
+    }
+
+    #[test]
+    fn human_history_notes_truncation_and_a_fully_archived_chain() {
+        let mut history = sample_history();
+        history.truncated = true;
+        history.chain[1].archived = true;
+        history.chain[1].current = false;
+        let out = render_history(&history, false);
+        assert!(out.contains("truncated"), "truncation note: {out}");
+        assert!(
+            out.contains("no current version"),
+            "all-archived note: {out}"
+        );
+    }
+
+    #[test]
+    fn json_history_is_the_raw_payload() {
+        let history = sample_history();
+        let out = render_history(&history, true);
+        let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(parsed["namespace"].as_str(), Some("project:rusty-brain"));
+        assert_eq!(parsed["chain"].as_array().map(Vec::len), Some(2));
+        assert_eq!(parsed["chain"][1]["current"].as_bool(), Some(true));
+        assert_eq!(parsed["chain"][1]["is_target"].as_bool(), Some(true));
+        assert_eq!(parsed["chain"][0]["archived"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["edges"][0]["link_type"].as_str(),
+            Some("Contradicts")
+        );
+        assert_eq!(
+            parsed["edges"][0]["other_summary"].as_str(),
+            Some("kafka too slow for us")
+        );
+        // The round trip back into the typed payload is lossless.
+        let back: rb_types::MemoryHistory = serde_json::from_str(&out).unwrap();
+        assert_eq!(back, history);
     }
 
     #[test]

@@ -350,6 +350,14 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
         "delete" => Ok(Request::Delete {
             id: parse_id(args)?,
         }),
+        // Full-toolset-gated (PRD 2026-07-02 decision history): not in the
+        // default advertised set, but ROUTABLE like every gated tool.
+        "history" => Ok(Request::History {
+            id: parse_id(args)?,
+            // The daemon clamps to its safety cap; opt_u8's 0..=255 range is
+            // ample (the cap is 100) and matches the `graph.depth` parsing.
+            depth: opt_u8(args, "depth")?.map(u32::from),
+        }),
         "context" => Ok(Request::Context),
         "memory_feedback" => {
             let id = parse_id(args)?;
@@ -635,6 +643,10 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         // mapping stays total.
         Response::ForgetPlanned { plan } => ToolContent::json(json!({ "plan": plan }), false),
         Response::ForgetDone { outcome } => ToolContent::json(json!({ "outcome": outcome }), false),
+        // The decision-history timeline (full-toolset-gated `history` tool):
+        // the model fetched it deliberately, so keep the full JSON as text
+        // (the `get` convention).
+        Response::History { history } => ToolContent::json(json!({ "history": history }), false),
         Response::Error { kind, message } => ToolContent::json(
             json!({ "error": { "kind": kind, "message": message } }),
             true,
@@ -955,6 +967,74 @@ mod tests {
         }
         let d = build_request("delete", &json!({ "id": id.to_string() })).unwrap();
         assert!(matches!(d, Request::Delete { .. }));
+    }
+
+    #[test]
+    fn build_history_parses_id_and_optional_depth() {
+        let id = MemoryId::new();
+        let h = build_request("history", &json!({ "id": id.to_string() })).unwrap();
+        match h {
+            Request::History { id: got, depth } => {
+                assert_eq!(got, id);
+                assert_eq!(depth, None, "absent depth defers to the daemon cap");
+            }
+            other => panic!("expected History, got {other:?}"),
+        }
+        let h = build_request("history", &json!({ "id": id.to_string(), "depth": 3 })).unwrap();
+        match h {
+            Request::History { depth, .. } => assert_eq!(depth, Some(3)),
+            other => panic!("expected History, got {other:?}"),
+        }
+        // Bad ids and non-numeric depths fail closed with INVALID_PARAMS.
+        let err = build_request("history", &json!({ "id": "not-a-uuid" })).unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+        let err = build_request("history", &json!({ "id": id.to_string(), "depth": "deep" }))
+            .unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+        let err = build_request("history", &json!({})).unwrap_err();
+        assert_eq!(err.code, crate::jsonrpc::INVALID_PARAMS);
+    }
+
+    #[test]
+    fn history_response_projects_structured_json() {
+        use rb_proto::Response;
+        let id = MemoryId::new();
+        let content = response_to_content(
+            Response::History {
+                history: rb_types::MemoryHistory {
+                    namespace: "project:p".to_string(),
+                    depth: 100,
+                    chain: vec![rb_types::HistoryEntry {
+                        id: id.clone(),
+                        summary: "we use kafka".to_string(),
+                        importance: 7,
+                        confidence: 0.9,
+                        created_at: Utc::now(),
+                        archived: false,
+                        contested: true,
+                        current: true,
+                        is_target: true,
+                        superseded_by: None,
+                        origin_user: None,
+                        origin_host: None,
+                        origin_agent: None,
+                        origin_source: None,
+                    }],
+                    edges: Vec::new(),
+                    truncated: false,
+                },
+            },
+            Utc::now(),
+        );
+        assert!(!content.is_error);
+        assert_eq!(
+            content.structured["history"]["chain"][0]["id"],
+            id.to_string()
+        );
+        assert_eq!(content.structured["history"]["chain"][0]["current"], true);
+        // Like `get`, the model text is the JSON itself (deliberate fetch).
+        let text: serde_json::Value = serde_json::from_str(&content.text).unwrap();
+        assert_eq!(text["history"]["depth"], 100);
     }
 
     #[test]

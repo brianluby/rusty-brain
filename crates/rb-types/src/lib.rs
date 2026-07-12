@@ -9,6 +9,7 @@ mod anchor;
 mod change;
 mod error;
 mod feedback_kind;
+mod history;
 mod job;
 mod link;
 mod link_type;
@@ -28,6 +29,7 @@ pub use anchor::{
 pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
 pub use feedback_kind::FeedbackKind;
+pub use history::{HistoryEdge, HistoryEntry, MemoryHistory};
 pub use job::JobKind;
 pub use link::{MemoryLink, SIMILARITY_LINK_MAX_COSINE_DISTANCE};
 pub use link_type::LinkType;

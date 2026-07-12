@@ -522,6 +522,22 @@ impl StoreHandle {
         .await
     }
 
+    /// Decision-history timeline for one memory (PRD 2026-07-02). Goes
+    /// through the bounded read pool — the history path issues zero writer
+    /// ops (W1.8) by construction. `depth` bounds the chain walk per
+    /// direction and `edge_limit` the edge list (both pre-clamped by the
+    /// caller); namespace purity is enforced inside the store query.
+    pub async fn memory_history(
+        &self,
+        namespace: Namespace,
+        id: MemoryId,
+        depth: u32,
+        edge_limit: usize,
+    ) -> Result<rb_types::MemoryHistory> {
+        self.with_read(move |store| store.memory_history(&namespace, &id, depth, edge_limit))
+            .await
+    }
+
     /// Whether the writer thread is alive (i.e. has not died ABNORMALLY).
     /// Snapshot of the same watch [`StoreHandle::writer_died`] resolves on;
     /// surfaced on the stats/status path so a zombie-adjacent state is visible.
@@ -2858,6 +2874,62 @@ mod tests {
         assert_eq!(stats.feedback.helpful, 1);
         assert_eq!(stats.feedback.wrong, 1);
         assert_eq!(stats.feedback.stale, 1);
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn memory_history_runs_on_the_read_pool_with_zero_writer_ops() {
+        // W1.8 mirror for the history path (decision-history PRD hard
+        // constraint): the whole chain+edge derivation runs on the read pool
+        // and must enqueue NOTHING on the writer thread — which also proves
+        // it triggers zero FTS writes (every FTS write rides a writer op).
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let handle = StoreHandle::start(db, DIM, 2).unwrap();
+        let ns = Namespace::Project("zero-writer-history".to_string());
+
+        let old = note(&ns, "old decision");
+        let new = note(&ns, "replacement decision");
+        let rival = note(&ns, "rival claim");
+        let (old_id, new_id, rival_id) = (old.id.clone(), new.id.clone(), rival.id.clone());
+        handle.write(old, Some(vec![0.1f32; DIM])).await.unwrap();
+        handle.write(new, Some(vec![0.2f32; DIM])).await.unwrap();
+        handle.write(rival, Some(vec![0.3f32; DIM])).await.unwrap();
+        handle
+            .supersede(ns.clone(), old_id.clone(), new_id.clone())
+            .await
+            .unwrap();
+        handle
+            .add_link(rb_types::MemoryLink {
+                source_id: rival_id.clone(),
+                target_id: new_id.clone(),
+                link_type: rb_types::LinkType::Contradicts,
+                strength: 1.0,
+                reason: "disagrees".to_string(),
+                created_at: chrono::Utc::now(),
+            })
+            .await
+            .unwrap();
+
+        let ops_before = handle.writer_ops_count();
+        let history = handle
+            .memory_history(ns.clone(), new_id.clone(), 100, 200)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.writer_ops_count(),
+            ops_before,
+            "history must issue ZERO writer-thread ops (W1.8)"
+        );
+
+        assert_eq!(history.namespace, ns.as_db_string());
+        assert_eq!(history.chain.len(), 2, "old -> new chain");
+        assert_eq!(history.chain[0].id, old_id);
+        assert_eq!(history.chain[1].id, new_id);
+        assert!(history.chain[1].current && history.chain[1].contested);
+        assert_eq!(history.edges.len(), 1);
+        assert_eq!(history.edges[0].other, rival_id);
 
         handle.shutdown().await;
     }

@@ -188,6 +188,12 @@ rusty-brain context
 rusty-brain update <id> --confidence 0.3
 rusty-brain link <from-id> <to-id> --type contradicts --reason "policy reversed"
 
+# audit how a decision evolved: the supersede chain in both directions plus
+# active contradicts/extends/references links, with current/superseded/
+# contested markers (read-only, zero writer ops)
+rusty-brain history <id>
+rusty-brain history <id> --depth 3 --json
+
 # retroactively redact secrets from every stored memory, then re-embed
 rusty-brain scrub
 rusty-brain reembed
@@ -254,11 +260,12 @@ MCP-capable agent at it as a stdio server, for example:
 }
 ```
 
-It exposes eleven tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
+It exposes twelve tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
 `link` (e.g. mark one memory as contradicting another), `delete`, `context`,
 `memory_feedback` (report whether a recalled memory was `helpful`/`wrong`/`stale`,
-nudging its trust prior), and `poll_changes` (drains buffered change
-notifications).
+nudging its trust prior), `history` (a memory's decision-history timeline:
+supersede chain + active contradiction links), and `poll_changes` (drains
+buffered change notifications).
 
 ### Capture hooks (optional)
 
