@@ -31,6 +31,45 @@ All notable changes to rusty-brain are documented here. The format is based on
   fail-open and stores the summary WITHOUT anchors instead. The default MCP
   `tools/list` stays under the W3.3 token budget (897/900) — existing
   descriptions were tightened to make room for the anchor params.
+### Added — User-facing retention and forgetting policy
+
+- **`[retention]` config block** (retention PRD RET-1): a declarative,
+  OFF-BY-DEFAULT forgetting policy in the user config — `enabled`,
+  `max_age_days` (forget horizon), `archive_after_days` (soft stage before
+  forget), `importance_floor` (default 6), `protected_tags`, `batch_limit`.
+  Deliberately stricter than every other section: unknown keys fail closed
+  (`deny_unknown_fields`) and out-of-range/incoherent values abort resolution
+  instead of warn-and-ignore — a typo in a policy that mutates memories must
+  never silently no-op or broaden scope.
+- **`rusty-brain forget`** (RET-2): bare invocation is a DRY-RUN listing
+  exactly the set one pass would touch, with reasons (age, effective/author
+  importance, last-recalled, archived state, matched rule; summaries pass
+  through the shared redactor). `--apply` archives (soft, reversible, prunes
+  vectors); `--hard` irreversibly purges row/FTS/vectors/feedback/history
+  (one namespace-stamped `purge` oplog marker remains; freed bytes are
+  zeroed via scoped `secure_delete` + WAL truncate, asserted by a raw-bytes
+  drill) and is peer-gated like `scrub`. Bounded per pass and re-runnable.
+  Eligibility guards are absolute: the importance floor gates BOTH the
+  effective importance and the author prior (the W1.9 clamp productized —
+  an authored importance-10 memory is never eligible), protected tags
+  exempt entirely, and contested memories (per `active_contradicts`) are
+  never swept. Dry-run and execute share one candidate query, recomputed on
+  the single writer immediately before mutating.
+- **Retention evolution job** (RET-3): `JobKind::Retention` runs a daily,
+  apply-only (never purge) pass per namespace, spawned only when the policy
+  is explicitly enabled; the `RunJob` path is a zero-work no-op without an
+  enabled policy.
+- **Visibility** (RET-4): `stats` reports `retention_eligible` (None =
+  no policy, distinguishable from 0) and `last_forget_at`; `doctor` gains a
+  static retention-policy lint (warns on a floor that would forget
+  high-importance memories or an under-30-day horizon). Every sweep records
+  per-memory oplog causes plus one bulk `retention_sweep` row; purge replays
+  as `Archived` for subscribers.
+- **Wire**: additive `Request::Forget` / `Response::ForgetPlanned` /
+  `Response::ForgetDone` (no `CONTRACT_VERSION` bump); serde defaults are
+  the safety contract — an absent `mode` decodes to apply (never hard) and
+  an absent `dry_run` decodes to a preview (never an execute). Deliberately
+  NO MCP tool: a destructive surface stays off the model-facing toolset.
 
 ### Added — Contract-drift guard (W5a.4 operationalized)
 
