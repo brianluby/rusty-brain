@@ -95,7 +95,10 @@ flowchart TB
 ```
 
 A deeper walkthrough — component boundaries, the write and recall data flows, and
-the namespace model — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md).
+the namespace model — lives in [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md). The
+memory-management policy the system enforces (taxonomy, consolidation, retrieval,
+degradation, health, security) is declared in
+[`docs/COGNITION.md`](docs/COGNITION.md).
 
 ## What works today
 
