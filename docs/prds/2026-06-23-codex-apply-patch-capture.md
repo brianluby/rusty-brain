@@ -2,7 +2,11 @@
 
 ## Status
 
-Draft, readiness-gated. Do not implement capture mapping until a current local Codex build proves that `apply_patch` emits the expected hook event shape.
+Delivered 2026-07-12 (Vikunja #371, PR #68). The AP1 readiness gate cleared with a LIVE capture from codex-cli 0.144.1 (openai/codex#16732 shipped in Codex 0.123.0): sanitized fixtures + provenance under `crates/rb-hooks/tests/fixtures/codex/`, event shape `tool_name: "apply_patch"` with the raw V4A patch in `tool_input.command`. The extractor (`crates/rb-hooks/src/capture.rs::v4a_patch_paths`) is hunk-aware (directives at column 0 only, never inside `@@` hunk bodies), handles add/update/delete plus `*** Move to:` rename destinations (both paths recorded), and vets paths per AP3 (leading `./` stripped to match `rb_types::normalize_anchor_value`; empty, absolute, and `..`-traversal paths rejected — V4A paths are relative-only by spec). One event batches all scratch appends (`Scratch::append_many`).
+
+**Documented deviation from AP3's "do not return `unknown`"**: the EXTRACTOR returns no paths on malformed patches (as specified), but the capture layer's shared fallback then records one generic `"unknown"` file touch — the landed OpenCode Gap-B contract (PR #54) that an unidentified file touch is recorded rather than silently dropped. Kept deliberately for cross-CLI consistency; the unsafe/poisoned string itself is never recorded.
+
+The remaining Codex gap is out of this PRD's scope by design (Non-Goals): the fixture-gated `Stop` terminus fold (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`) — capture stays `partial` in the capability matrix until it lands.
 
 ## Owner Area
 
@@ -138,13 +142,13 @@ If integration tests are added, include a Codex `apply_patch` fixture sequence t
 
 ## Implementation Checklist
 
-- [ ] Record current Codex `apply_patch` fixture.
-- [ ] Document Codex version and event shape.
-- [ ] Add adapter fixture test.
-- [ ] Implement path-only extractor.
-- [ ] Add add/update/delete/move tests.
-- [ ] Add malformed payload tests.
-- [ ] Add no-raw-patch leak tests.
-- [ ] Append multiple observations.
-- [ ] Verify Bash capture unchanged.
-- [ ] Update follow-up doc.
+- [x] Record current Codex `apply_patch` fixture (live capture, codex-cli 0.144.1; `crates/rb-hooks/tests/fixtures/codex/post_tool_use_apply_patch{,_multifile}.json`).
+- [x] Document Codex version and event shape (fixtures README provenance section).
+- [x] Add adapter fixture test (`cross_adapter.rs` asserts the real `apply_patch` name; the rb-hooks e2e replays the recorded fixtures through the real binary, proving the adapter preserves the `command` payload into capture).
+- [x] Implement path-only extractor (`v4a_patch_paths` + `safe_patch_path`: hunk-aware, column-0 directives, AP3 path vetting).
+- [x] Add add/update/delete/move tests (incl. rename source+destination, stray `Move to` rejection, hunk-poisoning decoys).
+- [x] Add malformed payload tests (non-V4A, non-string, empty-string, empty-path — all fail open; see the documented `unknown`-fallback deviation in Status).
+- [x] Add no-raw-patch leak tests (`post_tool_use_apply_patch_never_records_patch_content` asserts the raw scratch bytes carry no hunk content).
+- [x] Append multiple observations (one observation per directive path, batched into one scratch write via `Scratch::append_many`).
+- [x] Verify Bash capture unchanged (existing bash capture tests stay green; codex shell events still record commands).
+- [x] Update follow-up doc (`docs/follow-ups/2026-06-02-codex-apply-patch-capture.md` resolution section).

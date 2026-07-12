@@ -12,9 +12,12 @@
 >
 > The two committed `post_tool_use_apply_patch*.json` payloads below are REAL
 > live captures from a separate, targeted 2026-07-12 run (see "apply_patch
-> capture provenance") — they are hand-committed, so a future full
-> `record-agent-fixtures.sh --agent codex` run (which clears non-README
-> fixtures) must preserve or re-record them.
+> capture provenance"). They are hand-committed and the recorder cannot
+> regenerate them (its per-event `head -1` keeps only the session's first
+> PostToolUse — the Bash event), so `record-agent-fixtures.sh`'s pre-record
+> cleanup explicitly preserves `post_tool_use_apply_patch*.json` (pinned by its
+> `--self-test`); `include_str!` in the rb-hooks tests is the compile-time
+> backstop.
 
 ## apply_patch capture provenance (2026-07-12)
 
@@ -46,14 +49,20 @@ separate from the full recorder harness:
 Both events carry `tool_name: "apply_patch"` and the raw V4A patch under
 `tool_input.command`; `tool_response` is a plain string. The multifile payload
 proves ONE `apply_patch` call can touch several files, which is why capture
-records one observation per `*** <op> File:` directive.
+records one observation per directive (`*** Add|Update|Delete File:` and the
+`*** Move to:` rename destination).
 
-## Provenance
+## Provenance (full-lifecycle recorder — distinct from the targeted apply_patch captures above)
 
-- **CLI:** codex-cli 0.142.0 (awaiting re-record under trusted recorder home)
+This block tracks the FULL `record-agent-fixtures.sh --agent codex` lifecycle
+recording (session_start/stop/pre_compact/bash post_tool_use), which has NOT
+happened yet; the 0.144.1 provenance above covers only the two targeted
+apply_patch payloads.
+
+- **CLI:** codex-cli 0.142.0 recorder attempt (captured zero events; awaiting re-record under trusted recorder home)
 - **Captured:** pending re-record, Darwin 25.5.0
 - **Captured by:** scripts/record-agent-fixtures.sh
-- **Events:** 
+- **Events:** none (lifecycle recording pending)
 
 ## Recording Recipe
 

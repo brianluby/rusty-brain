@@ -5,7 +5,10 @@
 - **Status:** Codex `apply_patch` capture **landed and live-verified** — the
   upstream blocker shipped and the payload shape is confirmed by a real
   capture (see the 2026-07-12 resolution below).
-- **Severity:** Low (latent — cannot occur today)
+- **Severity:** Resolved for capture; the residual limitation is the
+  fixture-gated `Stop` terminus fold — Codex `apply_patch` edits reach the
+  scratch but never fold into a summary until the terminus mapping is
+  verified (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`).
 
 ## Resolution (2026-07-12)
 
@@ -27,23 +30,36 @@ captures are committed as
 following files: A <path>"), so the object-shaped `is_error` failure
 detection simply never fires for it (conservative, by design).
 
-What landed (all four recipe steps below, plus one finding):
+What landed (all four recipe steps below, plus review-round hardening; the
+governing PRD is `docs/prds/2026-06-23-codex-apply-patch-capture.md`):
 
 1. The `"apply_patch" => "Edit"` arm already existed (landed for OpenCode);
    its Codex path is now live-reachable and covered by un-gated tests.
 2. **Multi-file finding:** one `apply_patch` call can touch SEVERAL files —
    the live capture's second event adds two files in a single patch.
    `edited_paths`/`v4a_patch_paths` now record **one observation per
-   `*** Add|Update|Delete File:` directive** (in patch order, deduplicated),
-   exactly as separate Edit events would; a malformed/non-V4A payload still
-   fails open to one `"unknown"` file touch.
-3. Capture tests cover the real Codex shape
+   directive** (`*** Add|Update|Delete File:` plus the `*** Move to:` rename
+   destination — a rename records both source and destination, per PRD AP3),
+   in patch order, deduplicated, exactly as separate Edit events would; a
+   malformed/non-V4A payload still fails open to one `"unknown"` file touch.
+3. **Hunk-aware, path-vetted parsing (review round):** directives are
+   recognized at column 0 only and never inside `@@` hunk bodies, so patch
+   CONTENT that looks like a directive (a context/added/removed line reading
+   `*** Add File: /etc/cron.d/evil`) can no longer register phantom touched
+   files in summaries/anchors. Paths are vetted per PRD AP3: leading `./`
+   stripped (matching `rb_types::normalize_anchor_value`), empty, absolute,
+   and `..`-traversal paths rejected (V4A paths are relative-only by spec).
+   A stray `*** Move to:` not immediately following an `*** Update File:`
+   header is ignored. One `apply_patch` event now batches all its scratch
+   appends into a single write round (`Scratch::append_many`).
+4. Capture tests cover the real Codex shape
    (`codex_apply_patch_command_field_captures_path`,
    `codex_apply_patch_multi_file_patch_captures_every_touched_path`,
-   `apply_patch_malformed_payload_fails_open_to_unknown`) and the
+   `apply_patch_malformed_payload_fails_open_to_unknown`, the hunk-poisoning
+   and Move/normalization suites, the AP5 no-content-leak test) and the
    binary-level e2e replays both recorded fixtures
    (`codex_apply_patch_post_tool_use_captures_every_edited_file`).
-4. `crates/rb-agents/tests/cross_adapter.rs` asserts the real `apply_patch`
+   `crates/rb-agents/tests/cross_adapter.rs` asserts the real `apply_patch`
    name for Codex instead of the `"Write"` placeholder.
 
 Codex `capture` stays **Partial** in the capability matrix: the scratch now

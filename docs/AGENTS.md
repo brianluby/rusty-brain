@@ -56,11 +56,15 @@ rusty-brain-install install --agents codex --global   # writes ~/.codex/hooks.js
   (`docs/plans/2026-06-26-cross-cli-terminus-mapping.md`).
   `apply_patch` capture is live-fixture-verified: Codex emits `PostToolUse`
   for it since 0.123.0 ([openai/codex#16732](https://github.com/openai/codex/issues/16732)),
-  carrying the raw V4A patch under `tool_input.command`; every
-  `*** Add|Update|Delete File:` path in the patch is recorded, including
-  multi-file patches (recorded from codex-cli 0.144.1, see
+  carrying the raw V4A patch under `tool_input.command`. Every directive path
+  is recorded — `*** Add|Update|Delete File:` plus the `*** Move to:` rename
+  destination (a rename records both source and destination), including
+  multi-file patches. Parsing is hunk-aware (patch CONTENT inside `@@` hunks
+  is never treated as a directive) and paths are vetted (leading `./`
+  stripped; empty, absolute, and `..`-traversal paths rejected — V4A paths
+  are relative-only by spec). Recorded from codex-cli 0.144.1, see
   `crates/rb-hooks/tests/fixtures/codex/` and
-  `docs/follow-ups/2026-06-02-codex-apply-patch-capture.md`).
+  `docs/follow-ups/2026-06-02-codex-apply-patch-capture.md`.
 - Retrieval — **unsupported**: the closest equivalent to Claude's
   `UserPromptSubmit` injection is Codex's `SessionStart` context injection
   (returned via `hookSpecificOutput.additionalContext`), which is active.

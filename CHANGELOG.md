@@ -15,11 +15,27 @@ All notable changes to rusty-brain are documented here. The format is based on
   per-session capture scratch; the scratch still awaits the fixture-gated
   `Stop` terminus mapping to fold (capture stays `partial` in the matrix).
 - **Multi-file `apply_patch` patches record every touched path**: one
-  `apply_patch` call can add/update/delete several files in a single V4A
-  patch (the live capture proves it); capture now records one observation per
-  `*** <op> File:` directive — in patch order, deduplicated — instead of only
-  the first, for Codex and OpenCode alike. Malformed/non-V4A payloads still
-  fail open to a single `unknown` file touch.
+  `apply_patch` call can add/update/delete/rename several files in a single
+  V4A patch (the live capture proves it); capture now records one observation
+  per directive — `*** Add|Update|Delete File:` plus the `*** Move to:`
+  rename destination (a rename records both source and destination) — in
+  patch order, deduplicated, instead of only the first, for Codex and
+  OpenCode alike. Malformed/non-V4A payloads still fail open to a single
+  `unknown` file touch.
+- **Hunk-aware, path-vetted V4A parsing**: directives are recognized at
+  column 0 only and never inside `@@` hunk bodies, so patch content that
+  merely looks like a directive (e.g. a context line reading
+  `*** Add File: /etc/cron.d/evil`) can no longer register phantom touched
+  files in session summaries and memory anchors. Directive paths are vetted
+  per the capture PRD: leading `./` stripped (matching
+  `rb_types::normalize_anchor_value`); empty, absolute, and `..`-traversal
+  paths rejected (V4A paths are relative-only by spec); patch hunk content
+  never reaches the scratch or folded summaries (leak-tested).
+- **Batched scratch appends**: one `apply_patch` event persists all its
+  observations in a single scratch read-modify-write round
+  (`Scratch::append_many`) instead of one full write per touched file, and
+  the fixture recorder's cleanup now preserves the hand-committed codex
+  apply_patch fixtures it cannot regenerate (pinned by its `--self-test`).
 - **Cross-adapter test uses the real Codex tool name**: the Codex PostToolUse
   fixture in `crates/rb-agents/tests/cross_adapter.rs` asserts `apply_patch`
   (mirroring the live-recorded payload) instead of the `Write` placeholder.
