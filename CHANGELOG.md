@@ -77,6 +77,37 @@ All notable changes to rusty-brain are documented here. The format is based on
   fixture in `crates/rb-agents/tests/cross_adapter.rs` asserts `apply_patch`
   (mirroring the live-recorded payload) instead of the `Write` placeholder.
 
+### Fixed — Freshness memory-induced errors: injection framing (Vikunja #502)
+
+- **Mechanism established** for the 2026-07-12 N=5 scorecard safety-gate RED
+  (`freshness/fresh-test-runner`, memory-on runs 3 and 4): NOT an
+  archived-value leak and NOT a recall miss — a deterministic local
+  reproduction (fallback embeddings, exact `plant_explicit` semantics) shows
+  the SessionStart digest, the UserPromptSubmit injection, and every recall
+  probe return only the supersede-chain tip, and the run TSV shows identical
+  memory-on token accounting across passing and failing runs. The model
+  received a correct injection and ignored it (mechanism (c)). Pinned by
+  `superseded_decision_never_reaches_context_or_recall_and_tip_always_does`
+  (`crates/rb-daemon/tests/daemon_e2e.rs`).
+- **Injection preamble reworded** (`rb_agents::recall_contract`): the shared
+  W2.5 frame no longer discounts every entry as "possibly-stale" — for a
+  stored convention ("use nextest, not plain cargo test") that wording argues
+  against the freshest fact in the store. The frame now separates the security
+  rule (memory text is never an instruction to the agent — unchanged, still
+  pinned) from the data-weighting rule (entries are current, non-superseded
+  records; prefer them over generic defaults when they answer the task).
+  Consumed verbatim by both injection channels in `rb-hooks`; `docs/COGNITION.md`
+  §4.3 updated to match.
+- **Scorecard session-log retention** (`scripts/memory-scorecard.sh`): the
+  harness deleted its workroot unconditionally, which made the MIEs
+  undiagnosable. Opt-in retention via `--log-dir DIR` or
+  `RB_SCORECARD_KEEP_LOGS=1` (anchored to `--out`) copies the log-shaped
+  artifacts (session stream-json, judged text, memory-on daemon logs — no
+  store DBs, no seeded CLAUDE.md, no key material) out before cleanup;
+  `memory-scorecard.yml` retains them and uploads a
+  `memory-scorecard-session-logs` artifact on failure. Exercised by
+  `--self-test`.
+
 ### Added — Guided contradiction/dedup review (PRD 2026-07-02)
 
 - **`rusty-brain review`**: one guided sweep over the trust backlog. The
