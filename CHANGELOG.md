@@ -5,6 +5,45 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Guided contradiction/dedup review (PRD 2026-07-02)
+
+- **`rusty-brain review`**: one guided sweep over the trust backlog. The
+  queue surfaces, in priority order, active contradiction pairs (the
+  pairwise expression of `active_contradicts`, held in lockstep by a drift
+  test), near-duplicate pairs (reusing `near_duplicates()` — the one
+  similarity definition, conservative 0.95 default / 0.80 floor), and
+  low-confidence (< 0.4) plus stale never-recalled singles (the stats
+  predicate + a 30-day age bound). Bare `review` is a DRY-RUN listing;
+  `--interactive` walks the queue item by item (`keep` / `bump` / `merge` /
+  `archive` / `demote` / `snooze`); `--apply --policy auto-merge-dups |
+  demote-low-confidence` executes one bounded pass non-interactively.
+  `--since <seq>` scopes to recently-touched memories; `--limit` and
+  `--threshold` are server-clamped.
+- **Safety posture (the forget precedent)**: apply requires an explicit
+  policy (never auto-resolve without consent); on a TTY it previews the
+  SAME plan the pass executes and asks with a default-NO prompt; `--yes`
+  is required for `--json`/piped automation. Every action is reversible —
+  merge stores a combined memory and supersedes both originals (the W3.1
+  update-as-supersede path), archive is a soft delete, demote/bump are
+  bounded confidence nudges (`-0.15` / `+0.05`, the feedback magnitudes).
+  Partial failures follow the `ForgetOutcome` shape: completed items stay
+  committed, the failure is reported, the pass is re-runnable, and the bulk
+  `review_sweep` oplog row is written unconditionally.
+- **Snooze persistence**: the additive `review_state` table (migration 010)
+  keyed by the canonical item key (reason + sorted member ids), so a
+  snoozed item stays hidden until its window elapses and acting on an item
+  clears its snooze. Every resolution records provenance + a
+  `review_resolve` oplog row (REV-4), so merges surface in the history
+  timeline and review activity feeds stats.
+- **Wire surface**: additive `Review`/`Resolve` requests and
+  `ReviewPlanned`/`ReviewDone`/`Resolved` responses (serde-default
+  payloads, no `CONTRACT_VERSION` bump; an absent `dry_run` always
+  previews). Queue generation runs entirely on the read pool (zero writer
+  ops, pinned). Deliberately NOT an MCP tool (the forget precedent:
+  destructive surface; tools/list budget at 897/900).
+- **Stats**: new additive `low_confidence_live` gauge — with `contested`
+  and `never_recalled_live`, the review-queue trend.
+
 ### Added — HTTP/REST surface and agent-agnostic prompt-time recall (PRD 2026-07-02)
 
 - **Opt-in loopback HTTP listener** (`serve --http [bind]` / `[http]`

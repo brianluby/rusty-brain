@@ -455,6 +455,9 @@ pub fn render_stats(
         }
     }
     out.push_str(&format!("contested: {}\n", stats.contested));
+    // Review-queue trend (PRD 2026-07-02 REV-4), alongside `contested` and
+    // `never recalled` above.
+    out.push_str(&format!("low confidence: {}\n", stats.low_confidence_live));
     out.push_str(&format!("re-embed backlog: {}\n", stats.reembed_pending));
     // RET-4 visibility: only rendered when a [retention] policy exists /
     // a sweep ever ran — "0 eligible" and "no policy" must not look alike.
@@ -828,6 +831,167 @@ pub fn render_forget_outcome(outcome: &rb_types::ForgetOutcome, json: bool) -> S
     out
 }
 
+/// One review-queue member line (REV-1: both sides render summary,
+/// importance, confidence, age, provenance). The stored summary passes
+/// through the shared redactor — a review listing must never leak a secret.
+fn review_member_line(index: usize, m: &rb_types::ReviewMember) -> String {
+    let last = match m.last_accessed_at {
+        Some(ts) => format!("last-recalled {}", format_ts(ts)),
+        None => "never recalled".to_string(),
+    };
+    let source = m.origin_source.as_deref().unwrap_or("unknown");
+    format!(
+        "  {}) {} imp {} conf {:.2} age {}d {} [{}] {}",
+        index + 1,
+        m.id,
+        m.importance,
+        m.confidence,
+        m.age_days,
+        last,
+        source,
+        redact(&m.summary)
+    )
+}
+
+/// Human rendering of one review item (shared by the plan listing and the
+/// interactive loop).
+pub fn render_review_item(item: &rb_types::ReviewItem, position: usize, total: usize) -> String {
+    let reason = match item.reason {
+        rb_types::ReviewReason::Contradiction => "contradiction".to_string(),
+        rb_types::ReviewReason::NearDuplicate => match item.similarity {
+            Some(sim) => format!("near-duplicate (similarity {sim:.2})"),
+            None => "near-duplicate".to_string(),
+        },
+        rb_types::ReviewReason::LowConfidence => "low confidence".to_string(),
+        rb_types::ReviewReason::StaleNeverRecalled => "stale, never recalled".to_string(),
+    };
+    let mut out = format!("[{position}/{total}] {reason}\n");
+    for (i, m) in item.members.iter().enumerate() {
+        out.push_str(&review_member_line(i, m));
+        out.push('\n');
+    }
+    out.trim_end().to_string()
+}
+
+/// A [`rb_types::ReviewPlan`] with every member summary redacted (W2.4): the
+/// one shape BOTH render branches emit, so JSON and human output cannot
+/// disagree on redaction (the PR #60 forget-plan lesson).
+fn redacted_review_plan(plan: &rb_types::ReviewPlan) -> rb_types::ReviewPlan {
+    let mut plan = plan.clone();
+    for item in &mut plan.items {
+        for m in &mut item.members {
+            m.summary = redact(&m.summary);
+        }
+    }
+    plan
+}
+
+/// Render the review queue / dry-run plan (PRD 2026-07-02 REV-1). JSON: the
+/// redacted `ReviewPlan`. Human: the totals header, one block per item, and
+/// the policy's planned action per item when a policy was named.
+pub fn render_review_plan(plan: &rb_types::ReviewPlan, json: bool) -> String {
+    let plan = redacted_review_plan(plan);
+    if json {
+        return serde_json::to_string_pretty(&plan).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render review plan JSON");
+            "{}".to_string()
+        });
+    }
+    let t = &plan.totals;
+    if plan.items.is_empty() {
+        let mut out = "review: nothing needs review.".to_string();
+        if t.snoozed > 0 {
+            out.push_str(&format!(" ({} item(s) snoozed)", t.snoozed));
+        }
+        return out;
+    }
+    let mut out = format!(
+        "review queue: {} item(s) (contradictions {}, near-dups {}, low-confidence {}, \
+         stale {}; snoozed {})\n",
+        plan.items.len(),
+        t.contradictions,
+        t.near_duplicates,
+        t.low_confidence,
+        t.stale_never_recalled,
+        t.snoozed
+    );
+    let total = plan.items.len();
+    for (i, item) in plan.items.iter().enumerate() {
+        out.push_str(&render_review_item(item, i + 1, total));
+        out.push('\n');
+        if let Some(policy) = plan.policy {
+            match plan.planned.iter().find(|p| p.key == item.key) {
+                Some(p) => out.push_str(&format!(
+                    "  -> {} would {}\n",
+                    policy.as_str(),
+                    p.action.kind_str()
+                )),
+                None => out.push_str(&format!("  -> {} skips this item\n", policy.as_str())),
+            }
+        }
+    }
+    if plan.truncated {
+        out.push_str("note: the queue was truncated by the item limit; re-run to continue\n");
+    }
+    out.trim_end().to_string()
+}
+
+/// Render a review apply outcome (REV-3). JSON: the raw `ReviewOutcome`.
+pub fn render_review_outcome(outcome: &rb_types::ReviewOutcome, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(outcome).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render review outcome JSON");
+            "{}".to_string()
+        });
+    }
+    let policy = outcome
+        .policy
+        .map(|p| p.as_str())
+        .unwrap_or("no-policy")
+        .to_string();
+    let mut out = format!(
+        "review ({policy}): merged={} archived={} demoted={} kept={} snoozed={} \
+         skipped={} of {} item(s)",
+        outcome.merged,
+        outcome.archived,
+        outcome.demoted,
+        outcome.kept,
+        outcome.snoozed,
+        outcome.skipped,
+        outcome.total_items
+    );
+    if let Some(failure) = &outcome.failure {
+        // A partial pass is loud: the counts above DID commit durably, and
+        // the pass is re-runnable once the cause is fixed.
+        out.push_str(&format!(
+            "\nFAILED partway (completed work kept): {failure}"
+        ));
+    }
+    out
+}
+
+/// Render one per-item resolution ack (REV-2 interactive mode). JSON: the raw
+/// `ReviewResolution` (ids, action, and post-nudge numbers — no content).
+pub fn render_review_resolution(res: &rb_types::ReviewResolution, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(res).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render review resolution JSON");
+            "{}".to_string()
+        });
+    }
+    let mut out = format!("applied {}", res.action);
+    if let Some(id) = &res.merged_into {
+        out.push_str(&format!(": merged into {id}"));
+    }
+    for mc in &res.confidence {
+        out.push_str(&format!("; {} confidence -> {:.2}", mc.id, mc.confidence));
+    }
+    if let Some(until) = res.snoozed_until {
+        out.push_str(&format!(": snoozed until {}", format_ts(until)));
+    }
+    out
+}
+
 /// Unix seconds to a short UTC date for the human reason lines.
 fn format_ts(ts: i64) -> String {
     chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
@@ -1137,6 +1301,7 @@ mod tests {
             }],
             never_recalled_live: 12,
             contested: 1,
+            low_confidence_live: 2,
             created_per_day: vec![rb_types::GrowthBucket {
                 day: "2026-07-10".to_string(),
                 count: 2,
@@ -1145,6 +1310,156 @@ mod tests {
             retention_eligible: Some(4),
             last_forget_at: Some(1_700_000_000),
         }
+    }
+
+    fn review_pair_plan() -> rb_types::ReviewPlan {
+        let a = rb_types::ReviewMember {
+            id: rb_types::MemoryId::new(),
+            summary: "left side with key sk-abc123def456ghi789jkl012mno".to_string(),
+            importance: 5,
+            confidence: 0.9,
+            created_at: 1_700_000_000,
+            age_days: 12,
+            last_accessed_at: None,
+            origin_source: Some("cli".to_string()),
+            origin_user: None,
+        };
+        let b = rb_types::ReviewMember {
+            id: rb_types::MemoryId::new(),
+            summary: "right side".to_string(),
+            importance: 7,
+            confidence: 0.4,
+            created_at: 1_700_000_000,
+            age_days: 3,
+            last_accessed_at: Some(1_710_000_000),
+            origin_source: Some("hook".to_string()),
+            origin_user: None,
+        };
+        let key = rb_types::review_item_key(
+            rb_types::ReviewReason::NearDuplicate,
+            &[a.id.clone(), b.id.clone()],
+        );
+        rb_types::ReviewPlan {
+            items: vec![rb_types::ReviewItem {
+                key: key.clone(),
+                reason: rb_types::ReviewReason::NearDuplicate,
+                members: vec![a, b],
+                similarity: Some(0.97),
+            }],
+            totals: rb_types::ReviewTotals {
+                contradictions: 0,
+                near_duplicates: 1,
+                low_confidence: 2,
+                stale_never_recalled: 3,
+                snoozed: 4,
+            },
+            policy: Some(rb_types::ReviewPolicy::AutoMergeDups),
+            planned: vec![rb_types::PlannedResolution {
+                key,
+                action: rb_types::ReviewAction::Merge,
+            }],
+            truncated: true,
+        }
+    }
+
+    #[test]
+    fn review_plan_renders_both_sides_with_redacted_summaries() {
+        let plan = review_pair_plan();
+        let out = render_review_plan(&plan, false);
+        // Both sides render what the human decision needs (REV-1).
+        assert!(out.contains("near-duplicate"), "{out}");
+        assert!(out.contains("similarity 0.97"), "{out}");
+        assert!(out.contains("imp 5"), "{out}");
+        assert!(out.contains("conf 0.90"), "{out}");
+        assert!(out.contains("age 12d"), "{out}");
+        assert!(out.contains("[cli]"), "{out}");
+        // The queue trend totals are visible.
+        assert!(out.contains("low-confidence 2"), "{out}");
+        assert!(out.contains("snoozed 4"), "{out}");
+        // The policy's planned action is announced per item.
+        assert!(out.contains("auto-merge-dups"), "{out}");
+        assert!(out.contains("merge"), "{out}");
+        // Truncation is a visible re-run hint.
+        assert!(out.contains("truncated"), "{out}");
+        // W2.4: stored summaries pass through the shared redactor.
+        assert!(!out.contains("sk-abc123def456ghi789jkl012mno"), "{out}");
+        assert!(out.contains("REDACTED"), "{out}");
+
+        let empty = rb_types::ReviewPlan::default();
+        let out = render_review_plan(&empty, false);
+        assert!(out.contains("nothing needs review"), "{out}");
+    }
+
+    #[test]
+    fn review_plan_json_redacts_summaries_like_sibling_renderers() {
+        // W2.4 consistency (the PR #60 forget-plan fix): the JSON branch
+        // must never leak a secret the human branch redacts.
+        let plan = review_pair_plan();
+        let json_out = render_review_plan(&plan, true);
+        assert!(
+            !json_out.contains("sk-abc123def456ghi789jkl012mno"),
+            "JSON review listing must redact summaries: {json_out}"
+        );
+        assert!(json_out.contains("REDACTED"), "{json_out}");
+        let parsed: rb_types::ReviewPlan = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(parsed.items.len(), 1);
+        assert_eq!(parsed.totals, plan.totals);
+        assert_eq!(parsed.planned.len(), 1);
+    }
+
+    #[test]
+    fn review_outcome_failure_is_rendered_in_both_modes() {
+        let outcome = rb_types::ReviewOutcome {
+            policy: Some(rb_types::ReviewPolicy::AutoMergeDups),
+            merged: 2,
+            skipped: 1,
+            total_items: 4,
+            failure: Some("merge of near_duplicate:a:b failed: injected".to_string()),
+            ..Default::default()
+        };
+        let human = render_review_outcome(&outcome, false);
+        assert!(human.contains("merged=2"), "{human}");
+        assert!(human.contains("skipped=1"), "{human}");
+        assert!(human.contains("FAILED partway"), "{human}");
+        assert!(human.contains("injected"), "{human}");
+
+        let parsed: rb_types::ReviewOutcome =
+            serde_json::from_str(&render_review_outcome(&outcome, true)).unwrap();
+        assert_eq!(parsed, outcome);
+    }
+
+    #[test]
+    fn review_resolution_renders_the_effect() {
+        let merged = rb_types::MemoryId::new();
+        let res = rb_types::ReviewResolution {
+            key: "near_duplicate:a:b".to_string(),
+            action: "merge".to_string(),
+            merged_into: Some(merged.clone()),
+            ..Default::default()
+        };
+        let out = render_review_resolution(&res, false);
+        assert!(out.contains("merge"), "{out}");
+        assert!(out.contains(&merged.to_string()), "{out}");
+
+        let snoozed = rb_types::ReviewResolution {
+            key: "low_confidence:x".to_string(),
+            action: "snooze".to_string(),
+            snoozed_until: Some(1_800_000_000),
+            ..Default::default()
+        };
+        let out = render_review_resolution(&snoozed, false);
+        assert!(out.contains("snoozed until"), "{out}");
+
+        let parsed: rb_types::ReviewResolution =
+            serde_json::from_str(&render_review_resolution(&res, true)).unwrap();
+        assert_eq!(parsed, res);
+    }
+
+    #[test]
+    fn human_stats_reports_the_low_confidence_gauge() {
+        // The review-queue trend (PRD 2026-07-02 REV-4) is visible in stats.
+        let out = render_stats(&sample_stats(), "deterministic", true, false);
+        assert!(out.contains("low confidence: 2"), "{out}");
     }
 
     #[test]
