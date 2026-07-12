@@ -10,7 +10,8 @@ env:
   CARGO_TERM_COLOR: always
   RUSTFLAGS: "-D warnings"
 
-# CI only reads the repo; no job needs write access to anything.
+# CI reads the repo by default. The cargo-audit job has the sole write
+# exception: rustsec/audit-check creates a GitHub check run on push events.
 permissions:
   contents: read
 
@@ -118,6 +119,12 @@ jobs:
   audit:
     name: cargo-audit
     runs-on: ubuntu-latest
+    # rustsec/audit-check reports its result through the Checks API on push.
+    # Without this job-scoped grant, a clean audit still fails afterward with
+    # "Resource not accessible by integration" while creating the check run.
+    permissions:
+      contents: read
+      checks: write
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
