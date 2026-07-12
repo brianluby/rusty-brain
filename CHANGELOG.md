@@ -93,13 +93,18 @@ All notable changes to rusty-brain are documented here. The format is based on
   existing rows (`memories.superseded_by` + `memory_links`): no schema change,
   no new persistence, and the whole path runs on the daemon's READ pool —
   zero writer ops (W1.8), asserted at the StoreHandle level and over a real
-  socket. Cycles in user-creatable link data cannot hang the walk (visited
-  set + server depth clamp of 100 hops per direction; edge list capped at
-  200), and traversal never crosses namespaces (both chain hops and both
-  edge endpoints are namespace-scoped, the `active_contradicts` rigor).
+  socket. Each direction is one bounded recursive CTE (the `graph_neighbors`
+  shape), walked independently so an ancestor entering a supersede cycle is
+  still found; cycles in user-creatable data cannot hang the walk (SQL hop
+  bound + `MIN(hop)` dedup; server depth clamp of 100 hops per direction,
+  chain membership and edge list each capped at 200, with exact
+  depth-truncation reporting), and traversal never crosses namespaces (both
+  chain hops and both edge endpoints are namespace-scoped, the
+  `active_contradicts` rigor). A corrupt out-of-band `importance` fails
+  closed instead of decoding as 0.
 - **Additive wire op `Request::History`/`Response::History`** with
   `rb_types::{MemoryHistory, HistoryEntry, HistoryEdge}` payloads — every
-  field serde-default, no `CONTRACT_VERSION` bump (recorded in the
+  top-level field serde-default, no `CONTRACT_VERSION` bump (recorded in the
   contract-drift snapshot as an additive decision).
 - **MCP `history` tool (full-toolset-gated)**: exposed only under
   `RB_MCP_FULL_TOOLSET` per HIST-3, so the default `tools/list` token budget

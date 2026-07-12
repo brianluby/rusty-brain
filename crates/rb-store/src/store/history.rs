@@ -23,12 +23,33 @@ struct ChainRow {
     entry: HistoryEntry,
 }
 
+/// Which way one supersede-chain CTE walks from the target.
+#[derive(Clone, Copy)]
+enum Direction {
+    /// Follow `superseded_by` pointers (old -> new): the successors.
+    Forward,
+    /// Follow reverse pointers (rows whose `superseded_by` reaches the
+    /// target): the ancestors, including near-dup fan-in.
+    Backward,
+}
+
+/// One direction's walk result: emit-eligible rows (with shortest hop
+/// distance), the ids discovered at the depth+1 probe (never emitted), and
+/// whether the row-budget window filled (rows beyond it exist).
+struct DirectionWalk {
+    rows: Vec<(u32, ChainRow)>,
+    dropped: Vec<MemoryId>,
+    overflow: bool,
+}
+
 impl SqliteStore {
     /// Derive the decision-history timeline for `id` in `ns`: the supersede
-    /// chain in BOTH directions (each direction bounded by `depth` hops) plus
-    /// the active `contradicts`/`extends`/`references` edges touching chain
-    /// members (bounded by `edge_limit`). Pure reads — safe on a read-pool
-    /// connection.
+    /// chain in BOTH directions (each direction bounded by `depth` hops, the
+    /// whole chain by `chain_limit` members) plus the active
+    /// `contradicts`/`extends`/`references` edges touching chain members
+    /// (bounded by `edge_limit`). Pure reads — safe on a read-pool
+    /// connection: one recursive-CTE query per direction (the
+    /// `graph_neighbors` shape), one edge query, one contested batch.
     ///
     /// Semantics guarantees:
     /// - Namespace purity: every chain member and BOTH endpoints of every edge
@@ -36,14 +57,22 @@ impl SqliteStore {
     ///   pointers/edges exist, so each hop and both edge endpoints are scoped
     ///   explicitly — the `active_contradicts` rigor). A target id living in
     ///   another namespace is indistinguishable from a missing one: `NotFound`.
-    /// - Cycle defense: `superseded_by` is user-influencable data; a visited
-    ///   set plus the depth cap make the walk terminate on any input.
-    /// - `truncated` reports a depth- or edge-cap stop with rows remaining.
+    /// - Cycle defense: `superseded_by` is user-influencable data; the CTE's
+    ///   hop bound terminates any cycle and `MIN(hop) GROUP BY id` collapses
+    ///   revisits, so each member appears once. The two directions are walked
+    ///   INDEPENDENTLY (an ancestor entering a forward cycle is still found),
+    ///   then merged with successors taking precedence for cycle overlaps.
+    /// - `truncated` is exact for depth stops: it is set only when a
+    ///   discovered-but-dropped row is genuinely absent from the final chain
+    ///   (a boundary coinciding with a dangling/cross-namespace pointer or a
+    ///   cycle revisit does NOT claim truncation). Cap overflows (chain or
+    ///   edge) always report it.
     pub fn memory_history(
         &self,
         ns: &Namespace,
         id: &MemoryId,
         depth: u32,
+        chain_limit: usize,
         edge_limit: usize,
     ) -> Result<MemoryHistory> {
         let ns_str = ns.as_db_string();
@@ -51,74 +80,91 @@ impl SqliteStore {
             .history_row(&ns_str, id)?
             .ok_or_else(|| Error::NotFound(id.clone()))?;
 
-        let mut truncated = false;
-        let mut visited: HashSet<MemoryId> = HashSet::new();
-        visited.insert(id.clone());
+        // Per-direction budget: the target always holds one chain slot.
+        let budget = chain_limit.saturating_sub(1);
+        let mut fwd = self.chain_direction(&ns_str, id, depth, budget, Direction::Forward)?;
+        let mut bwd = self.chain_direction(&ns_str, id, depth, budget, Direction::Backward)?;
 
-        // Forward walk: follow the superseded_by pointer (old -> new). A
-        // pointer that leaves the namespace, dangles, or closes a cycle ends
-        // the walk; only a depth stop with a live pointer marks truncation.
-        let mut successors: Vec<ChainRow> = Vec::new();
-        let mut cursor = target.entry.superseded_by.clone();
-        while let Some(next_id) = cursor {
-            if successors.len() as u32 >= depth {
-                truncated = true;
-                break;
-            }
-            if !visited.insert(next_id.clone()) {
-                break; // cycle: already on the chain
-            }
-            match self.history_row(&ns_str, &next_id)? {
-                Some(row) => {
-                    cursor = row.entry.superseded_by.clone();
-                    successors.push(row);
+        // Cross-direction merge: a member can only appear in both directions
+        // through a cycle; successors win so the timeline reads target-first
+        // toward the current truth, and the ancestor copy is dropped.
+        let mut member_ids: HashSet<MemoryId> = HashSet::with_capacity(fwd.rows.len() + 1);
+        member_ids.insert(id.clone());
+        member_ids.extend(fwd.rows.iter().map(|(_, r)| r.entry.id.clone()));
+        bwd.rows.retain(|(_, r)| !member_ids.contains(&r.entry.id));
+        member_ids.extend(bwd.rows.iter().map(|(_, r)| r.entry.id.clone()));
+
+        // Total chain cap: keep the members closest to the target (smallest
+        // hop; successors before ancestors on ties — the current-truth side
+        // is the more valuable half of an audit view).
+        let mut cap_dropped = false;
+        if fwd.rows.len() + bwd.rows.len() > budget {
+            cap_dropped = true;
+            let mut candidates: Vec<(u32, u8, bool, ChainRow)> = fwd
+                .rows
+                .into_iter()
+                .map(|(h, r)| (h, 0u8, true, r))
+                .chain(bwd.rows.into_iter().map(|(h, r)| (h, 1u8, false, r)))
+                .collect();
+            candidates.sort_by(|a, b| {
+                a.0.cmp(&b.0)
+                    .then_with(|| a.1.cmp(&b.1))
+                    .then_with(|| a.3.entry.created_at.cmp(&b.3.entry.created_at))
+                    .then_with(|| a.3.entry.id.as_uuid().cmp(&b.3.entry.id.as_uuid()))
+            });
+            candidates.truncate(budget);
+            let (mut kept_fwd, mut kept_bwd) = (Vec::new(), Vec::new());
+            for (h, _, is_fwd, row) in candidates {
+                if is_fwd {
+                    kept_fwd.push((h, row));
+                } else {
+                    kept_bwd.push((h, row));
                 }
-                None => break, // cross-namespace or dangling pointer: never leak
             }
+            member_ids = kept_fwd
+                .iter()
+                .chain(kept_bwd.iter())
+                .map(|(_, r)| r.entry.id.clone())
+                .collect();
+            member_ids.insert(id.clone());
+            fwd.rows = kept_fwd;
+            bwd.rows = kept_bwd;
         }
 
-        // Backward walk: BFS over predecessors (rows whose superseded_by
-        // points INTO the frontier). Multiple predecessors per hop are
-        // possible (near-dup absorption fans in), so this is a level walk,
-        // not a pointer chase.
-        let mut ancestors: Vec<(u32, ChainRow)> = Vec::new();
-        let mut frontier: Vec<MemoryId> = vec![id.clone()];
-        for hop in 0..=depth {
-            if frontier.is_empty() {
-                break;
-            }
-            let rows = self.predecessor_rows(&ns_str, &frontier)?;
-            let mut next_frontier = Vec::new();
-            for row in rows {
-                if !visited.insert(row.entry.id.clone()) {
-                    continue; // cycle or already-collected member
-                }
-                if hop >= depth {
-                    // A probe level past the bound: rows remain, do not emit.
-                    truncated = true;
-                    continue;
-                }
-                next_frontier.push(row.entry.id.clone());
-                ancestors.push((hop, row));
-            }
-            frontier = next_frontier;
-        }
+        // Exact depth-truncation: a row discovered at the depth+1 probe only
+        // counts as truncation when it is ABSENT from the final chain — a
+        // cycle revisiting an already-listed member at the boundary is
+        // completeness, not loss (PR #61 review, CodeRabbit).
+        let depth_dropped = fwd
+            .dropped
+            .iter()
+            .chain(bwd.dropped.iter())
+            .any(|d| !member_ids.contains(d));
+        let mut truncated = depth_dropped || fwd.overflow || bwd.overflow || cap_dropped;
+
         // Timeline order (HIST-1: "ordered by time"): ancestors oldest first.
         // The hop distance is the primary key — `created_at` has one-second
         // resolution, so a fast A->B->C chain would tie on time and shuffle;
         // deeper ancestors are by construction older. Time then id break ties
         // WITHIN a fan-in level (near-dup absorption).
-        ancestors.sort_by(|(ah, a), (bh, b)| {
+        bwd.rows.sort_by(|(ah, a), (bh, b)| {
             bh.cmp(ah)
                 .then_with(|| a.entry.created_at.cmp(&b.entry.created_at))
-                .then_with(|| a.entry.id.to_string().cmp(&b.entry.id.to_string()))
+                .then_with(|| a.entry.id.as_uuid().cmp(&b.entry.id.as_uuid()))
+        });
+        // Successors stay in pointer-chase order (hop ascending).
+        fwd.rows.sort_by(|(ah, a), (bh, b)| {
+            ah.cmp(bh)
+                .then_with(|| a.entry.created_at.cmp(&b.entry.created_at))
+                .then_with(|| a.entry.id.as_uuid().cmp(&b.entry.id.as_uuid()))
         });
 
-        let mut chain: Vec<HistoryEntry> = ancestors
+        let mut chain: Vec<HistoryEntry> = bwd
+            .rows
             .into_iter()
             .map(|(_, r)| r.entry)
             .chain(std::iter::once(target.entry))
-            .chain(successors.into_iter().map(|r| r.entry))
+            .chain(fwd.rows.into_iter().map(|(_, r)| r.entry))
             .collect();
 
         // Edges: active links touching any chain member, both endpoints
@@ -130,7 +176,7 @@ impl SqliteStore {
         // Contested flags for chain members AND far endpoints in one batch.
         let mut flag_ids = chain_ids.clone();
         flag_ids.extend(edges.iter().map(|e| e.other.clone()));
-        flag_ids.sort_by_key(|i| i.to_string());
+        flag_ids.sort_by_key(rb_types::MemoryId::as_uuid);
         flag_ids.dedup();
         let contested = self.active_contradicts(ns, &flag_ids)?;
         for entry in &mut chain {
@@ -176,41 +222,107 @@ impl SqliteStore {
         }
     }
 
-    /// Rows whose `superseded_by` points at any id in `frontier`, scoped to
-    /// `ns`, ordered deterministically.
-    fn predecessor_rows(&self, ns_str: &str, frontier: &[MemoryId]) -> Result<Vec<ChainRow>> {
-        if frontier.is_empty() {
-            return Ok(Vec::new());
-        }
-        let placeholders: Vec<String> =
-            (0..frontier.len()).map(|i| format!("?{}", i + 2)).collect();
+    /// Walk one supersede direction with a single bounded recursive CTE (the
+    /// `graph_neighbors` shape): every hop is namespace-scoped, `UNION`
+    /// dedups `(id, hop)` pairs, and the `hop < depth+1` bound terminates any
+    /// cycle. `MIN(hop) GROUP BY id` collapses multi-path revisits to the
+    /// shortest distance; the target itself is excluded.
+    ///
+    /// The query probes ONE hop past `depth` and ONE row past `budget`:
+    /// - rows whose shortest distance is `depth + 1` are returned as
+    ///   `dropped` ids (never emitted) so the caller can decide whether a
+    ///   genuinely-new row was cut (exact truncation semantics);
+    /// - fetching `budget + 1` rows sets `overflow` and the extra row is
+    ///   discarded (the chain cap refused to fetch further).
+    fn chain_direction(
+        &self,
+        ns_str: &str,
+        id: &MemoryId,
+        depth: u32,
+        budget: usize,
+        direction: Direction,
+    ) -> Result<DirectionWalk> {
+        // Both directions share the outer projection; only the recursive
+        // seed/step differ. Every fragment is a FIXED literal — caller data
+        // rides numbered parameters exclusively.
+        let cte = match direction {
+            Direction::Forward => {
+                "walk(id, hop) AS (
+                     SELECT nxt.memory_id, 1
+                       FROM memories cur
+                       JOIN memories nxt ON nxt.memory_id = cur.superseded_by
+                      WHERE cur.memory_id = ?1 AND cur.namespace = ?2
+                        AND nxt.namespace = ?2
+                     UNION
+                     SELECT nxt.memory_id, w.hop + 1
+                       FROM walk w
+                       JOIN memories cur ON cur.memory_id = w.id
+                       JOIN memories nxt ON nxt.memory_id = cur.superseded_by
+                      WHERE nxt.namespace = ?2 AND w.hop < ?3
+                 )"
+            }
+            Direction::Backward => {
+                "walk(id, hop) AS (
+                     SELECT p.memory_id, 1
+                       FROM memories p
+                      WHERE p.superseded_by = ?1 AND p.namespace = ?2
+                     UNION
+                     SELECT p.memory_id, w.hop + 1
+                       FROM walk w
+                       JOIN memories p ON p.superseded_by = w.id
+                      WHERE p.namespace = ?2 AND w.hop < ?3
+                 )"
+            }
+        };
         let sql = format!(
-            "SELECT memory_id, summary, content, importance, confidence, created_at,
-                    archived_at, superseded_by, origin_user, origin_host, origin_agent,
-                    origin_source
-             FROM memories
-             WHERE namespace = ?1 AND superseded_by IN ({})
-             ORDER BY created_at ASC, memory_id ASC",
-            placeholders.join(", ")
+            "WITH RECURSIVE {cte}
+             SELECT m.memory_id, m.summary, m.content, m.importance, m.confidence,
+                    m.created_at, m.archived_at, m.superseded_by, m.origin_user,
+                    m.origin_host, m.origin_agent, m.origin_source, x.hops
+               FROM (SELECT id, MIN(hop) AS hops FROM walk WHERE id <> ?1 GROUP BY id) x
+               JOIN memories m ON m.memory_id = x.id
+              ORDER BY x.hops ASC, m.created_at ASC, m.memory_id ASC
+              LIMIT ?4"
         );
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(frontier.len() + 1);
-        params.push(Box::new(ns_str.to_string()));
-        for id in frontier {
-            params.push(Box::new(id.to_string()));
+
+        let probe_depth = i64::from(depth).saturating_add(1);
+        let probe_budget = i64::try_from(budget.saturating_add(1)).unwrap_or(i64::MAX);
+        let mut stmt = self.conn.prepare(&sql).map_err(storage)?;
+        let mut db_rows = stmt
+            .query(rusqlite::params![
+                id.to_string(),
+                ns_str,
+                probe_depth,
+                probe_budget
+            ])
+            .map_err(storage)?;
+
+        let mut walk = DirectionWalk {
+            rows: Vec::new(),
+            dropped: Vec::new(),
+            overflow: false,
+        };
+        let mut fetched: i64 = 0;
+        while let Some(row) = db_rows.next().map_err(storage)? {
+            fetched += 1;
+            let hops_raw = row.get::<_, i64>(12).map_err(storage)?;
+            let hops = u32::try_from(hops_raw).unwrap_or(u32::MAX);
+            if hops > depth {
+                // Depth+1 probe row: discovered but never emitted. Ordering
+                // (hops ASC) guarantees these follow every emit-eligible row,
+                // so the emit slots below are never displaced by a probe.
+                walk.dropped
+                    .push(parse_id(&row.get::<_, String>(0).map_err(storage)?)?);
+            } else if walk.rows.len() < budget {
+                walk.rows.push((hops, decode_chain_row(row)?));
+            }
         }
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt
-            .query(refs.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
-            out.push(decode_chain_row(row)?);
-        }
-        Ok(out)
+        // A full window means rows beyond it exist (emit-eligible or probe —
+        // unknown either way), so the cap reports conservatively. Below the
+        // window, everything reachable was fetched and the `dropped` set is
+        // complete, keeping the caller's depth-truncation check exact.
+        walk.overflow = fetched == probe_budget;
+        Ok(walk)
     }
 
     /// Active `contradicts`/`extends`/`references` edges touching any chain
@@ -334,7 +446,15 @@ fn decode_chain_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
         row.get::<_, String>(1).map_err(storage)?,
         row.get::<_, String>(2).map_err(storage)?,
     );
-    let importance = u8::try_from(row.get::<_, i64>(3).map_err(storage)?).unwrap_or(0);
+    // Fail closed on an out-of-band importance: the schema CHECKs 1..=10, so
+    // a value no u8 holds is corruption — surfacing 0 would mask it (PR #61
+    // review, Copilot).
+    let raw_importance = row.get::<_, i64>(3).map_err(storage)?;
+    let importance = u8::try_from(raw_importance).map_err(|_| {
+        Error::Storage(format!(
+            "corrupt importance {raw_importance} on memory {id} (schema allows 1..=10)"
+        ))
+    })?;
     let confidence = row.get::<_, f64>(4).map_err(storage)? as f32;
     let created_at = from_ts(row.get::<_, i64>(5).map_err(storage)?)?;
     let archived = row.get::<_, Option<i64>>(6).map_err(storage)?.is_some();
@@ -420,7 +540,7 @@ mod tests {
         store.supersede(&a, &b).unwrap();
         store.supersede(&b, &c).unwrap();
 
-        let history = store.memory_history(&ns, &b, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &b, 100, 200, 200).unwrap();
         assert_eq!(history.namespace, ns.as_db_string());
         assert_eq!(history.depth, 100);
         assert!(!history.truncated);
@@ -465,7 +585,7 @@ mod tests {
         store.supersede(&a, &b).unwrap();
         store.supersede(&b, &c).unwrap();
 
-        let history = store.memory_history(&ns, &c, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &c, 100, 200, 200).unwrap();
         let ids: Vec<&MemoryId> = history.chain.iter().map(|e| &e.id).collect();
         assert_eq!(ids, vec![&a, &b, &c]);
         assert!(history.chain[2].current && history.chain[2].is_target);
@@ -489,7 +609,7 @@ mod tests {
         store.supersede(&a1, &b).unwrap();
         store.supersede(&a2, &b).unwrap();
 
-        let history = store.memory_history(&ns, &b, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &b, 100, 200, 200).unwrap();
         let ids: std::collections::HashSet<String> =
             history.chain.iter().map(|e| e.id.to_string()).collect();
         assert_eq!(history.chain.len(), 3);
@@ -511,14 +631,206 @@ mod tests {
         store.supersede(&b, &a).unwrap(); // closes the cycle A -> B -> A
 
         for anchor in [&a, &b] {
-            let history = store.memory_history(&ns, anchor, 100, 200).unwrap();
+            let history = store.memory_history(&ns, anchor, 100, 200, 200).unwrap();
             let mut ids: Vec<String> = history.chain.iter().map(|e| e.id.to_string()).collect();
             let len_before = ids.len();
             ids.sort();
             ids.dedup();
             assert_eq!(ids.len(), len_before, "no duplicate chain members");
             assert_eq!(history.chain.len(), 2, "both cycle members, exactly once");
+            assert!(
+                !history.truncated,
+                "a cycle stop is completeness, not truncation"
+            );
         }
+    }
+
+    /// PR #61 review (HIGH): an external ancestor that enters a supersede
+    /// cycle must still appear in the chain. With a shared cross-direction
+    /// visited set, the forward walk (B, C) poisoned the backward BFS: it hit
+    /// forward-visited C, skipped without enqueueing, and A -> C's ancestor A
+    /// silently vanished while `truncated` stayed false — an integrity defect
+    /// for an audit surface.
+    #[test]
+    fn history_backward_reaches_ancestors_that_enter_a_forward_cycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-cycle-entry".to_string());
+
+        let a = seed(&store, &ns, "external ancestor");
+        let b = seed(&store, &ns, "cycle b");
+        let c = seed(&store, &ns, "cycle c");
+        let d = seed(&store, &ns, "cycle d");
+        store.supersede(&b, &c).unwrap();
+        store.supersede(&c, &d).unwrap();
+        store.supersede(&d, &b).unwrap(); // closes the cycle B -> C -> D -> B
+        store.supersede(&a, &c).unwrap(); // the external entry A -> C
+
+        // From D (inside the cycle) and from A (outside, feeding in): every
+        // member appears exactly once and nothing is silently dropped.
+        for anchor in [&d, &a] {
+            let history = store.memory_history(&ns, anchor, 100, 200, 200).unwrap();
+            let mut got: Vec<String> = history.chain.iter().map(|e| e.id.to_string()).collect();
+            let len_before = got.len();
+            got.sort();
+            got.dedup();
+            assert_eq!(got.len(), len_before, "no duplicates from {anchor}");
+            for member in [&a, &b, &c, &d] {
+                assert!(
+                    history.chain.iter().any(|e| &e.id == member),
+                    "member {member} missing from the chain anchored at {anchor}: {got:?}"
+                );
+            }
+            assert_eq!(history.chain.len(), 4);
+            assert!(
+                !history.truncated,
+                "nothing was dropped, so truncated must be false (anchor {anchor})"
+            );
+        }
+    }
+
+    /// Diamond fan-in (a1 -> b1 -> d, a2 -> b2 -> d): every branch member
+    /// appears exactly once, ordered by hop distance (deepest ancestors
+    /// first), with no cross-path duplicates.
+    #[test]
+    fn history_diamond_fan_in_lists_every_branch_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-diamond".to_string());
+
+        let a1 = seed(&store, &ns, "a1");
+        let a2 = seed(&store, &ns, "a2");
+        let b1 = seed(&store, &ns, "b1");
+        let b2 = seed(&store, &ns, "b2");
+        let d = seed(&store, &ns, "d");
+        store.supersede(&a1, &b1).unwrap();
+        store.supersede(&a2, &b2).unwrap();
+        store.supersede(&b1, &d).unwrap();
+        store.supersede(&b2, &d).unwrap();
+
+        let history = store.memory_history(&ns, &d, 100, 200, 200).unwrap();
+        assert_eq!(history.chain.len(), 5, "all branch members, exactly once");
+        let hop2: Vec<&MemoryId> = history.chain[..2].iter().map(|e| &e.id).collect();
+        let hop1: Vec<&MemoryId> = history.chain[2..4].iter().map(|e| &e.id).collect();
+        assert!(hop2.contains(&&a1) && hop2.contains(&&a2), "deepest first");
+        assert!(hop1.contains(&&b1) && hop1.contains(&&b2));
+        assert_eq!(history.chain[4].id, d);
+        assert!(history.chain[4].is_target);
+        assert!(!history.truncated);
+    }
+
+    /// A self-supersede (A -> A) terminates and yields a one-entry chain.
+    #[test]
+    fn history_self_supersede_terminates() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-self".to_string());
+        let a = seed(&store, &ns, "self-superseded");
+        store.supersede(&a, &a).unwrap();
+
+        let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
+        assert_eq!(history.chain.len(), 1, "the self-loop adds no members");
+        assert_eq!(history.chain[0].id, a);
+        assert!(history.chain[0].archived, "supersede archived it");
+        assert!(
+            !history.chain[0].current,
+            "an archived row is never current"
+        );
+        assert!(!history.truncated);
+    }
+
+    /// PR #61 review (Copilot): depth bounds hops, not width — near-dup
+    /// fan-in can point many predecessors at one id. The total chain-member
+    /// cap bounds the response and reports the drop via `truncated`.
+    #[test]
+    fn history_chain_cap_bounds_members_and_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-chain-cap".to_string());
+
+        let hub = seed(&store, &ns, "absorbing hub");
+        for i in 0..6 {
+            let dup = seed(&store, &ns, &format!("near-dup {i}"));
+            store.supersede(&dup, &hub).unwrap();
+        }
+
+        let history = store.memory_history(&ns, &hub, 100, 3, 200).unwrap();
+        assert_eq!(history.chain.len(), 3, "total chain members are capped");
+        assert!(
+            history.chain.iter().any(|e| e.id == hub),
+            "the target always survives the cap"
+        );
+        assert!(history.truncated, "the cap dropped rows: report it");
+
+        let full = store.memory_history(&ns, &hub, 100, 200, 200).unwrap();
+        assert_eq!(full.chain.len(), 7);
+        assert!(!full.truncated);
+    }
+
+    /// PR #61 review (CodeRabbit): a depth-boundary stop where the next
+    /// pointer is cross-namespace/dangling or cyclic has NO further row to
+    /// fetch — it must not claim truncation.
+    #[test]
+    fn history_depth_boundary_without_further_rows_is_not_truncated() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-boundary".to_string());
+        let other = Namespace::Project("hist-boundary-other".to_string());
+
+        // A -> B -> X where X is foreign: at depth 1 from A the boundary
+        // coincides with the cross-namespace pointer — nothing was dropped.
+        let a = seed(&store, &ns, "a");
+        let b = seed(&store, &ns, "b");
+        let x = seed(&store, &other, "foreign x");
+        store.supersede(&a, &b).unwrap();
+        store.supersede(&b, &x).unwrap();
+        let history = store.memory_history(&ns, &a, 1, 200, 200).unwrap();
+        assert_eq!(history.chain.len(), 2, "A and B; the foreign X never leaks");
+        assert!(
+            !history.truncated,
+            "a cross-namespace pointer at the boundary is not truncation"
+        );
+
+        // C -> D -> C: at depth 1 from C the boundary coincides with the
+        // cycle closing back onto the target — nothing was dropped either.
+        let c = seed(&store, &ns, "c");
+        let d = seed(&store, &ns, "d");
+        store.supersede(&c, &d).unwrap();
+        store.supersede(&d, &c).unwrap();
+        let history = store.memory_history(&ns, &c, 1, 200, 200).unwrap();
+        assert_eq!(history.chain.len(), 2);
+        assert!(
+            !history.truncated,
+            "a cycle closing at the boundary is not truncation"
+        );
+    }
+
+    /// PR #61 review (Copilot): a corrupt importance outside the schema's
+    /// CHECK range must fail closed with a storage error, not silently decode
+    /// as the impossible value 0.
+    #[test]
+    fn history_corrupt_importance_fails_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-corrupt".to_string());
+        let a = seed(&store, &ns, "will be corrupted");
+
+        // Simulate on-disk corruption: bypass the CHECK constraint and plant
+        // an importance no u8 (or the schema) allows.
+        store
+            .conn
+            .execute_batch(&format!(
+                "PRAGMA ignore_check_constraints = ON;
+                 UPDATE memories SET importance = 300 WHERE memory_id = '{a}';
+                 PRAGMA ignore_check_constraints = OFF;"
+            ))
+            .unwrap();
+
+        let err = store.memory_history(&ns, &a, 100, 200, 200).unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::Storage(_)),
+            "corruption must surface as a storage error, got {err:?}"
+        );
     }
 
     /// The depth bound clamps BOTH directions and reports truncation.
@@ -536,7 +848,7 @@ mod tests {
             store.supersede(&w[0], &w[1]).unwrap();
         }
 
-        let history = store.memory_history(&ns, &ids[2], 1, 200).unwrap();
+        let history = store.memory_history(&ns, &ids[2], 1, 200, 200).unwrap();
         let got: Vec<String> = history.chain.iter().map(|e| e.id.to_string()).collect();
         assert_eq!(
             got,
@@ -546,7 +858,7 @@ mod tests {
         assert!(history.truncated, "rows remain past the bound");
 
         // A bound that covers everything reports no truncation.
-        let full = store.memory_history(&ns, &ids[2], 10, 200).unwrap();
+        let full = store.memory_history(&ns, &ids[2], 10, 200, 200).unwrap();
         assert_eq!(full.chain.len(), 5);
         assert!(!full.truncated);
     }
@@ -567,20 +879,24 @@ mod tests {
         // StoreHandle enforces it); simulate the hostile/corrupt edge.
         store.supersede(&a, &foreign).unwrap();
 
-        let history = store.memory_history(&ns, &a, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
         assert_eq!(history.chain.len(), 1, "the cross-ns successor never leaks");
         assert_eq!(history.chain[0].id, a);
         // The backward direction is scoped too: history of the foreign row in
         // ITS namespace must not pull in the `ns` ancestor.
-        let foreign_history = store.memory_history(&other, &foreign, 100, 200).unwrap();
+        let foreign_history = store
+            .memory_history(&other, &foreign, 100, 200, 200)
+            .unwrap();
         assert_eq!(foreign_history.chain.len(), 1);
 
         // A target id from another namespace is NotFound, not a leak.
-        let err = store.memory_history(&ns, &foreign, 100, 200).unwrap_err();
+        let err = store
+            .memory_history(&ns, &foreign, 100, 200, 200)
+            .unwrap_err();
         assert!(matches!(err, rb_types::Error::NotFound(_)), "{err:?}");
         // A missing id errors identically.
         let err = store
-            .memory_history(&ns, &MemoryId::new(), 100, 200)
+            .memory_history(&ns, &MemoryId::new(), 100, 200, 200)
             .unwrap_err();
         assert!(matches!(err, rb_types::Error::NotFound(_)), "{err:?}");
     }
@@ -626,7 +942,7 @@ mod tests {
             "on archived member",
         );
 
-        let history = store.memory_history(&ns, &b, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &b, 100, 200, 200).unwrap();
         assert_eq!(history.edges.len(), 2, "{:?}", history.edges);
 
         let contra = history
@@ -679,11 +995,11 @@ mod tests {
             link(&store, &spoke, &hub, LinkType::References, "");
         }
 
-        let history = store.memory_history(&ns, &hub, 100, 2).unwrap();
+        let history = store.memory_history(&ns, &hub, 100, 200, 2).unwrap();
         assert_eq!(history.edges.len(), 2, "edge cap applied");
         assert!(history.truncated, "capped edge list reports truncation");
 
-        let full = store.memory_history(&ns, &hub, 100, 200).unwrap();
+        let full = store.memory_history(&ns, &hub, 100, 200, 200).unwrap();
         assert_eq!(full.edges.len(), 4);
         assert!(!full.truncated);
     }
@@ -697,7 +1013,7 @@ mod tests {
         let ns = Namespace::Project("hist-single".to_string());
         let a = seed(&store, &ns, "lone decision");
 
-        let history = store.memory_history(&ns, &a, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
         assert_eq!(history.chain.len(), 1);
         let entry = &history.chain[0];
         assert!(entry.current && entry.is_target && !entry.archived);
@@ -716,7 +1032,7 @@ mod tests {
         store.supersede(&a, &b).unwrap();
         store.archive_memory(&b).unwrap();
 
-        let history = store.memory_history(&ns, &a, 100, 200).unwrap();
+        let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
         assert!(
             history.chain.iter().all(|e| !e.current),
             "no member of an all-archived chain may claim current truth"

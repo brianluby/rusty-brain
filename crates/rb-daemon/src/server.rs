@@ -61,6 +61,10 @@ const STATS_TOP_RECALLED_LIMIT: usize = 5;
 /// this cap, and a client cannot exceed it). Also the cycle-defense backstop
 /// alongside the store's visited set.
 const HISTORY_MAX_DEPTH: u32 = 100;
+/// Hard cap on TOTAL chain members in a history reply. Depth bounds hops, not
+/// width: near-dup fan-in can point many predecessors at one id, so one hop
+/// could otherwise balloon the response. Overflow is reported via `truncated`.
+const HISTORY_CHAIN_LIMIT: usize = 200;
 /// Hard cap on the edge list in a history reply, so a heavily linked chain
 /// cannot balloon one response (the stats window-clamp convention).
 const HISTORY_EDGE_LIMIT: usize = 200;
@@ -1200,14 +1204,20 @@ where
         // Namespace-scoped read-only decision-history timeline (PRD
         // 2026-07-02). Runs entirely on the read pool — zero writer ops
         // (W1.8). The depth is clamped server-side (never trusted raw) and
-        // the edge list is capped; namespace purity (both chain hops and edge
-        // endpoints) is enforced inside the store query.
+        // the chain/edge lists are capped; namespace purity (both chain hops
+        // and edge endpoints) is enforced inside the store query.
         Request::History { id, depth } => {
             let depth = depth
                 .unwrap_or(HISTORY_MAX_DEPTH)
                 .clamp(1, HISTORY_MAX_DEPTH);
             match job_store
-                .memory_history(namespace.clone(), id, depth, HISTORY_EDGE_LIMIT)
+                .memory_history(
+                    namespace.clone(),
+                    id,
+                    depth,
+                    HISTORY_CHAIN_LIMIT,
+                    HISTORY_EDGE_LIMIT,
+                )
                 .await
             {
                 Ok(history) => Response::History { history },

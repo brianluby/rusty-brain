@@ -525,17 +525,21 @@ impl StoreHandle {
     /// Decision-history timeline for one memory (PRD 2026-07-02). Goes
     /// through the bounded read pool — the history path issues zero writer
     /// ops (W1.8) by construction. `depth` bounds the chain walk per
-    /// direction and `edge_limit` the edge list (both pre-clamped by the
-    /// caller); namespace purity is enforced inside the store query.
+    /// direction, `chain_limit` the total chain membership, and `edge_limit`
+    /// the edge list (all pre-clamped by the caller); namespace purity is
+    /// enforced inside the store query.
     pub async fn memory_history(
         &self,
         namespace: Namespace,
         id: MemoryId,
         depth: u32,
+        chain_limit: usize,
         edge_limit: usize,
     ) -> Result<rb_types::MemoryHistory> {
-        self.with_read(move |store| store.memory_history(&namespace, &id, depth, edge_limit))
-            .await
+        self.with_read(move |store| {
+            store.memory_history(&namespace, &id, depth, chain_limit, edge_limit)
+        })
+        .await
     }
 
     /// Whether the writer thread is alive (i.e. has not died ABNORMALLY).
@@ -2914,7 +2918,7 @@ mod tests {
 
         let ops_before = handle.writer_ops_count();
         let history = handle
-            .memory_history(ns.clone(), new_id.clone(), 100, 200)
+            .memory_history(ns.clone(), new_id.clone(), 100, 200, 200)
             .await
             .unwrap();
         assert_eq!(

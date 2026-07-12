@@ -19,7 +19,17 @@ Delivery notes:
   carry their stored `reason`.
 - Server bounds: depth clamps to 100 hops per direction (an absent `--depth`
   uses the cap, per HIST-3's "default unbounded but capped"); the edge list
-  caps at 200. Both report `truncated`.
+  and the TOTAL chain membership each cap at 200 (depth bounds hops, not
+  width — near-dup fan-in can point many predecessors at one id). All report
+  `truncated`; depth-truncation is exact (a boundary coinciding with a
+  dangling/cross-namespace pointer or a cycle revisit does not claim it).
+- Traversal is one bounded recursive CTE per direction (the `graph_neighbors`
+  shape): the directions are walked independently, so an ancestor entering a
+  supersede cycle is still found, and cycle handling lives in SQL
+  (`MIN(hop) GROUP BY id` + the hop bound).
+- Supersede-writer hygiene (rejecting `old == new` and re-supersede of an
+  archived row at the source) is follow-up Vikunja #501 — out of this PRD's
+  read-only scope; the timeline defends against such rows regardless.
 - "Active" edges follow the `contested` semantics exactly: both endpoints
   non-archived AND in the request namespace (the `active_contradicts`
   double-endpoint scoping), so edges on archived chain members do not render.

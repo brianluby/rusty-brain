@@ -260,12 +260,15 @@ MCP-capable agent at it as a stdio server, for example:
 }
 ```
 
-It exposes twelve tools: `remember`, `recall`, `get`, `list`, `graph`, `update`,
-`link` (e.g. mark one memory as contradicting another), `delete`, `context`,
-`memory_feedback` (report whether a recalled memory was `helpful`/`wrong`/`stale`,
-nudging its trust prior), `history` (a memory's decision-history timeline:
-supersede chain + active contradiction links), and `poll_changes` (drains
-buffered change notifications).
+It implements twelve tools. By default `tools/list` advertises the six-tool
+token-economy subset the model pays for every turn: `remember`, `recall`,
+`get`, `context`, `update`, and `memory_feedback` (report whether a recalled
+memory was `helpful`/`wrong`/`stale`, nudging its trust prior). The remaining
+six — `list`, `graph`, `link` (e.g. mark one memory as contradicting another),
+`delete`, `history` (a memory's decision-history timeline: supersede chain +
+active contradiction links), and `poll_changes` (drains buffered change
+notifications) — are advertised only when `RB_MCP_FULL_TOOLSET` is set, though
+every tool stays routable when called directly.
 
 ### Capture hooks (optional)
 

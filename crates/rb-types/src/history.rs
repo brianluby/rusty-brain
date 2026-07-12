@@ -12,9 +12,13 @@ use serde::{Deserialize, Serialize};
 /// columns, and `memory_links`) — no new persistence. Computed on the daemon's
 /// READ pool: the history path issues zero writer ops (W1.8).
 ///
-/// Every field is `#[serde(default)]` so the payload stays additive: a peer
-/// that predates (or postdates) a field decodes the rest — the `MemoryStats`
-/// precedent, no CONTRACT_VERSION bump.
+/// Additive-payload guarantee: every field of THIS struct is
+/// `#[serde(default)]`, so a peer that predates (or postdates) a top-level
+/// field decodes the rest — the `MemoryStats` precedent, no CONTRACT_VERSION
+/// bump. The nested [`HistoryEntry`]/[`HistoryEdge`] items keep their
+/// identity fields (`id`, `local`/`other`, `link_type`, `created_at`)
+/// REQUIRED — no payload version has ever omitted them, and an item without
+/// an identity is meaningless; only their annotated metadata fields default.
 #[derive(Serialize, Deserialize, Debug, Clone, Default, PartialEq)]
 pub struct MemoryHistory {
     /// Namespace the timeline is scoped to (db string form). Both endpoints of
