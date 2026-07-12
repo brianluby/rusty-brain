@@ -32,6 +32,16 @@ const OPENCODE_TOOL_EXECUTE_AFTER_APPLY_PATCH: &str =
     include_str!("fixtures/opencode/tool_execute_after_apply_patch.json");
 const OPENCODE_SESSION_IDLE: &str = include_str!("fixtures/opencode/session_idle.json");
 
+// ---- REAL recorded Codex hook payloads (live-captured 2026-07-12 from
+// codex-cli 0.144.1, see fixtures/codex/README.md) ----
+// Codex fires PostToolUse for `apply_patch` since 0.123.0 (openai/codex#16732);
+// the raw V4A patch rides under `tool_input.command`. The multifile payload is
+// ONE apply_patch call whose single patch adds TWO files.
+const CODEX_POST_TOOL_USE_APPLY_PATCH: &str =
+    include_str!("fixtures/codex/post_tool_use_apply_patch.json");
+const CODEX_POST_TOOL_USE_APPLY_PATCH_MULTIFILE: &str =
+    include_str!("fixtures/codex/post_tool_use_apply_patch_multifile.json");
+
 fn hooks_command() -> std::process::Command {
     std::process::Command::cargo_bin("rusty-brain-hooks").expect("binary builds")
 }
@@ -551,6 +561,73 @@ fn opencode_apply_patch_file_edit_folds_into_checkpoint_summary() {
             .iter()
             .any(|a| a.kind == rb_types::AnchorKind::File && a.value.contains("notes.txt")),
         "the summary must carry a file anchor for the touched file: {anchors:?}"
+    );
+}
+
+#[test]
+fn codex_apply_patch_post_tool_use_captures_every_edited_file() {
+    // Codex fires PostToolUse for `apply_patch` since 0.123.0
+    // (openai/codex#16732); these are the REAL payloads live-captured from
+    // codex-cli 0.144.1 (fixtures/codex/README.md). Codex has no verified fold
+    // event yet (its Stop stays a no-op boundary), so the captured proof is
+    // the scratch itself: drive the REAL binary with both recorded payloads
+    // and assert the per-session scratch recorded every touched file — the
+    // multifile payload is ONE apply_patch call whose single V4A patch adds
+    // TWO files, so a first-path-only parse would silently drop one. A
+    // PostToolUse never connects to the daemon; the dead socket also pins the
+    // fail-open contract.
+    let dir = tempfile::tempdir().unwrap();
+    let dead = "/nonexistent/dir/rb-hooks-codex.sock";
+    for event in [
+        CODEX_POST_TOOL_USE_APPLY_PATCH,
+        CODEX_POST_TOOL_USE_APPLY_PATCH_MULTIFILE,
+    ] {
+        let mut child = hooks_command()
+            .args(["--agent", "codex"])
+            .env("RUSTY_BRAIN_SOCKET", dead)
+            .env("XDG_CACHE_HOME", dir.path())
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .expect("spawn hooks binary");
+        child
+            .stdin
+            .take()
+            .expect("stdin")
+            .write_all(event.as_bytes())
+            .expect("write stdin");
+        let output = child.wait_with_output().expect("wait for output");
+        assert!(output.status.success(), "must exit 0");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let value: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+        assert_eq!(value.get("continue").and_then(|v| v.as_bool()), Some(true));
+    }
+    // Both recorded events share a session id, so ONE scratch file under
+    // <cache>/rusty-brain/ holds all three touched files.
+    let scratch_dir = dir.path().join("rusty-brain");
+    let scratches: Vec<serde_json::Value> = std::fs::read_dir(&scratch_dir)
+        .expect("scratch cache dir exists")
+        .filter_map(Result::ok)
+        .filter(|e| e.file_name().to_string_lossy().starts_with("scratch-"))
+        .map(|e| {
+            serde_json::from_str(&std::fs::read_to_string(e.path()).expect("read scratch"))
+                .expect("scratch is valid JSON")
+        })
+        .collect();
+    assert_eq!(scratches.len(), 1, "one session => one scratch file");
+    let files: Vec<&str> = scratches[0]["files"]
+        .as_array()
+        .expect("scratch carries a files array")
+        .iter()
+        .filter_map(|v| v.as_str())
+        .collect();
+    assert_eq!(
+        files,
+        vec!["notes.txt", "alpha.txt", "beta.txt"],
+        "every apply_patch-touched file must be captured, including BOTH files \
+         of the single multi-file patch"
     );
 }
 

@@ -107,20 +107,39 @@ impl Scratch {
     /// bounds growth; an over-long entry is head-truncated. Best-effort: any
     /// error is swallowed (fail-open). The caller is responsible for redaction.
     pub fn append(&self, kind: Kind, value: &str) {
-        let value = truncate(value.trim());
-        if value.is_empty() {
-            return;
-        }
+        self.append_many([(kind, value.to_string())]);
+    }
+
+    /// Append a batch of observations in ONE read-modify-write round. A
+    /// multi-file `apply_patch` event would otherwise pay a full
+    /// read-redact-serialize-write-rename per path, multiplying disk I/O and
+    /// widening the lost-update window across overlapping hook processes (the
+    /// same accepted last-writer-wins posture as [`Scratch::append`], just a
+    /// single window per event instead of one per path). Per-entry semantics
+    /// match repeated `append` calls exactly: trim, blank-skip, head-truncate,
+    /// coalesce, per-category cap, first-seen order, fail-open. A batch with no
+    /// effective entries performs no write.
+    pub fn append_many(&self, entries: impl IntoIterator<Item = (Kind, String)>) {
         let mut data = self.read();
-        let (list, cap) = match kind {
-            Kind::File => (&mut data.files, MAX_FILES),
-            Kind::Command => (&mut data.commands, MAX_COMMANDS),
-            Kind::Failure => (&mut data.failures, MAX_FAILURES),
-        };
-        if list.len() < cap && !list.iter().any(|e| e == &value) {
-            list.push(value);
+        let mut changed = false;
+        for (kind, value) in entries {
+            let value = truncate(value.trim());
+            if value.is_empty() {
+                continue;
+            }
+            let (list, cap) = match kind {
+                Kind::File => (&mut data.files, MAX_FILES),
+                Kind::Command => (&mut data.commands, MAX_COMMANDS),
+                Kind::Failure => (&mut data.failures, MAX_FAILURES),
+            };
+            if list.len() < cap && !list.iter().any(|e| e == &value) {
+                list.push(value);
+                changed = true;
+            }
         }
-        self.write(&data);
+        if changed {
+            self.write(&data);
+        }
     }
 
     /// Read the scratch (empty on any error — fail-open).
@@ -316,6 +335,52 @@ mod tests {
         s.append(Kind::Command, "   ");
         s.append(Kind::File, "");
         assert!(s.read().is_empty());
+    }
+
+    #[test]
+    fn append_many_records_batch_with_single_append_semantics() {
+        // One multi-file apply_patch event batches all its observations into ONE
+        // read-modify-write round; per-entry semantics (trim, blank-skip,
+        // coalesce, first-seen order) match repeated `append` calls exactly.
+        let (_d, s) = scratch();
+        s.append(Kind::File, "pre.rs");
+        s.append_many([
+            (Kind::File, "a.rs".to_string()),
+            (Kind::File, "b.rs".to_string()),
+            (Kind::File, "a.rs".to_string()), // in-batch repeat coalesces
+            (Kind::File, "pre.rs".to_string()), // on-disk repeat coalesces
+            (Kind::File, "   ".to_string()),  // blank skipped
+            (Kind::Command, "cargo test".to_string()),
+        ]);
+        let data = s.read();
+        assert_eq!(data.files, vec!["pre.rs", "a.rs", "b.rs"]);
+        assert_eq!(data.commands, vec!["cargo test"]);
+    }
+
+    #[test]
+    fn append_many_respects_category_cap_across_the_batch() {
+        // MAX_FILES semantics are preserved within a single batch: first-seen
+        // entries win, overflow is dropped, exactly as repeated appends would.
+        let (_d, s) = scratch();
+        let batch: Vec<(Kind, String)> = (0..(MAX_FILES + 25))
+            .map(|i| (Kind::File, format!("f{i}.rs")))
+            .collect();
+        s.append_many(batch);
+        let data = s.read();
+        assert_eq!(data.files.len(), MAX_FILES, "files capped within a batch");
+        assert_eq!(data.files[0], "f0.rs");
+        assert!(!data.files.contains(&format!("f{}.rs", MAX_FILES + 10)));
+    }
+
+    #[test]
+    fn append_many_with_no_effective_entries_writes_nothing() {
+        // An all-blank/empty batch performs no write: no scratch file appears.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("scratch.json");
+        let s = Scratch::at(path.clone());
+        s.append_many([]);
+        s.append_many([(Kind::File, "   ".to_string())]);
+        assert!(!path.exists(), "no-op batches must not create the file");
     }
 
     #[test]

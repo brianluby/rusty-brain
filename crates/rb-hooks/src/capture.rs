@@ -121,10 +121,10 @@ use rb_redact::redact;
 ///   recognized here or every Gemini file edit/write/shell command would degrade
 ///   to a no-op capture.
 /// - Codex: its shell tool reports `Bash` (already handled above). Its
-///   `apply_patch` edit tool shares OpenCode's name, so the arm below captures
-///   it wherever a CLI fires PostToolUse for it — OpenCode does (with a V4A
-///   `patchText`); Codex does not yet (openai/codex#16732 — hooks fire only for
-///   the shell tool), so the arm is simply unreached for Codex today.
+///   `apply_patch` edit tool shares OpenCode's name and fires PostToolUse
+///   since Codex 0.123.0 (openai/codex#16732), carrying the raw V4A patch
+///   under `tool_input.command` — live-verified against codex-cli 0.144.1
+///   (see `tests/fixtures/codex/post_tool_use_apply_patch.json`).
 ///
 /// Lowercasing first lets the Claude (capitalized) and OpenCode/Gemini (snake)
 /// spellings match the same arms. Anything not a recognized mutation tool maps to
@@ -140,12 +140,12 @@ fn normalize_tool(tool_name: &str) -> &'static str {
         "replace" => "Edit",
         "write_file" => "Write",
         "run_shell_command" => "Bash",
-        // OpenCode's file-edit tool `apply_patch` (also Codex's, though Codex
-        // does not yet fire PostToolUse for it — openai/codex#16732). The payload
-        // carries a V4A `patchText`, not `file_path`; `edited_path` parses the
-        // `*** <op> File: <path>` directive so the touched path is captured
-        // instead of "Edited unknown". Codex is simply unreached until upstream
-        // fires the event; no separate arm is needed.
+        // The file-edit tool `apply_patch`, shared by OpenCode (V4A patch under
+        // `patchText`) and Codex (V4A patch under `command`, fired since Codex
+        // 0.123.0 — openai/codex#16732 — and live-verified on 0.144.1). Neither
+        // carries a `file_path`; `edited_paths` parses every `*** <op> File:
+        // <path>` directive so each touched path is captured instead of
+        // "Edited unknown". One arm covers both CLIs.
         "apply_patch" => "Edit",
         _ => "",
     }
@@ -156,68 +156,163 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
     input.get(key).and_then(|v| v.as_str()).unwrap_or("unknown")
 }
 
-/// Resolve the file path a file-mutation tool touched. `Edit`/`Write` carry it
-/// directly as `file_path`; an `apply_patch` tool instead carries a V4A patch
-/// whose `*** Add|Update|Delete File: <path>` directive names the target. OpenCode puts that
-/// patch under `patchText`; Codex's field is unverified (speculated `command`)
-/// and latent until openai/codex#16732 ships PostToolUse for `apply_patch`. Both
-/// share the V4A format, so one parser covers either field. Falls back to
-/// `"unknown"` (matching `str_field`) so an unidentified file touch is still
-/// recorded rather than silently dropped.
-fn edited_path(tool_input: &serde_json::Value) -> String {
+/// Resolve every file path a file-mutation tool touched. `Edit`/`Write` carry
+/// one path directly as `file_path`; an `apply_patch` tool instead carries a
+/// V4A patch whose `*** Add|Update|Delete File: <path>` directives (plus the
+/// `*** Move to: <path>` rename destination) name the targets — and one patch
+/// can touch SEVERAL files in a single call, so every directive is captured
+/// (a first-path-only parse would silently drop the rest). OpenCode puts the
+/// patch under `patchText`; Codex puts it under `command` (VERIFIED against a
+/// live codex-cli 0.144.1 capture, see
+/// `tests/fixtures/codex/post_tool_use_apply_patch.json` — openai/codex#16732
+/// shipped PostToolUse for `apply_patch` in Codex 0.123.0). Both share the V4A
+/// format, so one hunk-aware parser ([`v4a_patch_paths`]) covers either field.
+/// Falls back to `["unknown"]` (matching `str_field`) so an unidentified file
+/// touch is still recorded rather than silently dropped.
+fn edited_paths(tool_input: &serde_json::Value) -> Vec<String> {
     if let Some(p) = tool_input.get("file_path").and_then(|v| v.as_str()) {
-        return p.to_string();
+        return vec![p.to_string()];
     }
     for field in ["patchText", "command"] {
         if let Some(patch) = tool_input.get(field).and_then(|v| v.as_str()) {
-            if let Some(p) = v4a_patch_path(patch) {
-                return p;
+            let paths = v4a_patch_paths(patch);
+            if !paths.is_empty() {
+                return paths;
             }
         }
     }
-    str_field(tool_input, "file_path").to_string()
+    vec![str_field(tool_input, "file_path").to_string()]
 }
 
-/// Parse the target path out of a V4A `apply_patch` patchText — the first
-/// `*** Add|Update|Delete File: <path>` directive. Returns `None` when no such
-/// directive is present (caller then falls back to `"unknown"`).
-fn v4a_patch_path(patch_text: &str) -> Option<String> {
+/// Parse every target path out of a V4A `apply_patch` patch text: each
+/// `*** Add|Update|Delete File: <path>` directive plus the `*** Move to:
+/// <path>` rename destination, in patch order, deduplicated (first-seen wins,
+/// `HashSet`-backed). Returns an empty vec when no directive yields a safe
+/// path (the caller then falls back to `"unknown"`).
+///
+/// The parser is HUNK-AWARE, per the V4A grammar (`UpdateFile := header
+/// [MoveTo] {Hunk}`, hunks anchored by `@@`):
+/// - Directives are recognized at COLUMN 0 only — never inside hunk bodies.
+///   Hunk body lines are file CONTENT prefixed by ' ', '+', or '-'; treating
+///   them as structure would let patch content register phantom touched files
+///   (e.g. a context line reading `*** Add File: /etc/cron.d/evil`) that flow
+///   into summaries and anchors.
+/// - After an `@@` line, body lines (' ', '+', '-' prefixed, or empty — a
+///   context line whose trailing space was stripped) are skipped; the next
+///   structural line closes the hunk and is examined normally.
+/// - `*** Move to:` is only honored as the IMMEDIATE next structural line
+///   after an `*** Update File:` header (the grammar's rename form, capturing
+///   BOTH source and destination); a stray `Move to` anywhere else is
+///   malformed structure and is ignored (fail-open).
+///
+/// Paths pass [`safe_patch_path`] before being recorded.
+fn v4a_patch_paths(patch_text: &str) -> Vec<String> {
+    let mut paths: Vec<String> = Vec::new();
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut in_hunk = false;
+    // True only on the line immediately after an `*** Update File:` header.
+    let mut move_allowed = false;
+    // Vet + dedup (HashSet keeps the check O(1); the Vec keeps first-seen order).
+    fn push(paths: &mut Vec<String>, seen: &mut std::collections::HashSet<String>, raw: &str) {
+        if let Some(path) = safe_patch_path(raw) {
+            if seen.insert(path.clone()) {
+                paths.push(path);
+            }
+        }
+    }
     for line in patch_text.lines() {
-        let line = line.trim_start();
+        if in_hunk {
+            if line.is_empty()
+                || line.starts_with(' ')
+                || line.starts_with('+')
+                || line.starts_with('-')
+            {
+                continue; // hunk body: file content, never structure
+            }
+            in_hunk = false; // structural line closes the hunk; examine it
+        }
+        if line.starts_with("@@") {
+            in_hunk = true;
+            move_allowed = false;
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("*** Move to:") {
+            if move_allowed {
+                push(&mut paths, &mut seen, rest);
+            }
+            move_allowed = false;
+            continue;
+        }
+        move_allowed = false;
         for op in ["*** Add File:", "*** Update File:", "*** Delete File:"] {
             if let Some(rest) = line.strip_prefix(op) {
-                let path = rest.trim();
-                if !path.is_empty() {
-                    return Some(path.to_string());
-                }
+                push(&mut paths, &mut seen, rest);
+                move_allowed = op == "*** Update File:";
+                break;
             }
         }
     }
-    None
+    paths
 }
 
-/// Map a mutation tool to the scratch observation it records: file mutations
-/// record the touched path, `Bash` records the command. Normalizes first so
+/// Normalize and vet one directive path (PRD 2026-06-23 AP3: "normalize only
+/// enough to avoid obvious empty or unsafe paths"). These are strings headed
+/// into long-term memory — not filesystem I/O — so the bar guards against
+/// misleading/poisoned observations, not traversal of our own reads:
+/// - trim; reject empty/whitespace-only paths;
+/// - strip leading `./` segments (aligned with
+///   `rb_types::normalize_anchor_value`, so scratch entries and the folded
+///   summary's file anchors agree on one spelling);
+/// - reject ABSOLUTE paths — V4A paths are relative-only by spec and codex
+///   rejects absolute targets at apply time, so one can never name a real
+///   workspace edit;
+/// - reject `..` traversal segments (`../../etc/passwd` is the canonical
+///   poisoned-memory string; workspace-rooted patches do not need them).
+///
+/// A rejected path yields `None`; if every directive is rejected the caller
+/// records the generic `"unknown"` file touch, so the EVENT is still captured
+/// without the unsafe string.
+fn safe_patch_path(raw: &str) -> Option<String> {
+    let mut path = raw.trim();
+    while let Some(rest) = path.strip_prefix("./") {
+        path = rest;
+    }
+    if path.is_empty() || path.starts_with('/') {
+        return None;
+    }
+    if path.split('/').any(|segment| segment == "..") {
+        return None;
+    }
+    Some(path.to_string())
+}
+
+/// Map a mutation tool to the scratch observations it records: file mutations
+/// record the touched path(s), `Bash` records the command. Normalizes first so
 /// lowercase (OpenCode) and snake-case (Gemini) names produce the same
-/// observation as Claude's capitalized names. OpenCode `apply_patch` carries a
-/// V4A `patchText`; [`edited_path`] parses its `*** <op> File: <path>`
-/// directive. Returns `None` for a tool we do not capture (the caller continues
-/// without recording).
-fn tool_observation(
+/// observations as Claude's capitalized names. `apply_patch` (OpenCode
+/// `patchText` / Codex `command`) carries a V4A patch; [`edited_paths`] parses
+/// its `*** <op> File: <path>` directives, yielding ONE observation PER
+/// touched path — a single multi-file patch records each file, exactly as
+/// separate Edit events would. Returns an empty vec for a tool we do not
+/// capture (the caller continues without recording).
+fn tool_observations(
     tool_name: &str,
     tool_input: &serde_json::Value,
-) -> Option<(scratch::Kind, String)> {
+) -> Vec<(scratch::Kind, String)> {
     match normalize_tool(tool_name) {
-        "Edit" | "Write" => Some((scratch::Kind::File, edited_path(tool_input))),
-        "NotebookEdit" => Some((
+        "Edit" | "Write" => edited_paths(tool_input)
+            .into_iter()
+            .map(|path| (scratch::Kind::File, path))
+            .collect(),
+        "NotebookEdit" => vec![(
             scratch::Kind::File,
             str_field(tool_input, "notebook_path").to_string(),
-        )),
-        "Bash" => Some((
+        )],
+        "Bash" => vec![(
             scratch::Kind::Command,
             str_field(tool_input, "command").to_string(),
-        )),
-        _ => None,
+        )],
+        _ => Vec::new(),
     }
 }
 
@@ -260,9 +355,15 @@ pub async fn post_tool_use(
     let Some(scratch) = scratch else {
         return continue_only();
     };
-    if let Some((kind, raw)) = tool_observation(tool_name, tool_input) {
-        // Redact BEFORE persisting so no secret ever reaches the scratch file.
-        scratch.append(kind, &redact(&raw));
+    // Redact BEFORE persisting so no secret ever reaches the scratch file, and
+    // batch the whole event into ONE scratch write round — a multi-file
+    // apply_patch would otherwise pay one read-modify-write per path.
+    let observations: Vec<(scratch::Kind, String)> = tool_observations(tool_name, tool_input)
+        .into_iter()
+        .map(|(kind, raw)| (kind, redact(&raw)))
+        .collect();
+    if !observations.is_empty() {
+        scratch.append_many(observations);
     }
     // A failing tool response is decision-grade on its own, recorded whether or
     // not the tool was a captured mutation (a failed Read still teaches a future
@@ -1008,14 +1109,14 @@ mod tests {
 
     // ---- tool classification + observation -------------------------------
 
-    /// A tool is "captured" iff `tool_observation` yields an observation for it.
+    /// A tool is "captured" iff `tool_observations` yields an observation for it.
     fn is_captured(tool: &str) -> bool {
         // A path/command field is supplied so Bash/Edit/Write resolve to a value.
-        tool_observation(
+        !tool_observations(
             tool,
             &serde_json::json!({"file_path": "/x", "command": "c"}),
         )
-        .is_some()
+        .is_empty()
     }
 
     #[test]
@@ -1070,84 +1171,306 @@ mod tests {
             "patchText": "*** Begin Patch\n*** Add File: notes.txt\n+recorded\n*** End Patch"
         });
         assert_eq!(
-            tool_observation("apply_patch", &add),
-            Some((scratch::Kind::File, "notes.txt".to_string()))
+            tool_observations("apply_patch", &add),
+            vec![(scratch::Kind::File, "notes.txt".to_string())]
         );
         let upd = serde_json::json!({
             "patchText": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-old\n+new\n*** End Patch"
         });
         assert_eq!(
-            tool_observation("apply_patch", &upd),
-            Some((scratch::Kind::File, "src/lib.rs".to_string()))
+            tool_observations("apply_patch", &upd),
+            vec![(scratch::Kind::File, "src/lib.rs".to_string())]
         );
         // A path-less / non-V4A patch still records a file touch ("unknown"),
-        // never a silent drop. Codex stays unrepresented at the EVENT level
-        // (openai/codex#16732 — it does not fire PostToolUse for apply_patch),
-        // not at the normalization level this unit covers.
+        // never a silent drop (fail-open capture).
         let bare = serde_json::json!({"patchText": "not a v4a patch"});
         assert_eq!(
-            tool_observation("apply_patch", &bare),
-            Some((scratch::Kind::File, "unknown".to_string()))
+            tool_observations("apply_patch", &bare),
+            vec![(scratch::Kind::File, "unknown".to_string())]
         );
     }
 
     #[test]
-    #[ignore = "pending a real Codex apply_patch fixture; command field name is unverified (openai/codex#16732)"]
-    fn codex_apply_patch_command_field_captures_path_pending_real_fixture() {
-        // STUB: Codex's apply_patch is speculated to carry the V4A patch under
-        // `tool_input.command` (not OpenCode's `patchText`). `edited_path` checks
-        // both fields, so this passes today — but the field name is UNVERIFIED, so
-        // the test stays #[ignore] until a real Codex fixture confirms the shape.
-        // Un-ignore (and adjust the field name) once openai/codex#16732 ships.
+    fn codex_apply_patch_command_field_captures_path() {
+        // Codex carries the raw V4A patch under `tool_input.command` (NOT
+        // OpenCode's `patchText`). VERIFIED: live capture from codex-cli
+        // 0.144.1 on 2026-07-12 (openai/codex#16732 shipped PostToolUse for
+        // apply_patch in Codex 0.123.0); the exact recorded payload is
+        // tests/fixtures/codex/post_tool_use_apply_patch.json.
         let input = serde_json::json!({
-            "command": "*** Begin Patch\n*** Update File: codex/src/lib.rs\n@@\n-old\n+new\n*** End Patch"
+            "command": "*** Begin Patch\n*** Add File: notes.txt\n+recorded.\n*** End Patch\n"
         });
         assert_eq!(
-            tool_observation("apply_patch", &input),
-            Some((scratch::Kind::File, "codex/src/lib.rs".to_string()))
+            tool_observations("apply_patch", &input),
+            vec![(scratch::Kind::File, "notes.txt".to_string())]
         );
     }
 
     #[test]
-    fn tool_observation_maps_each_mutation_to_kind_and_value() {
-        let edit = tool_observation("Edit", &serde_json::json!({"file_path": "/src/main.rs"}));
+    fn codex_apply_patch_multi_file_patch_captures_every_touched_path() {
+        // One apply_patch call can touch SEVERAL files: the live-captured
+        // multi-file payload (tests/fixtures/codex/
+        // post_tool_use_apply_patch_multifile.json, codex-cli 0.144.1) carries
+        // two `*** Add File:` directives in a single patch. Every touched path
+        // must be recorded — a first-path-only parse silently drops the rest.
+        let input = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: alpha.txt\n+aaa\n*** Add File: beta.txt\n+bbb\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &input),
+            vec![
+                (scratch::Kind::File, "alpha.txt".to_string()),
+                (scratch::Kind::File, "beta.txt".to_string()),
+            ]
+        );
+        // Mixed-op patches (add/update/delete) record each target once, in
+        // patch order, deduplicated.
+        let mixed = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-a\n+b\n*** Delete File: old.rs\n*** Update File: src/lib.rs\n@@\n-c\n+d\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &mixed),
+            vec![
+                (scratch::Kind::File, "src/lib.rs".to_string()),
+                (scratch::Kind::File, "old.rs".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_patch_malformed_payload_fails_open_to_unknown() {
+        // Capture is fail-open by contract: a malformed apply_patch payload
+        // degrades to the generic "unknown" file touch, never an error and
+        // never a silent drop.
+        for input in [
+            // command present but not a V4A patch
+            serde_json::json!({"command": "not a v4a patch"}),
+            // command is not a string
+            serde_json::json!({"command": ["*** Begin Patch"]}),
+            // neither patchText nor command present
+            serde_json::json!({"unexpected": true}),
+            // directive present but with an empty path
+            serde_json::json!({"command": "*** Begin Patch\n*** Add File:\n+x\n*** End Patch"}),
+            // literal empty-string payloads (both field spellings)
+            serde_json::json!({"command": ""}),
+            serde_json::json!({"patchText": ""}),
+        ] {
+            assert_eq!(
+                tool_observations("apply_patch", &input),
+                vec![(scratch::Kind::File, "unknown".to_string())],
+                "malformed payload must fail open, input: {input}"
+            );
+        }
+    }
+
+    #[test]
+    fn apply_patch_hunk_content_is_never_parsed_as_a_directive() {
+        // Poisoning primitive: hunk BODY lines are file content, not patch
+        // structure. A context line (leading space), an added line ('+'), or a
+        // removed line ('-') whose CONTENT looks like a directive must never be
+        // captured as a touched file — it would flow into SessionEnd summaries
+        // and persisted MemoryAnchors as a phantom path. Directives are only
+        // recognized at column 0, OUTSIDE an active @@ hunk.
+        let context_poison = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: docs/example.md\n@@\n *** Add File: /etc/cron.d/evil\n-old line\n+new line\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &context_poison),
+            vec![(scratch::Kind::File, "docs/example.md".to_string())],
+            "a hunk context line must not register a phantom file"
+        );
+        let added_poison = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: docs/example.md\n@@\n context\n+*** Add File: /etc/cron.d/evil2\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &added_poison),
+            vec![(scratch::Kind::File, "docs/example.md".to_string())],
+            "an added ('+') hunk line must not register a phantom file"
+        );
+        let removed_poison = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: docs/example.md\n@@\n-*** Delete File: src/keep.rs\n+safe\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &removed_poison),
+            vec![(scratch::Kind::File, "docs/example.md".to_string())],
+            "a removed ('-') hunk line must not register a phantom file"
+        );
+        // Add File bodies carry '+' on every line — content that LOOKS like a
+        // directive inside an added file is body, not structure.
+        let add_body_poison = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: notes.txt\n+*** Update File: /etc/passwd\n+recorded\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &add_body_poison),
+            vec![(scratch::Kind::File, "notes.txt".to_string())],
+            "an Add File body line must not register a phantom file"
+        );
+        // A hunk ends at the next structural line: a REAL directive after the
+        // hunk body is still captured.
+        let hunk_then_directive = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: a.rs\n@@\n context\n-x\n+y\n*** Add File: b.rs\n+body\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &hunk_then_directive),
+            vec![
+                (scratch::Kind::File, "a.rs".to_string()),
+                (scratch::Kind::File, "b.rs".to_string()),
+            ],
+            "a real directive after a hunk still counts"
+        );
+    }
+
+    #[test]
+    fn apply_patch_move_to_captures_both_source_and_destination() {
+        // PRD 2026-06-23 AP3: renames use `*** Update File: <old>` immediately
+        // followed by `*** Move to: <new>` (V4A grammar: UpdateFile := header
+        // [MoveTo] {Hunk}); BOTH paths must be captured or the summary/anchors
+        // keep only the stale pre-rename path.
+        let pure_rename = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/old_name.rs\n*** Move to: src/new_name.rs\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &pure_rename),
+            vec![
+                (scratch::Kind::File, "src/old_name.rs".to_string()),
+                (scratch::Kind::File, "src/new_name.rs".to_string()),
+            ]
+        );
+        // Rename WITH content edits AND a hostile hunk context line: both
+        // rename paths captured, the poison line not.
+        let rename_with_hunk = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/old.rs\n*** Move to: src/new.rs\n@@\n *** Add File: /etc/cron.d/evil\n-a\n+b\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &rename_with_hunk),
+            vec![
+                (scratch::Kind::File, "src/old.rs".to_string()),
+                (scratch::Kind::File, "src/new.rs".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn apply_patch_stray_move_to_directive_is_ignored() {
+        // `*** Move to:` is only valid IMMEDIATELY after an Update File header
+        // (V4A grammar). A stray one — first line, after an Add File, or after
+        // a hunk — is malformed structure and records nothing (fail-open).
+        let stray_alone = serde_json::json!({
+            "command": "*** Begin Patch\n*** Move to: sneaky.rs\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &stray_alone),
+            vec![(scratch::Kind::File, "unknown".to_string())],
+            "a stray Move to with no Update captures nothing (generic fallback)"
+        );
+        let stray_after_add = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: real.rs\n+body\n*** Move to: sneaky.rs\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &stray_after_add),
+            vec![(scratch::Kind::File, "real.rs".to_string())],
+            "Move to after Add File is invalid grammar and is ignored"
+        );
+        let stray_after_hunk = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: real.rs\n@@\n-a\n+b\n*** Move to: sneaky.rs\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &stray_after_hunk),
+            vec![(scratch::Kind::File, "real.rs".to_string())],
+            "Move to must immediately follow the Update header, not a hunk"
+        );
+    }
+
+    #[test]
+    fn apply_patch_unsafe_paths_are_rejected_not_recorded() {
+        // PRD 2026-06-23 AP3: "normalize only enough to avoid obvious empty or
+        // unsafe paths". V4A paths are relative-only by spec (codex rejects
+        // absolute paths at apply time), so an absolute path can never name a
+        // real workspace edit; `..` traversal escapes the workspace root
+        // (`../../etc/passwd` is the canonical poisoned-memory string). Both
+        // are rejected. These are strings-into-memory, not filesystem I/O —
+        // rejection guards against misleading observations.
+        let all_unsafe = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: /etc/passwd\n+x\n*** Add File: ../../etc/passwd\n+x\n*** Add File: a/../../b.rs\n+x\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &all_unsafe),
+            vec![(scratch::Kind::File, "unknown".to_string())],
+            "a patch with ONLY unsafe paths degrades to the generic file touch"
+        );
+        // A mixed patch keeps the safe paths and drops the unsafe ones.
+        let mixed = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: safe.rs\n+x\n*** Add File: /etc/cron.d/evil\n+x\n*** Update File: also/safe.rs\n@@\n-a\n+b\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &mixed),
+            vec![
+                (scratch::Kind::File, "safe.rs".to_string()),
+                (scratch::Kind::File, "also/safe.rs".to_string()),
+            ]
+        );
+        // An unsafe Move destination is rejected while the (safe) source stays.
+        let unsafe_move = serde_json::json!({
+            "command": "*** Begin Patch\n*** Update File: src/ok.rs\n*** Move to: ../../outside.rs\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &unsafe_move),
+            vec![(scratch::Kind::File, "src/ok.rs".to_string())]
+        );
+    }
+
+    #[test]
+    fn apply_patch_leading_dot_slash_is_normalized() {
+        // Aligned with rb_types::normalize_anchor_value: leading `./` segments
+        // are stripped so `./src/foo.rs` and `src/foo.rs` are the same file in
+        // both the scratch and the folded summary's anchors (and dedup agrees).
+        let input = serde_json::json!({
+            "command": "*** Begin Patch\n*** Add File: ./src/foo.rs\n+x\n*** Update File: src/foo.rs\n@@\n-a\n+b\n*** End Patch\n"
+        });
+        assert_eq!(
+            tool_observations("apply_patch", &input),
+            vec![(scratch::Kind::File, "src/foo.rs".to_string())],
+            "./-prefixed and bare spellings normalize to one entry"
+        );
+    }
+
+    #[test]
+    fn tool_observations_map_each_mutation_to_kind_and_value() {
+        let edit = tool_observations("Edit", &serde_json::json!({"file_path": "/src/main.rs"}));
         assert_eq!(
             edit,
-            Some((scratch::Kind::File, "/src/main.rs".to_string()))
+            vec![(scratch::Kind::File, "/src/main.rs".to_string())]
         );
-        let write = tool_observation("Write", &serde_json::json!({"file_path": "/src/lib.rs"}));
+        let write = tool_observations("Write", &serde_json::json!({"file_path": "/src/lib.rs"}));
         assert_eq!(
             write,
-            Some((scratch::Kind::File, "/src/lib.rs".to_string()))
+            vec![(scratch::Kind::File, "/src/lib.rs".to_string())]
         );
-        let nb = tool_observation(
+        let nb = tool_observations(
             "NotebookEdit",
             &serde_json::json!({"notebook_path": "/n.ipynb"}),
         );
-        assert_eq!(nb, Some((scratch::Kind::File, "/n.ipynb".to_string())));
-        let bash = tool_observation("Bash", &serde_json::json!({"command": "cargo test"}));
+        assert_eq!(nb, vec![(scratch::Kind::File, "/n.ipynb".to_string())]);
+        let bash = tool_observations("Bash", &serde_json::json!({"command": "cargo test"}));
         assert_eq!(
             bash,
-            Some((scratch::Kind::Command, "cargo test".to_string()))
+            vec![(scratch::Kind::Command, "cargo test".to_string())]
         );
     }
 
     #[test]
-    fn tool_observation_is_cross_cli_and_none_for_non_mutations() {
+    fn tool_observations_are_cross_cli_and_empty_for_non_mutations() {
         // OpenCode lowercase + Gemini snake-case yield the same observations.
         assert_eq!(
-            tool_observation("write", &serde_json::json!({"file_path": "/x.rs"})),
-            Some((scratch::Kind::File, "/x.rs".to_string()))
+            tool_observations("write", &serde_json::json!({"file_path": "/x.rs"})),
+            vec![(scratch::Kind::File, "/x.rs".to_string())]
         );
         assert_eq!(
-            tool_observation("run_shell_command", &serde_json::json!({"command": "ls"})),
-            Some((scratch::Kind::Command, "ls".to_string()))
+            tool_observations("run_shell_command", &serde_json::json!({"command": "ls"})),
+            vec![(scratch::Kind::Command, "ls".to_string())]
         );
         // Non-mutation tools record no observation.
-        assert_eq!(
-            tool_observation("Read", &serde_json::json!({"file_path": "/x"})),
-            None
-        );
+        assert!(tool_observations("Read", &serde_json::json!({"file_path": "/x"})).is_empty());
     }
 
     #[test]
@@ -1208,6 +1531,66 @@ mod tests {
             vec!["/src/main.rs"],
             "repeated edits to one file coalesce to a single scratch entry"
         );
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_appends_every_apply_patch_file_to_scratch() {
+        // The live-captured Codex multi-file payload (codex-cli 0.144.1, see
+        // tests/fixtures/codex/post_tool_use_apply_patch_multifile.json): one
+        // apply_patch PostToolUse touching two files must record BOTH paths.
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch = scratch_at(tmp.path());
+        let result = post_tool_use(
+            Some(&scratch),
+            "apply_patch",
+            &serde_json::json!({
+                "command": "*** Begin Patch\n*** Add File: alpha.txt\n+aaa\n*** Add File: beta.txt\n+bbb\n*** End Patch\n"
+            }),
+            &serde_json::json!(
+                "Exit code: 0\nWall time: 0.2 seconds\nOutput:\nSuccess. Updated the following files:\nA alpha.txt\nA beta.txt\n"
+            ),
+        )
+        .await;
+        assert!(result.continue_execution);
+        let data = scratch.read();
+        assert_eq!(data.files, vec!["alpha.txt", "beta.txt"]);
+        // Codex's apply_patch tool_response is a plain string (not an object
+        // with is_error), so a successful patch records no failure.
+        assert!(data.commands.is_empty() && data.failures.is_empty());
+    }
+
+    #[tokio::test]
+    async fn post_tool_use_apply_patch_never_records_patch_content() {
+        // PRD 2026-06-23 AP5: patch hunk content — token-like strings, code,
+        // comments — must NEVER appear in the scratch (and therefore never in
+        // the folded summary). Only the touched paths are recorded.
+        let tmp = tempfile::tempdir().unwrap();
+        let scratch_path = tmp.path().join("scratch.json");
+        let scratch = Scratch::at(scratch_path.clone());
+        post_tool_use(
+            Some(&scratch),
+            "apply_patch",
+            &serde_json::json!({
+                "command": "*** Begin Patch\n*** Update File: src/config.rs\n@@\n context_marker_line\n-let old_secret = \"HUNK_TOKEN_AKIAFAKEFAKEFAKE\";\n+let new_secret = \"HUNK_TOKEN_sk-fake-body-string\";\n+// hunk_comment_body\n*** End Patch\n"
+            }),
+            &serde_json::json!("Exit code: 0\nOutput:\nSuccess. Updated the following files:\nM src/config.rs\n"),
+        )
+        .await;
+        assert_eq!(scratch.read().files, vec!["src/config.rs"]);
+        // Strongest form: the raw on-disk scratch bytes carry NO hunk content.
+        let raw = std::fs::read_to_string(&scratch_path).expect("scratch file exists");
+        for leaked in [
+            "HUNK_TOKEN",
+            "old_secret",
+            "new_secret",
+            "hunk_comment_body",
+            "context_marker_line",
+        ] {
+            assert!(
+                !raw.contains(leaked),
+                "patch hunk content leaked into the scratch: {leaked} in {raw}"
+            );
+        }
     }
 
     #[tokio::test]

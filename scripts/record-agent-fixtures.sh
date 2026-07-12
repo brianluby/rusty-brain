@@ -372,7 +372,13 @@ record_live() { # agent out_dir
   # Clear prior per-event fixtures so a re-run never mixes stale events from an
   # earlier session with the new capture (README is preserved; result.jsonl and
   # terminus.json are regenerated below). Only this run's events should remain.
-  find "$out" -maxdepth 1 -type f ! -name 'README.md' -delete 2>/dev/null || true
+  # EXCEPTION: hand-committed targeted captures the recorder CANNOT regenerate
+  # are preserved — the codex post_tool_use_apply_patch*.json fixtures came from
+  # a dedicated apply_patch session (see fixtures/codex/README.md); this
+  # harness's per-event `head -1` would keep only the session's FIRST
+  # PostToolUse (the Bash event), silently clobbering them.
+  find "$out" -maxdepth 1 -type f ! -name 'README.md' \
+    ! -name 'post_tool_use_apply_patch*.json' -delete 2>/dev/null || true
   # A two-step prompt so the terminus event count can be compared against turns.
   local prompt="First run: echo hi via Bash. Then create a file notes.txt containing exactly: recorded. Do both."
   # Capture raw CLI output to a temp file INSIDE the recorder home (outside the
@@ -604,7 +610,23 @@ self_test() {
   check "record_live refuses codex trust-not-done" "1" "$tg_rc"
   check "record_live wrote no fixtures when trust missing" "0" \
     "$( [ -f "$tg_out/README.md" ] || [ -f "$tg_out/result.jsonl" ] && echo 1 || echo 0 )"
-  rm -rf "$tg_bin" "$tg_home" "$tg_cache" "$(dirname "$tg_out")"
+  # The pre-record cleanup (which runs BEFORE the trust guard) must PRESERVE the
+  # hand-committed codex apply_patch fixtures it cannot regenerate, while still
+  # clearing stale recorder-owned events. Reuse the mock-codex env: seed the out
+  # dir, let record_live run its cleanup, then abort at the trust guard.
+  local kp_out
+  kp_out="$(mktemp -d "${TMPDIR:-/tmp}/rb-kp-out.XXXXXX")/codex"
+  mkdir -p "$kp_out"
+  printf '{"keep":1}\n' > "$kp_out/post_tool_use_apply_patch.json"
+  printf '{"keep":2}\n' > "$kp_out/post_tool_use_apply_patch_multifile.json"
+  printf '{"stale":1}\n' > "$kp_out/session_start.json"
+  PATH="$tg_bin:$PATH" HOME="$tg_home" XDG_CACHE_HOME="$tg_cache" \
+    record_live codex "$kp_out" >/dev/null 2>&1 || true
+  check "cleanup preserves hand-committed apply_patch fixtures" "2" \
+    "$(find "$kp_out" -maxdepth 1 -name 'post_tool_use_apply_patch*.json' | wc -l | tr -d ' ')"
+  check "cleanup still clears stale recorder-owned events" "0" \
+    "$( [ -f "$kp_out/session_start.json" ] && echo 1 || echo 0 )"
+  rm -rf "$tg_bin" "$tg_home" "$tg_cache" "$(dirname "$tg_out")" "$(dirname "$kp_out")"
   check "codex cli name" "codex" "$(record_cli_for codex)"
   check "opencode cli name" "opencode" "$(record_cli_for opencode)"
   # recorder_home: STABLE per-agent home OUTSIDE the repo under the XDG cache
