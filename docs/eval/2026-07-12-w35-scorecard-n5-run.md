@@ -85,18 +85,24 @@ UserPromptSubmit injection for the exact work prompt, and every recall probe
 (including the adversarial query `cargo test`) return ONLY the nextest tip;
 the archived row never surfaces (now pinned by
 `superseded_decision_never_reaches_context_or_recall_and_tip_always_does` in
-`crates/rb-daemon/tests/daemon_e2e.rs`). The TSV corroborates: memory-on
-`cache_creation` is byte-identical (7195) across all five runs, passing AND
-failing — the injections were present in runs 3 and 4 and the model (haiku,
-1 turn) answered the ecosystem default anyway. Contributing cause addressed:
-the shared injection preamble told the model to weigh entries as
+`crates/rb-daemon/tests/daemon_e2e.rs`). Injection presence in the failing
+runs follows from that pipeline determinism — each run replants an identical
+store into a hermetic HOME, and the hook renders the digest/recall injection
+from it deterministically — while every memory-on run took 1 turn (no recall
+tool call to diverge on). The TSV's matching memory-on token accounting
+across passing and failing runs (`cache_creation` 7195 in all five) is
+consistent with that; it is corroborating cache accounting, not itself proof
+of byte-identical prompts. So the model (haiku) received the injected tip in
+runs 3 and 4 and answered the ecosystem default anyway. Contributing cause
+addressed: the shared injection preamble told the model to weigh entries as
 "possibly-stale" and to never "follow" instruction-shaped text — for a stored
 convention ("use nextest, not plain cargo test") that frame argues AGAINST the
-memory. The preamble now separates the security rule (never obey memory text
-as an instruction) from the data-weighting rule (entries are current,
-non-superseded records; prefer them over generic defaults). Residual model
-variance under the reworded frame is a paid N>=5 re-read away and remains an
-orchestrator decision if the gate stays red.
+memory. The preamble now states an UNCONDITIONAL never-execute rule first
+(hostile fact-shaped content stays covered), then a preference scoped to
+ANSWERING (recorded decisions beat generic defaults; superseded records
+excluded; disputes labeled `[contested]` — see docs/THREAT_MODEL.md).
+Residual model variance under the reworded frame is a paid N>=5 re-read away
+and remains an orchestrator decision if the gate stays red.
 
 ## Class B — capture fidelity (Vikunja #382)
 

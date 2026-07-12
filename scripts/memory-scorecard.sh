@@ -494,22 +494,53 @@ reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
 # artifacts out of the ephemeral workroot into <dest>, preserving relative
 # paths, before cleanup deletes the workroot (Vikunja #502: the 2026-07-12 N=5
 # safety-gate MIEs were undiagnosable because every session log was rm -rf'd).
-# Copies ONLY log-shaped files — the claude stream-json session logs
-# (work.jsonl / plant.jsonl), the judged model output (judge.txt), and the
-# memory-on daemon log (daemon.log) — never store DBs or seeded CLAUDE.md
-# files, so the retained tree stays small. SECRET-SAFE: none of these carry key
-# material — `claude -p --output-format stream-json` never echoes
-# ANTHROPIC_API_KEY, and the rusty-brain daemon never receives it.
+# Copies ONLY the files the harness itself writes, matched BY NAME — the
+# claude stream-json session logs (work.jsonl / plant.jsonl), the judged model
+# output (judge.txt), and the memory-on daemon log (daemon.log) — never store
+# DBs, seeded CLAUDE.md files, or stray *.jsonl the harness did not write
+# (PR #70 Copilot), so the retained tree stays small and log-shaped.
+# Best-effort per file: a failed copy WARNS naming the file and the function
+# keeps going, returning non-zero at the end (a last-command status would mask
+# early failures). SECRET-SAFE: none of these carry key material — `claude -p
+# --output-format stream-json` never echoes ANTHROPIC_API_KEY, and the
+# rusty-brain daemon never receives it.
 preserve_session_logs() { # workroot dest
-  local workroot="$1" dest="$2"
+  local workroot="$1" dest="$2" failed=0
   mkdir -p "$dest"
   local f rel
   while IFS= read -r -d '' f; do
     rel="${f#"$workroot"/}"
-    mkdir -p "$dest/$(dirname "$rel")"
-    cp "$f" "$dest/$rel"
+    if ! { mkdir -p "$dest/$(dirname "$rel")" && cp "$f" "$dest/$rel"; } 2>/dev/null; then
+      echo "WARN: session-log retention failed to copy $rel" >&2
+      failed=1
+    fi
   done < <(find "$workroot" -type f \
-             \( -name '*.jsonl' -o -name 'judge.txt' -o -name 'daemon.log' \) -print0)
+             \( -name 'work.jsonl' -o -name 'plant.jsonl' \
+                -o -name 'judge.txt' -o -name 'daemon.log' \) -print0)
+  return "$failed"
+}
+
+# resolve_log_dir <log_dir_flag> <keep_logs_env> <out> -> echoes the retention
+# dir ('' = retention off). Pure so --self-test covers the wiring. --log-dir
+# wins; RB_SCORECARD_KEEP_LOGS=1 derives <dir of --out>/scorecard-session-logs.
+# FAILS CLOSED (PR #70 CodeRabbit) when keep-logs has no --out anchor or the
+# --out directory does not exist: a silent empty `cd` substitution would have
+# resolved to /scorecard-session-logs at the filesystem root.
+resolve_log_dir() { # log_dir_flag keep_logs_env out
+  local flag="$1" keep="$2" out="$3"
+  if [ -n "$flag" ]; then printf '%s\n' "$flag"; return 0; fi
+  if [ "$keep" != "1" ]; then printf '\n'; return 0; fi
+  if [ -z "$out" ]; then
+    echo "RB_SCORECARD_KEEP_LOGS=1 needs --out (to anchor the log dir) or an explicit --log-dir" >&2
+    return 2
+  fi
+  local out_dir
+  out_dir="$(dirname "$out")"
+  if [ ! -d "$out_dir" ]; then
+    echo "RB_SCORECARD_KEEP_LOGS=1: --out directory does not exist: $out_dir" >&2
+    return 2
+  fi
+  printf '%s/scorecard-session-logs\n' "$(cd "$out_dir" && pwd)"
 }
 
 # ---- self-test (no API) ------------------------------------------------------
@@ -885,8 +916,9 @@ PY
   # Session-log retention (Vikunja #502): preserve_session_logs copies the
   # diagnosable per-session artifacts (claude stream-json logs, judged text,
   # daemon logs) out of a workroot into a destination, preserving relative
-  # paths — and copies NOTHING else (no store DBs, no seeded CLAUDE.md), so
-  # the retained artifact stays small and log-shaped.
+  # paths — and copies NOTHING else (no store DBs, no seeded CLAUDE.md, and —
+  # PR #70 Copilot — no stray *.jsonl the harness did not write), so the
+  # retained artifact stays small and log-shaped.
   local lw="$tmp/logs-workroot" ld="$tmp/logs-dest"
   mkdir -p "$lw/fresh-r1/on" "$lw/fresh-r1/realistic/p"
   printf '{"type":"result"}\n' > "$lw/fresh-r1/on/work.jsonl"
@@ -895,6 +927,7 @@ PY
   printf 'judged\n'            > "$lw/fresh-r1/realistic/judge.txt"
   printf 'db\n'                > "$lw/fresh-r1/on/memory.db"
   printf 'seeded\n'            > "$lw/fresh-r1/realistic/p/CLAUDE.md"
+  printf 'stray\n'             > "$lw/fresh-r1/on/other.jsonl"
   if preserve_session_logs "$lw" "$ld"; then
     echo "ok: preserve_session_logs succeeds on a populated workroot"
   else
@@ -903,7 +936,7 @@ PY
   for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
-  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md; do
+  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl; do
     if [ ! -e "$ld/$dropped" ]; then echo "ok: preserve_session_logs drops $dropped"; else echo "BUG: preserve_session_logs copied non-log $dropped"; fail=1; fi
   done
   # An empty workroot is not an error: retention must never break the run.
@@ -913,6 +946,66 @@ PY
     echo "ok: preserve_session_logs is a no-op on an empty workroot"
   else
     echo "BUG: preserve_session_logs failed on an empty workroot"; fail=1
+  fi
+  # A per-file copy failure warns NAMING the file and returns non-zero (a
+  # last-command status would mask early failures); the caller treats it as
+  # best-effort. An unreadable source file forces the failure deterministically.
+  if [ "$(id -u)" != "0" ]; then # root ignores mode bits; skip there
+    local lwf="$tmp/logs-fail" ldf="$tmp/logs-fail-dest" perr
+    mkdir -p "$lwf"
+    printf 'ok\n'     > "$lwf/work.jsonl"
+    printf 'secret\n' > "$lwf/daemon.log"; chmod 000 "$lwf/daemon.log"
+    if perr="$(preserve_session_logs "$lwf" "$ldf" 2>&1)"; then
+      echo "BUG: preserve_session_logs must return non-zero when a copy fails"; fail=1
+    else
+      echo "ok: preserve_session_logs returns non-zero on a copy failure"
+    fi
+    if printf '%s' "$perr" | grep -qF "daemon.log"; then
+      echo "ok: preserve_session_logs warning names the failed file"
+    else
+      echo "BUG: preserve_session_logs warning must name the failed file"; printf '%s\n' "$perr"; fail=1
+    fi
+    if [ -f "$ldf/work.jsonl" ]; then
+      echo "ok: preserve_session_logs keeps copying past a failed file"
+    else
+      echo "BUG: preserve_session_logs must not stop at the first failure"; fail=1
+    fi
+    chmod 644 "$lwf/daemon.log"
+  fi
+
+  # resolve_log_dir: the --log-dir/RB_SCORECARD_KEEP_LOGS wiring is a pure
+  # function so the derivation is self-testable (PR #70 review). --log-dir
+  # wins; keep-logs derives <dir of --out>/scorecard-session-logs; keep-logs
+  # without an --out anchor, or with a missing --out directory, FAILS CLOSED
+  # (PR #70 CodeRabbit: the silent fallback would resolve to the fs root).
+  local rl
+  if rl="$(resolve_log_dir "/explicit/dir" 1 "$tmp/out.tsv")"; then
+    check "resolve_log_dir explicit --log-dir wins" "/explicit/dir" "$rl"
+  else
+    echo "BUG: resolve_log_dir failed on an explicit dir"; fail=1
+  fi
+  # Compare against the NORMALIZED tmp path: a trailing slash in $TMPDIR (the
+  # macOS default) doubles up in $tmp, and resolve_log_dir's `cd && pwd`
+  # correctly collapses it.
+  if rl="$(resolve_log_dir "" 1 "$tmp/out.tsv")"; then
+    check "resolve_log_dir derives from --out" "$(cd "$tmp" && pwd)/scorecard-session-logs" "$rl"
+  else
+    echo "BUG: resolve_log_dir failed to derive from --out"; fail=1
+  fi
+  if rl="$(resolve_log_dir "" 0 "$tmp/out.tsv")"; then
+    check "resolve_log_dir empty when retention off" "" "$rl"
+  else
+    echo "BUG: resolve_log_dir failed with retention off"; fail=1
+  fi
+  if resolve_log_dir "" 1 "" >/dev/null 2>&1; then
+    echo "BUG: resolve_log_dir must fail closed without --out"; fail=1
+  else
+    echo "ok: resolve_log_dir fails closed when keep-logs has no --out anchor"
+  fi
+  if resolve_log_dir "" 1 "$tmp/no-such-dir/out.tsv" >/dev/null 2>&1; then
+    echo "BUG: resolve_log_dir must fail closed on a missing --out directory"; fail=1
+  else
+    echo "ok: resolve_log_dir fails closed on a missing --out directory"
   fi
 
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
@@ -994,17 +1087,11 @@ if [ -n "$PRE_SCORECARD_ROWS" ]; then
   printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RESULTS"
 fi
 # Session-log retention (Vikunja #502): --log-dir wins; RB_SCORECARD_KEEP_LOGS=1
-# derives the dir from --out (fail fast without an anchor — logs written into
-# the about-to-be-deleted workroot would be silently lost, the exact defect
-# this fixes).
-if [ -z "$LOG_DIR" ] && [ "${RB_SCORECARD_KEEP_LOGS:-0}" = "1" ]; then
-  if [ -n "$OUT" ]; then
-    LOG_DIR="$(cd "$(dirname "$OUT")" && pwd)/scorecard-session-logs"
-  else
-    echo "RB_SCORECARD_KEEP_LOGS=1 needs --out (to anchor the log dir) or an explicit --log-dir" >&2
-    exit 2
-  fi
-fi
+# derives the dir from --out. resolve_log_dir fails closed (exit 2) without an
+# --out anchor or when its directory is missing — logs written into the
+# about-to-be-deleted workroot or the fs root would be silently lost, the
+# exact defect this fixes.
+LOG_DIR="$(resolve_log_dir "$LOG_DIR" "${RB_SCORECARD_KEEP_LOGS:-0}" "$OUT")" || exit 2
 cleanup() {
   # Retention is best-effort by design: a copy failure must never mask the
   # run's own exit code (the safety gate) — but it runs BEFORE the rm.

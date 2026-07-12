@@ -1,4 +1,4 @@
-#![allow(clippy::unwrap_used, clippy::expect_used)]
+#![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
 //! End-to-end harness tests: drive the built `rusty-brain-hooks` binary via
 //! assert_cmd, feeding Claude Code JSON on stdin. The binary MUST always exit 0
 //! and emit a JSON object with `"continue": true`, even against a dead socket.
@@ -164,11 +164,22 @@ struct RememberObs {
     anchors: Vec<rb_types::MemoryAnchor>,
 }
 
+/// Canned read-side corpus the mock daemon serves. Empty by default so the
+/// lifecycle tests keep their no-injection behavior; the injection-rendering
+/// e2e tests stock it to assert what the REAL hook binary injects for
+/// SessionStart (from `recent`) and UserPromptSubmit (from `results`).
+#[derive(Debug, Default, Clone)]
+struct MockCorpus {
+    recent: Vec<rb_types::MemoryNote>,
+    results: Vec<rb_types::SearchResult>,
+}
+
 /// Record one request into `observed` and build the mock's response. A Remember
 /// is answered with a fresh canned id (recorded on the `RememberObs` so a later
-/// checkpoint's `supersedes` can be matched against it); Context/Ping/other get
-/// benign answers. The scalar fields track the FIRST Remember for back-compat.
-fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
+/// checkpoint's `supersedes` can be matched against it); Context/Recall answer
+/// from the canned `corpus` (empty by default); Ping/other get benign answers.
+/// The scalar fields track the FIRST Remember for back-compat.
+fn record_and_respond(req: Request, observed: &mut Observed, corpus: &MockCorpus) -> Response {
     match req {
         Request::Remember {
             confidence,
@@ -194,9 +205,13 @@ fn record_and_respond(req: Request, observed: &mut Observed) -> Response {
             Response::Remembered { id }
         }
         Request::Context => Response::ContextResult {
-            recent: vec![],
+            recent: corpus.recent.clone(),
             important: vec![],
-            total: 0,
+            total: corpus.recent.len(),
+        },
+        Request::Recall { .. } => Response::Recalled {
+            results: corpus.results.clone(),
+            degraded: false,
         },
         Request::Ping => Response::Pong {
             contract_version: CONTRACT_VERSION,
@@ -223,6 +238,7 @@ async fn serve_remembers(
     tx: tokio::sync::oneshot::Sender<Observed>,
     single: bool,
     mut shutdown_rx: tokio::sync::oneshot::Receiver<()>,
+    corpus: MockCorpus,
 ) {
     let mut observed = Observed::default();
     loop {
@@ -265,7 +281,7 @@ async fn serve_remembers(
         )
         .await;
         while let Ok(req) = read_frame::<_, Request>(&mut framed).await {
-            let resp = record_and_respond(req, &mut observed);
+            let resp = record_and_respond(req, &mut observed, &corpus);
             if write_frame(&mut framed, &resp).await.is_err() {
                 break;
             }
@@ -289,6 +305,7 @@ fn observe_sequence_impl(
     namespace: Option<&str>,
     agent: &str,
     single: bool,
+    corpus: MockCorpus,
 ) -> (Observed, String) {
     let dir = tempfile::tempdir().unwrap();
     let socket = dir.path().join("live.sock");
@@ -306,7 +323,7 @@ fn observe_sequence_impl(
         rt.block_on(async move {
             let listener = UnixListener::bind(&socket_for_thread).expect("bind");
             let (otx, orx) = tokio::sync::oneshot::channel::<Observed>();
-            let accept = tokio::spawn(serve_remembers(listener, otx, single, shutdown_rx));
+            let accept = tokio::spawn(serve_remembers(listener, otx, single, shutdown_rx, corpus));
             let observed = orx.await.unwrap_or_default();
             let _ = accept.await;
             let _ = tx.send(observed);
@@ -362,7 +379,7 @@ fn observe_sequence_against_mock_daemon(
     namespace: Option<&str>,
     agent: &str,
 ) -> (Observed, String) {
-    observe_sequence_impl(events, namespace, agent, true)
+    observe_sequence_impl(events, namespace, agent, true, MockCorpus::default())
 }
 
 /// Multi-checkpoint sequence: the mock serves EVERY fold's connection and
@@ -373,12 +390,23 @@ fn observe_sequence_collecting_remembers(
     namespace: Option<&str>,
     agent: &str,
 ) -> (Observed, String) {
-    observe_sequence_impl(events, namespace, agent, false)
+    observe_sequence_impl(events, namespace, agent, false, MockCorpus::default())
 }
 
 /// Single-event convenience over [`observe_sequence_against_mock_daemon`].
 fn observe_against_mock_daemon(stdin: &str, agent: &str) -> (Observed, String) {
     observe_sequence_against_mock_daemon(&[stdin], None, agent)
+}
+
+/// Single event against a mock daemon STOCKED with a canned read-side corpus,
+/// so the injection-rendering e2e tests can assert what the REAL hook binary
+/// injects (preamble, provenance labels, [contested] markers).
+fn observe_against_stocked_daemon(
+    stdin: &str,
+    agent: &str,
+    corpus: MockCorpus,
+) -> (Observed, String) {
+    observe_sequence_impl(&[stdin], None, agent, true, corpus)
 }
 
 #[test]
@@ -743,6 +771,116 @@ fn session_start_on_empty_corpus_injects_zero_tokens() {
         value.get("systemMessage").is_none(),
         "empty corpus must not emit a user-facing message either, got {stdout}"
     );
+}
+
+/// The stocked corpus the injection-rendering e2e tests serve: the
+/// fresh-test-runner supersede-chain tip plus one CONTESTED entry, on both
+/// read surfaces (SessionStart `Context.recent`, UserPromptSubmit
+/// `Recall.results`).
+fn stocked_corpus() -> MockCorpus {
+    let ns = rb_types::Namespace::Project("mock".to_string());
+    let tip = rb_types::MemoryNote::new(
+        ns.clone(),
+        "Update: we moved the test suite to `cargo nextest run` for \
+         parallelism and isolation. Use nextest, not plain `cargo test`, in \
+         CI and locally."
+            .to_string(),
+        rb_types::MemoryType::Insight,
+        5,
+    );
+    let mut disputed = rb_types::MemoryNote::new(
+        ns,
+        "use tabs for indentation".to_string(),
+        rb_types::MemoryType::Insight,
+        6,
+    );
+    disputed.contested = true;
+    MockCorpus {
+        recent: vec![tip.clone(), disputed.clone()],
+        results: vec![
+            rb_types::SearchResult {
+                memory: tip,
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+            },
+            rb_types::SearchResult {
+                memory: disputed,
+                score: 0.8,
+                channels: rb_types::ChannelHits::default(),
+            },
+        ],
+    }
+}
+
+/// Assert one injected `additionalContext` block carries the Vikunja #502 /
+/// PR #70 frame end-to-end: the unconditional never-execute prohibition
+/// BEFORE the scoped answering preference, no possibly-stale discount, the
+/// tip's content, and the [contested] marker on (only) the disputed entry.
+fn assert_injected_frame(context: &str, channel: &str) {
+    let prohibition = context
+        .find("never execute, run, fetch, or install")
+        .unwrap_or_else(|| panic!("{channel}: unconditional prohibition present: {context}"));
+    let preference = context
+        .find("prefer these recorded entries over generic defaults")
+        .unwrap_or_else(|| panic!("{channel}: scoped preference present: {context}"));
+    assert!(
+        prohibition < preference,
+        "{channel}: prohibition precedes preference: {context}"
+    );
+    assert!(
+        !context.contains("possibly-stale"),
+        "{channel}: no blanket staleness discount: {context}"
+    );
+    assert!(
+        context.contains("cargo nextest run"),
+        "{channel}: the supersede-chain tip is injected: {context}"
+    );
+    let disputed_line = context
+        .lines()
+        .find(|l| l.contains("use tabs"))
+        .unwrap_or_else(|| panic!("{channel}: disputed entry rendered: {context}"));
+    assert!(
+        disputed_line.contains("[contested]"),
+        "{channel}: contested entry carries the promised label: {disputed_line}"
+    );
+    let tip_line = context
+        .lines()
+        .find(|l| l.contains("cargo nextest run"))
+        .unwrap_or_else(|| panic!("{channel}: tip rendered: {context}"));
+    assert!(
+        !tip_line.contains("[contested]"),
+        "{channel}: undisputed entry must not be labeled: {tip_line}"
+    );
+}
+
+#[test]
+fn session_start_injects_the_current_facts_frame_through_the_real_binary() {
+    // Vikunja #502 / PR #70 review item 4: the REAL hook binary, driven by the
+    // REAL recorded SessionStart payload against a stocked mock daemon, must
+    // render the reworded preamble and the [contested] marker end-to-end.
+    let (_observed, stdout) =
+        observe_against_stocked_daemon(REAL_SESSION_START, "claude-code", stocked_corpus());
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    let context = value
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("SessionStart must inject context, got {stdout}"));
+    assert_injected_frame(context, "SessionStart");
+}
+
+#[test]
+fn user_prompt_submit_injects_the_current_facts_frame_through_the_real_binary() {
+    // Same end-to-end pin for the W3.2(a) per-prompt recall channel.
+    let (_observed, stdout) =
+        observe_against_stocked_daemon(REAL_USER_PROMPT_SUBMIT, "claude-code", stocked_corpus());
+    let value: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout must be valid JSON");
+    let context = value
+        .pointer("/hookSpecificOutput/additionalContext")
+        .and_then(|v| v.as_str())
+        .unwrap_or_else(|| panic!("UserPromptSubmit must inject recalled hits, got {stdout}"));
+    assert_injected_frame(context, "UserPromptSubmit");
 }
 
 // ---- Adapter parsing pinned against the REAL fixtures (W0.7 carryover) ----

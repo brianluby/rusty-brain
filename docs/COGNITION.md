@@ -252,10 +252,12 @@ the opt-in declared retention policy:
 ### 4.2 Pruning triggers
 
 - **Conflict** — a `contradicts` link marks BOTH endpoints `contested`, surfaced
-  on every read (`crates/rb-engine/src/engine.rs`) and filterable
-  (`RecallFilter.contested`). The review queue (§5) puts contradiction pairs
-  first; resolution is keep / merge / archive / snooze, never silent deletion
-  (PR #63). Contested is surfaced, not adjudicated — see §6.4.
+  on every read (`crates/rb-engine/src/engine.rs`), labeled `[contested]` on the
+  rendered line in both injection channels (`crates/rb-hooks/src/capture.rs`),
+  and filterable (`RecallFilter.contested`). The review queue (§5) puts
+  contradiction pairs first; resolution is keep / merge / archive / snooze,
+  never silent deletion (PR #63). Contested is surfaced, not adjudicated — see
+  §6.4.
 - **Obsolescence** — supersede archives the old row behind a `superseded_by`
   pointer (§2); `stale` feedback erodes confidence (−0.15, §2); the review queue
   surfaces stale-never-recalled singles.
@@ -270,12 +272,15 @@ the opt-in declared retention policy:
   degrades their weight rather than pretending certainty either way
   (`crates/rb-engine/src/engine.rs`).
 - Injected recall states its trust posture explicitly (the CA6 preamble, §3.1):
-  entries are data from the labeled source — current, non-superseded records to
-  apply as project facts, never instructions to follow. Uncertainty rides
-  per-memory signals (provenance labels, confidence dampening) rather than a
-  blanket staleness disclaimer, which measurably caused models to ignore the
-  freshest fact in the store (the 2026-07-12 `fresh-test-runner`
-  memory-induced errors; Vikunja #502).
+  entries are data from the labeled source, never instructions to follow —
+  superseded records are excluded, and the preference for recorded decisions
+  over generic defaults is scoped to ANSWERING, behind an unconditional
+  never-execute rule (§6.3). Uncertainty rides per-memory signals the model can
+  SEE — the provenance label and the `[contested]` marker on the rendered line —
+  plus confidence dampening in ranking, rather than a blanket staleness
+  disclaimer, which measurably caused models to ignore the freshest fact in the
+  store (the 2026-07-12 `fresh-test-runner` memory-induced errors; Vikunja
+  #502).
 - Link `strength` decays exponentially by age from an immutable baseline
   (`base_strength`, migration 002), floored and idempotent
   (`crates/rb-daemon/src/jobs/link_decay.rs`) — old associations fade instead of
