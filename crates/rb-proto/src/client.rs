@@ -16,6 +16,12 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[derive(Debug)]
 pub struct Client {
     framed: Framed<UnixStream, LengthDelimitedCodec>,
+    /// Whether the daemon advertised [`crate::CAP_ANCHORS`] at handshake —
+    /// i.e. it evaluates typed code anchors instead of silently dropping
+    /// (`Remember.anchors`) or ignoring (pre-filter daemons) them. Gates the
+    /// anchor-bearing wrappers so the fail-fast anchor guarantee holds across
+    /// daemon versions.
+    supports_anchors: bool,
 }
 
 /// One item yielded by a live subscribe stream: either a change event or a
@@ -71,7 +77,22 @@ impl Client {
             return Err(Error::Storage(format!("handshake rejected: {detail}")));
         }
 
-        Ok(Client { framed })
+        // A pre-anchor daemon sends no capabilities (serde default: empty),
+        // so `supports_anchors` correctly degrades to false against it.
+        let supports_anchors = ack.capabilities.iter().any(|c| c == crate::CAP_ANCHORS);
+        Ok(Client {
+            framed,
+            supports_anchors,
+        })
+    }
+
+    /// Whether the daemon advertised typed-code-anchor support
+    /// ([`crate::CAP_ANCHORS`]) at handshake. Raw-`Request` callers (the MCP
+    /// adapter) combine this with [`crate::request_uses_anchors`] to fail
+    /// fast instead of letting an old daemon silently drop/ignore anchors.
+    #[must_use]
+    pub fn supports_anchors(&self) -> bool {
+        self.supports_anchors
     }
 
     /// Send one request frame WITHOUT reading the response. Split from
@@ -180,7 +201,47 @@ impl Client {
             tags,
             related_files,
             confidence,
+            Vec::new(),
             None,
+        )
+        .await
+    }
+
+    /// [`Client::remember`] carrying typed code anchors (PRD 2026-07-02) and
+    /// an optional atomic supersede. Fails fast with
+    /// [`Error::InvalidArgument`] when `anchors` is non-empty but the daemon
+    /// did NOT advertise anchor support at handshake — a pre-anchor daemon
+    /// would silently DROP the additive `anchors` field, storing an
+    /// un-anchored memory the caller believes is anchored.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_anchored(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        keywords: Vec<String>,
+        tags: Vec<String>,
+        related_files: Vec<String>,
+        confidence: Option<f32>,
+        anchors: Vec<rb_types::MemoryAnchor>,
+        supersedes: Option<MemoryId>,
+    ) -> Result<MemoryId> {
+        self.ensure_anchor_capable(!anchors.is_empty())?;
+        for anchor in &anchors {
+            anchor.validate()?;
+        }
+        self.remember_inner(
+            content,
+            context,
+            memory_type,
+            importance,
+            keywords,
+            tags,
+            related_files,
+            confidence,
+            anchors,
+            supersedes,
         )
         .await
     }
@@ -212,6 +273,7 @@ impl Client {
             tags,
             related_files,
             confidence,
+            Vec::new(),
             Some(supersedes),
         )
         .await
@@ -228,6 +290,7 @@ impl Client {
         tags: Vec<String>,
         related_files: Vec<String>,
         confidence: Option<f32>,
+        anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
@@ -251,6 +314,7 @@ impl Client {
                 related_files,
                 confidence,
                 supersedes,
+                anchors,
             })
             .await?;
         match resp {
@@ -290,21 +354,30 @@ impl Client {
         self.recall_filtered_with_status(query, filter, limit).await
     }
 
-    /// Fail-fast gate shared by the filtered wrappers: anchor filters are not
-    /// evaluable anywhere yet (the `memory_anchors` table ships with typed
-    /// code anchors), and an OLD contract-v2 daemon silently IGNORES the
-    /// additive `filter` field — so a frame carrying anchors could come back
-    /// unfiltered instead of erroring. Rejecting locally keeps the anchor
+    /// Fail-fast anchor-capability gate: anchor payloads may only ride the
+    /// wire when the daemon advertised [`crate::CAP_ANCHORS`] at handshake.
+    /// A PRE-ANCHOR contract-v2 daemon either silently IGNORES the additive
+    /// `filter` field (pre-parity daemons — anchor-filtered recall would come
+    /// back unfiltered) or rejects it server-side; a pre-anchor daemon
+    /// silently DROPS `Remember.anchors`. Rejecting locally keeps the
     /// fail-fast guarantee independent of the daemon version.
-    fn ensure_filter_sendable(filter: &rb_types::RecallFilter) -> Result<()> {
-        if !filter.anchors.is_empty() {
+    fn ensure_anchor_capable(&self, uses_anchors: bool) -> Result<()> {
+        if uses_anchors && !self.supports_anchors {
             return Err(Error::InvalidArgument(
-                "anchor filters are not supported yet (the memory_anchors table ships with \
-                 typed code anchors)"
+                "this daemon does not support typed code anchors (no `anchors` capability \
+                 in its handshake); upgrade and restart the daemon to use anchor \
+                 filters/anchored memories"
                     .to_string(),
             ));
         }
         Ok(())
+    }
+
+    /// Fail-fast gate shared by the filtered wrappers: non-empty anchor
+    /// filters require the daemon's advertised anchor capability (see
+    /// [`Client::ensure_anchor_capable`]).
+    fn ensure_filter_sendable(&self, filter: &rb_types::RecallFilter) -> Result<()> {
+        self.ensure_anchor_capable(!filter.anchors.is_empty())
     }
 
     /// [`Client::recall_with_status`] over the unified [`rb_types::RecallFilter`]
@@ -313,14 +386,15 @@ impl Client {
     /// legacy request slots so an old daemon still honors them; only the new
     /// dimensions ride the additive `filter` field (which an old daemon
     /// ignores — graceful degradation to the legacy subset). Non-empty anchor
-    /// filters are rejected BEFORE sending (see `ensure_filter_sendable`).
+    /// filters are rejected BEFORE sending unless the daemon advertised
+    /// anchor support (see `ensure_filter_sendable`).
     pub async fn recall_filtered_with_status(
         &mut self,
         query: String,
         filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<(Vec<SearchResult>, bool)> {
-        Self::ensure_filter_sendable(&filter)?;
+        self.ensure_filter_sendable(&filter)?;
         let (memory_type, tags, filter) = filter.split_recall_legacy();
         let resp = self
             .request(Request::Recall {
@@ -360,13 +434,14 @@ impl Client {
     /// legacy-slot split as [`Client::recall_filtered_with_status`]:
     /// `min_importance` rides the pre-filter wire slot (old daemons honor it),
     /// the new dimensions ride the additive `filter` field. Non-empty anchor
-    /// filters are rejected BEFORE sending (see `ensure_filter_sendable`).
+    /// filters are rejected BEFORE sending unless the daemon advertised
+    /// anchor support (see `ensure_filter_sendable`).
     pub async fn list_filtered(
         &mut self,
         filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        Self::ensure_filter_sendable(&filter)?;
+        self.ensure_filter_sendable(&filter)?;
         let (min_importance, filter) = filter.split_list_legacy();
         let resp = self
             .request(Request::List {
@@ -608,6 +683,7 @@ mod tests {
             } else {
                 Some("version mismatch".into())
             },
+            capabilities: vec![],
         };
         write_frame(&mut framed, &ack).await.unwrap();
         if !ok {
@@ -682,6 +758,7 @@ mod tests {
                     contract_version: CONTRACT_VERSION,
                     ok: true,
                     message: None,
+                    capabilities: vec![],
                 },
             )
             .await
@@ -760,9 +837,20 @@ mod wrapper_tests {
         )
     }
 
-    // Accept one connection, handshake, then answer each incoming Request with a
+    // Accept one connection, handshake (advertising NO capabilities — the
+    // pre-anchor daemon shape), then answer each incoming Request with a
     // matching canned Response until the client disconnects.
     async fn serve(listener: UnixListener, fixed_id: MemoryId) {
+        serve_with_capabilities(listener, fixed_id, vec![]).await;
+    }
+
+    // `serve` with an explicit advertised-capability list, so tests cover both
+    // the old-daemon (empty) and anchor-capable daemon shapes.
+    async fn serve_with_capabilities(
+        listener: UnixListener,
+        fixed_id: MemoryId,
+        capabilities: Vec<String>,
+    ) {
         let (stream, _addr) = listener.accept().await.unwrap();
         let mut framed: Framed<UnixStream, LengthDelimitedCodec> =
             Framed::new(stream, LengthDelimitedCodec::new());
@@ -774,6 +862,7 @@ mod wrapper_tests {
                 contract_version: CONTRACT_VERSION,
                 ok: true,
                 message: None,
+                capabilities,
             },
         )
         .await
@@ -785,9 +874,20 @@ mod wrapper_tests {
                 Err(_) => break, // client closed
             };
             let resp = match req {
-                Request::Remember { .. } => Response::Remembered {
-                    id: fixed_id.clone(),
-                },
+                Request::Remember {
+                    content, anchors, ..
+                } => {
+                    if content == "anchored-probe" {
+                        // The anchored-remember test: prove the anchors rode
+                        // the frame (a panic here fails the joined task).
+                        assert_eq!(anchors.len(), 2, "anchors must ride the wire");
+                        assert_eq!(anchors[0].value, "src/a.rs");
+                        assert_eq!(anchors[0].start_line, Some(3));
+                    }
+                    Response::Remembered {
+                        id: fixed_id.clone(),
+                    }
+                }
                 Request::Recall {
                     query,
                     memory_type,
@@ -820,6 +920,17 @@ mod wrapper_tests {
                             if memory_type.is_none()
                                 && filter.min_confidence == Some(0.9)
                                 && filter.sources == vec!["hook".to_string()]
+                            {
+                                hit()
+                            } else {
+                                Vec::new()
+                            }
+                        }
+                        "probe-anchors" => {
+                            // Anchor filters ride the ADDITIVE filter field.
+                            if filter.anchors.len() == 1
+                                && filter.anchors[0].kind == rb_types::AnchorKind::File
+                                && filter.anchors[0].value == "src/a.rs"
                             {
                                 hit()
                             } else {
@@ -922,19 +1033,24 @@ mod wrapper_tests {
     }
 
     #[tokio::test]
-    async fn filtered_wrappers_reject_anchor_filters_before_sending() {
-        // An OLD contract-v2 daemon ignores the additive `filter` field, so a
-        // frame carrying an anchor filter would come back silently UNFILTERED
-        // — violating the fail-fast anchor guarantee across daemon versions.
-        // The client must reject non-empty anchors LOCALLY, before any frame
-        // is sent. (The fake server here would happily return a hit for any
-        // recall/list, so an Err proves the request never round-tripped.)
+    async fn anchor_payloads_are_rejected_against_a_daemon_without_the_capability() {
+        // Old-daemon compatibility: a pre-anchor daemon advertises no
+        // `anchors` capability. It would silently IGNORE anchor filters on
+        // the additive `filter` field (pre-parity daemons) and silently DROP
+        // `Remember.anchors` — so the client must reject anchor-bearing calls
+        // LOCALLY, before any frame is sent. (The fake server here — acking
+        // with NO capabilities — would happily return a hit/ack for any
+        // request, so an Err proves the request never round-tripped.)
         use rb_types::{AnchorFilter, AnchorKind, RecallFilter};
         let (_dir, path) = socket_path();
         let listener = UnixListener::bind(&path).unwrap();
         let server = tokio::spawn(serve(listener, MemoryId::new()));
 
         let mut c = connect(&path).await;
+        assert!(
+            !c.supports_anchors(),
+            "a capability-less ack must read as unsupported"
+        );
         let anchored = RecallFilter {
             anchors: vec![AnchorFilter {
                 kind: AnchorKind::File,
@@ -957,6 +1073,132 @@ mod wrapper_tests {
             matches!(err, rb_types::Error::InvalidArgument(_)),
             "list must fail fast client-side, got {err:?}"
         );
+
+        let err = c
+            .remember_anchored(
+                "anchored body".into(),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "anchored remember must fail fast client-side, got {err:?}"
+        );
+
+        // Anchor-FREE calls still work against the old daemon (graceful
+        // degradation, not a hard cut).
+        let listed = c.list_filtered(RecallFilter::default(), 5).await.unwrap();
+        assert_eq!(listed.len(), 1);
+        let id = c
+            .remember_anchored(
+                "plain body".into(),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec![],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(id.to_string().len(), 36);
+
+        drop(c);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn anchor_payloads_flow_when_the_daemon_advertises_the_capability() {
+        use rb_types::{AnchorFilter, AnchorKind, RecallFilter};
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let fixed_id = MemoryId::new();
+        let server = tokio::spawn(serve_with_capabilities(
+            listener,
+            fixed_id.clone(),
+            vec![crate::CAP_ANCHORS.to_string()],
+        ));
+
+        let mut c = connect(&path).await;
+        assert!(
+            c.supports_anchors(),
+            "the capability must be read off the ack"
+        );
+
+        // Anchored remember: the fake server ASSERTS the anchors rode the
+        // frame for this content (a mismatch panics the joined task).
+        let id = c
+            .remember_anchored(
+                "anchored-probe".into(),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec![
+                    rb_types::MemoryAnchor::parse_file_spec("src/a.rs:3-9").unwrap(),
+                    rb_types::MemoryAnchor::new(AnchorKind::Symbol, "Foo::bar").unwrap(),
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(id, fixed_id);
+
+        // Anchor filters ride the additive filter field: a hit comes back
+        // ONLY when the fake server saw them there.
+        let (results, _) = c
+            .recall_filtered_with_status(
+                "probe-anchors".into(),
+                RecallFilter {
+                    anchors: vec![AnchorFilter {
+                        kind: AnchorKind::File,
+                        value: "src/a.rs".into(),
+                    }],
+                    ..Default::default()
+                },
+                5,
+            )
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 1, "anchor filter must ride the wire");
+
+        // An invalid anchor is still rejected locally (validation before send).
+        let err = c
+            .remember_anchored(
+                "bad".into(),
+                None,
+                MemoryType::Insight,
+                5,
+                vec![],
+                vec![],
+                vec![],
+                None,
+                vec![rb_types::MemoryAnchor {
+                    kind: AnchorKind::Commit,
+                    value: "abc".into(),
+                    start_line: Some(1),
+                    end_line: None,
+                }],
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
 
         drop(c);
         server.await.unwrap();
@@ -1171,6 +1413,7 @@ mod wrapper_tests {
                 contract_version: CONTRACT_VERSION,
                 ok: true,
                 message: None,
+                capabilities: vec![],
             },
         )
         .await
@@ -1226,6 +1469,7 @@ mod subscribe_tests {
                 contract_version: CONTRACT_VERSION,
                 ok: true,
                 message: None,
+                capabilities: vec![],
             },
         )
         .await

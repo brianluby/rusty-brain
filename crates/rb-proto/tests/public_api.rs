@@ -28,6 +28,7 @@ fn public_surface_is_reachable_and_stable() {
         contract_version: CONTRACT_VERSION,
         ok: true,
         message: None,
+        capabilities: vec![],
     };
     let _req = Request::Remember {
         content: "c".into(),
@@ -39,6 +40,7 @@ fn public_surface_is_reachable_and_stable() {
         related_files: vec![],
         confidence: Some(0.7),
         supersedes: Some(MemoryId::new()),
+        anchors: vec![],
     };
 
     // Error mapping helpers, round-tripping through the wire form.

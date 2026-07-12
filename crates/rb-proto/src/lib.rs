@@ -15,6 +15,6 @@ pub use codec::{bounded_codec, bounded_framed, MAX_FRAME_BYTES};
 pub use error::{error_to_response, response_error_to_error};
 pub use frame::{read_frame, write_frame};
 pub use messages::{
-    ClientIdentity, Handshake, HandshakeAck, RecallChannelTotals, Request, Response,
-    CONTRACT_VERSION,
+    request_uses_anchors, ClientIdentity, Handshake, HandshakeAck, RecallChannelTotals, Request,
+    Response, CAP_ANCHORS, CONTRACT_VERSION,
 };

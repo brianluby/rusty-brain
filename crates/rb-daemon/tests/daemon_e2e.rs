@@ -1230,26 +1230,89 @@ async fn recall_and_list_filters_flow_over_the_wire() {
         vec![low_conf.clone()]
     );
 
-    // Anchor filters fail fast (typed-code-anchors is not shipped yet): the
-    // client wrapper rejects them BEFORE sending (so even an old daemon that
-    // ignores the additive filter field can never return unfiltered results);
-    // the daemon-side rejection is covered by engine/store unit tests.
-    let err = cli_client
+    // Typed code anchors over a real socket (PRD 2026-07-02): the daemon
+    // advertises the `anchors` capability at handshake, an anchored remember
+    // persists its anchors, and recall/list scope by them — present under the
+    // anchored file, absent under a different one (the PRD acceptance
+    // criterion), composing with the metadata dimensions.
+    assert!(
+        cli_client.supports_anchors(),
+        "a current daemon must advertise anchor support"
+    );
+    let anchors = vec![
+        rb_types::MemoryAnchor::parse_file_spec("src/server.rs:10-40").unwrap(),
+        rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Server::run").unwrap(),
+    ];
+    let anchored_id = cli_client
+        .remember_anchored(
+            "filterable anchored decision".to_string(),
+            None,
+            MemoryType::Insight,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            Some(0.9),
+            anchors.clone(),
+            None,
+        )
+        .await
+        .unwrap();
+    let file_filter = |path: &str| RecallFilter {
+        anchors: vec![rb_types::AnchorFilter {
+            kind: rb_types::AnchorKind::File,
+            value: path.to_string(),
+        }],
+        ..Default::default()
+    };
+    let (results, _) = cli_client
+        .recall_filtered_with_status("filterable".to_string(), file_filter("src/server.rs"), 10)
+        .await
+        .unwrap();
+    assert_eq!(
+        results
+            .iter()
+            .map(|r| r.memory.id.clone())
+            .collect::<Vec<_>>(),
+        vec![anchored_id.clone()],
+        "recall scoped to the anchored file returns ONLY the anchored memory"
+    );
+    assert_eq!(
+        results[0].memory.anchors, anchors,
+        "anchors ride the result payload"
+    );
+    let (absent, _) = cli_client
+        .recall_filtered_with_status("filterable".to_string(), file_filter("src/other.rs"), 10)
+        .await
+        .unwrap();
+    assert!(absent.is_empty(), "a different file matches nothing");
+    // List: anchor + metadata composition over the wire.
+    let listed = cli_client
         .list_filtered(
             RecallFilter {
+                min_importance: Some(7),
                 anchors: vec![rb_types::AnchorFilter {
-                    kind: rb_types::AnchorKind::File,
-                    value: "src/server.rs".to_string(),
+                    kind: rb_types::AnchorKind::Symbol,
+                    value: "Server::run".to_string(),
                 }],
                 ..Default::default()
             },
             10,
         )
         .await
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+        vec![anchored_id.clone()]
+    );
+    // An empty anchor-filter value is a wire-visible validation error.
+    let err = cli_client
+        .list_filtered(file_filter("   "), 10)
+        .await
         .unwrap_err();
     assert!(
         matches!(err, Error::InvalidArgument(_)),
-        "anchor filter must fail fast over the wire, got {err:?}"
+        "empty anchor filter value must fail fast, got {err:?}"
     );
 
     // Old-client compatibility: a raw pre-filter frame (NO `filter` key at
@@ -1282,7 +1345,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
             let got: std::collections::HashSet<_> = memories.iter().map(|n| n.id.clone()).collect();
             assert_eq!(
                 got,
-                [high_conf, from_mcp].into_iter().collect(),
+                [high_conf, from_mcp, anchored_id].into_iter().collect(),
                 "an old frame must keep the pre-filter default (active, unfiltered)"
             );
         }

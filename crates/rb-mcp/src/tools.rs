@@ -77,11 +77,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
     vec![
         ToolDef {
             name: "remember",
-            description: "Store a durable memory in the shared store. Use when the user \
-                          states a decision, preference, constraint, or correction worth \
-                          recalling in a future session (e.g. \"we use X because Y\", \
-                          \"always do Z\", \"never touch W\") — capture the decision and its \
-                          rationale, not transient chatter. Returns the new memory id.",
+            // Deliberately TERSE (W3.3): remember is in the default advertised
+            // set, so every description byte counts against the token budget
+            // (trimmed to make room for the typed-code-anchor params).
+            description: "Store a durable memory. Use when the user states a decision, \
+                          preference, constraint, or correction worth recalling later — \
+                          capture the decision and its rationale, not transient chatter. \
+                          Returns the new memory id.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -92,7 +94,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "importance": { "type": "integer", "minimum": 1, "maximum": 10,
                                     "description": "Importance 1-10 (default: 5)." },
                     "tags": { "type": "array", "items": { "type": "string" },
-                              "description": "Optional tags." }
+                              "description": "Optional tags." },
+                    "files": { "type": "array", "items": { "type": "string" },
+                               "description": "Anchor to files: PATH[:LINE[-END]]." },
+                    "commits": { "type": "array", "items": { "type": "string" },
+                                 "description": "Anchor to commit SHAs." },
+                    "symbols": { "type": "array", "items": { "type": "string" },
+                                 "description": "Anchor to symbols." }
                 },
                 "required": ["content"]
             }),
@@ -100,9 +108,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "recall",
             description: "Hybrid (keyword + vector + graph) recall of stored memories. Use \
-                          BEFORE starting a task, or whenever the user references a past \
-                          decision, prior work, or \"how we do X here\", to retrieve relevant \
-                          prior context. Returns ranked memories.",
+                          BEFORE starting a task, or when the user references a past \
+                          decision or prior work. Returns ranked memories.",
             // The unified filter params (PRD 2026-07-02 search-filter parity)
             // are deliberately TERSE: recall is in the default advertised set,
             // so every schema byte counts against the W3.3 token budget.
@@ -125,7 +132,11 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "source": { "type": "array",
                                 "items": { "enum": ["hook", "mcp", "cli", "job"] } },
                     "contested": { "type": "boolean" },
-                    "archived": { "type": "boolean" }
+                    "archived": { "type": "boolean" },
+                    "file": { "type": "string",
+                              "description": "Only memories anchored to this file path." },
+                    "commit": { "type": "string" },
+                    "symbol": { "type": "string" }
                 },
                 "required": ["query"]
             }),
@@ -133,8 +144,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "get",
             description: "Fetch one memory's full content + links by id. Use to expand a \
-                          memory surfaced by recall/list when you need its complete text or \
-                          its linked memories.",
+                          recall/list hit.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -173,7 +183,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                                    "description": "true: only contested; false: only \
                                                    uncontested." },
                     "archived": { "type": "boolean",
-                                  "description": "List archived memories instead of active." }
+                                  "description": "List archived memories instead of active." },
+                    "file": { "type": "string",
+                              "description": "Only memories anchored to this file path." },
+                    "commit": { "type": "string",
+                                "description": "Only memories anchored to this commit SHA." },
+                    "symbol": { "type": "string",
+                                "description": "Only memories anchored to this symbol." }
                 }
             }),
         },
@@ -208,7 +224,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "context": { "type": "string" },
                     "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0,
                                     "description": "Trust prior 0.0-1.0; lower it when a \
-                                                    memory looks unreliable or outdated." }
+                                                    memory looks unreliable." }
                 },
                 "required": ["id"]
             }),
@@ -247,8 +263,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "context",
             description: "Project memory digest: recent + important memories and a total \
-                          count for the current namespace. Use at the start of work to load \
-                          standing context before the user's first specific request.",
+                          count for the current namespace. Use at the start of work.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}
@@ -257,10 +272,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         ToolDef {
             name: "memory_feedback",
             description: "Report whether a recalled memory was actually useful. Use AFTER \
-                          acting on a memory recall surfaced: 'helpful' if it helped, \
-                          'wrong' if it was incorrect, 'stale' if it was once right but is \
-                          now outdated. This is the usefulness signal access counts cannot \
-                          capture; it adjusts the memory's trust so future recalls improve.",
+                          acting on one: 'helpful', 'wrong', or 'stale'. Adjusts the \
+                          memory's trust so future recalls improve.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -359,8 +372,9 @@ mod tests {
     #[test]
     fn recall_and_list_schemas_expose_the_unified_filter_params() {
         // SRH-3 (PRD 2026-07-02): recall and list advertise the SAME optional
-        // filter params, so the MCP surface reaches parity with the CLI flags.
-        const FILTER_PARAMS: [&str; 11] = [
+        // filter params, so the MCP surface reaches parity with the CLI flags
+        // (incl. the typed-code-anchor filters file/commit/symbol).
+        const FILTER_PARAMS: [&str; 14] = [
             "type",
             "tags",
             "min_importance",
@@ -372,6 +386,9 @@ mod tests {
             "source",
             "contested",
             "archived",
+            "file",
+            "commit",
+            "symbol",
         ];
         for tool_name in ["recall", "list"] {
             let t = tool_definitions()
@@ -529,7 +546,16 @@ mod tests {
             .collect();
         assert_eq!(required, vec!["content"]);
         let props = t.input_schema["properties"].as_object().unwrap();
-        for opt in ["context", "type", "importance", "tags"] {
+        for opt in [
+            "context",
+            "type",
+            "importance",
+            "tags",
+            // Typed-code-anchor capture params (PRD 2026-07-02).
+            "files",
+            "commits",
+            "symbols",
+        ] {
             assert!(
                 props.contains_key(opt),
                 "remember should accept optional {opt}"

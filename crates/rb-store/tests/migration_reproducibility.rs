@@ -46,6 +46,13 @@ fn fresh_db_exercises_every_query_path() {
     b.summary = "sqlite-vec knn".to_string();
     b.keywords = vec!["sqlite".to_string(), "vector".to_string()];
     b.tags = vec!["db".to_string(), "search".to_string()];
+    // Typed code anchors (migration 009): populated so the anchor
+    // insert/load/filter paths are all exercised by this gate.
+    b.anchors = vec![
+        rb_types::MemoryAnchor::parse_file_spec("src/store/core.rs:10-20").unwrap(),
+        rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc123def").unwrap(),
+        rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "SqliteStore::open").unwrap(),
+    ];
     let emb_b: [f32; DIM] = [0.0, 1.0, 0.0, 0.0];
     store.insert_memory(&b, Some(&emb_b)).unwrap();
 
@@ -103,6 +110,32 @@ fn fresh_db_exercises_every_query_path() {
     assert!(
         neighbors.contains(&(b.id.clone(), 1)),
         "graph_neighbors must reach b from a at hop distance 1"
+    );
+
+    // --- anchors (migration 009): round-trip through get + the filter path
+    let got_b = store.get_memory(&b.id).unwrap().unwrap();
+    assert_eq!(got_b.anchors, b.anchors, "anchors must round-trip");
+    assert!(
+        got.anchors.is_empty(),
+        "an anchor-less row loads an empty list (no backfill)"
+    );
+    let anchored = store
+        .list_filtered(
+            &ns,
+            &rb_types::RecallFilter {
+                anchors: vec![rb_types::AnchorFilter {
+                    kind: rb_types::AnchorKind::File,
+                    value: "src/store/core.rs".to_string(),
+                }],
+                ..Default::default()
+            },
+            10,
+        )
+        .unwrap();
+    assert_eq!(
+        anchored.iter().map(|m| m.id.clone()).collect::<Vec<_>>(),
+        vec![b.id.clone()],
+        "anchor-filtered list must reach the anchored row"
     );
 
     // --- list: active only, ORDER BY created_at DESC

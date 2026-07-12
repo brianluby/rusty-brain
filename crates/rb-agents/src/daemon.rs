@@ -75,20 +75,17 @@ impl DaemonClient {
         tags: Vec<String>,
         confidence: Option<f32>,
     ) -> Option<MemoryId> {
-        let fut = self.client.remember(
+        self.remember_anchored(
             content,
             context,
             memory_type,
             importance,
-            Vec::new(),
             tags,
-            Vec::new(),
             confidence,
-        );
-        match tokio::time::timeout(self.timeout, fut).await {
-            Ok(Ok(id)) => Some(id),
-            Ok(Err(_)) | Err(_) => None,
-        }
+            Vec::new(),
+            None,
+        )
+        .await
     }
 
     /// Best-effort `remember` that ATOMICALLY supersedes `supersedes` with the
@@ -106,7 +103,46 @@ impl DaemonClient {
         confidence: Option<f32>,
         supersedes: MemoryId,
     ) -> Option<MemoryId> {
-        let fut = self.client.remember_superseding(
+        self.remember_anchored(
+            content,
+            context,
+            memory_type,
+            importance,
+            tags,
+            confidence,
+            Vec::new(),
+            Some(supersedes),
+        )
+        .await
+    }
+
+    /// Best-effort `remember` carrying typed code anchors (PRD 2026-07-02)
+    /// and an optional atomic supersede. STRICTLY FAIL-OPEN like the rest of
+    /// the hook surface: when the daemon did not advertise anchor support,
+    /// the anchors are DROPPED (logged at debug) and the memory is stored
+    /// un-anchored — a summary must never be lost over an old daemon.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_anchored(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        tags: Vec<String>,
+        confidence: Option<f32>,
+        anchors: Vec<rb_types::MemoryAnchor>,
+        supersedes: Option<MemoryId>,
+    ) -> Option<MemoryId> {
+        let anchors = if anchors.is_empty() || self.client.supports_anchors() {
+            anchors
+        } else {
+            tracing::debug!(
+                dropped = anchors.len(),
+                "daemon lacks anchor support; storing without anchors"
+            );
+            Vec::new()
+        };
+        let fut = self.client.remember_anchored(
             content,
             context,
             memory_type,
@@ -115,6 +151,7 @@ impl DaemonClient {
             tags,
             Vec::new(),
             confidence,
+            anchors,
             supersedes,
         );
         match tokio::time::timeout(self.timeout, fut).await {
@@ -288,6 +325,36 @@ mod tests {
         // user/host were not declared: the daemon fell back to its own whoami.
         assert_eq!(note.origin_user, rb_config::current_user());
         assert_eq!(note.origin_host, rb_config::current_hostname());
+
+        // Typed code anchors: the real daemon advertises the capability, so
+        // an anchored best-effort remember persists its anchors.
+        let anchors = vec![
+            rb_types::MemoryAnchor::parse_file_spec("src/server.rs:1-9").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Server::run").unwrap(),
+        ];
+        let anchored_id = client
+            .remember_anchored(
+                "anchored session summary".to_string(),
+                None,
+                MemoryType::Insight,
+                6,
+                vec!["hook".to_string()],
+                Some(0.7),
+                anchors.clone(),
+                None,
+            )
+            .await
+            .expect("anchored remember must return an id");
+        let (recent, important, _total) = client.context().await.expect("context");
+        let anchored_note = recent
+            .iter()
+            .chain(important.iter())
+            .find(|m| m.id == anchored_id)
+            .expect("anchored memory must appear");
+        assert_eq!(
+            anchored_note.anchors, anchors,
+            "anchors must persist through the fail-open hook client"
+        );
 
         let _ = shutdown.send(());
         let _ = handle.await;

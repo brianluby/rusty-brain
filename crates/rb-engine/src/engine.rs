@@ -23,6 +23,10 @@ pub struct RememberInput {
     /// enricher must not override (fix #4). Hook captures send `Some(0.7)`.
     pub confidence: Option<f32>,
     pub provenance: Provenance,
+    /// Typed code anchors (PRD 2026-07-02): structured file/commit/symbol
+    /// links stored with the memory. Validated fail-closed; empty is the
+    /// pre-anchor behavior (anchors are never required).
+    pub anchors: Vec<rb_types::MemoryAnchor>,
 }
 
 /// What `recall_with_status` returns (W1.6d): the ranked results plus whether
@@ -174,19 +178,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     }
 
     /// Fail-fast filter gate shared by `recall` and `list`: range/bound
-    /// validation plus the anchor rejection — the anchors TABLE ships with the
-    /// typed-code-anchors PRD, so until then a non-empty anchor filter is an
-    /// explicit error, never a silently ignored constraint.
+    /// validation, including anchor-filter values (empty-after-normalization
+    /// values are a caller mistake, rejected before any query runs).
     fn ensure_filter_supported(filter: &rb_types::RecallFilter) -> rb_types::Result<()> {
-        filter.validate()?;
-        if !filter.anchors.is_empty() {
-            return Err(rb_types::Error::InvalidArgument(
-                "anchor filters are not supported yet (the memory_anchors table ships with \
-                 typed code anchors)"
-                    .to_string(),
-            ));
-        }
-        Ok(())
+        filter.validate()
     }
 
     async fn get_scoped(&self, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
@@ -205,6 +200,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // rather than a Storage one). `None` carries no prior — valid.
         if let Some(c) = input.confidence {
             rb_types::validate_confidence(c)?;
+        }
+        // Anchor validation is fail-closed at the engine boundary (the store
+        // re-validates; the SQL CHECKs are the last backstop).
+        for anchor in &input.anchors {
+            anchor.validate()?;
         }
 
         let mut note = MemoryNote::new(
@@ -262,6 +262,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .unwrap_or_default()
         };
         note.related_files = input.related_files;
+        note.anchors = input.anchors;
         if let Some(ctx) = input.context {
             note.context = ctx;
         }
@@ -749,12 +750,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// List memories in the engine namespace, most-recent first, filtered by
     /// the unified [`rb_types::RecallFilter`] (PRD 2026-07-02 search-filter
-    /// parity). EVERY dimension — metadata AND the contested tri-state — is
-    /// honored by the backend's bounded query (SQL on the real store), so
-    /// `limit` fills with actual matches no matter how deep they sit; a
-    /// backend error under a contested filter fails the list (fail-closed —
-    /// never silently unfiltered results). Anchors are rejected until typed
-    /// code anchors land.
+    /// parity). EVERY dimension — metadata, anchors, AND the contested
+    /// tri-state — is honored by the backend's bounded query (SQL on the real
+    /// store), so `limit` fills with actual matches no matter how deep they
+    /// sit; a backend error under a contested filter fails the list
+    /// (fail-closed — never silently unfiltered results).
     pub async fn list(
         &self,
         filter: &rb_types::RecallFilter,
@@ -995,6 +995,7 @@ mod tests {
             // enricher (when present) may fill it.
             confidence: None,
             provenance: Provenance::default(),
+            anchors: Vec::new(),
         }
     }
 
@@ -1235,21 +1236,99 @@ mod tests {
         assert_eq!(all.len(), 2);
     }
 
+    fn file_anchor_filter(path: &str) -> rb_types::RecallFilter {
+        rb_types::RecallFilter {
+            anchors: vec![rb_types::AnchorFilter {
+                kind: rb_types::AnchorKind::File,
+                value: path.to_string(),
+            }],
+            ..Default::default()
+        }
+    }
+
     #[tokio::test]
-    async fn recall_rejects_anchor_filters_until_typed_anchors_land() {
+    async fn remember_persists_anchors_and_recall_filters_by_them() {
+        // The PRD acceptance criterion end-to-end at the engine layer: a
+        // memory stored with a file anchor is returned by recall filtered to
+        // that file, and absent when filtered to a different file.
+        let eng = engine();
+        let mut anchored_input = input("anchored decision about the server", 7);
+        anchored_input.anchors = vec![
+            rb_types::MemoryAnchor::parse_file_spec("src/server.rs:10-40").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Server::run").unwrap(),
+        ];
+        let anchored_id = eng.remember(anchored_input).await.unwrap();
+        let _plain_id = eng
+            .remember(input("plain decision about the server", 7))
+            .await
+            .unwrap();
+
+        let stored = eng.get(anchored_id.clone()).await.unwrap().unwrap();
+        assert_eq!(stored.anchors.len(), 2, "anchors persist through remember");
+
+        let hits = eng
+            .recall("server", 10, &file_anchor_filter("src/server.rs"))
+            .await
+            .unwrap();
+        assert_eq!(
+            hits.iter().map(|r| r.memory.id.clone()).collect::<Vec<_>>(),
+            vec![anchored_id.clone()],
+            "recall scoped to the anchored file returns ONLY the anchored memory"
+        );
+        let misses = eng
+            .recall("server", 10, &file_anchor_filter("src/other.rs"))
+            .await
+            .unwrap();
+        assert!(misses.is_empty(), "a different file matches nothing");
+    }
+
+    #[tokio::test]
+    async fn recall_composes_anchor_and_metadata_filters() {
+        let eng = engine();
+        let anchor = rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap();
+        let ids = seed_notes(&eng, 3, |i, note| {
+            if i < 2 {
+                note.anchors = vec![anchor.clone()];
+            }
+            note.importance = if i == 0 { 8 } else { 3 };
+        })
+        .await;
+        let mut filter = file_anchor_filter("./src/a.rs"); // normalization applies
+        filter.min_importance = Some(7);
+        let results = eng.recall("seeded", 10, &filter).await.unwrap();
+        assert_eq!(
+            results
+                .iter()
+                .map(|r| r.memory.id.clone())
+                .collect::<Vec<_>>(),
+            vec![ids[0].clone()],
+            "anchor + min-importance must compose (only note 0 satisfies both)"
+        );
+    }
+
+    #[tokio::test]
+    async fn remember_rejects_invalid_anchors_fail_closed() {
+        let eng = engine();
+        let mut bad = input("bad anchor", 5);
+        bad.anchors = vec![rb_types::MemoryAnchor {
+            kind: rb_types::AnchorKind::Commit,
+            value: "abc".into(),
+            start_line: Some(3), // lines are file-only
+            end_line: None,
+        }];
+        let err = eng.remember(bad).await.unwrap_err();
+        assert!(
+            matches!(err, rb_types::Error::InvalidArgument(_)),
+            "expected InvalidArgument, got {err:?}"
+        );
+        assert_eq!(eng.backend().count(), 0, "nothing may be stored");
+    }
+
+    #[tokio::test]
+    async fn recall_rejects_empty_anchor_filter_values() {
         let eng = engine();
         let err = eng
-            .recall(
-                "q",
-                10,
-                &only(rb_types::RecallFilter {
-                    anchors: vec![rb_types::AnchorFilter {
-                        kind: rb_types::AnchorKind::File,
-                        value: "src/lib.rs".into(),
-                    }],
-                    ..Default::default()
-                }),
-            )
+            .recall("q", 10, &file_anchor_filter("   "))
             .await
             .unwrap_err();
         assert!(
@@ -1406,9 +1485,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn list_rejects_anchor_filters_and_invalid_bounds() {
+    async fn list_honors_anchor_filters() {
         let eng = engine();
-        let err = eng
+        let symbol =
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Engine::recall").unwrap();
+        let ids = seed_notes(&eng, 2, |i, note| {
+            if i == 0 {
+                note.anchors = vec![symbol.clone()];
+            }
+        })
+        .await;
+        let listed = eng
             .list(
                 &only(rb_types::RecallFilter {
                     anchors: vec![rb_types::AnchorFilter {
@@ -1420,9 +1507,16 @@ mod tests {
                 10,
             )
             .await
-            .unwrap_err();
-        assert!(matches!(err, rb_types::Error::InvalidArgument(_)));
+            .unwrap();
+        assert_eq!(
+            listed.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            vec![ids[0].clone()]
+        );
+    }
 
+    #[tokio::test]
+    async fn list_rejects_invalid_bounds() {
+        let eng = engine();
         let err = eng
             .list(
                 &only(rb_types::RecallFilter {

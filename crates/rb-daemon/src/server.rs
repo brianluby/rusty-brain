@@ -636,6 +636,7 @@ async fn handle_connection(
                 "contract mismatch: server {CONTRACT_VERSION}, client {}",
                 handshake.contract_version
             )),
+            capabilities: vec![],
         };
         write_frame(&mut framed, &ack).await?;
         return Ok(());
@@ -648,6 +649,7 @@ async fn handle_connection(
                 contract_version: CONTRACT_VERSION,
                 ok: false,
                 message: Some(e.to_string()),
+                capabilities: vec![],
             };
             write_frame(&mut framed, &ack).await?;
             return Ok(());
@@ -657,6 +659,11 @@ async fn handle_connection(
         contract_version: CONTRACT_VERSION,
         ok: true,
         message: None,
+        // Typed code anchors (PRD 2026-07-02): this daemon evaluates anchor
+        // payloads, so advertise the capability — clients gate anchor-bearing
+        // requests on it (pre-anchor daemons never send it). Old clients
+        // ignore the additive field.
+        capabilities: vec![rb_proto::CAP_ANCHORS.to_string()],
     };
     write_frame(&mut framed, &ack).await?;
 
@@ -929,6 +936,7 @@ where
             related_files,
             confidence,
             supersedes,
+            anchors,
         } => {
             let input = RememberInput {
                 content,
@@ -940,6 +948,7 @@ where
                 related_files,
                 confidence,
                 provenance: provenance.clone(),
+                anchors,
             };
             match engine.remember(input).await {
                 Ok(id) => {

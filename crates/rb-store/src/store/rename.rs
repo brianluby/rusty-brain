@@ -23,6 +23,9 @@ impl SqliteStore {
     ///   have no vector (W1.7 hygiene), so `vectors <= memories`.
     /// - `memory_links` — carries no namespace column; edges key on memory ids
     ///   and survive untouched.
+    /// - `memory_anchors` — namespace mirrors memories.namespace (the 009
+    ///   migration's scoping column for anchor-filter lookups), so it is
+    ///   re-keyed with a plain UPDATE in the same transaction.
     /// - `memory_oplog` — ONE `namespace_rename` row recording old, new and
     ///   the row counts; historical oplog rows keep their original namespace
     ///   (the log is history, not state).
@@ -107,6 +110,16 @@ impl SqliteStore {
                 .conn
                 .execute(
                     "UPDATE memories SET namespace = ?1 WHERE namespace = ?2",
+                    rusqlite::params![new_str, old_str],
+                )
+                .map_err(storage_err)?;
+
+            // Re-key the anchor scoping column in the same transaction (it
+            // mirrors memories.namespace; a stranded old-namespace anchor
+            // would silently drop out of anchor-filter lookups).
+            self.conn
+                .execute(
+                    "UPDATE memory_anchors SET namespace = ?1 WHERE namespace = ?2",
                     rusqlite::params![new_str, old_str],
                 )
                 .map_err(storage_err)?;
@@ -323,6 +336,47 @@ mod namespace_rename_tests {
         assert_eq!(v["moved"], 3);
         assert_eq!(v["vectors"], 2);
         assert_eq!(v["merged_into"], 0);
+    }
+
+    #[test]
+    fn rename_rekeys_anchor_namespace_and_anchor_filters_follow() {
+        // memory_anchors.namespace mirrors memories.namespace; a rename must
+        // re-key it in the same transaction so anchors stay attached AND the
+        // anchor-filter list keeps finding the memory under the new namespace.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = Namespace::Project("anchored-old".into());
+        let new = Namespace::Project("anchored-new".into());
+
+        let mut m = MemoryNote::new(old.clone(), "anchored".into(), MemoryType::Insight, 5);
+        m.anchors = vec![rb_types::MemoryAnchor::parse_file_spec("src/server.rs:1-3").unwrap()];
+        store.insert_memory(&m, None).unwrap();
+
+        store.rename_namespace(&old, &new, false).unwrap();
+
+        let stranded: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_anchors WHERE namespace = ?1",
+                rusqlite::params![old.as_db_string()],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stranded, 0, "no anchor may stay under the old namespace");
+
+        let filter = rb_types::RecallFilter {
+            anchors: vec![rb_types::AnchorFilter {
+                kind: rb_types::AnchorKind::File,
+                value: "src/server.rs".into(),
+            }],
+            ..Default::default()
+        };
+        let hits = store.list_filtered(&new, &filter, 10).unwrap();
+        assert_eq!(
+            hits.iter().map(|n| n.id.clone()).collect::<Vec<_>>(),
+            vec![m.id.clone()],
+            "the anchor filter must find the memory in the NEW namespace"
+        );
+        assert_eq!(hits[0].anchors, m.anchors, "anchors stay attached");
     }
 
     #[test]

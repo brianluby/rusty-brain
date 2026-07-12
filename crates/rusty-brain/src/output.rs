@@ -42,6 +42,17 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
     out.trim_end().to_string()
 }
 
+/// Compact one-line anchor suffix for human renderings (typed code anchors,
+/// ANC-4: `graph <id>` and friends list anchors): ` [anchors: file:src/a.rs,
+/// commit:abc123]`, or empty when the note has none.
+fn anchors_suffix(n: &MemoryNote) -> String {
+    if n.anchors.is_empty() {
+        return String::new();
+    }
+    let labels: Vec<String> = n.anchors.iter().map(ToString::to_string).collect();
+    format!(" [anchors: {}]", labels.join(", "))
+}
+
 /// Render a list of notes (used by `list`, `graph`, and the `context` halves).
 pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
     if json {
@@ -63,12 +74,13 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         // Surface the contested flag (Feature C) inline for the human reader.
         let contested = if n.contested { " [contested]" } else { "" };
         out.push_str(&format!(
-            "{} (imp {}, {}){} {}\n",
+            "{} (imp {}, {}){} {}{}\n",
             n.id,
             n.importance,
             n.memory_type.as_str(),
             contested,
-            summary
+            summary,
+            anchors_suffix(n)
         ));
     }
     out.trim_end().to_string()
@@ -87,13 +99,20 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             // Surface the contested flag (Feature C) on the get read path too, so
             // every human surface (recall/list/context/get) marks a contradicted note.
             let contested = if n.contested { " [contested]" } else { "" };
+            let anchors = if n.anchors.is_empty() {
+                String::new()
+            } else {
+                let labels: Vec<String> = n.anchors.iter().map(ToString::to_string).collect();
+                format!("\nanchors: {}", labels.join(", "))
+            };
             format!(
-                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}\n\n{}",
+                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
                 n.id,
                 contested,
                 n.namespace.as_db_string(),
                 n.memory_type.as_str(),
                 n.importance,
+                anchors,
                 n.content
             )
         }
@@ -703,6 +722,7 @@ mod tests {
             importance: 8,
             source: "docs/adr.md".to_string(),
             tags: Vec::new(),
+            anchors: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);
@@ -727,6 +747,7 @@ mod tests {
             importance: 5,
             source: format!("docs/{token}.md"),
             tags: Vec::new(),
+            anchors: Vec::new(),
         }];
 
         let human = render_import_plan(&items, false);
@@ -797,6 +818,31 @@ mod tests {
         assert!(none.to_lowercase().contains("not found"));
         let json_none = render_get(&None, true);
         assert_eq!(json_none.trim(), "null");
+    }
+
+    #[test]
+    fn render_surfaces_anchors_on_get_and_notes() {
+        // ANC-4: `graph <id>`/`list`/`get` list a memory's anchors.
+        let mut n = note("anchored body", 5);
+        n.anchors = vec![
+            rb_types::MemoryAnchor::parse_file_spec("src/a.rs:3-9").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Foo::bar").unwrap(),
+        ];
+        let got = render_get(&Some(n.clone()), false);
+        assert!(
+            got.contains("anchors: file:src/a.rs:3-9, symbol:Foo::bar"),
+            "{got}"
+        );
+
+        let listed = render_notes(&[n], false);
+        assert!(
+            listed.contains("[anchors: file:src/a.rs:3-9, symbol:Foo::bar]"),
+            "{listed}"
+        );
+
+        // Anchor-less notes render exactly as before (no empty suffix).
+        let plain = render_notes(&[note("plain", 5)], false);
+        assert!(!plain.contains("anchors"), "{plain}");
     }
 
     #[test]

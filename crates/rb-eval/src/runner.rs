@@ -160,6 +160,7 @@ async fn ingest<P: EmbeddingProvider>(
                 related_files: Vec::new(),
                 confidence: None,
                 provenance: Default::default(),
+                anchors: Vec::new(),
             })
             .await?;
         // Apply the authored confidence (no-op at the 1.0 default).

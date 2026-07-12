@@ -5,6 +5,33 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Typed code anchors (PRD 2026-07-02)
+
+- **First-class, queryable code anchors**: a memory can now carry structured
+  `file` (+ optional 1-based line range), `commit`, and `symbol` anchors,
+  stored in the additive `memory_anchors` table (migration 009 — no ALTER on
+  `memories`, no backfill, no `CONTRACT_VERSION` bump). Capture:
+  `remember --file src/foo.rs:12-40 --commit <sha> --symbol Foo::bar`
+  (repeatable), MCP `remember` `files`/`commits`/`symbols` params, and the
+  SessionEnd hook fold now AUTO-ANCHORS the session summary to the touched
+  files (fail-open, capped like the summary's file section). Recall/list
+  filter by anchor — `--file <path>` / `--commit <sha>` / `--symbol <name>`
+  (CLI + MCP; all-of composition with each other and with the metadata
+  filters) — with normalization on both sides (`./src/a.rs` == `src/a.rs`;
+  file filters match by path, line ranges are capture-only). Anchors ride
+  `graph`/`get`/`list` output, survive `export`/`restore`, and follow a
+  `namespace rename`. v1 ships anchors as a FILTER only; ranking boosts are
+  deferred to W4.1 evidence per the PRD.
+- **`anchors` daemon capability on the handshake ack**: the additive
+  `HandshakeAck.capabilities` list lets clients distinguish an
+  anchor-evaluating daemon from an older one that would silently drop
+  `Remember.anchors` or ignore anchor filters. Typed clients (and the MCP
+  adapter's raw path) fail fast with `InvalidArgument` when anchors are used
+  against a daemon that did not advertise the capability; the hook path stays
+  fail-open and stores the summary WITHOUT anchors instead. The default MCP
+  `tools/list` stays under the W3.3 token budget (897/900) — existing
+  descriptions were tightened to make room for the anchor params.
+
 ### Added — Contract-drift guard (W5a.4 operationalized)
 
 - **`rb-contract-guard` + `contract-drift` CI job**: the wire surface

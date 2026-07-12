@@ -260,6 +260,7 @@ async fn full_flow_through_public_api() {
             related_files: Vec::new(),
             confidence: Some(1.0),
             provenance: Default::default(),
+            anchors: Vec::new(),
         })
         .await
         .unwrap();

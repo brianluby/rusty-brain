@@ -47,6 +47,7 @@ fn build_recall_filter(
     source: Vec<String>,
     contested: Option<bool>,
     archived: bool,
+    anchors: Vec<rb_types::AnchorFilter>,
 ) -> rb_types::RecallFilter {
     rb_types::RecallFilter {
         types: memory_type.into_iter().collect(),
@@ -64,8 +65,19 @@ fn build_recall_filter(
         } else {
             rb_types::MemoryState::Active
         },
-        anchors: Vec::new(),
+        anchors,
     }
+}
+
+/// Concatenate the per-kind anchor filter flags (`--file`/`--commit`/
+/// `--symbol`, each already parse-validated by clap) into the single
+/// [`rb_types::RecallFilter::anchors`] list (all-of composition).
+fn collect_anchor_filters(
+    file: Vec<rb_types::AnchorFilter>,
+    commit: Vec<rb_types::AnchorFilter>,
+    symbol: Vec<rb_types::AnchorFilter>,
+) -> Vec<rb_types::AnchorFilter> {
+    file.into_iter().chain(commit).chain(symbol).collect()
 }
 
 /// Execute the parsed CLI with a pre-resolved `namespace` (resolved OFF the
@@ -335,8 +347,15 @@ async fn run_client(
             context,
             tags,
             supersedes,
+            file,
+            commit,
+            symbol,
             batch,
         } => {
+            // Typed code anchors: parse-validated per flag; one flat list on
+            // the wire. Applied uniformly in --batch mode (like --tags).
+            let anchors: Vec<rb_types::MemoryAnchor> =
+                file.into_iter().chain(commit).chain(symbol).collect();
             // CLI `remember` declares no explicit prior: the daemon applies the
             // 1.0 baseline (and an enricher may fill it).
             if batch {
@@ -353,7 +372,7 @@ async fn run_client(
                         continue;
                     }
                     client
-                        .remember(
+                        .remember_anchored(
                             fact.to_string(),
                             context.clone(),
                             memory_type,
@@ -361,6 +380,8 @@ async fn run_client(
                             Vec::new(),
                             tags.clone(),
                             Vec::new(),
+                            None,
+                            anchors.clone(),
                             None,
                         )
                         .await
@@ -381,38 +402,24 @@ async fn run_client(
             } else {
                 let content = content
                     .context("remember requires a content argument unless --batch is set")?;
-                let id = match supersedes {
-                    Some(old) => {
-                        let old = parse_id(&old).context("--supersedes must be a memory UUID")?;
-                        client
-                            .remember_superseding(
-                                content,
-                                context,
-                                memory_type,
-                                importance,
-                                Vec::new(),
-                                tags,
-                                Vec::new(),
-                                None,
-                                old,
-                            )
-                            .await
-                            .context("remember --supersedes failed")?
-                    }
-                    None => client
-                        .remember(
-                            content,
-                            context,
-                            memory_type,
-                            importance,
-                            Vec::new(),
-                            tags,
-                            Vec::new(),
-                            None,
-                        )
-                        .await
-                        .context("remember failed")?,
-                };
+                let supersedes = supersedes
+                    .map(|old| parse_id(&old).context("--supersedes must be a memory UUID"))
+                    .transpose()?;
+                let id = client
+                    .remember_anchored(
+                        content,
+                        context,
+                        memory_type,
+                        importance,
+                        Vec::new(),
+                        tags,
+                        Vec::new(),
+                        None,
+                        anchors,
+                        supersedes,
+                    )
+                    .await
+                    .context("remember failed")?;
                 println!("{}", output::render_remembered(&id, json));
             }
         }
@@ -430,6 +437,9 @@ async fn run_client(
             source,
             contested,
             archived,
+            file,
+            commit,
+            symbol,
         } => {
             let filter = build_recall_filter(
                 memory_type,
@@ -443,6 +453,7 @@ async fn run_client(
                 source,
                 contested,
                 archived,
+                collect_anchor_filters(file, commit, symbol),
             );
             let (results, degraded) = client
                 .recall_filtered_with_status(query, filter, limit)
@@ -477,6 +488,9 @@ async fn run_client(
             source,
             contested,
             archived,
+            file,
+            commit,
+            symbol,
         } => {
             let filter = build_recall_filter(
                 memory_type,
@@ -490,6 +504,7 @@ async fn run_client(
                 source,
                 contested,
                 archived,
+                collect_anchor_filters(file, commit, symbol),
             );
             let notes = client
                 .list_filtered(filter, limit)

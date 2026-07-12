@@ -46,8 +46,10 @@ pub trait MemoryBackend: Send + Sync {
     /// the SAME semantics as [`MemoryBackend::active_contradicts`] (the store
     /// pins the two with a drift test; in-memory impls delegate to their own
     /// `active_contradicts`). An error resolving contested fails the list
-    /// (fail-closed). `anchors` is NOT evaluated here — the engine rejects it
-    /// until typed code anchors land.
+    /// (fail-closed). `anchors` IS evaluated here too (all-of, the
+    /// [`RecallFilter::matches`] semantics — the SQL store probes
+    /// `memory_anchors`, in-memory impls rely on `matches` reading the
+    /// note's own anchors).
     async fn list(
         &self,
         ns: Namespace,
