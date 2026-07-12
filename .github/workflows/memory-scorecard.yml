@@ -85,6 +85,44 @@ jobs:
             exit 1
           fi
 
+      - name: Preflight - bare claude session probe (prints result record, no secrets)
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          # One minimal -p session outside the scorecard harness: isolates
+          # key/billing/model-access errors from harness (hooks/daemon) errors.
+          # Only the stream-json system/result records are printed; they carry
+          # no key material.
+          npm install -g @anthropic-ai/claude-code
+          probe_home="$(mktemp -d)"
+          printf '{"hasCompletedOnboarding": true}\n' > "${probe_home}/.claude.json"
+          probe_proj="$(mktemp -d)"
+          set +e
+          (
+            export HOME="$probe_home"
+            cd "$probe_proj"
+            timeout 120 claude -p 'reply with exactly: ok' \
+              --model haiku --max-budget-usd 0.50 \
+              --output-format stream-json --verbose </dev/null
+          ) | python3 -c '
+          import sys, json
+          for line in sys.stdin:
+              try:
+                  r = json.loads(line)
+              except ValueError:
+                  continue
+              t = r.get("type")
+              if t == "system" and r.get("subtype") == "init":
+                  print("apiKeySource:", r.get("apiKeySource"), "| model:", r.get("model"))
+              if t == "result":
+                  print("result subtype:", r.get("subtype"),
+                        "| is_error:", r.get("is_error"),
+                        "| turns:", r.get("num_turns"),
+                        "| cost_usd:", r.get("total_cost_usd"))
+                  print("result text:", str(r.get("result"))[:300])
+          '
+          set -e
+
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           persist-credentials: false
