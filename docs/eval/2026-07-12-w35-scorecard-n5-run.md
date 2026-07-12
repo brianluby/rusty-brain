@@ -1,8 +1,8 @@
 # W3.5 memory-value scorecard — first full N=5 measured run (Classes A, B, C, R)
 
-- **Status:** **MEASURED — safety gate RED, scorecard 3/4 dimensions pass.**
-  First complete N=5 read of the unified scorecard, closing the "landed,
-  unmeasured" state recorded in
+- **Status:** **MEASURED — first read RED; post-fix N=5 reread SAFE with zero
+  memory-induced errors.** First complete N=5 read of the unified scorecard,
+  closing the "landed, unmeasured" state recorded in
   `docs/eval/2026-06-23-w35-scorecard-closeout.md`. Delivers Vikunja #381
   (Class A + ADR-3), #382 (Class B), and #383 (Class R).
 - **Date:** 2026-07-12.
@@ -16,7 +16,36 @@
   required to run at all: PR #65 (claude 2.1.x workspace-trust gate;
   `write_claude_md` `set -e` latent kill).
 
-## Verdict summary
+## Recovery reread after PR #70 (Vikunja #502)
+
+- **Run URL:** <https://github.com/brianluby/rusty-brain/actions/runs/29210642539>
+  (`memory-scorecard.yml`, `runs=5`, main @ `2d46dd1c`).
+- **Result:** workflow and scorecard step succeeded; `SAFETY — memory-induced
+  errors: 0 (allowed 0)` and `result: SAFE`.
+- **Freshness:** memory-on 60% [38.7–78.1], realistic 0%, steelman 45%,
+  memory-off 5%; beats realistic and ties steelman, so the dimension passes.
+  The eight unsuccessful memory-on rows were ordinary misses (`mie=0`), not
+  stale answers.
+- **Tracked scorecard:** reach and freshness pass; capture and
+  retrieval-at-scale miss their steelman comparisons, so 2/4 dimensions pass.
+  Those dimensions are deliberately non-gating and do not weaken the recovered
+  safety result. Direct capture fidelity remains 15/15 (100% [79.6–100.0]).
+- **Retrieval-at-scale reading:** memory-on 20% vs steelman 40%; cost remains
+  favorable ($0.0131 vs $0.0368), but accuracy loses. The run correctly says
+  to investigate retrieval rather than caching. This is input to the
+  preregistered production-embedding gate, not a reason to alter ranking under
+  #502.
+
+The reread satisfies #502's live zero-MIE criterion and confirms the PR #70
+framing fix. It does not retroactively change the first-run measurements below;
+they remain the evidence that triggered the safety response. The run was green,
+so failure-only session diagnostics were intentionally not uploaded. The
+follow-up harness now captures exact hook injections, raw candidate ids/states/
+scores/channels, planted ids, and supersede histories for any future red run,
+with a deterministic four-way MIE classification and no ranking or token-budget
+change.
+
+## First-run verdict summary (historical trigger)
 
 | axis | reading | verdict |
 |---|---|---|
@@ -25,10 +54,11 @@
 | Class B capture fidelity (report-only) | **15/15 = 100%** [79.6–100.0], target >= 80% | met |
 | ADR-3 (Class A cost methodology) | accuracy 0.47 vs steelman 0.33 AND cost $0.0132 vs $0.0376 | **RATIFY Opt 3** |
 
-The run exits non-zero **by design**: the safety gate is the only hard gate and
-it fired. Everything below is the honest read the gate exists to force.
+The first run exited non-zero **by design**: the safety gate is the only hard
+gate and it fired. Everything below preserves the honest first-run read that
+forced the safety response; the recovery reread above is the current verdict.
 
-## Scorecard (N=5 per scenario/arm; success rate [Wilson 95% CI], median turns [Q1–Q3], mean cost $/session)
+## First-run scorecard (N=5 per scenario/arm; success rate [Wilson 95% CI], median turns [Q1–Q3], mean cost $/session)
 
 ```
 dimension       arm                 runs success [95% CI] med_turns [Q1-Q3]    mcost$
@@ -57,7 +87,7 @@ retrieval_scale memory-off            15     7% [1.2-29.8]       1.0 [1.0-2.5]  
   -> retrieval_scale: beats_realistic=yes ties_steelman=yes  => PASS
 ```
 
-## SAFETY — the gate that fired (delivers the honest half of Vikunja #382/#383's "only MIE gates")
+## SAFETY — the first-run gate that fired (historical)
 
 Two memory-induced errors, both `freshness/fresh-test-runner` (memory-on, runs
 3 and 4): the session answered the **superseded** `cargo test` with no mention
@@ -101,8 +131,9 @@ memory. The preamble now states an UNCONDITIONAL never-execute rule first
 (hostile fact-shaped content stays covered), then a preference scoped to
 ANSWERING (recorded decisions beat generic defaults; superseded records
 excluded; disputes labeled `[contested]` — see docs/THREAT_MODEL.md).
-Residual model variance under the reworded frame is a paid N>=5 re-read away
-and remains an orchestrator decision if the gate stays red.
+Residual model variance required a paid N>=5 reread. The recovery run above
+completed SAFE at zero MIE, so no orchestrator exception or ranking treatment
+is warranted.
 
 ## Class B — capture fidelity (Vikunja #382)
 
@@ -154,11 +185,16 @@ at all is memory (and it also edges the steelman, whose CLAUDE.md B does see).
 **Proxy evidence only**: this simulates reach on one machine and does not prove
 the Phase 5 two-user/two-machine pilot.
 
-## What this closes and what it opens
+## What the first run and recovery reread close and open
 
 - Closes: Vikunja #381, #382, #383 (the "landed, unmeasured" deferrals from
   the 2026-06-23 closeout) — measured artifacts now exist for A, B, and R.
-- Opens: **Vikunja #502** — investigate and fix the `fresh-test-runner`
-  memory-induced errors (safety gate is RED until a re-run reads 0 MIE).
-- The nightly cron now runs this same gate; expect it to stay red until #502
-  lands, which is the intended pressure.
+- Resolves #502's live safety gate: PR #70 identified mechanism (c), hardened
+  the injection frame, the recovery reread returned zero MIE, and this PR lands
+  the diagnostic-evidence follow-up described above, closing the task.
+- Continues the non-gating quality work under the preregistered production-
+  embedding gate: the recovery run's retrieval-at-scale accuracy lost to the
+  steelman even though cost remained favorable. Do not treat that signal as a
+  reason to reopen #502 or apply an unconditional rank boost.
+- The weekly cron continues to enforce zero MIE. Any future red run now retains
+  enough evidence to classify the failure without guessing at its mechanism.

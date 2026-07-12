@@ -79,6 +79,13 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ### Fixed — Freshness memory-induced errors: injection framing (Vikunja #502)
 
+- **Safety gate recovered on the paid N=5 reread**: GitHub Actions run
+  `29210642539` on main @ `2d46dd1c` completed `SAFE` with **zero
+  memory-induced errors**. Freshness still passed (memory-on 60%, realistic
+  0%, steelman 45%); its unsuccessful rows were ordinary misses, not stale
+  answers. Capture and retrieval-at-scale each missed their tracked,
+  non-gating steelman comparison and remain evaluation work rather than safety
+  regressions.
 - **Mechanism established** for the 2026-07-12 N=5 scorecard safety-gate RED
   (`freshness/fresh-test-runner`, memory-on runs 3 and 4): NOT an
   archived-value leak and NOT a recall miss — a deterministic local
@@ -112,13 +119,24 @@ All notable changes to rusty-brain are documented here. The format is based on
   harness deleted its workroot unconditionally, which made the MIEs
   undiagnosable. Opt-in retention via `--log-dir DIR` or
   `RB_SCORECARD_KEEP_LOGS=1` (anchored to `--out`; `resolve_log_dir` fails
-  closed without an anchor or when the `--out` directory is missing) copies
-  exactly the harness-written logs by name (`work.jsonl`, `plant.jsonl`,
-  `judge.txt`, `daemon.log` — no store DBs, no seeded CLAUDE.md, no stray
-  files, no key material) out before cleanup, warning per failed file;
+  closed without an anchor or when the `--out` directory is missing) copies a
+  strict allowlist of harness-written session logs (`work.jsonl`,
+  `plant.jsonl`, `judge.txt`, `daemon.log`) and diagnostic JSON — no store DBs,
+  no seeded CLAUDE.md, no arbitrary files, no key material — out before
+  cleanup, warning per failed file;
   `memory-scorecard.yml` retains them and uploads a
   `memory-scorecard-session-logs` artifact on failure. Exercised by
   `--self-test`.
+- **Failure evidence now closes the diagnostic loop**: before each memory-on
+  model session, the harness uses only read-only `context`, `recall`, and
+  `history` paths plus the real hook binary to retain the exact SessionStart
+  digest, prompt-time injection, active/archived candidates (ids, state,
+  scores, and channel contribution flags), planted ids, and full supersede
+  histories. An outcome record deterministically classifies any future MIE as
+  stale content surfaced, current chain head missed, current evidence ignored,
+  or no evidence/model guess. The strict retention allowlist admits only those
+  harness-authored files; model-created files, DBs, and arbitrary JSON remain
+  excluded. No rank, prompt budget, or stored state changes.
 
 ### Added — Guided contradiction/dedup review (PRD 2026-07-02)
 

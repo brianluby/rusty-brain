@@ -20,9 +20,11 @@
 # is_error), followed by Class B capture fields
 # (cap_fidelity/cap_reason/cap_summary_count/cap_mcp_bypass_count). It contains
 # counts, costs, booleans, and bounded reason codes, not model free-text.
-# On FAILURE it additionally uploads the per-session logs the harness retained
-# via --log-dir (Vikunja #502) so a red safety gate is diagnosable; these are
-# model/session transcripts and daemon logs, never key material.
+# On FAILURE it additionally uploads the per-session evidence the harness
+# retained via --log-dir (Vikunja #502): model/session transcripts, daemon
+# logs, exact SessionStart/prompt-time injections, raw active/archived recall
+# candidates (ids, states, scores, channel flags), and supersede histories.
+# These diagnostics are synthetic scorecard data and never key material.
 #
 # Required repository secret:
 #   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.
@@ -169,13 +171,14 @@ jobs:
           case "$RUNS_INPUT" in
             ''|*[!0-9]*|0) echo "::error::'runs' must be a positive integer (got '$RUNS_INPUT')"; exit 1 ;;
           esac
-          # --log-dir retains the per-session logs (stream-json session logs,
-          # judged text, memory-on daemon logs) that the harness otherwise
-          # deletes with its workroot — the 2026-07-12 N=5 safety-gate MIEs
-          # were undiagnosable without them (Vikunja #502). They are uploaded
-          # only on failure (below) and carry no key material: claude -p
-          # stream-json never echoes ANTHROPIC_API_KEY, and the rusty-brain
-          # daemon never receives it.
+          # --log-dir retains the per-session evidence (stream-json session
+          # logs, judged text, daemon logs, exact hook injections, raw ranked
+          # candidates/states/channels, and supersede histories) that the
+          # harness otherwise deletes with its workroot. The first 2026-07-12
+          # N=5 safety-gate MIEs were undiagnosable without this evidence
+          # (Vikunja #502). It is uploaded only on failure (below) and carries
+          # no key material: claude -p never echoes ANTHROPIC_API_KEY, the
+          # daemon never receives it, and the scorecard corpus is synthetic.
           scripts/memory-scorecard.sh \
             --bin-dir target/release \
             --runs "$RUNS_INPUT" \
@@ -190,7 +193,7 @@ jobs:
           path: ${{ runner.temp }}/memory-scorecard.tsv
           if-no-files-found: ignore
 
-      - name: Upload per-session logs (failure diagnosis, Vikunja #502)
+      - name: Upload per-session diagnostics (failure diagnosis, Vikunja #502)
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
