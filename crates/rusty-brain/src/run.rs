@@ -133,11 +133,22 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 namespace,
                 effective.embed_backend.clone(),
                 effective.local_model.clone(),
+                effective.retention.clone(),
                 cli.json,
             )
             .await
         }
-        other => run_client(other, cli.json, namespace, &socket_path, &db_path).await,
+        other => {
+            run_client(
+                other,
+                cli.json,
+                namespace,
+                &socket_path,
+                &db_path,
+                effective.retention.clone(),
+            )
+            .await
+        }
     }
 }
 
@@ -158,6 +169,7 @@ async fn run_client(
     namespace: rb_types::Namespace,
     socket_path: &std::path::Path,
     db_path: &std::path::Path,
+    retention: Option<rb_types::RetentionPolicy>,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
     let ns_str = namespace.as_db_string();
@@ -683,6 +695,66 @@ async fn run_client(
                 println!("{{\"scanned\":{scanned},\"changed\":{changed},\"skipped\":{skipped}}}");
             } else {
                 println!("reembed: scanned={scanned} changed={changed} skipped={skipped}");
+            }
+        }
+        Command::Forget {
+            dry_run,
+            apply,
+            hard,
+        } => {
+            // No [retention] section = no policy = nothing to do — a clear
+            // error, not a silent no-op (fail closed both ways).
+            let Some(policy) = retention else {
+                anyhow::bail!(
+                    "retention is not configured: add a [retention] section to {} \
+                     (see the retention PRD; forgetting is opt-in)",
+                    rb_config::config_file_path()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|_| "~/.config/rusty-brain/config.toml".to_string())
+                );
+            };
+            let mode = if hard {
+                rb_types::ForgetMode::Hard
+            } else {
+                rb_types::ForgetMode::Apply
+            };
+            let execute = (apply || hard) && !dry_run;
+            if execute {
+                // Friendly client-side refusal; the daemon AND the store
+                // refuse a disabled policy too (defense in depth).
+                if !policy.enabled {
+                    anyhow::bail!(
+                        "retention.enabled = false: refusing to execute; run \
+                         `rusty-brain forget --dry-run` to preview, then set \
+                         retention.enabled = true to allow forgetting"
+                    );
+                }
+                let outcome = client
+                    .forget_execute(policy, mode)
+                    .await
+                    .context("forget failed")?;
+                println!("{}", output::render_forget_outcome(&outcome, json));
+                if outcome.remaining > 0 {
+                    // stderr so `--json` stdout stays machine-parseable.
+                    eprintln!(
+                        "note: {} eligible memories remain (bounded pass); \
+                         re-run to continue",
+                        outcome.remaining
+                    );
+                }
+            } else {
+                let plan = client
+                    .forget_plan(policy, mode)
+                    .await
+                    .context("forget dry-run failed")?;
+                println!("{}", output::render_forget_plan(&plan, json));
+                if !plan.candidates.is_empty() {
+                    let flag = if hard { "--hard" } else { "--apply" };
+                    eprintln!(
+                        "dry-run only — nothing was changed; run `rusty-brain forget {flag}` \
+                         to execute"
+                    );
+                }
             }
         }
         Command::Scrub => {

@@ -96,6 +96,9 @@ pub async fn run_serve(
         db_path: effective.db_path,
         read_pool_size,
         jobs_config,
+        // Retention PRD: the resolved (validated, fail-closed) [retention]
+        // policy; None = unconfigured, the daemon stays inert.
+        retention_policy: effective.retention,
         request_idle_timeout: effective
             .idle_timeout_secs
             .map(std::time::Duration::from_secs),
@@ -277,6 +280,7 @@ mod tests {
             db_path: dir.path().join("rb.sqlite"),
             read_pool_size: 4,
             jobs_config: rb_daemon::JobsConfig::default(),
+            retention_policy: None,
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,

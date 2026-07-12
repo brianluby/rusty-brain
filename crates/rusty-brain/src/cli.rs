@@ -565,6 +565,32 @@ pub enum Command {
         limit: Option<usize>,
     },
 
+    /// Preview or execute the declarative [retention] forgetting policy
+    /// (retention PRD). With no flags this is a DRY-RUN: it lists exactly
+    /// what one apply pass would archive — with reasons (age, importance,
+    /// last-recalled, archived state) — and writes NOTHING. Requires a
+    /// [retention] section in the user config; executing additionally
+    /// requires `retention.enabled = true`. Guardrails are absolute: the
+    /// importance floor (effective AND author-set), protected tags, and
+    /// contested memories are never swept.
+    Forget {
+        /// Preview only (the default posture even without this flag).
+        /// Combine with --hard to preview the purge set instead.
+        #[arg(long)]
+        dry_run: bool,
+        /// Execute one bounded pass: ARCHIVE eligible memories (soft delete,
+        /// reversible; vectors are pruned, the row is kept).
+        #[arg(long, conflicts_with = "hard")]
+        apply: bool,
+        /// HARD mode: irreversibly purge eligible memories (row, FTS,
+        /// vectors, feedback, and their oplog history — one purge marker
+        /// remains). Includes already-archived rows past max_age_days.
+        /// Admin op like scrub: only a client running as the daemon's own
+        /// user may execute it. With --dry-run, previews the purge set.
+        #[arg(long)]
+        hard: bool,
+    },
+
     /// Retroactively redact secrets from every stored memory (W2.4). Rewrites
     /// content/summary/context in place and marks affected rows for
     /// re-embedding; follow with `rusty-brain reembed` until changed=0. Admin
@@ -776,6 +802,45 @@ mod tests {
             Command::Recall { contested, .. } => assert_eq!(contested, Some(true)),
             other => panic!("expected Recall, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn forget_defaults_to_dry_run_and_flags_compose() {
+        // Bare `forget` is a DRY-RUN (safety posture): no execution flag, no
+        // writes. `--apply` and `--hard` are the explicit executes; adding
+        // `--dry-run` to either turns it back into a preview of that mode.
+        let cli = Cli::parse_from(["rusty-brain", "forget"]);
+        match cli.command {
+            Command::Forget {
+                dry_run,
+                apply,
+                hard,
+            } => {
+                assert!(!dry_run && !apply && !hard);
+            }
+            other => panic!("expected Forget, got {other:?}"),
+        }
+        for args in [
+            ["rusty-brain", "forget", "--apply"].as_slice(),
+            ["rusty-brain", "forget", "--hard"].as_slice(),
+            ["rusty-brain", "forget", "--dry-run"].as_slice(),
+            ["rusty-brain", "forget", "--hard", "--dry-run"].as_slice(),
+            ["rusty-brain", "forget", "--apply", "--dry-run"].as_slice(),
+        ] {
+            assert!(Cli::try_parse_from(args).is_ok(), "{args:?} must parse");
+        }
+    }
+
+    #[test]
+    fn forget_rejects_apply_with_hard_and_garbage() {
+        // apply and hard are mutually exclusive modes; garbage input is a
+        // clean parse error, never a panic.
+        assert!(
+            Cli::try_parse_from(["rusty-brain", "forget", "--apply", "--hard"]).is_err(),
+            "--apply conflicts with --hard"
+        );
+        assert!(Cli::try_parse_from(["rusty-brain", "forget", "--nonsense"]).is_err());
+        assert!(Cli::try_parse_from(["rusty-brain", "forget", "extra-positional"]).is_err());
     }
 
     #[test]

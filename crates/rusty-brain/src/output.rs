@@ -456,6 +456,22 @@ pub fn render_stats(
     }
     out.push_str(&format!("contested: {}\n", stats.contested));
     out.push_str(&format!("re-embed backlog: {}\n", stats.reembed_pending));
+    // RET-4 visibility: only rendered when a [retention] policy exists /
+    // a sweep ever ran — "0 eligible" and "no policy" must not look alike.
+    if let Some(eligible) = stats.retention_eligible {
+        let last = match stats.last_forget_at {
+            Some(ts) => format!("last forget {}", format_ts(ts)),
+            None => "last forget never".to_string(),
+        };
+        out.push_str(&format!(
+            "retention: {eligible} eligible to forget; {last}\n"
+        ));
+    } else if let Some(ts) = stats.last_forget_at {
+        out.push_str(&format!(
+            "retention: no policy configured; last forget {}\n",
+            format_ts(ts)
+        ));
+    }
     if !stats.top_recalled.is_empty() {
         out.push_str("top recalled:\n");
         for t in &stats.top_recalled {
@@ -594,6 +610,81 @@ pub fn render_change(item: &rb_proto::SubscribeItem, json: bool) -> String {
             }
         }
     }
+}
+
+/// Render a forget dry-run plan (retention PRD RET-2). JSON: the raw
+/// `ForgetPlan`. Human: one reason-annotated line per candidate — age,
+/// effective/author importance, last-recalled, archived state, matched rule —
+/// so the user can recognize what a pass would touch before allowing it.
+pub fn render_forget_plan(plan: &rb_types::ForgetPlan, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(plan).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render forget plan JSON");
+            "{}".to_string()
+        });
+    }
+    let action = match plan.mode {
+        rb_types::ForgetMode::Apply => "archive",
+        rb_types::ForgetMode::Hard => "PURGE",
+    };
+    if plan.candidates.is_empty() {
+        return format!("forget dry-run: nothing eligible to {action}.");
+    }
+    let mut out = format!(
+        "forget dry-run: one pass would {action} {} of {} eligible\n",
+        plan.candidates.len(),
+        plan.total_eligible
+    );
+    for c in &plan.candidates {
+        let last = match c.last_accessed_at {
+            Some(ts) => format!("last-recalled {}", format_ts(ts)),
+            None => "never recalled".to_string(),
+        };
+        let rule = match c.rule {
+            rb_types::ForgetRule::ArchiveAge => "archive_after_days",
+            rb_types::ForgetRule::MaxAge => "max_age_days",
+        };
+        let state = if c.archived {
+            " [already archived]"
+        } else {
+            ""
+        };
+        out.push_str(&format!(
+            "  {} imp {}/{} age {}d {} [{rule}]{state} {}\n",
+            c.id,
+            c.importance,
+            c.base_importance,
+            c.age_days,
+            last,
+            redact(&c.summary)
+        ));
+    }
+    out.trim_end().to_string()
+}
+
+/// Render a forget execution outcome. JSON: the raw `ForgetOutcome`.
+pub fn render_forget_outcome(outcome: &rb_types::ForgetOutcome, json: bool) -> String {
+    if json {
+        return serde_json::to_string_pretty(outcome).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render forget outcome JSON");
+            "{}".to_string()
+        });
+    }
+    format!(
+        "forget ({}): archived={} purged={} eligible={} remaining={}",
+        outcome.mode.as_str(),
+        outcome.archived,
+        outcome.purged,
+        outcome.total_eligible,
+        outcome.remaining
+    )
+}
+
+/// Unix seconds to a short UTC date for the human reason lines.
+fn format_ts(ts: i64) -> String {
+    chrono::DateTime::<chrono::Utc>::from_timestamp(ts, 0)
+        .map(|dt| dt.format("%Y-%m-%d").to_string())
+        .unwrap_or_else(|| format!("@{ts}"))
 }
 
 #[cfg(test)]
@@ -903,7 +994,79 @@ mod tests {
                 count: 2,
             }],
             reembed_pending: 3,
+            retention_eligible: Some(4),
+            last_forget_at: Some(1_700_000_000),
         }
+    }
+
+    #[test]
+    fn human_stats_reports_retention_gauges_when_present() {
+        // RET-4: eligible-forgetting count and last-forget run are visible in
+        // the human rendering; absent gauges (no policy / never swept) leave
+        // no confusing zero lines.
+        let stats = sample_stats();
+        let out = render_stats(&stats, "deterministic", true, false);
+        assert!(out.contains("retention: 4 eligible"), "{out}");
+        assert!(out.contains("last forget"), "{out}");
+
+        let mut bare = sample_stats();
+        bare.retention_eligible = None;
+        bare.last_forget_at = None;
+        let out = render_stats(&bare, "deterministic", true, false);
+        assert!(!out.contains("retention:"), "{out}");
+    }
+
+    #[test]
+    fn forget_plan_renders_reasons_and_redacts_summaries() {
+        let plan = rb_types::ForgetPlan {
+            mode: rb_types::ForgetMode::Apply,
+            candidates: vec![rb_types::ForgetCandidate {
+                id: rb_types::MemoryId::new(),
+                summary: "old note with key sk-abc123def456ghi789jkl012mno".to_string(),
+                created_at: 1_700_000_000,
+                age_days: 60,
+                importance: 2,
+                base_importance: 3,
+                last_accessed_at: None,
+                archived: false,
+                rule: rb_types::ForgetRule::MaxAge,
+            }],
+            total_eligible: 5,
+        };
+        let out = render_forget_plan(&plan, false);
+        assert!(out.contains("archive 1 of 5 eligible"), "{out}");
+        assert!(out.contains("imp 2/3"), "{out}");
+        assert!(out.contains("age 60d"), "{out}");
+        assert!(out.contains("never recalled"), "{out}");
+        assert!(out.contains("max_age_days"), "{out}");
+        // Summaries pass through the shared redactor: a stored secret must
+        // not leak via a dry-run listing.
+        assert!(!out.contains("sk-abc123def456ghi789jkl012mno"), "{out}");
+
+        let empty = rb_types::ForgetPlan::default();
+        assert!(render_forget_plan(&empty, false).contains("nothing eligible"));
+
+        let json_out = render_forget_plan(&plan, true);
+        let parsed: rb_types::ForgetPlan = serde_json::from_str(&json_out).unwrap();
+        assert_eq!(parsed, plan);
+    }
+
+    #[test]
+    fn forget_outcome_renders_counts_in_both_modes() {
+        let outcome = rb_types::ForgetOutcome {
+            mode: rb_types::ForgetMode::Hard,
+            archived: 0,
+            purged: 2,
+            total_eligible: 3,
+            remaining: 1,
+        };
+        let out = render_forget_outcome(&outcome, false);
+        assert!(out.contains("hard"), "{out}");
+        assert!(out.contains("purged=2"), "{out}");
+        assert!(out.contains("remaining=1"), "{out}");
+        let parsed: rb_types::ForgetOutcome =
+            serde_json::from_str(&render_forget_outcome(&outcome, true)).unwrap();
+        assert_eq!(parsed, outcome);
     }
 
     #[test]

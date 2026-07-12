@@ -629,6 +629,12 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
             }),
             false,
         ),
+        // Forget is DELIBERATELY not an MCP tool (retention PRD): a
+        // destructive surface stays off the model-facing toolset (and the
+        // tools/list budget sits at 893/900). Projected anyway so the
+        // mapping stays total.
+        Response::ForgetPlanned { plan } => ToolContent::json(json!({ "plan": plan }), false),
+        Response::ForgetDone { outcome } => ToolContent::json(json!({ "outcome": outcome }), false),
         Response::Error { kind, message } => ToolContent::json(
             json!({ "error": { "kind": kind, "message": message } }),
             true,

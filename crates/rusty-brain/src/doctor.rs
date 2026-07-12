@@ -448,12 +448,75 @@ fn check_embedding_identity(
 
 /// Run the full doctor flow and print the report; `Err` (non-zero exit) when
 /// any check FAILS. Never auto-starts the daemon and never writes.
+/// Retention-policy lint (retention PRD RET-4): purely static — no daemon,
+/// no DB. The guardrails themselves are absolute (floor/protected/contested
+/// enforcement lives in the store), so doctor's job is the POLICY-level
+/// review: warn when the configured policy would forget high-importance
+/// memories or uses an aggressively short horizon.
+fn check_retention(policy: Option<&rb_types::RetentionPolicy>) -> DoctorCheck {
+    let name = "retention-policy";
+    let Some(policy) = policy else {
+        return DoctorCheck {
+            name,
+            status: CheckStatus::Skipped,
+            detail: "no [retention] policy configured; forgetting is off".to_string(),
+            hint: None,
+        };
+    };
+    // Floor > 8 makes importance-8/9 memories (author-marked high) eligible.
+    if policy.importance_floor > 8 {
+        return DoctorCheck {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "importance_floor {} would forget high-importance memories \
+                 (everything below {}, including importance 8-9)",
+                policy.importance_floor, policy.importance_floor
+            ),
+            hint: Some("lower retention.importance_floor (default 6)".to_string()),
+        };
+    }
+    const AGGRESSIVE_MAX_AGE_DAYS: u32 = 30;
+    if let Some(days) = policy.max_age_days {
+        if days < AGGRESSIVE_MAX_AGE_DAYS {
+            return DoctorCheck {
+                name,
+                status: CheckStatus::Warn,
+                detail: format!(
+                    "max_age_days {days} is an aggressive forget horizon \
+                     (less than {AGGRESSIVE_MAX_AGE_DAYS} days)"
+                ),
+                hint: Some(
+                    "preview with `rusty-brain forget` before enabling/applying".to_string(),
+                ),
+            };
+        }
+    }
+    DoctorCheck {
+        name,
+        status: CheckStatus::Ok,
+        detail: format!(
+            "enabled={} max_age_days={:?} archive_after_days={:?} floor={} \
+             protected_tags={} batch_limit={}",
+            policy.enabled,
+            policy.max_age_days,
+            policy.archive_after_days,
+            policy.importance_floor,
+            policy.protected_tags.len(),
+            policy.batch_limit
+        ),
+        hint: None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_doctor(
     socket_path: &Path,
     db_path: &Path,
     namespace: rb_types::Namespace,
     embed_backend: Option<String>,
     local_model: Option<String>,
+    retention: Option<rb_types::RetentionPolicy>,
     json: bool,
 ) -> anyhow::Result<()> {
     let mut checks = Vec::new();
@@ -471,6 +534,7 @@ pub async fn run_doctor(
         local_model.as_deref(),
         &mut checks,
     );
+    checks.push(check_retention(retention.as_ref()));
 
     let report = DoctorReport { checks };
     println!("{}", report.render(json));
@@ -488,6 +552,40 @@ pub async fn run_doctor(
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
+
+    #[test]
+    fn retention_check_skips_without_policy_and_warns_on_dangerous_ones() {
+        // RET-4: doctor warns on a policy that would forget high-importance
+        // memories or uses an aggressive horizon; a sane policy is Ok; no
+        // policy is a skip, not a warning.
+        let none = check_retention(None);
+        assert_eq!(none.status, CheckStatus::Skipped, "{none:?}");
+
+        let sane = rb_types::RetentionPolicy {
+            enabled: true,
+            max_age_days: Some(365),
+            archive_after_days: Some(90),
+            protected_tags: vec!["architecture_decision".to_string()],
+            ..rb_types::RetentionPolicy::default()
+        };
+        let ok = check_retention(Some(&sane));
+        assert_eq!(ok.status, CheckStatus::Ok, "{ok:?}");
+
+        let mut high_floor = sane.clone();
+        high_floor.importance_floor = 10;
+        let warn = check_retention(Some(&high_floor));
+        assert_eq!(warn.status, CheckStatus::Warn, "{warn:?}");
+        assert!(
+            warn.detail.contains("high-importance") || warn.detail.contains("importance"),
+            "{warn:?}"
+        );
+
+        let mut aggressive = sane.clone();
+        aggressive.max_age_days = Some(7);
+        let warn = check_retention(Some(&aggressive));
+        assert_eq!(warn.status, CheckStatus::Warn, "{warn:?}");
+        assert!(warn.detail.contains("7"), "{warn:?}");
+    }
 
     #[test]
     fn check_mode_accepts_expected_and_flags_wrong_permissions() {
