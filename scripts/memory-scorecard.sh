@@ -29,9 +29,16 @@
 # scorecard but emits no SAFE/UNSAFE verdict and exits 0. The only hard gate
 # (P4) is zero memory-induced errors, and only from a >=min-runs run.
 #
+# Session-log retention (Vikunja #502): the ephemeral workroot (and with it
+# every per-session stream-json log) is deleted on exit, which made the
+# 2026-07-12 N=5 safety-gate MIEs undiagnosable. Opt in to retention with
+# `--log-dir DIR` (retain there) or `RB_SCORECARD_KEEP_LOGS=1` (retain under
+# `<dir of --out>/scorecard-session-logs`). Retained files are log-shaped only
+# and carry no key material (see preserve_session_logs).
+#
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
-#   memory-scorecard.sh [--agent claude-code|codex|opencode|gemini|hermes|all] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--scenarios-file F]
+#   memory-scorecard.sh [--agent claude-code|codex|opencode|gemini|hermes|all] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--log-dir DIR] [--scenarios-file F]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -482,6 +489,29 @@ reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
   printf '%s\t%s\t%s\t%s\n' "$mb/ha" "$mb/pa" "$mb/hb" "$mb/pb"
 }
 
+# ---- session-log retention (pure; exercised by --self-test) -------------------
+# preserve_session_logs <workroot> <dest>: copy the diagnosable per-session
+# artifacts out of the ephemeral workroot into <dest>, preserving relative
+# paths, before cleanup deletes the workroot (Vikunja #502: the 2026-07-12 N=5
+# safety-gate MIEs were undiagnosable because every session log was rm -rf'd).
+# Copies ONLY log-shaped files — the claude stream-json session logs
+# (work.jsonl / plant.jsonl), the judged model output (judge.txt), and the
+# memory-on daemon log (daemon.log) — never store DBs or seeded CLAUDE.md
+# files, so the retained tree stays small. SECRET-SAFE: none of these carry key
+# material — `claude -p --output-format stream-json` never echoes
+# ANTHROPIC_API_KEY, and the rusty-brain daemon never receives it.
+preserve_session_logs() { # workroot dest
+  local workroot="$1" dest="$2"
+  mkdir -p "$dest"
+  local f rel
+  while IFS= read -r -d '' f; do
+    rel="${f#"$workroot"/}"
+    mkdir -p "$dest/$(dirname "$rel")"
+    cp "$f" "$dest/$rel"
+  done < <(find "$workroot" -type f \
+             \( -name '*.jsonl' -o -name 'judge.txt' -o -name 'daemon.log' \) -print0)
+}
+
 # ---- self-test (no API) ------------------------------------------------------
 self_test() {
   echo "== memory-scorecard self-test (judge + scorecard math; no API) =="
@@ -852,12 +882,45 @@ PY
     echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
   fi
 
+  # Session-log retention (Vikunja #502): preserve_session_logs copies the
+  # diagnosable per-session artifacts (claude stream-json logs, judged text,
+  # daemon logs) out of a workroot into a destination, preserving relative
+  # paths — and copies NOTHING else (no store DBs, no seeded CLAUDE.md), so
+  # the retained artifact stays small and log-shaped.
+  local lw="$tmp/logs-workroot" ld="$tmp/logs-dest"
+  mkdir -p "$lw/fresh-r1/on" "$lw/fresh-r1/realistic/p"
+  printf '{"type":"result"}\n' > "$lw/fresh-r1/on/work.jsonl"
+  printf 'plant\n'             > "$lw/fresh-r1/on/plant.jsonl"
+  printf 'daemon\n'            > "$lw/fresh-r1/on/daemon.log"
+  printf 'judged\n'            > "$lw/fresh-r1/realistic/judge.txt"
+  printf 'db\n'                > "$lw/fresh-r1/on/memory.db"
+  printf 'seeded\n'            > "$lw/fresh-r1/realistic/p/CLAUDE.md"
+  if preserve_session_logs "$lw" "$ld"; then
+    echo "ok: preserve_session_logs succeeds on a populated workroot"
+  else
+    echo "BUG: preserve_session_logs failed on a populated workroot"; fail=1
+  fi
+  for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt; do
+    if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
+  done
+  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md; do
+    if [ ! -e "$ld/$dropped" ]; then echo "ok: preserve_session_logs drops $dropped"; else echo "BUG: preserve_session_logs copied non-log $dropped"; fail=1; fi
+  done
+  # An empty workroot is not an error: retention must never break the run.
+  local lwe="$tmp/logs-empty" lde="$tmp/logs-empty-dest"
+  mkdir -p "$lwe"
+  if preserve_session_logs "$lwe" "$lde" && [ -d "$lde" ]; then
+    echo "ok: preserve_session_logs is a no-op on an empty workroot"
+  else
+    echo "BUG: preserve_session_logs failed on an empty workroot"; fail=1
+  fi
+
   if [ "$fail" -eq 0 ]; then echo "self-test PASS"; return 0; fi
   echo "self-test FAIL" >&2; return 1
 }
 
 # ---- arg parsing -------------------------------------------------------------
-MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""; AGENT="claude-code"; PRE_SCORECARD_ROWS=""
+MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""; AGENT="claude-code"; PRE_SCORECARD_ROWS=""; LOG_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test)      MODE="self-test"; shift ;;
@@ -870,6 +933,7 @@ while [ $# -gt 0 ]; do
                       case "$MIN_RUNS" in ''|*[!0-9]*|0) echo "--min-runs must be a positive integer (got '$MIN_RUNS')" >&2; exit 2 ;; esac
                       shift 2 ;;
     --out)            OUT="${2:?--out needs a value}"; shift 2 ;;
+    --log-dir)        LOG_DIR="${2:?--log-dir needs a value}"; shift 2 ;;
     --scenarios-file) SCENARIOS_FILE="${2:?--scenarios-file needs a value}"; shift 2 ;;
     -h|--help)        awk 'NR>1 && /^#/ {print; next} NR>1 {exit}' "$0"; exit 2 ;;
     *)                echo "unknown arg: $1" >&2; exit 2 ;;
@@ -929,7 +993,27 @@ RESULTS="${OUT:-$WORKROOT/scorecard.tsv}"; : > "$RESULTS"
 if [ -n "$PRE_SCORECARD_ROWS" ]; then
   printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RESULTS"
 fi
-cleanup() { rm -rf "$WORKROOT" 2>/dev/null || true; }
+# Session-log retention (Vikunja #502): --log-dir wins; RB_SCORECARD_KEEP_LOGS=1
+# derives the dir from --out (fail fast without an anchor — logs written into
+# the about-to-be-deleted workroot would be silently lost, the exact defect
+# this fixes).
+if [ -z "$LOG_DIR" ] && [ "${RB_SCORECARD_KEEP_LOGS:-0}" = "1" ]; then
+  if [ -n "$OUT" ]; then
+    LOG_DIR="$(cd "$(dirname "$OUT")" && pwd)/scorecard-session-logs"
+  else
+    echo "RB_SCORECARD_KEEP_LOGS=1 needs --out (to anchor the log dir) or an explicit --log-dir" >&2
+    exit 2
+  fi
+fi
+cleanup() {
+  # Retention is best-effort by design: a copy failure must never mask the
+  # run's own exit code (the safety gate) — but it runs BEFORE the rm.
+  if [ -n "$LOG_DIR" ]; then
+    preserve_session_logs "$WORKROOT" "$LOG_DIR" \
+      || echo "WARN: session-log retention to $LOG_DIR failed (continuing cleanup)" >&2
+  fi
+  rm -rf "$WORKROOT" 2>/dev/null || true
+}
 trap cleanup EXIT
 
 seed_home() { # home [proj]
@@ -1183,8 +1267,11 @@ run_scenario() { # row
       # daemon's output: a fail-closed bind gate with the output discarded turns
       # every failure into an unactionable "did not bind". It carries no secrets
       # (the daemon never receives ANTHROPIC_API_KEY) and is printed only on a
-      # bind failure.
-      derr="$sockdir/daemon.log"
+      # bind failure. The log lives under the WORKROOT (not the short-lived
+      # sockdir) so opt-in session-log retention (Vikunja #502) preserves it;
+      # only the SOCKET needs the short /tmp path (unix socket length limits).
+      mkdir -p "$mb"
+      derr="$mb/daemon.log"
       rusty-brain serve >"$derr" 2>&1 &
       dpid=$!
       # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
