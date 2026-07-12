@@ -1470,43 +1470,41 @@ impl Store for SqliteStore {
     }
 
     fn supersede(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        // Every guard lives in the shared primitive (#501,
+        // `supersede_guarded_in_tx` — the one choke point that makes the
+        // pointer graph structurally acyclic); this wrapper only owns the
+        // transaction and the general-path error mapping:
+        // - self-supersede is a static caller bug (InvalidArgument);
+        // - a missing row on either side is a precise NotFound;
+        // - an already-resolved old row or a non-current new target means the
+        //   caller's plan was formed against a stale view (StalePlan): the
+        //   established lineage must never be rewritten, and pointing lineage
+        //   at a dead end would fabricate a decision-evolution step on the
+        //   W2.2 audit surface.
         let now = chrono::Utc::now().timestamp();
         immediate_tx(&self.conn, || {
-            // Point old -> new. FK on superseded_by makes a missing `new` fail here,
-            // rolling back the whole transaction (old stays unarchived).
-            let affected = self
-                .conn
-                .execute(
-                    "UPDATE memories SET superseded_by = ?1, updated_at = ?2 WHERE memory_id = ?3",
-                    rusqlite::params![new.to_string(), now, old.to_string()],
-                )
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            // Fail fast on a missing `old`: 0 rows updated means a caller bug, not a
-            // silent success. Returning the error rolls the whole transaction back.
-            if affected == 0 {
-                return Err(Error::NotFound(old.clone()));
+            match self.supersede_guarded_in_tx(old, new, now)? {
+                SupersedeGuard::Applied => Ok(()),
+                SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
+                    "a memory cannot supersede itself: {old}"
+                ))),
+                SupersedeGuard::MissingOld => Err(Error::NotFound(old.clone())),
+                SupersedeGuard::OldResolved {
+                    archived,
+                    superseded,
+                } => Err(Error::StalePlan(format!(
+                    "{old} was already resolved (archived: {archived}, superseded: \
+                     {superseded}); re-plan against the current row"
+                ))),
+                SupersedeGuard::MissingNew => Err(Error::NotFound(new.clone())),
+                SupersedeGuard::NewNotCurrent {
+                    archived,
+                    superseded,
+                } => Err(Error::StalePlan(format!(
+                    "{new} is no longer current truth (archived: {archived}, superseded: \
+                     {superseded}); a supersede must point at an active replacement"
+                ))),
             }
-            // Archive old (idempotent: only if currently active).
-            self.conn
-                .execute(
-                    "UPDATE memories SET archived_at = ?1, updated_at = ?1
-                     WHERE memory_id = ?2 AND archived_at IS NULL",
-                    rusqlite::params![now, old.to_string()],
-                )
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            // Vector hygiene (W1.7): the superseded (now archived) memory's
-            // vector leaves the KNN index in the same transaction. Idempotent:
-            // a vectorless or already-cleaned row deletes nothing.
-            self.conn
-                .execute(
-                    "DELETE FROM memory_vectors WHERE memory_id = ?1",
-                    rusqlite::params![old.to_string()],
-                )
-                .map_err(|e| Error::Storage(e.to_string()))?;
-            // One `supersede` oplog row covers the whole compound mutation
-            // (pointer + archive); the replacement id rides in `details`.
-            let details = serde_json::json!({ "new": new.to_string() }).to_string();
-            append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
         })
     }
 
@@ -1807,6 +1805,124 @@ impl Store for SqliteStore {
             }
             Ok(())
         })
+    }
+}
+
+/// Outcome of the guarded supersede pointer-take (#501). The guards are
+/// shared by every supersede path; each caller owns the error mapping (the
+/// review-merge path wants its keyed StalePlan message, the general path
+/// disambiguates NotFound), so the guard reports data, not errors. One
+/// distinct variant per guard: callers match exhaustively, so adding a guard
+/// forces every caller to reconsider its mapping.
+pub(crate) enum SupersedeGuard {
+    /// Pointer taken, old row archived, vector pruned, oplog row appended.
+    Applied,
+    /// `old == new`: statically invalid, nothing was written.
+    SelfSupersede,
+    /// The old row does not exist.
+    MissingOld,
+    /// The old row was already resolved (archived and/or superseded): the
+    /// guarded UPDATE refused and nothing was written.
+    OldResolved { archived: bool, superseded: bool },
+    /// The new target does not exist.
+    MissingNew,
+    /// The new target is not current truth (archived and/or superseded):
+    /// refused before the pointer UPDATE, nothing was written.
+    NewNotCurrent { archived: bool, superseded: bool },
+}
+
+impl SqliteStore {
+    /// The guarded supersede transaction body (#501, generalizing the PR #63
+    /// review-merge guard) — the ONE choke point that structurally enforces
+    /// acyclicity, with no reliance on caller invariants:
+    ///
+    /// 1. `old != new` (a self-loop is never a replacement);
+    /// 2. `new` is CURRENT TRUTH — present, active, not itself superseded —
+    ///    so the last edge of any would-be cycle, which necessarily targets
+    ///    an already-superseded row, is refused here;
+    /// 3. the pointer UPDATE (pointer + archive + `updated_at` in ONE
+    ///    statement, `WHERE superseded_by IS NULL AND archived_at IS NULL`)
+    ///    with a rows-affected check makes `superseded_by` set-once, so
+    ///    lineage can never be silently rewritten.
+    ///
+    /// On `Applied` the vector is pruned (W1.7) and the `supersede` oplog row
+    /// appended in the same transaction. MUST run inside an open transaction;
+    /// callers map every non-`Applied` outcome to their own error so the
+    /// whole transaction rolls back. The `superseded_by` FK stays as
+    /// belt-and-suspenders behind the explicit `new`-side check.
+    pub(crate) fn supersede_guarded_in_tx(
+        &self,
+        old: &MemoryId,
+        new: &MemoryId,
+        now_ts: i64,
+    ) -> Result<SupersedeGuard> {
+        if old == new {
+            return Ok(SupersedeGuard::SelfSupersede);
+        }
+        let new_row: Option<(bool, bool)> = match self.conn.query_row(
+            "SELECT archived_at IS NOT NULL, superseded_by IS NOT NULL
+             FROM memories WHERE memory_id = ?1",
+            rusqlite::params![new.to_string()],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        ) {
+            Ok(v) => Some(v),
+            Err(rusqlite::Error::QueryReturnedNoRows) => None,
+            Err(e) => return Err(Error::Storage(e.to_string())),
+        };
+        match new_row {
+            None => return Ok(SupersedeGuard::MissingNew),
+            Some((false, false)) => {}
+            Some((archived, superseded)) => {
+                return Ok(SupersedeGuard::NewNotCurrent {
+                    archived,
+                    superseded,
+                })
+            }
+        }
+        let affected = self
+            .conn
+            .execute(
+                "UPDATE memories
+                 SET superseded_by = ?1, archived_at = ?2, updated_at = ?2
+                 WHERE memory_id = ?3 AND superseded_by IS NULL AND archived_at IS NULL",
+                rusqlite::params![new.to_string(), now_ts, old.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        if affected == 0 {
+            // Disambiguate the guard miss: a missing row vs one already
+            // resolved by a concurrent/prior action.
+            let row: Option<(bool, bool)> = match self.conn.query_row(
+                "SELECT archived_at IS NOT NULL, superseded_by IS NOT NULL
+                 FROM memories WHERE memory_id = ?1",
+                rusqlite::params![old.to_string()],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            ) {
+                Ok(v) => Some(v),
+                Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                Err(e) => return Err(Error::Storage(e.to_string())),
+            };
+            return Ok(match row {
+                None => SupersedeGuard::MissingOld,
+                Some((archived, superseded)) => SupersedeGuard::OldResolved {
+                    archived,
+                    superseded,
+                },
+            });
+        }
+        // Vector hygiene (W1.7): the superseded (now archived) memory's
+        // vector leaves the KNN index in the same transaction. Idempotent:
+        // a vectorless row deletes nothing.
+        self.conn
+            .execute(
+                "DELETE FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![old.to_string()],
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        // One `supersede` oplog row covers the whole compound mutation
+        // (pointer + archive); the replacement id rides in `details`.
+        let details = serde_json::json!({ "new": new.to_string() }).to_string();
+        append_oplog(&self.conn, &self.site_id, "supersede", old, &details)?;
+        Ok(SupersedeGuard::Applied)
     }
 }
 #[cfg(test)]
@@ -4055,18 +4171,218 @@ mod access_tests {
     }
 
     #[test]
-    fn supersede_missing_new_target_fails_fk() {
+    fn supersede_missing_new_target_is_not_found() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let old = node(&store, "old");
-        // superseded_by REFERENCES memories(memory_id); a missing target must fail
-        // the FK and leave the old note unchanged (transaction rolled back).
-        // foreign_keys=ON is set in SqliteStore::init, so the FK is enforced
-        // immediately on the UPDATE statement (SQLite FKs are not deferred by default).
-        let err = store.supersede(&old.id, &MemoryId::new()).unwrap_err();
-        assert!(matches!(err, Error::Storage(_)));
+        // The current-truth check on `new` loads the row first, so a missing
+        // target fails closed as NotFound (client-safe and precise) BEFORE any
+        // mutation; the FK on superseded_by stays as belt-and-suspenders. The
+        // old note is unchanged (nothing was written).
+        let missing_new = MemoryId::new();
+        let err = store.supersede(&old.id, &missing_new).unwrap_err();
+        assert!(
+            matches!(err, Error::NotFound(ref id) if *id == missing_new),
+            "got {err:?}"
+        );
         let got = store.get_memory(&old.id).unwrap().unwrap();
         assert!(got.superseded_by.is_none(), "rolled back: no superseded_by");
         assert!(got.archived_at.is_none(), "rolled back: not archived");
+    }
+
+    #[test]
+    fn supersede_rejects_self_supersede() {
+        // #501 guard 1: old == new is statically invalid (a self-loop can
+        // never be a "replacement as current truth") and must be refused
+        // before any SQL runs — a distinct validation-class error.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "self target");
+
+        let err = store.supersede(&a.id, &a.id).unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)), "got {err:?}");
+
+        let got = store.get_memory(&a.id).unwrap().unwrap();
+        assert!(got.superseded_by.is_none(), "row untouched: no pointer");
+        assert!(got.archived_at.is_none(), "row untouched: not archived");
+        let oplog: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_oplog WHERE op = 'supersede'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oplog, 0, "a refused supersede leaves no oplog row");
+    }
+
+    #[test]
+    fn supersede_rejects_already_superseded_old_and_keeps_the_pointer() {
+        // #501 guard 2 (the review-finding regression): the pointer UPDATE is
+        // guarded (`WHERE superseded_by IS NULL AND archived_at IS NULL`), so
+        // a second supersede of the same old row must FAIL with the distinct
+        // stale-plan error instead of silently REWRITING lineage.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "old truth");
+        let first = node(&store, "first replacement");
+        let second = node(&store, "second replacement");
+
+        store.supersede(&old.id, &first.id).unwrap();
+        let err = store.supersede(&old.id, &second.id).unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert_eq!(
+            got.superseded_by.as_ref(),
+            Some(&first.id),
+            "the original pointer must never be overwritten"
+        );
+        // Exactly ONE supersede oplog row: the refused attempt wrote nothing.
+        let oplog: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_oplog WHERE op = 'supersede'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(oplog, 1);
+    }
+
+    #[test]
+    fn supersede_rejects_archived_old() {
+        // #501 guard 2b: an archived old row was already retired (explicit
+        // forget or retention) — a supersede plan against it was formed on a
+        // stale view. Previously this silently set the pointer; now it is the
+        // distinct stale-plan error and the row keeps a NULL pointer.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = node(&store, "retired row");
+        let new = node(&store, "replacement");
+        store.archive_memory(&old.id).unwrap();
+
+        let err = store.supersede(&old.id, &new.id).unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+
+        let got = store.get_memory(&old.id).unwrap().unwrap();
+        assert!(
+            got.superseded_by.is_none(),
+            "no lineage pointer is invented on a retired row"
+        );
+        assert!(got.archived_at.is_some(), "still archived");
+    }
+
+    #[test]
+    fn supersede_guarded_in_tx_owns_every_guard_including_new_side() {
+        // #501 review follow-up (HIGH): the acyclicity induction must be
+        // STRUCTURAL in the one shared primitive, not an undocumented caller
+        // invariant -- an in-tx call passing a non-fresh `new` (which the
+        // review-merge path never does today) must be refused by the
+        // primitive itself, with a distinct variant per guard so each caller
+        // can own its error mapping.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let now = chrono::Utc::now().timestamp();
+
+        // Guard 1 lives in the primitive: self-supersede.
+        let a = node(&store, "self");
+        assert!(matches!(
+            store.supersede_guarded_in_tx(&a.id, &a.id, now).unwrap(),
+            SupersedeGuard::SelfSupersede
+        ));
+
+        // Guard 3 lives in the primitive: missing new target.
+        assert!(matches!(
+            store
+                .supersede_guarded_in_tx(&a.id, &MemoryId::new(), now)
+                .unwrap(),
+            SupersedeGuard::MissingNew
+        ));
+
+        // Guard 3: an archived (non-current) new target.
+        let live = node(&store, "live old");
+        let dead = node(&store, "archived new");
+        store.archive_memory(&dead.id).unwrap();
+        assert!(matches!(
+            store
+                .supersede_guarded_in_tx(&live.id, &dead.id, now)
+                .unwrap(),
+            SupersedeGuard::NewNotCurrent {
+                archived: true,
+                superseded: false
+            }
+        ));
+        let got_live = store.get_memory(&live.id).unwrap().unwrap();
+        assert!(
+            got_live.superseded_by.is_none() && got_live.archived_at.is_none(),
+            "a refused new-side guard writes nothing"
+        );
+
+        // Guard 3: a superseded new target -- the cycle-closing edge.
+        let x = node(&store, "x");
+        let y = node(&store, "y");
+        store.supersede(&x.id, &y.id).unwrap();
+        assert!(matches!(
+            store.supersede_guarded_in_tx(&y.id, &x.id, now).unwrap(),
+            SupersedeGuard::NewNotCurrent {
+                archived: true,
+                superseded: true
+            }
+        ));
+        let got_y = store.get_memory(&y.id).unwrap().unwrap();
+        assert!(got_y.superseded_by.is_none() && got_y.archived_at.is_none());
+
+        // Guard 2 arms are unchanged: missing old / already-resolved old.
+        assert!(matches!(
+            store
+                .supersede_guarded_in_tx(&MemoryId::new(), &a.id, now)
+                .unwrap(),
+            SupersedeGuard::MissingOld
+        ));
+        assert!(matches!(
+            store.supersede_guarded_in_tx(&x.id, &a.id, now).unwrap(),
+            SupersedeGuard::OldResolved {
+                archived: true,
+                superseded: true
+            }
+        ));
+
+        // The happy path through the bare primitive still applies.
+        let b = node(&store, "fresh new");
+        assert!(matches!(
+            store.supersede_guarded_in_tx(&a.id, &b.id, now).unwrap(),
+            SupersedeGuard::Applied
+        ));
+        let got_a = store.get_memory(&a.id).unwrap().unwrap();
+        assert_eq!(got_a.superseded_by.as_ref(), Some(&b.id));
+    }
+
+    #[test]
+    fn supersede_rejects_non_current_new_target() {
+        // #501 guard 3 (the write-side cycle defense): `new` must itself be
+        // current truth (active, not superseded). This is what actually
+        // blocks A->B then B->A — when superseding B, the OLD row B is still
+        // active and unclaimed, so the old-row guard passes; the cycle is
+        // refused because the NEW target A is archived+superseded. Together
+        // with set-once pointers and old != new this makes the pointer graph
+        // acyclic at the write side.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = node(&store, "cycle a");
+        let b = node(&store, "cycle b");
+
+        store.supersede(&a.id, &b.id).unwrap();
+        let err = store.supersede(&b.id, &a.id).unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+
+        // B is fully untouched: still active, still unclaimed.
+        let got_b = store.get_memory(&b.id).unwrap().unwrap();
+        assert!(got_b.superseded_by.is_none(), "no cycle pointer");
+        assert!(got_b.archived_at.is_none(), "B stays active");
+
+        // An archived-but-unsuperseded target is refused the same way.
+        let c = node(&store, "live row");
+        let d = node(&store, "archived target");
+        store.archive_memory(&d.id).unwrap();
+        let err = store.supersede(&c.id, &d.id).unwrap_err();
+        assert!(matches!(err, Error::StalePlan(_)), "got {err:?}");
+        let got_c = store.get_memory(&c.id).unwrap().unwrap();
+        assert!(got_c.superseded_by.is_none() && got_c.archived_at.is_none());
     }
 
     #[test]

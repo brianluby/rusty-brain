@@ -697,9 +697,20 @@ impl SqliteStore {
 
     /// The supersede transaction body with the pointer GUARD: pointer,
     /// archive, vector prune, and one `supersede` oplog row — but only when
-    /// the pointer is still unclaimed on an active row. MUST run inside an
-    /// open transaction; a guard miss is [`Error::StalePlan`] so the whole
-    /// merge rolls back (never a split chain).
+    /// the pointer is still unclaimed on an active row. Delegates to the
+    /// shared guarded primitive (`SqliteStore::supersede_guarded_in_tx`,
+    /// #501) so there is exactly ONE supersede guard in the store; only the
+    /// error mapping is review-specific. MUST run inside an open transaction;
+    /// a guard miss rolls the whole merge back (never a split chain).
+    ///
+    /// Defense-in-depth note: under the current usage every non-`Applied`
+    /// arm is unreachable — the entire merge runs inside ONE single-writer
+    /// transaction whose step 1 verified both members present, active, and
+    /// unresolved, and whose `new` is inserted fresh in the same transaction
+    /// (so the primitive's `new`-side currency check passes by construction).
+    /// The mapping still exists so the merge's all-or-nothing contract holds
+    /// on its own, without depending on caller discipline or the single-tx
+    /// shape staying true forever.
     fn supersede_unclaimed_in_tx(
         &self,
         old: &MemoryId,
@@ -707,30 +718,24 @@ impl SqliteStore {
         now: chrono::DateTime<chrono::Utc>,
         key: &str,
     ) -> Result<()> {
-        let now_ts = now.timestamp();
-        let affected = self
-            .conn
-            .execute(
-                "UPDATE memories
-                 SET superseded_by = ?1, archived_at = ?2, updated_at = ?2
-                 WHERE memory_id = ?3 AND superseded_by IS NULL AND archived_at IS NULL",
-                rusqlite::params![new.to_string(), now_ts, old.to_string()],
-            )
-            .map_err(storage_err)?;
-        if affected == 0 {
-            return Err(Error::StalePlan(format!(
+        use super::core::SupersedeGuard;
+        match self.supersede_guarded_in_tx(old, new, now.timestamp())? {
+            SupersedeGuard::Applied => Ok(()),
+            // A static caller bug, not a raced plan: review_merge rejects
+            // `a == b` and `note.id == a/b` before the transaction opens.
+            SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
+                "a memory cannot supersede itself: {old}"
+            ))),
+            // Exhaustive on purpose (no `_`): a future guard variant must
+            // force this mapping to be reconsidered.
+            SupersedeGuard::MissingOld
+            | SupersedeGuard::OldResolved { .. }
+            | SupersedeGuard::MissingNew
+            | SupersedeGuard::NewNotCurrent { .. } => Err(Error::StalePlan(format!(
                 "{old} was claimed by a concurrent resolution of {key}; re-run review \
                  for a fresh queue"
-            )));
+            ))),
         }
-        self.conn
-            .execute(
-                "DELETE FROM memory_vectors WHERE memory_id = ?1",
-                rusqlite::params![old.to_string()],
-            )
-            .map_err(storage_err)?;
-        let details = serde_json::json!({ "new": new.to_string() }).to_string();
-        super::internal::append_oplog(&self.conn, &self.site_id, "supersede", old, &details)
     }
 
     fn upsert_review_state(

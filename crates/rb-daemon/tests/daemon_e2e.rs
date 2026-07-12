@@ -1574,6 +1574,78 @@ async fn remember_superseding_archives_old_and_keeps_new() {
     daemon.stop().await;
 }
 
+// #501 caller compatibility: the supersede fold after `remember` is
+// best-effort — when the old row was ALREADY resolved (here: superseded by an
+// earlier fold whose id a fail-open hook lost), the store guard refuses the
+// re-supersede, the daemon logs it, and the NEW memory is still stored. The
+// established lineage pointer is never rewritten.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remember_superseding_an_already_resolved_row_keeps_new_and_lineage() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("supersede-stale-wire".to_string());
+    let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
+
+    let old = client
+        .remember(
+            "first draft of the session summary".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let first = client
+        .remember_superseding(
+            "second draft of the session summary".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            old.clone(),
+        )
+        .await
+        .unwrap();
+
+    // A stale client re-supersedes the SAME old id: the remember must still
+    // succeed (best-effort fold), and old must still point at `first`.
+    let second = client
+        .remember_superseding(
+            "third draft written against a stale view".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            old.clone(),
+        )
+        .await
+        .unwrap();
+    assert_ne!(second, first);
+
+    let old_row = client.get(old.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        old_row.superseded_by,
+        Some(first.clone()),
+        "the established lineage pointer is never rewritten"
+    );
+    let second_row = client.get(second.clone()).await.unwrap().unwrap();
+    assert!(
+        second_row.archived_at.is_none(),
+        "the new memory is stored live despite the refused fold"
+    );
+
+    daemon.stop().await;
+}
+
 // W3.1 write-time near-dup suppression: two hook captures with identical
 // content embed to the same vector under the DeterministicProvider, so storing
 // the second (a cosine-1.0 near-dup) absorbs the first via supersede — automatic
