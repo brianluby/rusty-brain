@@ -164,14 +164,19 @@ async fn raw_round_trip(addr: SocketAddr, request: &[u8]) -> (u16, String) {
     (status, body)
 }
 
-/// JSON POST with well-formed loopback Host and JSON content type.
+/// The custom header REQUIRED on every route: it scopes the request AND (as
+/// a non-simple header) forces browsers into a failing CORS preflight.
+const NS_HEADER: (&str, &str) = ("x-rusty-brain-namespace", "global");
+
+/// JSON POST with well-formed loopback Host, JSON content type, and the
+/// required namespace header.
 async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
     let host = addr.to_string();
     let req = build_request(
         "POST",
         path,
         Some(&host),
-        &[("Content-Type", "application/json")],
+        &[("Content-Type", "application/json"), NS_HEADER],
         Some(body),
     );
     raw_round_trip(addr, &req).await
@@ -179,7 +184,7 @@ async fn post_json(addr: SocketAddr, path: &str, body: &str) -> (u16, String) {
 
 async fn get(addr: SocketAddr, path: &str) -> (u16, String) {
     let host = addr.to_string();
-    let req = build_request("GET", path, Some(&host), &[], None);
+    let req = build_request("GET", path, Some(&host), &[NS_HEADER], None);
     raw_round_trip(addr, &req).await
 }
 
@@ -558,6 +563,7 @@ async fn oversized_body_is_413() {
     // Declared oversized length: the server must answer without waiting for
     // the (never-sent) body.
     let mut req = format!("POST /recall HTTP/1.1\r\nHost: {host}\r\n");
+    req.push_str("x-rusty-brain-namespace: global\r\n");
     req.push_str("Content-Type: application/json\r\n");
     req.push_str("Connection: close\r\n");
     req.push_str(&format!("Content-Length: {}\r\n\r\n", 2 * 1024 * 1024));
@@ -610,7 +616,7 @@ async fn post_without_json_content_type_is_415() {
         "POST",
         "/recall",
         Some(&host),
-        &[("Content-Type", "text/plain")],
+        &[("Content-Type", "text/plain"), NS_HEADER],
         Some(&body),
     );
     let (status, resp_body) = raw_round_trip(addr, &req).await;
@@ -621,7 +627,10 @@ async fn post_without_json_content_type_is_415() {
         "POST",
         "/recall",
         Some(&host),
-        &[("Content-Type", "application/json; charset=utf-8")],
+        &[
+            ("Content-Type", "application/json; charset=utf-8"),
+            NS_HEADER,
+        ],
         Some(&body),
     );
     let (status, resp_body) = raw_round_trip(addr, &req).await;
@@ -655,7 +664,7 @@ async fn foreign_or_missing_host_is_rejected() {
         format!("localhost:{}", addr.port()),
         "localhost".to_string(),
     ] {
-        let req = build_request("GET", "/ping", Some(&host), &[], None);
+        let req = build_request("GET", "/ping", Some(&host), &[NS_HEADER], None);
         let (status, body) = raw_round_trip(addr, &req).await;
         assert_eq!(status, 200, "Host {host} must be accepted: {body}");
     }
@@ -667,6 +676,61 @@ async fn foreign_or_missing_host_is_rejected() {
         status == 400 || status == 403,
         "missing Host must be refused, got {status}"
     );
+
+    daemon.stop().await;
+}
+
+/// SECURITY (no-cors blind-trigger defense, CodeRabbit PR #62): browsers
+/// OMIT the Origin header on cross-origin no-cors GETs (img/link tags,
+/// `fetch(..., {mode: "no-cors"})`), and Host on such a request names the
+/// target itself — so the Host and Origin gates alone cannot see them, and a
+/// hostile page could blind-trigger GET routes (skewing `access_count` /
+/// recall stats, which `Get`/`Recall` record). Every route therefore
+/// REQUIRES the custom `x-rusty-brain-namespace` header: a non-simple header
+/// forces ANY browser-initiated cross-origin request into a CORS preflight,
+/// which always fails because the listener never emits CORS headers. An
+/// absent header is a 400 naming the header, before routing or dispatch.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn all_routes_require_the_custom_namespace_header() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let host = addr.to_string();
+
+    // Header-absent GET on every GET route: refused 400, naming the header.
+    for path in [
+        "/ping".to_string(),
+        "/context".to_string(),
+        format!("/memories/{}", rb_types::MemoryId::new()),
+    ] {
+        let req = build_request("GET", &path, Some(&host), &[], None);
+        let (status, body) = raw_round_trip(addr, &req).await;
+        assert_eq!(status, 400, "{path} without the header must be 400: {body}");
+        assert!(
+            body.contains("x-rusty-brain-namespace"),
+            "{path}: the 400 must name the required header: {body}"
+        );
+    }
+
+    // Header-absent POST: refused the same way.
+    let body_json = shortcut_body(&recall_request("q"));
+    let req = build_request(
+        "POST",
+        "/recall",
+        Some(&host),
+        &[("Content-Type", "application/json")],
+        Some(&body_json),
+    );
+    let (status, body) = raw_round_trip(addr, &req).await;
+    assert_eq!(status, 400, "POST without the header must be 400: {body}");
+    assert!(body.contains("x-rusty-brain-namespace"), "{body}");
+
+    // Header-present: the same routes serve normally.
+    let (status, body) = get(addr, "/ping").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = get(addr, "/context").await;
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = post_json(addr, "/recall", &body_json).await;
+    assert_eq!(status, 200, "{body}");
 
     daemon.stop().await;
 }
@@ -722,8 +786,10 @@ async fn absolute_uri_and_host_mismatch_is_rejected() {
     assert_eq!(status, 400, "mismatched authority/Host must be 400: {body}");
 
     // A MATCHING absolute-form pair is legitimate and passes.
-    let req =
-        format!("GET http://{host}/ping HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n\r\n");
+    let req = format!(
+        "GET http://{host}/ping HTTP/1.1\r\nHost: {host}\r\n\
+         x-rusty-brain-namespace: global\r\nConnection: close\r\n\r\n"
+    );
     let (status, body) = raw_round_trip(addr, req.as_bytes()).await;
     assert_eq!(status, 200, "matching authority/Host must pass: {body}");
 
@@ -751,7 +817,7 @@ async fn foreign_origin_is_rejected() {
         "GET",
         "/ping",
         Some(&host),
-        &[("Origin", &loopback_origin)],
+        &[("Origin", &loopback_origin), NS_HEADER],
         None,
     );
     let (status, body) = raw_round_trip(addr, &req).await;
@@ -807,7 +873,7 @@ async fn trickled_body_is_closed_at_request_deadline() {
     // Complete headers, body cap respected on paper — then stall mid-body.
     let head = format!(
         "POST /recall HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\n\
-         Connection: close\r\nContent-Length: 1000\r\n\r\n"
+         x-rusty-brain-namespace: global\r\nConnection: close\r\nContent-Length: 1000\r\n\r\n"
     );
     stream.write_all(head.as_bytes()).await.unwrap();
     stream.write_all(b"{\"query\":").await.unwrap(); // 9 of 1000 bytes, then silence
@@ -849,7 +915,7 @@ async fn method_not_allowed_names_the_paths_allowed_method() {
             "POST",
             path,
             Some(&host),
-            &[("Content-Type", "application/json")],
+            &[("Content-Type", "application/json"), NS_HEADER],
             Some("{}"),
         );
         let (status, head, body) = raw_round_trip_full(addr, &req).await;
@@ -862,7 +928,7 @@ async fn method_not_allowed_names_the_paths_allowed_method() {
 
     // POST-only paths report Allow: POST.
     for path in ["/recall", "/ops"] {
-        let req = build_request("GET", path, Some(&host), &[], None);
+        let req = build_request("GET", path, Some(&host), &[NS_HEADER], None);
         let (status, head, body) = raw_round_trip_full(addr, &req).await;
         assert_eq!(status, 405, "{path}: {body}");
         assert!(

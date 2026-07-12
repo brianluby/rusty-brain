@@ -134,7 +134,8 @@ parity):
 Agents without a mapped event can still get recall-before-work from their
 own tooling via the opt-in loopback HTTP surface (`serve --http`, see the
 README "HTTP listener" section and `docs/THREAT_MODEL.md`): `POST /recall`
-with the prompt as the query, then wrap the results per the contract above
+with the prompt as the query and the required `x-rusty-brain-namespace`
+header, then wrap the results per the contract above
 (cap the item count, apply the untrusted preamble) before injecting them
 into the agent's context. This is a documented integration path, not a
 claim of native support — the matrix rows above stay authoritative.

@@ -114,15 +114,26 @@ connection carries nothing. Two consequences, both handled fail-closed:
   v1 has NO non-loopback opt-in flag at all; the PRD's warned opt-in is
   deferred to the multi-host phase with real auth.
 - **Browser-origin and DNS-rebinding defenses.** A hostile web page can make
-  a victim's browser fire requests at 127.0.0.1. Three gates:
+  a victim's browser fire requests at 127.0.0.1. Four gates:
   the Host header must name a loopback literal (`127.0.0.1`, `[::1]`,
   `localhost`; DNS rebinding arrives with the attacker's hostname in Host —
   refused 403); a present Origin header must be a loopback origin (anything
-  else, including `null`, is refused 403); and POST bodies must declare
+  else, including `null`, is refused 403); POST bodies must declare
   `application/json`, which forces browsers into a CORS preflight that fails
-  because the listener never emits CORS headers. Pinned by
-  `foreign_or_missing_host_is_rejected`, `foreign_origin_is_rejected`,
-  `post_without_json_content_type_is_415`, and the unit tests on
+  because the listener never emits CORS headers; and the custom
+  `x-rusty-brain-namespace` header is REQUIRED on EVERY route (absent =
+  400). That last gate exists because Origin checking does NOT cover
+  no-cors requests: browsers omit Origin on cross-origin no-cors GETs
+  (`<img>`/`<link>` tags, `fetch(..., {mode: "no-cors"})`), and Host on
+  such a request names the target itself, so the first two gates pass and
+  a hostile page could otherwise blind-trigger the GET routes — responses
+  stay opaque, but `Get` records `access_count` and `Recall` feeds the
+  stats counters (the W3.7 usefulness signal), so blind triggers could
+  skew them. Requiring a non-simple custom header forces even Origin-less
+  no-cors requests into a failing CORS preflight, closing the blind-trigger
+  path. Pinned by `foreign_or_missing_host_is_rejected`,
+  `foreign_origin_is_rejected`, `post_without_json_content_type_is_415`,
+  `all_routes_require_the_custom_namespace_header`, and the unit tests on
   `host_is_loopback`/`origin_is_loopback`.
 - **Bounded requests, fail closed.** Bodies are capped at the UDS frame
   bound (1 MiB, `MAX_FRAME_BYTES`) — refused from the declared length before

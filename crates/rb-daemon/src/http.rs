@@ -14,9 +14,12 @@
 //!   connection would (W2.6 fail-closed semantics).
 //! - **Browser defenses**: the Host header must name a loopback literal
 //!   (DNS-rebinding defense), a present Origin header must be a loopback
-//!   origin (cross-origin defense; no CORS headers are ever sent), and POST
+//!   origin (cross-origin defense; no CORS headers are ever sent), POST
 //!   bodies must declare `application/json` (forces a preflight, which fails
-//!   without CORS headers).
+//!   without CORS headers), and the custom `x-rusty-brain-namespace` header
+//!   is REQUIRED on every route — browsers omit Origin on no-cors GETs, and
+//!   a required non-simple header forces even those into a failing
+//!   preflight (the blind-trigger defense).
 //! - **Bounded**: request bodies are capped at the UDS frame bound
 //!   ([`MAX_FRAME_BYTES`]), header reads have a deadline, each request has an
 //!   overall deadline, and concurrent connections are capped by a semaphore
@@ -56,8 +59,11 @@ const DEFAULT_REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 /// cannot consume UDS connection slots.
 const DEFAULT_MAX_CONNECTIONS: usize = 64;
 /// Request header selecting the namespace (DB string form, e.g. `global`,
-/// `project:name`). Absent means `global`. Namespace is organization, not an
-/// auth boundary — same as the UDS handshake namespace.
+/// `project:name`). REQUIRED on every route: it mirrors the mandatory UDS
+/// handshake namespace, and as a non-simple custom header it forces browser
+/// cross-origin requests (including no-cors GETs, which omit Origin) into a
+/// CORS preflight that always fails. Namespace is organization, not an auth
+/// boundary — same as the UDS handshake namespace.
 const NAMESPACE_HEADER: &str = "x-rusty-brain-namespace";
 
 /// Static configuration for the opt-in HTTP listener. Constructed by the
@@ -315,9 +321,28 @@ async fn process_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -
     }
 
     // Namespace: header-selected, validated exactly like the UDS handshake
-    // namespace (fail closed before any dispatch).
+    // namespace (fail closed before routing, body reads, or any dispatch).
+    //
+    // The header is REQUIRED on EVERY route — including GETs — for two
+    // reasons: it mirrors the UDS wire contract (the handshake namespace is
+    // mandatory; clients declare `global` explicitly), and it is the
+    // no-cors blind-trigger defense (CodeRabbit, PR #62). Browsers omit
+    // Origin on cross-origin no-cors GETs (img/link tags, no-cors fetch)
+    // and Host names the target itself, so the two gates above cannot see
+    // those requests; requiring a NON-SIMPLE custom header forces any
+    // browser-initiated cross-origin request into a CORS preflight, which
+    // always fails because no CORS headers are ever emitted. Pinned by
+    // `all_routes_require_the_custom_namespace_header`.
     let namespace = match header_str(&req, NAMESPACE_HEADER) {
-        None => Namespace::Global,
+        None => {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_argument",
+                "missing x-rusty-brain-namespace header: it is required on \
+                 every route (e.g. `global` or `project:name`) and, as a \
+                 custom header, keeps browser no-cors requests out",
+            )
+        }
         Some(raw) => match Namespace::parse_db_string(raw).and_then(validate_namespace) {
             Ok(ns) => ns,
             Err(e) => {

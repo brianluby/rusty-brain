@@ -282,7 +282,8 @@ rusty-brain serve --http 127.0.0.1:7777  # explicit loopback bind
 ```
 
 ```bash
-curl -s http://127.0.0.1:7777/ping
+curl -s http://127.0.0.1:7777/ping \
+  -H 'x-rusty-brain-namespace: global'
 curl -s -X POST http://127.0.0.1:7777/recall \
   -H 'content-type: application/json' \
   -H 'x-rusty-brain-namespace: project:my-app' \
@@ -300,7 +301,12 @@ request line that disagrees with Host, 403 for a non-loopback Host or
 Origin, 404 for unknown paths, 405 with a per-path `Allow` header for wrong
 methods, 413 for bodies over 1 MiB, 415 for POSTs that are not
 `application/json`, and 503 when a request exceeds the overall deadline.
-The `x-rusty-brain-namespace` header scopes a request (default `global`).
+The `x-rusty-brain-namespace` header is **required on every route**
+(`global` or `project:name`; absent = 400): it scopes the request —
+mirroring the mandatory UDS handshake namespace — and, being a custom
+(non-simple) header, forces any browser-initiated cross-origin request
+(including Origin-less no-cors GETs) into a CORS preflight that always
+fails, since the listener never emits CORS headers.
 
 Security posture (see [docs/THREAT_MODEL.md](docs/THREAT_MODEL.md), "The
 opt-in HTTP listener"): off by default at every layer; the bind must be a
