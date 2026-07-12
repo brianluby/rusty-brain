@@ -67,19 +67,18 @@ jobs:
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: |
-          # Prints ONLY the HTTP status; the key and response body are never
-          # echoed. 200 = key valid; 401 = invalid/revoked or mangled paste.
+          # Validate the secret's shape BEFORE it is used anywhere, then print
+          # ONLY the HTTP status; the key and response body are never echoed.
+          # 200 = key valid; 401 = invalid/revoked or mangled paste.
+          case "$ANTHROPIC_API_KEY" in
+            *[[:space:]]*) echo "::error::secret contains whitespace (bad paste?)"; exit 1 ;;
+          esac
           status="$(curl -sS -o /dev/null -w '%{http_code}' \
             --max-time 30 \
             -H "x-api-key: ${ANTHROPIC_API_KEY}" \
             -H "anthropic-version: 2023-06-01" \
             https://api.anthropic.com/v1/models)"
           echo "anthropic /v1/models HTTP status: ${status}"
-          key_len="${#ANTHROPIC_API_KEY}"
-          echo "secret length: ${key_len} chars"
-          case "$ANTHROPIC_API_KEY" in
-            *[[:space:]]*) echo "::error::secret contains whitespace (bad paste?)"; exit 1 ;;
-          esac
           if [ "$status" != "200" ]; then
             echo "::error::ANTHROPIC_API_KEY did not authenticate (HTTP ${status}); fix the repository secret."
             exit 1
@@ -97,17 +96,19 @@ jobs:
           probe_home="$(mktemp -d)"
           printf '{"hasCompletedOnboarding": true}\n' > "${probe_home}/.claude.json"
           probe_proj="$(mktemp -d)"
-          # No `timeout` wrapper: macOS runners lack GNU timeout (the scorecard
-          # script falls back to gtimeout for the same reason); the job-level
-          # timeout bounds this step instead.
+          # macOS runners lack GNU timeout (the scorecard script falls back to
+          # gtimeout for the same reason); perl alarm gives a portable 180s
+          # bound so a hung CLI cannot eat the 300-minute job budget.
           (
             export HOME="$probe_home"
             cd "$probe_proj"
-            claude -p 'reply with exactly: ok' \
+            perl -e 'alarm 180; exec @ARGV' -- \
+              claude -p 'reply with exactly: ok' \
               --model haiku --max-budget-usd 0.50 \
               --output-format stream-json --verbose </dev/null || true
           ) | python3 -c '
           import sys, json
+          ok_result = False
           seen = 0
           for line in sys.stdin:
               try:
@@ -125,8 +126,13 @@ jobs:
                         "| turns:", r.get("num_turns"),
                         "| cost_usd:", r.get("total_cost_usd"))
                   print("result text:", str(r.get("result"))[:300])
+                  if not r.get("is_error"):
+                      ok_result = True
           if seen == 0:
               print("PROBE FAILURE: no parseable stream-json records at all", file=sys.stderr)
+              sys.exit(1)
+          if not ok_result:
+              print("PROBE FAILURE: no non-error result record (key/billing/model-access problem — the error text is printed above)", file=sys.stderr)
               sys.exit(1)
           '
 
