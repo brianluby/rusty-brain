@@ -56,13 +56,16 @@ fallback is disabled and a missing/wrong-kind vector fails closed.
   preregistered recall/MRR/NDCG/dedup/channel floors. The Linear gate runs in
   ordinary CI; a weekly/manual workflow also reports the five-instant RRF arm.
 - `tests/semantic_safety.rs` — offline exact-answer, multi-memory,
-  archive/supersede, contested, and instruction-shaped poison strata.
+  archive/supersede, contested, and instruction-shaped poison strata. The
+  explicit ignored pilot gate currently fails closed because the poison remains
+  exposed below the correct fact.
 - `controlled.rs` + `tests/controlled_arms.rs` — five fixed chronological
   streams for equal-budget Linear/RRF/exact-evidence/recency/importance
   retrieval arms and novelty/importance-confidence/combined online shadow
   admission arms. The scheduled/manual report emits every seed and enforces
-  the frozen no-go for the exact lane and pilot-only go for combined admission;
-  it never changes production behavior.
+  the frozen no-go for the exact lane and the combined admission arm's
+  shadow-only qualification; the overall poison-exposure NO-GO blocks pilot
+  admission and no production behavior changes.
 
 Re-record after any corpus change (single command per provider):
 
@@ -100,8 +103,9 @@ cargo test -p rb-eval --test controlled_arms \
   -- --ignored --nocapture
 ```
 
-Its 2026-07-12 result keeps the exact-evidence lane off and qualifies the
-combined admission product only for a later bounded shadow pilot. See the
+Its 2026-07-12 result keeps the exact-evidence lane off. The combined admission
+product meets its shadow-arm criteria, but the overall zero-poison-exposure
+NO-GO blocks a bounded pilot. See the
 [frozen preregistration](../../docs/eval/2026-07-12-w41-controlled-arms-preregistration.md)
 and [dated results](../../docs/eval/2026-07-12-w41-semantic-gate-results.md).
 

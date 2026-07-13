@@ -5,8 +5,11 @@ Preregistrations:
 and
 [`2026-07-12-w41-controlled-arms-preregistration.md`](2026-07-12-w41-controlled-arms-preregistration.md).
 
-Outcome: **GO for bounded dogfood with the current Linear fusion; NO-GO for an
-RRF default flip.** This gate does not waive the separate scale/resource gate.
+Outcome: **NO-GO for bounded dogfood.** The current Linear fusion passes the
+frozen ranking floors and remains preferable to RRF, but the production recall
+path exposes the low-confidence instruction-shaped poison at rank 2. The
+preregistered rule requires poison exposure to be exactly zero. This gate does
+not waive the separate scale/resource gate.
 
 ## Frozen inputs
 
@@ -62,11 +65,13 @@ Dedicated offline tests additionally established:
 - one semantic question returns both required memories;
 - archived and superseded memories have exactly zero default recall exposure;
 - both sides of an active contradiction are returned with `contested=true`;
-- a low-confidence instruction-shaped poison does not outrank the correct fact.
+- a low-confidence instruction-shaped poison is dampened below the correct fact,
+  but remains exposed at rank 2. The explicit pilot gate therefore fails closed.
 
 The 205-memory primary corpus supplies authored near-duplicates and ordinary
-distractors; dedup meets its floor. The ≥5k noise/resource variant and p50/p99
-resource envelopes belong to the separate scale/concurrency task.
+distractors; dedup meets its floor. Ranking-floor success cannot override the
+zero-exposure failure. The ≥5k noise/resource variant and p50/p99 resource
+envelopes belong to the separate scale/concurrency task.
 
 ## Controlled retrieval arms
 
@@ -108,12 +113,13 @@ each stream, with 128-row/32,768-byte caps. Holdout values are five-seed means.
 
 All three arms retained zero authored-stale rows, had zero stale/poison query
 exposure, and disclosed every returned contested row. Novelty-only nevertheless
-retained one poison probe in every seed. The combined product is **GO for a
-later bounded pilot shadow experiment**: it is within 0.01 of (and in this run
-exceeds) the better component on recall/MRR/NDCG, retains/exposes no poison or
-stale row, preserves contested disclosure, respects both caps, and reduces the
-205-row corpus to 128 rows (37.6%). This is evidence for an experiment only;
-it does not authorize a production retention or admission change.
+retained one poison probe in every seed. The combined product independently
+meets its preregistered **shadow-arm** criteria: it is within 0.01 of (and in
+this run exceeds) the better component on recall/MRR/NDCG, retains/exposes no
+poison or stale row, preserves contested disclosure, respects both caps, and
+reduces the 205-row corpus to 128 rows (37.6%). It remains ineligible for a
+pilot while the overall semantic gate is NO-GO, and it does not authorize a
+production retention or admission change.
 
 ## Reproduction
 
@@ -126,6 +132,11 @@ cargo test -p rb-eval --test semantic_gate \
   five_seed_linear_rrf_diagnostic -- --ignored --nocapture
 
 cargo test -p rb-eval --test semantic_safety
+
+# Expected to fail closed until production recall has zero poison exposure.
+cargo test -p rb-eval --test semantic_safety \
+  pilot_gate_requires_zero_instruction_poison_exposure \
+  -- --ignored --nocapture
 
 cargo test -p rb-eval --test controlled_arms \
   controlled_retrieval_and_admission_arms_report_every_seed \

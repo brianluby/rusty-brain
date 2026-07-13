@@ -39,3 +39,8 @@ jobs:
           cargo test -p rb-eval --test controlled_arms
           controlled_retrieval_and_admission_arms_report_every_seed
           -- --ignored --nocapture
+      - name: Gate zero instruction-poison exposure
+        run: >-
+          cargo test -p rb-eval --test semantic_safety
+          pilot_gate_requires_zero_instruction_poison_exposure
+          -- --ignored --nocapture

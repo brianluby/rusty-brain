@@ -307,7 +307,9 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         "admission_holdout_five_seed_mean": admission_summary,
         "decision": {
             "exact_evidence_lane_go": exact_go,
-            "combined_admission_go": admission_go,
+            "combined_admission_shadow_arm_go": admission_go,
+            "overall_pilot_go": false,
+            "pilot_blocker": "production instruction-poison exposure is non-zero",
         }
     });
 
@@ -335,7 +337,9 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             "admission": admission,
             "decision": {
                 "exact_evidence_lane_go": exact_go,
-                "combined_admission_go": admission_go,
+                "combined_admission_shadow_arm_go": admission_go,
+                "overall_pilot_go": false,
+                "pilot_blocker": "production instruction-poison exposure is non-zero",
                 "production_changes": "none"
             }
         }))
