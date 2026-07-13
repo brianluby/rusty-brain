@@ -11,6 +11,17 @@ env:
 permissions: {}
 
 jobs:
+  matrix:
+    name: define release targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - id: targets
+        name: Publish target matrix
+        run: |
+          echo 'matrix={"include":[{"target":"aarch64-apple-darwin","os":"macos-latest"},{"target":"x86_64-apple-darwin","os":"macos-15-intel"},{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
+
   preflight:
     name: release preflight
     runs-on: ubuntu-latest
@@ -28,19 +39,10 @@ jobs:
 
   build:
     name: build (${{ matrix.target }})
-    needs: preflight
+    needs: [matrix, preflight]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          # Build Intel on an Intel runner so the same artifact can be exercised
-          # natively by the packaged smoke job below.
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -83,17 +85,10 @@ jobs:
 
   smoke:
     name: packaged smoke (${{ matrix.target }})
-    needs: build
+    needs: [build, matrix]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          - target: x86_64-apple-darwin
-            os: macos-15-intel
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read

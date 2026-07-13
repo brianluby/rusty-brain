@@ -31,9 +31,15 @@ write_valid_changelog() {
 
 expect_failure() {
   label="$1"
-  shift
+  expected="$2"
+  shift 2
   if "$@" >failure.out 2>&1; then
     echo "FAIL: expected failure for $label" >&2
+    exit 1
+  fi
+  if ! grep -qF "$expected" failure.out; then
+    echo "FAIL: $label failed for the wrong reason:" >&2
+    cat failure.out >&2
     exit 1
   fi
 }
@@ -47,10 +53,12 @@ git update-ref refs/remotes/origin/main HEAD
 
 ./release-preflight.sh --tag v1.2.3 --commit HEAD --main-ref origin/main
 expect_failure version-mismatch \
+  "does not match workspace version" \
   ./release-preflight.sh --tag v1.2.4 --commit HEAD --main-ref origin/main
 
 printf '%s\n' '# Changelog' '## [Unreleased]' > CHANGELOG.md
 expect_failure missing-release-notes \
+  "has no released ## [1.2.3] section" \
   ./release-preflight.sh --tag v1.2.3 --commit HEAD --main-ref origin/main
 git restore CHANGELOG.md
 
@@ -59,6 +67,7 @@ printf '%s\n' '# side commit' >> CHANGELOG.md
 git add CHANGELOG.md
 git commit -qm side
 expect_failure not-on-main \
+  "is not reachable from origin/main" \
   ./release-preflight.sh --tag v1.2.3 --commit HEAD --main-ref origin/main
 
 echo "PASS: release preflight self-test"
