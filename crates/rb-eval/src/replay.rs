@@ -228,16 +228,56 @@ pub struct ReplayProvider {
     query_fallbacks: AtomicUsize,
     /// Ensures the fallback warning is logged once per provider, not per query.
     fallback_warned: AtomicUsize,
+    /// Legacy fixtures may serve query lookups from document entries. The
+    /// production semantic gate disables this compatibility path.
+    allow_query_fallback: bool,
 }
 
 impl ReplayProvider {
     /// Build from a parsed fixture, validating every vector against `dim`.
     pub fn from_fixture(fixture: &EmbeddingFixture) -> Result<Self, String> {
+        Self::from_fixture_with_policy(fixture, true)
+    }
+
+    /// Build a replay provider that requires exact document/query input kinds.
+    /// Used by the W4.1 production-embedding gate: a missing query vector is a
+    /// hard error even when a document vector for the same text exists.
+    pub fn from_fixture_strict(fixture: &EmbeddingFixture) -> Result<Self, String> {
+        Self::from_fixture_with_policy(fixture, false)
+    }
+
+    fn from_fixture_with_policy(
+        fixture: &EmbeddingFixture,
+        allow_query_fallback: bool,
+    ) -> Result<Self, String> {
         if fixture.dim == 0 {
             return Err("fixture dim must be non-zero".to_string());
         }
+        if fixture.model_id.trim().is_empty() {
+            return Err("fixture model_id must be non-empty".to_string());
+        }
         let mut vectors: HashMap<FixtureKey, Vec<f32>> = HashMap::new();
         for rv in &fixture.vectors {
+            if !matches!(
+                rv.input_kind.as_str(),
+                INPUT_KIND_DOCUMENT | INPUT_KIND_QUERY
+            ) {
+                return Err(format!(
+                    "unknown fixture input_kind {:?}; expected document or query",
+                    rv.input_kind
+                ));
+            }
+            if rv.text_sha256.len() != 64
+                || !rv
+                    .text_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+            {
+                return Err(format!(
+                    "fixture text_sha256 must be 64 lowercase hex characters: {:?}",
+                    rv.text_sha256
+                ));
+            }
             let v = decode_vector(&rv.embedding_hex)
                 .map_err(|e| format!("vector for hash {}: {e}", rv.text_sha256))?;
             if v.len() != fixture.dim {
@@ -246,6 +286,12 @@ impl ReplayProvider {
                     rv.text_sha256,
                     v.len(),
                     fixture.dim
+                ));
+            }
+            if v.iter().any(|value| !value.is_finite()) {
+                return Err(format!(
+                    "vector for hash {} contains a non-finite value",
+                    rv.text_sha256
                 ));
             }
             if vectors
@@ -264,6 +310,7 @@ impl ReplayProvider {
             vectors,
             query_fallbacks: AtomicUsize::new(0),
             fallback_warned: AtomicUsize::new(0),
+            allow_query_fallback,
         })
     }
 
@@ -279,6 +326,14 @@ impl ReplayProvider {
     pub fn committed() -> Result<Self, String> {
         const RAW: &str = include_str!("../fixtures/embeddings/all-MiniLM-L6-v2.json");
         Self::from_json(RAW)
+    }
+
+    /// Load the committed fixture with query/document fallback disabled.
+    pub fn committed_strict() -> Result<Self, String> {
+        const RAW: &str = include_str!("../fixtures/embeddings/all-MiniLM-L6-v2.json");
+        let fixture: EmbeddingFixture =
+            serde_json::from_str(RAW).map_err(|e| format!("fixture parse error: {e}"))?;
+        Self::from_fixture_strict(&fixture)
     }
 
     /// Number of recorded vectors (observability for tests/reports).
@@ -320,7 +375,7 @@ impl EmbeddingProvider for ReplayProvider {
                 // document-kind entry (pre-W1.4 fixtures recorded queries as
                 // documents; for kind-blind models the vectors are identical).
                 // Document-kind misses NEVER fall back — fail closed.
-                if kind == EmbedKind::Query {
+                if kind == EmbedKind::Query && self.allow_query_fallback {
                     let doc_key = (INPUT_KIND_DOCUMENT.to_string(), sha.clone());
                     if let Some(v) = self.vectors.get(&doc_key) {
                         self.query_fallbacks.fetch_add(1, Ordering::Relaxed);
@@ -438,6 +493,52 @@ mod tests {
             "the fallback must serve the document vector bytes"
         );
         assert_eq!(replay.query_fallbacks(), 1, "fallback must be counted");
+    }
+
+    #[tokio::test]
+    async fn strict_replay_rejects_query_to_document_fallback() {
+        let recorder = RecordingProvider::new(DeterministicProvider::new(8));
+        let texts = vec!["legacy recorded as document".to_string()];
+        recorder.embed(&texts, EmbedKind::Document).await.unwrap();
+
+        let replay = ReplayProvider::from_fixture_strict(&recorder.fixture("t").unwrap()).unwrap();
+        let err = replay.embed(&texts, EmbedKind::Query).await.unwrap_err();
+
+        assert!(err.to_string().contains("replay miss"), "{err}");
+    }
+
+    #[test]
+    fn fixture_validation_rejects_unknown_input_kind() {
+        let fixture = EmbeddingFixture {
+            comment: String::new(),
+            model_id: "test".to_string(),
+            dim: 1,
+            vectors: vec![RecordedVector {
+                input_kind: "unspecified".to_string(),
+                text_sha256: text_sha256("x"),
+                text_preview: "x".to_string(),
+                embedding_hex: encode_vector(&[1.0]),
+            }],
+        };
+
+        assert!(ReplayProvider::from_fixture_strict(&fixture).is_err());
+    }
+
+    #[test]
+    fn fixture_validation_rejects_non_finite_vectors() {
+        let fixture = EmbeddingFixture {
+            comment: String::new(),
+            model_id: "test".to_string(),
+            dim: 1,
+            vectors: vec![RecordedVector {
+                input_kind: INPUT_KIND_DOCUMENT.to_string(),
+                text_sha256: text_sha256("x"),
+                text_preview: "x".to_string(),
+                embedding_hex: encode_vector(&[f32::NAN]),
+            }],
+        };
+
+        assert!(ReplayProvider::from_fixture_strict(&fixture).is_err());
     }
 
     #[tokio::test]

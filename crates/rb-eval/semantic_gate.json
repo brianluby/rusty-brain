@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "preregistration": "docs/eval/2026-07-12-w41-semantic-gate-preregistration.md",
+  "corpus": {
+    "sha256": "7d33087001142b95097551e564fe18d6ae9cd6e474e9d7c5779c2358acc9102e",
+    "memories": 205,
+    "golden_queries": 72,
+    "dedup_clusters": 8
+  },
+  "holdout": {
+    "sha256": "81fe9057a4e91ececfb0cb50f0c001c19229e377f3f621648c9ea47e79df37d0",
+    "queries": 20,
+    "aggregate_only": true
+  },
+  "embedding": {
+    "fixture_sha256": "716dd5edeb275d73d553ebbfdd59a4404ac7db03dae4f214765e40fa1e2ba818",
+    "model_id": "all-MiniLM-L6-v2",
+    "dim": 384,
+    "document_vectors": 205,
+    "query_vectors": 92,
+    "total_vectors": 297,
+    "require_exact_input_kinds": true
+  },
+  "floors": {
+    "mean_recall_at_k": 0.80,
+    "mrr": 0.70,
+    "ndcg": 0.75,
+    "dedup_precision": 0.90,
+    "fts_query_rate": 0.80,
+    "vector_query_rate": 0.95,
+    "graph_query_rate": 0.00
+  },
+  "chronological_seeds": [
+    "2026-01-01T00:00:00Z",
+    "2026-02-01T00:00:00Z",
+    "2026-03-01T00:00:00Z",
+    "2026-04-01T00:00:00Z",
+    "2026-05-01T00:00:00Z"
+  ],
+  "default_decision": "keep_linear"
+}

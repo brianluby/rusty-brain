@@ -326,9 +326,9 @@ than gaps:
 
 ## Honesty note
 
-Everything above is implemented and exercised by unit and integration tests, but the
-system has not been performance-, scale-, or capability-tested, and retrieval quality
-has not been measured with a real embedding model at a meaningful corpus size. The
-offline evaluation harness guards ranking *determinism and regressions*, not absolute
-semantic quality. Read the architecture as a description of intent and current
-structure, not as a benchmarked, production-hardened system.
+Everything above is implemented and exercised by unit and integration tests. Retrieval
+quality is now gated offline with committed real `all-MiniLM-L6-v2` vectors over 205
+memories plus an untouched 20-query holdout, alongside the deterministic ranking
+regression harness. That is evidence at authored first-release scale, not proof of
+portable performance, large-corpus behavior, Voyage quality, resource-exhaustion
+resilience, or production hardening; those remain separate gates.

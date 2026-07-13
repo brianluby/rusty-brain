@@ -5,6 +5,26 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — W4.1 production-embedding semantic quality gate
+
+- **The 205-memory corpus and untouched 20-query holdout now gate real semantic
+  replay in CI.** A machine-readable manifest locks their hashes, the
+  re-recorded 384-dimension `all-MiniLM-L6-v2` fixture (205 explicit document
+  vectors + 92 explicit query vectors), preregistered recall@5/MRR/NDCG/dedup
+  and channel floors, five chronological instants, and the keep-Linear default
+  decision. Strict replay rejects drift, duplicate/unknown input kinds,
+  dimensions, non-finite values, missing vectors, and legacy query fallbacks.
+- **The gate is offline and scheduled.** Normal CI runs the Linear golden +
+  holdout gate with zero provider requests/cost; a weekly/manual workflow
+  reports aggregate Linear/RRF results at all five instants. RRF clears the
+  absolute floors but materially regresses MRR/NDCG, so no default or weight
+  changed. Diagnostics include channel contribution, p50/p99 latency, fixture
+  bytes, returned rows/content, and approximate tokens.
+- **Offline robustness strata** cover literal operational evidence,
+  multi-memory answers, zero archived/superseded exposure, contested
+  disclosure, and low-confidence instruction-shaped poison suppression. The
+  frozen preregistration and dated results keep holdout decisions auditable.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing

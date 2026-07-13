@@ -4,8 +4,8 @@
 //! committed REAL-vector replay fixture and the deterministic provider, and
 //! emits one JSON document with overall metrics AND per-channel contribution
 //! stats. The committed artifact (`docs/eval/2026-06-12-pre-phase1-baseline.json`)
-//! is FROZEN: later Phase 1 workstreams compare against it; it is measurement,
-//! not a CI gate (gating thresholds arrive in W4.1).
+//! is FROZEN: later Phase 1 workstreams compare against it; it remains a
+//! measurement artifact, separate from the W4.1 gate in `semantic_gate.json`.
 //!
 //! ```text
 //! cargo run -p rb-eval --example capture_baseline > docs/eval/<date>-pre-phase1-baseline.json
@@ -48,7 +48,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let artifact = json!({
         "_comment": "Pre-Phase-1 retrieval baseline (W1.0). FROZEN measurement artifact: later \
                      Phase 1 workstreams report before/after against these numbers. It is NOT a \
-                     CI gate (thresholds come in W4.1) and must never be edited; re-capture under \
+                     CI gate (W4.1 now lives in semantic_gate.json) and must never be edited; re-capture under \
                      a new dated filename only if the corpus or fixture is re-recorded. \
                      Regenerate: cargo run -p rb-eval --example capture_baseline",
         "captured_at": chrono::Utc::now().format("%Y-%m-%d").to_string(),

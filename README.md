@@ -467,15 +467,18 @@ Conventions:
 
 ## Testing
 
-The current test suite is about **correctness, not performance or quality**:
+The current test suite covers **correctness and bounded retrieval quality, not
+portable performance**:
 
 - **Unit and integration tests** across the workspace cover type invariants, ranking
   determinism, protocol round-trips, the FTS/vector/graph query paths, migration
   reproducibility, concurrency and namespace isolation, and the MCP contract.
-- **`rb-eval`** is an offline regression harness over a committed fixture corpus with
-  deterministic (non-semantic) vectors. It guards **ranking determinism and
-  relative-ordering regressions** — "did this change reorder results?" — and explicitly
-  does **not** measure absolute semantic quality.
+- **`rb-eval`** keeps the deterministic ranking-regression harness and now also runs a
+  strict offline production-embedding gate: committed real local-model vectors over
+  205 memories, 72 goldens, and an untouched 20-query holdout must clear preregistered
+  recall@5/MRR/NDCG/dedup/channel floors with exact document/query input kinds and zero
+  replay fallbacks. A scheduled five-instant comparison keeps Linear as the default;
+  RRF currently regresses MRR/NDCG.
 - **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
   scheduled macOS job drives a real headless Claude Code session (`claude -p`) against
   freshly built binaries with hooks + MCP installed into an isolated `HOME`, then proves
@@ -487,10 +490,10 @@ The current test suite is about **correctness, not performance or quality**:
   `--model haiku --max-budget-usd 1`). Run it locally with
   `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
 
-**Not yet tested:** performance and latency, behavior at scale (large corpora, many
-concurrent clients), real-world semantic recall quality with a production embedding
-model, and failure modes under resource exhaustion or partial outages. A real-model
-evaluation mode exists but is run manually and is not part of CI.
+**Not yet tested:** portable performance/latency envelopes, behavior at scale (large
+corpora and many concurrent clients), Voyage quality, and failure modes under resource
+exhaustion or partial outages. The semantic gate measures the supported local model at
+the authored 205-memory scale; it is not a scale benchmark.
 
 ## Roadmap
 

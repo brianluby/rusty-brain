@@ -37,26 +37,26 @@ choice has a precise, honest consequence:
 This mirrors the architecture spec's sqlite-vec scale honesty (§11): state the
 limit explicitly rather than overclaim.
 
-### Absolute semantic quality: record/replay real vectors (W1.0)
+### Absolute semantic quality: strict record/replay gate (W4.1)
 
 CI's semantic-measurement path is **replay**: real model vectors recorded once
 (manually, with network/credentials) into a committed fixture, then served
 offline with zero network and zero keys. Each vector is keyed on
 `(model_id, input_kind, sha256(text))`; since W1.4 (query-kind embeddings),
 recordings capture document inputs as `"document"` and query strings as
-`"query"`. The committed fixture predates W1.4 and holds only `"document"`
-entries, so replay serves query-kind lookups from the same text's document
-vector with a logged warning — exact for the kind-blind all-MiniLM-L6-v2
-model, and removed by the next re-recording. Replay otherwise **fails
-closed** on any text missing from the fixture, so corpus drift forces a
-re-recording instead of silently degrading.
+`"query"`. The W4.1 fixture has been re-recorded with 205 document entries and
+92 query entries. The production gate uses strict replay: legacy query-to-document
+fallback is disabled and a missing/wrong-kind vector fails closed.
 
 - `fixtures/embeddings/all-MiniLM-L6-v2.json` — the committed default fixture:
   real all-MiniLM-L6-v2 (384-dim) vectors for every corpus document (composite
   embedding input), golden query, and held-out query.
-- `tests/replay_model.rs` — runs in CI: replays the corpus + held-out queries
-  through the committed vectors and asserts sanity floors only (gating
-  thresholds come in W4.1).
+- `semantic_gate.json` + `tests/semantic_gate.rs` — lock the corpus, untouched
+  holdout, fixture digest, exact input kinds, five chronological instants, and
+  preregistered recall/MRR/NDCG/dedup/channel floors. The Linear gate runs in
+  ordinary CI; a weekly/manual workflow also reports the five-instant RRF arm.
+- `tests/semantic_safety.rs` — offline exact-answer, multi-memory,
+  archive/supersede, contested, and instruction-shaped poison strata.
 
 Re-record after any corpus change (single command per provider):
 
@@ -82,7 +82,9 @@ VOYAGE_API_KEY=... cargo test -p rb-eval --test real_model -- --ignored --nocapt
 ```
 
 It runs the same fixtures through `VoyageProvider`, prints semantic metrics for a
-human to judge, and makes no assertion against the deterministic baselines.
+human to judge, and makes no assertion against the deterministic baselines. Voyage
+was not recorded for the 2026-07-12 W4.1 result because no existing credential was
+available; the local-model gate made no network calls and cost $0.
 
 ### The pre-Phase-1 baseline artifact
 
@@ -137,10 +139,10 @@ semantic gain.
   against the committed corpus, and the harness asserts it stays disjoint from
   the tuning goldens. **Measurement cadence:** holdout aggregates are computed
   only at frozen-artifact captures (`examples/capture_baseline.rs`) and by the
-  future W4.1 gate — never per-workstream, and never in the default test suite
-  (the holdout replay test is `#[ignore]`d; default CI proves only fixture
-  coverage of the holdout texts). Iterating ranking changes while watching
-  holdout deltas is itself a tuning loop.
+  aggregate-only W4.1 gate — never as per-query tuning feedback. The legacy
+  holdout replay diagnostic stays `#[ignore]`d; the strict gate is the only
+  default-CI consumer. Iterating ranking changes while watching per-query
+  holdout behavior is itself a tuning loop.
 - `corpus.rs` — fixture loader + validation; fails fast on any malformed fixture
   (unknown memory type, out-of-range importance/confidence, duplicate keys,
   queries/clusters referencing unknown keys).

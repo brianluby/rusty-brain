@@ -47,6 +47,20 @@ impl SqliteBackend {
         let store = self.lock()?;
         store.set_confidence(id, confidence)
     }
+
+    /// Offline safety-stratum seam: archive a fixture row through the same
+    /// store primitive production uses, then verify recall exposure is zero.
+    pub fn archive_for_eval(&self, id: &MemoryId) -> rb_types::Result<()> {
+        let store = self.lock()?;
+        store.archive_memory(id)
+    }
+
+    /// Offline safety-stratum seam: supersede a fixture row atomically through
+    /// the production store, then verify only the current replacement recalls.
+    pub fn supersede_for_eval(&self, old: &MemoryId, new: &MemoryId) -> rb_types::Result<()> {
+        let store = self.lock()?;
+        store.supersede(old, new)
+    }
 }
 
 #[async_trait::async_trait]
