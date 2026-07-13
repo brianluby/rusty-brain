@@ -9,11 +9,12 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 - Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,
   UDS/HTTP recall, interactive and hook-burst writes, bounded writer-queue
-  saturation, namespace isolation, committed-write durability, RSS/DB/WAL
-  growth, long-lived readers, shutdown/checkpoint timing, and provider
-  deadlines. The dated report defines a 1k interactive envelope, prioritizes
-  ANN plus read-side controls, and defers sharding; disk-full testing remains
-  explicitly blocked on a disposable quota-limited filesystem.
+  saturation, MCP-facing concurrent mixed traffic, read-pool pressure,
+  namespace isolation, committed-write durability through reopen, RSS/DB/WAL
+  growth, long-lived readers, shutdown/checkpoint timing, provider deadlines,
+  and an opt-in guarded disk-full probe. The default is the real 384-dimensional
+  local model. The dated report withdraws the earlier 8-dimensional envelope
+  claim and lists the adequate unattended real-local matrix as remaining work.
 
 ### Changed — Supersede hardened at the source (#501)
 

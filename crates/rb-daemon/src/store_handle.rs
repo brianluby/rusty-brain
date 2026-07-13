@@ -32,9 +32,32 @@ pub struct WriterQueueMetrics {
     pub capacity: usize,
 }
 
+/// Snapshot of bounded read-pool permit pressure for load tests and diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct ReadPoolMetrics {
+    /// Read operations that acquired a pool permit.
+    pub acquired: u64,
+    /// Acquisitions that observed no immediately available permit.
+    pub saturated: u64,
+    /// Sum of time spent awaiting a permit, in nanoseconds.
+    pub total_wait_ns: u64,
+    /// Longest single permit wait, in nanoseconds.
+    pub max_wait_ns: u64,
+    /// Configured pool capacity.
+    pub capacity: usize,
+}
+
 #[derive(Default)]
 struct WriterQueueMetricState {
     enqueued: std::sync::atomic::AtomicU64,
+    saturated: std::sync::atomic::AtomicU64,
+    total_wait_ns: std::sync::atomic::AtomicU64,
+    max_wait_ns: std::sync::atomic::AtomicU64,
+}
+
+#[derive(Default)]
+struct ReadPoolMetricState {
+    acquired: std::sync::atomic::AtomicU64,
     saturated: std::sync::atomic::AtomicU64,
     total_wait_ns: std::sync::atomic::AtomicU64,
     max_wait_ns: std::sync::atomic::AtomicU64,
@@ -301,6 +324,8 @@ pub struct StoreHandle {
     /// `Shutdown`). Observability + the W1.8 zero-writer-ops-on-recall proof.
     writer_ops: Arc<std::sync::atomic::AtomicU64>,
     queue_metrics: Arc<WriterQueueMetricState>,
+    read_metrics: Arc<ReadPoolMetricState>,
+    read_pool_capacity: usize,
 }
 
 /// Buffered access-tracking state shared by every [`StoreHandle`] clone.
@@ -496,6 +521,8 @@ impl StoreHandle {
             }),
             writer_ops,
             queue_metrics: Arc::new(WriterQueueMetricState::default()),
+            read_metrics: Arc::new(ReadPoolMetricState::default()),
+            read_pool_capacity: read_pool_size.max(1),
         })
     }
 
@@ -637,6 +664,8 @@ impl StoreHandle {
             access_buf: _access_buf,
             writer_ops: _writer_ops,
             queue_metrics: _queue_metrics,
+            read_metrics: _read_metrics,
+            read_pool_capacity: _read_pool_capacity,
         } = self;
 
         if !shutting_down.swap(true, Ordering::SeqCst) {
@@ -773,6 +802,18 @@ impl StoreHandle {
         }
     }
 
+    /// Snapshot bounded read-pool permit pressure without resetting counters.
+    #[must_use]
+    pub fn read_pool_metrics(&self) -> ReadPoolMetrics {
+        ReadPoolMetrics {
+            acquired: self.read_metrics.acquired.load(Ordering::Relaxed),
+            saturated: self.read_metrics.saturated.load(Ordering::Relaxed),
+            total_wait_ns: self.read_metrics.total_wait_ns.load(Ordering::Relaxed),
+            max_wait_ns: self.read_metrics.max_wait_ns.load(Ordering::Relaxed),
+            capacity: self.read_pool_capacity,
+        }
+    }
+
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(Error::Storage("writer thread unavailable".to_string()));
@@ -806,10 +847,23 @@ impl StoreHandle {
     {
         let permits = Arc::clone(&self.pool.permits);
         let stores = Arc::clone(&self.pool.stores);
+        let saturated = permits.available_permits() == 0;
+        let wait_started = std::time::Instant::now();
         let permit = permits
             .acquire_owned()
             .await
             .map_err(|_| Error::Storage("read pool closed".to_string()))?;
+        let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.read_metrics.acquired.fetch_add(1, Ordering::Relaxed);
+        if saturated {
+            self.read_metrics.saturated.fetch_add(1, Ordering::Relaxed);
+        }
+        self.read_metrics
+            .total_wait_ns
+            .fetch_add(wait_ns, Ordering::Relaxed);
+        self.read_metrics
+            .max_wait_ns
+            .fetch_max(wait_ns, Ordering::Relaxed);
 
         tokio::task::spawn_blocking(move || {
             // The semaphore permit is held for the lifetime of this closure.

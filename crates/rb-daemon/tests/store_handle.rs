@@ -57,6 +57,11 @@ async fn write_then_read_round_trips_through_pool() {
     );
     assert_eq!(vec_hits[0].0, id);
 
+    let reads = handle.read_pool_metrics();
+    assert!(reads.acquired >= 4, "get/list/keyword/vector used the pool");
+    assert_eq!(reads.capacity, 4);
+    assert!(reads.total_wait_ns >= reads.max_wait_ns);
+
     handle.shutdown().await;
 }
 

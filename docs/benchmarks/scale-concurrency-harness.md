@@ -1,9 +1,12 @@
 # Scale, concurrency, and resource harness
 
 This harness is the reproducible evidence path for Vikunja #57. It runs the
-real single-writer daemon with deterministic embeddings, drives both UDS and
-opt-in loopback HTTP, and writes machine-readable JSON. It does not call a
-paid provider or require network access.
+real single-writer daemon, drives UDS, opt-in loopback HTTP, and MCP-facing
+`tools/call` paths concurrently, and writes machine-readable JSON. The default
+provider is the real local `all-MiniLM-L6-v2` model at 384 dimensions.
+The first run may download the model weights into the local model cache, so
+record the cache/model identity with retained evidence and exclude download
+time from cross-run latency comparisons.
 
 ```bash
 scripts/run-scale-benchmark.sh \
@@ -16,7 +19,9 @@ scripts/run-scale-benchmark.sh \
 Always use a release build. Each corpus is fresh and reports:
 
 - p50/p95/p99 and throughput for UDS recall, HTTP recall, UDS remember, and a
-  concurrent hook-shaped remember burst;
+  concurrent hook-shaped remember burst, with errors timed separately;
+- a concurrent mixed read/write phase over UDS, HTTP, and MCP plus bounded
+  read-pool permit wait/saturation;
 - bounded-writer-queue enqueue wait, saturation, and capacity;
 - dropped change broadcasts, current process RSS, DB size, pinned WAL size,
   shutdown/checkpoint time, and retry/truncate time;
@@ -25,17 +30,21 @@ Always use a release build. Each corpus is fresh and reports:
 The default upper bound is 25,000 memories because sqlite-vec search is exact
 today. Change `--corpora` to probe a larger local envelope; do not silently
 replace the committed default or compare results from different corpus lists.
-The harness intentionally keeps deterministic-provider time out of the storage
-numbers. Provider timeout, writer-death, and interrupted-write behavior remain
-separate fault tests named in the JSON report.
+For fast wiring checks only, pass `--provider fixture`; such reports are marked
+ineligible for a production envelope. Eligibility also requires the complete
+committed 1k/10k/25k corpus matrix, adequate samples, zero measured path
+errors, and the acknowledged-write/namespace/checkpoint invariants.
+Only `rusty-brain-scale-v2` reports carry that eligibility contract; older v1
+artifacts cannot support a production-envelope claim.
 
 ## Disk exhaustion
 
-Disk-full and low-disk results require a disposable quota-limited filesystem.
-The harness deliberately does not set process-wide file-size limits because
-that can corrupt unrelated files produced by the same build/test process. Until
-CI provisions such a mount, the JSON fault matrix reports this case as blocked;
-it must not be described as passing.
+Disk-full and low-disk results require `--disk-exhaustion-dir` to name a
+dedicated quota-limited filesystem mount root containing the marker file
+`.rusty-brain-scale-disposable-volume`. The path must be the mount root, have no
+pre-existing probe artifacts, and stay below `--disk-exhaustion-max-mib` free.
+Otherwise the probe refuses to run. RAII cleanup removes only its known filler
+and DB artifacts, including on errors.
 
 ## Rerunning after schema changes
 

@@ -1,118 +1,136 @@
 # Scale, concurrency, and resource report — 2026-07-12
 
-## Scope and method
+## Status: incomplete
 
-Release-mode measurements ran on Apple silicon (`Darwin vega.luby.us 25.5.0`,
-arm64) at commit `9e8312d` plus the task #57 harness changes. The deterministic
-8-dimensional provider removes network/provider variance. Fresh corpora used
-1,000, 10,000, and 25,000 rows; every row had FTS text and a sqlite-vec vector.
-The harness drove the real daemon over UDS and opt-in loopback HTTP, then held a
-raw SQLite read transaction while writes and shutdown exercised WAL behavior.
+This report records harness development and bounded exploratory runs. It does
+**not** establish a production operating envelope. An adequate run still needs
+at least 30 successful samples per latency path at 1k, 10k, and a practical
+upper bound, using the real 384-dimensional local model in an unattended
+environment without this task runner's execution ceiling.
 
-The task runner limits one command to roughly two minutes. The 1k corpus has 50
-samples per transport. Exact recall was too slow to collect a useful population
-within that bound at 10k/25k, so those corpora have one sample per transport.
-Their p50/p95/p99 fields are therefore the same single observation and are
-**directional scale evidence, not percentile estimates or release gates**.
+## Corrected harness contract
 
-## Results
+The committed command defaults to the real local `all-MiniLM-L6-v2` provider
+and derives its 384-dimensional vector shape. Corpus document embeddings,
+query embeddings, and writes all use that provider. `--dimension` and
+`--model-id` are configurable, but the local path fails closed if the requested
+dimension disagrees with the loaded model. `--provider fixture` is explicitly
+smoke-only and its JSON sets `production_envelope_eligible=false`.
 
-| Corpus | UDS recall p50 / p95 / p99 | HTTP recall p50 / p95 / p99 | UDS remember p50 / p95 / p99 | RSS | DB |
-|---:|---:|---:|---:|---:|---:|
-| 1k (n=50) | 108.9 / 130.5 / 511.7 ms | 116.0 / 161.5 / 209.7 ms | 1.23 / 1.97 / 2.02 ms | 23.4 MB | 1.01 MB |
-| 10k (n=1) | 23.77 s | 26.36 s | 4.82 ms | 26.4 MB | 7.39 MB |
-| 25k (n=1) | 174.56 s | **failed at 30 s HTTP deadline** | 19.41 ms | 28.0 MB | 18.73 MB |
+Each corpus now includes:
 
-At 1k, UDS and HTTP recall throughput was 8.57/s and 8.17/s respectively;
-sequential remembers reached 810/s. A 32-client hook-shaped burst committed all
-32 writes, with 20.20 ms p50 and 27.97 ms p95 completion latency (1,121/s wall
-throughput). At 10k and 25k the smaller four-client bursts also committed fully;
-write latency rose, but recall—not storage size or RSS—was the limiting resource.
+- concurrent UDS, loopback HTTP, and MCP `tools/call` recall/remember traffic;
+- direct writer-queue and read-pool wait/saturation measurements;
+- success/error latency accounting for every path;
+- pinned-reader write successes/errors plus an exact committed-row check after
+  shutdown, freeing the reader, checkpoint retry, and database reopen;
+- RSS, DB/WAL size, shutdown/checkpoint time, provider timeout, writer
+  recovery/death tests, and an optional guarded disk-exhaustion probe.
 
-### Queue saturation and write durability
+## Invalidated pre-review evidence
 
-A separate 1,024-write probe deliberately filled the 256-slot writer queue:
+The original 1k/10k/25k measurements used deterministic 8-dimensional vectors.
+They were useful for finding a severe exact-recall cliff and a timed-out
+blocking read that pinned WAL, but they are **not production-representative**.
+In addition, 10k and 25k had only one observation per transport; those values
+are individual durations, not p50/p95/p99 estimates. They cannot support the
+old 1k envelope, an ANN decision, or a sharding decision.
 
-- 767/1,024 enqueues (74.9%) observed a full queue;
-- average queue-capacity wait was 42.78 ms; maximum was 115.06 ms;
-- end-to-end write completion was 75.52 ms p50, 147.01 ms p95, and
-  153.01 ms p99 (6,477/s wall throughput);
-- all 1,024 acknowledged writes were visible afterward.
+For provenance only, the single observations were:
 
-The normal 1k mixed run did not saturate the queue. No-subscriber change
-broadcast counters advanced once per committed write (82 in that run); durable
-oplog/state verification found no lost committed writes. Namespace-isolation
-probes returned no foreign-namespace recall results at every corpus size.
+| Exploratory corpus | UDS recall | HTTP recall | Qualification |
+|---:|---:|---:|---|
+| 1k | p95 130.5 ms (n=50) | p95 161.5 ms (n=50) | 8-dimensional fixture |
+| 10k | 23.77 s (n=1) | 26.36 s (n=1) | not a percentile |
+| 25k | 174.56 s (n=1) | failed at 30 s deadline | not a percentile |
 
-### WAL, readers, and shutdown
+At 25k the HTTP deadline cancelled the request future but not its
+`spawn_blocking` SQLite read. That work continued, leaving 1.23 MB of WAL pinned
+through shutdown and an immediate retry. This remains a valid failure-mode
+observation, but its corpus threshold must be remeasured with the real model.
 
-| Corpus | WAL while reader pinned | Shutdown/checkpoint | Explicit retry | WAL after retry |
-|---:|---:|---:|---:|---:|
-| 1k | 5.01 MB | 5.20 s | <1 ms | 0 |
-| 10k | 1.25 MB | 5.17 s | <1 ms | 0 |
-| 25k | 1.23 MB | 5.20 s | 5.19 s | **1.23 MB remained** |
+## Corrected bounded evidence
 
-The 25k HTTP recall timed out, but its `spawn_blocking` SQLite work was not
-cancellable and continued after the response deadline. That long read held the
-WAL through daemon shutdown and the immediate retry. This is a concrete
-read-side resource-exhaustion/backpressure gap: an HTTP deadline bounds client
-wait, not underlying blocking DB work or its WAL lifetime.
+### 384-dimensional fixture smoke (100 rows; inadequate n)
 
-### Fault matrix
+This run verified harness wiring only. It used `--provider fixture`, three
+sequential operations per transport, six operations per mixed path, and is not
+eligible for an envelope:
 
-- **Provider timeout:** executed. A 200 ms embedding provider behind a 20 ms
-  HTTP deadline returned bounded HTTP 503 and the daemon shut down cleanly.
-- **Interrupted/poisoned writer recovery and writer death:** existing focused
-  tests were rerun (`caught_writer_panic_isolates_and_does_not_lose_later_writes`,
-  `writer_alive_reports_liveness_and_flips_on_death`, and
-  `writer_death_exits_the_accept_loop`). The harness separately proves
-  acknowledged-write durability under saturation.
-- **Long-lived reader:** executed for every corpus; the 25k result above is a
-  failure to clear WAL immediately, not a pass.
-- **Disk-full/low-disk:** **not executed**. It requires a disposable,
-  quota-limited filesystem. Applying a process-wide file-size rlimit inside a
-  shared build environment was rejected as unsafe. This remains a release-test
-  infrastructure blocker and must not be claimed green.
+- all six UDS recall, UDS remember, HTTP recall, HTTP remember, MCP recall, and
+  MCP remember operations succeeded while running concurrently;
+- the four-connection read pool observed saturation on 157/229 acquisitions
+  (68.6%), averaging 4.58 ms permit wait with a 29.06 ms maximum;
+- the 1,024-write queue probe observed 767/1,024 saturated enqueues (74.9%);
+- 35 writes were acknowledged across sequential, burst, mixed, and pinned-reader
+  phases; 127 rows were visible before the eight pinned-reader writes and all
+  135 expected rows were present after reopen;
+- WAL retry cleared the sidecar.
 
-## Recommended operating envelope
+The real-local ten-row smoke was attempted after the corrected default was
+implemented, but the task runner terminated it before a JSON artifact was
+written. No latency or envelope claim is made from that attempt.
 
-Until retrieval changes, use **about 1,000 active memories per database** for
-interactive hybrid recall. At that size, p95 recall stayed under 162 ms across
-UDS/HTTP and writes remained low-millisecond. The 10k corpus is acceptable for
-durable writes but not interactive recall (24–26 seconds observed); 25k is
-outside the supported interactive envelope and can outlive HTTP deadlines.
+### Disk-full/low-disk probe
 
-The queue's existing bounded backpressure worked as designed under a 1,024
-write burst: callers waited, memory stayed bounded, and no acknowledged writes
-were lost. Keep the 256-command bound for now. Add read-side admission/budgets
-or cancellable query work before raising the corpus envelope; an HTTP timeout
-alone is insufficient.
+The optional probe ran on a dedicated 64 MiB APFS image mounted under
+`/private/tmp`, marked with `.rusty-brain-scale-disposable-volume`. The harness
+verified that the supplied path was the filesystem mount root and under the
+configured free-space cap before writing filler data.
 
-## ANN, backpressure, and sharding decision
+- The mount began with 63 MiB free.
+- Two pressure writes committed.
+- The next write failed with `database or disk is full`.
+- After the RAII cleanup freed the filler, all three committed rows (baseline
+  plus two acknowledged pressure writes) survived reopen.
+- The image was detached and deleted after the run.
 
-- **ANN: pursue next, behind quality gates.** Exact retrieval is the evidenced
-  bottleneck. Prototype ANN with exact-search recall-quality comparison and the
-  task #56 semantic gate before changing defaults.
-- **Backpressure: retain write queue; add read-side controls.** No new write
-  queue design is justified. The timed-out 25k blocking read demonstrates the
-  need for bounded/cancellable read work and explicit saturation metrics.
-- **Sharding: defer.** DB/RSS growth remained modest and namespace isolation
-  held. Sharding would not address the measured exact-retrieval cliff and would
-  add cross-shard ranking/consistency complexity. Reconsider only after ANN and
-  read-side controls are measured.
+Without an explicitly supplied dedicated mount root and marker, the probe does
+not write filler data; it reports `not_run_requires_explicit_disposable_mount`.
+Shared paths, non-mount roots, pre-existing probe files, and mounts over the
+free-space cap are refused.
+
+## Decisions still pending
+
+- **Operating envelope:** not established. The previous 1k recommendation is
+  withdrawn until adequate real-local samples complete.
+- **ANN:** the exploratory exact-recall cliff makes ANN worth evaluating, but
+  implementation/default decisions require the real-local scale matrix plus
+  task #56's semantic-quality comparison against exact search.
+- **Backpressure:** the bounded writer queue and read pool both surfaced
+  measurable saturation without losing acknowledged writes in the corrected
+  fixture smoke. Production limits still need real-local mixed-load evidence.
+- **Sharding:** no decision. Reconsider only after representative ANN/read-side
+  controls are measured; the old 8-dimensional DB/RSS numbers are insufficient.
+
+## Remaining blockers
+
+1. Run the default real-local matrix unattended with at least 30 successful
+   samples per latency path at 1k, 10k, and a declared practical upper bound.
+2. Preserve those JSON artifacts and rerun after task #54 lands.
+3. If 10k/upper-bound requests exceed deadlines, report the failed sample
+   distribution and residual blocking work; do not collapse failures into zero
+   latency or call n=1 a percentile.
+4. Use the resulting representative evidence with task #56 before selecting
+   ANN, changing backpressure defaults, or proposing sharding.
 
 ## Reproduction
 
 ```bash
-scripts/run-scale-benchmark.sh --corpora 1000 --operations 50 --burst 32 \
-  --output target/scale-benchmark-1k.json
-scripts/run-scale-benchmark.sh --corpora 10000 --operations 1 --burst 4 \
-  --output target/scale-benchmark-10k.json
-scripts/run-scale-benchmark.sh --corpora 25000 --operations 1 --burst 4 \
-  --output target/scale-benchmark-25k.json
-```
+# Real local model (default; compiles rb-eval's record-local feature):
+scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
+  --operations 50 --burst 32 \
+  --output target/scale-local-384.json
 
-For statistically meaningful 10k/25k percentiles, run the default 50-operation
-matrix unattended outside the task runner and preserve its JSON. Rerun the same
-commands after task #54 lands; corpus seeding closes before normal daemon open,
-so schema initialization remains in the exercised path.
+# Explicit smoke-only deterministic fixture:
+scripts/run-scale-benchmark.sh --provider fixture --corpora 100 \
+  --operations 3 --burst 6 \
+  --output target/scale-fixture-384-smoke.json
+
+# Disk probe: only a dedicated quota-limited mount root with the marker:
+scripts/run-scale-benchmark.sh --provider fixture --corpora 10 \
+  --operations 1 --burst 2 \
+  --disk-exhaustion-dir /path/to/dedicated-mount \
+  --disk-exhaustion-max-mib 128 \
+  --output target/scale-disk-probe.json
+```
