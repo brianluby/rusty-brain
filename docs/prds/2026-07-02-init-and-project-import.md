@@ -2,11 +2,20 @@
 
 ## Status
 
-Draft. Addresses the highest-leverage activation gap surfaced in the
-2026-07-02 senior-PM product review: an empty brain on first run means the
-human sees no value and never builds the capture habit. Not on the existing
-Road-to-Tens roadmap (it is the missing "activation & value-realization"
-dimension).
+Delivered 2026-07-02 (PR #51, merge `f783d1c`). `rusty-brain init` scans the
+bounded project sources below, supports plan/confirmation and batch undo, and
+`rusty-brain import` accepts a bounded file or stdin with dry-run. Both use the
+normal remember path after client-side redaction; fixture-driven e2e coverage
+proves non-empty recall, DB-bytes redaction, rerun idempotency, undo, and
+dry-run no-write behavior.
+
+Two implementation details differ from the draft without reducing the user
+contract: dedup confirms exact redacted-content equality through a bounded
+recall probe rather than calling `near_duplicates()` directly, and undo uses a
+private per-database sidecar ledger of stored ids followed by idempotent
+per-id archive calls rather than a bulk delete-by-tag operation. Import is a
+bounded cold-start tool, not an ongoing sync mechanism; source-quality and
+large-project activation remain unmeasured.
 
 ## Owner Area
 
@@ -147,13 +156,16 @@ project tree and asserting recall + DB-bytes redaction + dedup.
 
 ## Implementation Checklist
 
-- [ ] Add `Init` and `Import` subcommands to `cli.rs`.
-- [ ] Implement source adapters (md/txt/git-log) in a new `import` module.
-- [ ] Wire adapters through the enricher + redaction + engine store path.
-- [ ] Add `import_batch:<id>` provenance/tagging and `init --undo`.
-- [ ] Reuse `near_duplicates()` for import dedup.
-- [ ] Add fixture-driven e2e (recall + DB-bytes redaction + dedup + undo).
-- [ ] Document first-run flow in the README Quickstart.
+- [x] Add `Init` and `Import` subcommands to `cli.rs`.
+- [x] Implement bounded markdown/text/git-log source adapters in `import.rs`.
+- [x] Wire adapters through redaction and the normal engine remember path.
+- [x] Add `import_batch:<id>` tagging, a private batch ledger, and
+      `init --undo` / `--list-batches`.
+- [x] Implement idempotent exact-content dedup through a bounded recall probe
+      (deliberate deviation from the draft's `near_duplicates()` mechanism).
+- [x] Add fixture-driven e2e coverage for recall, DB-bytes redaction, dedup,
+      undo, and dry-run.
+- [x] Document the first-run flow in the README Quickstart.
 
 ## Roadmap Fit
 

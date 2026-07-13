@@ -2,11 +2,24 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. The Road-to-Tens plan
-scopes backup/restore (W5b.3) to raw SQLite online-backup, gated behind team
-mode (Phase 5, 6-10 weeks out). Today there is no way to back up, migrate,
-inspect, or version-control memory except grepping a DB - the #1 adoption
-objection ("what if I want to leave / lose it").
+Delivered 2026-07-02 (PR #52, merge `24ac007`). The CLI ships deterministic
+markdown/JSON/CSV export, timestamped portable backup with listing/retention,
+and bounded JSON restore through the redacting, deduplicating normal remember
+path (therefore vectors are recomputed under the current model). Unit and
+binary e2e tests cover deterministic id order, retention pruning,
+export/restore idempotency, recall after restore, and planted-secret absence.
+
+Delivered v1 is narrower than the draft in several reviewable ways: export is
+the current namespace to stdout (no `--all`, output-file flag, `--since`, or
+archived-row mode); filters are type/tags/min-importance; CSV is metadata-only;
+the read is bounded at 100,000 active memories and warns if it may truncate;
+restore accepts JSON only; and no cron/launchd schedule is installed. The e2e
+round trip restores into the same live namespace and proves dedup/continued
+recall, not rank equivalence on a fresh database or semantic parity across two
+production embedding models. Export serializes stored rows; it does not run a
+new redaction pass. The planted-secret test writes through the redacting import
+path, so operators with legacy or manually stored plaintext must run `scrub`
+before exporting. Raw SQLite disaster recovery remains future team-mode work.
 
 ## Owner Area
 
@@ -17,7 +30,7 @@ Touchpoints:
 - `crates/rusty-brain/src/cli.rs` (`Export` / `Backup` / `Restore`)
 - `crates/rusty-brain/src/run.rs`
 - `crates/rusty-brain/src/output.rs`
-- `crates/rb-store/src/store.rs`
+- `crates/rusty-brain/src/export.rs`
 - `crates/rb-proto/src/messages.rs`
 - `crates/rb-eval/` (existing export tooling to productize)
 - `docs/prds/2026-07-02-init-and-project-import.md` (round-trip pair)
@@ -59,7 +72,8 @@ Read-only dump of the current namespace (or `--all`) to stdout or a file:
   created/updated, links, `contested`, provenance.
 - Filters: `--type`, `--tags`, `--min-importance`, `--since <seq>` (oplog),
   `--active` (exclude archived).
-- Content is post-redaction; no secret that was scrubbed is re-emitted.
+- Content reflects the stored post-scrub state; export itself does not mutate
+  or newly redact rows. A secret removed by `scrub` is not re-emitted.
 
 ### EXP-2. `rusty-brain backup`
 
@@ -124,12 +138,15 @@ redaction in the export.
 
 ## Implementation Checklist
 
-- [ ] Add `Export`/`Backup`/`Restore` subcommands.
-- [ ] Productize the `rb-eval` export helpers into the CLI.
-- [ ] Wire restore through the import path + `reembed`.
-- [ ] Add `--retention` pruning for backups.
-- [ ] Add round-trip + redaction e2e tests.
-- [ ] Document the backup/restore + migration story in the README.
+- [x] Add `Export`/`Backup`/`Restore` subcommands.
+- [x] Add dedicated deterministic export formatting in the CLI crate.
+- [x] Wire JSON restore through the import/remember path so vectors are
+      recomputed under the current provider.
+- [x] Add backup listing and `--retention` pruning.
+- [x] Add idempotent export/restore, recall, ordering, and redaction tests
+      (with the fresh-DB/model-swap limitation recorded in Status).
+- [x] Document backup/restore commands and the portable migration story in the
+      README Quickstart.
 
 ## Roadmap Fit
 

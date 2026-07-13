@@ -27,18 +27,18 @@ engineering roadmap does not measure.
 
 From the senior-PM product review. Ordered by leverage (Tier 1 = activation/retention loop, Tier 2 = differentiation, Tier 3 = hygiene/scale).
 
-| # | Tier | PRD |
-| --- | --- | --- |
-| 1 | 1 | [First-run cold-start and project import](2026-07-02-init-and-project-import.md) |
-| 2 | 1 | ["Memory is working" observability](2026-07-02-doctor-and-stats-observability.md) |
-| 3 | 1 | [Portable export and one-command backup](2026-07-02-portable-export-and-backup.md) |
-| 4 | 2 | [Typed code anchors](2026-07-02-typed-code-anchors.md) |
-| 5 | 2 | [Decision history and audit timeline](2026-07-02-decision-history-timeline.md) |
-| 6 | 2 | [Guided contradiction/dedup resolution](2026-07-02-contradiction-dedup-review.md) |
-| 7 | 2 | [HTTP/REST surface and agent-agnostic recall](2026-07-02-http-surface-and-agent-agnostic-recall.md) |
-| 8 | 3 | [User-facing retention and forgetting policy](2026-07-02-user-facing-retention-policy.md) |
-| 9 | 3 | [Search and filter parity](2026-07-02-search-filter-parity.md) |
-| 10 | 3 | [Native Windows support](2026-07-02-native-windows-support.md) |
+| # | Tier | PRD | Current status |
+| --- | --- | --- | --- |
+| 1 | 1 | [First-run cold-start and project import](2026-07-02-init-and-project-import.md) | Delivered (PR #51) |
+| 2 | 1 | ["Memory is working" observability](2026-07-02-doctor-and-stats-observability.md) | Delivered (PR #56) |
+| 3 | 1 | [Portable export and one-command backup](2026-07-02-portable-export-and-backup.md) | Delivered (PR #52) |
+| 4 | 2 | [Typed code anchors](2026-07-02-typed-code-anchors.md) | Delivered |
+| 5 | 2 | [Decision history and audit timeline](2026-07-02-decision-history-timeline.md) | Delivered |
+| 6 | 2 | [Guided contradiction/dedup resolution](2026-07-02-contradiction-dedup-review.md) | Delivered |
+| 7 | 2 | [HTTP/REST surface and agent-agnostic recall](2026-07-02-http-surface-and-agent-agnostic-recall.md) | Delivered (PR #62) |
+| 8 | 3 | [User-facing retention and forgetting policy](2026-07-02-user-facing-retention-policy.md) | Delivered |
+| 9 | 3 | [Search and filter parity](2026-07-02-search-filter-parity.md) | Delivered |
+| 10 | 3 | [Native Windows support](2026-07-02-native-windows-support.md) | Deferred; WSL2 remains the documented path |
 
 ## Notes
 

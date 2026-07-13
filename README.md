@@ -4,11 +4,12 @@
 > (vector + keyword + graph) retrieval over SQLite, exposed via MCP and a CLI.
 >
 > **Status: early development.** The pieces described below are implemented and
-> covered by unit and integration tests, but the project has only had **basic
-> correctness testing**. It has **not** been performance-, scale-, or
-> capability-tested, and retrieval quality has not been measured against real
-> embedding models at any meaningful corpus size. Treat it as a work in progress,
-> not a finished product. Interfaces and on-disk format may change.
+> covered by unit and integration tests. A bounded Claude Code scorecard has
+> provided **N=5 proxy capability evidence**, but this is not production proof:
+> performance, scale, sustained concurrency, resource exhaustion, semantic
+> quality with a production embedding provider, and multi-machine adoption are
+> still unmeasured. Treat it as a work in progress, not a finished product.
+> Interfaces and the on-disk format may change.
 
 ## What it is
 
@@ -102,7 +103,7 @@ degradation, health, security) is declared in
 
 ## What works today
 
-Implemented and test-covered (correctness only — see [Testing](#testing)):
+Implemented and test-covered (correctness is the primary coverage; see [Testing](#testing) for bounded capability evidence and limits):
 
 - **Store and recall** memories scoped by namespace, with enrichment and graph links.
 - **Hybrid retrieval** fusing FTS5 keyword search, `sqlite-vec` vector similarity, and
@@ -113,8 +114,14 @@ Implemented and test-covered (correctness only — see [Testing](#testing)):
   active `contradicts` link (best-effort, never fails recall).
 - **A single-writer daemon** over SQLite WAL with a concurrent read pool, change
   notifications via an in-process broadcast, and auto-start from any client command.
-- **An MCP server** exposing ten tools over stdio.
+- **An MCP server** exposing **12 MCP tools** over stdio (six advertised by
+  default; all 12 remain directly routable).
 - **A CLI** for direct use and scripting.
+- **Activation and operations commands**: bounded project `init`/`import`,
+  read-only `status`/`stats` plus `doctor`, and portable
+  `export`/`backup`/JSON `restore`.
+- **An optional loopback HTTP surface** for non-MCP local clients, off by
+  default and deliberately not an authentication boundary.
 - **Pluggable embeddings** — an offline deterministic provider (default), a Voyage API
   provider, and an optional local ONNX provider behind a feature flag.
 - **Best-effort capture hooks** (`rusty-brain-hooks`) and an installer
@@ -205,7 +212,8 @@ rusty-brain reembed
 rusty-brain init --list-batches
 rusty-brain init --undo <batch-id>
 
-# export memories (post-redaction, sorted by id for git-diffability)
+# export stored memories (sorted by id for git-diffability; run `scrub` first
+# if legacy or manually-entered rows may still contain plaintext secrets)
 rusty-brain export --format markdown
 rusty-brain export --format json --min-importance 5
 rusty-brain export --format csv
@@ -316,9 +324,10 @@ opt-in HTTP listener"): off by default at every layer; the bind must be a
 literal loopback `ip:port` — anything else refuses to start; **admin ops are
 always denied over HTTP** (no kernel-verified peer credential over TCP);
 Host/Origin are checked against loopback (DNS-rebinding/browser defense);
-bodies are capped at 1 MiB; v1 is a same-machine, same-user surface and
-explicitly **not an auth boundary** — on a multi-user machine, any local
-account can reach the non-admin surface while it is enabled.
+bodies are capped at 1 MiB; v1 is a same-machine surface intended for a
+single-user deployment and explicitly **not an auth boundary** — there is no
+same-user enforcement, so on a multi-user machine any local account can reach
+the non-admin surface while it is enabled.
 
 ### Capture hooks (optional)
 
@@ -423,12 +432,15 @@ unpinned overrides are never silently honored.
 
 ## Workspace layout
 
-Thirteen crates, plus a dev-only evaluation harness. Each crate is small and
-single-purpose; dependencies form a compiler-enforced DAG.
+The repository currently contains **18 workspace crates**. Each crate is
+small and single-purpose; dependencies form a compiler-enforced DAG. The
+evaluation and contract-guard crates are development/CI tooling rather than
+shipped runtime components.
 
 | Crate | Responsibility |
 |---|---|
 | `rb-types` | Domain vocabulary: `MemoryId`, `Namespace`, `MemoryNote`, errors, enums. |
+| `rb-config` | Shared configuration, namespace resolution, and path precedence. |
 | `rb-store` | SQLite + `sqlite-vec` engine: schema, migrations, FTS, vector KNN, graph queries. |
 | `rb-proto` | Daemon wire protocol: request/response types, length-delimited JSON framing, socket client. |
 | `rb-embed` | `EmbeddingProvider` trait + deterministic / Voyage / local (feature-gated) providers. |
@@ -436,13 +448,15 @@ single-purpose; dependencies form a compiler-enforced DAG.
 | `rb-engine` | Per-request orchestration: enrich → embed → store → link → recall. |
 | `rb-enrich` | Opt-in LLM enrichment and semantic linking (heuristic offline by default). |
 | `rb-daemon` | Single-writer service: writer thread, read pool, socket listener, change broadcast, namespace isolation. |
-| `rb-mcp` | MCP stdio adapter (the ten tools). |
+| `rb-mcp` | MCP stdio adapter (the 12 tools; six advertised by default). |
 | `rb-redact` | Shared secret-redaction pass (rules + entropy sweep) for capture and `scrub`. |
+| `rb-tokens` | Shared token counting used by prompt and MCP tool-budget guards. |
 | `rusty-brain` | The `rusty-brain` binary: `serve`, `mcp`, and client subcommands. |
 | `rb-agents` | CLI-agnostic agent hook spine: event model and per-CLI adapters. |
 | `rb-hooks` | The `rusty-brain-hooks` capture binary (fail-open). |
 | `rb-install` | The `rusty-brain-install` binary: wire/unwire hooks into agent CLIs. |
 | `rb-eval` *(dev-only)* | Offline deterministic regression harness; excluded from the shipped binary. |
+| `rb-contract-guard` *(CI/dev-only)* | Detects protocol/schema drift and requires an explicit compatibility decision. |
 
 ## Development
 
@@ -476,6 +490,12 @@ The current test suite is about **correctness, not performance or quality**:
   deterministic (non-semantic) vectors. It guards **ranking determinism and
   relative-ordering regressions** — "did this change reorder results?" — and explicitly
   does **not** measure absolute semantic quality.
+- **Bounded N=5 capability scorecard**: the 2026-07-12 Claude Code recovery
+  run was safe with zero memory-induced errors; reach and freshness passed,
+  while capture and retrieval-at-scale missed their steelman comparisons
+  (2/4 tracked dimensions passed). This is small-sample proxy evidence, not a
+  production-embedding quality gate or a user-adoption study. See
+  [`docs/eval/2026-07-12-w35-scorecard-n5-run.md`](docs/eval/2026-07-12-w35-scorecard-n5-run.md).
 - **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
   scheduled macOS job drives a real headless Claude Code session (`claude -p`) against
   freshly built binaries with hooks + MCP installed into an isolated `HOME`, then proves
@@ -487,10 +507,11 @@ The current test suite is about **correctness, not performance or quality**:
   `--model haiku --max-budget-usd 1`). Run it locally with
   `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
 
-**Not yet tested:** performance and latency, behavior at scale (large corpora, many
-concurrent clients), real-world semantic recall quality with a production embedding
-model, and failure modes under resource exhaustion or partial outages. A real-model
-evaluation mode exists but is run manually and is not part of CI.
+**Not yet measured:** performance and latency; large-corpus scale; sustained
+concurrency; resource exhaustion and partial outages; real-world semantic
+quality with a production embedding provider; and multi-user/multi-machine
+activation or adoption. A real-model evaluation mode exists but is manual and
+is not a production semantic-quality gate.
 
 ## Roadmap
 
@@ -498,8 +519,9 @@ Implemented through the retrieval-quality phase (store/recall, the daemon, MCP a
 surfaces, agent capture hooks, composite embeddings, RRF, confidence, and contradiction
 surfacing). Designed but not yet built:
 
-- LLM-assisted memory **evolution** (reconciliation, reflection, importance
-  recalibration) as opt-in background jobs.
+- LLM-assisted memory **evolution** (reconciliation and reflection) beyond the
+  deterministic consolidation, decay, and importance-recalibration jobs that
+  already ship.
 - A **networked / multi-host** surface with real authentication (today it is
   single-machine and per-user).
 - An **ANN vector index** for larger corpora (`sqlite-vec` brute-force KNN is the
