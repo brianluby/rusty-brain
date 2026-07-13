@@ -61,7 +61,11 @@ flowchart TD
   RB --> rbdaemon
   RB --> rbmcp
   RB --> rbconfig
+  RB --> rbembed
+  RB --> rbproto
   RB --> rbredact
+  RB --> rbstore
+  RB --> rbtypes
   HOOKS --> rbagents
   HOOKS --> rbconfig
   HOOKS --> rbproto
@@ -76,7 +80,6 @@ flowchart TD
   rbdaemon --> rbstore
   rbdaemon --> rbproto
   rbmcp --> rbproto
-  rbmcp --> rbtokens
   rbagents --> rbconfig
   rbagents --> rbproto
   rbenrich --> rbengine
@@ -102,6 +105,7 @@ flowchart TD
   EVAL -.-> rbembed
   EVAL -.-> rbsearch
   EVAL -.-> rbstore
+  EVAL -.-> rbtypes
   GUARD -.->|"inspects wire + migrations"| rbproto
   GUARD -.-> rbtypes
   GUARD -.-> rbstore
