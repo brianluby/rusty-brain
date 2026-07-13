@@ -28,6 +28,7 @@ step "agent: test"       cargo test -p rb-agents -p rb-hooks -p rb-install
 
 # --- contract drift guard job (W5a.4) ---
 step "contract-drift"    cargo run -p rb-contract-guard -- check
+step "release preflight" scripts/release-preflight.test.sh
 
 # --- cargo-deny / cargo-audit jobs ---
 step "cargo-deny"        cargo deny check

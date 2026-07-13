@@ -2,10 +2,20 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review: the human cannot answer
-"is this helping?", so trust and retention die. The Road-to-Tens `status`
-gate clause (W1.6/W4.3) covers writer health/WAL/corpus for ops, but not the
-user-facing value signal.
+Delivered 2026-07-11 (PR #56, merge `33a2218`, Vikunja #460). `status` and
+`stats` expose the daemon/writer, corpus, feedback, recall, contention,
+retention, WAL, and embedding-model signals in human and JSON forms;
+`doctor` diagnoses the live system without auto-starting or writing and exits
+non-zero on failed checks. Store aggregation lives in
+`crates/rb-store/src/store/stats.rs`, and binary e2e tests cover the value
+signals plus permission/model failures.
+
+Residual scope is explicit: aggregation cost has correctness coverage but no
+large-corpus benchmark; doctor reports the model served by a reachable daemon
+but does not independently probe a remote provider; and it does not yet invoke
+the separately delivered `rusty-brain-install status` hook-wiring report. The
+DB parent directory is intentionally not checked because it may be
+caller-owned; socket directory ownership is checked when present.
 
 ## Owner Area
 
@@ -17,7 +27,7 @@ Touchpoints:
 - `crates/rusty-brain/src/run.rs`
 - `crates/rusty-brain/src/output.rs`
 - `crates/rb-daemon/src/server.rs`
-- `crates/rb-store/src/store.rs`
+- `crates/rb-store/src/store/stats.rs`
 - `crates/rb-proto/src/messages.rs` (additive `Stats` request/response)
 - `crates/rb-types/src/feedback_kind.rs` (feedback aggregates)
 - `crates/rb-daemon/src/change.rs` (oplog-derived activity)
@@ -72,7 +82,8 @@ A health-check + diagnostic that exits non-zero on a problem and prints
 actionable guidance:
 
 - daemon reachable; socket mode correct; DB mode 0600 / dir 0700.
-- embedding provider reachable (or `deterministic` fallback noted loudly).
+- reachable daemon reports the configured embedding model (`deterministic` is
+  noted loudly); doctor does not independently call a remote provider.
 - embedding-model identity matches DB meta (the W0.2 fail-closed contract).
 - WAL checkpoint health; oversized-WAL warning with remediation hint.
 - hooks installed + wiring drift (delegates to installer `status` where

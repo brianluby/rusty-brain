@@ -5,7 +5,7 @@
 
 use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
-use crate::messages::{Handshake, HandshakeAck, Request, Response, CONTRACT_VERSION};
+use crate::messages::{Handshake, HandshakeAck, Request, Response, ScrubResult, CONTRACT_VERSION};
 use crate::{response_error_to_error, Response as Resp};
 use rb_types::{
     Error, FeedbackKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
@@ -627,13 +627,28 @@ where
     /// afterward to recompute vectors for the changed rows. Admin op: a
     /// non-admin peer is rejected with `Error::PermissionDenied`.
     pub async fn scrub(&mut self) -> Result<(u64, u64, u64)> {
+        let result = self.scrub_with_checkpoint().await?;
+        Ok((result.scanned, result.redacted, result.reembed_pending))
+    }
+
+    /// Retroactively redact secrets and return the post-scrub WAL checkpoint
+    /// status. Prefer this over [`Self::scrub`] when reporting at-rest safety.
+    pub async fn scrub_with_checkpoint(&mut self) -> Result<ScrubResult> {
         let resp = self.request(Request::Scrub).await?;
         match resp {
             Resp::Scrubbed {
                 scanned,
                 redacted,
                 reembed_pending,
-            } => Ok((scanned, redacted, reembed_pending)),
+                wal_checkpoint,
+                wal_checkpoint_error,
+            } => Ok(ScrubResult {
+                scanned,
+                redacted,
+                reembed_pending,
+                wal_checkpoint,
+                wal_checkpoint_error,
+            }),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -1040,6 +1055,7 @@ mod wrapper_tests {
         .await
         .unwrap();
 
+        let mut scrub_requests = 0u8;
         loop {
             let req: Request = match read_frame(&mut framed).await {
                 Ok(r) => r,
@@ -1179,11 +1195,30 @@ mod wrapper_tests {
                     moved: if merge { 7 } else { 3 },
                     vectors: 2,
                 },
-                Request::Scrub => Response::Scrubbed {
-                    scanned: 0,
-                    redacted: 0,
-                    reembed_pending: 0,
-                },
+                Request::Scrub => {
+                    scrub_requests += 1;
+                    if scrub_requests == 1 {
+                        Response::Scrubbed {
+                            scanned: 9,
+                            redacted: 2,
+                            reembed_pending: 1,
+                            wal_checkpoint: Some(crate::ScrubCheckpoint {
+                                busy: true,
+                                log_frames: 7,
+                                checkpointed_frames: 3,
+                            }),
+                            wal_checkpoint_error: None,
+                        }
+                    } else {
+                        Response::Scrubbed {
+                            scanned: 9,
+                            redacted: 2,
+                            reembed_pending: 1,
+                            wal_checkpoint: None,
+                            wal_checkpoint_error: Some("checkpoint unavailable".to_string()),
+                        }
+                    }
+                }
                 // Canned payload keyed on `window_days` so the typed-wrapper
                 // test can prove the window rides the wire.
                 Request::Stats { window_days } => Response::Stats {
@@ -1714,6 +1749,32 @@ mod wrapper_tests {
             .await
             .unwrap();
         assert_eq!((moved, vectors), (7, 2));
+
+        let scrubbed = c.scrub_with_checkpoint().await.unwrap();
+        assert_eq!(
+            (
+                scrubbed.scanned,
+                scrubbed.redacted,
+                scrubbed.reembed_pending
+            ),
+            (9, 2, 1)
+        );
+        assert_eq!(
+            scrubbed.wal_checkpoint,
+            Some(crate::ScrubCheckpoint {
+                busy: true,
+                log_frames: 7,
+                checkpointed_frames: 3,
+            })
+        );
+        assert!(scrubbed.wal_checkpoint_error.is_none());
+
+        let unavailable = c.scrub_with_checkpoint().await.unwrap();
+        assert!(unavailable.wal_checkpoint.is_none());
+        assert_eq!(
+            unavailable.wal_checkpoint_error.as_deref(),
+            Some("checkpoint unavailable")
+        );
 
         // The fake server echoes the window into the payload, proving the
         // window rides the wire and the payload comes back typed.

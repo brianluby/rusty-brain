@@ -1,0 +1,46 @@
+name: Semantic quality gate
+
+on:
+  schedule:
+    - cron: "17 9 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: semantic-quality-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  offline-replay:
+    name: W4.1 offline replay
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@29eef336d9b2848a0b548edc03f92a220660cdb8 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Gate frozen local-model replay
+        run: >-
+          cargo test -p rb-eval --test semantic_gate
+          production_embedding_linear_gate_passes_goldens_and_untouched_holdout
+          -- --nocapture
+      - name: Report five-seed Linear and RRF aggregates
+        run: >-
+          cargo test -p rb-eval --test semantic_gate
+          five_seed_linear_rrf_diagnostic
+          -- --ignored --nocapture
+      - name: Report controlled retrieval and shadow-admission arms
+        run: >-
+          cargo test -p rb-eval --test controlled_arms
+          controlled_retrieval_and_admission_arms_report_every_seed
+          -- --ignored --nocapture
+      - name: Gate zero instruction-poison exposure
+        run: >-
+          cargo test -p rb-eval --test semantic_safety
+          pilot_gate_requires_zero_instruction_poison_exposure
+          -- --ignored --nocapture

@@ -2,11 +2,23 @@
 
 ## Status
 
-Draft. From the 2026-07-02 senior-PM product review. The roadmap is ~90%
-Claude Code; today everything funnels through stdio MCP or the CLI. A local
-HTTP surface unlocks any tool/script/non-MCP agent and expands TAM beyond
-coding agents, and a generic recall-before-work abstraction is what the
-cross-agent parity PRD is reaching for as a *product* invariant.
+Delivered 2026-07-11 (PR #62, merge `e4ca88e`). The optional listener is
+default-off and loopback-only, reuses the daemon's wire requests/responses,
+and exposes shortcut routes plus generic `POST /ops`. The transport-generic
+`rb_proto::Client<S>` and the shared prompt-time recall contract are shipped;
+the capability matrix records unsupported adapters rather than implying
+parity. HTTP/UDS agreement and HTTP security behavior are covered by
+`crates/rb-daemon/tests/http_e2e.rs`.
+
+The delivered security posture is deliberately stricter than this draft:
+non-loopback binds are refused outright (there is no override), HTTP callers
+are always non-admin because TCP has no kernel peer credential, and streaming
+`subscribe` is rejected. Every route requires an explicit namespace header;
+Host/Origin, JSON media type, body size, deadlines, and connection count are
+bounded. HTTP v1 remains a same-machine convenience surface, not an auth
+boundary or multi-host API. Native prompt-time injection remains Claude-only;
+other adapters are explicitly unsupported or may call `/recall` from their own
+tooling.
 
 ## Owner Area
 
@@ -14,7 +26,8 @@ Primary: transport, server listeners, and the prompt-time injection seam.
 
 Touchpoints:
 
-- `crates/rb-daemon/src/server.rs` (listener; transport seam)
+- `crates/rb-daemon/src/http.rs` (HTTP listener and request hygiene)
+- `crates/rb-daemon/src/server.rs` (shared dispatch; UDS listener)
 - `crates/rb-proto/src/client.rs`, `crates/rb-proto/src/codec.rs`
   (stream-generic framing - the W5a.3 transport-genericization, pulled
   forward)
@@ -42,7 +55,7 @@ Two coupled gaps:
 ## Goals
 
 - An optional local HTTP/REST listener (`rusty-brain serve --http`) exposing
-  the same operations as the CLI/MCP, for any client.
+  the same non-admin request shapes as the CLI/MCP, for any local client.
 - An agent-agnostic "recall-before-work" abstraction so prompt-time retrieval
   is a capability, not a Claude implementation detail.
 - Default-off, opt-in, loopback-only, with clear security framing; the
@@ -52,8 +65,9 @@ Two coupled gaps:
 
 - Do not replace MCP stdio (it stays the primary agent surface).
 - Do not build team-mode auth (that is Phase 5a/W5a.1); HTTP v1 is loopback
-  + same-user peer-cred, not multi-host.
-- Do not expose admin ops over HTTP without the existing peer-cred gate.
+  only and is not a multi-host surface.
+- Do not expose admin operations over HTTP; TCP callers have no kernel-verified
+  peer credential and are always treated as non-admin.
 - Do not change ranking or the response shape.
 
 ## Functional Requirements
@@ -62,21 +76,20 @@ Two coupled gaps:
 
 - `serve --http [bind]` (default `127.0.0.1:0` or a configured port) starts
   an HTTP listener alongside (or instead of) the UDS listener.
-- REST endpoints mirror CLI/MCP operations: `POST /remember`, `POST
+- REST endpoints mirror non-admin CLI/MCP operations: `POST /remember`, `POST
   /recall`, `GET /memories/:id`, `GET /context`, `POST /feedback`, etc.,
   over JSON. The existing `Response` types serialize directly.
 - Default-off; enabling it is explicit. A config knob (`[http] enable`,
   `bind`) under the same precedence rules as other knobs; secrets stay
   env-only.
 
-### HTTP-2. Security posture (v1: loopback + same-user)
+### HTTP-2. Security posture (v1: loopback-only, non-admin)
 
-- Bind loopback only by default; a non-loopback bind requires an explicit
-  opt-in flag and prints a warning.
-- Peer identity reuses the W2.6 peer-cred machinery where available;
-  admin ops (`RunJob`/`Reembed`/`Scrub`/`NamespaceRename`) stay admin-gated.
+- Refuse every non-loopback bind; v1 has no override or warning-only mode.
+- Treat every HTTP caller as non-admin because TCP supplies no kernel-verified
+  peer credential. Reject `RunJob`, `Reembed`, `Scrub`, and `NamespaceRename`.
 - The threat model is updated: HTTP is a new network surface; v1 is
-  same-machine/same-user and explicitly not an auth boundary.
+  same-machine and explicitly not an auth or same-user boundary.
 
 ### HTTP-3. Transport genericization (pulled forward from W5a.3)
 
@@ -100,8 +113,8 @@ Two coupled gaps:
 
 - `serve --http` responds to `POST /recall` with the same ranked results as
   the CLI, over loopback.
-- A non-loopback bind refuses without an explicit opt-in and warns.
-- Admin ops over HTTP are peer-cred-gated exactly as over UDS.
+- A non-loopback bind is refused with no override.
+- Admin operations are always rejected over HTTP.
 - An agent without `UserPromptSubmit` can still get prompt-time recall via
   its mapped equivalent, or the capability matrix records `unsupported`
   (never silent parity).
@@ -118,13 +131,14 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Plus an HTTP e2e hitting `/recall` and `/feedback`, and a peer-cred test
+Plus an HTTP e2e hitting `/recall` and `/feedback`, and a non-admin HTTP test
 asserting admin rejection.
 
 ## Risks
 
-- New attack surface. Mitigate: default-off, loopback-only, peer-cred,
-  threat-model update, admin gating; no multi-host auth in v1.
+- New attack surface. Mitigate: default-off, loopback-only binding,
+  unconditionally denied admin operations, and a threat-model update; no
+  multi-host auth in v1.
 - Transport refactor regresses UDS. Mitigate: pull W5a.3's `Client<S>`
   genericization with agreement tests on both transports.
 - Agent recall abstraction too broad. Mitigate: narrow contract (top-k,
@@ -132,12 +146,15 @@ asserting admin rejection.
 
 ## Implementation Checklist
 
-- [ ] Generalize codec/client to `Client<S>` (W5a.3 seam).
-- [ ] Add opt-in HTTP listener + REST endpoints.
-- [ ] Loopback default + non-loopback opt-in + peer-cred admin gate.
-- [ ] Promote recall-before-work to an agent capability.
-- [ ] Map per-adapter events to the injection contract; update the matrix.
-- [ ] Update the threat model; add HTTP + UDS agreement tests.
+- [x] Generalize codec/client to `Client<S>` (W5a.3 seam).
+- [x] Add the opt-in HTTP listener, shortcut routes, and generic `/ops`.
+- [x] Enforce loopback-only binding and always deny admin operations over HTTP
+      (stricter than the draft's non-loopback opt-in/peer-cred proposal).
+- [x] Promote recall-before-work to an agent capability and shared contract.
+- [x] Map verified adapter events and record unsupported mappings explicitly in
+      the capability matrix.
+- [x] Update the threat model; add HTTP/UDS agreement and adversarial HTTP
+      security tests.
 
 ## Roadmap Fit
 
