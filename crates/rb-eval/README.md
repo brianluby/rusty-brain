@@ -63,9 +63,9 @@ fallback is disabled and a missing/wrong-kind vector fails closed.
   streams for equal-budget Linear/RRF/exact-evidence/recency/importance
   retrieval arms and novelty/importance-confidence/combined online shadow
   admission arms. The scheduled/manual report emits every seed and enforces
-  the frozen no-go for the exact lane and the combined admission arm's
-  shadow-only qualification; the overall poison-exposure NO-GO blocks pilot
-  admission and no production behavior changes.
+  the tracker-authoritative no-go for both exact evidence and surprise-aware
+  combined admission. A dated erratum preserves the invalid original threshold
+  transcription for auditability; no production behavior changes.
 
 Re-record after any corpus change (single command per provider):
 
@@ -103,9 +103,9 @@ cargo test -p rb-eval --test controlled_arms \
   -- --ignored --nocapture
 ```
 
-Its 2026-07-12 result keeps the exact-evidence lane off. The combined admission
-product meets its shadow-arm criteria, but the overall zero-poison-exposure
-NO-GO blocks a bounded pilot. See the
+Its 2026-07-12 result keeps both exact evidence and surprise-aware combined
+admission off; the separate zero-poison-exposure failure also blocks dogfood.
+See the
 [frozen preregistration](../../docs/eval/2026-07-12-w41-controlled-arms-preregistration.md)
 and [dated results](../../docs/eval/2026-07-12-w41-semantic-gate-results.md).
 

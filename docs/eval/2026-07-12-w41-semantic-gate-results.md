@@ -3,7 +3,12 @@
 Preregistrations:
 [`2026-07-12-w41-semantic-gate-preregistration.md`](2026-07-12-w41-semantic-gate-preregistration.md)
 and
-[`2026-07-12-w41-controlled-arms-preregistration.md`](2026-07-12-w41-controlled-arms-preregistration.md).
+[`2026-07-12-w41-controlled-arms-preregistration.md`](2026-07-12-w41-controlled-arms-preregistration.md),
+with the decision-integrity correction in
+[`2026-07-12-w41-controlled-arms-erratum.md`](2026-07-12-w41-controlled-arms-erratum.md).
+The original controlled artifact is retained unchanged; its transcribed
+thresholds are invalid, and all decisions below use the tracker rules that
+predated the run.
 
 Outcome: **NO-GO for bounded dogfood.** The current Linear fusion passes the
 frozen ranking floors and remains preferable to RRF, but the production recall
@@ -68,6 +73,13 @@ Dedicated offline tests additionally established:
 - a low-confidence instruction-shaped poison is dampened below the correct fact,
   but remains exposed at rank 2. The explicit pilot gate therefore fails closed.
 
+Required strata not supplied by this artifact remain explicit:
+
+| Stratum | State | Reason |
+|---|---|---|
+| typed-anchor contribution to the controlled exact lane | `not_measured` | the frozen `FixtureMemory` schema has no anchor field; no contribution is invented |
+| secrets after redaction | `not_measured` | no dedicated redaction-to-recall stratum was executed in this gate |
+
 The 205-memory primary corpus supplies authored near-duplicates and ordinary
 distractors; dedup meets its floor. Ranking-floor success cannot override the
 zero-exposure failure. The ≥5k noise/resource variant and p50/p99 resource
@@ -87,11 +99,13 @@ the same 5-row/800-token whole-row prompt budget.
 | recency only | 0.0433 | 0.0252 | 0.0235 | 1.0000 | 0.0300 | 0.0100 | 0.0800 | 0.9900 | 5296.0 |
 | importance only | 0.0167 | 0.0167 | 0.0058 | 1.0000 | 0.0000 | 0.0000 | 0.0000 | 1.0000 | 5575.0 |
 
-Every arm had zero poison exposure and 1.0 contested disclosure. The bounded
-exact-evidence lane is **NO-GO**: it did not improve exact-span coverage or
-answer accuracy, and recall regressed by 0.025, beyond the allowed 0.01. The
-small stale-exposure improvement does not override that failure. Recency-only
-and importance-only remain diagnostic baselines, not default candidates.
+Every arm had zero poison exposure. Controlled rankings contain only stable
+keys, not returned-row labels, so contested disclosure is `not_measured` rather
+than inferred from fixture truth. The bounded exact-evidence lane is **NO-GO**:
+it improved neither exact-span coverage nor answer accuracy, far short of the
+required +0.10 on both, and recall regressed by 0.025. The small stale-exposure
+improvement does not override those failures. Recency-only and importance-only
+remain diagnostic baselines, not default candidates.
 
 The controlled stale label is deliberately stricter than the engine state. It
 derives authored truth from fixture contexts that declare a current reversal,
@@ -107,19 +121,19 @@ each stream, with 128-row/32,768-byte caps. Holdout values are five-seed means.
 
 | Arm | recall@5 | MRR | NDCG@5 | dedup@5 | exact span | answer | relevant retained | rows | bytes | poison rows |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| novelty only | 0.5917 | 0.7150 | 0.6207 | 1.0000 | 0.6500 | 0.6900 | 0.5310 | 128 | 26440.2 | 1 |
+| novelty only | 0.5867 | 0.6900 | 0.6043 | 1.0000 | 0.6200 | 0.6700 | 0.5172 | 128 | 26423.6 | 1 |
 | importance-confidence | 0.7917 | 0.9000 | 0.8101 | 0.9800 | 0.8000 | 0.8500 | 0.8621 | 128 | 27197.0 | 0 |
-| combined product | 0.8217 | 0.9300 | 0.8456 | 0.9900 | 0.8600 | 0.8800 | 0.8759 | 128 | 27107.0 | 0 |
+| combined product | 0.8067 | 0.9150 | 0.8307 | 0.9900 | 0.8300 | 0.8800 | 0.8621 | 128 | 27091.4 | 0 |
 
-All three arms retained zero authored-stale rows, had zero stale/poison query
-exposure, and disclosed every returned contested row. Novelty-only nevertheless
-retained one poison probe in every seed. The combined product independently
-meets its preregistered **shadow-arm** criteria: it is within 0.01 of (and in
-this run exceeds) the better component on recall/MRR/NDCG, retains/exposes no
-poison or stale row, preserves contested disclosure, respects both caps, and
-reduces the 205-row corpus to 128 rows (37.6%). It remains ineligible for a
-pilot while the overall semantic gate is NO-GO, and it does not authorize a
-production retention or admission change.
+All three arms retained zero authored-stale rows and had zero stale/poison query
+exposure; contested disclosure is `not_measured`. Novelty-only nevertheless
+retained one poison probe in every seed. Surprise-aware combined selection is
+**NO-GO**: recall@5 is 0.8067 versus current Linear's 0.9750 (a 0.1683 loss,
+not the required +0.05 lift), NDCG loses 0.1190 instead of at most 0.01, and
+wrong-answer exposure is 0.12 versus Linear's 0.10. Its large lift over
+recency-only, zero retained poison, bounded 128-row set, and 37.6% row reduction
+cannot override those failures. No production retention or admission change is
+authorized.
 
 ## Reproduction
 

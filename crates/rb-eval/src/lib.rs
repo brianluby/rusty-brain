@@ -49,8 +49,8 @@ pub use runner::{
     EvalReport, ModeComparison, QueryChannelHits, QueryDetail,
 };
 pub use semantic_gate::{
-    check_semantic_floors, load_semantic_gate, QualityFloors, SemanticGateInputs,
-    SemanticGateManifest,
+    check_semantic_floors, load_semantic_gate, ControlledThresholds, QualityFloors,
+    SemanticGateInputs, SemanticGateManifest,
 };
 
 // Re-export so harness callers can name the fusion mode without depending on

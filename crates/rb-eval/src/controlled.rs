@@ -53,7 +53,10 @@ pub struct ArmMetrics {
     pub stale_exposure_rate: f64,
     pub wrong_answer_rate: f64,
     pub poison_exposure_rate: f64,
-    pub contested_disclosure_rate: f64,
+    /// Whether contested labels were preserved on returned rows. The current
+    /// key-only shadow rankings do not carry row labels, so this remains
+    /// `None` instead of assuming disclosure from authored fixture truth.
+    pub contested_disclosure_rate: Option<f64>,
     pub injected_rows: usize,
     pub injected_bytes: usize,
     pub injected_tokens: usize,
@@ -375,9 +378,7 @@ pub fn evaluate_admission_arm(
         let memory = by_key
             .get(&key)
             .ok_or_else(|| format!("stream references unknown key {key:?}"))?;
-        if let Some(targets) = superseded_by_successor.get(key.as_str()) {
-            active.retain(|row| !targets.contains(&row.memory.key.as_str()));
-        }
+        let superseded_targets = superseded_by_successor.get(key.as_str());
         let novelty = novelty_against_active(memory, &active);
         let prior = f64::from(memory.importance) / 10.0 * f64::from(memory.confidence);
         let score = match arm {
@@ -389,6 +390,9 @@ pub fn evaluate_admission_arm(
             memory: memory.clone(),
             score,
         });
+        if let Some(targets) = superseded_targets {
+            active.retain(|row| !targets.contains(&row.memory.key.as_str()));
+        }
         while active.len() > ADMISSION_ROW_BUDGET || active_bytes(&active) > ADMISSION_BYTE_BUDGET {
             let evict = active
                 .iter()
@@ -487,8 +491,6 @@ fn evaluate_rankings(
     let mut correct_top = 0usize;
     let mut stale = 0usize;
     let mut poison = 0usize;
-    let mut contested = 0usize;
-    let mut disclosed = 0usize;
     let mut rows = 0usize;
     let mut bytes = 0usize;
 
@@ -521,10 +523,6 @@ fn evaluate_rankings(
             if labels.stale.contains(key) {
                 stale += 1;
             }
-            if labels.contested.contains(key) {
-                contested += 1;
-                disclosed += 1; // Shadow output explicitly carries this label.
-            }
             if let Some(memory) = memories.get(key) {
                 poison += usize::from(memory.poison);
                 rows += 1;
@@ -543,11 +541,7 @@ fn evaluate_rankings(
         stale_exposure_rate: fraction(stale, rows),
         wrong_answer_rate: 1.0 - fraction(correct_top, queries.len()),
         poison_exposure_rate: fraction(poison, rows),
-        contested_disclosure_rate: if contested == 0 {
-            1.0
-        } else {
-            fraction(disclosed, contested)
-        },
+        contested_disclosure_rate: None,
         injected_rows: rows,
         injected_bytes: bytes,
         injected_tokens: bytes.div_ceil(4),

@@ -18,16 +18,26 @@ const HOLDOUT_RAW: &str = include_str!("../fixtures/holdout_queries.json");
 const FIXTURE_RAW: &str = include_str!("../fixtures/embeddings/all-MiniLM-L6-v2.json");
 const PREREGISTRATION_RAW: &str =
     include_str!("../../../docs/eval/2026-07-12-w41-semantic-gate-preregistration.md");
+const CONTROLLED_PREREGISTRATION_RAW: &str =
+    include_str!("../../../docs/eval/2026-07-12-w41-controlled-arms-preregistration.md");
+const CONTROLLED_ERRATUM_RAW: &str =
+    include_str!("../../../docs/eval/2026-07-12-w41-controlled-arms-erratum.md");
 
 /// Machine-readable W4.1 gate definition frozen by the preregistration.
 #[derive(Debug, Clone, Deserialize)]
 pub struct SemanticGateManifest {
     pub schema_version: u32,
     pub preregistration: String,
+    pub preregistration_sha256: String,
+    pub controlled_preregistration: String,
+    pub controlled_preregistration_sha256: String,
+    pub controlled_erratum: String,
+    pub controlled_erratum_sha256: String,
     pub corpus: CorpusLock,
     pub holdout: HoldoutLock,
     pub embedding: EmbeddingLock,
     pub floors: QualityFloors,
+    pub controlled_thresholds: ControlledThresholds,
     pub chronological_seeds: Vec<String>,
     pub default_decision: String,
 }
@@ -70,6 +80,19 @@ pub struct QualityFloors {
     pub graph_query_rate: f64,
 }
 
+/// Tracker-authoritative controlled-arm decision thresholds locked by the
+/// dated erratum.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize)]
+pub struct ControlledThresholds {
+    pub exact_span_lift: f64,
+    pub exact_answer_lift: f64,
+    pub max_semantic_quality_regression: f64,
+    pub surprise_recall_lift_vs_linear: f64,
+    pub surprise_recall_lift_vs_recency: f64,
+    pub surprise_max_ndcg_loss: f64,
+    pub surprise_max_dedup_loss: f64,
+}
+
 /// Validated immutable inputs for one semantic-gate run.
 pub struct SemanticGateInputs {
     pub manifest: SemanticGateManifest,
@@ -91,6 +114,21 @@ pub fn load_semantic_gate() -> Result<SemanticGateInputs, String> {
         "embedding fixture",
         FIXTURE_RAW,
         &manifest.embedding.fixture_sha256,
+    )?;
+    verify_hash(
+        "primary preregistration",
+        PREREGISTRATION_RAW,
+        &manifest.preregistration_sha256,
+    )?;
+    verify_hash(
+        "controlled preregistration",
+        CONTROLLED_PREREGISTRATION_RAW,
+        &manifest.controlled_preregistration_sha256,
+    )?;
+    verify_hash(
+        "controlled decision erratum",
+        CONTROLLED_ERRATUM_RAW,
+        &manifest.controlled_erratum_sha256,
     )?;
 
     let corpus = Corpus::from_json(CORPUS_RAW).map_err(|error| error.to_string())?;
@@ -210,7 +248,12 @@ fn validate_manifest_shape(manifest: &SemanticGateManifest) -> Result<(), String
         ));
     }
     if manifest.preregistration != "docs/eval/2026-07-12-w41-semantic-gate-preregistration.md"
+        || manifest.controlled_preregistration
+            != "docs/eval/2026-07-12-w41-controlled-arms-preregistration.md"
+        || manifest.controlled_erratum != "docs/eval/2026-07-12-w41-controlled-arms-erratum.md"
         || PREREGISTRATION_RAW.trim().is_empty()
+        || CONTROLLED_PREREGISTRATION_RAW.trim().is_empty()
+        || CONTROLLED_ERRATUM_RAW.trim().is_empty()
     {
         return Err("semantic gate preregistration is missing or unexpected".to_string());
     }
@@ -248,6 +291,48 @@ fn validate_manifest_shape(manifest: &SemanticGateManifest) -> Result<(), String
     ] {
         if !floor.is_finite() || !(0.0..=1.0).contains(&floor) {
             return Err(format!("semantic gate floor {name} is invalid: {floor}"));
+        }
+    }
+    for (name, threshold) in [
+        (
+            "exact_span_lift",
+            manifest.controlled_thresholds.exact_span_lift,
+        ),
+        (
+            "exact_answer_lift",
+            manifest.controlled_thresholds.exact_answer_lift,
+        ),
+        (
+            "max_semantic_quality_regression",
+            manifest
+                .controlled_thresholds
+                .max_semantic_quality_regression,
+        ),
+        (
+            "surprise_recall_lift_vs_linear",
+            manifest
+                .controlled_thresholds
+                .surprise_recall_lift_vs_linear,
+        ),
+        (
+            "surprise_recall_lift_vs_recency",
+            manifest
+                .controlled_thresholds
+                .surprise_recall_lift_vs_recency,
+        ),
+        (
+            "surprise_max_ndcg_loss",
+            manifest.controlled_thresholds.surprise_max_ndcg_loss,
+        ),
+        (
+            "surprise_max_dedup_loss",
+            manifest.controlled_thresholds.surprise_max_dedup_loss,
+        ),
+    ] {
+        if !threshold.is_finite() || !(0.0..=1.0).contains(&threshold) {
+            return Err(format!(
+                "semantic gate controlled threshold {name} is invalid: {threshold}"
+            ));
         }
     }
     Ok(())

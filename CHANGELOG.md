@@ -32,10 +32,11 @@ All notable changes to rusty-brain are documented here. The format is based on
   admission arms report exact-span/answer quality, stale/wrong/poison exposure,
   contested disclosure, rows/tokens/bytes, and latency. The exact lane is a
   frozen no-go (no answer lift and a 0.025 recall regression); combined
-  admission meets its shadow-arm criteria (better component quality, zero
-  stale/poison retained or exposed, 128/205 rows) but cannot enter a pilot while
-  the overall semantic gate is NO-GO. No production ranking, retention, or
-  admission behavior changed.
+  surprise-aware admission is also no-go under the tracker-authoritative rules
+  (recall/NDCG regress versus Linear despite zero retained poison and 128/205
+  rows). The original threshold transcription is retained with a dated erratum;
+  preregistration hashes and controlled thresholds are machine-locked. No
+  production ranking, retention, or admission behavior changed.
 
 ### Changed — Supersede hardened at the source (#501)
 

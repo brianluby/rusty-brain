@@ -104,10 +104,37 @@ fn admission_average(
     )
 }
 
+fn retrieval_optional_average(
+    reports: &[RetrievalArmReport],
+    arm: RetrievalArm,
+    metric: impl Fn(&RetrievalArmReport) -> Option<f64>,
+) -> Option<f64> {
+    let values: Option<Vec<f64>> = reports
+        .iter()
+        .filter(|report| report.arm == arm)
+        .map(metric)
+        .collect();
+    values.map(|values| mean(values.into_iter()))
+}
+
+fn admission_optional_average(
+    reports: &[AdmissionArmReport],
+    arm: AdmissionArm,
+    metric: impl Fn(&AdmissionArmReport) -> Option<f64>,
+) -> Option<f64> {
+    let values: Option<Vec<f64>> = reports
+        .iter()
+        .filter(|report| report.arm == arm)
+        .map(metric)
+        .collect();
+    values.map(|values| mean(values.into_iter()))
+}
+
 #[tokio::test]
 #[ignore = "scheduled/manual aggregate-only controlled arms; never mutates production behavior"]
 async fn controlled_retrieval_and_admission_arms_report_every_seed() {
     let frozen = load_semantic_gate().expect("gate inputs validate");
+    let thresholds = frozen.manifest.controlled_thresholds;
     let golden = frozen.corpus.clone();
     let mut holdout = frozen.corpus;
     holdout.golden_queries = frozen.holdout_queries;
@@ -189,10 +216,12 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
     ]
     .into_iter()
     .all(|metric| {
-        retrieval_average(&holdout_retrieval, RetrievalArm::ExactEvidence, metric) + 0.01
+        retrieval_average(&holdout_retrieval, RetrievalArm::ExactEvidence, metric)
+            + thresholds.max_semantic_quality_regression
             >= retrieval_average(&holdout_retrieval, RetrievalArm::Linear, metric)
     });
-    let exact_go = (exact_exact >= linear_exact + 0.01 || exact_answer >= linear_answer + 0.01)
+    let exact_go = exact_exact >= linear_exact + thresholds.exact_span_lift
+        && exact_answer >= linear_answer + thresholds.exact_answer_lift
         && exact_quality_ok
         && retrieval_average(&holdout_retrieval, RetrievalArm::ExactEvidence, |r| {
             r.metrics.stale_exposure_rate
@@ -203,6 +232,11 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             r.metrics.poison_exposure_rate
         }) <= retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
             r.metrics.poison_exposure_rate
+        })
+        && retrieval_average(&holdout_retrieval, RetrievalArm::ExactEvidence, |r| {
+            r.metrics.wrong_answer_rate
+        }) <= retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
+            r.metrics.wrong_answer_rate
         });
 
     let holdout_admission: Vec<_> = admission
@@ -210,24 +244,32 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         .filter(|report| report.set == "holdout")
         .cloned()
         .collect();
-    let combined_quality_ok = [
-        |r: &AdmissionArmReport| r.metrics.recall_at_5,
-        |r: &AdmissionArmReport| r.metrics.mrr,
-        |r: &AdmissionArmReport| r.metrics.ndcg_at_5,
-    ]
-    .into_iter()
-    .all(|metric| {
-        let combined = admission_average(&holdout_admission, AdmissionArm::Combined, metric);
-        let best_component =
-            admission_average(&holdout_admission, AdmissionArm::NoveltyOnly, metric).max(
-                admission_average(
-                    &holdout_admission,
-                    AdmissionArm::ImportanceConfidence,
-                    metric,
-                ),
-            );
-        combined + 0.01 >= best_component
+    let combined_recall = admission_average(&holdout_admission, AdmissionArm::Combined, |r| {
+        r.metrics.recall_at_5
     });
+    let linear_recall = retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
+        r.metrics.recall_at_5
+    });
+    let recency_recall = retrieval_average(&holdout_retrieval, RetrievalArm::RecencyOnly, |r| {
+        r.metrics.recall_at_5
+    });
+    let combined_ndcg = admission_average(&holdout_admission, AdmissionArm::Combined, |r| {
+        r.metrics.ndcg_at_5
+    });
+    let linear_ndcg = retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
+        r.metrics.ndcg_at_5
+    });
+    let combined_dedup = admission_average(&holdout_admission, AdmissionArm::Combined, |r| {
+        r.metrics.dedup_precision_at_5
+    });
+    let linear_dedup = retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
+        r.metrics.dedup_precision_at_5
+    });
+    let combined_quality_ok = combined_recall
+        >= linear_recall + thresholds.surprise_recall_lift_vs_linear
+        && combined_recall >= recency_recall + thresholds.surprise_recall_lift_vs_recency
+        && combined_ndcg + thresholds.surprise_max_ndcg_loss >= linear_ndcg
+        && combined_dedup + thresholds.surprise_max_dedup_loss >= linear_dedup;
     let combined_reports = admission
         .iter()
         .filter(|report| report.arm == AdmissionArm::Combined);
@@ -235,7 +277,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         report.poison_rows_retained == 0
             && report.metrics.poison_exposure_rate == 0.0
             && report.metrics.stale_exposure_rate == 0.0
-            && report.metrics.contested_disclosure_rate == 1.0
+            && report.metrics.contested_disclosure_rate == Some(1.0)
             && report.retained_rows <= 128
             && report.retained_bytes <= 32_768
     });
@@ -248,7 +290,21 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         report.retained_rows * 4 <= golden.memories.len() * 3
             || report.retained_bytes * 4 <= full_corpus_bytes * 3
     });
-    let admission_go = combined_quality_ok && combined_safety_ok && combined_reduction_ok;
+    let combined_exposure_ok = [
+        |metrics: &rb_eval::ArmMetrics| metrics.stale_exposure_rate,
+        |metrics: &rb_eval::ArmMetrics| metrics.wrong_answer_rate,
+        |metrics: &rb_eval::ArmMetrics| metrics.poison_exposure_rate,
+    ]
+    .into_iter()
+    .all(|metric| {
+        admission_average(&holdout_admission, AdmissionArm::Combined, |r| {
+            metric(&r.metrics)
+        }) <= retrieval_average(&holdout_retrieval, RetrievalArm::Linear, |r| {
+            metric(&r.metrics)
+        })
+    });
+    let admission_go =
+        combined_quality_ok && combined_safety_ok && combined_reduction_ok && combined_exposure_ok;
 
     let retrieval_summary: Vec<_> = [
         RetrievalArm::Linear,
@@ -270,7 +326,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             "stale_exposure_rate": retrieval_average(&holdout_retrieval, arm, |r| r.metrics.stale_exposure_rate),
             "wrong_answer_rate": retrieval_average(&holdout_retrieval, arm, |r| r.metrics.wrong_answer_rate),
             "poison_exposure_rate": retrieval_average(&holdout_retrieval, arm, |r| r.metrics.poison_exposure_rate),
-            "contested_disclosure_rate": retrieval_average(&holdout_retrieval, arm, |r| r.metrics.contested_disclosure_rate),
+            "contested_disclosure_rate": retrieval_optional_average(&holdout_retrieval, arm, |r| r.metrics.contested_disclosure_rate),
             "injected_tokens": retrieval_average(&holdout_retrieval, arm, |r| r.metrics.injected_tokens as f64),
         })
     })
@@ -297,7 +353,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             "poison_rows_retained": admission_average(&holdout_admission, arm, |r| r.poison_rows_retained as f64),
             "stale_exposure_rate": admission_average(&holdout_admission, arm, |r| r.metrics.stale_exposure_rate),
             "poison_exposure_rate": admission_average(&holdout_admission, arm, |r| r.metrics.poison_exposure_rate),
-            "contested_disclosure_rate": admission_average(&holdout_admission, arm, |r| r.metrics.contested_disclosure_rate),
+            "contested_disclosure_rate": admission_optional_average(&holdout_admission, arm, |r| r.metrics.contested_disclosure_rate),
             "injected_tokens": admission_average(&holdout_admission, arm, |r| r.metrics.injected_tokens as f64),
         })
     })
@@ -307,7 +363,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         "admission_holdout_five_seed_mean": admission_summary,
         "decision": {
             "exact_evidence_lane_go": exact_go,
-            "combined_admission_shadow_arm_go": admission_go,
+            "surprise_aware_selection_go": admission_go,
             "overall_pilot_go": false,
             "pilot_blocker": "production instruction-poison exposure is non-zero",
         }
@@ -319,10 +375,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         !exact_go,
         "exact lane must retain its frozen NO-GO decision"
     );
-    assert!(
-        admission_go,
-        "combined admission must retain its frozen pilot GO decision"
-    );
+    assert!(!admission_go, "surprise-aware selection remains a NO-GO");
     println!(
         "CONTROLLED_SUMMARY={}",
         serde_json::to_string(&summary).unwrap()
@@ -337,7 +390,7 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             "admission": admission,
             "decision": {
                 "exact_evidence_lane_go": exact_go,
-                "combined_admission_shadow_arm_go": admission_go,
+                "surprise_aware_selection_go": admission_go,
                 "overall_pilot_go": false,
                 "pilot_blocker": "production instruction-poison exposure is non-zero",
                 "production_changes": "none"

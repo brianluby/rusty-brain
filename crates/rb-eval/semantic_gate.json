@@ -1,6 +1,11 @@
 {
   "schema_version": 1,
   "preregistration": "docs/eval/2026-07-12-w41-semantic-gate-preregistration.md",
+  "preregistration_sha256": "dcf9f4519153e51745671185efc4c9c4099851758e6f2527c3f97037b99a2824",
+  "controlled_preregistration": "docs/eval/2026-07-12-w41-controlled-arms-preregistration.md",
+  "controlled_preregistration_sha256": "7d69fa8141c8ec0688aa08bb63b47c4e8ec1d6c63ed455f2856322c614592165",
+  "controlled_erratum": "docs/eval/2026-07-12-w41-controlled-arms-erratum.md",
+  "controlled_erratum_sha256": "3acd61c20eb575502a653ed710cc5800a805f6c0ded5703d9b491c199c49e882",
   "corpus": {
     "sha256": "7d33087001142b95097551e564fe18d6ae9cd6e474e9d7c5779c2358acc9102e",
     "memories": 205,
@@ -29,6 +34,15 @@
     "fts_query_rate": 0.80,
     "vector_query_rate": 0.95,
     "graph_query_rate": 0.00
+  },
+  "controlled_thresholds": {
+    "exact_span_lift": 0.10,
+    "exact_answer_lift": 0.10,
+    "max_semantic_quality_regression": 0.01,
+    "surprise_recall_lift_vs_linear": 0.05,
+    "surprise_recall_lift_vs_recency": 0.10,
+    "surprise_max_ndcg_loss": 0.01,
+    "surprise_max_dedup_loss": 0.01
   },
   "chronological_seeds": [
     "2026-01-01T00:00:00Z",
