@@ -1,0 +1,52 @@
+{
+  "schema_version": 1,
+  "pilot_id": null,
+  "status": "blocked",
+  "period": {
+    "duration_days": 14,
+    "start_utc": null,
+    "end_utc": null
+  },
+  "paired_runs_per_repository": null,
+  "admission": {
+    "frozen_at_utc": null,
+    "task_56": {
+      "state": "no-go",
+      "evidence": "independent-review-local-reproduction-2026-07-12",
+      "overall_pilot_go": false,
+      "blocker": "instruction-shaped-poison-is-second-production-recall-result",
+      "qualified_treatment_arm": null,
+      "unqualified_behavior_allowed": false
+    },
+    "task_57": {
+      "state": "not-complete",
+      "complete": false,
+      "evidence": "task-57-results-not-reviewed-complete-2026-07-12",
+      "max_active_memories": null
+    }
+  },
+  "thresholds": {
+    "memory_induced_errors_max": 0,
+    "contested_regression_max_pp": 1.0,
+    "multi_answer_regression_max_pp": 1.0,
+    "provenance_label_coverage_min": 1.0,
+    "contested_label_coverage_min": 1.0,
+    "time_to_first_useful_recall_hours_max": 72.0,
+    "useful_recall_repository_coverage_min": 1.0,
+    "helpful_ratio_min": 0.8,
+    "wrong_ratio_max": 0.1,
+    "stale_ratio_max": 0.1,
+    "task_success_regression_max_pp": 1.0,
+    "correction_incidence_regression_max_pp": 1.0,
+    "median_turns_saved_min": 0.0,
+    "median_active_seconds_saved_min": 0.0,
+    "exact_recoveries_min": 1,
+    "semantic_helpful_recalls_min": 1,
+    "review_backlog_growth_max": 0,
+    "backup_attempts_min": 1,
+    "backup_failures_max": 0,
+    "retention_actions_min": 1,
+    "retention_failures_max": 0
+  },
+  "repositories": []
+}
