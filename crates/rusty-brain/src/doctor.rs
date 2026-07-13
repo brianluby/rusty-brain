@@ -712,12 +712,13 @@ mod tests {
         // Legacy DB without a stamp: warn, not fail.
         let legacy = check_model_identity(Some("deterministic"), None);
         assert_eq!(legacy.status, CheckStatus::Warn, "{legacy:?}");
+        let hint = legacy
+            .hint
+            .as_deref()
+            .expect("legacy recovery carries explicit remediation");
         assert!(
-            legacy
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("--accept-model-change")),
-            "legacy recovery carries explicit remediation: {legacy:?}"
+            hint.contains("--accept-model-change") && hint.contains("rusty-brain reembed"),
+            "legacy recovery names the opt-in and re-embed step: {hint}"
         );
 
         // Provider identity unknown (offline with a remote provider): skip.
