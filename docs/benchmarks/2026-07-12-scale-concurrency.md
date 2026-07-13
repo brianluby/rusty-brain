@@ -3,8 +3,8 @@
 ## Status: incomplete
 
 This report records harness development and bounded exploratory runs. It does
-**not** establish a production operating envelope. An adequate run still needs
-at least 30 successful samples per latency path at 1k, 10k, and a practical
+**not** establish a production operating envelope. An adequate p99 run still
+needs at least 100 successful samples per latency path at 1k, 10k, and a practical
 upper bound, using the real 384-dimensional local model in an unattended
 environment without this task runner's execution ceiling.
 
@@ -15,13 +15,22 @@ and derives its 384-dimensional vector shape. Corpus document embeddings,
 query embeddings, and writes all use that provider. `--dimension` and
 `--model-id` are configurable, but the local path fails closed if the requested
 dimension disagrees with the loaded model. `--provider fixture` is explicitly
-smoke-only and its JSON sets `production_envelope_eligible=false`.
+smoke-only and its JSON sets both eligibility fields to `false`.
+
+The v3 report preregisters 100 actual, error-free successes as the minimum p99
+sample floor. Configured operation counts do not satisfy that floor when errors
+or timeouts reduce successful observations. Every measured operation has a
+configurable deadline; timeout duration, count, and possible residual SQLite
+`spawn_blocking` work are reported instead of allowing a silent harness hang.
+The MCP path now runs the production `serve_stdio` newline-delimited framing,
+serialization, and I/O loop, validates JSON-RPC/result/`isError`, and counts an
+MCP remember only after receiving a parseable returned memory id.
 
 Each corpus now includes:
 
-- concurrent UDS, loopback HTTP, and MCP `tools/call` recall/remember traffic;
+- concurrent UDS, loopback HTTP, and MCP stdio `tools/call` recall/remember traffic;
 - direct writer-queue and read-pool wait/saturation measurements;
-- success/error latency accounting for every path;
+- success/error/timeout latency accounting for every path;
 - pinned-reader write successes/errors plus an exact committed-row check after
   shutdown, freeing the reader, checkpoint retry, and database reopen;
 - RSS, DB/WAL size, shutdown/checkpoint time, provider timeout, writer
@@ -59,7 +68,7 @@ sequential operations per transport, six operations per mixed path, and is not
 eligible for an envelope:
 
 - all six UDS recall, UDS remember, HTTP recall, HTTP remember, MCP recall, and
-  MCP remember operations succeeded while running concurrently;
+  MCP handler-dispatch remember operations succeeded while running concurrently;
 - the four-connection read pool observed saturation on 156/229 acquisitions
   (68.1%), averaging 3.67 ms permit wait with a 26.38 ms maximum;
 - the 1,024-write queue probe observed 767/1,024 saturated enqueues (74.9%);
@@ -68,9 +77,26 @@ eligible for an envelope:
   130 expected rows were present after reopen;
 - WAL retry cleared the sidecar.
 
-The real-local ten-row smoke was attempted after the corrected default was
-implemented, but the task runner terminated it before a JSON artifact was
-written. No latency or envelope claim is made from that attempt.
+This fixture artifact predates v3's production stdio transport path and does
+not establish MCP framing evidence; its corrected durability and queue/read-pool
+counts remain valid for the phases it did execute.
+
+### Real-local 384-dimensional smoke (10 rows; inadequate n)
+
+After the local LuLu network rule that blocked the model/runtime request was
+disabled, commit `d5a0f2a91bb97d0137b5f4d36a8eeacdc74a2efc` completed the
+same smoke shape with the real local `all-MiniLM-L6-v2` provider. All three
+sequential UDS/HTTP operations and all six operations on each mixed
+UDS/HTTP/MCP-handler recall/remember path succeeded. The queue probe committed
+1,024/1,024 writes, all 30 corpus-phase writes were acknowledged, and all 40
+expected rows survived checkpoint retry and reopen with the WAL cleared.
+
+This establishes real-provider harness wiring only. With three sequential and
+six mixed samples per path at ten rows, it is deliberately marked
+`production_envelope_eligible=false`; no latency percentile or operating-
+envelope claim is made from it.
+It also predates v3's production MCP stdio framing and therefore remains wiring
+evidence for the real embedding provider, not MCP transport evidence.
 
 ### Disk-full/low-disk probe
 
@@ -91,6 +117,12 @@ not write filler data; it reports `not_run_requires_explicit_disposable_mount`.
 Shared paths, non-mount roots, pre-existing probe files, and mounts over the
 free-space cap are refused.
 
+V3 separates `representative_load_eligible` from the stricter
+`production_envelope_eligible`. The latter additionally requires this disk
+probe to execute in the current report and immutable SHA-256 references for
+the interrupted-write and writer-death/reopen test artifacts. A default run
+without a disposable mount is never fully production-eligible.
+
 ## Decisions still pending
 
 - **Operating envelope:** not established. The previous 1k recommendation is
@@ -106,9 +138,10 @@ free-space cap are refused.
 
 ## Remaining blockers
 
-1. Run the default real-local matrix unattended with at least 30 successful
+1. Run the default real-local matrix unattended with at least 100 successful
    samples per latency path at 1k, 10k, and a declared practical upper bound.
-2. Preserve those JSON artifacts and rerun after task #54 lands.
+2. Preserve those JSON artifacts and rerun after task #54 lands; retain and
+   hash the required interrupted-write and writer-death/reopen test output.
 3. If 10k/upper-bound requests exceed deadlines, report the failed sample
    distribution and residual blocking work; do not collapse failures into zero
    latency or call n=1 a percentile.
@@ -120,7 +153,7 @@ free-space cap are refused.
 ```bash
 # Real local model (default; compiles rb-eval's record-local feature):
 scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
-  --operations 50 --burst 32 \
+  --operations 100 --burst 100 --operation-timeout-ms 30000 \
   --output target/scale-local-384.json
 
 # Explicit smoke-only deterministic fixture:

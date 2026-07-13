@@ -9,11 +9,13 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 - Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,
   UDS/HTTP recall, interactive and hook-burst writes, bounded writer-queue
-  saturation, MCP-facing concurrent mixed traffic, read-pool pressure,
+  saturation, production-framed MCP stdio concurrent mixed traffic, read-pool pressure,
   namespace isolation, committed-write durability through reopen, RSS/DB/WAL
   growth, long-lived readers, shutdown/checkpoint timing, provider deadlines,
   and an opt-in guarded disk-full probe. The default is the real 384-dimensional
-  local model. The dated report withdraws the earlier 8-dimensional envelope
+  local model. V3 requires 100 actual error-free successes per path for p99,
+  records bounded-operation timeouts, and gates full eligibility on mandatory
+  fault evidence. The dated report withdraws the earlier 8-dimensional envelope
   claim and lists the adequate unattended real-local matrix as remaining work.
 
 ### Changed — Supersede hardened at the source (#501)
