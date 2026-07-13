@@ -3,9 +3,13 @@
 This document describes how `rusty-brain` is put together: the crate boundaries,
 the single-writer daemon, the write and recall data flows, the namespace model, and
 the storage layout. It reflects what is **implemented today**. Like the rest of the
-project, it is early-stage and has had basic correctness testing only — no
-performance, scale, or capability testing. For the user-facing overview and
-quickstart, see the [README](../README.md).
+project, it is early-stage. Its broad automated suite emphasizes correctness;
+there is no portable performance, large-corpus scale, sustained-concurrency,
+resource-exhaustion, Voyage-quality, or multi-machine adoption measurement.
+The supported local model has an offline authored-corpus semantic gate, and a
+bounded N=5 Claude Code scorecard provides proxy capability evidence; neither
+is production validation. For the user-facing overview and quickstart, see the
+[README](../README.md).
 
 ## Design background
 
@@ -20,7 +24,7 @@ left as guidelines.
 
 | Principle | How it shows up |
 |---|---|
-| Focused crates, never a monolith | A workspace of 13 focused crates plus a dev-only harness (14 members), with a compiler-enforced dependency DAG; heavy/optional pieces (ONNX) behind a feature flag; supply-chain policy checked in CI. |
+| Focused crates, never a monolith | **18 workspace crates** with a compiler-enforced dependency DAG; heavy/optional pieces (ONNX) behind a feature flag; evaluation and contract guards stay outside the shipped runtime; supply-chain policy is checked in CI. |
 | One database, one transaction, one truth | Memories, FTS, and vectors in a single SQLite file; all writes serialize through one thread; reads run concurrently over WAL. |
 | Fail-closed boundaries | Namespace isolation and the embedding-dimension contract refuse to run on doubt. |
 | Fail-open capture | Best-effort capture hooks degrade silently and never block an agent session. |
@@ -35,31 +39,77 @@ Dependencies flow downward; no cycles.
 flowchart TD
   subgraph bins["Binaries"]
     RB["rusty-brain<br/>(serve · mcp · client)"]
-    HOOKS["rusty-brain-hooks"]
-    INSTALL["rusty-brain-install"]
+    HOOKS["rusty-brain-hooks<br/>(rb-hooks crate)"]
+    INSTALL["rusty-brain-install<br/>(rb-install crate)"]
   end
 
-  RB --> rbmcp["rb-mcp"]
-  RB --> rbdaemon["rb-daemon"]
-  RB --> rbproto["rb-proto"]
-  HOOKS --> rbagents["rb-agents"]
+  subgraph runtime["Runtime libraries"]
+    rbdaemon["rb-daemon"]
+    rbmcp["rb-mcp"]
+    rbagents["rb-agents"]
+    rbconfig["rb-config"]
+    rbproto["rb-proto"]
+    rbengine["rb-engine"]
+    rbenrich["rb-enrich"]
+    rbembed["rb-embed"]
+    rbsearch["rb-search"]
+    rbstore["rb-store"]
+    rbredact["rb-redact"]
+    rbtokens["rb-tokens"]
+    rbtypes["rb-types"]
+  end
+
+  RB --> rbdaemon
+  RB --> rbmcp
+  RB --> rbconfig
+  RB --> rbembed
+  RB --> rbproto
+  RB --> rbredact
+  RB --> rbstore
+  RB --> rbtypes
+  HOOKS --> rbagents
+  HOOKS --> rbconfig
+  HOOKS --> rbproto
+  HOOKS --> rbredact
+  HOOKS --> rbtokens
   INSTALL --> rbagents
-  rbagents --> rbproto
 
-  rbmcp --> rbproto
-  rbdaemon --> rbengine["rb-engine"]
-  rbdaemon --> rbstore["rb-store"]
+  rbdaemon --> rbconfig
+  rbdaemon --> rbengine
+  rbdaemon --> rbenrich
+  rbdaemon --> rbembed
+  rbdaemon --> rbstore
   rbdaemon --> rbproto
-  rbengine --> rbsearch["rb-search"]
-  rbengine --> rbembed["rb-embed"]
-  rbengine --> rbenrich["rb-enrich"]
-  rbengine --> rbstore
-  rbstore --> rbtypes["rb-types"]
-  rbsearch --> rbtypes
-  rbembed --> rbtypes
-  rbproto --> rbtypes
+  rbmcp --> rbproto
+  rbagents --> rbconfig
+  rbagents --> rbproto
+  rbenrich --> rbengine
+  rbengine --> rbembed
+  rbengine --> rbsearch
+  rbstore --> rbredact
 
-  EVAL["rb-eval (dev-only)"] -.->|"not in shipped binary"| rbengine
+  rbconfig --> rbtypes
+  rbproto --> rbtypes
+  rbagents --> rbtypes
+  rbenrich --> rbtypes
+  rbengine --> rbtypes
+  rbembed --> rbtypes
+  rbsearch --> rbtypes
+  rbstore --> rbtypes
+  rbmcp --> rbtypes
+
+  subgraph dev["Development and CI only"]
+    EVAL["rb-eval"]
+    GUARD["rb-contract-guard"]
+  end
+  EVAL -.->|"offline harness"| rbengine
+  EVAL -.-> rbembed
+  EVAL -.-> rbsearch
+  EVAL -.-> rbstore
+  EVAL -.-> rbtypes
+  GUARD -.->|"inspects wire + migrations"| rbproto
+  GUARD -.-> rbtypes
+  GUARD -.-> rbstore
 
   classDef client fill:#e3f2fd,stroke:#4781c4,color:#0d2b4e;
   classDef proc fill:#ede7f6,stroke:#7e57c2,color:#311b54;
@@ -70,18 +120,34 @@ flowchart TD
   classDef base fill:#eceff1,stroke:#90a4ae,color:#263238;
   classDef muted fill:#f5f5f5,stroke:#bdbdbd,color:#616161;
   class RB,HOOKS,INSTALL client;
-  class rbmcp,rbdaemon,rbengine,rbagents,rbproto proc;
+  class rbmcp,rbdaemon,rbengine,rbenrich,rbagents,rbconfig,rbproto,rbtokens proc;
   class rbstore store;
   class rbembed embed;
   class rbsearch decision;
-  class rbenrich accent;
+  class rbredact accent;
   class rbtypes base;
-  class EVAL muted;
+  class EVAL,GUARD muted;
   style bins fill:#f2f7fd,stroke:#9bbbe0,color:#0d2b4e;
+  style runtime fill:#f6f3fb,stroke:#b9a7da,color:#311b54;
+  style dev fill:#f5f5f5,stroke:#bdbdbd,color:#616161;
 ```
 
-`rb-eval` depends on the engine/store/search/embed crates for its offline harness but
-is excluded from the shipped binary's dependency closure (enforced by a CI check).
+All 18 manifest members appear above. `rb-eval` depends on the
+engine/store/search/embed crates for its offline harness but is excluded from
+the shipped binary's dependency closure. `rb-contract-guard` inspects the wire
+types and migrations from source and checks the compatibility snapshot in CI.
+
+## Current product surfaces
+
+- **CLI:** local client and operator commands, including `init`/`import`,
+  `doctor`/`stats`, and portable `export`/`backup`/JSON `restore`.
+- **MCP:** 12 routable tools over stdio; the default `tools/list` advertises a
+  six-tool token-economy subset, with the other six gated by
+  `RB_MCP_FULL_TOOLSET`.
+- **HTTP:** an optional, default-off loopback listener that mirrors the common
+  wire operations for local non-MCP clients. It is not multi-host and is not an
+  authentication boundary; admin and streaming operations remain unavailable
+  over HTTP v1.
 
 ## The single-writer daemon
 
@@ -304,7 +370,10 @@ daemon refuse to start rather than write mismatched vectors. The embedding model
 identity (`meta.embedding_model`) is the second: a same-dimension provider swap also
 refuses to start — mixed vector spaces must be impossible — unless explicitly accepted
 via `serve --accept-model-change` (or `RB_ACCEPT_MODEL_CHANGE=1` for auto-started
-daemons) followed by a corpus `reembed`.
+daemons) followed by a corpus `reembed`. A legacy database with no global model marker
+is reconciled from `SELECT DISTINCT memories.embedding_model`: an empty corpus or one
+model matching the configured provider may seed the marker; a conflicting or mixed
+corpus fails closed and requires that explicit accept-and-re-embed flow.
 
 The database file holds captured memory text, so it gets the same posture as the
 daemon socket: the file is created `0600` and tightened fail-closed on every open
@@ -316,19 +385,25 @@ creates the data directory `0700` when it creates it.
 These are designed-but-not-built seams, called out so they read as boundaries rather
 than gaps:
 
-- **LLM-assisted evolution** — reconciliation, reflection, and importance recalibration
-  as opt-in background jobs.
+- **LLM-assisted evolution** — reconciliation and reflection beyond the
+  deterministic consolidation, decay, and importance-recalibration jobs that
+  already ship.
 - **Networked / multi-host operation** — today the daemon is single-machine and
   per-user; a networked surface with real authentication is a separate future crate.
 - **Approximate vector search (ANN)** — the current brute-force KNN has a documented
   scale ceiling.
-- **A portable export/snapshot format.**
+- **Byte-exact online database backup and replication.** Portable text/JSON/CSV
+  export, JSON restore, and one-command portable snapshots are shipped; raw
+  SQLite disaster recovery and team replication remain separate future work.
 
 ## Honesty note
 
-Everything above is implemented and exercised by unit and integration tests, but the
-system has not been performance-, scale-, or capability-tested, and retrieval quality
-has not been measured with a real embedding model at a meaningful corpus size. The
-offline evaluation harness guards ranking *determinism and regressions*, not absolute
-semantic quality. Read the architecture as a description of intent and current
-structure, not as a benchmarked, production-hardened system.
+Everything above is implemented and exercised by unit and integration tests. Retrieval
+quality is now gated offline with committed real `all-MiniLM-L6-v2` vectors over 205
+memories plus an untouched 20-query holdout, alongside the deterministic ranking
+regression harness. The bounded N=5 Claude Code scorecard adds small-sample proxy
+capability evidence: its recovery run was safe with zero memory-induced errors,
+and 2/4 tracked dimensions passed. Together these are evidence at authored
+first-release scale, not proof of portable performance, large-corpus behavior,
+Voyage quality, resource-exhaustion resilience, real-world value, multi-machine
+adoption, or production hardening; those remain separate gates.

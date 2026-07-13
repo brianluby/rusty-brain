@@ -2,11 +2,20 @@
 
 ## Status
 
-Draft. Addresses the highest-leverage activation gap surfaced in the
-2026-07-02 senior-PM product review: an empty brain on first run means the
-human sees no value and never builds the capture habit. Not on the existing
-Road-to-Tens roadmap (it is the missing "activation & value-realization"
-dimension).
+Delivered 2026-07-02 (PR #51, merge `f783d1c`). `rusty-brain init` scans the
+bounded project sources below, supports plan/confirmation and batch undo, and
+`rusty-brain import` accepts a bounded file or stdin with dry-run. Both use the
+normal remember path after client-side redaction; fixture-driven e2e coverage
+proves non-empty recall, DB-bytes redaction, rerun idempotency, undo, and
+dry-run no-write behavior.
+
+Two implementation details differ from the draft without reducing the user
+contract: dedup confirms exact redacted-content equality through a bounded
+recall probe rather than calling `near_duplicates()` directly, and undo uses a
+private per-database sidecar ledger of stored ids followed by idempotent
+per-id archive calls rather than a bulk delete-by-tag operation. Import is a
+bounded cold-start tool, not an ongoing sync mechanism; source-quality and
+large-project activation remain unmeasured.
 
 ## Owner Area
 
@@ -45,8 +54,8 @@ it is ingested.
   context, so the first recall is non-empty and immediately useful.
 - Reuse existing primitives: batch `remember`, the enricher, namespace
   detection, and the redaction pass. No new storage schema for v1.
-- Make the import safe (redacted, namespaced, reviewable) and reversible
-  (deletable by namespace / source).
+- Make the import safe (redacted, namespaced, reviewable) and reversible through
+  the private per-database batch ledger.
 - Produce a visible "imported N memories" aha-moment at install time.
 
 ## Non-Goals
@@ -72,7 +81,7 @@ A guided first-run command, safe to run idempotently. Behavior:
 - Route every candidate through the existing redaction pass before storing.
 - Store via the engine enrich -> embed -> store path, tagging imported
   memories with `origin_source = "cli"` and a stable `import_batch` tag so
-  they are reviewable and bulk-deletable.
+  they are reviewable; record stored ids in the private batch ledger for undo.
 
 ### INIT-2. `rusty-brain import <path|->`
 
@@ -95,18 +104,19 @@ is logged and skipped.
 ### INIT-4. Provenance and redaction
 
 - Imported memories carry `origin_source = "cli"` and an `import_batch:<id>`
-  tag for reviewability and bulk delete.
+  tag for reviewability; the private sidecar ledger records their ids for undo.
 - Every imported byte passes through `rb-redact` before store; a planted
   secret in a source file must yield zero plaintext in the DB (asserted by a
   test mirroring the W2.4 scrub drill).
 
 ### INIT-5. Idempotency and rollback
 
-- Re-running `init` does not duplicate: near-dup suppression (the existing
-  `near_duplicates()` path) collapses repeats; the importer reports
+- Re-running `init` does not duplicate: a bounded recall probe confirms exact
+  redacted-content equality; the importer reports
   `new`/`skipped-duplicate`/`failed` counts.
-- `rusty-brain delete --tag import_batch:<id>` (or a dedicated `init --undo
-  <batch>`) removes an entire import in one op, cascading to vectors/FTS.
+- `init --undo <batch>` reads the private per-database sidecar ledger and issues
+  idempotent per-id archive calls for exactly the stored set; vector/FTS state
+  follows the normal archive path.
 
 ## Acceptance Criteria
 
@@ -136,7 +146,7 @@ project tree and asserting recall + DB-bytes redaction + dedup.
 ## Risks
 
 - Noisy/low-grade imports pollute recall. Mitigate: default importance cap,
-  import-batch tagging, and the `--undo` escape hatch.
+  import-batch tagging, the private ledger, and the `--undo` escape hatch.
 - Enricher cost/time on large doc sets. Mitigate: bounded defaults,
   `--dry-run`, and reuse of the batched single-connection pattern.
 - Secret leakage from imported files. Mitigate: mandatory redaction pass;
@@ -147,13 +157,16 @@ project tree and asserting recall + DB-bytes redaction + dedup.
 
 ## Implementation Checklist
 
-- [ ] Add `Init` and `Import` subcommands to `cli.rs`.
-- [ ] Implement source adapters (md/txt/git-log) in a new `import` module.
-- [ ] Wire adapters through the enricher + redaction + engine store path.
-- [ ] Add `import_batch:<id>` provenance/tagging and `init --undo`.
-- [ ] Reuse `near_duplicates()` for import dedup.
-- [ ] Add fixture-driven e2e (recall + DB-bytes redaction + dedup + undo).
-- [ ] Document first-run flow in the README Quickstart.
+- [x] Add `Init` and `Import` subcommands to `cli.rs`.
+- [x] Implement bounded markdown/text/git-log source adapters in `import.rs`.
+- [x] Wire adapters through redaction and the normal engine remember path.
+- [x] Add `import_batch:<id>` tagging, a private batch ledger, and
+      `init --undo` / `--list-batches`.
+- [x] Implement idempotent exact redacted-content dedup through a bounded recall probe
+      (deliberate deviation from the draft's `near_duplicates()` mechanism).
+- [x] Add fixture-driven e2e coverage for recall, DB-bytes redaction, dedup,
+      undo, and dry-run.
+- [x] Document the first-run flow in the README Quickstart.
 
 ## Roadmap Fit
 

@@ -47,6 +47,18 @@ impl SqliteBackend {
         let store = self.lock()?;
         store.set_confidence(id, confidence)
     }
+
+    /// Prepare an archived fixture row through the store primitive production uses.
+    pub fn archive_for_eval(&self, id: &MemoryId) -> rb_types::Result<()> {
+        let store = self.lock()?;
+        store.archive_memory(id)
+    }
+
+    /// Prepare a superseded fixture row atomically through the production store.
+    pub fn supersede_for_eval(&self, old: &MemoryId, new: &MemoryId) -> rb_types::Result<()> {
+        let store = self.lock()?;
+        store.supersede(old, new)
+    }
 }
 
 #[async_trait::async_trait]

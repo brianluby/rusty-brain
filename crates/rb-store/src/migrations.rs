@@ -115,52 +115,55 @@ fn recorded_checksum(conn: &rusqlite::Connection, version: i64) -> Result<Option
 fn apply_all(conn: &rusqlite::Connection, migs: &[Migration]) -> Result<()> {
     for m in migs {
         match recorded_checksum(conn, m.version)? {
-            Some(existing) => {
-                let current = checksum(&m.sql);
-                if existing != current {
-                    return Err(Error::Migration(format!(
-                        "checksum mismatch for migration {} ({}): \
-                         recorded {existing}, file {current}",
-                        m.version, m.name
-                    )));
-                }
-                // Already applied and unchanged: no-op.
-            }
-            None => {
-                let sum = checksum(&m.sql);
-                conn.execute_batch("BEGIN;").map_err(migration_err)?;
-                let applied = (|| -> Result<()> {
-                    conn.execute_batch(&m.sql).map_err(migration_err)?;
-                    conn.execute(
-                        "INSERT INTO _migrations (version, name, checksum, applied_at) \
-                         VALUES (?1, ?2, ?3, unixepoch())",
-                        rusqlite::params![m.version, m.name, sum],
-                    )
-                    .map_err(migration_err)?;
-                    Ok(())
-                })();
-                match applied {
-                    Ok(()) => {
-                        conn.execute_batch("COMMIT;").map_err(migration_err)?;
-                    }
-                    Err(e) => {
-                        // Best-effort rollback; surface the original error.
-                        let _ = conn.execute_batch("ROLLBACK;");
-                        return Err(e);
-                    }
-                }
-            }
+            Some(existing) => verify_recorded_checksum(m, &existing)?,
+            None => apply_unseen(conn, m)?,
         }
     }
     Ok(())
+}
+
+fn verify_recorded_checksum(migration: &Migration, recorded: &str) -> Result<()> {
+    let current = checksum(&migration.sql);
+    if recorded == current {
+        Ok(())
+    } else {
+        Err(Error::Migration(format!(
+            "checksum mismatch for migration {} ({}): \
+             recorded {recorded}, file {current}",
+            migration.version, migration.name
+        )))
+    }
+}
+
+/// Apply one optimistically-unseen migration under a write lock. Re-read the
+/// ledger after acquiring the lock because another fresh opener may have
+/// applied the migration while this connection waited.
+fn apply_unseen(conn: &rusqlite::Connection, migration: &Migration) -> Result<()> {
+    let tx = rusqlite::Transaction::new_unchecked(conn, rusqlite::TransactionBehavior::Immediate)
+        .map_err(migration_err)?;
+
+    if let Some(existing) = recorded_checksum(conn, migration.version)? {
+        verify_recorded_checksum(migration, &existing)?;
+    } else {
+        let sum = checksum(&migration.sql);
+        conn.execute_batch(&migration.sql).map_err(migration_err)?;
+        conn.execute(
+            "INSERT INTO _migrations (version, name, checksum, applied_at) \
+             VALUES (?1, ?2, ?3, unixepoch())",
+            rusqlite::params![migration.version, migration.name, sum],
+        )
+        .map_err(migration_err)?;
+    }
+
+    tx.commit().map_err(migration_err)
 }
 
 /// Run all pending migrations against `conn`, transactionally and in order.
 ///
 /// - Creates `_migrations` if absent.
 /// - Discovers `NNN_*.sql` files, orders by the numeric prefix.
-/// - Applies each unseen version inside its own transaction, recording the
-///   sha256 checksum.
+/// - Applies each unseen version inside its own immediate transaction,
+///   rechecking the ledger after locking and recording the sha256 checksum.
 /// - Re-applying an already-recorded version is a no-op.
 /// - A checksum change on an already-applied version returns `Error::Migration`.
 pub fn run_migrations(conn: &rusqlite::Connection) -> Result<()> {

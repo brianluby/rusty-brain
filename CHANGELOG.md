@@ -18,6 +18,99 @@ All notable changes to rusty-brain are documented here. The format is based on
   fault evidence. The dated report withdraws the earlier 8-dimensional envelope
   claim and lists the adequate unattended real-local matrix as remaining work.
 
+### Changed — Release publication gate (Vikunja #510)
+
+- Release tags now pass a deterministic preflight for tag/workspace-version
+  alignment, a corresponding released changelog section, and reachability
+  from `main` before any target builds; a hermetic CI self-test pins its
+  fail-closed cases.
+- Every packaged target is smoke-tested on a matching native GitHub runner
+  before publication, covering fresh auto-start, remember/recall, owner-only
+  database permissions, and a real `PostToolUse` to `SessionEnd` redacted
+  capture fold. Partial matrices cannot publish; checksums and Sigstore
+  build-provenance attestations are preserved.
+- `docs/RELEASING.md` documents preparation, partial-failure handling, safe
+  pre-publication retagging, and fix-forward recovery after publication.
+
+### Added — W4.1 production-embedding semantic quality gate
+
+- **The 205-memory corpus and untouched 20-query holdout now gate real semantic
+  replay in CI.** A machine-readable manifest locks their hashes, the
+  re-recorded 384-dimension `all-MiniLM-L6-v2` fixture (205 explicit document
+  vectors + 92 explicit query vectors), preregistered recall@5/MRR/NDCG/dedup
+  and channel floors, five chronological instants, and the keep-Linear default
+  decision. Strict replay rejects drift, duplicate/unknown input kinds,
+  dimensions, non-finite values, missing vectors, and legacy query fallbacks.
+- **The gate is offline and scheduled.** Normal CI runs the Linear golden +
+  holdout gate with zero provider requests/cost; a weekly/manual workflow
+  reports aggregate Linear/RRF results at all five instants. RRF clears the
+  absolute floors but materially regresses MRR/NDCG, so no default or weight
+  changed. Diagnostics include channel contribution, p50/p99 latency, fixture
+  bytes, returned rows/content, and approximate tokens.
+- **Offline robustness strata** cover literal operational evidence,
+  multi-memory answers, zero archived/superseded exposure, contested
+  disclosure, and low-confidence instruction-shaped poison behavior. The
+  poison is dampened below the correct fact but remains exposed at rank 2, so
+  the preregistered zero-exposure pilot gate is an explicit NO-GO. The frozen
+  preregistration and dated results keep holdout decisions auditable.
+- **Five-seed controlled arms now close the remaining W4.1 evidence gaps.**
+  Equal-budget exact-evidence, recency-only, and importance-only retrieval arms
+  plus novelty-only, importance-confidence, and combined online shadow
+  admission arms report exact-span/answer quality, stale/wrong/poison exposure,
+  contested disclosure, rows/tokens/bytes, and latency. The exact lane is a
+  frozen no-go (no answer lift and a 0.025 recall regression); combined
+  surprise-aware admission is also no-go under the tracker-authoritative rules
+  (recall/NDCG regress versus Linear despite zero retained poison and 128/205
+  rows). The original threshold transcription is retained with a dated erratum;
+  preregistration hashes and controlled thresholds are machine-locked. No
+  production ranking, retention, or admission behavior changed.
+
+### Fixed — Concurrent zero-byte store initialization (Vikunja #506)
+
+- **Two public opens can now create the same zero-byte database safely**: the
+  busy handler is installed before WAL negotiation, SQLite's occasionally
+  immediate `BUSY`/`LOCKED` journal-mode result gets a bounded retry, and each
+  optimistically-unseen migration takes `BEGIN IMMEDIATE` then rechecks its
+  ledger row. The losing opener validates the winner's checksum instead of
+  replaying already-applied DDL (`duplicate column name`). Already-recorded
+  migrations still take the existing read-only checksum path.
+- **Dynamic-vector initialization is also single-winner**: current schemas keep
+  the existing read-only `vector_schema_version` fast path; a missing/outdated
+  marker takes `BEGIN IMMEDIATE`, then revalidates both the marker and
+  `memory_vectors` existence. A loser returns against the winner's committed
+  schema instead of failing with `table memory_vectors already exists`.
+- **Crash and rebuild guarantees are unchanged**: create/rebuild plus the
+  version and cosine-metric markers remain one atomic transaction; pending
+  migrations retain one transaction per migration with RAII rollback. A
+  path-scoped barrier drives two real `open_with_model` calls from a nonexistent
+  file and verifies identical dimension, model, vector schema, metric, and site
+  markers. A checked-in release benchmark records why the vector write lock is
+  slow-path-only: unconditional locking cost 1.52–1.66x the current-schema
+  marker check in the task runs.
+
+### Fixed — Scrub reports blocked WAL cleanup (Vikunja #53)
+
+- `rusty-brain scrub` now inspects the full result of its truncating WAL
+  checkpoint instead of treating SQLite's successful-but-busy pragma as
+  complete at-rest cleanup. Human and JSON output report checkpoint status,
+  warn when pre-redaction plaintext may remain in the WAL, and tell operators
+  to close long-lived database readers and rerun scrub. A no-change rerun now
+  retries the checkpoint so that remediation can complete. If checkpoint
+  execution itself errors after redaction commits, scrub preserves and returns
+  the committed counts as a partial success with an explicit unavailable
+  diagnostic instead of misreporting the entire scrub as failed.
+
+### Fixed — Legacy embedding-model metadata recovery
+
+- **Missing `meta.embedding_model` no longer silently adopts the configured
+  provider on a populated database.** Startup now inspects the distinct
+  per-row model stamps before seeding: an empty corpus or a single model that
+  matches the configured provider recovers automatically, while a conflicting
+  or mixed-model corpus fails closed with the existing
+  `--accept-model-change` + `reembed` remediation. The missing-marker recovery
+  runs under a write lock with revalidation; already-seeded opens keep their
+  read-only fast path.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing

@@ -68,28 +68,15 @@ policy.
 
 ## 3. `scrub`'s WAL checkpoint discards the `(busy, log, checkpointed)` result
 
-`crates/rb-store/src/store/scrub.rs`, `scrub`: the post-redaction
-`PRAGMA wal_checkpoint(TRUNCATE)` runs via `execute_batch`, which discards
-the pragma's result row. A blocked checkpoint (e.g. a long-lived reader
-holding the WAL) can leave pre-redaction plaintext sitting in `-wal` while
-`scrub()` still reports success (`ScrubOutcome`), a real gap against the
-threat model's redaction guarantee.
+**Resolved (Vikunja #53):** scrub now returns the checkpoint result through
+the daemon protocol, human and JSON CLI surfaces warn on a busy or unavailable
+status, and a no-change rerun retries `TRUNCATE` after blocking readers close.
+A checkpoint execution error preserves the already-committed scrub counts and
+returns an explicit unavailable diagnostic. Regressions pin busy, successful
+retry, and partial-success error handling.
 
-**Why not fixed now:** the crate deliberately carries no logging facility
-(see the comment on `rebuild_vector_table`'s stats: "rb-store carries no
-logging facility, so the one-shot counts live in meta"), so "just log a
-warning" isn't available. Properly surfacing this means either adding a
-field to the public `ScrubOutcome` struct (an API change requiring CLI-layer
-wiring so `rusty-brain scrub` can warn the operator) or persisting a durable
-`meta` marker in the `rebuild_vector_table`-stats style. Either is more than
-a quick patch and needs a test that provokes a busy checkpoint (a concurrent
-reader holding the WAL during `scrub()`).
-
-**What "done" looks like:** switch to `query_row` over the pragma, add
-`ScrubOutcome.wal_checkpoint_busy: bool` (or similar), wire the CLI `scrub`
-command to warn when set, and add a test that holds a concurrent read
-transaction open during `scrub()` and asserts the flag comes back `true`
-while confirming `scrub()` still succeeds (best-effort, not a hard failure).
+The original problem statement and proposed `wal_checkpoint_busy`-only design
+are superseded by the typed status and partial-success implementation above.
 
 ## Provenance
 
