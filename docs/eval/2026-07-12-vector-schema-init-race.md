@@ -1,8 +1,11 @@
 # Vector schema initialization race and fast-path benchmark
 
-Date: 2026-07-12  
-Task: Vikunja #506 (rusty-brain project task #54)  
-Base: `9e8312d`  
+Date: 2026-07-12
+
+Task: Vikunja #506 (rusty-brain project task #54)
+
+Base: `9e8312d`
+
 Platform: macOS 26.5.2 arm64, rustc 1.96.0
 
 ## Decision
