@@ -53,18 +53,19 @@ observation, but its corpus threshold must be remeasured with the real model.
 
 ### 384-dimensional fixture smoke (100 rows; inadequate n)
 
-This run verified harness wiring only. It used `--provider fixture`, three
+This run verified harness wiring only. It used commit
+`77730655c97dc2b994fed0c86cbf29470d47d33f`, `--provider fixture`, three
 sequential operations per transport, six operations per mixed path, and is not
 eligible for an envelope:
 
 - all six UDS recall, UDS remember, HTTP recall, HTTP remember, MCP recall, and
   MCP remember operations succeeded while running concurrently;
-- the four-connection read pool observed saturation on 157/229 acquisitions
-  (68.6%), averaging 4.58 ms permit wait with a 29.06 ms maximum;
+- the four-connection read pool observed saturation on 156/229 acquisitions
+  (68.1%), averaging 3.67 ms permit wait with a 26.38 ms maximum;
 - the 1,024-write queue probe observed 767/1,024 saturated enqueues (74.9%);
-- 35 writes were acknowledged across sequential, burst, mixed, and pinned-reader
-  phases; 127 rows were visible before the eight pinned-reader writes and all
-  135 expected rows were present after reopen;
+- 30 writes were acknowledged across sequential, burst, mixed, and pinned-reader
+  phases; 127 rows were visible before the three pinned-reader writes and all
+  130 expected rows were present after reopen;
 - WAL retry cleared the sidecar.
 
 The real-local ten-row smoke was attempted after the corrected default was
