@@ -24,3 +24,7 @@ Cargo.lock.orig
 # commits them deliberately per the plan's Task 9.
 **/rusty-brain/fixture-record/
 .cache/
+# Privacy-preserving session replay outputs are always local review artifacts.
+# Only explicitly reviewed sanitized fixtures and aggregate reports may be copied
+# out of this ignored tree and committed.
+**/session-replay-local/

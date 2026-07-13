@@ -1,0 +1,88 @@
+{
+  "schema_version": "rusty-brain-session-replay-v1",
+  "mode": "aggregate_dry_run",
+  "faker_version": "5.1.0",
+  "faker_seed": 5932739705870373441,
+  "sources": [
+    {
+      "source": "claude_code",
+      "source_containers": 1606,
+      "source_sessions": 1541,
+      "source_records": 143920,
+      "accepted_sessions": 1541,
+      "accepted_events": 108004,
+      "dialogue_events": 23817,
+      "tool_events": 83062,
+      "lifecycle_events": 1125,
+      "events_with_redactions": 36593,
+      "redactions": {
+        "credential": 2891,
+        "high_entropy": 3369,
+        "email": 554,
+        "phone": 13,
+        "ip_address": 1148,
+        "hostname": 2076,
+        "home_path": 5326,
+        "absolute_path": 23121,
+        "personal_name": 180,
+        "user_identifier": 717,
+        "organization": 122,
+        "url": 3188
+      },
+      "rejections": {
+        "missing_session": 65,
+        "unsupported_record": 21427,
+        "private_reasoning": 14333,
+        "residual_sensitive_data": 168
+      }
+    },
+    {
+      "source": "open_code",
+      "source_containers": 1,
+      "source_sessions": 467,
+      "source_records": 103611,
+      "accepted_sessions": 459,
+      "accepted_events": 68780,
+      "dialogue_events": 5390,
+      "tool_events": 29964,
+      "lifecycle_events": 33426,
+      "events_with_redactions": 17285,
+      "redactions": {
+        "credential": 1831,
+        "high_entropy": 2285,
+        "email": 356,
+        "phone": 5,
+        "ip_address": 507,
+        "hostname": 1287,
+        "home_path": 7850,
+        "absolute_path": 6184,
+        "personal_name": 180,
+        "user_identifier": 166,
+        "organization": 83,
+        "url": 2695
+      },
+      "rejections": {
+        "missing_content": 2,
+        "private_reasoning": 16024,
+        "residual_sensitive_data": 88,
+        "empty_session": 8
+      }
+    }
+  ],
+  "normalized_sessions": 2000,
+  "normalized_events": 176784,
+  "dialogue_lane_events": 29207,
+  "full_event_lane_events": 176784,
+  "assistant_events_ineligible_as_truth": 25145,
+  "development_sessions": 1590,
+  "holdout_sessions": 400,
+  "crossing_sessions_rejected": 10,
+  "candidate_memories": 71430,
+  "natural_queries": 121,
+  "semantic_ground_truth_records": 0,
+  "planned_distractor_corpora": [
+    1000,
+    10000,
+    25000
+  ]
+}

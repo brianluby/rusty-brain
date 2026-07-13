@@ -34,6 +34,7 @@ pub mod metrics;
 pub mod replay;
 pub mod runner;
 pub mod semantic_gate;
+pub mod session_replay;
 
 pub use controlled::{
     budget_ranking, detailed_rankings, evaluate_admission_arm, evaluate_retrieval_arm,

@@ -16,6 +16,27 @@ Run it:
 cargo test -p rb-eval
 ```
 
+## Local session-replay dataset pipeline
+
+`session_replay` adds local-only Claude Code JSONL and OpenCode SQLite adapters
+for evaluation data shapes. It normalizes both sources into one provenance-rich
+schema, keeps user/assistant dialogue separate from tool events, rejects private
+reasoning, applies fail-closed session-consistent de-identification, and proposes
+whole-session chronological candidates/queries without treating assistant text
+or unreviewed extraction as truth.
+
+The default command is aggregate-only and prints no transcript text:
+
+```bash
+cargo run --release -p rb-eval --example session_replay --quiet
+```
+
+Faker is pinned and used only for deterministic aliases, controlled variants,
+and known-irrelevant 1k/10k/25k distractor corpora. Generated content is written
+only with `--write-local` below an ignored `session-replay-local` directory.
+See [`docs/eval/session-replay-dataset.md`](../../docs/eval/session-replay-dataset.md)
+for the schema, privacy contract, review states, and reproduction commands.
+
 ## What this measures — and what it does NOT
 
 This harness uses `rb_embed::DeterministicProvider`: a SHA-256-based provider
@@ -180,6 +201,9 @@ semantic gain.
   + graph paths run (not a mock map).
 - `runner.rs` — builds the engine, ingests fixtures, runs golden queries,
   computes the aggregate report, and compares against baselines.
+- `session_replay/` — local Claude/OpenCode adapters, normalized schema,
+  fail-closed de-identification, chronological candidate construction, Faker
+  augmentation, aggregate reporting, and owner-only artifact writing.
 - `baselines.json` — committed metric baselines; the harness fails on regression.
 
 ## Updating baselines
