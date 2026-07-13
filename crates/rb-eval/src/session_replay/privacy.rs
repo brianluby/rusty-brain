@@ -1,6 +1,7 @@
 //! Fail-closed, session-consistent de-identification.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::net::Ipv6Addr;
 
 use fake::faker::company::en::CompanyName;
 use fake::faker::internet::en::Username;
@@ -25,17 +26,16 @@ const DOMAIN_PATTERN: &str =
     r"(?i)\b(?:[a-z0-9-]+\.)+(?:com|org|net|io|dev|app|cloud|internal|local|lan|test)\b";
 const IPV4_PATTERN: &str =
     r"\b(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})(?:\.(?:25[0-5]|2[0-4][0-9]|1?[0-9]{1,2})){3}\b";
-const IPV6_PATTERN: &str = r"(?i)\b(?:[0-9a-f]{1,4}:){2,7}[0-9a-f]{1,4}\b";
 const PHONE_PATTERN: &str =
     r"(?x)(?:\+?1[-.\s]?)?(?:\([0-9]{3}\)|[0-9]{3})[-.\s][0-9]{3}[-.\s][0-9]{4}\b";
 const LABELED_HOST_PATTERN: &str =
     r"(?i)\b(host(?:name)?|server|machine)(\s*[:=]\s*)([a-z0-9][a-z0-9._-]*)";
 const LABELED_NAME_PATTERN: &str =
-    r"\b(name|owner|author|contact)(\s*[:=]\s*)([A-Z][a-z]+(?:[ -][A-Z][a-z]+){1,3})";
+    r"\b((?i:name|owner|author|contact))(\s*[:=]\s*)([A-Z][a-z]+(?:[ -][A-Z][a-z]+){1,3})";
 const LABELED_USER_PATTERN: &str =
-    r"(?i)\b(user(?:name)?|account)(\s*[:=]\s*)([a-z0-9][a-z0-9._-]*)";
+    r"\b((?i:user(?:name)?|account))(\s*[:=]\s*)([A-Za-z0-9][A-Za-z0-9._-]*)";
 const LABELED_ORG_PATTERN: &str =
-    r"\b(organization|company|client)(\s*[:=]\s*)([A-Z][A-Za-z0-9 &.-]{2,80})";
+    r"\b((?i:organization|company|client))(\s*[:=]\s*)([A-Z][A-Za-z0-9 &.-]{2,80})";
 const REDACTION_MARKER_PATTERN: &str = r"\[REDACTED:([a-z0-9-]+)\]";
 
 /// Redaction failed before sanitized text could be produced.
@@ -73,7 +73,6 @@ struct Patterns {
     url: Regex,
     domain: Regex,
     ipv4: Regex,
-    ipv6: Regex,
     phone: Regex,
     labeled_host: Regex,
     labeled_name: Regex,
@@ -95,7 +94,6 @@ impl Patterns {
             url: Regex::new(URL_PATTERN)?,
             domain: Regex::new(DOMAIN_PATTERN)?,
             ipv4: Regex::new(IPV4_PATTERN)?,
-            ipv6: Regex::new(IPV6_PATTERN)?,
             phone: Regex::new(PHONE_PATTERN)?,
             labeled_host: Regex::new(LABELED_HOST_PATTERN)?,
             labeled_name: Regex::new(LABELED_NAME_PATTERN)?,
@@ -112,7 +110,7 @@ impl Patterns {
             || self.url.is_match(text)
             || self.domain.is_match(text)
             || self.ipv4.is_match(text)
-            || self.ipv6.is_match(text)
+            || contains_ipv6(text)
             || self.phone.is_match(text)
             || self.labeled_host.is_match(text)
             || self.labeled_name.is_match(text)
@@ -182,15 +180,9 @@ impl StrictRedactor {
             RedactionCategory::Phone,
             &mut categories,
         );
+        output = replace_ipv6(&output, &mut categories);
         output = replace_constant(
             &self.patterns.ipv4,
-            &output,
-            "[REDACTED:ip-address]",
-            RedactionCategory::IpAddress,
-            &mut categories,
-        );
-        output = replace_constant(
-            &self.patterns.ipv6,
             &output,
             "[REDACTED:ip-address]",
             RedactionCategory::IpAddress,
@@ -368,6 +360,93 @@ fn replace_constant(
     regex.replace_all(text, replacement).into_owned()
 }
 
+fn replace_ipv6(text: &str, categories: &mut BTreeSet<RedactionCategory>) -> String {
+    let spans = ipv6_spans(text);
+    if spans.is_empty() {
+        return text.to_string();
+    }
+    categories.insert(RedactionCategory::IpAddress);
+
+    let mut output = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+    for (start, end) in spans {
+        output.push_str(&text[cursor..start]);
+        output.push_str("[REDACTED:ip-address]");
+        cursor = end;
+    }
+    output.push_str(&text[cursor..]);
+    output
+}
+
+fn contains_ipv6(text: &str) -> bool {
+    !ipv6_spans(text).is_empty()
+}
+
+fn ipv6_spans(text: &str) -> Vec<(usize, usize)> {
+    let mut spans = Vec::new();
+    let mut cursor = 0usize;
+    while cursor < text.len() {
+        let Some(character) = text[cursor..].chars().next() else {
+            break;
+        };
+        if !is_ipv6_candidate_character(character) {
+            cursor += character.len_utf8();
+            continue;
+        }
+
+        let start = cursor;
+        cursor += character.len_utf8();
+        while cursor < text.len() {
+            let Some(next) = text[cursor..].chars().next() else {
+                break;
+            };
+            if !is_ipv6_candidate_character(next) {
+                break;
+            }
+            cursor += next.len_utf8();
+        }
+
+        let run = &text[start..cursor];
+        let starts_at_boundary = text[..start]
+            .chars()
+            .next_back()
+            .is_none_or(|value| !is_identifier_character(value));
+        if starts_at_boundary {
+            let Some(candidate_len) = ipv6_prefix_len(run) else {
+                continue;
+            };
+            let candidate_end = start + candidate_len;
+            let ends_at_boundary = text[candidate_end..]
+                .chars()
+                .next()
+                .is_none_or(|value| !is_identifier_character(value));
+            if ends_at_boundary {
+                spans.push((start, candidate_end));
+            }
+        }
+    }
+    spans
+}
+
+fn ipv6_prefix_len(run: &str) -> Option<usize> {
+    let mut candidate_len = run.trim_end_matches('.').len();
+    loop {
+        let candidate = &run[..candidate_len];
+        if candidate.contains(':') && candidate.parse::<Ipv6Addr>().is_ok() {
+            return Some(candidate_len);
+        }
+        candidate_len = candidate.rfind('.')?;
+    }
+}
+
+fn is_ipv6_candidate_character(character: char) -> bool {
+    character.is_ascii_hexdigit() || matches!(character, ':' | '.')
+}
+
+fn is_identifier_character(character: char) -> bool {
+    character.is_ascii_alphanumeric() || character == '_'
+}
+
 fn replace_absolute_paths(
     regex: &Regex,
     text: &str,
@@ -435,6 +514,60 @@ mod tests {
         assert!(!result.text.contains("build.internal"));
         assert!(!result.text.contains("415-555-0199"));
         assert!(!result.text.contains(&token));
+    }
+
+    #[test]
+    fn compressed_ipv6_and_capitalized_labels_are_removed() {
+        let mut redactor = StrictRedactor::new(13, "session-ipv6").unwrap();
+        let input = "Loopbacks ::1 and fe80::1, docs 2001:db8::1. \
+                     Name: Casey Example; Company: Example Workshop; USER: Casey_42";
+        let result = redactor.sanitize(input).unwrap();
+
+        for forbidden in [
+            "::1",
+            "fe80::1",
+            "2001:db8::1",
+            "Casey Example",
+            "Example Workshop",
+            "Casey_42",
+        ] {
+            assert!(
+                !result.text.contains(forbidden),
+                "sensitive value remained: {forbidden}"
+            );
+        }
+        assert!(result.categories.contains(&RedactionCategory::IpAddress));
+        assert!(result.categories.contains(&RedactionCategory::PersonalName));
+        assert!(result.categories.contains(&RedactionCategory::Organization));
+        assert!(result
+            .categories
+            .contains(&RedactionCategory::UserIdentifier));
+    }
+
+    #[test]
+    fn rust_paths_are_not_misclassified_as_ipv6() {
+        let mut redactor = StrictRedactor::new(17, "session-rust-path").unwrap();
+        let input = "Use crate::session_replay and std::net::Ipv6Addr.";
+        assert_eq!(redactor.sanitize(input).unwrap().text, input);
+    }
+
+    #[test]
+    fn ipv6_before_dot_delimited_candidate_text_is_removed() {
+        let mut redactor = StrictRedactor::new(19, "session-ipv6-suffix").unwrap();
+        let result = redactor
+            .sanitize("Route 2001:db8::1.example locally.")
+            .unwrap();
+        assert_eq!(result.text, "Route [REDACTED:ip-address].example locally.");
+    }
+
+    #[test]
+    fn lowercase_prose_after_name_and_org_labels_is_preserved() {
+        let mut redactor = StrictRedactor::new(23, "session-label-prose").unwrap();
+        let input = "Name: this is ordinary prose. Company: this remains prose.";
+        let result = redactor.sanitize(input).unwrap();
+        assert_eq!(result.text, input);
+        assert!(!result.categories.contains(&RedactionCategory::PersonalName));
+        assert!(!result.categories.contains(&RedactionCategory::Organization));
     }
 
     #[test]

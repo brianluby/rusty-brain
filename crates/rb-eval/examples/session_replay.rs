@@ -38,15 +38,13 @@ struct Options {
 
 fn main() -> anyhow::Result<()> {
     let options = Options::parse();
-    let home = std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("the local home directory is unavailable"))?;
-    let claude_root = options
-        .claude_root
-        .unwrap_or_else(|| home.join(".claude/projects"));
-    let opencode_db = options
-        .opencode_db
-        .unwrap_or_else(|| home.join(".local/share/opencode/opencode.db"));
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    let claude_root = source_path(options.claude_root, home.as_deref(), ".claude/projects")?;
+    let opencode_db = source_path(
+        options.opencode_db,
+        home.as_deref(),
+        ".local/share/opencode/opencode.db",
+    )?;
 
     let claude = import_claude_jsonl(&claude_root, options.seed)
         .context("Claude Code aggregate import failed")?;
@@ -76,4 +74,40 @@ fn main() -> anyhow::Result<()> {
 
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+fn source_path(
+    explicit: Option<PathBuf>,
+    home: Option<&std::path::Path>,
+    default_relative: &str,
+) -> anyhow::Result<PathBuf> {
+    if let Some(path) = explicit {
+        return Ok(path);
+    }
+    home.map(|path| path.join(default_relative))
+        .ok_or_else(|| anyhow!("the local home directory is unavailable"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::source_path;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn explicit_source_path_does_not_require_home() {
+        let explicit = PathBuf::from("invented/source");
+        assert_eq!(
+            source_path(Some(explicit.clone()), None, "unused").unwrap(),
+            explicit
+        );
+    }
+
+    #[test]
+    fn default_source_path_requires_and_uses_home() {
+        assert!(source_path(None, None, "invented").is_err());
+        assert_eq!(
+            source_path(None, Some(Path::new("invented-home")), "store/db").unwrap(),
+            PathBuf::from("invented-home/store/db")
+        );
+    }
 }

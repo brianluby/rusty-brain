@@ -77,6 +77,19 @@ fn claude_adapter_removes_sensitive_fixture_values_and_private_reasoning() {
 }
 
 #[test]
+fn claude_adapter_accounts_for_each_record_in_an_unidentifiable_file() {
+    let output = import_claude_jsonl(Path::new(CLAUDE_FIXTURE_ROOT), DEFAULT_FAKER_SEED).unwrap();
+    assert_eq!(
+        output
+            .stats
+            .rejections
+            .get(&RejectionCategory::MissingSession),
+        Some(&2)
+    );
+    assert_eq!(output.stats.source_records, 9);
+}
+
+#[test]
 fn opencode_adapter_uses_parts_and_marks_committed_repository_evidence() {
     let temp = open_invented_opencode_db();
     let output = import_opencode_db(&temp.path().join("invented.db"), DEFAULT_FAKER_SEED).unwrap();
@@ -91,6 +104,17 @@ fn opencode_adapter_uses_parts_and_marks_committed_repository_evidence() {
         event.role == EventRole::Assistant
             && event.authority == EvidenceAuthority::AssistantUncorroborated
     }));
+    assert_eq!(
+        output
+            .stats
+            .rejections
+            .get(&RejectionCategory::MissingProject),
+        Some(&2)
+    );
+    assert!(!output
+        .stats
+        .rejections
+        .contains_key(&RejectionCategory::MissingSession));
 }
 
 #[test]

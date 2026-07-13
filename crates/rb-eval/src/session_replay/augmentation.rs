@@ -215,9 +215,10 @@ mod tests {
     }
 
     #[test]
-    fn faker_manifest_version_is_exactly_pinned() {
+    fn augmentation_dependency_versions_are_exactly_pinned() {
         const WORKSPACE_MANIFEST: &str = include_str!("../../../../Cargo.toml");
         assert!(WORKSPACE_MANIFEST.contains("fake = \"=5.1.0\""));
+        assert!(WORKSPACE_MANIFEST.contains("rand = \"=0.10.2\""));
         assert_eq!(FAKER_VERSION, "5.1.0");
     }
 }

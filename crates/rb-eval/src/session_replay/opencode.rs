@@ -1,6 +1,6 @@
 //! OpenCode SQLite adapter.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::Path;
 
 use chrono::{DateTime, Utc};
@@ -32,8 +32,13 @@ pub fn import_opencode_db(path: &Path, seed: u64) -> Result<AdapterOutput, Adapt
     stats.source_containers = 1;
     stats.source_records = physical_record_count(&connection)?;
     let locator = path.to_string_lossy().into_owned();
-    let mut raw_sessions = load_sessions(&connection, &locator, &mut stats)?;
-    load_parts(&connection, &mut raw_sessions, &mut stats)?;
+    let (mut raw_sessions, project_rejected) = load_sessions(&connection, &locator, &mut stats)?;
+    load_parts(
+        &connection,
+        &mut raw_sessions,
+        &project_rejected,
+        &mut stats,
+    )?;
     stats.source_sessions = raw_sessions.len() as u64;
 
     let mut sessions: Vec<_> = raw_sessions
@@ -61,7 +66,7 @@ fn load_sessions(
     connection: &Connection,
     locator: &str,
     stats: &mut ImportStats,
-) -> Result<BTreeMap<String, RawSession>, AdapterError> {
+) -> Result<(BTreeMap<String, RawSession>, BTreeSet<String>), AdapterError> {
     let mut statement = connection.prepare(
         "SELECT id, project_id, directory \
          FROM session ORDER BY time_created, id",
@@ -74,6 +79,7 @@ fn load_sessions(
         ))
     })?;
     let mut sessions = BTreeMap::new();
+    let mut project_rejected = BTreeSet::new();
     for row in rows {
         let (session_id, project_id, directory) = row?;
         if session_id.trim().is_empty() {
@@ -82,6 +88,7 @@ fn load_sessions(
         }
         if project_id.trim().is_empty() || directory.trim().is_empty() {
             stats.reject(RejectionCategory::MissingProject);
+            project_rejected.insert(session_id);
             continue;
         }
         sessions.insert(
@@ -96,12 +103,13 @@ fn load_sessions(
             },
         );
     }
-    Ok(sessions)
+    Ok((sessions, project_rejected))
 }
 
 fn load_parts(
     connection: &Connection,
     sessions: &mut BTreeMap<String, RawSession>,
+    project_rejected: &BTreeSet<String>,
     stats: &mut ImportStats,
 ) -> Result<(), AdapterError> {
     let mut statement = connection.prepare(
@@ -119,7 +127,12 @@ fn load_parts(
         let part_time: i64 = row.get(4)?;
         let part_data: String = row.get(5)?;
         let Some(session) = sessions.get_mut(&session_id) else {
-            stats.reject(RejectionCategory::MissingSession);
+            let category = if project_rejected.contains(&session_id) {
+                RejectionCategory::MissingProject
+            } else {
+                RejectionCategory::MissingSession
+            };
+            stats.reject(category);
             source_index += 1;
             continue;
         };

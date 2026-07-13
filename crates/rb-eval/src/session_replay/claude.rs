@@ -31,13 +31,21 @@ pub fn import_claude_jsonl(root: &Path, seed: u64) -> Result<AdapterOutput, Adap
     let mut raw_sessions = BTreeMap::new();
     for path in files {
         stats.source_containers += 1;
-        let (session_id, project_id) = file_identity(&path)?;
+        let (session_id, project_id, scanned_records) = file_identity(&path)?;
         let Some(session_id) = session_id else {
-            stats.reject(RejectionCategory::MissingSession);
+            reject_scanned_records(
+                &mut stats,
+                scanned_records,
+                RejectionCategory::MissingSession,
+            );
             continue;
         };
         let Some(project_id) = project_id else {
-            stats.reject(RejectionCategory::MissingProject);
+            reject_scanned_records(
+                &mut stats,
+                scanned_records,
+                RejectionCategory::MissingProject,
+            );
             continue;
         };
         let locator = path.to_string_lossy().into_owned();
@@ -83,12 +91,14 @@ fn collect_jsonl_files(root: &Path, files: &mut Vec<PathBuf>) -> Result<(), Adap
     Ok(())
 }
 
-fn file_identity(path: &Path) -> Result<(Option<String>, Option<String>), AdapterError> {
+fn file_identity(path: &Path) -> Result<(Option<String>, Option<String>, u64), AdapterError> {
     let reader = BufReader::new(File::open(path)?);
     let mut session_id = None;
     let mut project_id = None;
+    let mut scanned_records = 0u64;
     for line in reader.lines() {
         let line = line?;
+        scanned_records += 1;
         let Ok(value) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -98,7 +108,18 @@ fn file_identity(path: &Path) -> Result<(Option<String>, Option<String>), Adapte
             break;
         }
     }
-    Ok((session_id, project_id))
+    Ok((session_id, project_id, scanned_records))
+}
+
+fn reject_scanned_records(
+    stats: &mut ImportStats,
+    scanned_records: u64,
+    category: RejectionCategory,
+) {
+    stats.source_records += scanned_records;
+    for _ in 0..scanned_records {
+        stats.reject(category);
+    }
 }
 
 fn parse_file(

@@ -28,6 +28,22 @@ INSERT INTO session VALUES (
     1769940000000,
     1769940360000
 );
+INSERT INTO session VALUES (
+    'ses_invented_missing_project',
+    '',
+    '/home/invented/missing-project',
+    1769940400000,
+    1769940460000
+);
+
+INSERT INTO message VALUES (
+    'msg_missing_project', 'ses_invented_missing_project', 1769940400000, 1769940400000,
+    '{"role":"user"}'
+);
+INSERT INTO part VALUES (
+    'part_missing_project', 'msg_missing_project', 'ses_invented_missing_project', 1769940400000, 1769940400000,
+    '{"type":"text","text":"Invented row for missing-project rejection accounting."}'
+);
 
 INSERT INTO message VALUES (
     'msg_user_early', 'ses_invented_opencode', 1769940000000, 1769940000000,

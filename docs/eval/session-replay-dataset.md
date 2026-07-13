@@ -146,6 +146,9 @@ reporting, and human review are independent backstops.
 ## Faker augmentation contract
 
 - Rust crate `fake` is pinned exactly to `5.1.0`.
+- Rust crate `rand` is pinned exactly to `0.10.2`; changing the RNG version is
+  an explicit dataset-version event because `StdRng` does not promise a stable
+  algorithm across releases.
 - The default seed is pinned to `0x5255535459425241` and is recorded in every
   report and generated record. A different seed must be passed explicitly and
   retained with the evaluation artifact.
