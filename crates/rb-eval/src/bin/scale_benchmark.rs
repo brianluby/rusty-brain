@@ -95,6 +95,7 @@ struct Report {
     schema: &'static str,
     generated_at: String,
     git_sha: String,
+    worktree_clean: bool,
     host: String,
     embedding_dimension: usize,
     embedding_model_id: String,
@@ -505,6 +506,7 @@ async fn main() -> anyhow::Result<()> {
         );
     }
     let git_sha = command_output("git", &["rev-parse", "HEAD"]);
+    let worktree_clean = git_worktree_is_clean();
     let fault_matrix = fault_evidence(
         &shape,
         options.disk_exhaustion_dir.as_deref(),
@@ -515,6 +517,7 @@ async fn main() -> anyhow::Result<()> {
     )
     .await?;
     let representative_load_eligible = matches!(options.provider, ProviderMode::Local)
+        && worktree_clean
         && shape.dimension == DEFAULT_DIMENSION
         && shape.model_id == DEFAULT_MODEL_ID
         && production_corpus_matrix
@@ -535,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
         schema: "rusty-brain-scale-v3",
         generated_at: chrono::Utc::now().to_rfc3339(),
         git_sha,
+        worktree_clean,
         host: command_output("uname", &["-a"]),
         embedding_dimension: shape.dimension,
         embedding_model_id: shape.model_id.clone(),
@@ -1627,6 +1631,15 @@ fn command_output(command: &str, args: &[&str]) -> String {
         .filter(|output| output.status.success())
         .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_string())
         .unwrap_or_else(|| "unavailable".to_string())
+}
+
+fn git_worktree_is_clean() -> bool {
+    std::process::Command::new("git")
+        .args(["status", "--porcelain=v1", "--untracked-files=all"])
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .is_some_and(|output| output.stdout.is_empty())
 }
 
 async fn fault_evidence(

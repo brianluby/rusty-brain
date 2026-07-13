@@ -15,8 +15,8 @@ scripts/run-scale-benchmark.sh \
   --burst 100 \
   --operation-timeout-ms 30000 \
   --seed-batch-timeout-ms 120000 \
-  --interrupted-writes-artifact target/interrupted-writes-test.log \
-  --writer-death-artifact target/writer-death-test.log \
+  --interrupted-writes-artifact target/interrupted-writes-test.json \
+  --writer-death-artifact target/writer-death-test.json \
   --output target/scale-benchmark.json
 ```
 
@@ -47,8 +47,10 @@ replace the committed default or compare results from different corpus lists.
 For fast wiring checks only, pass `--provider fixture`; such reports are marked
 ineligible for a production envelope. V3 preregisters at least 100 actual,
 error-free successes per measured path for p99; configured counts alone do not
-qualify. `representative_load_eligible` also requires the complete committed
-1k/10k/25k matrix and acknowledged-write/namespace/checkpoint invariants.
+qualify. The report records `worktree_clean`, and machine eligibility requires
+a clean tracked and untracked worktree so a modified harness cannot claim only
+the clean `git_sha`. `representative_load_eligible` also requires the complete
+committed 1k/10k/25k matrix and acknowledged-write/namespace/checkpoint invariants.
 `production_envelope_eligible` additionally requires every mandatory fault,
 including actual disk exhaustion, plus SHA-256 references for retained
 interrupted-write and writer-death/reopen evidence. The harness reads and
@@ -58,8 +60,9 @@ not accepted as proof. Each artifact is JSON with schema
 `cargo test` command, `exit_code: 0`, the required test names, and captured
 output containing those names plus `test result: ok`. Empty, failing, stale-
 revision, malformed, or unrelated files remain incomplete. Only
-`rusty-brain-scale-v3` reports carry this contract; older artifacts cannot
-support a production-envelope claim.
+`rusty-brain-scale-v3` reports with an explicit `worktree_clean: true` carry
+this contract; older or incomplete artifacts cannot support a production-
+envelope claim.
 
 ## Disk exhaustion
 

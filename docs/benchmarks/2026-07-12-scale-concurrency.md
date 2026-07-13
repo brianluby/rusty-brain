@@ -24,6 +24,8 @@ configurable absolute deadline; MCP setup, framed call, and shutdown share that
 single budget and one elapsed timer. Timeout duration, count, and possible
 residual SQLite `spawn_blocking` work are reported instead of allowing a silent
 harness hang.
+The report also records `worktree_clean`, and both eligibility fields fail
+closed when tracked or untracked files differ from the reported `git_sha`.
 The MCP path now runs the production `serve_stdio` newline-delimited framing,
 serialization, and I/O loop, validates JSON-RPC/result/`isError`, and counts an
 MCP remember only after receiving a parseable returned memory id.
@@ -160,8 +162,8 @@ mount is never fully production-eligible.
 # Real local model (default; compiles rb-eval's record-local feature):
 scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
   --operations 100 --burst 100 --operation-timeout-ms 30000 \
-  --interrupted-writes-artifact target/interrupted-writes-test.log \
-  --writer-death-artifact target/writer-death-test.log \
+  --interrupted-writes-artifact target/interrupted-writes-test.json \
+  --writer-death-artifact target/writer-death-test.json \
   --output target/scale-local-384.json
 
 # Explicit smoke-only deterministic fixture:
