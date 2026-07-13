@@ -5,6 +5,29 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Concurrent zero-byte store initialization (Vikunja #506)
+
+- **Two public opens can now create the same zero-byte database safely**: the
+  busy handler is installed before WAL negotiation, SQLite's occasionally
+  immediate `BUSY`/`LOCKED` journal-mode result gets a bounded retry, and each
+  optimistically-unseen migration takes `BEGIN IMMEDIATE` then rechecks its
+  ledger row. The losing opener validates the winner's checksum instead of
+  replaying already-applied DDL (`duplicate column name`). Already-recorded
+  migrations still take the existing read-only checksum path.
+- **Dynamic-vector initialization is also single-winner**: current schemas keep
+  the existing read-only `vector_schema_version` fast path; a missing/outdated
+  marker takes `BEGIN IMMEDIATE`, then revalidates both the marker and
+  `memory_vectors` existence. A loser returns against the winner's committed
+  schema instead of failing with `table memory_vectors already exists`.
+- **Crash and rebuild guarantees are unchanged**: create/rebuild plus the
+  version and cosine-metric markers remain one atomic transaction; pending
+  migrations retain one transaction per migration with RAII rollback. A
+  path-scoped barrier drives two real `open_with_model` calls from a nonexistent
+  file and verifies identical dimension, model, vector schema, metric, and site
+  markers. A checked-in release benchmark records why the vector write lock is
+  slow-path-only: unconditional locking cost 1.52–1.66x the current-schema
+  marker check in the task runs.
+
 ### Fixed — Scrub reports blocked WAL cleanup (Vikunja #53)
 
 - `rusty-brain scrub` now inspects the full result of its truncating WAL
