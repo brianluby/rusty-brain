@@ -322,13 +322,17 @@ impl Daemon {
         self.http_addr
     }
 
-    /// Clone the storage handle for process-local diagnostics and benchmarks.
-    /// Normal clients should use UDS/HTTP; this exposes counters without adding
-    /// a wire endpoint solely for development-time measurements.
+    /// Return a read-only storage-pressure probe for diagnostics and benchmarks.
+    ///
+    /// The probe snapshots writer-queue and read-pool counters when invoked.
+    /// It contains no writer channel, store connection, or shutdown capability,
+    /// so retaining it cannot mutate the store or keep the storage core alive.
     #[doc(hidden)]
     #[must_use]
-    pub fn store_handle(&self) -> StoreHandle {
-        self.store.clone()
+    pub fn store_metrics_probe(
+        &self,
+    ) -> Arc<dyn Fn() -> (crate::WriterQueueMetrics, crate::ReadPoolMetrics) + Send + Sync> {
+        self.store.metrics_probe()
     }
 
     /// Run until `shutdown` resolves, then drain connections and clean up.

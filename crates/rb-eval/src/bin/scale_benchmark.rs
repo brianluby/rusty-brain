@@ -409,7 +409,7 @@ fn latency_is_adequate(latency: &Latency) -> bool {
 struct RunningDaemon {
     socket: PathBuf,
     http_addr: std::net::SocketAddr,
-    store: StoreHandle,
+    metrics_probe: std::sync::Arc<dyn Fn() -> (WriterQueueMetrics, ReadPoolMetrics) + Send + Sync>,
     shutdown: oneshot::Sender<()>,
     task: JoinHandle<anyhow::Result<()>>,
 }
@@ -432,7 +432,7 @@ impl RunningDaemon {
             .await
             .context("bind benchmark daemon")?;
         let http_addr = daemon.http_addr().context("HTTP listener missing")?;
-        let store = daemon.store_handle();
+        let metrics_probe = daemon.store_metrics_probe();
         let (shutdown, rx) = oneshot::channel();
         let task = tokio::spawn(async move {
             daemon
@@ -446,7 +446,7 @@ impl RunningDaemon {
         Ok(Self {
             socket,
             http_addr,
-            store,
+            metrics_probe,
             shutdown,
             task,
         })
@@ -638,17 +638,12 @@ async fn run_corpus(
     acknowledged_write_ids.extend(mixed.acknowledged_ids);
     let mut verification_failures = Vec::new();
     let mut verification_residual_blocking_possible = false;
-    let stats = match tokio::time::timeout(
-        operation_timeout,
-        daemon.store.namespace_stats(
-            Namespace::Project("scale".into()),
-            30,
-            shape.model_id.clone(),
-            INPUT_VERSION.to_string(),
-            1,
-            None,
-        ),
-    )
+    let stats = match tokio::time::timeout(operation_timeout, async {
+        let mut client =
+            Client::connect(&daemon.socket, Namespace::Project("scale".into())).await?;
+        let (stats, _, _) = client.stats(Some(30)).await?;
+        anyhow::Ok(stats)
+    })
     .await
     {
         Ok(Ok(stats)) => Some(stats),
@@ -679,12 +674,13 @@ async fn run_corpus(
             false
         }
     };
-    let queue = queue_result(daemon.store.writer_queue_metrics());
-    let read_pool = read_pool_result(daemon.store.read_pool_metrics());
+    let (queue_metrics, read_metrics) = (daemon.metrics_probe)();
+    let queue = queue_result(queue_metrics);
+    let read_pool = read_pool_result(read_metrics);
     let dropped_broadcasts = rb_daemon::dropped_broadcast_count() - dropped_before;
     let rss_bytes = current_rss_bytes();
 
-    let reader = rusqlite::Connection::open(&db).context("open long-lived reader")?;
+    let reader = open_pinned_reader(&db).context("open long-lived reader")?;
     reader.execute_batch("BEGIN")?;
     let _: i64 = reader.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
     let pinned_result = uds_remember(
@@ -1323,6 +1319,7 @@ async fn mixed_workload(
     deadline: Duration,
 ) -> anyhow::Result<MixedOutcome> {
     let phase_started = Instant::now();
+    let http_client = reqwest::Client::builder().build()?;
     let mut samples: std::collections::BTreeMap<&'static str, Samples> = MixedOp::ALL
         .iter()
         .map(|operation| {
@@ -1336,6 +1333,7 @@ async fn mixed_workload(
     for operation in MixedOp::ALL {
         for index in 0..operations_per_path {
             let socket = socket.to_path_buf();
+            let http_client = http_client.clone();
             tasks.spawn(async move {
                 let outcome = match operation {
                     MixedOp::McpRecall => {
@@ -1347,7 +1345,7 @@ async fn mixed_workload(
                     _ => {
                         timed_operation(
                             deadline,
-                            run_mixed_operation(operation, &socket, http_addr, index),
+                            run_mixed_operation(operation, &socket, http_addr, &http_client, index),
                         )
                         .await
                     }
@@ -1402,6 +1400,7 @@ async fn run_mixed_operation(
     operation: MixedOp,
     socket: &Path,
     http_addr: std::net::SocketAddr,
+    http_client: &reqwest::Client,
     index: usize,
 ) -> anyhow::Result<Option<rb_types::MemoryId>> {
     match operation {
@@ -1430,6 +1429,7 @@ async fn run_mixed_operation(
         }
         MixedOp::HttpRecall => {
             let response = http_post(
+                http_client,
                 http_addr,
                 "/recall",
                 Request::Recall {
@@ -1448,6 +1448,7 @@ async fn run_mixed_operation(
         }
         MixedOp::HttpRemember => {
             let response = http_post(
+                http_client,
                 http_addr,
                 "/remember",
                 Request::Remember {
@@ -1487,11 +1488,12 @@ fn parse_http_remember_id(value: &serde_json::Value) -> anyhow::Result<rb_types:
 }
 
 async fn http_post(
+    client: &reqwest::Client,
     addr: std::net::SocketAddr,
     path: &str,
     request: Request,
 ) -> anyhow::Result<reqwest::Response> {
-    Ok(reqwest::Client::new()
+    Ok(client
         .post(format!("http://{addr}{path}"))
         .header("x-rusty-brain-namespace", "project:scale")
         .json(&shortcut_json(request)?)
@@ -1651,7 +1653,6 @@ async fn fault_evidence(
     git_sha: &str,
 ) -> anyhow::Result<Vec<FaultEvidence>> {
     let provider_status = exercise_provider_timeout(shape).await?;
-    let provider_timeout_complete = provider_status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
     let disk_evidence = disk_exhaustion_evidence(shape, disk_dir, disk_max_mib).await?;
     Ok(vec![
         FaultEvidence {
@@ -1666,18 +1667,7 @@ async fn fault_evidence(
             &["caught_writer_panic_isolates_and_does_not_lose_later_writes"],
             git_sha,
         ),
-        FaultEvidence {
-            case: "provider_timeout",
-            status: if provider_timeout_complete {
-                "executed_expected_503"
-            } else {
-                "executed_unexpected_status"
-            },
-            complete_for_full_eligibility: provider_timeout_complete,
-            detail: format!(
-                "A 200ms embedding provider behind a 20ms HTTP request deadline returned HTTP {provider_status}; full eligibility requires 503 Service Unavailable."
-            ),
-        },
+        provider_timeout_evidence(provider_status),
         artifact_fault_evidence(
             "writer_death_recovery",
             writer_death_artifact,
@@ -1689,6 +1679,26 @@ async fn fault_evidence(
         ),
         disk_evidence,
     ])
+}
+
+fn provider_timeout_evidence(provider_status: reqwest::StatusCode) -> FaultEvidence {
+    let complete = provider_status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
+    FaultEvidence {
+        case: "provider_timeout",
+        status: if complete {
+            "executed_expected_503"
+        } else {
+            "executed_unexpected_status"
+        },
+        complete_for_full_eligibility: complete,
+        detail: format!(
+            "A 200ms embedding provider behind a 20ms HTTP request deadline returned HTTP {provider_status}; full eligibility requires 503 Service Unavailable."
+        ),
+    }
+}
+
+fn open_pinned_reader(db: &Path) -> rusqlite::Result<rusqlite::Connection> {
+    rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
 fn artifact_fault_evidence(
@@ -2029,9 +2039,6 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         .await
         .context("slow-provider daemon shutdown timed out")?
         .context("slow-provider daemon task panicked")??;
-    if status != reqwest::StatusCode::SERVICE_UNAVAILABLE {
-        bail!("expected HTTP 503 at provider deadline, got {status}");
-    }
     Ok(status)
 }
 
@@ -2207,6 +2214,29 @@ mod tests {
             .collect();
         evidence[4].complete_for_full_eligibility = false;
         assert!(!mandatory_fault_evidence_complete(&evidence));
+    }
+
+    #[test]
+    fn unexpected_provider_status_is_reported_as_incomplete_evidence() {
+        let evidence = provider_timeout_evidence(reqwest::StatusCode::OK);
+
+        assert_eq!(
+            (evidence.status, evidence.complete_for_full_eligibility),
+            ("executed_unexpected_status", false)
+        );
+    }
+
+    #[test]
+    fn pinned_reader_rejects_writes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("reader.db");
+        drop(rusqlite::Connection::open(&db).unwrap());
+
+        let reader = open_pinned_reader(&db).unwrap();
+
+        assert!(reader
+            .execute_batch("CREATE TABLE forbidden (id INTEGER)")
+            .is_err());
     }
 
     #[test]

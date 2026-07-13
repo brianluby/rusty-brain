@@ -300,6 +300,13 @@ enum WriteCommand {
     DieForTest {
         reply: oneshot::Sender<Result<()>>,
     },
+    /// Test-only: hold the writer loop until the test releases it, allowing
+    /// deterministic bounded-queue saturation without relying on slow CI I/O.
+    #[cfg(test)]
+    BlockForTest {
+        entered: std::sync::mpsc::Sender<()>,
+        release: std::sync::mpsc::Receiver<()>,
+    },
     Shutdown {
         reply: oneshot::Sender<()>,
     },
@@ -793,25 +800,32 @@ impl StoreHandle {
     /// Snapshot bounded writer-queue pressure without resetting the counters.
     #[must_use]
     pub fn writer_queue_metrics(&self) -> WriterQueueMetrics {
-        WriterQueueMetrics {
-            enqueued: self.queue_metrics.enqueued.load(Ordering::Relaxed),
-            saturated: self.queue_metrics.saturated.load(Ordering::Relaxed),
-            total_wait_ns: self.queue_metrics.total_wait_ns.load(Ordering::Relaxed),
-            max_wait_ns: self.queue_metrics.max_wait_ns.load(Ordering::Relaxed),
-            capacity: WRITE_QUEUE_CAPACITY,
-        }
+        writer_queue_metrics_snapshot(&self.queue_metrics)
     }
 
     /// Snapshot bounded read-pool permit pressure without resetting counters.
     #[must_use]
     pub fn read_pool_metrics(&self) -> ReadPoolMetrics {
-        ReadPoolMetrics {
-            acquired: self.read_metrics.acquired.load(Ordering::Relaxed),
-            saturated: self.read_metrics.saturated.load(Ordering::Relaxed),
-            total_wait_ns: self.read_metrics.total_wait_ns.load(Ordering::Relaxed),
-            max_wait_ns: self.read_metrics.max_wait_ns.load(Ordering::Relaxed),
-            capacity: self.read_pool_capacity,
-        }
+        read_pool_metrics_snapshot(&self.read_metrics, self.read_pool_capacity)
+    }
+
+    /// Build a read-only metrics probe for in-process diagnostics.
+    ///
+    /// The probe retains only the metric counters, not the writer channel,
+    /// read connections, or shutdown state. It therefore cannot mutate or
+    /// terminate the store and does not keep the storage core alive.
+    pub(crate) fn metrics_probe(
+        &self,
+    ) -> Arc<dyn Fn() -> (WriterQueueMetrics, ReadPoolMetrics) + Send + Sync> {
+        let queue_metrics = Arc::clone(&self.queue_metrics);
+        let read_metrics = Arc::clone(&self.read_metrics);
+        let read_pool_capacity = self.read_pool_capacity;
+        Arc::new(move || {
+            (
+                writer_queue_metrics_snapshot(&queue_metrics),
+                read_pool_metrics_snapshot(&read_metrics, read_pool_capacity),
+            )
+        })
     }
 
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
@@ -1257,6 +1271,26 @@ impl StoreHandle {
             reply,
         };
         self.send_write(cmd, rx).await
+    }
+}
+
+fn writer_queue_metrics_snapshot(metrics: &WriterQueueMetricState) -> WriterQueueMetrics {
+    WriterQueueMetrics {
+        enqueued: metrics.enqueued.load(Ordering::Relaxed),
+        saturated: metrics.saturated.load(Ordering::Relaxed),
+        total_wait_ns: metrics.total_wait_ns.load(Ordering::Relaxed),
+        max_wait_ns: metrics.max_wait_ns.load(Ordering::Relaxed),
+        capacity: WRITE_QUEUE_CAPACITY,
+    }
+}
+
+fn read_pool_metrics_snapshot(metrics: &ReadPoolMetricState, capacity: usize) -> ReadPoolMetrics {
+    ReadPoolMetrics {
+        acquired: metrics.acquired.load(Ordering::Relaxed),
+        saturated: metrics.saturated.load(Ordering::Relaxed),
+        total_wait_ns: metrics.total_wait_ns.load(Ordering::Relaxed),
+        max_wait_ns: metrics.max_wait_ns.load(Ordering::Relaxed),
+        capacity,
     }
 }
 
@@ -2114,6 +2148,11 @@ fn writer_loop(
                 let _ = reply.send(Err(Error::Storage("writer killed for test".to_string())));
                 break;
             }
+            #[cfg(test)]
+            WriteCommand::BlockForTest { entered, release } => {
+                let _ = entered.send(());
+                let _ = release.recv();
+            }
             WriteCommand::Shutdown { reply } => {
                 // Fold the WAL back into the main file before the connection is
                 // dropped, so the on-disk DB is a clean single file. Best-effort:
@@ -2379,6 +2418,134 @@ mod tests {
         let changed = accept_model_change(&db, DIM, "voyage-3").unwrap();
         assert!(!changed, "nothing to accept on a fresh install");
         assert!(!db.exists(), "the opt-in path must not create the DB");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn read_pool_metrics_record_waiters_when_the_only_connection_is_held() {
+        const WAITERS: usize = 4;
+
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("rb.db"), DIM, 1).unwrap();
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        let holder = {
+            let handle = handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .with_read(move |_store| {
+                        entered_tx.send(()).unwrap();
+                        release_rx.recv().unwrap();
+                        Ok(())
+                    })
+                    .await
+            })
+        };
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(WAITERS + 1));
+        let mut waiters = Vec::with_capacity(WAITERS);
+        for _ in 0..WAITERS {
+            let handle = handle.clone();
+            let start = Arc::clone(&start);
+            waiters.push(tokio::spawn(async move {
+                start.wait().await;
+                handle.with_read(|_store| Ok(())).await
+            }));
+        }
+        start.wait().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release_tx.send(()).unwrap();
+
+        holder.await.unwrap().unwrap();
+        for waiter in waiters {
+            waiter.await.unwrap().unwrap();
+        }
+
+        let metrics = handle.read_pool_metrics();
+        assert_eq!(metrics.capacity, 1);
+        assert_eq!(metrics.acquired, (WAITERS + 1) as u64);
+        assert_eq!(metrics.saturated, WAITERS as u64);
+        assert!(metrics.total_wait_ns > 0);
+        assert!(metrics.max_wait_ns > 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn writer_queue_metrics_record_pressure_beyond_bounded_capacity() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("rb.db"), DIM, 1).unwrap();
+        let namespace = Namespace::Project("writer-pressure".to_string());
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+
+        handle
+            .writer_tx
+            .send(WriteCommand::BlockForTest {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let start = Arc::new(tokio::sync::Barrier::new(WRITE_QUEUE_CAPACITY + 1));
+        let mut writes = Vec::with_capacity(WRITE_QUEUE_CAPACITY + 1);
+        for i in 0..WRITE_QUEUE_CAPACITY {
+            let handle = handle.clone();
+            let namespace = namespace.clone();
+            let start = Arc::clone(&start);
+            writes.push(tokio::spawn(async move {
+                start.wait().await;
+                handle
+                    .write(
+                        note(&namespace, &format!("queued memory {i}")),
+                        Some(vec![0.1; DIM]),
+                    )
+                    .await
+            }));
+        }
+        start.wait().await;
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while handle.writer_tx.capacity() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the blocked writer must allow its bounded queue to fill");
+
+        let overflow = {
+            let handle = handle.clone();
+            let namespace = namespace.clone();
+            tokio::spawn(async move {
+                handle
+                    .write(note(&namespace, "overflow memory"), Some(vec![0.2; DIM]))
+                    .await
+            })
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            !overflow.is_finished(),
+            "the write beyond queue capacity must wait while the writer is blocked"
+        );
+        release_tx.send(()).unwrap();
+
+        for write in writes {
+            write.await.unwrap().unwrap();
+        }
+        overflow.await.unwrap().unwrap();
+
+        let metrics = handle.writer_queue_metrics();
+        assert_eq!(metrics.capacity, WRITE_QUEUE_CAPACITY);
+        assert_eq!(metrics.enqueued, (WRITE_QUEUE_CAPACITY + 1) as u64);
+        assert!(metrics.saturated >= 1);
+        assert!(metrics.total_wait_ns > 0);
+        assert!(metrics.max_wait_ns > 0);
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
