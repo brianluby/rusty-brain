@@ -12,7 +12,9 @@ contract_version = 2
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
 "crates/rb-proto/src/messages.rs::Request" = "4ea3877bcfbbc0c0a3b824baefe860629eafb07f77d1ced5e64be1ac87420926"
-"crates/rb-proto/src/messages.rs::Response" = "9db3b5b9faf7163bcc85a93568856cb254ee85abb1fe2f947f5a47aaeb418d5e"
+"crates/rb-proto/src/messages.rs::Response" = "8eadc7e8be732b895abe42ca67222cc68e235a96404e7ce6ec0a410f7386f04b"
+"crates/rb-proto/src/messages.rs::ScrubCheckpoint" = "dfe99a03b49da585b2e26b8825493a07cb95b11c615bf1ed4b48a339ea6976cc"
+"crates/rb-proto/src/messages.rs::ScrubResult" = "89eb31711254dae32468bce07ea31c707f4fa0a6d32dfe9ca33dc4707f922918"
 "crates/rb-types/src/anchor.rs::MemoryAnchor" = "db65d4fee2c23b5628270cdcb7b19ce99056eb3656de73aa0e50fc77090a9277"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
@@ -113,3 +115,13 @@ note = "PR: review sweep — Request::Review/Resolve + Response::ReviewPlanned/R
 contract_version = 2
 intent = "additive"
 note = "PR #63 review fixes: Resolve.threshold (serde-default merge-revalidation bound) + stale_plan error kind (no bump, additive per W5a.4)"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "Vikunja #53 adds optional scrub WAL checkpoint status; serde defaults preserve old-daemon compatibility"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "Vikunja #53 preserves scrub counts with an optional checkpoint-error diagnostic"

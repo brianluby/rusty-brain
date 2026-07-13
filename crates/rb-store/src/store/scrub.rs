@@ -43,7 +43,7 @@ impl SqliteStore {
     /// `set_recalibrated_importance` rule), so it must not distort recency
     /// ranking. One bulk oplog row records the pass.
     pub fn scrub(&self) -> Result<ScrubOutcome> {
-        let outcome = immediate_tx(&self.conn, || {
+        let mut outcome = immediate_tx(&self.conn, || {
             let mut scanned = 0u64;
             let mut redacted = 0u64;
             let mut reembed_pending = 0u64;
@@ -135,22 +135,31 @@ impl SqliteStore {
                 scanned,
                 redacted,
                 reembed_pending,
+                wal_checkpoint: None,
+                wal_checkpoint_error: None,
             })
         })?;
 
-        // Force the pre-redaction WAL frames into the main DB and truncate the
-        // -wal file: without this, `scrub` could report success while the old
-        // plaintext still sits in the -wal on disk until an arbitrary later
-        // checkpoint. Best-effort and only when something changed (a no-op
-        // scrub wrote nothing). A no-op on an in-memory DB (no WAL). Residual:
-        // freed-page slack in the main DB needs VACUUM/purge (W5b.3) — out of
-        // scope here; this closes the obvious recoverable copy.
-        if outcome.redacted > 0 {
-            self.conn
-                .execute_batch("PRAGMA wal_checkpoint(TRUNCATE);")
-                .map_err(storage_err)?;
-        }
+        // Force pre-redaction WAL frames into the main DB and truncate the WAL.
+        // SQLite reports a busy checkpoint as a successful pragma row, so the
+        // result must be inspected rather than discarded. Always retry the
+        // checkpoint, even on a no-op scrub, so an operator can close the
+        // blocking reader and rerun `scrub` to finish the at-rest cleanup.
+        // Residual freed-page slack in the main DB needs VACUUM/purge (W5b.3).
+        attach_checkpoint_result(&mut outcome, self.truncate_wal());
         Ok(outcome)
+    }
+
+    fn truncate_wal(&self) -> Result<WalCheckpointOutcome> {
+        self.conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                Ok(WalCheckpointOutcome {
+                    busy: row.get::<_, i64>(0)? != 0,
+                    log_frames: row.get(1)?,
+                    checkpointed_frames: row.get(2)?,
+                })
+            })
+            .map_err(storage_err)
     }
     /// One keyset page of redactable rows with `memory_id > cursor`, ordered by
     /// `memory_id`, capped at `SCRUB_BATCH`. Split out so the prepared SELECT
@@ -189,7 +198,7 @@ impl SqliteStore {
     }
 }
 /// Result of a retroactive [`SqliteStore::scrub`] pass (W2.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScrubOutcome {
     /// Rows examined (every memory, active and archived).
     pub scanned: u64,
@@ -200,6 +209,39 @@ pub struct ScrubOutcome {
     /// keywords/tags — everything except `summary`) changed and were
     /// therefore marked stale for re-embedding.
     pub reembed_pending: u64,
+    /// Result of the post-scrub truncating WAL checkpoint. `None` is retained
+    /// for backward-compatible construction via [`Default`] and when checkpoint
+    /// execution fails; a completed [`SqliteStore::scrub`] call populates either
+    /// this field or [`Self::wal_checkpoint_error`], never both.
+    pub wal_checkpoint: Option<WalCheckpointOutcome>,
+    /// Checkpoint execution failure after the redaction transaction committed.
+    /// The scrub counts remain authoritative; callers must warn that old
+    /// plaintext may remain in the WAL and offer a checkpoint retry.
+    pub wal_checkpoint_error: Option<String>,
+}
+
+/// SQLite's result row for `PRAGMA wal_checkpoint(TRUNCATE)` after a scrub.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WalCheckpointOutcome {
+    /// Whether a concurrent reader or writer prevented a complete checkpoint.
+    pub busy: bool,
+    /// Frames observed in the WAL (`-1` when the database has no WAL).
+    pub log_frames: i64,
+    /// Frames copied into the main database (`-1` when there is no WAL).
+    pub checkpointed_frames: i64,
+}
+
+fn attach_checkpoint_result(outcome: &mut ScrubOutcome, result: Result<WalCheckpointOutcome>) {
+    match result {
+        Ok(checkpoint) => {
+            outcome.wal_checkpoint = Some(checkpoint);
+            outcome.wal_checkpoint_error = None;
+        }
+        Err(error) => {
+            outcome.wal_checkpoint = None;
+            outcome.wal_checkpoint_error = Some(error.to_string());
+        }
+    }
 }
 #[cfg(test)]
 mod scrub_tests {
@@ -366,6 +408,109 @@ mod scrub_tests {
                 .windows(secret.len())
                 .any(|w| w == secret.as_bytes()),
             "the planted secret must be GONE from the db file bytes after scrub"
+        );
+    }
+
+    #[test]
+    fn scrub_surfaces_busy_checkpoint_and_noop_retry_truncates_wal() {
+        let secret = aws_key();
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("busy-checkpoint.db");
+        let store = SqliteStore::open(&db, 8).unwrap();
+        store.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+
+        let mut memory = MemoryNote::new(
+            Namespace::Project("scrub".into()),
+            format!("reader-pinned secret {secret}"),
+            MemoryType::Insight,
+            5,
+        );
+        memory.summary = "busy checkpoint fixture".to_string();
+        store.insert_memory(&memory, None).unwrap();
+
+        // Pin a snapshot before scrub writes the redacted row. The write can
+        // still commit in WAL mode, but TRUNCATE cannot reset the WAL while
+        // this reader needs the older snapshot.
+        let reader = rusqlite::Connection::open(&db).unwrap();
+        reader.execute_batch("BEGIN").unwrap();
+        let pinned: String = reader
+            .query_row(
+                "SELECT content FROM memories WHERE memory_id = ?1",
+                [&memory.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(pinned.contains(&secret));
+
+        let first = store.scrub().unwrap();
+        assert_eq!(first.redacted, 1, "redaction itself must still commit");
+        let first_checkpoint = first.wal_checkpoint.unwrap();
+        assert!(
+            first_checkpoint.busy,
+            "the pinned reader must be surfaced instead of silent success: {first_checkpoint:?}"
+        );
+        let redacted = store.get_memory(&memory.id).unwrap().unwrap();
+        assert!(!redacted.content.contains(&secret));
+
+        reader.execute_batch("COMMIT").unwrap();
+        drop(reader);
+
+        // A no-change rerun deliberately retries TRUNCATE, providing the CLI's
+        // remediation path after the operator closes blocking readers.
+        let retry = store.scrub().unwrap();
+        assert_eq!(retry.redacted, 0);
+        let retry_checkpoint = retry.wal_checkpoint.unwrap();
+        assert!(
+            !retry_checkpoint.busy,
+            "checkpoint should complete after the reader closes: {retry_checkpoint:?}"
+        );
+
+        let wal = db.with_extension("db-wal");
+        assert!(
+            !wal.exists() || std::fs::metadata(wal).unwrap().len() == 0,
+            "successful TRUNCATE must remove or empty the WAL"
+        );
+    }
+
+    #[test]
+    fn checkpoint_failure_preserves_committed_scrub_counts_as_partial_success() {
+        let mut outcome = ScrubOutcome {
+            scanned: 8,
+            redacted: 2,
+            reembed_pending: 1,
+            wal_checkpoint: None,
+            wal_checkpoint_error: None,
+        };
+        attach_checkpoint_result(
+            &mut outcome,
+            Err(Error::Storage("checkpoint unavailable".to_string())),
+        );
+
+        assert_eq!((outcome.scanned, outcome.redacted), (8, 2));
+        assert_eq!(outcome.reembed_pending, 1);
+        assert!(outcome.wal_checkpoint.is_none());
+        assert_eq!(
+            outcome.wal_checkpoint_error.as_deref(),
+            Some("storage error: checkpoint unavailable")
+        );
+
+        let checkpoint = WalCheckpointOutcome {
+            busy: false,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        attach_checkpoint_result(&mut outcome, Ok(checkpoint));
+        assert_eq!(outcome.wal_checkpoint, Some(checkpoint));
+        assert!(outcome.wal_checkpoint_error.is_none());
+
+        attach_checkpoint_result(
+            &mut outcome,
+            Err(Error::Storage("retry failed".to_string())),
+        );
+        assert!(outcome.wal_checkpoint.is_none());
+        assert_eq!(
+            outcome.wal_checkpoint_error.as_deref(),
+            Some("storage error: retry failed")
         );
     }
 
