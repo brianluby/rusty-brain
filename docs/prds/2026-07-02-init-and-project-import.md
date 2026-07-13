@@ -162,7 +162,7 @@ project tree and asserting recall + DB-bytes redaction + dedup.
 - [x] Wire adapters through redaction and the normal engine remember path.
 - [x] Add `import_batch:<id>` tagging, a private batch ledger, and
       `init --undo` / `--list-batches`.
-- [x] Implement idempotent exact-content dedup through a bounded recall probe
+- [x] Implement idempotent exact redacted-content dedup through a bounded recall probe
       (deliberate deviation from the draft's `near_duplicates()` mechanism).
 - [x] Add fixture-driven e2e coverage for recall, DB-bytes redaction, dedup,
       undo, and dry-run.
