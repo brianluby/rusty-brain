@@ -57,6 +57,12 @@ fallback is disabled and a missing/wrong-kind vector fails closed.
   ordinary CI; a weekly/manual workflow also reports the five-instant RRF arm.
 - `tests/semantic_safety.rs` — offline exact-answer, multi-memory,
   archive/supersede, contested, and instruction-shaped poison strata.
+- `controlled.rs` + `tests/controlled_arms.rs` — five fixed chronological
+  streams for equal-budget Linear/RRF/exact-evidence/recency/importance
+  retrieval arms and novelty/importance-confidence/combined online shadow
+  admission arms. The scheduled/manual report emits every seed and enforces
+  the frozen no-go for the exact lane and pilot-only go for combined admission;
+  it never changes production behavior.
 
 Re-record after any corpus change (single command per provider):
 
@@ -85,6 +91,19 @@ It runs the same fixtures through `VoyageProvider`, prints semantic metrics for 
 human to judge, and makes no assertion against the deterministic baselines. Voyage
 was not recorded for the 2026-07-12 W4.1 result because no existing credential was
 available; the local-model gate made no network calls and cost $0.
+
+Run the aggregate-only controlled report locally with:
+
+```bash
+cargo test -p rb-eval --test controlled_arms \
+  controlled_retrieval_and_admission_arms_report_every_seed \
+  -- --ignored --nocapture
+```
+
+Its 2026-07-12 result keeps the exact-evidence lane off and qualifies the
+combined admission product only for a later bounded shadow pilot. See the
+[frozen preregistration](../../docs/eval/2026-07-12-w41-controlled-arms-preregistration.md)
+and [dated results](../../docs/eval/2026-07-12-w41-semantic-gate-results.md).
 
 ### The pre-Phase-1 baseline artifact
 

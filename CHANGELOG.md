@@ -24,6 +24,15 @@ All notable changes to rusty-brain are documented here. The format is based on
   multi-memory answers, zero archived/superseded exposure, contested
   disclosure, and low-confidence instruction-shaped poison suppression. The
   frozen preregistration and dated results keep holdout decisions auditable.
+- **Five-seed controlled arms now close the remaining W4.1 evidence gaps.**
+  Equal-budget exact-evidence, recency-only, and importance-only retrieval arms
+  plus novelty-only, importance-confidence, and combined online shadow
+  admission arms report exact-span/answer quality, stale/wrong/poison exposure,
+  contested disclosure, rows/tokens/bytes, and latency. The exact lane is a
+  frozen no-go (no answer lift and a 0.025 recall regression); combined
+  admission qualifies only for a later bounded shadow pilot (better component
+  quality, zero stale/poison retained or exposed, 128/205 rows). No production
+  ranking, retention, or admission behavior changed.
 
 ### Changed — Supersede hardened at the source (#501)
 

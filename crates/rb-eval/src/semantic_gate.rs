@@ -180,7 +180,11 @@ pub fn check_semantic_floors(
 }
 
 fn gate(failures: &mut Vec<String>, name: &str, actual: f64, floor: f64) {
-    if !actual.is_finite() || actual + 1e-9 < floor {
+    if !actual.is_finite() || !(0.0..=1.0).contains(&actual) {
+        failures.push(format!(
+            "{name}: actual {actual:.4} is outside the valid [0, 1] range"
+        ));
+    } else if actual + 1e-9 < floor {
         failures.push(format!(
             "{name}: actual {actual:.4} < preregistered floor {floor:.4}"
         ));
@@ -312,6 +316,29 @@ mod tests {
         };
 
         let error = check_semantic_floors("test", &report, floors).unwrap_err();
-        assert!(error.contains("mean_recall_at_k") && error.contains("vector_query_rate"));
+        for metric in [
+            "mean_recall_at_k",
+            "mrr",
+            "ndcg",
+            "dedup_precision",
+            "fts_query_rate",
+            "vector_query_rate",
+        ] {
+            assert!(error.contains(metric), "missing regression for {metric}");
+        }
+        assert!(!error.contains("graph_query_rate"));
+    }
+
+    #[test]
+    fn floor_check_rejects_metrics_outside_probability_range() {
+        let mut failures = Vec::new();
+        gate(&mut failures, "too_high", 1.01, 0.5);
+        gate(&mut failures, "too_low", -0.01, 0.0);
+        gate(&mut failures, "nan", f64::NAN, 0.0);
+
+        assert_eq!(failures.len(), 3);
+        assert!(failures
+            .iter()
+            .all(|failure| failure.contains("valid [0, 1]")));
     }
 }

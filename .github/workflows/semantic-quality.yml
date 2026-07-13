@@ -34,3 +34,8 @@ jobs:
           cargo test -p rb-eval --test semantic_gate
           five_seed_linear_rrf_diagnostic
           -- --ignored --nocapture
+      - name: Report controlled retrieval and shadow-admission arms
+        run: >-
+          cargo test -p rb-eval --test controlled_arms
+          controlled_retrieval_and_admission_arms_report_every_seed
+          -- --ignored --nocapture

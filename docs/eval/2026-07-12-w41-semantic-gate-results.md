@@ -1,7 +1,9 @@
 # W4.1 production-embedding semantic gate results
 
-Preregistration:
+Preregistrations:
 [`2026-07-12-w41-semantic-gate-preregistration.md`](2026-07-12-w41-semantic-gate-preregistration.md)
+and
+[`2026-07-12-w41-controlled-arms-preregistration.md`](2026-07-12-w41-controlled-arms-preregistration.md).
 
 Outcome: **GO for bounded dogfood with the current Linear fusion; NO-GO for an
 RRF default flip.** This gate does not waive the separate scale/resource gate.
@@ -63,11 +65,55 @@ Dedicated offline tests additionally established:
 - a low-confidence instruction-shaped poison does not outrank the correct fact.
 
 The 205-memory primary corpus supplies authored near-duplicates and ordinary
-distractors; dedup meets its floor. Exact-evidence, recency-only,
-importance-only, novelty, and alternate-confidence arms are not separately
-calibrated production modes in this result and remain `not_measured`, not pass.
-The ≥5k noise/resource variant and p50/p99 resource envelopes belong to the
-separate scale/concurrency task.
+distractors; dedup meets its floor. The ≥5k noise/resource variant and p50/p99
+resource envelopes belong to the separate scale/concurrency task.
+
+## Controlled retrieval arms
+
+The controlled report evaluated every arm over five preregistered chronological
+streams. All values below are five-seed means over the untouched holdout, with
+the same 5-row/800-token whole-row prompt budget.
+
+| Arm | recall@5 | MRR | NDCG@5 | dedup@5 | exact span | answer | stale exposure | wrong answer | tokens |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| Linear | 0.9750 | 0.9500 | 0.9498 | 0.9700 | 0.9000 | 0.9000 | 0.0600 | 0.1000 | 5237.0 |
+| RRF | 0.9500 | 0.8583 | 0.8493 | 0.9700 | 0.9000 | 0.7500 | 0.0400 | 0.2500 | 5325.0 |
+| exact evidence | 0.9500 | 0.9500 | 0.9413 | 0.9700 | 0.9000 | 0.9000 | 0.0500 | 0.1000 | 5525.0 |
+| recency only | 0.0433 | 0.0252 | 0.0235 | 1.0000 | 0.0300 | 0.0100 | 0.0800 | 0.9900 | 5296.0 |
+| importance only | 0.0167 | 0.0167 | 0.0058 | 1.0000 | 0.0000 | 0.0000 | 0.0000 | 1.0000 | 5575.0 |
+
+Every arm had zero poison exposure and 1.0 contested disclosure. The bounded
+exact-evidence lane is **NO-GO**: it did not improve exact-span coverage or
+answer accuracy, and recall regressed by 0.025, beyond the allowed 0.01. The
+small stale-exposure improvement does not override that failure. Recency-only
+and importance-only remain diagnostic baselines, not default candidates.
+
+The controlled stale label is deliberately stricter than the engine state. It
+derives authored truth from fixture contexts that declare a current reversal,
+even though those predecessor rows remain active in the frozen corpus. Thus the
+0.06 Linear value exposes a fixture-state gap; it does not contradict the
+engine safety test showing zero exposure for rows actually archived or
+superseded in storage.
+
+## Online shadow-admission arms
+
+Each arm saw the same 205 rows plus five labeled instruction-poison probes in
+each stream, with 128-row/32,768-byte caps. Holdout values are five-seed means.
+
+| Arm | recall@5 | MRR | NDCG@5 | dedup@5 | exact span | answer | relevant retained | rows | bytes | poison rows |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| novelty only | 0.5917 | 0.7150 | 0.6207 | 1.0000 | 0.6500 | 0.6900 | 0.5310 | 128 | 26440.2 | 1 |
+| importance-confidence | 0.7917 | 0.9000 | 0.8101 | 0.9800 | 0.8000 | 0.8500 | 0.8621 | 128 | 27197.0 | 0 |
+| combined product | 0.8217 | 0.9300 | 0.8456 | 0.9900 | 0.8600 | 0.8800 | 0.8759 | 128 | 27107.0 | 0 |
+
+All three arms retained zero authored-stale rows, had zero stale/poison query
+exposure, and disclosed every returned contested row. Novelty-only nevertheless
+retained one poison probe in every seed. The combined product is **GO for a
+later bounded pilot shadow experiment**: it is within 0.01 of (and in this run
+exceeds) the better component on recall/MRR/NDCG, retains/exposes no poison or
+stale row, preserves contested disclosure, respects both caps, and reduces the
+205-row corpus to 128 rows (37.6%). This is evidence for an experiment only;
+it does not authorize a production retention or admission change.
 
 ## Reproduction
 
@@ -80,4 +126,8 @@ cargo test -p rb-eval --test semantic_gate \
   five_seed_linear_rrf_diagnostic -- --ignored --nocapture
 
 cargo test -p rb-eval --test semantic_safety
+
+cargo test -p rb-eval --test controlled_arms \
+  controlled_retrieval_and_admission_arms_report_every_seed \
+  -- --ignored --nocapture
 ```
