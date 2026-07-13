@@ -38,7 +38,10 @@ not waive the separate scale/resource gate.
 
 Strict replay failed on any missing `(model, input_kind, text hash)` entry and
 the run observed zero fallbacks. The committed non-ignored test now enforces
-these floors in ordinary CI; the weekly/manual workflow repeats it offline.
+these ranking floors in ordinary CI and separately pins the currently known
+poison exposure as a pilot blocker. The zero-exposure pilot gate itself remains
+an explicit failing test in the weekly/manual workflow until production recall
+is fixed; ordinary CI is not represented as passing that safety gate.
 
 Diagnostics from the local run (not portable gates): golden p50/p99 recall
 latency was about 22/54 ms and holdout about 21/37 ms; 711/200 rows and about

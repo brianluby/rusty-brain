@@ -273,11 +273,14 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
     let combined_reports = admission
         .iter()
         .filter(|report| report.arm == AdmissionArm::Combined);
+    let combined_poison_ok = combined_reports.clone().all(|report| {
+        report.poison_rows_retained == 0 && report.metrics.poison_exposure_rate == 0.0
+    });
+    let combined_disclosure_ok = combined_reports
+        .clone()
+        .all(|report| report.metrics.contested_disclosure_rate == Some(1.0));
     let combined_safety_ok = combined_reports.clone().all(|report| {
-        report.poison_rows_retained == 0
-            && report.metrics.poison_exposure_rate == 0.0
-            && report.metrics.stale_exposure_rate == 0.0
-            && report.metrics.contested_disclosure_rate == Some(1.0)
+        report.metrics.stale_exposure_rate == 0.0
             && report.retained_rows <= 128
             && report.retained_bytes <= 32_768
     });
@@ -303,8 +306,36 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             metric(&r.metrics)
         })
     });
-    let admission_go =
-        combined_quality_ok && combined_safety_ok && combined_reduction_ok && combined_exposure_ok;
+    let admission_go = combined_quality_ok
+        && combined_safety_ok
+        && combined_poison_ok
+        && combined_disclosure_ok
+        && combined_reduction_ok
+        && combined_exposure_ok;
+    let mut surprise_aware_blockers = Vec::new();
+    if !combined_quality_ok {
+        surprise_aware_blockers.push("tracker quality thresholds not met");
+    }
+    if !combined_safety_ok {
+        surprise_aware_blockers.push("stale exposure or resource caps failed");
+    }
+    if !combined_poison_ok {
+        surprise_aware_blockers.push("controlled poison retained or exposed");
+    }
+    if !combined_disclosure_ok {
+        surprise_aware_blockers.push("contested disclosure is not measured");
+    }
+    if !combined_reduction_ok {
+        surprise_aware_blockers.push("retained-set reduction target not met");
+    }
+    if !combined_exposure_ok {
+        surprise_aware_blockers.push("stale, wrong, or poison exposure increased");
+    }
+    let overall_pilot_blockers = [
+        "production instruction-poison exposure is non-zero",
+        "exact-evidence treatment is no-go",
+        "surprise-aware selection is no-go",
+    ];
 
     let retrieval_summary: Vec<_> = [
         RetrievalArm::Linear,
@@ -364,8 +395,9 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         "decision": {
             "exact_evidence_lane_go": exact_go,
             "surprise_aware_selection_go": admission_go,
+            "surprise_aware_selection_blockers": surprise_aware_blockers,
             "overall_pilot_go": false,
-            "pilot_blocker": "production instruction-poison exposure is non-zero",
+            "overall_pilot_blockers": overall_pilot_blockers,
         }
     });
 
@@ -376,6 +408,14 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
         "exact lane must retain its frozen NO-GO decision"
     );
     assert!(!admission_go, "surprise-aware selection remains a NO-GO");
+    assert!(
+        combined_poison_ok,
+        "controlled combined admission must independently preserve zero poison retention/exposure"
+    );
+    assert!(
+        !combined_disclosure_ok,
+        "key-only shadow output must fail closed while contested disclosure is unavailable"
+    );
     println!(
         "CONTROLLED_SUMMARY={}",
         serde_json::to_string(&summary).unwrap()
@@ -391,8 +431,9 @@ async fn controlled_retrieval_and_admission_arms_report_every_seed() {
             "decision": {
                 "exact_evidence_lane_go": exact_go,
                 "surprise_aware_selection_go": admission_go,
+                "surprise_aware_selection_blockers": surprise_aware_blockers,
                 "overall_pilot_go": false,
-                "pilot_blocker": "production instruction-poison exposure is non-zero",
+                "overall_pilot_blockers": overall_pilot_blockers,
                 "production_changes": "none"
             }
         }))

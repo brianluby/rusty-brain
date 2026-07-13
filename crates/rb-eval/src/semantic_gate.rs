@@ -16,6 +16,10 @@ const MANIFEST_RAW: &str = include_str!("../semantic_gate.json");
 const CORPUS_RAW: &str = include_str!("../fixtures/corpus.json");
 const HOLDOUT_RAW: &str = include_str!("../fixtures/holdout_queries.json");
 const FIXTURE_RAW: &str = include_str!("../fixtures/embeddings/all-MiniLM-L6-v2.json");
+const PREREGISTRATION_PATH: &str = "docs/eval/2026-07-12-w41-semantic-gate-preregistration.md";
+const CONTROLLED_PREREGISTRATION_PATH: &str =
+    "docs/eval/2026-07-12-w41-controlled-arms-preregistration.md";
+const CONTROLLED_ERRATUM_PATH: &str = "docs/eval/2026-07-12-w41-controlled-arms-erratum.md";
 const PREREGISTRATION_RAW: &str =
     include_str!("../../../docs/eval/2026-07-12-w41-semantic-gate-preregistration.md");
 const CONTROLLED_PREREGISTRATION_RAW: &str =
@@ -131,7 +135,7 @@ pub fn load_semantic_gate() -> Result<SemanticGateInputs, String> {
         &manifest.controlled_erratum_sha256,
     )?;
 
-    let corpus = Corpus::from_json(CORPUS_RAW).map_err(|error| error.to_string())?;
+    let mut corpus = Corpus::from_json(CORPUS_RAW).map_err(|error| error.to_string())?;
     if corpus.memories.len() != manifest.corpus.memories
         || corpus.golden_queries.len() != manifest.corpus.golden_queries
         || corpus.dedup_clusters.len() != manifest.corpus.dedup_clusters
@@ -144,13 +148,25 @@ pub fn load_semantic_gate() -> Result<SemanticGateInputs, String> {
         ));
     }
 
-    let holdout_queries = load_committed_holdout_queries().map_err(|error| error.to_string())?;
+    let mut holdout_queries =
+        load_committed_holdout_queries().map_err(|error| error.to_string())?;
     if holdout_queries.len() != manifest.holdout.queries {
         return Err(format!(
             "frozen holdout shape drifted: got {} queries, expected {}",
             holdout_queries.len(),
             manifest.holdout.queries
         ));
+    }
+
+    // The preregistered metrics are recall@5 and NDCG@5. Normalize only the
+    // validated in-memory gate inputs so legacy per-query fixture horizons
+    // cannot silently change the metric while the locked raw artifacts remain
+    // byte-for-byte auditable.
+    for query in &mut corpus.golden_queries {
+        query.k = Some(5);
+    }
+    for query in &mut holdout_queries {
+        query.k = Some(5);
     }
 
     let fixture: EmbeddingFixture = serde_json::from_str(FIXTURE_RAW)
@@ -247,10 +263,9 @@ fn validate_manifest_shape(manifest: &SemanticGateManifest) -> Result<(), String
             manifest.schema_version
         ));
     }
-    if manifest.preregistration != "docs/eval/2026-07-12-w41-semantic-gate-preregistration.md"
-        || manifest.controlled_preregistration
-            != "docs/eval/2026-07-12-w41-controlled-arms-preregistration.md"
-        || manifest.controlled_erratum != "docs/eval/2026-07-12-w41-controlled-arms-erratum.md"
+    if manifest.preregistration != PREREGISTRATION_PATH
+        || manifest.controlled_preregistration != CONTROLLED_PREREGISTRATION_PATH
+        || manifest.controlled_erratum != CONTROLLED_ERRATUM_PATH
         || PREREGISTRATION_RAW.trim().is_empty()
         || CONTROLLED_PREREGISTRATION_RAW.trim().is_empty()
         || CONTROLLED_ERRATUM_RAW.trim().is_empty()
@@ -376,6 +391,12 @@ mod tests {
         let inputs = load_semantic_gate().unwrap();
         assert_eq!(inputs.corpus.memories.len(), 205);
         assert_eq!(inputs.holdout_queries.len(), 20);
+        assert!(inputs
+            .corpus
+            .golden_queries
+            .iter()
+            .chain(&inputs.holdout_queries)
+            .all(|query| query.k == Some(5)));
         assert_eq!(inputs.replay.query_fallbacks(), 0);
     }
 

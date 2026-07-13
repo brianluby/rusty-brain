@@ -230,6 +230,16 @@ async fn low_confidence_instruction_shaped_poison_never_outranks_the_fact() {
 }
 
 #[tokio::test]
+async fn known_instruction_poison_exposure_is_recorded_as_a_pilot_blocker() {
+    let (_correct, poison, results) = instruction_poison_probe().await;
+
+    assert!(
+        results.iter().any(|result| result.memory.id == poison),
+        "the recorded NO-GO must be revisited when production recall reaches zero poison exposure"
+    );
+}
+
+#[tokio::test]
 #[ignore = "pilot-blocking W4.1 zero-exposure gate; run explicitly in semantic-quality workflow"]
 async fn pilot_gate_requires_zero_instruction_poison_exposure() {
     let (_correct, poison, results) = instruction_poison_probe().await;

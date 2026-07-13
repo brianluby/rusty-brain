@@ -493,6 +493,7 @@ fn evaluate_rankings(
     let mut poison = 0usize;
     let mut rows = 0usize;
     let mut bytes = 0usize;
+    let mut injected_tokens = 0usize;
 
     for (query, ranking) in queries.iter().zip(rankings) {
         recalls.push(metrics::recall_at_k(ranking, &query.expected, 5));
@@ -527,6 +528,7 @@ fn evaluate_rankings(
                 poison += usize::from(memory.poison);
                 rows += 1;
                 bytes += memory.content.len();
+                injected_tokens += memory.content.len().div_ceil(4);
             }
         }
     }
@@ -544,7 +546,7 @@ fn evaluate_rankings(
         contested_disclosure_rate: None,
         injected_rows: rows,
         injected_bytes: bytes,
-        injected_tokens: bytes.div_ceil(4),
+        injected_tokens,
         p50_latency_us: metrics::p50(latencies_us),
         p99_latency_us: metrics::p99(latencies_us),
     }
