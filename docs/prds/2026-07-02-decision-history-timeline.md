@@ -82,8 +82,9 @@ Prints the evolution of the memory identified by `id`:
 
 - The supersede chain in both directions: what this memory supersedes
   (ancestors) and what supersedes it (newer), ordered by time, each with
-  summary, importance, confidence, `created_at`, `origin_*`, and the
-  supersede `reason`.
+  summary, importance, confidence, `created_at`, and `origin_*`. Supersede
+  hops carry no `reason` in v1 because the atomic supersede operation never
+  persisted one; only ordinary link edges expose their stored `reason`.
 - Active `contradicts`/`extends`/`references` edges with the linked memory's
   summary, confidence, and `contested` state.
 - A clear "current truth" pointer (the newest non-archived member of the
@@ -91,9 +92,9 @@ Prints the evolution of the memory identified by `id`:
 
 ### HIST-2. Derivation
 
-Built entirely from existing queries: the supersede link type, the
-`memories.archived_at`/`confidence`/`origin_*` columns, and the existing
-link rows. No new persistence.
+Built entirely from existing queries: the `memories.superseded_by` pointer,
+the `memories.archived_at`/`confidence`/`origin_*` columns, and ordinary link
+rows. No new persistence and no synthetic supersede-link/reason record.
 
 ### HIST-3. Output and limits
 

@@ -28,18 +28,29 @@
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 pub mod backend;
+pub mod controlled;
 pub mod corpus;
 pub mod metrics;
 pub mod replay;
 pub mod runner;
+pub mod semantic_gate;
 
+pub use controlled::{
+    budget_ranking, detailed_rankings, evaluate_admission_arm, evaluate_retrieval_arm,
+    exact_evidence_rankings, importance_rankings, lifecycle_labels, recency_rankings, AdmissionArm,
+    AdmissionArmReport, ArmMetrics, RetrievalArm, RetrievalArmReport, STREAM_SEEDS,
+};
 pub use corpus::{load_committed_corpus, load_committed_holdout_queries, Corpus, CorpusError};
 pub use replay::{EmbeddingFixture, RecordedVector, RecordingProvider, ReplayProvider};
 pub use runner::{
-    build_engine_with, check_against_baselines, compare_modes, compare_modes_committed, run_corpus,
-    run_corpus_detailed, run_corpus_detailed_mode, run_corpus_with, run_eval, run_eval_mode,
-    Baselines, ChannelContribution, DetailedRun, EvalReport, ModeComparison, QueryChannelHits,
-    QueryDetail,
+    build_engine_with, build_engine_with_at, check_against_baselines, compare_modes,
+    compare_modes_committed, run_corpus, run_corpus_detailed, run_corpus_detailed_mode,
+    run_corpus_with, run_eval, run_eval_mode, Baselines, ChannelContribution, DetailedRun,
+    EvalReport, ModeComparison, QueryChannelHits, QueryDetail,
+};
+pub use semantic_gate::{
+    check_semantic_floors, load_semantic_gate, ControlledThresholds, QualityFloors,
+    SemanticGateInputs, SemanticGateManifest,
 };
 
 // Re-export so harness callers can name the fusion mode without depending on
