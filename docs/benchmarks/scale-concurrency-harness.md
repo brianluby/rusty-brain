@@ -53,7 +53,11 @@ qualify. `representative_load_eligible` also requires the complete committed
 including actual disk exhaustion, plus SHA-256 references for retained
 interrupted-write and writer-death/reopen evidence. The harness reads and
 hashes the supplied artifact paths itself; caller-supplied digest strings are
-not accepted as proof. Only
+not accepted as proof. Each artifact is JSON with schema
+`rusty-brain-scale-fault-evidence-v1`, the current full `git_sha`, the exact
+`cargo test` command, `exit_code: 0`, the required test names, and captured
+output containing those names plus `test result: ok`. Empty, failing, stale-
+revision, malformed, or unrelated files remain incomplete. Only
 `rusty-brain-scale-v3` reports carry this contract; older artifacts cannot
 support a production-envelope claim.
 

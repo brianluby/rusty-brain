@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::Read, io::Write};
+use std::{fs::OpenOptions, io::Write};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -18,7 +18,7 @@ use rb_mcp::DaemonProxy;
 use rb_proto::{Client, Request, Response};
 use rb_store::{SqliteStore, Store};
 use rb_types::{MemoryNote, MemoryType, Namespace};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::oneshot;
@@ -252,6 +252,16 @@ struct FaultEvidence {
     status: &'static str,
     complete_for_full_eligibility: bool,
     detail: String,
+}
+
+#[derive(Deserialize)]
+struct FaultArtifactRecord {
+    schema: String,
+    git_sha: String,
+    command: String,
+    exit_code: i32,
+    tests: Vec<String>,
+    output: String,
 }
 
 enum TimedOutcome<T> {
@@ -494,12 +504,14 @@ async fn main() -> anyhow::Result<()> {
             .await?,
         );
     }
+    let git_sha = command_output("git", &["rev-parse", "HEAD"]);
     let fault_matrix = fault_evidence(
         &shape,
         options.disk_exhaustion_dir.as_deref(),
         options.disk_exhaustion_max_mib,
         options.interrupted_writes_artifact.as_deref(),
         options.writer_death_artifact.as_deref(),
+        &git_sha,
     )
     .await?;
     let representative_load_eligible = matches!(options.provider, ProviderMode::Local)
@@ -522,7 +534,7 @@ async fn main() -> anyhow::Result<()> {
     let report = Report {
         schema: "rusty-brain-scale-v3",
         generated_at: chrono::Utc::now().to_rfc3339(),
-        git_sha: command_output("git", &["rev-parse", "HEAD"]),
+        git_sha,
         host: command_output("uname", &["-a"]),
         embedding_dimension: shape.dimension,
         embedding_model_id: shape.model_id.clone(),
@@ -1623,6 +1635,7 @@ async fn fault_evidence(
     disk_max_mib: u64,
     interrupted_writes_artifact: Option<&Path>,
     writer_death_artifact: Option<&Path>,
+    git_sha: &str,
 ) -> anyhow::Result<Vec<FaultEvidence>> {
     let provider_status = exercise_provider_timeout(shape).await?;
     let provider_timeout_complete = provider_status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
@@ -1637,7 +1650,8 @@ async fn fault_evidence(
         artifact_fault_evidence(
             "interrupted_writes",
             interrupted_writes_artifact,
-            "caught_writer_panic_isolates_and_does_not_lose_later_writes",
+            &["caught_writer_panic_isolates_and_does_not_lose_later_writes"],
+            git_sha,
         ),
         FaultEvidence {
             case: "provider_timeout",
@@ -1654,7 +1668,11 @@ async fn fault_evidence(
         artifact_fault_evidence(
             "writer_death_recovery",
             writer_death_artifact,
-            "writer_alive_reports_liveness_and_flips_on_death + writer_death_exits_the_accept_loop",
+            &[
+                "writer_alive_reports_liveness_and_flips_on_death",
+                "writer_death_exits_the_accept_loop",
+            ],
+            git_sha,
         ),
         disk_evidence,
     ])
@@ -1663,8 +1681,10 @@ async fn fault_evidence(
 fn artifact_fault_evidence(
     case: &'static str,
     artifact: Option<&Path>,
-    tests: &'static str,
+    required_tests: &[&str],
+    expected_git_sha: &str,
 ) -> FaultEvidence {
+    let tests = required_tests.join(", ");
     let Some(path) = artifact else {
         return FaultEvidence {
             case,
@@ -1675,10 +1695,10 @@ fn artifact_fault_evidence(
             ),
         };
     };
-    match sha256_file(path) {
+    match validate_and_hash_fault_artifact(path, expected_git_sha, required_tests) {
         Ok(digest) => FaultEvidence {
             case,
-            status: "hashed_artifact_reference",
+            status: "validated_hashed_artifact",
             complete_for_full_eligibility: true,
             detail: format!(
                 "Retained test evidence for {tests}; artifact={}; sha256={digest}",
@@ -1690,28 +1710,43 @@ fn artifact_fault_evidence(
             status: "unreadable_artifact_reference",
             complete_for_full_eligibility: false,
             detail: format!(
-                "Could not hash retained test evidence for {tests} at {}: {error}",
+                "Could not validate retained test evidence for {tests} at {}: {error}",
                 path.display()
             ),
         },
     }
 }
 
-fn sha256_file(path: &Path) -> anyhow::Result<String> {
-    let mut file = std::fs::File::open(path)
-        .with_context(|| format!("open evidence artifact {}", path.display()))?;
-    let mut hasher = Sha256::new();
-    let mut buffer = [0_u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buffer)
-            .with_context(|| format!("read evidence artifact {}", path.display()))?;
-        if read == 0 {
-            break;
-        }
-        hasher.update(&buffer[..read]);
+fn validate_and_hash_fault_artifact(
+    path: &Path,
+    expected_git_sha: &str,
+    required_tests: &[&str],
+) -> anyhow::Result<String> {
+    let raw = std::fs::read(path)
+        .with_context(|| format!("read evidence artifact {}", path.display()))?;
+    let record: FaultArtifactRecord = serde_json::from_slice(&raw)
+        .with_context(|| format!("parse evidence artifact {}", path.display()))?;
+    if record.schema != "rusty-brain-scale-fault-evidence-v1" {
+        bail!("unsupported fault-evidence schema");
     }
-    Ok(format!("{:x}", hasher.finalize()))
+    if record.git_sha != expected_git_sha || expected_git_sha == "unavailable" {
+        bail!("fault evidence git SHA does not match the benchmark revision");
+    }
+    if record.exit_code != 0 {
+        bail!("fault evidence command did not exit successfully");
+    }
+    if !record.command.contains("cargo test") {
+        bail!("fault evidence command is not a cargo test invocation");
+    }
+    for test in required_tests {
+        if !record.tests.iter().any(|recorded| recorded == test) || !record.output.contains(test) {
+            bail!("fault evidence is missing required test {test}");
+        }
+    }
+    if !record.output.contains("test result: ok") {
+        bail!("fault evidence output does not record a passing test result");
+    }
+    Ok(format!("{:x}", Sha256::digest(&raw)))
 }
 
 fn mandatory_fault_evidence_complete(evidence: &[FaultEvidence]) -> bool {
@@ -2164,16 +2199,35 @@ mod tests {
     #[test]
     fn fault_artifact_is_read_and_hashed_by_the_harness() {
         let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("writer-test.log");
-        std::fs::write(&artifact, b"test result: ok").unwrap();
+        let artifact = dir.path().join("writer-test.json");
+        let test_name = "writer test";
+        let git_sha = "0123456789abcdef0123456789abcdef01234567";
+        let raw = serde_json::to_vec(&serde_json::json!({
+            "schema": "rusty-brain-scale-fault-evidence-v1",
+            "git_sha": git_sha,
+            "command": "cargo test writer_test",
+            "exit_code": 0,
+            "tests": [test_name],
+            "output": "test writer test ... ok\ntest result: ok",
+        }))
+        .unwrap();
+        std::fs::write(&artifact, &raw).unwrap();
 
-        let evidence = artifact_fault_evidence("writer", Some(&artifact), "writer test");
+        let evidence = artifact_fault_evidence("writer", Some(&artifact), &[test_name], git_sha);
 
         assert!(evidence.complete_for_full_eligibility);
-        assert_eq!(evidence.status, "hashed_artifact_reference");
+        assert_eq!(evidence.status, "validated_hashed_artifact");
         assert!(evidence
             .detail
-            .contains("sha256=0b0976888a90b035b00d14b7e7cc0c258bde88ba041141b3825718b614885132"));
+            .contains(&format!("sha256={:x}", Sha256::digest(&raw))));
+
+        let wrong_revision = artifact_fault_evidence(
+            "writer",
+            Some(&artifact),
+            &[test_name],
+            "ffffffffffffffffffffffffffffffffffffffff",
+        );
+        assert!(!wrong_revision.complete_for_full_eligibility);
     }
 
     #[test]

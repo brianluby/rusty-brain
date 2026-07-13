@@ -125,8 +125,9 @@ V3 separates `representative_load_eligible` from the stricter
 probe to execute in the current report and immutable SHA-256 references for
 the interrupted-write and writer-death/reopen test artifacts. The harness
 computes those hashes from supplied artifact paths; it does not trust a typed
-digest. A default run without a disposable mount is never fully
-production-eligible.
+digest. The artifact schema also binds passing test output and required test
+names to the report's current git SHA. A default run without a disposable
+mount is never fully production-eligible.
 
 ## Decisions still pending
 
