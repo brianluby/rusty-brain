@@ -15,6 +15,8 @@ scripts/run-scale-benchmark.sh \
   --burst 100 \
   --operation-timeout-ms 30000 \
   --seed-batch-timeout-ms 120000 \
+  --interrupted-writes-artifact target/interrupted-writes-test.log \
+  --writer-death-artifact target/writer-death-test.log \
   --output target/scale-benchmark.json
 ```
 
@@ -28,9 +30,16 @@ Always use a release build. Each corpus is fresh and reports:
 - bounded-writer-queue enqueue wait, saturation, and capacity;
 - dropped change broadcasts, current process RSS, DB size, pinned WAL size,
   shutdown/checkpoint time, and retry/truncate time;
-- namespace-isolation and acknowledged-write durability checks;
+- exact acknowledged-write-id durability checks: UDS, HTTP, and MCP remember
+  ids from every write phase must each exist in the `scale` namespace after
+  reopen, in addition to the aggregate row-count invariant;
 - timed errors and timeout counts, including a residual-blocking flag when
   cancellation cannot stop daemon-side SQLite `spawn_blocking` work.
+
+Queue, hook-burst, and mixed-path throughput timers begin before task spawning;
+all mixed paths share the same phase start. Each MCP operation uses one absolute
+deadline across session setup, newline-framed call, and adapter shutdown, so it
+cannot consume multiple full timeout budgets.
 
 The default upper bound is 25,000 memories because sqlite-vec search is exact
 today. Change `--corpora` to probe a larger local envelope; do not silently
@@ -42,7 +51,9 @@ qualify. `representative_load_eligible` also requires the complete committed
 1k/10k/25k matrix and acknowledged-write/namespace/checkpoint invariants.
 `production_envelope_eligible` additionally requires every mandatory fault,
 including actual disk exhaustion, plus SHA-256 references for retained
-interrupted-write and writer-death/reopen evidence. Only
+interrupted-write and writer-death/reopen evidence. The harness reads and
+hashes the supplied artifact paths itself; caller-supplied digest strings are
+not accepted as proof. Only
 `rusty-brain-scale-v3` reports carry this contract; older artifacts cannot
 support a production-envelope claim.
 

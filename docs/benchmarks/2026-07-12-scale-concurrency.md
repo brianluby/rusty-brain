@@ -19,9 +19,11 @@ smoke-only and its JSON sets both eligibility fields to `false`.
 
 The v3 report preregisters 100 actual, error-free successes as the minimum p99
 sample floor. Configured operation counts do not satisfy that floor when errors
-or timeouts reduce successful observations. Every measured operation has a
-configurable deadline; timeout duration, count, and possible residual SQLite
-`spawn_blocking` work are reported instead of allowing a silent harness hang.
+or timeouts reduce successful observations. Every measured operation has one
+configurable absolute deadline; MCP setup, framed call, and shutdown share that
+single budget and one elapsed timer. Timeout duration, count, and possible
+residual SQLite `spawn_blocking` work are reported instead of allowing a silent
+harness hang.
 The MCP path now runs the production `serve_stdio` newline-delimited framing,
 serialization, and I/O loop, validates JSON-RPC/result/`isError`, and counts an
 MCP remember only after receiving a parseable returned memory id.
@@ -31,8 +33,9 @@ Each corpus now includes:
 - concurrent UDS, loopback HTTP, and MCP stdio `tools/call` recall/remember traffic;
 - direct writer-queue and read-pool wait/saturation measurements;
 - success/error/timeout latency accounting for every path;
-- pinned-reader write successes/errors plus an exact committed-row check after
-  shutdown, freeing the reader, checkpoint retry, and database reopen;
+- every acknowledged write id from sequential, hook-burst, mixed UDS/HTTP/MCP,
+  and pinned-reader phases, plus post-reopen verification that each exact id
+  exists in the `scale` namespace and that the aggregate row count matches;
 - RSS, DB/WAL size, shutdown/checkpoint time, provider timeout, writer
   recovery/death tests, and an optional guarded disk-exhaustion probe.
 
@@ -120,8 +123,10 @@ free-space cap are refused.
 V3 separates `representative_load_eligible` from the stricter
 `production_envelope_eligible`. The latter additionally requires this disk
 probe to execute in the current report and immutable SHA-256 references for
-the interrupted-write and writer-death/reopen test artifacts. A default run
-without a disposable mount is never fully production-eligible.
+the interrupted-write and writer-death/reopen test artifacts. The harness
+computes those hashes from supplied artifact paths; it does not trust a typed
+digest. A default run without a disposable mount is never fully
+production-eligible.
 
 ## Decisions still pending
 
@@ -154,6 +159,8 @@ without a disposable mount is never fully production-eligible.
 # Real local model (default; compiles rb-eval's record-local feature):
 scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
   --operations 100 --burst 100 --operation-timeout-ms 30000 \
+  --interrupted-writes-artifact target/interrupted-writes-test.log \
+  --writer-death-artifact target/writer-death-test.log \
   --output target/scale-local-384.json
 
 # Explicit smoke-only deterministic fixture:

@@ -3,7 +3,7 @@
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
-use std::{fs::OpenOptions, io::Write};
+use std::{fs::OpenOptions, io::Read, io::Write};
 
 use anyhow::{anyhow, bail, Context};
 use async_trait::async_trait;
@@ -16,9 +16,10 @@ use rb_embed::{DeterministicProvider, EmbedKind, EmbeddingProvider};
 use rb_engine::MemoryBackend;
 use rb_mcp::DaemonProxy;
 use rb_proto::{Client, Request, Response};
-use rb_store::SqliteStore;
+use rb_store::{SqliteStore, Store};
 use rb_types::{MemoryNote, MemoryType, Namespace};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::oneshot;
 use tokio::task::{JoinHandle, JoinSet};
@@ -63,12 +64,12 @@ struct Options {
     /// Refuse disk exhaustion when the dedicated mount has more free space.
     #[arg(long, default_value_t = 512)]
     disk_exhaustion_max_mib: u64,
-    /// SHA-256 of retained interrupted-write test evidence for this revision.
+    /// Retained interrupted-write test evidence; the harness hashes this file.
     #[arg(long)]
-    interrupted_writes_artifact_sha256: Option<String>,
-    /// SHA-256 of retained writer-death/reopen test evidence for this revision.
+    interrupted_writes_artifact: Option<PathBuf>,
+    /// Retained writer-death/reopen test evidence; the harness hashes this file.
     #[arg(long)]
-    writer_death_artifact_sha256: Option<String>,
+    writer_death_artifact: Option<PathBuf>,
     /// JSON report path.
     #[arg(long, default_value = "target/scale-benchmark.json")]
     output: PathBuf,
@@ -170,10 +171,15 @@ struct CorpusResult {
     read_pool: ReadPoolResult,
     dropped_broadcasts: u64,
     committed_writes: u64,
+    acknowledged_write_ids: usize,
+    verified_acknowledged_write_ids: usize,
+    all_acknowledged_write_ids_verified: bool,
     observed_live: u64,
     observed_live_after_reopen: u64,
     no_lost_committed_writes: bool,
     namespace_isolation: bool,
+    verification_failures: Vec<&'static str>,
+    verification_residual_blocking_possible: bool,
     rss_bytes: u64,
     db_bytes: u64,
     wal_bytes_with_reader: u64,
@@ -192,7 +198,12 @@ struct MixedWorkload {
 
 struct MixedOutcome {
     report: MixedWorkload,
-    committed_writes: u64,
+    acknowledged_ids: Vec<rb_types::MemoryId>,
+}
+
+struct WritePhaseOutcome {
+    latency: Latency,
+    acknowledged_ids: Vec<rb_types::MemoryId>,
 }
 
 #[derive(Serialize)]
@@ -249,6 +260,32 @@ enum TimedOutcome<T> {
     Timeout { elapsed: Duration },
 }
 
+#[derive(Clone, Copy)]
+struct AbsoluteOperationDeadline {
+    started: Instant,
+    expires: tokio::time::Instant,
+}
+
+impl AbsoluteOperationDeadline {
+    fn new(budget: Duration) -> Self {
+        Self {
+            started: Instant::now(),
+            expires: tokio::time::Instant::now() + budget,
+        }
+    }
+
+    async fn run<T, F>(&self, future: F) -> Result<T, tokio::time::error::Elapsed>
+    where
+        F: Future<Output = T>,
+    {
+        tokio::time::timeout_at(self.expires, future).await
+    }
+
+    fn elapsed(self) -> Duration {
+        self.started.elapsed()
+    }
+}
+
 struct Samples {
     started: Instant,
     durations: Vec<Duration>,
@@ -260,8 +297,12 @@ struct Samples {
 
 impl Samples {
     fn new(capacity: usize) -> Self {
+        Self::new_at(capacity, Instant::now())
+    }
+
+    fn new_at(capacity: usize, started: Instant) -> Self {
         Self {
-            started: Instant::now(),
+            started,
             durations: Vec::with_capacity(capacity),
             error_durations: Vec::new(),
             errors: 0,
@@ -457,8 +498,8 @@ async fn main() -> anyhow::Result<()> {
         &shape,
         options.disk_exhaustion_dir.as_deref(),
         options.disk_exhaustion_max_mib,
-        options.interrupted_writes_artifact_sha256.as_deref(),
-        options.writer_death_artifact_sha256.as_deref(),
+        options.interrupted_writes_artifact.as_deref(),
+        options.writer_death_artifact.as_deref(),
     )
     .await?;
     let representative_load_eligible = matches!(options.provider, ProviderMode::Local)
@@ -470,7 +511,9 @@ async fn main() -> anyhow::Result<()> {
         && corpora.iter().all(|corpus| {
             corpus.adequate_latency_samples
                 && corpus.no_lost_committed_writes
+                && corpus.all_acknowledged_write_ids_verified
                 && corpus.namespace_isolation
+                && corpus.verification_failures.is_empty()
                 && corpus.retry_checkpoint_cleared_wal
         });
     let production_envelope_eligible =
@@ -559,7 +602,7 @@ async fn run_corpus(
     let http_recall = http_recall(daemon.http_addr, operations, operation_timeout).await?;
     let uds_remember_result =
         uds_remember(&daemon.socket, operations, "interactive", operation_timeout).await;
-    let (hook_burst, hook_committed) = hook_burst(&daemon.socket, burst, operation_timeout).await;
+    let hook_result = hook_burst(&daemon.socket, burst, operation_timeout).await;
     let mixed = mixed_workload(
         &daemon.socket,
         daemon.http_addr,
@@ -567,21 +610,59 @@ async fn run_corpus(
         operation_timeout,
     )
     .await?;
-    let committed_writes =
-        uds_remember_result.successes as u64 + hook_committed + mixed.committed_writes;
-    let stats = daemon
-        .store
-        .namespace_stats(
+    let WritePhaseOutcome {
+        latency: uds_remember_latency,
+        acknowledged_ids: mut acknowledged_write_ids,
+    } = uds_remember_result;
+    let WritePhaseOutcome {
+        latency: hook_burst,
+        acknowledged_ids: hook_ids,
+    } = hook_result;
+    acknowledged_write_ids.extend(hook_ids);
+    acknowledged_write_ids.extend(mixed.acknowledged_ids);
+    let mut verification_failures = Vec::new();
+    let mut verification_residual_blocking_possible = false;
+    let stats = match tokio::time::timeout(
+        operation_timeout,
+        daemon.store.namespace_stats(
             Namespace::Project("scale".into()),
             30,
             shape.model_id.clone(),
             INPUT_VERSION.to_string(),
             1,
             None,
-        )
-        .await
-        .context("read post-load stats")?;
-    let namespace_isolation = verify_namespace_isolation(&daemon.socket).await?;
+        ),
+    )
+    .await
+    {
+        Ok(Ok(stats)) => Some(stats),
+        Ok(Err(_)) => {
+            verification_failures.push("post_load_stats_error");
+            None
+        }
+        Err(_) => {
+            verification_failures.push("post_load_stats_timeout");
+            verification_residual_blocking_possible = true;
+            None
+        }
+    };
+    let namespace_isolation = match tokio::time::timeout(
+        operation_timeout,
+        verify_namespace_isolation(&daemon.socket),
+    )
+    .await
+    {
+        Ok(Ok(isolated)) => isolated,
+        Ok(Err(_)) => {
+            verification_failures.push("namespace_isolation_error");
+            false
+        }
+        Err(_) => {
+            verification_failures.push("namespace_isolation_timeout");
+            verification_residual_blocking_possible = true;
+            false
+        }
+    };
     let queue = queue_result(daemon.store.writer_queue_metrics());
     let read_pool = read_pool_result(daemon.store.read_pool_metrics());
     let dropped_broadcasts = rb_daemon::dropped_broadcast_count() - dropped_before;
@@ -590,38 +671,78 @@ async fn run_corpus(
     let reader = rusqlite::Connection::open(&db).context("open long-lived reader")?;
     reader.execute_batch("BEGIN")?;
     let _: i64 = reader.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
-    let pinned_reader_writes = uds_remember(
+    let pinned_result = uds_remember(
         &daemon.socket,
         operations,
         "reader-pinned",
         operation_timeout,
     )
     .await;
+    let WritePhaseOutcome {
+        latency: pinned_reader_writes,
+        acknowledged_ids: pinned_ids,
+    } = pinned_result;
+    acknowledged_write_ids.extend(pinned_ids);
     let wal_bytes_with_reader = file_size(&wal_path(&db));
     let shutdown_checkpoint = daemon.stop().await?;
     reader.execute_batch("COMMIT")?;
     drop(reader);
 
     let retry_started = Instant::now();
-    let reopened = SqliteStore::open_with_model(&db, shape.dimension, &shape.model_id)?;
-    reopened.checkpoint_truncate()?;
+    let reopen_db = db.clone();
+    let reopen_dimension = shape.dimension;
+    let reopen_model_id = shape.model_id.clone();
+    let acknowledged_write_id_count = acknowledged_write_ids.len();
+    let committed_writes = u64::try_from(acknowledged_write_id_count).unwrap_or(u64::MAX);
+    let expected_live = size as u64 + committed_writes;
+    let mut reopen = tokio::task::spawn_blocking(move || -> anyhow::Result<(u64, u64, usize)> {
+        let reopened =
+            SqliteStore::open_with_model(&reopen_db, reopen_dimension, &reopen_model_id)?;
+        reopened.checkpoint_truncate()?;
+        let stats = reopened.namespace_stats(
+            &Namespace::Project("scale".into()),
+            30,
+            &reopen_model_id,
+            INPUT_VERSION,
+            1,
+            None,
+        )?;
+        let expected_namespace = Namespace::Project("scale".into());
+        let mut verified_ids = 0;
+        for id in &acknowledged_write_ids {
+            if reopened
+                .get_memory(id)?
+                .is_some_and(|note| note.namespace == expected_namespace)
+            {
+                verified_ids += 1;
+            }
+        }
+        drop(reopened);
+        Ok((stats.live, file_size(&wal_path(&reopen_db)), verified_ids))
+    });
+    let (observed_live_after_reopen, wal_bytes_after_retry, verified_ids, reopen_ok) =
+        match tokio::time::timeout(operation_timeout, &mut reopen).await {
+            Ok(Ok(Ok((live, wal_bytes, verified_ids)))) => (live, wal_bytes, verified_ids, true),
+            Ok(Ok(Err(_))) | Ok(Err(_)) => {
+                verification_failures.push("reopen_checkpoint_error");
+                (0, file_size(&wal_path(&db)), 0, false)
+            }
+            Err(_) => {
+                reopen.abort();
+                verification_failures.push("reopen_checkpoint_timeout");
+                verification_residual_blocking_possible = true;
+                (0, file_size(&wal_path(&db)), 0, false)
+            }
+        };
+    let all_acknowledged_write_ids_verified =
+        reopen_ok && verified_ids == acknowledged_write_id_count;
+    if reopen_ok && !all_acknowledged_write_ids_verified {
+        verification_failures.push("acknowledged_write_id_missing_or_wrong_namespace");
+    }
     let retry_checkpoint_ms = retry_started.elapsed().as_millis();
-    let reopened_stats = reopened.namespace_stats(
-        &Namespace::Project("scale".into()),
-        30,
-        &shape.model_id,
-        INPUT_VERSION,
-        1,
-        None,
-    )?;
-    drop(reopened);
-
-    let wal_bytes_after_retry = file_size(&wal_path(&db));
-    let total_committed_writes = committed_writes + pinned_reader_writes.successes as u64;
-    let expected_live = size as u64 + total_committed_writes;
     let adequate_latency_samples = latency_is_adequate(&uds_recall)
         && latency_is_adequate(&http_recall)
-        && latency_is_adequate(&uds_remember_result)
+        && latency_is_adequate(&uds_remember_latency)
         && latency_is_adequate(&hook_burst)
         && latency_is_adequate(&pinned_reader_writes)
         && mixed
@@ -634,7 +755,7 @@ async fn run_corpus(
         seed_seconds,
         uds_recall,
         http_recall,
-        uds_remember: uds_remember_result,
+        uds_remember: uds_remember_latency,
         hook_burst,
         pinned_reader_writes,
         mixed_workload: mixed.report,
@@ -642,18 +763,23 @@ async fn run_corpus(
         queue,
         read_pool,
         dropped_broadcasts,
-        committed_writes: total_committed_writes,
-        observed_live: stats.live,
-        observed_live_after_reopen: reopened_stats.live,
-        no_lost_committed_writes: reopened_stats.live == expected_live,
+        committed_writes,
+        acknowledged_write_ids: acknowledged_write_id_count,
+        verified_acknowledged_write_ids: verified_ids,
+        all_acknowledged_write_ids_verified,
+        observed_live: stats.as_ref().map_or(0, |stats| stats.live),
+        observed_live_after_reopen,
+        no_lost_committed_writes: reopen_ok && observed_live_after_reopen == expected_live,
         namespace_isolation,
+        verification_failures,
+        verification_residual_blocking_possible,
         rss_bytes,
         db_bytes: file_size(&db),
         wal_bytes_with_reader,
         shutdown_checkpoint_ms_with_reader: shutdown_checkpoint.as_millis(),
         retry_checkpoint_ms,
         wal_bytes_after_retry,
-        retry_checkpoint_cleared_wal: wal_bytes_after_retry == 0,
+        retry_checkpoint_cleared_wal: reopen_ok && wal_bytes_after_retry == 0,
     })
 }
 
@@ -666,6 +792,8 @@ async fn run_queue_probe(
     let db = dir.path().join("queue.db");
     let handle = StoreHandle::start_with_model(db, shape.dimension, shape.model_id.clone(), 4)?;
     let namespace = Namespace::Project("queue-probe".into());
+    let phase_started = Instant::now();
+    let mut samples = Samples::new_at(operations, phase_started);
     let mut tasks = JoinSet::new();
     for index in 0..operations {
         let handle = handle.clone();
@@ -690,7 +818,6 @@ async fn run_queue_probe(
             .await
         });
     }
-    let mut samples = Samples::new(operations);
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok(outcome) => {
@@ -821,14 +948,15 @@ async fn uds_remember(
     operations: usize,
     label: &str,
     deadline: Duration,
-) -> Latency {
+) -> WritePhaseOutcome {
     let mut samples = Samples::new(operations);
+    let mut acknowledged_ids = Vec::with_capacity(operations);
     for index in 0..operations {
         let socket = socket.to_path_buf();
         let label = label.to_string();
         let outcome = timed_operation(deadline, async move {
             let mut client = Client::connect(&socket, Namespace::Project("scale".into())).await?;
-            client
+            let id = client
                 .remember(
                     format!("{label} write {index} under bounded load"),
                     None,
@@ -840,15 +968,22 @@ async fn uds_remember(
                     Some(0.7),
                 )
                 .await?;
-            Ok(())
+            Ok(id)
         })
         .await;
-        samples.record(outcome, true);
+        if let Some(id) = samples.record(outcome, true) {
+            acknowledged_ids.push(id);
+        }
     }
-    samples.finish()
+    WritePhaseOutcome {
+        latency: samples.finish(),
+        acknowledged_ids,
+    }
 }
 
-async fn hook_burst(socket: &Path, burst: usize, deadline: Duration) -> (Latency, u64) {
+async fn hook_burst(socket: &Path, burst: usize, deadline: Duration) -> WritePhaseOutcome {
+    let phase_started = Instant::now();
+    let mut samples = Samples::new_at(burst, phase_started);
     let mut tasks = JoinSet::new();
     for index in 0..burst {
         let socket = socket.to_path_buf();
@@ -856,7 +991,7 @@ async fn hook_burst(socket: &Path, burst: usize, deadline: Duration) -> (Latency
             timed_operation(deadline, async move {
                 let mut client =
                     Client::connect(&socket, Namespace::Project("scale".into())).await?;
-                client
+                let id = client
                     .remember(
                         format!("hook burst capture {index}"),
                         None,
@@ -868,23 +1003,26 @@ async fn hook_burst(socket: &Path, burst: usize, deadline: Duration) -> (Latency
                         Some(0.7),
                     )
                     .await?;
-                Ok(())
+                Ok(id)
             })
             .await
         });
     }
-    let mut samples = Samples::new(burst);
+    let mut acknowledged_ids = Vec::with_capacity(burst);
     while let Some(result) = tasks.join_next().await {
         match result {
             Ok(outcome) => {
-                samples.record(outcome, true);
+                if let Some(id) = samples.record(outcome, true) {
+                    acknowledged_ids.push(id);
+                }
             }
             Err(_) => samples.error(Duration::ZERO),
         }
     }
-    let latency = samples.finish();
-    let committed = u64::try_from(latency.successes).unwrap_or(u64::MAX);
-    (latency, committed)
+    WritePhaseOutcome {
+        latency: samples.finish(),
+        acknowledged_ids,
+    }
 }
 
 #[derive(Clone, Copy)]
@@ -916,13 +1054,6 @@ impl MixedOp {
             Self::McpRecall => "mcp_recall",
             Self::McpRemember => "mcp_remember",
         }
-    }
-
-    fn is_write(self) -> bool {
-        matches!(
-            self,
-            Self::UdsRemember | Self::HttpRemember | Self::McpRemember
-        )
     }
 }
 
@@ -997,8 +1128,7 @@ impl McpStdioSession {
         &mut self,
         kind: McpToolKind,
         index: usize,
-        deadline: Duration,
-    ) -> TimedOutcome<()> {
+    ) -> anyhow::Result<Option<rb_types::MemoryId>> {
         let (name, arguments) = match kind {
             McpToolKind::Recall => (
                 "recall",
@@ -1016,27 +1146,8 @@ impl McpStdioSession {
             "method": "tools/call",
             "params": { "name": name, "arguments": arguments },
         });
-        let started = Instant::now();
-        match tokio::time::timeout(deadline, self.exchange(&request)).await {
-            Ok(Ok(response)) => match validate_mcp_tool_response(&response, id, kind) {
-                Ok(()) => TimedOutcome::Success {
-                    value: (),
-                    elapsed: started.elapsed(),
-                },
-                Err(_) => TimedOutcome::Error {
-                    elapsed: started.elapsed(),
-                },
-            },
-            Ok(Err(_)) => TimedOutcome::Error {
-                elapsed: started.elapsed(),
-            },
-            Err(_) => {
-                self.abort_and_reap().await;
-                TimedOutcome::Timeout {
-                    elapsed: started.elapsed(),
-                }
-            }
-        }
+        let response = self.exchange(&request).await?;
+        validate_mcp_tool_response(&response, id, kind)
     }
 
     async fn exchange(&mut self, request: &serde_json::Value) -> anyhow::Result<serde_json::Value> {
@@ -1057,15 +1168,13 @@ impl McpStdioSession {
         Ok(())
     }
 
-    async fn shutdown(mut self, deadline: Duration) {
-        let _ = self.writer.shutdown().await;
-        let Some(mut server) = self.server.take() else {
-            return;
-        };
-        if tokio::time::timeout(deadline, &mut server).await.is_err() {
-            server.abort();
-            let _ = server.await;
+    async fn shutdown(&mut self) -> anyhow::Result<()> {
+        self.writer.shutdown().await?;
+        if let Some(server) = self.server.as_mut() {
+            server.await.context("MCP stdio server task panicked")??;
         }
+        self.server.take();
+        Ok(())
     }
 
     async fn abort_and_reap(&mut self) {
@@ -1104,7 +1213,7 @@ fn validate_mcp_tool_response(
     response: &serde_json::Value,
     expected_id: u64,
     kind: McpToolKind,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<rb_types::MemoryId>> {
     validate_jsonrpc_result(response, expected_id)?;
     let result = response
         .get("result")
@@ -1123,8 +1232,10 @@ fn validate_mcp_tool_response(
                 .get("id")
                 .and_then(serde_json::Value::as_str)
                 .context("MCP remember result omitted its id")?;
-            id.parse::<rb_types::MemoryId>()
+            let id = id
+                .parse::<rb_types::MemoryId>()
                 .context("MCP remember returned an invalid memory id")?;
+            Ok(Some(id))
         }
         McpToolKind::Recall => {
             if !structured
@@ -1133,9 +1244,9 @@ fn validate_mcp_tool_response(
             {
                 bail!("MCP recall result omitted its results array");
             }
+            Ok(None)
         }
     }
-    Ok(())
 }
 
 async fn run_mcp_operation(
@@ -1143,25 +1254,50 @@ async fn run_mcp_operation(
     kind: McpToolKind,
     index: usize,
     deadline: Duration,
-) -> TimedOutcome<()> {
-    let setup_started = Instant::now();
-    let session = tokio::time::timeout(deadline, McpStdioSession::start(socket)).await;
-    let mut session = match session {
+) -> TimedOutcome<Option<rb_types::MemoryId>> {
+    let timer = AbsoluteOperationDeadline::new(deadline);
+    let mut session = match timer.run(McpStdioSession::start(socket)).await {
         Ok(Ok(session)) => session,
         Ok(Err(_)) => {
             return TimedOutcome::Error {
-                elapsed: setup_started.elapsed(),
+                elapsed: timer.elapsed(),
             };
         }
         Err(_) => {
             return TimedOutcome::Timeout {
-                elapsed: setup_started.elapsed(),
+                elapsed: timer.elapsed(),
             };
         }
     };
-    let outcome = session.call_tool(kind, index, deadline).await;
-    session.shutdown(deadline).await;
-    outcome
+    let call = match timer.run(session.call_tool(kind, index)).await {
+        Ok(result) => result,
+        Err(_) => {
+            session.abort_and_reap().await;
+            return TimedOutcome::Timeout {
+                elapsed: timer.elapsed(),
+            };
+        }
+    };
+    match timer.run(session.shutdown()).await {
+        Ok(Ok(())) => match call {
+            Ok(id) => TimedOutcome::Success {
+                value: id,
+                elapsed: timer.elapsed(),
+            },
+            Err(_) => TimedOutcome::Error {
+                elapsed: timer.elapsed(),
+            },
+        },
+        Ok(Err(_)) => TimedOutcome::Error {
+            elapsed: timer.elapsed(),
+        },
+        Err(_) => {
+            session.abort_and_reap().await;
+            TimedOutcome::Timeout {
+                elapsed: timer.elapsed(),
+            }
+        }
+    }
 }
 
 async fn mixed_workload(
@@ -1170,6 +1306,16 @@ async fn mixed_workload(
     operations_per_path: usize,
     deadline: Duration,
 ) -> anyhow::Result<MixedOutcome> {
+    let phase_started = Instant::now();
+    let mut samples: std::collections::BTreeMap<&'static str, Samples> = MixedOp::ALL
+        .iter()
+        .map(|operation| {
+            (
+                operation.name(),
+                Samples::new_at(operations_per_path, phase_started),
+            )
+        })
+        .collect();
     let mut tasks = JoinSet::new();
     for operation in MixedOp::ALL {
         for index in 0..operations_per_path {
@@ -1195,18 +1341,13 @@ async fn mixed_workload(
         }
     }
 
-    let mut samples: std::collections::BTreeMap<&'static str, Samples> = MixedOp::ALL
-        .iter()
-        .map(|operation| (operation.name(), Samples::new(operations_per_path)))
-        .collect();
-    let mut committed_writes = 0_u64;
+    let mut acknowledged_ids = Vec::with_capacity(operations_per_path * 3);
     while let Some(joined) = tasks.join_next().await {
         match joined {
             Ok((operation, outcome)) => {
                 if let Some(path_samples) = samples.get_mut(operation.name()) {
-                    let succeeded = path_samples.record(outcome, true).is_some();
-                    if succeeded && operation.is_write() {
-                        committed_writes += 1;
+                    if let Some(Some(id)) = path_samples.record(outcome, true) {
+                        acknowledged_ids.push(id);
                     }
                 }
             }
@@ -1235,9 +1376,9 @@ async fn mixed_workload(
         report: MixedWorkload {
             operations_per_path,
             paths,
-            committed_writes,
+            committed_writes: u64::try_from(acknowledged_ids.len()).unwrap_or(u64::MAX),
         },
-        committed_writes,
+        acknowledged_ids,
     })
 }
 
@@ -1246,17 +1387,18 @@ async fn run_mixed_operation(
     socket: &Path,
     http_addr: std::net::SocketAddr,
     index: usize,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<Option<rb_types::MemoryId>> {
     match operation {
         MixedOp::UdsRecall => {
             let mut client = Client::connect(socket, Namespace::Project("scale".into())).await?;
             client
                 .recall("sqlite concurrency".into(), None, vec![], 10)
                 .await?;
+            Ok(None)
         }
         MixedOp::UdsRemember => {
             let mut client = Client::connect(socket, Namespace::Project("scale".into())).await?;
-            client
+            let id = client
                 .remember(
                     format!("mixed UDS write {index}"),
                     None,
@@ -1268,6 +1410,7 @@ async fn run_mixed_operation(
                     Some(0.7),
                 )
                 .await?;
+            Ok(Some(id))
         }
         MixedOp::HttpRecall => {
             let response = http_post(
@@ -1285,6 +1428,7 @@ async fn run_mixed_operation(
             if !response.status().is_success() {
                 bail!("mixed HTTP recall returned {}", response.status());
             }
+            Ok(None)
         }
         MixedOp::HttpRemember => {
             let response = http_post(
@@ -1307,12 +1451,23 @@ async fn run_mixed_operation(
             if !response.status().is_success() {
                 bail!("mixed HTTP remember returned {}", response.status());
             }
+            let value = response
+                .json::<serde_json::Value>()
+                .await
+                .context("decode mixed HTTP remember response")?;
+            Ok(Some(parse_http_remember_id(&value)?))
         }
         MixedOp::McpRecall | MixedOp::McpRemember => {
             bail!("MCP mixed operations must use the stdio transport path")
         }
     }
-    Ok(())
+}
+
+fn parse_http_remember_id(value: &serde_json::Value) -> anyhow::Result<rb_types::MemoryId> {
+    match serde_json::from_value::<Response>(value.clone())? {
+        Response::Remembered { id } => Ok(id),
+        other => bail!("HTTP remember returned unexpected response: {other:?}"),
+    }
 }
 
 async fn http_post(
@@ -1466,10 +1621,11 @@ async fn fault_evidence(
     shape: &EmbeddingShape,
     disk_dir: Option<&Path>,
     disk_max_mib: u64,
-    interrupted_writes_artifact_sha256: Option<&str>,
-    writer_death_artifact_sha256: Option<&str>,
+    interrupted_writes_artifact: Option<&Path>,
+    writer_death_artifact: Option<&Path>,
 ) -> anyhow::Result<Vec<FaultEvidence>> {
     let provider_status = exercise_provider_timeout(shape).await?;
+    let provider_timeout_complete = provider_status == reqwest::StatusCode::SERVICE_UNAVAILABLE;
     let disk_evidence = disk_exhaustion_evidence(shape, disk_dir, disk_max_mib).await?;
     Ok(vec![
         FaultEvidence {
@@ -1480,20 +1636,24 @@ async fn fault_evidence(
         },
         artifact_fault_evidence(
             "interrupted_writes",
-            interrupted_writes_artifact_sha256,
+            interrupted_writes_artifact,
             "caught_writer_panic_isolates_and_does_not_lose_later_writes",
         ),
         FaultEvidence {
             case: "provider_timeout",
-            status: "executed",
-            complete_for_full_eligibility: true,
+            status: if provider_timeout_complete {
+                "executed_expected_503"
+            } else {
+                "executed_unexpected_status"
+            },
+            complete_for_full_eligibility: provider_timeout_complete,
             detail: format!(
-                "A 200ms embedding provider behind a 20ms HTTP request deadline returned HTTP {provider_status}; the daemon remained bounded and shut down cleanly."
+                "A 200ms embedding provider behind a 20ms HTTP request deadline returned HTTP {provider_status}; full eligibility requires 503 Service Unavailable."
             ),
         },
         artifact_fault_evidence(
             "writer_death_recovery",
-            writer_death_artifact_sha256,
+            writer_death_artifact,
             "writer_alive_reports_liveness_and_flips_on_death + writer_death_exits_the_accept_loop",
         ),
         disk_evidence,
@@ -1502,34 +1662,56 @@ async fn fault_evidence(
 
 fn artifact_fault_evidence(
     case: &'static str,
-    sha256: Option<&str>,
+    artifact: Option<&Path>,
     tests: &'static str,
 ) -> FaultEvidence {
-    let valid = sha256.is_some_and(is_sha256);
-    FaultEvidence {
-        case,
-        status: if valid {
-            "immutable_artifact_reference"
-        } else {
-            "missing_immutable_artifact_reference"
-        },
-        complete_for_full_eligibility: valid,
-        detail: match sha256 {
-            Some(digest) if valid => {
-                format!("Retained test evidence for {tests}; sha256={digest}")
-            }
-            Some(_) => format!(
-                "The supplied artifact digest is not 64 hexadecimal characters; retain output for {tests} and pass its SHA-256."
+    let Some(path) = artifact else {
+        return FaultEvidence {
+            case,
+            status: "missing_immutable_artifact_reference",
+            complete_for_full_eligibility: false,
+            detail: format!(
+                "Retain output for {tests} and pass its artifact path; a test name alone is not immutable evidence."
             ),
-            None => format!(
-                "Retain output for {tests} and pass its SHA-256; a test name alone is not immutable evidence."
+        };
+    };
+    match sha256_file(path) {
+        Ok(digest) => FaultEvidence {
+            case,
+            status: "hashed_artifact_reference",
+            complete_for_full_eligibility: true,
+            detail: format!(
+                "Retained test evidence for {tests}; artifact={}; sha256={digest}",
+                path.display()
+            ),
+        },
+        Err(error) => FaultEvidence {
+            case,
+            status: "unreadable_artifact_reference",
+            complete_for_full_eligibility: false,
+            detail: format!(
+                "Could not hash retained test evidence for {tests} at {}: {error}",
+                path.display()
             ),
         },
     }
 }
 
-fn is_sha256(value: &str) -> bool {
-    value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+fn sha256_file(path: &Path) -> anyhow::Result<String> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("open evidence artifact {}", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buffer)
+            .with_context(|| format!("read evidence artifact {}", path.display()))?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+    Ok(format!("{:x}", hasher.finalize()))
 }
 
 fn mandatory_fault_evidence_complete(evidence: &[FaultEvidence]) -> bool {
@@ -1925,6 +2107,7 @@ mod tests {
     #[tokio::test]
     async fn benchmark_mcp_path_round_trips_through_stdio_framing() {
         let remembered_id = rb_types::MemoryId::new();
+        let expected_id = remembered_id.clone();
         let mut session = tokio::time::timeout(
             Duration::from_secs(1),
             McpStdioSession::start_with_proxy(FakeMcpProxy { remembered_id }),
@@ -1932,11 +2115,36 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        let outcome = session
-            .call_tool(McpToolKind::Remember, 0, Duration::from_secs(1))
-            .await;
-        session.shutdown(Duration::from_secs(1)).await;
-        assert!(matches!(outcome, TimedOutcome::Success { .. }));
+        let returned_id = session
+            .call_tool(McpToolKind::Remember, 0)
+            .await
+            .unwrap()
+            .unwrap();
+        session.shutdown().await.unwrap();
+        assert_eq!(returned_id, expected_id);
+    }
+
+    #[tokio::test]
+    async fn absolute_deadline_is_shared_across_operation_steps() {
+        let deadline = AbsoluteOperationDeadline::new(Duration::from_millis(80));
+        deadline
+            .run(tokio::time::sleep(Duration::from_millis(45)))
+            .await
+            .unwrap();
+        assert!(deadline
+            .run(tokio::time::sleep(Duration::from_millis(45)))
+            .await
+            .is_err());
+    }
+
+    #[test]
+    fn http_remember_response_returns_acknowledged_id() {
+        let expected_id = rb_types::MemoryId::new();
+        let value = serde_json::to_value(Response::Remembered {
+            id: expected_id.clone(),
+        })
+        .unwrap();
+        assert_eq!(parse_http_remember_id(&value).unwrap(), expected_id);
     }
 
     #[test]
@@ -1951,6 +2159,21 @@ mod tests {
             .collect();
         evidence[4].complete_for_full_eligibility = false;
         assert!(!mandatory_fault_evidence_complete(&evidence));
+    }
+
+    #[test]
+    fn fault_artifact_is_read_and_hashed_by_the_harness() {
+        let dir = tempfile::tempdir().unwrap();
+        let artifact = dir.path().join("writer-test.log");
+        std::fs::write(&artifact, b"test result: ok").unwrap();
+
+        let evidence = artifact_fault_evidence("writer", Some(&artifact), "writer test");
+
+        assert!(evidence.complete_for_full_eligibility);
+        assert_eq!(evidence.status, "hashed_artifact_reference");
+        assert!(evidence
+            .detail
+            .contains("sha256=0b0976888a90b035b00d14b7e7cc0c258bde88ba041141b3825718b614885132"));
     }
 
     #[test]
