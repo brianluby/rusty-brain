@@ -246,8 +246,10 @@ fn persist_private(temporary: tempfile::NamedTempFile, path: &Path) -> Result<()
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
     use std::collections::BTreeMap;
 
+    #[cfg(unix)]
     use sha2::{Digest, Sha256};
 
     use super::*;
@@ -285,6 +287,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     fn file_hashes(directory: &Path) -> BTreeMap<String, Vec<u8>> {
         let mut hashes = BTreeMap::new();
         for entry in std::fs::read_dir(directory).unwrap() {
@@ -311,6 +314,7 @@ mod tests {
         assert!(matches!(error, ArtifactError::UnsafeOutputDirectory));
     }
 
+    #[cfg(unix)]
     #[test]
     fn local_artifacts_are_deterministic_and_private() {
         let temp = tempfile::tempdir().unwrap();
@@ -331,20 +335,32 @@ mod tests {
             assert_eq!(rows, size);
         }
 
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::PermissionsExt;
 
-            assert_eq!(
-                std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            assert!(std::fs::read_dir(&output).unwrap().all(|entry| {
-                entry
-                    .ok()
-                    .and_then(|entry| entry.metadata().ok())
-                    .is_some_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
-            }));
-        }
+        assert_eq!(
+            std::fs::metadata(&output).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert!(std::fs::read_dir(&output).unwrap().all(|entry| {
+            entry
+                .ok()
+                .and_then(|entry| entry.metadata().ok())
+                .is_some_and(|metadata| metadata.permissions().mode() & 0o777 == 0o600)
+        }));
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn local_artifacts_fail_closed_before_creating_output() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = temp.path().join("session-replay-local");
+
+        let error =
+            write_local_artifacts(&output, &[], &empty_dataset(), &empty_report()).unwrap_err();
+        assert!(matches!(
+            error,
+            ArtifactError::Io(source) if source.kind() == std::io::ErrorKind::Unsupported
+        ));
+        assert!(!output.exists());
     }
 }

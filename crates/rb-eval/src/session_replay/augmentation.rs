@@ -6,6 +6,7 @@ use fake::{Fake, Faker};
 use rand::rngs::StdRng;
 use rand::SeedableRng;
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use super::common::pseudonymous_id;
 use super::schema::{CandidateMemory, SourceKind, SESSION_REPLAY_SCHEMA_VERSION};
@@ -135,14 +136,10 @@ pub fn generate_distractors(corpus_size: usize, seed: u64) -> Vec<Distractor> {
 }
 
 fn stable_candidate_seed(candidate: &CandidateMemory) -> u64 {
-    let bytes = candidate.candidate_id.as_bytes();
-    bytes
-        .iter()
-        .take(8)
-        .enumerate()
-        .fold(0u64, |seed, (index, byte)| {
-            seed | (u64::from(*byte) << (index * 8))
-        })
+    let digest = Sha256::digest(candidate.candidate_id.as_bytes());
+    let mut seed_bytes = [0u8; 8];
+    seed_bytes.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(seed_bytes)
 }
 
 #[cfg(test)]
@@ -183,6 +180,22 @@ mod tests {
         assert_eq!(
             controlled_variants(&candidate(), 9),
             controlled_variants(&candidate(), 9)
+        );
+    }
+
+    #[test]
+    fn candidate_seed_uses_the_complete_candidate_id() {
+        let first = candidate();
+        let mut second = candidate();
+        second.candidate_id = "candidate-invented-second".to_string();
+
+        assert_ne!(
+            stable_candidate_seed(&first),
+            stable_candidate_seed(&second)
+        );
+        assert_ne!(
+            controlled_variants(&first, 9)[0].text,
+            controlled_variants(&second, 9)[0].text
         );
     }
 
