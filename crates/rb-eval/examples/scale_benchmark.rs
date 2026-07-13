@@ -674,12 +674,6 @@ async fn run_corpus(
             false
         }
     };
-    let (queue_metrics, read_metrics) = (daemon.metrics_probe)();
-    let queue = queue_result(queue_metrics);
-    let read_pool = read_pool_result(read_metrics);
-    let dropped_broadcasts = rb_daemon::dropped_broadcast_count() - dropped_before;
-    let rss_bytes = current_rss_bytes();
-
     let reader = open_pinned_reader(&db).context("open long-lived reader")?;
     reader.execute_batch("BEGIN")?;
     let _: i64 = reader.query_row("SELECT COUNT(*) FROM memories", [], |row| row.get(0))?;
@@ -696,6 +690,11 @@ async fn run_corpus(
     } = pinned_result;
     acknowledged_write_ids.extend(pinned_ids);
     let wal_bytes_with_reader = file_size(&wal_path(&db));
+    let (queue_metrics, read_metrics) = (daemon.metrics_probe)();
+    let queue = queue_result(queue_metrics);
+    let read_pool = read_pool_result(read_metrics);
+    let dropped_broadcasts = rb_daemon::dropped_broadcast_count() - dropped_before;
+    let rss_bytes = current_rss_bytes();
     let shutdown_checkpoint = daemon.stop().await?;
     reader.execute_batch("COMMIT")?;
     drop(reader);

@@ -843,13 +843,13 @@ impl StoreHandle {
         self.queue_metrics.enqueued.fetch_add(1, Ordering::Relaxed);
         if saturated {
             self.queue_metrics.saturated.fetch_add(1, Ordering::Relaxed);
+            self.queue_metrics
+                .total_wait_ns
+                .fetch_add(wait_ns, Ordering::Relaxed);
+            self.queue_metrics
+                .max_wait_ns
+                .fetch_max(wait_ns, Ordering::Relaxed);
         }
-        self.queue_metrics
-            .total_wait_ns
-            .fetch_add(wait_ns, Ordering::Relaxed);
-        self.queue_metrics
-            .max_wait_ns
-            .fetch_max(wait_ns, Ordering::Relaxed);
         rx.await
             .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
     }
@@ -871,13 +871,13 @@ impl StoreHandle {
         self.read_metrics.acquired.fetch_add(1, Ordering::Relaxed);
         if saturated {
             self.read_metrics.saturated.fetch_add(1, Ordering::Relaxed);
+            self.read_metrics
+                .total_wait_ns
+                .fetch_add(wait_ns, Ordering::Relaxed);
+            self.read_metrics
+                .max_wait_ns
+                .fetch_max(wait_ns, Ordering::Relaxed);
         }
-        self.read_metrics
-            .total_wait_ns
-            .fetch_add(wait_ns, Ordering::Relaxed);
-        self.read_metrics
-            .max_wait_ns
-            .fetch_max(wait_ns, Ordering::Relaxed);
 
         tokio::task::spawn_blocking(move || {
             // The semaphore permit is held for the lifetime of this closure.
@@ -2418,6 +2418,27 @@ mod tests {
         let changed = accept_model_change(&db, DIM, "voyage-3").unwrap();
         assert!(!changed, "nothing to accept on a fresh install");
         assert!(!db.exists(), "the opt-in path must not create the DB");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn pressure_metrics_ignore_uncontended_fast_path_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("rb.db"), DIM, 1).unwrap();
+        let namespace = Namespace::Project("uncontended-metrics".to_string());
+
+        handle.with_read(|_store| Ok(())).await.unwrap();
+        handle
+            .write(note(&namespace, "uncontended write"), Some(vec![0.1; DIM]))
+            .await
+            .unwrap();
+
+        let reads = handle.read_pool_metrics();
+        assert_eq!((reads.acquired, reads.saturated), (1, 0));
+        assert_eq!((reads.total_wait_ns, reads.max_wait_ns), (0, 0));
+        let writes = handle.writer_queue_metrics();
+        assert_eq!((writes.enqueued, writes.saturated), (1, 0));
+        assert_eq!((writes.total_wait_ns, writes.max_wait_ns), (0, 0));
+        handle.shutdown().await;
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
