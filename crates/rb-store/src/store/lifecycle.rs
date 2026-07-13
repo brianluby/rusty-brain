@@ -6,6 +6,9 @@ use crate::error::{io_err, storage_err};
 use crate::migrations::run_migrations;
 use std::path::Path;
 
+const OPEN_BUSY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+const WAL_RETRY_INTERVAL: std::time::Duration = std::time::Duration::from_millis(5);
+
 impl SqliteStore {
     /// Open (or create) a store at `path` with the given embedding dimension.
     ///
@@ -99,6 +102,8 @@ impl SqliteStore {
                 path.display()
             )))
         })?;
+        #[cfg(test)]
+        wait_for_public_open_test_barrier(path);
         Self::init_with_schema_hook(
             conn,
             embedding_dim,
@@ -138,17 +143,17 @@ impl SqliteStore {
             ));
         }
 
-        // WAL gives concurrent readers + one writer with no SQLITE_BUSY storms.
-        // (In-memory DBs ignore WAL and report "memory"; that is fine.)
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(storage_err)?;
-        conn.pragma_update(None, "foreign_keys", "ON")
-            .map_err(storage_err)?;
-
         // A busy handler keeps the P1 daemon (multiple connections + WAL
         // checkpoints) from hitting immediate SQLITE_BUSY: a contended write
-        // waits up to 5s for the lock instead of failing right away.
-        conn.busy_timeout(std::time::Duration::from_secs(5))
+        // waits up to 5s for the lock instead of failing right away. Install it
+        // before WAL negotiation: changing a zero-byte DB's journal mode is
+        // itself a write and two first openers can contend there.
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT).map_err(storage_err)?;
+
+        // WAL gives concurrent readers + one writer with no SQLITE_BUSY storms.
+        // (In-memory DBs ignore WAL and report "memory"; that is fine.)
+        enable_wal(&conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(storage_err)?;
 
         run_migrations(&conn)?;
@@ -236,6 +241,72 @@ impl SqliteStore {
     pub fn meta_value(&self, key: &str) -> Result<Option<String>> {
         meta_value(&self.conn, key)
     }
+}
+
+/// Enable WAL with a bounded retry for SQLite's journal-mode transition.
+/// SQLite may return BUSY immediately for this pragma even with a busy handler
+/// installed, so two zero-byte first openers need an explicit retry window.
+fn enable_wal(conn: &rusqlite::Connection) -> Result<()> {
+    let deadline = std::time::Instant::now() + OPEN_BUSY_TIMEOUT;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error)
+                if matches!(
+                    error.sqlite_error_code(),
+                    Some(rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked)
+                ) && std::time::Instant::now() < deadline =>
+            {
+                std::thread::sleep(WAL_RETRY_INTERVAL);
+            }
+            Err(error) => return Err(Error::Storage(format!("enable WAL journal mode: {error}"))),
+        }
+    }
+}
+
+#[cfg(test)]
+fn public_open_test_barriers() -> &'static std::sync::Mutex<
+    std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Barrier>>,
+> {
+    static BARRIERS: std::sync::OnceLock<
+        std::sync::Mutex<
+            std::collections::HashMap<std::path::PathBuf, std::sync::Arc<std::sync::Barrier>>,
+        >,
+    > = std::sync::OnceLock::new();
+    BARRIERS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+#[cfg(test)]
+fn wait_for_public_open_test_barrier(path: &Path) {
+    let barrier = public_open_test_barriers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .get(path)
+        .cloned();
+    if let Some(barrier) = barrier {
+        barrier.wait();
+    }
+}
+
+#[cfg(test)]
+fn install_public_open_test_barrier(path: &Path, barrier: std::sync::Arc<std::sync::Barrier>) {
+    let previous = public_open_test_barriers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .insert(path.to_path_buf(), barrier);
+    assert!(
+        previous.is_none(),
+        "test barrier already installed for {path:?}"
+    );
+}
+
+#[cfg(test)]
+fn remove_public_open_test_barrier(path: &Path) {
+    let removed = public_open_test_barriers()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .remove(path);
+    assert!(removed.is_some(), "test barrier missing for {path:?}");
 }
 /// Caches the result of the one-time process-global sqlite-vec registration.
 /// `Ok(())` on success; the error message is cloned on every subsequent call.
@@ -1552,6 +1623,51 @@ mod vector_schema_tests {
         let second = spawn_open(path, barrier);
         let first = first.join().unwrap().unwrap();
         let second = second.join().unwrap().unwrap();
+
+        assert_eq!(first, second, "both opens must observe one committed state");
+        assert_eq!(
+            &first[..4],
+            ["8", "deterministic", VECTOR_SCHEMA_VERSION, "cosine"],
+            "dimension, model, schema version, and metric markers agree"
+        );
+    }
+
+    #[test]
+    fn concurrent_zero_byte_public_opens_agree_on_all_markers() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("zero-byte-concurrent.db");
+        assert!(!path.exists(), "the public opens must create the database");
+
+        // The path-scoped test seam pauses both connections immediately after
+        // Connection::open, so the calls below race the complete public init
+        // path: WAL negotiation, migrations, marker seeding, and vec0 create.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        install_public_open_test_barrier(&path, barrier);
+        let spawn_open = |path: std::path::PathBuf| {
+            std::thread::spawn(move || -> std::result::Result<[String; 5], String> {
+                let store = SqliteStore::open_with_model(&path, DIM, "deterministic")
+                    .map_err(|error| error.to_string())?;
+                let value = |key| {
+                    store
+                        .meta_value(key)
+                        .map_err(|error| error.to_string())?
+                        .ok_or_else(|| format!("missing meta.{key}"))
+                };
+                Ok([
+                    value("embedding_dim")?,
+                    value("embedding_model")?,
+                    value("vector_schema_version")?,
+                    value("vector_metric")?,
+                    store.site_id().to_string(),
+                ])
+            })
+        };
+
+        let first = spawn_open(path.clone());
+        let second = spawn_open(path.clone());
+        let first = first.join().unwrap().unwrap();
+        let second = second.join().unwrap().unwrap();
+        remove_public_open_test_barrier(&path);
 
         assert_eq!(first, second, "both opens must observe one committed state");
         assert_eq!(
