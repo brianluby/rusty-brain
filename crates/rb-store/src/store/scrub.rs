@@ -210,8 +210,9 @@ pub struct ScrubOutcome {
     /// therefore marked stale for re-embedding.
     pub reembed_pending: u64,
     /// Result of the post-scrub truncating WAL checkpoint. `None` is retained
-    /// only for backward-compatible construction via [`Default`]; a completed
-    /// [`SqliteStore::scrub`] call always populates it.
+    /// for backward-compatible construction via [`Default`] and when checkpoint
+    /// execution fails; a completed [`SqliteStore::scrub`] call populates either
+    /// this field or [`Self::wal_checkpoint_error`], never both.
     pub wal_checkpoint: Option<WalCheckpointOutcome>,
     /// Checkpoint execution failure after the redaction transaction committed.
     /// The scrub counts remain authoritative; callers must warn that old
@@ -232,8 +233,14 @@ pub struct WalCheckpointOutcome {
 
 fn attach_checkpoint_result(outcome: &mut ScrubOutcome, result: Result<WalCheckpointOutcome>) {
     match result {
-        Ok(checkpoint) => outcome.wal_checkpoint = Some(checkpoint),
-        Err(error) => outcome.wal_checkpoint_error = Some(error.to_string()),
+        Ok(checkpoint) => {
+            outcome.wal_checkpoint = Some(checkpoint);
+            outcome.wal_checkpoint_error = None;
+        }
+        Err(error) => {
+            outcome.wal_checkpoint = None;
+            outcome.wal_checkpoint_error = Some(error.to_string());
+        }
     }
 }
 #[cfg(test)]
@@ -485,6 +492,25 @@ mod scrub_tests {
         assert_eq!(
             outcome.wal_checkpoint_error.as_deref(),
             Some("storage error: checkpoint unavailable")
+        );
+
+        let checkpoint = WalCheckpointOutcome {
+            busy: false,
+            log_frames: 0,
+            checkpointed_frames: 0,
+        };
+        attach_checkpoint_result(&mut outcome, Ok(checkpoint));
+        assert_eq!(outcome.wal_checkpoint, Some(checkpoint));
+        assert!(outcome.wal_checkpoint_error.is_none());
+
+        attach_checkpoint_result(
+            &mut outcome,
+            Err(Error::Storage("retry failed".to_string())),
+        );
+        assert!(outcome.wal_checkpoint.is_none());
+        assert_eq!(
+            outcome.wal_checkpoint_error.as_deref(),
+            Some("storage error: retry failed")
         );
     }
 
