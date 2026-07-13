@@ -53,11 +53,19 @@ WORKSPACE_VERSION="$({
 }
 
 CHANGELOG_MATCH=0
+RELEASE_HEADING="## [$TAG_VERSION]"
+DATED_HEADING_PREFIX="$RELEASE_HEADING - "
 while IFS= read -r line; do
-  if [ "$line" = "## [$TAG_VERSION]" ] ||
-     [[ "$line" =~ ^"## [$TAG_VERSION] - "[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+  if [ "$line" = "$RELEASE_HEADING" ]; then
     CHANGELOG_MATCH=1
     break
+  fi
+  if [[ "$line" == "$DATED_HEADING_PREFIX"* ]]; then
+    release_date="${line#"$DATED_HEADING_PREFIX"}"
+    if [[ "$release_date" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]]; then
+      CHANGELOG_MATCH=1
+      break
+    fi
   fi
 done < CHANGELOG.md
 [ "$CHANGELOG_MATCH" -eq 1 ] || {
