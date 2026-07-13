@@ -11,20 +11,38 @@ env:
 permissions: {}
 
 jobs:
+  matrix:
+    name: define release targets
+    runs-on: ubuntu-latest
+    outputs:
+      targets: ${{ steps.targets.outputs.matrix }}
+    steps:
+      - id: targets
+        name: Publish target matrix
+        run: |
+          echo 'matrix={"include":[{"target":"aarch64-apple-darwin","os":"macos-latest"},{"target":"x86_64-apple-darwin","os":"macos-15-intel"},{"target":"x86_64-unknown-linux-gnu","os":"ubuntu-latest"}]}' >> "$GITHUB_OUTPUT"
+
+  preflight:
+    name: release preflight
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Fetch main branch
+        run: git fetch --no-tags origin main:refs/remotes/origin/main
+      - name: Verify tag, version, changelog, and ancestry
+        run: scripts/release-preflight.sh --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+
   build:
     name: build (${{ matrix.target }})
+    needs: [matrix, preflight]
     strategy:
       fail-fast: false
-      matrix:
-        include:
-          - target: aarch64-apple-darwin
-            os: macos-latest
-          # Cross-compiled on the arm64 runner: the apple toolchain builds both
-          # arches from one SDK, so we don't depend on Intel runner availability.
-          - target: x86_64-apple-darwin
-            os: macos-latest
-          - target: x86_64-unknown-linux-gnu
-            os: ubuntu-latest
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: read
@@ -65,9 +83,31 @@ jobs:
           path: dist/*.tar.gz
           if-no-files-found: error
 
+  smoke:
+    name: packaged smoke (${{ matrix.target }})
+    needs: [build, matrix]
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.matrix.outputs.targets) }}
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: tarball-${{ matrix.target }}
+          path: dist
+      - name: Verify packaged artifact on its native runner
+        run: scripts/verify-fresh-install.sh --tarball "dist/rusty-brain-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+        env:
+          TARGET: ${{ matrix.target }}
+
   release:
     name: publish release
-    needs: build
+    needs: [preflight, build, smoke]
     runs-on: ubuntu-latest
     permissions:
       contents: write

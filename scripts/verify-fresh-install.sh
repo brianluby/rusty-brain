@@ -115,9 +115,12 @@ rusty-brain status >/dev/null
 rusty-brain recall "gate sentinel" | grep -F "fresh-install gate sentinel" >/dev/null \
   || { echo "recall did not return the sentinel" >&2; exit 1; }
 
-# 5. Plant a fake secret through the REAL hook capture path; the daemon must
+# 5. Plant a fake secret through the REAL hook capture path, then close the
+# synthetic session so its scratch folds into the database. The daemon must
 # store the redacted summary, never the plaintext value.
 printf '%s' "{\"hook_event_name\":\"PostToolUse\",\"session_id\":\"gate\",\"cwd\":\"$HOME\",\"tool_name\":\"Bash\",\"tool_input\":{\"command\":\"export API_TOKEN=${PLANTED}\"},\"tool_response\":\"ok\"}" \
+  | rusty-brain-hooks --agent claude-code >/dev/null
+printf '%s' "{\"hook_event_name\":\"SessionEnd\",\"session_id\":\"gate\",\"cwd\":\"$HOME\",\"reason\":\"other\"}" \
   | rusty-brain-hooks --agent claude-code >/dev/null
 
 # 6. Exactly one DB, owner-only, with the capture landed and zero plaintext hits.
@@ -136,8 +139,16 @@ for sibling in "$DB-wal" "$DB-shm"; do
     FILES+=("$sibling")
   fi
 done
-grep -aq "REDACTED:credential" "${FILES[@]}" \
-  || { echo "hook capture did not land in the DB (no redaction marker found)" >&2; exit 1; }
+# The hook-to-daemon send is asynchronous. Bound the wait so a delayed fold is
+# distinguished from a missing redaction marker without making the gate flaky.
+CAPTURE_DEADLINE=$((SECONDS + 10))
+until grep -aq "REDACTED:credential" "${FILES[@]}"; do
+  if [ "$SECONDS" -ge "$CAPTURE_DEADLINE" ]; then
+    echo "hook capture did not land in the DB (no redaction marker found)" >&2
+    exit 1
+  fi
+  sleep 0.1
+done
 if grep -aq "$PLANTED" "${FILES[@]}"; then
   echo "planted secret found in plaintext in the DB" >&2
   exit 1
