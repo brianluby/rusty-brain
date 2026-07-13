@@ -12,7 +12,10 @@ All notable changes to rusty-brain are documented here. The format is based on
   complete at-rest cleanup. Human and JSON output report checkpoint status,
   warn when pre-redaction plaintext may remain in the WAL, and tell operators
   to close long-lived database readers and rerun scrub. A no-change rerun now
-  retries the checkpoint so that remediation can complete.
+  retries the checkpoint so that remediation can complete. If checkpoint
+  execution itself errors after redaction commits, scrub preserves and returns
+  the committed counts as a partial success with an explicit unavailable
+  diagnostic instead of misreporting the entire scrub as failed.
 
 ### Changed — Supersede hardened at the source (#501)
 

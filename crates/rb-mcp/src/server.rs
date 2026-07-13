@@ -322,6 +322,7 @@ mod tests {
                     redacted: 0,
                     reembed_pending: 0,
                     wal_checkpoint: None,
+                    wal_checkpoint_error: None,
                 },
                 // No MCP tool maps to the forget op (deliberately: it is a
                 // destructive surface); the arm exists only to keep this

@@ -641,11 +641,13 @@ where
                 redacted,
                 reembed_pending,
                 wal_checkpoint,
+                wal_checkpoint_error,
             } => Ok(ScrubResult {
                 scanned,
                 redacted,
                 reembed_pending,
                 wal_checkpoint,
+                wal_checkpoint_error,
             }),
             other => Err(Self::unexpected(other)),
         }
@@ -1197,6 +1199,7 @@ mod wrapper_tests {
                     redacted: 0,
                     reembed_pending: 0,
                     wal_checkpoint: None,
+                    wal_checkpoint_error: None,
                 },
                 // Canned payload keyed on `window_days` so the typed-wrapper
                 // test can prove the window rides the wire.

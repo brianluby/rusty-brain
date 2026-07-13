@@ -1780,6 +1780,7 @@ where
                         checkpointed_frames: checkpoint.checkpointed_frames,
                     }
                 }),
+                wal_checkpoint_error: outcome.wal_checkpoint_error,
             },
             Err(e) => error_to_response(e),
         },

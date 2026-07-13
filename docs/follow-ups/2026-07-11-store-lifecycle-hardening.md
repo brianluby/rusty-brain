@@ -71,8 +71,9 @@ policy.
 **Resolved (Vikunja #53):** scrub now returns the checkpoint result through
 the daemon protocol, human and JSON CLI surfaces warn on a busy or unavailable
 status, and a no-change rerun retries `TRUNCATE` after blocking readers close.
-A concurrent-reader regression test pins both the busy result and successful
-retry.
+A checkpoint execution error preserves the already-committed scrub counts and
+returns an explicit unavailable diagnostic. Regressions pin busy, successful
+retry, and partial-success error handling.
 
 `crates/rb-store/src/store/scrub.rs`, `scrub`: the post-redaction
 `PRAGMA wal_checkpoint(TRUNCATE)` runs via `execute_batch`, which discards

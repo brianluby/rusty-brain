@@ -250,8 +250,10 @@ posture).
      truncating WAL checkpoint and reports its `(busy, log, checkpointed)`
      status. If a long-lived reader makes that checkpoint busy, scrub's row
      rewrites still commit but its CLI and JSON output warn that old plaintext
-     may remain in the WAL; close those readers and rerun scrub (a no-change
-     pass retries the checkpoint) before treating the file as clean at rest.
+     may remain in the WAL. A checkpoint execution error likewise returns the
+     committed redaction counts plus an unavailable diagnostic rather than
+     hiding the partial success; close readers and rerun scrub (a no-change pass
+     retries the checkpoint) before treating the file as clean at rest.
      A base64 secret containing
      `/` is split by the entropy sweep (paths are deliberately token
      separators, to avoid eating every absolute path) and only fires if a

@@ -883,6 +883,7 @@ async fn run_client(
                 .await
                 .context("scrub failed")?;
             let checkpoint = outcome.wal_checkpoint;
+            let checkpoint_error = outcome.wal_checkpoint_error.as_deref();
             let plaintext_may_remain = outcome.plaintext_may_remain_in_wal();
             let warning = "the WAL checkpoint was busy or its status was unavailable; \
                            pre-redaction plaintext may remain in the WAL";
@@ -900,6 +901,7 @@ async fn run_client(
                             "log_frames": status.log_frames,
                             "checkpointed_frames": status.checkpointed_frames,
                         })),
+                        "wal_checkpoint_error": checkpoint_error,
                         "plaintext_may_remain_in_wal": plaintext_may_remain,
                         "warning": plaintext_may_remain.then_some(warning),
                         "remediation": plaintext_may_remain.then_some(remediation),
@@ -907,7 +909,12 @@ async fn run_client(
                 );
             } else {
                 let checkpoint_status = checkpoint.map_or_else(
-                    || "unavailable".to_string(),
+                    || {
+                        checkpoint_error.map_or_else(
+                            || "unavailable".to_string(),
+                            |error| format!("unavailable ({error})"),
+                        )
+                    },
                     |status| {
                         format!(
                             "{} log_frames={} checkpointed_frames={}",

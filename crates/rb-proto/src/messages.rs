@@ -383,20 +383,23 @@ pub struct ScrubCheckpoint {
 }
 
 /// Typed result of a scrub request, including its at-rest checkpoint status.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ScrubResult {
     pub scanned: u64,
     pub redacted: u64,
     pub reembed_pending: u64,
     /// `None` when talking to an older daemon that predates checkpoint status.
     pub wal_checkpoint: Option<ScrubCheckpoint>,
+    /// Checkpoint execution failure after the redaction transaction committed.
+    pub wal_checkpoint_error: Option<String>,
 }
 
 impl ScrubResult {
     /// Conservatively reports risk when the checkpoint was busy or unavailable.
     #[must_use]
-    pub fn plaintext_may_remain_in_wal(self) -> bool {
-        self.wal_checkpoint.is_none_or(|checkpoint| checkpoint.busy)
+    pub fn plaintext_may_remain_in_wal(&self) -> bool {
+        self.wal_checkpoint_error.is_some()
+            || self.wal_checkpoint.is_none_or(|checkpoint| checkpoint.busy)
     }
 }
 
@@ -473,6 +476,10 @@ pub enum Response {
         /// Additive and optional for old-daemon/new-client compatibility.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         wal_checkpoint: Option<ScrubCheckpoint>,
+        /// Additive partial-success diagnostic when checkpoint execution failed
+        /// after the redaction transaction committed.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        wal_checkpoint_error: Option<String>,
     },
     /// Acknowledges a `Request::Feedback` (W3.7): `confidence` is the target
     /// memory's trust prior AFTER the bounded nudge, so the caller can surface
@@ -1128,6 +1135,7 @@ mod tests {
                     log_frames: 0,
                     checkpointed_frames: 0,
                 }),
+                wal_checkpoint_error: None,
             },
             Response::Stats {
                 stats: rb_types::MemoryStats {
@@ -1688,6 +1696,7 @@ mod tests {
             decoded,
             Response::Scrubbed {
                 wal_checkpoint: None,
+                wal_checkpoint_error: None,
                 ..
             }
         ));
@@ -1701,6 +1710,7 @@ mod tests {
                 log_frames: 7,
                 checkpointed_frames: 3,
             }),
+            wal_checkpoint_error: None,
         };
         let value = serde_json::to_value(response).unwrap();
         assert_eq!(value["wal_checkpoint"]["busy"], true);

@@ -136,6 +136,7 @@ impl SqliteStore {
                 redacted,
                 reembed_pending,
                 wal_checkpoint: None,
+                wal_checkpoint_error: None,
             })
         })?;
 
@@ -145,7 +146,7 @@ impl SqliteStore {
         // checkpoint, even on a no-op scrub, so an operator can close the
         // blocking reader and rerun `scrub` to finish the at-rest cleanup.
         // Residual freed-page slack in the main DB needs VACUUM/purge (W5b.3).
-        outcome.wal_checkpoint = Some(self.truncate_wal()?);
+        attach_checkpoint_result(&mut outcome, self.truncate_wal());
         Ok(outcome)
     }
 
@@ -197,7 +198,7 @@ impl SqliteStore {
     }
 }
 /// Result of a retroactive [`SqliteStore::scrub`] pass (W2.4).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ScrubOutcome {
     /// Rows examined (every memory, active and archived).
     pub scanned: u64,
@@ -212,6 +213,10 @@ pub struct ScrubOutcome {
     /// only for backward-compatible construction via [`Default`]; a completed
     /// [`SqliteStore::scrub`] call always populates it.
     pub wal_checkpoint: Option<WalCheckpointOutcome>,
+    /// Checkpoint execution failure after the redaction transaction committed.
+    /// The scrub counts remain authoritative; callers must warn that old
+    /// plaintext may remain in the WAL and offer a checkpoint retry.
+    pub wal_checkpoint_error: Option<String>,
 }
 
 /// SQLite's result row for `PRAGMA wal_checkpoint(TRUNCATE)` after a scrub.
@@ -223,6 +228,13 @@ pub struct WalCheckpointOutcome {
     pub log_frames: i64,
     /// Frames copied into the main database (`-1` when there is no WAL).
     pub checkpointed_frames: i64,
+}
+
+fn attach_checkpoint_result(outcome: &mut ScrubOutcome, result: Result<WalCheckpointOutcome>) {
+    match result {
+        Ok(checkpoint) => outcome.wal_checkpoint = Some(checkpoint),
+        Err(error) => outcome.wal_checkpoint_error = Some(error.to_string()),
+    }
 }
 #[cfg(test)]
 mod scrub_tests {
@@ -450,6 +462,29 @@ mod scrub_tests {
         assert!(
             !wal.exists() || std::fs::metadata(wal).unwrap().len() == 0,
             "successful TRUNCATE must remove or empty the WAL"
+        );
+    }
+
+    #[test]
+    fn checkpoint_failure_preserves_committed_scrub_counts_as_partial_success() {
+        let mut outcome = ScrubOutcome {
+            scanned: 8,
+            redacted: 2,
+            reembed_pending: 1,
+            wal_checkpoint: None,
+            wal_checkpoint_error: None,
+        };
+        attach_checkpoint_result(
+            &mut outcome,
+            Err(Error::Storage("checkpoint unavailable".to_string())),
+        );
+
+        assert_eq!((outcome.scanned, outcome.redacted), (8, 2));
+        assert_eq!(outcome.reembed_pending, 1);
+        assert!(outcome.wal_checkpoint.is_none());
+        assert_eq!(
+            outcome.wal_checkpoint_error.as_deref(),
+            Some("storage error: checkpoint unavailable")
         );
     }
 
