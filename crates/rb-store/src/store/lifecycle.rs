@@ -493,15 +493,16 @@ fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> R
             [stored] => {
                 return Err(Error::Storage(format!(
                     "embedding model changed (meta.embedding_model is missing, stored rows use: \
-                     {stored}, configured: {embedding_model}); run with --accept-model-change \
-                     to mark the corpus for re-embedding"
+                     {stored:?}, configured: {embedding_model:?}); run with \
+                     --accept-model-change to mark the corpus, then run \
+                     `rusty-brain reembed` until changed=0"
                 )))
             }
             models => {
                 return Err(Error::Storage(format!(
                     "meta.embedding_model is missing and stored rows contain mixed embedding \
                      models {models:?}; run with --accept-model-change to adopt \
-                     {embedding_model} and re-embed the corpus"
+                     {embedding_model:?}; then run `rusty-brain reembed` until changed=0"
                 )))
             }
         }
@@ -518,8 +519,9 @@ fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> R
 fn verify_configured_model(stored: &str, embedding_model: &str) -> Result<()> {
     if stored != embedding_model {
         return Err(Error::Storage(format!(
-            "embedding model changed (stored: {stored}, configured: {embedding_model}); \
-             run with --accept-model-change to mark the corpus for re-embedding"
+            "embedding model changed (stored: {stored:?}, configured: {embedding_model:?}); \
+             run with --accept-model-change to mark the corpus, then run \
+             `rusty-brain reembed` until changed=0"
         )));
     }
     Ok(())
@@ -737,9 +739,10 @@ mod open_tests {
         let msg = err.to_string();
         assert!(msg.contains("meta.embedding_model is missing"), "{msg}");
         assert!(
-            msg.contains("stored rows use: model-a") && msg.contains("configured: model-b"),
+            msg.contains("stored rows use: \"model-a\"") && msg.contains("configured: \"model-b\""),
             "{msg}"
         );
+        assert!(msg.contains("rusty-brain reembed"), "{msg}");
 
         let legacy = SqliteStore::open(&path, 8).unwrap();
         assert!(legacy.meta_value("embedding_model").unwrap().is_none());
@@ -763,6 +766,22 @@ mod open_tests {
 
         let legacy = SqliteStore::open(&path, 8).unwrap();
         assert!(legacy.meta_value("embedding_model").unwrap().is_none());
+    }
+
+    #[test]
+    fn missing_model_marker_with_empty_legacy_row_stamp_names_it_unambiguously() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            insert_memory_with_model(&store, "", "unstamped legacy row");
+        }
+
+        let err = SqliteStore::open_with_model(&path, 8, "model-b").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("stored rows use: \"\""), "{msg}");
+        assert!(msg.contains("rusty-brain reembed"), "{msg}");
     }
 
     #[test]
