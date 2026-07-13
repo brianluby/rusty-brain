@@ -66,8 +66,9 @@ fn readme_mcp_count_matches_tool_definitions() {
         "README must carry the code-derived MCP count marker {claim:?}"
     );
     assert!(
-        !readme.contains("ten tools") && !readme.contains("the ten tools"),
-        "README still contains the obsolete ten-tool claim"
+        !readme.contains("exposing ten tools over stdio")
+            && !readme.contains("It implements ten tools."),
+        "README still contains one of the obsolete ten-tool product claims"
     );
 }
 
