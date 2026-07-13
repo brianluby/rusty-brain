@@ -78,7 +78,7 @@ REPOSITORY_KEYS = {
     "treatment_namespace",
     "pair_plan",
 }
-PLAN_KEYS = {"pair_id", "scenario_id", "arm_order"}
+PLAN_KEYS = {"pair_id", "scenario_id", "arm_order", "snapshot_sha256"}
 PAIR_KEYS = {
     "schema_version",
     "pair_id",
@@ -149,6 +149,9 @@ PROVENANCE_LABELS = {"hook", "mcp", "cli", "job", "http", "none"}
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$")
 SHA256 = re.compile(r"^[0-9a-f]{64}$")
 COMMIT_SHA = re.compile(r"^[0-9a-f]{40}$")
+IMMUTABLE_EVIDENCE = re.compile(
+    r"^(?:commit:[0-9a-f]{40}|sha256:[0-9a-f]{64}|github-run:[1-9][0-9]*)$"
+)
 SUSPECT_SECRET = re.compile(
     r"(?i)(Bearer\s+[A-Za-z0-9._-]{8,}|sk-[A-Za-z0-9-]{8,}|"
     r"AKIA[A-Z0-9]{12,}|-----BEGIN .*PRIVATE KEY-----|"
@@ -192,7 +195,11 @@ def number(value: Any, where: str, minimum: float = 0.0) -> float:
 
 
 def identifier(value: Any, where: str) -> str:
-    if not isinstance(value, str) or not IDENTIFIER.fullmatch(value):
+    if (
+        not isinstance(value, str)
+        or not IDENTIFIER.fullmatch(value)
+        or SUSPECT_SECRET.search(value)
+    ):
         fail(f"{where} must be a short opaque identifier")
     return value
 
@@ -217,14 +224,16 @@ def nonempty_string(value: Any, where: str) -> str:
 
 def evidence_reference(value: Any, where: str) -> str:
     value = nonempty_string(value, where)
-    if len(value) > 512 or "\n" in value or SUSPECT_SECRET.search(value):
-        fail(f"{where} must be a sanitized immutable reference")
+    if not IMMUTABLE_EVIDENCE.fullmatch(value) or SUSPECT_SECRET.search(value):
+        fail(
+            f"{where} must be commit:<40-hex>, sha256:<64-hex>, or github-run:<id>"
+        )
     return value
 
 
 def validate_manifest(manifest: Any) -> dict[str, Any]:
     manifest = exact_keys(manifest, MANIFEST_KEYS, "manifest")
-    if isinstance(manifest["schema_version"], bool) or manifest["schema_version"] != SCHEMA_VERSION:
+    if integer(manifest["schema_version"], "manifest.schema_version", 1) != SCHEMA_VERSION:
         fail("unsupported manifest schema_version")
 
     admission = exact_keys(manifest["admission"], ADMISSION_KEYS, "manifest.admission")
@@ -243,7 +252,7 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     identifier(manifest["pilot_id"], "manifest.pilot_id")
 
     period = exact_keys(manifest["period"], PERIOD_KEYS, "manifest.period")
-    if period["duration_days"] != 14:
+    if integer(period["duration_days"], "manifest.period.duration_days", 1) != 14:
         fail("manifest.period.duration_days must remain the preregistered 14 days")
     start = timestamp(period["start_utc"], "manifest.period.start_utc")
     end = timestamp(period["end_utc"], "manifest.period.end_utc")
@@ -275,6 +284,7 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
 
     seen_repositories: set[str] = set()
     seen_pairs: set[str] = set()
+    seen_storage: set[tuple[str, str]] = set()
     for index, repository in enumerate(repositories):
         where = f"manifest.repositories[{index}]"
         repository = exact_keys(repository, REPOSITORY_KEYS, where)
@@ -290,6 +300,14 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
             fail(f"{where} baseline and treatment stores must be isolated")
         if repository["baseline_namespace"] == repository["treatment_namespace"]:
             fail(f"{where} baseline and treatment namespaces must be isolated")
+        for arm in ("baseline", "treatment"):
+            storage = (
+                repository[f"{arm}_store_id"],
+                repository[f"{arm}_namespace"],
+            )
+            if storage in seen_storage:
+                fail(f"{where} reuses a store/namespace tuple from another pilot arm")
+            seen_storage.add(storage)
         plan = repository["pair_plan"]
         if not isinstance(plan, list) or len(plan) != runs:
             fail(f"{where}.pair_plan must contain exactly {runs} pairs")
@@ -298,6 +316,10 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
             pair = exact_keys(pair, PLAN_KEYS, pair_where)
             pair_id = identifier(pair["pair_id"], f"{pair_where}.pair_id")
             identifier(pair["scenario_id"], f"{pair_where}.scenario_id")
+            if not isinstance(pair["snapshot_sha256"], str) or not SHA256.fullmatch(
+                pair["snapshot_sha256"]
+            ):
+                fail(f"{pair_where}.snapshot_sha256 must be a lowercase SHA-256")
             if pair["arm_order"] not in ARM_ORDERS:
                 fail(f"{pair_where}.arm_order is invalid")
             if pair_id in seen_pairs:
@@ -359,6 +381,8 @@ def validate_treatment(arm: Any, where: str) -> dict[str, Any]:
         fail(f"{where}.exact_recoveries exceeds helpful injections")
     if arm["semantic_helpful_recalls"] > arm["helpful_injections"]:
         fail(f"{where}.semantic_helpful_recalls exceeds helpful injections")
+    if arm["exact_recoveries"] + arm["semantic_helpful_recalls"] > arm["helpful_injections"]:
+        fail(f"{where} exact and semantic helpful classifications must be disjoint")
     if arm["provenance_labeled_injections"] > arm["injections_total"]:
         fail(f"{where}.provenance_labeled_injections exceeds total")
     if arm["contested_injections"] > arm["injections_total"]:
@@ -392,7 +416,7 @@ def validate_example(example: Any, where: str) -> dict[str, Any]:
 
 def validate_pair(pair: Any, manifest: dict[str, Any]) -> dict[str, Any]:
     pair = exact_keys(pair, PAIR_KEYS, "pair")
-    if isinstance(pair["schema_version"], bool) or pair["schema_version"] != SCHEMA_VERSION:
+    if integer(pair["schema_version"], "pair.schema_version", 1) != SCHEMA_VERSION:
         fail("pair schema_version does not match")
     pair_id = identifier(pair["pair_id"], "pair.pair_id")
     identifier(pair["scenario_id"], "pair.scenario_id")
@@ -414,6 +438,8 @@ def validate_pair(pair: Any, manifest: dict[str, Any]) -> dict[str, Any]:
         fail(f"pair {pair_id} is absent from the frozen pair plan")
     if pair["arm_order"] != planned["arm_order"]:
         fail(f"pair {pair_id} arm order differs from the frozen pair plan")
+    if pair["snapshot_sha256"] != planned["snapshot_sha256"]:
+        fail(f"pair {pair_id} snapshot differs from the frozen pair plan")
 
     baseline = validate_common_arm(pair["baseline"], f"pair {pair_id}.baseline")
     treatment = validate_treatment(pair["treatment"], f"pair {pair_id}.treatment")
@@ -797,7 +823,7 @@ def self_test() -> None:
             "frozen_at_utc": "2026-07-31T00:00:00Z",
             "task_56": {
                 "state": "go",
-                "evidence": "self-test",
+                "evidence": f"commit:{'c' * 40}",
                 "overall_pilot_go": True,
                 "blocker": None,
                 "qualified_treatment_arm": "linear-qualified",
@@ -806,7 +832,7 @@ def self_test() -> None:
             "task_57": {
                 "state": "go",
                 "complete": True,
-                "evidence": "self-test",
+                "evidence": f"sha256:{'d' * 64}",
                 "max_active_memories": 1000,
             },
         },
@@ -819,7 +845,12 @@ def self_test() -> None:
             "baseline_namespace": "baseline-ns",
             "treatment_namespace": "treatment-ns",
             "pair_plan": [
-                {"pair_id": f"pair-{index}", "scenario_id": f"scenario-{index}", "arm_order": "baseline_first" if index % 2 else "treatment_first"}
+                {
+                    "pair_id": f"pair-{index}",
+                    "scenario_id": f"scenario-{index}",
+                    "arm_order": "baseline_first" if index % 2 else "treatment_first",
+                    "snapshot_sha256": "b" * 64,
+                }
                 for index in range(1, 6)
             ],
         }],
@@ -980,6 +1011,56 @@ def self_test() -> None:
         pass
     else:
         raise AssertionError("boolean threshold bypassed the frozen numeric value")
+    placeholder_evidence = copy.deepcopy(manifest)
+    placeholder_evidence["admission"]["task_56"]["evidence"] = "TBD"
+    try:
+        aggregate(placeholder_evidence, pairs[:1], final=False)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("placeholder gate evidence admitted treatment")
+    changed_snapshot = copy.deepcopy(pairs)
+    changed_snapshot[0]["snapshot_sha256"] = "e" * 64
+    try:
+        aggregate(manifest, changed_snapshot, final=True)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("an observation changed the frozen fixture hash")
+    double_counted_value = copy.deepcopy(pairs)
+    double_counted_value[0]["treatment"]["semantic_helpful_recalls"] = 1
+    try:
+        aggregate(manifest, double_counted_value, final=True)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("one helpful injection counted as exact and semantic")
+    secret_identifier = copy.deepcopy(manifest)
+    secret_identifier["pilot_id"] = "ghp_" + "a" * 36
+    try:
+        aggregate(secret_identifier, pairs[:1], final=False)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("secret-shaped pilot identifier passed sanitization")
+    cross_repository_reuse = copy.deepcopy(manifest)
+    second = copy.deepcopy(cross_repository_reuse["repositories"][0])
+    second["name"] = "threatmitigator"
+    second["commit_sha"] = "f" * 40
+    second["baseline_store_id"] = "treatment-store"
+    second["baseline_namespace"] = "treatment-ns"
+    second["treatment_store_id"] = "second-treatment-store"
+    second["treatment_namespace"] = "second-treatment-ns"
+    for index, plan in enumerate(second["pair_plan"], 1):
+        plan["pair_id"] = f"second-pair-{index}"
+        plan["scenario_id"] = f"second-scenario-{index}"
+    cross_repository_reuse["repositories"].append(second)
+    try:
+        validate_manifest(cross_repository_reuse)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("cross-repository store/namespace reuse passed isolation")
     unmeasured_pairs = copy.deepcopy(pairs[:1])
     for arm in ("baseline", "treatment"):
         unmeasured_pairs[0][arm]["contested_opportunities"] = 0

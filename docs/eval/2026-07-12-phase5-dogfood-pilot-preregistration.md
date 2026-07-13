@@ -70,16 +70,19 @@ active time are reported even where they do not have a value threshold.
 Do not install or enable a treatment from this protocol. Admission requires:
 
 1. Task #56 records `state=go` and `overall_pilot_go=true`, clears `blocker`,
-   links immutable reviewed evidence, and names exactly one qualified treatment
+   supplies an immutable `commit:`, `sha256:`, or `github-run:` evidence
+   reference, and names exactly one qualified treatment
    arm. The treatment uses only that arm. Experimental
    ranking, retention, admission, or embedding behavior that did not qualify
    remains shadow-only and cannot graduate through this pilot.
-2. Task #57 records `state=go` and `complete=true`, links immutable reviewed
-   evidence, and sets a positive maximum active-memory count. Every treatment observation must remain under
+2. Task #57 records `state=go` and `complete=true`, supplies the same kind of
+   immutable reviewed evidence reference, and sets a positive maximum
+   active-memory count. Every treatment observation must remain under
    that ceiling. Known resource limits remain operating constraints, not
    waived findings.
-3. The repository subset, full commit SHAs, isolated store/namespace IDs, pair
-   IDs, scenario IDs, and alternating arm order are frozen in the manifest.
+3. The repository subset, full commit SHAs, globally unique store/namespace
+   tuples, pair IDs, scenario IDs, sanitized fixture SHA-256 values, and
+   alternating arm order are frozen in the manifest.
 4. The exact UTC start/end timestamps span 14 days. `frozen_at_utc` precedes
    the start. The exact per-repository pair count is at least five and matches
    every repository's plan.
@@ -156,7 +159,8 @@ durations are operator-active seconds, not wall-clock calendar time.
 | injected-token cost | exact tokens added by treatment injections; USD is recorded only when the run can attribute it exactly, otherwise it is `null` and explicitly unmeasured |
 
 `injections_total` must equal helpful + wrong + stale + ignored. Exact
-recoveries and semantic helpful recalls are subsets of helpful injections.
+recoveries and semantic helpful recalls are disjoint subsets of helpful
+injections; their sum cannot exceed the helpful count.
 Every injection records provenance-label coverage; every contested injection
 records contested-label coverage. The tool rejects inconsistent partitions or
 counts.
