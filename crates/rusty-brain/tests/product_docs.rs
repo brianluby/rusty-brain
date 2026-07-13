@@ -74,7 +74,7 @@ fn readme_mcp_count_matches_tool_definitions() {
 
 fn status_section(document: &str) -> &str {
     let remainder = document
-        .split_once("## Status")
+        .split_once("\n## Status\n")
         .expect("PRD has a Status section")
         .1;
     remainder
@@ -84,7 +84,7 @@ fn status_section(document: &str) -> &str {
 
 fn checklist_section(document: &str) -> &str {
     let remainder = document
-        .split_once("## Implementation Checklist")
+        .split_once("\n## Implementation Checklist\n")
         .expect("delivered PRD has an Implementation Checklist")
         .1;
     remainder
@@ -96,7 +96,7 @@ fn checklist_section(document: &str) -> &str {
 fn delivered_prd_statuses_are_backed_by_cli_surfaces_and_closed_checklists() {
     let command = rusty_brain::cli::Cli::command();
     let index = read("docs/prds/README.md");
-    let claims: [(&str, &[&str]); 3] = [
+    let claims: [(&str, &[&str]); 4] = [
         (
             "docs/prds/2026-07-02-doctor-and-stats-observability.md",
             &["status", "stats", "doctor"],
@@ -108,6 +108,10 @@ fn delivered_prd_statuses_are_backed_by_cli_surfaces_and_closed_checklists() {
         (
             "docs/prds/2026-07-02-portable-export-and-backup.md",
             &["export", "backup", "restore"],
+        ),
+        (
+            "docs/prds/2026-07-02-http-surface-and-agent-agnostic-recall.md",
+            &["serve"],
         ),
     ];
 
@@ -143,26 +147,6 @@ fn delivered_prd_statuses_are_backed_by_cli_surfaces_and_closed_checklists() {
         }
     }
 
-    let http_prd = "docs/prds/2026-07-02-http-surface-and-agent-agnostic-recall.md";
-    let document = read(http_prd);
-    assert!(
-        status_section(&document)
-            .trim_start()
-            .starts_with("Delivered "),
-        "{http_prd} must identify its delivered status"
-    );
-    assert!(
-        !checklist_section(&document).contains("- [ ]"),
-        "{http_prd} is marked delivered but still has an unchecked implementation item"
-    );
-    let http_index_row = index
-        .lines()
-        .find(|line| line.contains("2026-07-02-http-surface-and-agent-agnostic-recall.md"))
-        .expect("PRD index includes the delivered HTTP PRD");
-    assert!(
-        http_index_row.contains("Delivered"),
-        "PRD index status drifted from the delivered HTTP PRD: {http_index_row}"
-    );
     let serve = command
         .find_subcommand("serve")
         .expect("delivered HTTP PRD requires serve");

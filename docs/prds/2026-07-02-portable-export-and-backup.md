@@ -46,7 +46,7 @@ swaps.
 ## Goals
 
 - A portable, human-readable, diffable export (memory + metadata + links).
-- A one-command backup with a default schedule, and a restore that round-trips.
+- A one-command backup with retention pruning, and a restore that round-trips.
 - Reuse the export logic the `rb-eval`/scorecard tooling already implements.
 - Restore must be embedding-model-aware (re-embed on import, reusing
   `reembed`) so an export survives a model swap.
@@ -64,14 +64,14 @@ swaps.
 
 ### EXP-1. `rusty-brain export`
 
-Read-only dump of the current namespace (or `--all`) to stdout or a file:
+Read-only dump of the current namespace to stdout:
 
-- Formats: `markdown` (human/diffable), `json` (full-fidelity), `csv`
-  (tabular). Reuse the `rb-eval` export helpers.
+- Formats: `markdown` (human/diffable), `json` (full-fidelity), and
+  metadata-only `csv` (tabular).
 - Fields: id, type, importance, confidence, tags, summary, content, context,
   created/updated, links, `contested`, provenance.
-- Filters: `--type`, `--tags`, `--min-importance`, `--since <seq>` (oplog),
-  `--active` (exclude archived).
+- Filters: `--type`, `--tags`, and `--min-importance`. V1 exports active rows;
+  `--all`, output-file, `--since`, and archived-row modes remain draft-only.
 - Content reflects the stored post-scrub state; export itself does not mutate
   or newly redact rows. A secret removed by `scrub` is not re-emitted.
 
@@ -131,8 +131,8 @@ redaction in the export.
 - Restore under a different model produces different vectors -> different
   ranking. Mitigate: re-embed on restore and document the caveat; the
   fail-closed model-identity contract still governs the live DB.
-- Large-corpus export size. Mitigate: streaming output, format choice, and
-  `--active` default.
+- Large-corpus export size. Mitigate: the bounded active-row snapshot, format
+  choice, and an explicit truncation warning.
 - Leaking secrets via export. Mitigate: export is post-redaction only;
   document residual risk in the threat model.
 

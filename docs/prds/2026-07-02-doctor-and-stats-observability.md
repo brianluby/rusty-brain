@@ -82,7 +82,8 @@ A health-check + diagnostic that exits non-zero on a problem and prints
 actionable guidance:
 
 - daemon reachable; socket mode correct; DB mode 0600 / dir 0700.
-- embedding provider reachable (or `deterministic` fallback noted loudly).
+- reachable daemon reports the configured embedding model (`deterministic` is
+  noted loudly); doctor does not independently call a remote provider.
 - embedding-model identity matches DB meta (the W0.2 fail-closed contract).
 - WAL checkpoint health; oversized-WAL warning with remediation hint.
 - hooks installed + wiring drift (delegates to installer `status` where

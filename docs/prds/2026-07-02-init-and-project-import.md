@@ -54,8 +54,8 @@ it is ingested.
   context, so the first recall is non-empty and immediately useful.
 - Reuse existing primitives: batch `remember`, the enricher, namespace
   detection, and the redaction pass. No new storage schema for v1.
-- Make the import safe (redacted, namespaced, reviewable) and reversible
-  (deletable by namespace / source).
+- Make the import safe (redacted, namespaced, reviewable) and reversible through
+  the private per-database batch ledger.
 - Produce a visible "imported N memories" aha-moment at install time.
 
 ## Non-Goals
@@ -81,7 +81,7 @@ A guided first-run command, safe to run idempotently. Behavior:
 - Route every candidate through the existing redaction pass before storing.
 - Store via the engine enrich -> embed -> store path, tagging imported
   memories with `origin_source = "cli"` and a stable `import_batch` tag so
-  they are reviewable and bulk-deletable.
+  they are reviewable; record stored ids in the private batch ledger for undo.
 
 ### INIT-2. `rusty-brain import <path|->`
 
@@ -104,18 +104,19 @@ is logged and skipped.
 ### INIT-4. Provenance and redaction
 
 - Imported memories carry `origin_source = "cli"` and an `import_batch:<id>`
-  tag for reviewability and bulk delete.
+  tag for reviewability; the private sidecar ledger records their ids for undo.
 - Every imported byte passes through `rb-redact` before store; a planted
   secret in a source file must yield zero plaintext in the DB (asserted by a
   test mirroring the W2.4 scrub drill).
 
 ### INIT-5. Idempotency and rollback
 
-- Re-running `init` does not duplicate: near-dup suppression (the existing
-  `near_duplicates()` path) collapses repeats; the importer reports
+- Re-running `init` does not duplicate: a bounded recall probe confirms exact
+  redacted-content equality; the importer reports
   `new`/`skipped-duplicate`/`failed` counts.
-- `rusty-brain delete --tag import_batch:<id>` (or a dedicated `init --undo
-  <batch>`) removes an entire import in one op, cascading to vectors/FTS.
+- `init --undo <batch>` reads the private per-database sidecar ledger and issues
+  idempotent per-id archive calls for exactly the stored set; vector/FTS state
+  follows the normal archive path.
 
 ## Acceptance Criteria
 
@@ -145,7 +146,7 @@ project tree and asserting recall + DB-bytes redaction + dedup.
 ## Risks
 
 - Noisy/low-grade imports pollute recall. Mitigate: default importance cap,
-  import-batch tagging, and the `--undo` escape hatch.
+  import-batch tagging, the private ledger, and the `--undo` escape hatch.
 - Enricher cost/time on large doc sets. Mitigate: bounded defaults,
   `--dry-run`, and reuse of the batched single-connection pattern.
 - Secret leakage from imported files. Mitigate: mandatory redaction pass;

@@ -55,7 +55,7 @@ Two coupled gaps:
 ## Goals
 
 - An optional local HTTP/REST listener (`rusty-brain serve --http`) exposing
-  the same operations as the CLI/MCP, for any client.
+  the same non-admin request shapes as the CLI/MCP, for any local client.
 - An agent-agnostic "recall-before-work" abstraction so prompt-time retrieval
   is a capability, not a Claude implementation detail.
 - Default-off, opt-in, loopback-only, with clear security framing; the
@@ -65,8 +65,9 @@ Two coupled gaps:
 
 - Do not replace MCP stdio (it stays the primary agent surface).
 - Do not build team-mode auth (that is Phase 5a/W5a.1); HTTP v1 is loopback
-  + same-user peer-cred, not multi-host.
-- Do not expose admin ops over HTTP without the existing peer-cred gate.
+  only and is not a multi-host surface.
+- Do not expose admin operations over HTTP; TCP callers have no kernel-verified
+  peer credential and are always treated as non-admin.
 - Do not change ranking or the response shape.
 
 ## Functional Requirements
@@ -75,21 +76,20 @@ Two coupled gaps:
 
 - `serve --http [bind]` (default `127.0.0.1:0` or a configured port) starts
   an HTTP listener alongside (or instead of) the UDS listener.
-- REST endpoints mirror CLI/MCP operations: `POST /remember`, `POST
+- REST endpoints mirror non-admin CLI/MCP operations: `POST /remember`, `POST
   /recall`, `GET /memories/:id`, `GET /context`, `POST /feedback`, etc.,
   over JSON. The existing `Response` types serialize directly.
 - Default-off; enabling it is explicit. A config knob (`[http] enable`,
   `bind`) under the same precedence rules as other knobs; secrets stay
   env-only.
 
-### HTTP-2. Security posture (v1: loopback + same-user)
+### HTTP-2. Security posture (v1: loopback-only, non-admin)
 
-- Bind loopback only by default; a non-loopback bind requires an explicit
-  opt-in flag and prints a warning.
-- Peer identity reuses the W2.6 peer-cred machinery where available;
-  admin ops (`RunJob`/`Reembed`/`Scrub`/`NamespaceRename`) stay admin-gated.
+- Refuse every non-loopback bind; v1 has no override or warning-only mode.
+- Treat every HTTP caller as non-admin because TCP supplies no kernel-verified
+  peer credential. Reject `RunJob`, `Reembed`, `Scrub`, and `NamespaceRename`.
 - The threat model is updated: HTTP is a new network surface; v1 is
-  same-machine/same-user and explicitly not an auth boundary.
+  same-machine and explicitly not an auth or same-user boundary.
 
 ### HTTP-3. Transport genericization (pulled forward from W5a.3)
 
@@ -113,8 +113,8 @@ Two coupled gaps:
 
 - `serve --http` responds to `POST /recall` with the same ranked results as
   the CLI, over loopback.
-- A non-loopback bind refuses without an explicit opt-in and warns.
-- Admin ops over HTTP are peer-cred-gated exactly as over UDS.
+- A non-loopback bind is refused with no override.
+- Admin operations are always rejected over HTTP.
 - An agent without `UserPromptSubmit` can still get prompt-time recall via
   its mapped equivalent, or the capability matrix records `unsupported`
   (never silent parity).
@@ -131,13 +131,14 @@ cargo fmt --check
 cargo clippy --workspace --all-targets -- -D warnings
 ```
 
-Plus an HTTP e2e hitting `/recall` and `/feedback`, and a peer-cred test
+Plus an HTTP e2e hitting `/recall` and `/feedback`, and a non-admin HTTP test
 asserting admin rejection.
 
 ## Risks
 
-- New attack surface. Mitigate: default-off, loopback-only, peer-cred,
-  threat-model update, admin gating; no multi-host auth in v1.
+- New attack surface. Mitigate: default-off, loopback-only binding,
+  unconditionally denied admin operations, and a threat-model update; no
+  multi-host auth in v1.
 - Transport refactor regresses UDS. Mitigate: pull W5a.3's `Client<S>`
   genericization with agreement tests on both transports.
 - Agent recall abstraction too broad. Mitigate: narrow contract (top-k,
