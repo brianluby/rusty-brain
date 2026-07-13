@@ -7,8 +7,9 @@
 > covered by unit and integration tests. A bounded Claude Code scorecard has
 > provided **N=5 proxy capability evidence**, but this is not production proof:
 > performance, scale, sustained concurrency, resource exhaustion, semantic
-> quality with a production embedding provider, and multi-machine adoption are
-> still unmeasured. Treat it as a work in progress, not a finished product.
+> quality beyond the supported local model's authored evaluation corpus, and
+> multi-machine adoption are still unmeasured. Treat it as a work in progress,
+> not a finished product.
 > Interfaces and the on-disk format may change.
 
 ## What it is
@@ -484,20 +485,23 @@ Conventions:
 
 ## Testing
 
-The current test suite is about **correctness, not performance or quality**:
+The current test suite covers **correctness and bounded retrieval quality, not
+portable performance**:
 
 - **Unit and integration tests** across the workspace cover type invariants, ranking
   determinism, protocol round-trips, the FTS/vector/graph query paths, migration
   reproducibility, concurrency and namespace isolation, and the MCP contract.
-- **`rb-eval`** is an offline regression harness over a committed fixture corpus with
-  deterministic (non-semantic) vectors. It guards **ranking determinism and
-  relative-ordering regressions** — "did this change reorder results?" — and explicitly
-  does **not** measure absolute semantic quality.
+- **`rb-eval`** keeps the deterministic ranking-regression harness and now also runs a
+  strict offline production-embedding gate: committed real local-model vectors over
+  205 memories, 72 goldens, and an untouched 20-query holdout must clear preregistered
+  recall@5/MRR/NDCG/dedup/channel floors with exact document/query input kinds and zero
+  replay fallbacks. A scheduled five-instant comparison keeps Linear as the default;
+  RRF currently regresses MRR/NDCG.
 - **Bounded N=5 capability scorecard**: the 2026-07-12 Claude Code recovery
   run was safe with zero memory-induced errors; reach and freshness passed,
   while capture and retrieval-at-scale missed their steelman comparisons
   (2/4 tracked dimensions passed). This is small-sample proxy evidence, not a
-  production-embedding quality gate or a user-adoption study. See
+  user-adoption study. See
   [`docs/eval/2026-07-12-w35-scorecard-n5-run.md`](docs/eval/2026-07-12-w35-scorecard-n5-run.md).
 - **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
   scheduled macOS job drives a real headless Claude Code session (`claude -p`) against
@@ -510,11 +514,11 @@ The current test suite is about **correctness, not performance or quality**:
   `--model haiku --max-budget-usd 1`). Run it locally with
   `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
 
-**Not yet measured:** performance and latency; large-corpus scale; sustained
-concurrency; resource exhaustion and partial outages; real-world semantic
-quality with a production embedding provider; and multi-user/multi-machine
-activation or adoption. A real-model evaluation mode exists but is manual and
-is not a production semantic-quality gate.
+**Not yet measured:** portable performance and latency; large-corpus scale;
+sustained concurrency; resource exhaustion and partial outages; Voyage quality;
+and multi-user/multi-machine activation or adoption. The semantic gate measures
+the supported local model at the authored 205-memory scale; it is not a scale
+benchmark or a real-world value study.
 
 ## Roadmap
 

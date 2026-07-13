@@ -125,8 +125,19 @@ pub fn eval_now() -> chrono::DateTime<chrono::Utc> {
 pub fn build_engine_with<P: EmbeddingProvider>(
     embedder: P,
 ) -> rb_types::Result<MemoryEngine<SqliteBackend, P>> {
+    build_engine_with_at(embedder, eval_now())
+}
+
+/// Build a real-provider engine at an explicit evaluation instant.
+///
+/// W4.1 uses this to replay the same frozen inputs at five preregistered
+/// chronological instants without reading wall-clock time.
+pub fn build_engine_with_at<P: EmbeddingProvider>(
+    embedder: P,
+    now: chrono::DateTime<chrono::Utc>,
+) -> rb_types::Result<MemoryEngine<SqliteBackend, P>> {
     let backend = SqliteBackend::in_memory(embedder.dim())?;
-    Ok(MemoryEngine::new(backend, embedder, eval_namespace()).with_fixed_now(eval_now()))
+    Ok(MemoryEngine::new(backend, embedder, eval_namespace()).with_fixed_now(now))
 }
 
 /// Ingest the corpus through the engine, returning a fixture-key -> MemoryId map.

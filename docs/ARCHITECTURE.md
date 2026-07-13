@@ -4,11 +4,12 @@ This document describes how `rusty-brain` is put together: the crate boundaries,
 the single-writer daemon, the write and recall data flows, the namespace model, and
 the storage layout. It reflects what is **implemented today**. Like the rest of the
 project, it is early-stage. Its broad automated suite emphasizes correctness;
-there is no performance, scale, sustained-concurrency, resource-exhaustion,
-production-embedding semantic-quality, or multi-machine adoption measurement.
-A bounded N=5 Claude Code scorecard is the only capability evidence; it is
-proxy evidence, not production validation. For the user-facing overview and
-quickstart, see the [README](../README.md).
+there is no portable performance, large-corpus scale, sustained-concurrency,
+resource-exhaustion, Voyage-quality, or multi-machine adoption measurement.
+The supported local model has an offline authored-corpus semantic gate, and a
+bounded N=5 Claude Code scorecard provides proxy capability evidence; neither
+is production validation. For the user-facing overview and quickstart, see the
+[README](../README.md).
 
 ## Design background
 
@@ -397,12 +398,12 @@ than gaps:
 
 ## Honesty note
 
-Everything above is implemented and exercised by unit and integration tests.
-The bounded N=5 Claude Code scorecard provides small-sample capability evidence:
-its recovery run was safe with zero memory-induced errors, and 2/4 tracked
-dimensions passed. It does not measure performance, large-corpus behavior,
-sustained concurrency, resource exhaustion, semantic quality with a production
-embedding provider, or multi-machine adoption. The offline harness guards
-ranking *determinism and regressions*, not absolute semantic quality. Read the
-architecture as current structure, not as a benchmarked, production-hardened
-system.
+Everything above is implemented and exercised by unit and integration tests. Retrieval
+quality is now gated offline with committed real `all-MiniLM-L6-v2` vectors over 205
+memories plus an untouched 20-query holdout, alongside the deterministic ranking
+regression harness. The bounded N=5 Claude Code scorecard adds small-sample proxy
+capability evidence: its recovery run was safe with zero memory-induced errors,
+and 2/4 tracked dimensions passed. Together these are evidence at authored
+first-release scale, not proof of portable performance, large-corpus behavior,
+Voyage quality, resource-exhaustion resilience, real-world value, multi-machine
+adoption, or production hardening; those remain separate gates.

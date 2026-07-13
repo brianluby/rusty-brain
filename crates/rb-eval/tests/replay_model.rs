@@ -3,9 +3,8 @@
 //! This is the semantic-measurement path CI and later Phase 1 workstreams use;
 //! the deterministic harness (`harness.rs`) remains the regression gate.
 //!
-//! These tests assert sanity floors only — the pre-Phase-1 baseline artifact
-//! (`docs/eval/2026-06-12-pre-phase1-baseline.json`) is measurement, and CI
-//! gating thresholds on these numbers arrive in W4.1.
+//! These compatibility/diagnostic tests retain their historical sanity floors.
+//! The strict W4.1 production gate lives in `semantic_gate.rs`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
 use rb_embed::{EmbedKind, EmbeddingProvider};
@@ -69,8 +68,8 @@ async fn replayed_real_vectors_run_the_golden_queries_offline() {
         run.report.channels.graph_query_rate
     );
 
-    // Sanity floors only (gating comes in W4.1): a real semantic model must
-    // find SOMETHING on a hand-authored corpus.
+    // Compatibility sanity floors only; semantic_gate.rs owns the strict
+    // preregistered quality thresholds.
     assert!(run.report.mrr > 0.0, "real-vector replay returned zero MRR");
     assert!(run.report.mean_recall_at_k > 0.0);
     assert!(run.report.ndcg > 0.0);
@@ -143,7 +142,7 @@ async fn readme_quickstart_query_returns_its_target_memory() {
 
 #[tokio::test]
 #[ignore = "holdout aggregates are measured ONLY at frozen-artifact captures \
-            (examples/capture_baseline.rs) and by the future W4.1 CI gate. \
+            (examples/capture_baseline.rs) and by the W4.1 semantic gate. \
             Running this in the default suite surfaced holdout metrics to \
             every local/CI iteration on ranking changes, eroding the set's \
             held-out status (Phase-1 review). Run explicitly with \
