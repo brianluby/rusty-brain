@@ -17,6 +17,17 @@ All notable changes to rusty-brain are documented here. The format is based on
   the committed counts as a partial success with an explicit unavailable
   diagnostic instead of misreporting the entire scrub as failed.
 
+### Fixed — Legacy embedding-model metadata recovery
+
+- **Missing `meta.embedding_model` no longer silently adopts the configured
+  provider on a populated database.** Startup now inspects the distinct
+  per-row model stamps before seeding: an empty corpus or a single model that
+  matches the configured provider recovers automatically, while a conflicting
+  or mixed-model corpus fails closed with the existing
+  `--accept-model-change` + `reembed` remediation. The missing-marker recovery
+  runs under a write lock with revalidation; already-seeded opens keep their
+  read-only fast path.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing
