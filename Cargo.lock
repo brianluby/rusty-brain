@@ -2664,16 +2664,25 @@ dependencies = [
 name = "rb-eval"
 version = "0.0.1"
 dependencies = [
+ "anyhow",
  "async-trait",
  "chrono",
+ "clap",
+ "libc",
+ "rb-daemon",
  "rb-embed",
  "rb-engine",
+ "rb-mcp",
+ "rb-proto",
  "rb-search",
  "rb-store",
  "rb-types",
+ "reqwest",
+ "rusqlite",
  "serde",
  "serde_json",
  "sha2",
+ "tempfile",
  "tokio",
 ]
 

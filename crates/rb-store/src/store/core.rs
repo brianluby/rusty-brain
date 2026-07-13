@@ -5,6 +5,35 @@ use super::*;
 use crate::error::storage_err;
 
 impl SqliteStore {
+    /// Insert benchmark fixtures in one transaction per caller-provided batch.
+    ///
+    /// This is feature-gated because normal writes must continue through the
+    /// daemon's single-writer path. The eval harness uses it only to keep
+    /// corpus construction outside the timed load phase.
+    #[cfg(feature = "bench-utils")]
+    #[doc(hidden)]
+    pub fn insert_memory_batch_for_benchmark(&self, rows: &[(MemoryNote, Vec<f32>)]) -> Result<()> {
+        for (note, embedding) in rows {
+            rb_types::validate_importance(note.importance)?;
+            rb_types::validate_confidence(note.confidence)?;
+            for anchor in &note.anchors {
+                anchor.validate()?;
+            }
+            if embedding.len() != self.embedding_dim {
+                return Err(Error::DimensionMismatch {
+                    expected: self.embedding_dim,
+                    got: embedding.len(),
+                });
+            }
+        }
+        immediate_tx(&self.conn, || {
+            for (note, embedding) in rows {
+                self.insert_memory_tx_body(note, Some(embedding))?;
+            }
+            Ok(())
+        })
+    }
+
     /// Set the EFFECTIVE `importance` of a single memory WITHOUT touching its
     /// `base_importance` author prior (W1.9). This is the importance
     /// recalibration job's only write path; the user-facing `update_memory`
@@ -1975,6 +2004,98 @@ mod insert_tests {
 
     fn vec8(seed: f32) -> Vec<f32> {
         (0..8).map(|i| seed + i as f32 * 0.1).collect()
+    }
+
+    #[cfg(feature = "bench-utils")]
+    #[test]
+    fn benchmark_batch_loader_commits_memory_and_vectors_together() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let namespace = Namespace::Project("bench-batch".into());
+        let rows: Vec<_> = (0..3)
+            .map(|index| {
+                (
+                    MemoryNote::new(
+                        namespace.clone(),
+                        format!("fixture {index}"),
+                        MemoryType::Insight,
+                        5,
+                    ),
+                    vec8(index as f32),
+                )
+            })
+            .collect();
+
+        store.insert_memory_batch_for_benchmark(&rows).unwrap();
+
+        assert_eq!(store.list(&namespace, None, 10).unwrap().len(), 3);
+        assert_eq!(
+            store
+                .vector_search(&namespace, rows[0].1.as_slice(), 10)
+                .unwrap()
+                .len(),
+            3
+        );
+    }
+
+    #[cfg(feature = "bench-utils")]
+    #[test]
+    fn benchmark_batch_loader_rejects_wrong_dimension_before_writes() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let namespace = Namespace::Project("bench-batch-dimension".into());
+        let first = MemoryNote::new(
+            namespace.clone(),
+            "valid fixture".into(),
+            MemoryType::Insight,
+            5,
+        );
+        let invalid = MemoryNote::new(namespace, "invalid fixture".into(), MemoryType::Insight, 5);
+        let rows = vec![(first.clone(), vec8(0.0)), (invalid, vec![0.0; 3])];
+
+        let err = store.insert_memory_batch_for_benchmark(&rows).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::DimensionMismatch {
+                expected: 8,
+                got: 3
+            }
+        ));
+        assert!(store.get_memory(&first.id).unwrap().is_none());
+    }
+
+    #[cfg(feature = "bench-utils")]
+    #[test]
+    fn benchmark_batch_loader_rolls_back_earlier_memory_and_vector_on_late_conflict() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let namespace = Namespace::Project("bench-batch-rollback".into());
+        let first = MemoryNote::new(
+            namespace.clone(),
+            "first fixture".into(),
+            MemoryType::Insight,
+            5,
+        );
+        let mut conflict = MemoryNote::new(
+            namespace,
+            "conflicting fixture".into(),
+            MemoryType::Insight,
+            5,
+        );
+        conflict.id = first.id.clone();
+        let rows = vec![(first.clone(), vec8(0.0)), (conflict, vec8(1.0))];
+
+        let err = store.insert_memory_batch_for_benchmark(&rows).unwrap_err();
+
+        assert!(matches!(err, Error::Storage(_)), "got {err:?}");
+        assert!(store.get_memory(&first.id).unwrap().is_none());
+        let vector_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE memory_id = ?1",
+                rusqlite::params![first.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_count, 0);
     }
 
     #[test]

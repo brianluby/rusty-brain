@@ -27,12 +27,24 @@ rb-store = { path = "../rb-store" }
 rb-search = { path = "../rb-search" }
 rb-embed = { path = "../rb-embed" }
 rb-types = { path = "../rb-types" }
+rb-daemon = { path = "../rb-daemon" }
+rb-proto = { path = "../rb-proto" }
+rb-mcp = { path = "../rb-mcp" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+rusqlite = { workspace = true }
+libc = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
 # Record/replay fixture keys are (model_id, input_kind, sha256(text)).
 sha2 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true }
+# The scale harness is an example target so its high-throughput fixture loader
+# cannot enable `bench-utils` in normal workspace or release builds.
+rb-store = { path = "../rb-store", features = ["bench-utils"] }

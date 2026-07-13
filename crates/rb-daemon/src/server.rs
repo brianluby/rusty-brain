@@ -322,6 +322,19 @@ impl Daemon {
         self.http_addr
     }
 
+    /// Return a read-only storage-pressure probe for diagnostics and benchmarks.
+    ///
+    /// The probe snapshots writer-queue and read-pool counters when invoked.
+    /// It contains no writer channel, store connection, or shutdown capability,
+    /// so retaining it cannot mutate the store or keep the storage core alive.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn store_metrics_probe(
+        &self,
+    ) -> Arc<dyn Fn() -> (crate::WriterQueueMetrics, crate::ReadPoolMetrics) + Send + Sync> {
+        self.store.metrics_probe()
+    }
+
     /// Run until `shutdown` resolves, then drain connections and clean up.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let Daemon {

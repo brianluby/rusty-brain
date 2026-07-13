@@ -57,6 +57,11 @@ async fn write_then_read_round_trips_through_pool() {
     );
     assert_eq!(vec_hits[0].0, id);
 
+    let reads = handle.read_pool_metrics();
+    assert!(reads.acquired >= 4, "get/list/keyword/vector used the pool");
+    assert_eq!(reads.capacity, 4);
+    assert!(reads.total_wait_ns >= reads.max_wait_ns);
+
     handle.shutdown().await;
 }
 
@@ -158,6 +163,11 @@ async fn many_concurrent_writers_lose_nothing() {
     for t in tasks {
         t.await.unwrap().unwrap();
     }
+
+    let queue = handle.writer_queue_metrics();
+    assert_eq!(queue.enqueued, N as u64);
+    assert!(queue.total_wait_ns >= queue.max_wait_ns);
+    assert_eq!(queue.capacity, 256);
 
     let listed = handle
         .list(ns, rb_types::RecallFilter::default(), N + 10)

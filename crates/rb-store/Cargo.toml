@@ -7,6 +7,9 @@ authors.workspace = true
 repository.workspace = true
 description = "SQLite + sqlite-vec storage engine for rusty-brain: schema, migrations, FTS, vector KNN, graph."
 
+[features]
+bench-utils = []
+
 [lib]
 name = "rb_store"
 path = "src/lib.rs"
