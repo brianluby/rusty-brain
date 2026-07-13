@@ -45,8 +45,9 @@ contested disclosure, injected rows/tokens/bytes, and rank p50/p99.
 An exact span is counted when a returned expected row contains at least two
 distinct normalized non-stop query tokens. Wrong exposure is a top-1 key not
 in the authored expected set. Stale keys are targets named by an authored
-`supersedes <key>` context. Contested keys are both endpoints named by an
-authored `contradicts <key>` context.
+`supersedes <key>` context, plus the target of `contradicts <key>` when the
+successor context explicitly says `current` or `supersedes`. Contested keys are
+both endpoints named by any authored `contradicts <key>` context.
 
 ## Online shadow admission arms
 
