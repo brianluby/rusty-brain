@@ -20,10 +20,10 @@ aggregator is `scripts/dogfood-pilot.py`.
 
 The manifest records `task_56.overall_pilot_go=false` and the poison-exposure
 blocker. It also records `task_57.complete=false`; partial benchmark evidence
-does not supply a pilot envelope. The #56 combined admission arm may remain GO for a bounded **shadow
-experiment**, but it is not a production-qualified treatment and cannot admit
-this pilot. Only a separately reviewed production fix plus a repeated #56 gate
-may change `task_56.state` from `no-go` to `go` and
+does not supply a pilot envelope. The corrected #56 decision leaves both exact
+evidence and surprise-aware combined admission at **NO-GO**, so no treatment
+arm is production-qualified. Only a separately reviewed production fix plus a
+repeated #56 gate may change `task_56.state` from `no-go` to `go` and
 `task_56.overall_pilot_go` to `true`.
 
 ## 1. What is frozen now
