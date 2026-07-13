@@ -679,11 +679,11 @@ mod open_tests {
             "refusal names the invariant: {msg}"
         );
         assert!(
-            msg.contains("stored: deterministic") && msg.contains("configured: voyage-3"),
+            msg.contains("stored: \"deterministic\"") && msg.contains("configured: \"voyage-3\""),
             "refusal names both models: {msg}"
         );
         assert!(
-            msg.contains("--accept-model-change"),
+            msg.contains("--accept-model-change") && msg.contains("rusty-brain reembed"),
             "refusal carries the remediation hint: {msg}"
         );
     }
