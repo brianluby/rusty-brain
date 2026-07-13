@@ -23,16 +23,21 @@ record-local = ["rb-embed/local"]
 
 [dependencies]
 rb-engine = { path = "../rb-engine" }
-rb-store = { path = "../rb-store" }
+rb-store = { path = "../rb-store", features = ["bench-utils"] }
 rb-search = { path = "../rb-search" }
 rb-embed = { path = "../rb-embed" }
 rb-types = { path = "../rb-types" }
+rb-daemon = { path = "../rb-daemon" }
+rb-proto = { path = "../rb-proto" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
 chrono = { workspace = true }
+tokio = { workspace = true }
+reqwest = { workspace = true }
+tempfile = { workspace = true }
+rusqlite = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
 # Record/replay fixture keys are (model_id, input_kind, sha256(text)).
 sha2 = { workspace = true }
-
-[dev-dependencies]
-tokio = { workspace = true }

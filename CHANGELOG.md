@@ -5,6 +5,16 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Scale, concurrency, and resource harness (Vikunja #57)
+
+- Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,
+  UDS/HTTP recall, interactive and hook-burst writes, bounded writer-queue
+  saturation, namespace isolation, committed-write durability, RSS/DB/WAL
+  growth, long-lived readers, shutdown/checkpoint timing, and provider
+  deadlines. The dated report defines a 1k interactive envelope, prioritizes
+  ANN plus read-side controls, and defers sharding; disk-full testing remains
+  explicitly blocked on a disposable quota-limited filesystem.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing

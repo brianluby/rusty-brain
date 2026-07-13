@@ -322,6 +322,15 @@ impl Daemon {
         self.http_addr
     }
 
+    /// Clone the storage handle for process-local diagnostics and benchmarks.
+    /// Normal clients should use UDS/HTTP; this exposes counters without adding
+    /// a wire endpoint solely for development-time measurements.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn store_handle(&self) -> StoreHandle {
+        self.store.clone()
+    }
+
     /// Run until `shutdown` resolves, then drain connections and clean up.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let Daemon {

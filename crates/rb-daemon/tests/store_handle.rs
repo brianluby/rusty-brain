@@ -159,6 +159,11 @@ async fn many_concurrent_writers_lose_nothing() {
         t.await.unwrap().unwrap();
     }
 
+    let queue = handle.writer_queue_metrics();
+    assert_eq!(queue.enqueued, N as u64);
+    assert!(queue.total_wait_ns >= queue.max_wait_ns);
+    assert_eq!(queue.capacity, 256);
+
     let listed = handle
         .list(ns, rb_types::RecallFilter::default(), N + 10)
         .await

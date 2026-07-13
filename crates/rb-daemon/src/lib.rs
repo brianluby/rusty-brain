@@ -28,4 +28,6 @@ pub use http::HttpListenerConfig;
 pub use rb_engine::FusionMode;
 pub use server::{Daemon, DaemonConfig, EnrichEndpoint};
 pub use shared_embedder::SharedEmbedder;
-pub use store_handle::{accept_model_change, StoreHandle};
+pub use store_handle::{
+    accept_model_change, dropped_broadcast_count, StoreHandle, WriterQueueMetrics,
+};

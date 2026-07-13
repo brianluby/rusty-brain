@@ -5,6 +5,29 @@ use super::*;
 use crate::error::storage_err;
 
 impl SqliteStore {
+    /// Insert benchmark fixtures in one transaction per caller-provided batch.
+    ///
+    /// This is feature-gated because normal writes must continue through the
+    /// daemon's single-writer path. The eval harness uses it only to keep
+    /// corpus construction outside the timed load phase.
+    #[cfg(feature = "bench-utils")]
+    #[doc(hidden)]
+    pub fn insert_memory_batch_for_benchmark(&self, rows: &[(MemoryNote, Vec<f32>)]) -> Result<()> {
+        for (note, _) in rows {
+            rb_types::validate_importance(note.importance)?;
+            rb_types::validate_confidence(note.confidence)?;
+            for anchor in &note.anchors {
+                anchor.validate()?;
+            }
+        }
+        immediate_tx(&self.conn, || {
+            for (note, embedding) in rows {
+                self.insert_memory_tx_body(note, Some(embedding))?;
+            }
+            Ok(())
+        })
+    }
+
     /// Set the EFFECTIVE `importance` of a single memory WITHOUT touching its
     /// `base_importance` author prior (W1.9). This is the importance
     /// recalibration job's only write path; the user-facing `update_memory`
@@ -1975,6 +1998,37 @@ mod insert_tests {
 
     fn vec8(seed: f32) -> Vec<f32> {
         (0..8).map(|i| seed + i as f32 * 0.1).collect()
+    }
+
+    #[cfg(feature = "bench-utils")]
+    #[test]
+    fn benchmark_batch_loader_commits_memory_and_vectors_together() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let namespace = Namespace::Project("bench-batch".into());
+        let rows: Vec<_> = (0..3)
+            .map(|index| {
+                (
+                    MemoryNote::new(
+                        namespace.clone(),
+                        format!("fixture {index}"),
+                        MemoryType::Insight,
+                        5,
+                    ),
+                    vec8(index as f32),
+                )
+            })
+            .collect();
+
+        store.insert_memory_batch_for_benchmark(&rows).unwrap();
+
+        assert_eq!(store.list(&namespace, None, 10).unwrap().len(), 3);
+        assert_eq!(
+            store
+                .vector_search(&namespace, rows[0].1.as_slice(), 10)
+                .unwrap()
+                .len(),
+            3
+        );
     }
 
     #[test]

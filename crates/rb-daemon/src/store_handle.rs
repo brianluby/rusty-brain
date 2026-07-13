@@ -17,6 +17,29 @@ use crate::change::{ChangeKind, MemoryChanged};
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
 
+/// Snapshot of writer-command enqueue pressure for load tests and diagnostics.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct WriterQueueMetrics {
+    /// Commands successfully enqueued through the common write path.
+    pub enqueued: u64,
+    /// Enqueues that observed a full bounded channel before awaiting capacity.
+    pub saturated: u64,
+    /// Sum of time spent awaiting queue capacity, in nanoseconds.
+    pub total_wait_ns: u64,
+    /// Longest single wait for queue capacity, in nanoseconds.
+    pub max_wait_ns: u64,
+    /// Fixed capacity of the bounded writer queue.
+    pub capacity: usize,
+}
+
+#[derive(Default)]
+struct WriterQueueMetricState {
+    enqueued: std::sync::atomic::AtomicU64,
+    saturated: std::sync::atomic::AtomicU64,
+    total_wait_ns: std::sync::atomic::AtomicU64,
+    max_wait_ns: std::sync::atomic::AtomicU64,
+}
+
 /// How often the background flusher drains buffered access bumps into one
 /// batched writer op (W1.8). Read paths only ever touch the in-memory buffer;
 /// the buffer is bounded in practice by the distinct ids recalled within one
@@ -277,6 +300,7 @@ pub struct StoreHandle {
     /// Count of write commands the writer thread has received (excluding
     /// `Shutdown`). Observability + the W1.8 zero-writer-ops-on-recall proof.
     writer_ops: Arc<std::sync::atomic::AtomicU64>,
+    queue_metrics: Arc<WriterQueueMetricState>,
 }
 
 /// Buffered access-tracking state shared by every [`StoreHandle`] clone.
@@ -471,6 +495,7 @@ impl StoreHandle {
                 flusher_started: AtomicBool::new(false),
             }),
             writer_ops,
+            queue_metrics: Arc::new(WriterQueueMetricState::default()),
         })
     }
 
@@ -611,6 +636,7 @@ impl StoreHandle {
             writer_death: _writer_death,
             access_buf: _access_buf,
             writer_ops: _writer_ops,
+            queue_metrics: _queue_metrics,
         } = self;
 
         if !shutting_down.swap(true, Ordering::SeqCst) {
@@ -735,15 +761,40 @@ impl StoreHandle {
         self.writer_ops.load(std::sync::atomic::Ordering::SeqCst)
     }
 
+    /// Snapshot bounded writer-queue pressure without resetting the counters.
+    #[must_use]
+    pub fn writer_queue_metrics(&self) -> WriterQueueMetrics {
+        WriterQueueMetrics {
+            enqueued: self.queue_metrics.enqueued.load(Ordering::Relaxed),
+            saturated: self.queue_metrics.saturated.load(Ordering::Relaxed),
+            total_wait_ns: self.queue_metrics.total_wait_ns.load(Ordering::Relaxed),
+            max_wait_ns: self.queue_metrics.max_wait_ns.load(Ordering::Relaxed),
+            capacity: WRITE_QUEUE_CAPACITY,
+        }
+    }
+
     async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(Error::Storage("writer thread unavailable".to_string()));
         }
 
+        let saturated = self.writer_tx.capacity() == 0;
+        let wait_started = std::time::Instant::now();
         self.writer_tx
             .send(cmd)
             .await
             .map_err(|_| Error::Storage("writer thread unavailable".to_string()))?;
+        let wait_ns = u64::try_from(wait_started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.queue_metrics.enqueued.fetch_add(1, Ordering::Relaxed);
+        if saturated {
+            self.queue_metrics.saturated.fetch_add(1, Ordering::Relaxed);
+        }
+        self.queue_metrics
+            .total_wait_ns
+            .fetch_add(wait_ns, Ordering::Relaxed);
+        self.queue_metrics
+            .max_wait_ns
+            .fetch_max(wait_ns, Ordering::Relaxed);
         rx.await
             .map_err(|_| Error::Storage("writer dropped reply".to_string()))?
     }
