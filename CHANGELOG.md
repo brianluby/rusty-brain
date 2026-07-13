@@ -28,6 +28,29 @@ All notable changes to rusty-brain are documented here. The format is based on
   slow-path-only: unconditional locking cost 1.52–1.66x the current-schema
   marker check in the task runs.
 
+### Fixed — Scrub reports blocked WAL cleanup (Vikunja #53)
+
+- `rusty-brain scrub` now inspects the full result of its truncating WAL
+  checkpoint instead of treating SQLite's successful-but-busy pragma as
+  complete at-rest cleanup. Human and JSON output report checkpoint status,
+  warn when pre-redaction plaintext may remain in the WAL, and tell operators
+  to close long-lived database readers and rerun scrub. A no-change rerun now
+  retries the checkpoint so that remediation can complete. If checkpoint
+  execution itself errors after redaction commits, scrub preserves and returns
+  the committed counts as a partial success with an explicit unavailable
+  diagnostic instead of misreporting the entire scrub as failed.
+
+### Fixed — Legacy embedding-model metadata recovery
+
+- **Missing `meta.embedding_model` no longer silently adopts the configured
+  provider on a populated database.** Startup now inspects the distinct
+  per-row model stamps before seeding: an empty corpus or a single model that
+  matches the configured provider recovers automatically, while a conflicting
+  or mixed-model corpus fails closed with the existing
+  `--accept-model-change` + `reembed` remediation. The missing-marker recovery
+  runs under a write lock with revalidation; already-seeded opens keep their
+  read-only fast path.
+
 ### Changed — Supersede hardened at the source (#501)
 
 - **`Store::supersede` now guards every half of the mutation** (generalizing
