@@ -366,7 +366,7 @@ def validate_treatment(arm: Any, where: str) -> dict[str, Any]:
         "retention_active_seconds",
         "backup_active_seconds",
     }
-    for field in integer_fields:
+    for field in sorted(integer_fields):
         integer(arm[field], f"{where}.{field}")
     for field in ("retention_active_seconds", "backup_active_seconds"):
         number(arm[field], f"{where}.{field}")

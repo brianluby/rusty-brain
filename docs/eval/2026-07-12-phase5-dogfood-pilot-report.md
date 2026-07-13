@@ -46,7 +46,7 @@ Agents and attributed surfaces:
 | multi-answer regression | ≤1.0 pp | UNMEASURED | UNMEASURED |
 | provenance-label coverage | 100% | UNMEASURED | UNMEASURED |
 | contested-label coverage | 100% | UNMEASURED | UNMEASURED |
-| stale/wrong exact injections | report each | UNMEASURED | report-only unless an MIE occurs |
+| stale/wrong exact injections | report each | UNMEASURED | each injection is report-only unless an MIE occurs; aggregate stale/wrong ratios remain verdict-gated |
 
 If STOP fired, enumerate only sanitized incident IDs and classifications here.
 Do not paste prompts, responses, transcripts, or memory content.
