@@ -369,7 +369,10 @@ daemon refuse to start rather than write mismatched vectors. The embedding model
 identity (`meta.embedding_model`) is the second: a same-dimension provider swap also
 refuses to start — mixed vector spaces must be impossible — unless explicitly accepted
 via `serve --accept-model-change` (or `RB_ACCEPT_MODEL_CHANGE=1` for auto-started
-daemons) followed by a corpus `reembed`.
+daemons) followed by a corpus `reembed`. A legacy database with no global model marker
+is reconciled from `SELECT DISTINCT memories.embedding_model`: an empty corpus or one
+model matching the configured provider may seed the marker; a conflicting or mixed
+corpus fails closed and requires that explicit accept-and-re-embed flow.
 
 The database file holds captured memory text, so it gets the same posture as the
 daemon socket: the file is created `0600` and tightened fail-closed on every open

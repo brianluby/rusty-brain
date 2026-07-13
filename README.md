@@ -256,7 +256,10 @@ providers — or models, even at the same dimension — against an existing data
 refuses to run rather than silently mix vector spaces. To accept a deliberate model
 swap, restart with `rusty-brain serve --accept-model-change` (or set
 `RB_ACCEPT_MODEL_CHANGE=1` for auto-started daemons) and re-embed the corpus with
-`rusty-brain reembed`.
+`rusty-brain reembed`. For a legacy database whose global model marker is missing,
+startup adopts the configured model only when the corpus is empty or every stored row
+already names that model. A conflicting or mixed-model corpus refuses to start until
+the operator uses the same explicit accept-and-re-embed recovery path.
 
 ### Wire the MCP server into an agent
 
