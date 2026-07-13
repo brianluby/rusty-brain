@@ -5,6 +5,18 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Scrub reports blocked WAL cleanup (Vikunja #53)
+
+- `rusty-brain scrub` now inspects the full result of its truncating WAL
+  checkpoint instead of treating SQLite's successful-but-busy pragma as
+  complete at-rest cleanup. Human and JSON output report checkpoint status,
+  warn when pre-redaction plaintext may remain in the WAL, and tell operators
+  to close long-lived database readers and rerun scrub. A no-change rerun now
+  retries the checkpoint so that remediation can complete. If checkpoint
+  execution itself errors after redaction commits, scrub preserves and returns
+  the committed counts as a partial success with an explicit unavailable
+  diagnostic instead of misreporting the entire scrub as failed.
+
 ### Fixed — Legacy embedding-model metadata recovery
 
 - **Missing `meta.embedding_model` no longer silently adopts the configured

@@ -201,5 +201,5 @@ pub use oplog::OplogReplayPage;
 pub use rename::NamespaceRenameOutcome;
 pub use retention::RetentionSweepEffects;
 pub use review::ReviewQueueParams;
-pub use scrub::ScrubOutcome;
+pub use scrub::{ScrubOutcome, WalCheckpointOutcome};
 pub use stats::read_meta_embedding_model;

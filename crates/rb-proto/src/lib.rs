@@ -16,5 +16,5 @@ pub use error::{error_to_response, response_error_to_error};
 pub use frame::{read_frame, write_frame};
 pub use messages::{
     request_uses_anchors, ClientIdentity, Handshake, HandshakeAck, RecallChannelTotals, Request,
-    Response, CAP_ANCHORS, CONTRACT_VERSION,
+    Response, ScrubCheckpoint, ScrubResult, CAP_ANCHORS, CONTRACT_VERSION,
 };
