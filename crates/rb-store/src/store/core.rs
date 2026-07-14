@@ -1009,6 +1009,10 @@ fn build_active_contradicts_query(
     let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
     let in_list = placeholders.join(", ");
     let ns_param = format!("?{}", ids.len() + 1);
+    // CROSS JOIN is deliberate: SQLite never reorders CROSS JOIN operands, so
+    // memory_links remains the outer loop on old and new planner versions. Plain
+    // JOIN lets SQLite 3.46 drive from idx_mem_ns for ten ids, turning this into
+    // a namespace-by-namespace cross scan even when memory_links is empty.
     let sql = format!(
         "SELECT l.source_id AS local FROM memory_links l
            CROSS JOIN memories far ON far.memory_id = l.target_id
@@ -1707,10 +1711,6 @@ impl Store for SqliteStore {
         // out-of-namespace id into the result (`loc` scope). Only ACTIVE,
         // in-namespace contradictions count (spec §9). The SELECT returns the local
         // endpoint id for every matching row; we collect the distinct set.
-        // CROSS JOIN is deliberate: SQLite never reorders CROSS JOIN operands, so
-        // memory_links remains the outer loop on old and new planner versions. Plain
-        // JOIN lets SQLite 3.46 drive from idx_mem_ns for ten ids, turning this into
-        // a namespace-by-namespace cross scan even when memory_links is empty.
         let (sql, params) = build_active_contradicts_query(ns, ids);
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
 
@@ -5035,14 +5035,15 @@ mod contradiction_tests {
         assert!(
             outer_loops
                 .iter()
-                .all(|detail| detail.split_whitespace().nth(1) == Some("l")),
+                .all(|detail| detail.starts_with("SEARCH l ") || detail.starts_with("SCAN l ")),
             "memory_links must drive both UNION halves; outer loops: {outer_loops:?}; plan:\n{}",
             plan.join("\n")
         );
         assert!(
             plan.iter().any(|detail| {
                 detail.contains("idx_memory_links_target_type")
-                    && detail.contains("target_id=? AND link_type=?")
+                    && detail.contains("target_id=?")
+                    && detail.contains("link_type=?")
             }),
             "the target-side half must use both columns of the composite index; plan:\n{}",
             plan.join("\n")
