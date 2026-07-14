@@ -4961,7 +4961,15 @@ mod contradiction_tests {
         let mut expect_outer_loop = false;
         let mut outer_loops = Vec::new();
         for detail in plan {
-            if detail.contains("LEFT-MOST SUBQUERY") || detail.starts_with("UNION ") {
+            // SQLite 3.53 renders compound arms as `LEFT` / `RIGHT` under
+            // `MERGE (UNION)`; older releases used `LEFT-MOST SUBQUERY` and
+            // `UNION ...`. In either format, the next SEARCH/SCAN is the arm's
+            // outer loop.
+            if detail == "LEFT"
+                || detail == "RIGHT"
+                || detail.contains("LEFT-MOST SUBQUERY")
+                || detail.starts_with("UNION ")
+            {
                 expect_outer_loop = true;
                 continue;
             }

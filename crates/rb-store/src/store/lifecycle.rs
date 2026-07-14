@@ -677,6 +677,17 @@ mod open_tests {
     }
 
     #[test]
+    fn bundled_sqlite_is_at_least_3_53() {
+        const MINIMUM_SQLITE_VERSION: i32 = 3_053_000;
+
+        assert!(
+            rusqlite::version_number() >= MINIMUM_SQLITE_VERSION,
+            "bundled SQLite must be at least 3.53.0, found {}",
+            rusqlite::version()
+        );
+    }
+
+    #[test]
     fn open_in_memory_creates_schema_and_seeds_dim() {
         let store = SqliteStore::open_in_memory(1024).unwrap();
         let c = &store.conn;
