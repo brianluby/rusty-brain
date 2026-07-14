@@ -70,6 +70,7 @@ contract_version = 2
 "008_memory_feedback.sql" = "64901f555624da4b738e437877d6b2b60579dbd5051f55ab476390015a67b70b"
 "009_memory_anchors.sql" = "d65aa99503a1573dfc55e65c60eb4045087e26680e2e6e426fdd6b9be1b3f6eb"
 "010_review_state.sql" = "a174de82d5ebbf75cd68e28369b1ef7ce549daa9874d5d497a5efde067b86d45"
+"011_memory_links_target_index.sql" = "0dc6147340f050df5ae3cac4f3492f6717001e9d02c9bb2a4a98db3fed8c7597"
 
 [[log]]
 contract_version = 2
@@ -125,3 +126,8 @@ note = "Vikunja #53 adds optional scrub WAL checkpoint status; serde defaults pr
 contract_version = 2
 intent = "additive"
 note = "Vikunja #53 preserves scrub counts with an optional checkpoint-error diagnostic"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "active_contradicts links-first query plus migration 011 target-side memory_links index; no wire change"
