@@ -994,6 +994,55 @@ fn build_list_filtered_query(
     Ok((sql, params))
 }
 
+/// Build the exact compound query used to annotate recalled ids whose active,
+/// in-namespace memories participate in an active contradiction.
+#[allow(clippy::vec_box)]
+fn build_active_contradicts_query(
+    ns: &Namespace,
+    ids: &[MemoryId],
+) -> (String, Vec<Box<dyn rusqlite::ToSql>>) {
+    debug_assert!(!ids.is_empty());
+
+    // Both UNION halves share the same ?1..?N (ids) and ?{N+1} (namespace)
+    // positional slots — SQLite parameters are shared across UNION, so binding
+    // N+1 values covers both halves. Do NOT double the params.
+    let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
+    let in_list = placeholders.join(", ");
+    let ns_param = format!("?{}", ids.len() + 1);
+    // CROSS JOIN is deliberate: SQLite never reorders CROSS JOIN operands, so
+    // memory_links remains the outer loop on old and new planner versions. Plain
+    // JOIN lets SQLite 3.46 drive from idx_mem_ns for ten ids, turning this into
+    // a namespace-by-namespace cross scan even when memory_links is empty.
+    let sql = format!(
+        "SELECT l.source_id AS local FROM memory_links l
+           CROSS JOIN memories far ON far.memory_id = l.target_id
+           CROSS JOIN memories loc ON loc.memory_id = l.source_id
+         WHERE l.link_type = 'contradicts'
+           AND far.archived_at IS NULL
+           AND loc.archived_at IS NULL
+           AND far.namespace = {ns_param}
+           AND loc.namespace = {ns_param}
+           AND l.source_id IN ({in_list})
+         UNION
+         SELECT l.target_id AS local FROM memory_links l
+           CROSS JOIN memories far ON far.memory_id = l.source_id
+           CROSS JOIN memories loc ON loc.memory_id = l.target_id
+         WHERE l.link_type = 'contradicts'
+           AND far.archived_at IS NULL
+           AND loc.archived_at IS NULL
+           AND far.namespace = {ns_param}
+           AND loc.namespace = {ns_param}
+           AND l.target_id IN ({in_list})"
+    );
+
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
+    for id in ids {
+        params.push(Box::new(id.to_string()));
+    }
+    params.push(Box::new(ns.as_db_string()));
+    (sql, params)
+}
+
 impl Store for SqliteStore {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
@@ -1662,40 +1711,7 @@ impl Store for SqliteStore {
         // out-of-namespace id into the result (`loc` scope). Only ACTIVE,
         // in-namespace contradictions count (spec §9). The SELECT returns the local
         // endpoint id for every matching row; we collect the distinct set.
-        //
-        // Both UNION halves share the same ?1..?N (ids) and ?{N+1} (namespace)
-        // positional slots — SQLite parameters are shared across UNION, so binding
-        // N+1 values covers both halves. Do NOT double the params.
-        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 1)).collect();
-        let in_list = placeholders.join(", ");
-        let ns_param = format!("?{}", ids.len() + 1);
-        let sql = format!(
-            "SELECT l.source_id AS local FROM memory_links l
-               JOIN memories far ON far.memory_id = l.target_id
-               JOIN memories loc ON loc.memory_id = l.source_id
-             WHERE l.link_type = 'contradicts'
-               AND far.archived_at IS NULL
-               AND loc.archived_at IS NULL
-               AND far.namespace = {ns_param}
-               AND loc.namespace = {ns_param}
-               AND l.source_id IN ({in_list})
-             UNION
-             SELECT l.target_id AS local FROM memory_links l
-               JOIN memories far ON far.memory_id = l.source_id
-               JOIN memories loc ON loc.memory_id = l.target_id
-             WHERE l.link_type = 'contradicts'
-               AND far.archived_at IS NULL
-               AND loc.archived_at IS NULL
-               AND far.namespace = {ns_param}
-               AND loc.namespace = {ns_param}
-               AND l.target_id IN ({in_list})"
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
-        for id in ids {
-            params.push(Box::new(id.to_string()));
-        }
-        params.push(Box::new(ns.as_db_string()));
+        let (sql, params) = build_active_contradicts_query(ns, ids);
         let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
 
         let mut stmt = self
@@ -4928,6 +4944,35 @@ mod contradiction_tests {
             .unwrap();
     }
 
+    fn active_contradicts_query_plan(store: &SqliteStore, ids: &[MemoryId]) -> Vec<String> {
+        let (sql, params) = build_active_contradicts_query(&Namespace::Global, ids);
+        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|value| value.as_ref()).collect();
+        let mut stmt = store
+            .conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {sql}"))
+            .unwrap();
+        stmt.query_map(refs.as_slice(), |row| row.get(3))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap()
+    }
+
+    fn compound_outer_loops(plan: &[String]) -> Vec<&str> {
+        let mut expect_outer_loop = false;
+        let mut outer_loops = Vec::new();
+        for detail in plan {
+            if detail.contains("LEFT-MOST SUBQUERY") || detail.starts_with("UNION ") {
+                expect_outer_loop = true;
+                continue;
+            }
+            if expect_outer_loop && (detail.starts_with("SEARCH ") || detail.starts_with("SCAN ")) {
+                outer_loops.push(detail.as_str());
+                expect_outer_loop = false;
+            }
+        }
+        outer_loops
+    }
+
     #[test]
     fn empty_input_returns_empty_set() {
         let store = SqliteStore::open_in_memory(8).unwrap();
@@ -4951,6 +4996,95 @@ mod contradiction_tests {
             .unwrap();
         assert!(flagged.contains(&a.id), "source flagged (outbound)");
         assert!(flagged.contains(&b.id), "target flagged (inbound)");
+    }
+
+    #[test]
+    fn flags_target_endpoint_when_only_target_is_queried() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let source = node(&store, "source says x");
+        let target = node(&store, "target says not-x");
+        contradicts(&store, &source, &target);
+
+        let flagged = store
+            .active_contradicts(&Namespace::Global, std::slice::from_ref(&target.id))
+            .unwrap();
+
+        assert_eq!(
+            flagged,
+            [target.id].into_iter().collect(),
+            "the target-side query must flag the requested local endpoint"
+        );
+    }
+
+    #[test]
+    fn active_contradicts_plan_drives_both_halves_from_memory_links() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ids: Vec<_> = (0..10)
+            .map(|i| node(&store, &format!("memory {i}")).id)
+            .collect();
+
+        let plan = active_contradicts_query_plan(&store, &ids);
+        let outer_loops = compound_outer_loops(&plan);
+
+        assert_eq!(
+            outer_loops.len(),
+            2,
+            "expected one outer loop per UNION half; plan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            outer_loops
+                .iter()
+                .all(|detail| detail.starts_with("SEARCH l ") || detail.starts_with("SCAN l ")),
+            "memory_links must drive both UNION halves; outer loops: {outer_loops:?}; plan:\n{}",
+            plan.join("\n")
+        );
+        assert!(
+            plan.iter().any(|detail| {
+                detail.contains("idx_memory_links_target_type")
+                    && detail.contains("target_id=?")
+                    && detail.contains("link_type=?")
+            }),
+            "the target-side half must use both columns of the composite index; plan:\n{}",
+            plan.join("\n")
+        );
+    }
+
+    #[cfg(feature = "bench-utils")]
+    #[test]
+    #[ignore = "performance smoke; run explicitly in release mode"]
+    fn active_contradicts_ten_ids_completes_under_one_second_at_ten_thousand_rows() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let rows: Vec<_> = (0..10_000)
+            .map(|i| {
+                (
+                    MemoryNote::new(
+                        Namespace::Global,
+                        format!("benchmark memory {i}"),
+                        MemoryType::Insight,
+                        5,
+                    ),
+                    vec![0.0; 8],
+                )
+            })
+            .collect();
+        store.insert_memory_batch_for_benchmark(&rows).unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .take(10)
+            .map(|(note, _)| note.id.clone())
+            .collect();
+
+        let started = std::time::Instant::now();
+        let flagged = store.active_contradicts(&Namespace::Global, &ids).unwrap();
+        let elapsed = started.elapsed();
+
+        eprintln!("active_contradicts elapsed at 10,000 rows: {elapsed:?}");
+        assert!(flagged.is_empty());
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "active_contradicts took {elapsed:?} for 10 ids over 10,000 rows"
+        );
     }
 
     #[test]

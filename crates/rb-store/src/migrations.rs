@@ -423,4 +423,50 @@ mod tests {
         );
         assert!(bad.is_err(), "CHECK constraint rejects invalid memory_type");
     }
+
+    #[test]
+    fn target_link_index_migrates_a_populated_prior_schema() {
+        let c = conn();
+        run_migrations_up_to(&c, 10).unwrap();
+        c.execute_batch(
+            "INSERT INTO memories (
+                 memory_id, namespace, created_at, updated_at, content, summary,
+                 keywords, tags, memory_type, importance, confidence, embedding_model
+             ) VALUES
+                 ('source', 'global', 1, 1, 'source', '', '[]', '[]', 'insight', 5, 1.0, ''),
+                 ('target', 'global', 2, 2, 'target', '', '[]', '[]', 'insight', 5, 1.0, '');
+             INSERT INTO memory_links (
+                 source_id, target_id, link_type, strength, reason, created_at, base_strength
+             ) VALUES ('source', 'target', 'contradicts', 1.0, '', 2, 1.0);",
+        )
+        .unwrap();
+
+        let index_before: i64 = c
+            .query_row(
+                "SELECT count(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_memory_links_target_type'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(index_before, 0, "version 10 fixture must lack the index");
+
+        run_migrations(&c).unwrap();
+
+        let index_columns: Vec<String> = c
+            .prepare(
+                "SELECT name FROM pragma_index_info('idx_memory_links_target_type')
+                 ORDER BY seqno",
+            )
+            .unwrap()
+            .query_map([], |row| row.get(0))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(index_columns, ["target_id", "link_type"]);
+        let link_count: i64 = c
+            .query_row("SELECT count(*) FROM memory_links", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(link_count, 1, "migration must preserve existing links");
+    }
 }
