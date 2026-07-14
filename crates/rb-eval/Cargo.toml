@@ -30,6 +30,7 @@ rb-types = { path = "../rb-types" }
 rb-daemon = { path = "../rb-daemon" }
 rb-proto = { path = "../rb-proto" }
 rb-mcp = { path = "../rb-mcp" }
+rb-redact = { path = "../rb-redact" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 async-trait = { workspace = true }
@@ -41,8 +42,14 @@ rusqlite = { workspace = true }
 libc = { workspace = true }
 clap = { workspace = true }
 anyhow = { workspace = true }
+thiserror = { workspace = true }
 # Record/replay fixture keys are (model_id, input_kind, sha256(text)).
 sha2 = { workspace = true }
+regex = { workspace = true }
+# Faker is augmentation-only. Keep the exact version pinned at workspace level;
+# generated aliases, variants, and distractor corpora also record the seed.
+fake = { workspace = true }
+rand = { workspace = true }
 
 [dev-dependencies]
 # The scale harness is an example target so its high-throughput fixture loader
