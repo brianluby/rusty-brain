@@ -295,7 +295,13 @@ fn reembed_scan_and_update_vector_round_trip() {
     // Re-embed the stale row: replaces vector + stamps to current.
     let new_emb: [f32; DIM] = [0.0, 0.0, 1.0, 0.0];
     store
-        .update_vector(&stale.id, &new_emb, "deterministic", "v2-composite")
+        .update_vector(
+            &stale.id,
+            &new_emb,
+            "deterministic",
+            "v2-composite",
+            rb_types::EmbeddingInputFingerprint::from(&cands[0]),
+        )
         .unwrap();
     let after = store.get_memory(&stale.id).unwrap().unwrap();
     assert_eq!(after.embedding_model, "deterministic");
@@ -326,7 +332,18 @@ fn update_vector_rejects_missing_id_and_wrong_dim() {
     let missing = MemoryId::new();
     let emb: [f32; DIM] = [1.0, 0.0, 0.0, 0.0];
     let err = store
-        .update_vector(&missing, &emb, "deterministic", "v2-composite")
+        .update_vector(
+            &missing,
+            &emb,
+            "deterministic",
+            "v2-composite",
+            rb_types::EmbeddingInputFingerprint::from(&note(
+                &Namespace::Global,
+                "missing",
+                MemoryType::Insight,
+                5,
+            )),
+        )
         .unwrap_err();
     assert!(matches!(err, rb_types::Error::NotFound(_)), "got {err:?}");
 
@@ -336,7 +353,13 @@ fn update_vector_rejects_missing_id_and_wrong_dim() {
     store.insert_memory(&n, Some(&emb)).unwrap();
     let bad: [f32; 2] = [1.0, 2.0];
     let err = store
-        .update_vector(&n.id, &bad, "deterministic", "v2-composite")
+        .update_vector(
+            &n.id,
+            &bad,
+            "deterministic",
+            "v2-composite",
+            rb_types::EmbeddingInputFingerprint::from(&n),
+        )
         .unwrap_err();
     assert!(
         matches!(err, rb_types::Error::DimensionMismatch { .. }),

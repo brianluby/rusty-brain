@@ -221,9 +221,10 @@ impl MemoryBackend for SqliteBackend {
         embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> rb_types::Result<()> {
         let store = self.lock()?;
-        store.update_vector(&id, &embedding, &model, &input_version)
+        store.update_vector(&id, &embedding, &model, &input_version, expected_input)
     }
 }
 

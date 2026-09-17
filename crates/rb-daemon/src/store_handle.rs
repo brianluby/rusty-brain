@@ -206,6 +206,7 @@ enum WriteCommand {
         embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
         reply: oneshot::Sender<Result<()>>,
     },
     /// One-time namespace rename (W0.3 carryover): re-scope every memory row
@@ -1844,6 +1845,7 @@ fn writer_loop(
                 embedding,
                 model,
                 input_version,
+                expected_input,
                 reply,
             } => {
                 // No MemoryChanged event: re-embed only refreshes the vector for
@@ -1853,7 +1855,7 @@ fn writer_loop(
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    |s| s.update_vector(&id, &embedding, &model, &input_version),
+                    |s| s.update_vector(&id, &embedding, &model, &input_version, expected_input),
                 );
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
@@ -2347,6 +2349,7 @@ impl MemoryBackend for StoreHandle {
         embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let cmd = WriteCommand::Reembed {
@@ -2354,6 +2357,7 @@ impl MemoryBackend for StoreHandle {
             embedding,
             model,
             input_version,
+            expected_input,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -3231,6 +3235,7 @@ mod tests {
                 vec![0.5f32; DIM],
                 "deterministic".to_string(),
                 "v2-composite".to_string(),
+                rb_types::EmbeddingInputFingerprint::from(&cands[0]),
             )
             .await
             .unwrap();
@@ -3256,6 +3261,7 @@ mod tests {
         let ns = Namespace::Project("dim".to_string());
 
         let n = note(&ns, "dim contract");
+        let expected_input = rb_types::EmbeddingInputFingerprint::from(&n);
         let id = n.id.clone();
         handle.write(n, Some(vec![0.1f32; DIM])).await.unwrap();
 
@@ -3266,6 +3272,7 @@ mod tests {
                 vec![0.5f32; DIM + 3],
                 "deterministic".to_string(),
                 "v2-composite".to_string(),
+                expected_input,
             )
             .await
             .unwrap_err();

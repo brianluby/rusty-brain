@@ -120,6 +120,9 @@ pub trait MemoryBackend: Send + Sync {
     ) -> rb_types::Result<Vec<MemoryNote>>;
     /// Replace `id`'s stored vector and stamp its row with the current
     /// `(model, input_version)` in one transaction (write path, single writer).
+    /// `expected_input` must come from the candidate read BEFORE embedding.
+    /// Reject changed input fields as `Error::StalePlan`, atomically leaving
+    /// both vector and stamp untouched. Missing/archived rows are `NotFound`.
     /// This is the first vector-UPDATE path; `remember` only ever INSERTs.
     async fn update_vector(
         &self,
@@ -127,6 +130,7 @@ pub trait MemoryBackend: Send + Sync {
         embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> rb_types::Result<()>;
 }
 
@@ -363,19 +367,25 @@ mod tests {
             embedding: Vec<f32>,
             model: String,
             input_version: String,
+            expected_input: rb_types::EmbeddingInputFingerprint,
         ) -> rb_types::Result<()> {
             // Fail closed on a missing id, like SqliteStore::update_vector.
-            if !self.notes.lock().unwrap().contains_key(&id) {
-                return Err(rb_types::Error::NotFound(id));
+            let mut notes = self.notes.lock().unwrap();
+            let note = notes
+                .get_mut(&id)
+                .filter(|note| note.archived_at.is_none())
+                .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+            if rb_types::EmbeddingInputFingerprint::from(&*note) != expected_input {
+                return Err(rb_types::Error::StalePlan(
+                    "embedding inputs changed; retry reembed".into(),
+                ));
             }
             self.embeddings
                 .lock()
                 .unwrap()
                 .insert(id.clone(), embedding);
-            if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
-                note.embedding_model = model;
-                note.embedding_input_version = input_version;
-            }
+            note.embedding_model = model;
+            note.embedding_input_version = input_version;
             Ok(())
         }
     }

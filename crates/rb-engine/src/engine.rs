@@ -671,7 +671,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// namespace does NOT restrict the scan, so a single `reembed` converges the
     /// whole corpus. For each candidate it recomputes the composite
     /// [`crate::embed_input::embedding_input`], embeds it, and replaces the
-    /// vector + stamp through the single writer.
+    /// vector + stamp through the single writer. A fingerprint captured before
+    /// embedding must still match the live row inside that write transaction;
+    /// an interleaved input edit is skipped without erasing its stale marker.
     ///
     /// Bounded and idempotent: candidates are exactly the rows whose stamp
     /// differs from current, so a row already at `(model, version)` is never
@@ -702,6 +704,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         for note in candidates {
             scanned += 1;
             // Reembed converges stored vectors => EmbedKind::Document (W1.4).
+            let expected_input = rb_types::EmbeddingInputFingerprint::from(&note);
             let input = crate::embed_input::embedding_input(&note);
             let embedding = match self.embedder.embed(&[input], EmbedKind::Document).await {
                 Ok(mut v) => match v.pop() {
@@ -725,6 +728,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                     embedding,
                     model.clone(),
                     input_version.clone(),
+                    expected_input,
                 )
                 .await
             {

@@ -426,6 +426,7 @@ impl MemoryBackend for MockBackend {
         embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> rb_types::Result<()> {
         use std::sync::atomic::Ordering;
         self.update_vector_calls.fetch_add(1, Ordering::SeqCst);
@@ -436,17 +437,22 @@ impl MemoryBackend for MockBackend {
         }
         // Fail closed on a missing id, like SqliteStore::update_vector (NotFound),
         // so engine tests cannot pass on a vector-update path production rejects.
-        if !self.notes.lock().unwrap().contains_key(&id) {
-            return Err(rb_types::Error::NotFound(id));
+        let mut notes = self.notes.lock().unwrap();
+        let note = notes
+            .get_mut(&id)
+            .filter(|note| note.archived_at.is_none())
+            .ok_or_else(|| rb_types::Error::NotFound(id.clone()))?;
+        if rb_types::EmbeddingInputFingerprint::from(&*note) != expected_input {
+            return Err(rb_types::Error::StalePlan(
+                "embedding inputs changed; retry reembed".into(),
+            ));
         }
         self.embeddings
             .lock()
             .unwrap()
             .insert(id.clone(), embedding);
-        if let Some(note) = self.notes.lock().unwrap().get_mut(&id) {
-            note.embedding_model = model;
-            note.embedding_input_version = input_version;
-        }
+        note.embedding_model = model;
+        note.embedding_input_version = input_version;
         Ok(())
     }
 }
