@@ -1,0 +1,209 @@
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 4.65s
+     Running unittests src/lib.rs (target/debug/deps/rb_eval-5a3a02bfcc97fbb8)
+
+running 77 tests
+test corpus::tests::rejects_cluster_with_one_member ... ok
+test corpus::tests::accepts_graded_golden_query ... ok
+test corpus::tests::rejects_cluster_referencing_unknown_key ... ok
+test corpus::tests::parses_and_validates_minimal_corpus ... ok
+test corpus::tests::committed_corpus_contains_readme_quickstart_golden ... ok
+test corpus::tests::committed_corpus_loads_and_validates ... ok
+test corpus::tests::rejects_duplicate_expected_key_in_golden_query ... ok
+test corpus::tests::rejects_duplicate_keys ... ok
+test corpus::tests::rejects_duplicate_member_in_dedup_cluster ... ok
+test corpus::tests::rejects_grade_count_mismatch ... ok
+test corpus::tests::rejects_golden_query_referencing_unknown_key ... ok
+test corpus::tests::rejects_out_of_range_confidence ... ok
+test corpus::tests::rejects_out_of_range_importance ... ok
+test corpus::tests::rejects_out_of_range_grade ... ok
+test metrics::tests::dedup_precision_no_clusters_is_perfect ... ok
+test metrics::tests::latency_percentile_clamps_out_of_range_p ... ok
+test metrics::tests::latency_percentile_empty_is_zero ... ok
+test corpus::tests::rejects_unknown_memory_type ... ok
+test metrics::tests::latency_percentile_nearest_rank ... ok
+test controlled::tests::prompt_budget_never_splits_or_exceeds_a_row ... ok
+test metrics::tests::latency_percentile_single_sample ... ok
+test metrics::tests::mrr_empty_is_zero ... ok
+test metrics::tests::mrr_mean_of_reciprocal_ranks ... ok
+test metrics::tests::ndcg_edge_cases_match_recall_conventions ... ok
+test metrics::tests::dedup_precision_empty_top_is_vacuously_precise ... ok
+test metrics::tests::ndcg_is_cut_off_at_k ... ok
+test metrics::tests::ndcg_penalizes_inverted_grade_order ... ok
+test metrics::tests::ndcg_perfect_order_is_one ... ok
+test metrics::tests::ndcg_zero_when_nothing_relevant_returned ... ok
+test metrics::tests::dedup_precision_one_redundant_member ... ok
+test metrics::tests::recall_at_k_all_relevant_in_top_k ... ok
+test metrics::tests::ndcg_empty_grades_falls_back_to_binary_relevance ... ok
+test metrics::tests::dedup_precision_distinct_representatives_are_clean ... ok
+test metrics::tests::dedup_precision_two_redundant_in_same_cluster ... ok
+test metrics::tests::recall_at_k_empty_expected_is_perfect ... ok
+test metrics::tests::recall_at_k_no_hit ... ok
+test metrics::tests::recall_at_k_partial_hit ... ok
+test metrics::tests::recall_at_k_zero_k_is_zero ... ok
+test metrics::tests::reciprocal_rank_first_position ... ok
+test metrics::tests::reciprocal_rank_no_hit_is_zero ... ok
+test metrics::tests::reciprocal_rank_third_position ... ok
+test metrics::tests::reciprocal_rank_uses_earliest_hit ... ok
+test replay::tests::decode_rejects_bad_hex ... ok
+test replay::tests::fixture_rejects_dim_mismatch_and_duplicates ... ok
+test replay::tests::fixture_validation_rejects_unknown_input_kind ... ok
+test replay::tests::fixture_validation_rejects_non_finite_vectors ... ok
+test replay::tests::text_hash_is_stable_and_text_sensitive ... ok
+test replay::tests::vector_hex_round_trips_exactly ... ok
+test replay::tests::query_kind_vectors_are_recorded_and_replayed_under_query ... ok
+test replay::tests::query_lookup_falls_back_to_document_vector_with_a_count ... ok
+test replay::tests::strict_replay_rejects_query_to_document_fallback ... ok
+test replay::tests::document_lookup_never_falls_back_to_a_query_entry ... ok
+test semantic_gate::tests::floor_check_rejects_metrics_outside_probability_range ... ok
+test replay::tests::record_then_replay_serves_identical_vectors ... ok
+test semantic_gate::tests::floor_check_reports_every_regression ... ok
+test replay::tests::replay_fails_closed_on_unrecorded_text ... ok
+test session_replay::augmentation::tests::augmentation_dependency_versions_are_exactly_pinned ... ok
+test session_replay::augmentation::tests::scale_sizes_are_preregistered ... ok
+test session_replay::dataset::tests::again_marker_matches_only_a_complete_word ... ok
+test session_replay::augmentation::tests::augmentation_is_deterministic_for_seed ... ok
+test session_replay::augmentation::tests::candidate_seed_uses_the_complete_candidate_id ... ok
+test session_replay::augmentation::tests::distractor_generation_is_deterministic_and_not_ground_truth ... ok
+test session_replay::privacy::tests::invalid_rule_compilation_fails_closed ... ok
+test corpus::tests::committed_holdout_set_loads_and_stays_disjoint ... ok
+test session_replay::privacy::tests::oversized_content_is_rejected ... ok
+test session_replay::report::tests::default_seed_is_reportable ... ok
+test session_replay::privacy::tests::aliases_are_consistent_within_a_session ... ok
+test session_replay::privacy::tests::lowercase_prose_after_name_and_org_labels_is_preserved ... ok
+test session_replay::privacy::tests::rust_paths_are_not_misclassified_as_ipv6 ... ok
+test session_replay::privacy::tests::ipv6_before_dot_delimited_candidate_text_is_removed ... ok
+test session_replay::privacy::tests::compressed_ipv6_and_capitalized_labels_are_removed ... ok
+test session_replay::privacy::tests::credentials_paths_and_personal_data_are_removed ... ok
+test session_replay::report::tests::output_directory_name_is_fail_closed ... ok
+test semantic_gate::tests::committed_gate_inputs_match_every_frozen_lock ... ok
+test controlled::tests::every_stream_seed_emits_each_row_once_and_keeps_stale_target_first ... ok
+test session_replay::report::tests::local_artifacts_are_deterministic_and_private ... ok
+test controlled::tests::every_admission_arm_holds_both_caps_for_every_seed ... ok
+
+test result: ok. 77 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 8.22s
+
+     Running unittests src/bin/assertion-precision.rs (target/debug/deps/assertion_precision-61b9dad8b4e2bc49)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/assertion_precision.rs (target/debug/deps/assertion_precision-aa2f31b1be2facb6)
+
+running 5 tests
+test exact_assertion_rejects_any_extra_including_unknown_ids ... ok
+test exact_assertion_handles_missing_empty_order_and_duplicates ... ok
+test committed_labels_are_nonvacuous_and_in_scope ... ok
+test real_engine_report_is_repeatable ... ok
+test offline_runner_reports_exact_sets_and_exits_for_the_gate ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.42s
+
+     Running tests/assertion_precision_baseline.rs (target/debug/deps/assertion_precision_baseline-f1b75c9efe648291)
+
+running 5 tests
+test budget_eviction ... ignored, capability gate; run explicitly, not an instrument correctness test
+test hard_negatives ... ignored, capability gate; run explicitly, not an instrument correctness test
+test namespace_leak ... ignored, capability gate; run explicitly, not an instrument correctness test
+test session_noise ... ignored, capability gate; run explicitly, not an instrument correctness test
+test supersede_resurfacing ... ignored, capability gate; run explicitly, not an instrument correctness test
+
+test result: ok. 0 passed; 0 failed; 5 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/controlled_arms.rs (target/debug/deps/controlled_arms-731871de4af43507)
+
+running 1 test
+test controlled_retrieval_and_admission_arms_report_every_seed ... ignored, scheduled/manual aggregate-only controlled arms; never mutates production behavior
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/harness.rs (target/debug/deps/harness-ec97639f4bbe07f4)
+
+running 10 tests
+test keyword_path_surfaces_exact_term_match ... ok
+test report_carries_per_query_channel_attribution ... ok
+test confidence_poison_low_confidence_wrong_memory_ranks_last ... ok
+test eval_runs_with_evolution_jobs_off ... ok
+test dedup_clusters_are_scored ... ok
+test committed_fixtures_meet_baselines ... ok
+test rrf_mode_is_deterministic_across_runs ... ok
+test fixtures_run_under_both_modes_and_report_metric_delta ... ok
+test linear_mode_matches_default_eval_quality_metrics ... ok
+test report_is_deterministic_across_runs ... ok
+
+test result: ok. 10 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 4.25s
+
+     Running tests/real_model.rs (target/debug/deps/real_model-aae4d3f79f3b3cda)
+
+running 2 tests
+test composite_embedding_semantic_recall ... ignored, real-model mode: composite-embedding semantic lift; requires VOYAGE_API_KEY; run manually
+test voyage_semantic_recall_spot_check ... ignored, real-model mode: requires VOYAGE_API_KEY and live network; run manually
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/record_embeddings.rs (target/debug/deps/record_embeddings-45b8a425f0aea314)
+
+running 1 test
+test record_voyage_fixture ... ignored, recording mode: requires VOYAGE_API_KEY and live network
+
+test result: ok. 0 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/replay_model.rs (target/debug/deps/replay_model-8312a0f7e5dade54)
+
+running 4 tests
+test replayed_real_vectors_run_the_holdout_queries_offline ... ignored, holdout aggregates are measured ONLY at frozen-artifact captures (examples/capture_baseline.rs) and by the W4.1 semantic gate. Running this in the default suite surfaced holdout metrics to every local/CI iteration on ranking changes, eroding the set's held-out status (Phase-1 review). Run explicitly with `cargo test -p rb-eval --test replay_model -- --ignored` only when capturing a frozen artifact or debugging a W4.1 gate failure.
+test committed_fixture_parses_and_covers_corpus_and_holdout_texts ... ok
+test readme_quickstart_query_returns_its_target_memory ... ok
+test replayed_real_vectors_run_the_golden_queries_offline ... ok
+
+test result: ok. 3 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.72s
+
+     Running tests/score_floor_diag.rs (target/debug/deps/score_floor_diag-e7a87b411152412f)
+
+running 2 tests
+test score_floor_sweep_deterministic ... ignored, recalibration tool, not a gate: run with --ignored --nocapture
+test score_floor_sweep_replay ... ignored, recalibration tool, not a gate: run with --ignored --nocapture
+
+test result: ok. 0 passed; 0 failed; 2 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/semantic_gate.rs (target/debug/deps/semantic_gate-4547196758ccd2e6)
+
+running 2 tests
+test five_seed_linear_rrf_diagnostic ... ignored, scheduled/manual aggregate-only diagnostic: runs Linear and RRF at five preregistered chronological instants; it does not change the default
+test production_embedding_linear_gate_passes_goldens_and_untouched_holdout ... ok
+
+test result: ok. 1 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 1.11s
+
+     Running tests/semantic_safety.rs (target/debug/deps/semantic_safety-899a857e563db97c)
+
+running 7 tests
+test pilot_gate_requires_zero_instruction_poison_exposure ... ignored, pilot-blocking W4.1 zero-exposure gate; run explicitly in semantic-quality workflow
+test exact_operational_fact_returns_the_literal_evidence_span ... ok
+test low_confidence_instruction_shaped_poison_never_outranks_the_fact ... ok
+test known_instruction_poison_exposure_is_recorded_as_a_pilot_blocker ... ok
+test semantic_multi_memory_question_returns_both_required_facts ... ok
+test active_contradiction_is_disclosed_as_contested ... ok
+test archived_and_superseded_memories_have_zero_default_recall_exposure ... ok
+
+test result: ok. 6 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+     Running tests/session_replay.rs (target/debug/deps/session_replay-26f8d310f627d474)
+
+running 7 tests
+test claude_adapter_accounts_for_each_record_in_an_unidentifiable_file ... ok
+test claude_adapter_preserves_order_and_separates_tools_from_dialogue ... ok
+test claude_adapter_removes_sensitive_fixture_values_and_private_reasoning ... ok
+test opencode_adapter_uses_parts_and_marks_committed_repository_evidence ... ok
+test sessions_crossing_boundary_are_rejected_instead_of_split ... ok
+test imports_and_aggregate_report_are_deterministic_and_content_free ... ok
+test chronological_dataset_keeps_whole_sessions_and_excludes_assistant_claims ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests rb_eval
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+

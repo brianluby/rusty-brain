@@ -10,6 +10,9 @@
 # Usage:
 #   sh scripts/memory-scorecard.test.sh
 set -eu
+# Routing tests must never start a paid session on a developer machine that
+# happens to have both built binaries and a real API key configured.
+unset ANTHROPIC_API_KEY
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCORECARD_SH="${HERE}/memory-scorecard.sh"
@@ -278,4 +281,8 @@ fi
 pass "--agent claude-code does not emit a status=skip line"
 
 # ---------------------------------------------------------------------------
-printf '\nTEST PASS: memory-scorecard.sh agent-targeting functions behave correctly\n'
+# Real runner subprocesses, fake transport only: exercises planting, hooks,
+# paired controls, emitted-size accounting, aggregation, retention, and gating.
+python3 -m unittest discover -s "$HERE/tests" -p test_scorecard_controls.py -v
+
+printf '\nTEST PASS: memory-scorecard.sh routing and offline controls behave correctly\n'

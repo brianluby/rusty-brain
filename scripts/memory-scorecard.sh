@@ -11,7 +11,8 @@
 #     memory-on          rusty-brain has the fact (planted per the scenario's mode)
 #     realistic-baseline the CLAUDE.md a real team would actually have (stale/partial/large)
 #     steelman-baseline  a diligent human's CLAUDE.md (clean/current/complete)
-#     memory-off         nothing (the floor)
+#     memory-off         nothing, no hooks (the floor)
+#     length-matched-placebo neutral punctuation through BOTH actual hook channels
 #
 #   a dimension's claim (P1): memory-on BEATS realistic AND at least TIES steelman.
 #   the ONLY hard gate (P4): zero memory-induced errors (the safety property).
@@ -21,7 +22,9 @@
 # dimensions plant explicitly; capture is its own dimension.
 #
 # This file ships the PURE scoring core (judge + scorecard aggregation) with a
-# `--self-test` that needs NO API, plus the live four-arm runner.
+# `--self-test` that needs NO API, plus the live five-arm runner.
+# Injected sizes use a documented UTF-8 estimator, NOT exact model tokens.
+# See docs/eval/scorecard-controls.md for pairing, artifacts, and limitations.
 #
 # Variance protocol (P3): success is reported as a Wilson 95% CI and turns as
 # median [Q1-Q3]; a single run never gates. A run with any arm below --min-runs
@@ -213,6 +216,8 @@ write_claude_md() { # file body distractors
 # AFTER mie so the existing column indices are stable). Class B appends four more
 # fields after those stable fields:
 #   cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count
+# Columns 18-22 append injected SessionStart, prompt-time, CLAUDE.md, total
+# estimates and estimator ID. Legacy rows have UNKNOWN sizes, not zero.
 # Prints the per-dimension
 # scorecard — success as a Wilson 95% CI, turns as median [Q1-Q3] (P3: median +
 # spread, never a bare mean), and mean total_cost_usd — plus, for the
@@ -227,10 +232,23 @@ write_claude_md() { # file body distractors
 #   $1 = tsv, $2 = steelman tie margin (default $TIE_MARGIN), $3 = min_runs (default 5).
 aggregate_scorecard() {
   local tsv="$1" tie_margin="${2:-${TIE_MARGIN:-0.10}}" min_runs="${3:-5}"
+  echo "scoring: legacy-substring-proxy; SAFE is not correctness evidence. Assertion fixture: no model judge, separate/not executed here; coverage equivalence NOT established."
+  echo "injected_est: per-arm mean [start,prompt,file,total], utf8-bytes-div4-ceil-v1; not exact model tokens; excludes prompts/tool traffic/plant sessions. Legacy sizes are unknown."
   awk -F'\t' -v tie="$tie_margin" -v min_runs="$min_runs" '
     /^agent=/ { next }
     # cache-read fraction cr/(cr+in) — 0 when there is no input (ADR-3 diag).
     function ratio(cr, inp) { if (cr + inp == 0) return 0; return cr / (cr + inp) }
+    # Never coerce absent historical measurements to zero.
+    function add_inj(k) {
+      inj_n[k]++;
+      if (NF < 22 || $22 != "utf8-bytes-div4-ceil-v1") { inj_unknown[k]=1; return }
+      inj_start[k]+=$18; inj_prompt[k]+=$19; inj_file[k]+=$20; inj_total[k]+=$21;
+    }
+    function injected(k) {
+      if (inj_unknown[k] || inj_n[k]==0) return "injected_est[start=?,prompt=?,file=?,total=?]";
+      return sprintf("injected_est[start=%.1f,prompt=%.1f,file=%.1f,total=%.1f]",
+        inj_start[k]/inj_n[k], inj_prompt[k]/inj_n[k], inj_file[k]/inj_n[k], inj_total[k]/inj_n[k]);
+    }
     # insertion sort arr[1..n] in place
     function sortarr(arr, n,   i, j, v) {
       for (i = 2; i <= n; i++) { v = arr[i]; j = i - 1;
@@ -263,7 +281,7 @@ aggregate_scorecard() {
       cost=$8; inp=$9; cc=$10; cr=$11; is_err=$13;
       cap_fid=$14; cap_reason=$15; cap_summary=$16; cap_mcp=$17;
       key = dim SUBSEP arm;
-      n[key]++; s[key]+=succ;
+      n[key]++; s[key]+=succ; add_inj(key);
       co[key]+=cost; ci_in[key]+=inp; ci_cc[key]+=cc; ci_cr[key]+=cr;
       if (is_err == "true") err[key]++;
       # Track per-RUN cost collapse: a non-errored run with zero/absent
@@ -278,6 +296,7 @@ aggregate_scorecard() {
         csc=$2;
         cap_scenarios[csc]=1;
         cap_n[csc]++; cap_s[csc]+=cap_fid+0;
+        add_inj("capture-scenario" SUBSEP csc); add_inj("capture-total");
         cap_summary_total[csc]+=cap_summary+0; cap_mcp_total[csc]+=cap_mcp+0;
         cap_reason_count[csc SUBSEP cap_reason]++;
         cap_total_n++; cap_total_s+=cap_fid+0;
@@ -287,16 +306,16 @@ aggregate_scorecard() {
     }
     END {
       directional = 0;
-      split("memory-on realistic-baseline steelman-baseline memory-off", order, " ");
+      split("memory-on realistic-baseline steelman-baseline memory-off length-matched-placebo", order, " ");
       printf "%-15s %-18s %5s %16s %16s %9s\n", "dimension", "arm", "runs", "success [95% CI]", "med_turns [Q1-Q3]", "mcost$";
       pass_dims=0; total_dims=0;
       for (d in dims) {
         total_dims++;
-        for (i=1;i<=4;i++) {
+        for (i=1;i<=5;i++) {
           a=order[i]; key=d SUBSEP a;
           if (n[key]==0) {
             directional = 1;   # missing arm = incomplete data → never gate (P3)
-            printf "%-15s %-18s %5d %16s %16s %9s\n", d, a, 0, "n/a", "n/a", "n/a"; continue
+            printf "%-15s %-18s %5d %16s %16s %9s %s\n", d, a, 0, "n/a", "n/a", "n/a", injected(key); continue
           }
           rate[key]=s[key]/n[key];
           if (n[key] < min_runs) directional = 1;
@@ -304,8 +323,8 @@ aggregate_scorecard() {
           for (r=1;r<=n[key];r++){ m++; tarr[m]=tv[key SUBSEP r] }
           med = pctile(tarr, m, 0.5); q1 = pctile(tarr, m, 0.25); q3 = pctile(tarr, m, 0.75);
           wilson(s[key], n[key]);
-          printf "%-15s %-18s %5d %5.0f%% [%.1f-%.1f] %8.1f [%.1f-%.1f] %9.4f\n",
-                 d, a, n[key], rate[key]*100, wil_lo*100, wil_hi*100, med, q1, q3, co[key]/n[key];
+          printf "%-15s %-18s %5d %5.0f%% [%.1f-%.1f] %8.1f [%.1f-%.1f] %9.4f %s\n",
+                 d, a, n[key], rate[key]*100, wil_lo*100, wil_hi*100, med, q1, q3, co[key]/n[key], injected(key);
         }
         # A verdict needs all three comparison arms present; a missing baseline
         # would default its rate to 0 and could falsify beats_realistic.
@@ -329,7 +348,7 @@ aggregate_scorecard() {
           printf "  -> %s: incomplete arms (no verdict)\n\n", d;
         }
       }
-      printf "scorecard: %d/%d dimensions pass (tracked, non-gating)\n", pass_dims, total_dims;
+      printf "scorecard: dimensions_passed=%d dimensions_evaluated=%d (tracked, non-gating)\n", pass_dims, total_dims;
 
       if (cap_total_n > 0) {
         split("cap_ok cap_no_session_summary cap_summary_missing_fact cap_forbidden_token cap_list_error cap_timeout cap_mcp_bypass_detected", reason_order, " ");
@@ -343,9 +362,9 @@ aggregate_scorecard() {
             if (rc > 0) { reasons = reasons sep rr "=" rc; sep = "," }
           }
           if (reasons == "") reasons = "none";
-          printf "%-28s %5d %5.0f%% [%.1f-%.1f] %9d %10d %s\n",
+          printf "%-28s %5d %5.0f%% [%.1f-%.1f] %9d %10d %s memory-on %s\n",
                  csc, cap_n[csc], 100*cap_s[csc]/cap_n[csc], wil_lo*100, wil_hi*100,
-                 cap_summary_total[csc], cap_mcp_total[csc], reasons;
+                 cap_summary_total[csc], cap_mcp_total[csc], reasons, injected("capture-scenario" SUBSEP csc);
         }
         wilson(cap_total_s, cap_total_n);
         target_met = (cap_total_s / cap_total_n >= 0.80);
@@ -355,9 +374,9 @@ aggregate_scorecard() {
           if (rc > 0) { reasons = reasons sep rr "=" rc; sep = "," }
         }
         if (reasons == "") reasons = "none";
-        printf "capture fidelity: %.0f%% [%.1f-%.1f] (%d/%d) target>=80%%=%s summaries=%d mcp_bypass=%d reasons=%s\n",
+        printf "capture fidelity: %.0f%% [%.1f-%.1f] (%d/%d) target>=80%%=%s summaries=%d mcp_bypass=%d reasons=%s memory-on %s\n",
                100*cap_total_s/cap_total_n, wil_lo*100, wil_hi*100, cap_total_s, cap_total_n,
-               (target_met?"yes":"NO"), cap_total_summary, cap_total_mcp, reasons;
+               (target_met?"yes":"NO"), cap_total_summary, cap_total_mcp, reasons, injected("capture-total");
       }
 
       # --- ADR-3 retrieval@scale token/cost (docs/eval/2026-06-19-*) ----------
@@ -372,15 +391,15 @@ aggregate_scorecard() {
         printf "\n== ADR-3 retrieval@scale token/cost (memory-on vs steelman-baseline; accuracy primary, cost secondary) ==\n";
         printf "%-20s %5s %6s %9s %10s %10s %10s %7s %9s %9s\n",
                "arm", "runs", "succ", "mcost$", "m_input", "m_ccrea", "m_cread", "cache%", "ctx_vol", "eff_in";
-        for (i=1;i<=4;i++) {
+        for (i=1;i<=5;i++) {
           a=order[i]; key=rk SUBSEP a;
           if (n[key]==0) continue;
           mc=co[key]/n[key]; mi=ci_in[key]/n[key]; mcc=ci_cc[key]/n[key]; mcr=ci_cr[key]/n[key];
           # ctx_vol = in+cc+cr (context-window pressure); eff_in = in+1.25*cc+0.1*cr
           # (cache-weighted full-price input equivalents) — both diagnostic.
-          printf "%-20s %5d %5.0f%% %9.4f %10.0f %10.0f %10.0f %6.1f%% %9.0f %9.0f\n",
+          printf "%-20s %5d %5.0f%% %9.4f %10.0f %10.0f %10.0f %6.1f%% %9.0f %9.0f %s\n",
                  a, n[key], 100*rate[key], mc, mi, mcc, mcr,
-                 100*ratio(ci_cr[key], ci_in[key]), mi+mcc+mcr, mi+1.25*mcc+0.1*mcr;
+                 100*ratio(ci_cr[key], ci_in[key]), mi+mcc+mcr, mi+1.25*mcc+0.1*mcr, injected(key);
         }
         onk=rk SUBSEP "memory-on"; stl=rk SUBSEP "steelman-baseline";
         on_cost=(n[onk]>0 ? co[onk]/n[onk] : 0); stl_cost=(n[stl]>0 ? co[stl]/n[stl] : 0);
@@ -407,8 +426,8 @@ aggregate_scorecard() {
           else if (acc_ok && !cost_ok)  v="Opt 2 candidate (accuracy wins; cost > 20% worse — consider caching the SessionStart digest)";
           else if (!acc_ok && cost_ok)  v="accuracy loses / not meaningful at scale (cost fine) — investigate retrieval, not caching";
           else                          v="descope token-cost axis (value is capture/freshness/reach per ADR-1)";
-          printf "  -> retrieval_scale: acc on %.2f vs stl %.2f [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
-                 on_acc, stl_acc, (acc_ok?"ok":"NO"), on_cost, stl_cost, (cost_ok?"ok":"NO");
+          printf "  -> retrieval_scale: acc on %.2f (%s) vs stl %.2f (%s) [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
+                 on_acc, injected(onk), stl_acc, injected(stl), (acc_ok?"ok":"NO"), on_cost, stl_cost, (cost_ok?"ok":"NO");
           printf "     => %s\n", v;
         }
       }
@@ -593,7 +612,10 @@ retainable_scorecard_artifact() { # relative_path
   # Fixed-depth regexes matter: shell case globs let `*` match `/`, so a path
   # like `fresh-r1/on/wp/on/diagnostics/index.json` (inside the model-writable
   # project) would otherwise masquerade as a harness-owned artifact.
-  if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off)/(work\.jsonl|judge\.txt)$ ]]; then
+  if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off|placebo)/(work\.jsonl|judge\.txt)$ ]]; then
+    return 0
+  fi
+  if [[ "$rel" =~ ^[^/]+/(on|placebo)/injections/(session-start\.jsonl|prompt-time\.jsonl|pair-check\.json|error\.json)$ ]]; then
     return 0
   fi
   if [[ "$rel" =~ ^[^/]+/on/(plant\.jsonl|daemon\.log)$ ]]; then
@@ -853,6 +875,7 @@ PY
     sc_row freshness s1 realistic-baseline 1 0 2 0
     sc_row freshness s1 steelman-baseline  1 1 2 0
     sc_row freshness s1 memory-off         1 0 2 0
+    sc_row freshness s1 length-matched-placebo         1 0 2 0
   } > "$good"
   if aggregate_scorecard "$good" 0.10 1 >/dev/null; then echo "ok: clean scorecard is SAFE"; else echo "BUG: clean scorecard flagged unsafe"; fail=1; fi
   if aggregate_scorecard "$good" 0.10 1 | grep -q '\-> freshness:.*=> PASS'; then echo "ok: dimension passes when it beats realistic + ties steelman"; else echo "BUG: dimension did not pass"; fail=1; fi
@@ -867,10 +890,12 @@ PY
     sc_row capture cap-one realistic-baseline 1 0 2 0
     sc_row capture cap-one steelman-baseline  1 1 2 0
     sc_row capture cap-one memory-off         1 0 2 0
+    sc_row capture cap-one length-matched-placebo         1 0 2 0
     sc_row capture cap-two memory-on          1 0 2 0 0 0 0 0 0 false 0 cap_summary_missing_fact 1 0
     sc_row capture cap-two realistic-baseline 1 0 2 0
     sc_row capture cap-two steelman-baseline  1 1 2 0
     sc_row capture cap-two memory-off         1 0 2 0
+    sc_row capture cap-two length-matched-placebo         1 0 2 0
   } > "$capagg"
   local capout; capout="$(aggregate_scorecard "$capagg" 0.10 1)"
   if printf '%s' "$capout" | grep -qF 'Class B capture fidelity'; then echo "ok: capture aggregation block prints"; else echo "BUG: capture aggregation block missing"; printf '%s\n' "$capout"; fail=1; fi
@@ -885,10 +910,12 @@ PY
     sc_row capture cap-one realistic-baseline 1 0 2 0
     sc_row capture cap-one steelman-baseline  1 1 2 0
     sc_row capture cap-one memory-off         1 0 2 0
+    sc_row capture cap-one length-matched-placebo         1 0 2 0
     sc_row capture cap-two memory-on          1 1 2 0 0 0 0 0 0 false 0 cap_summary_missing_fact 1 0
     sc_row capture cap-two realistic-baseline 1 0 2 0
     sc_row capture cap-two steelman-baseline  1 1 2 0
     sc_row capture cap-two memory-off         1 0 2 0
+    sc_row capture cap-two length-matched-placebo         1 0 2 0
   } > "$caplow"
   local caplow_out; caplow_out="$(aggregate_scorecard "$caplow" 0.10 1)"
   if printf '%s' "$caplow_out" | grep -q '\-> capture:.*capture_fidelity_target=NO.*=> no'; then echo "ok: capture dimension fails when direct fidelity target is missed"; else echo "BUG: capture dimension passed despite low direct fidelity"; printf '%s\n' "$caplow_out"; fail=1; fi
@@ -899,6 +926,7 @@ PY
     sc_row capture cap-one realistic-baseline 1 0 2 0
     sc_row capture cap-one steelman-baseline  1 1 2 0
     sc_row capture cap-one memory-off         1 0 2 0
+    sc_row capture cap-one length-matched-placebo         1 0 2 0
   } > "$caphigh"
   if aggregate_scorecard "$caphigh" 0.10 1 | grep -q '\-> capture:.*capture_fidelity_target=yes.*=> PASS'; then echo "ok: capture dimension passes when downstream and direct fidelity targets pass"; else echo "BUG: capture dimension did not pass with high direct fidelity"; aggregate_scorecard "$caphigh" 0.10 1; fail=1; fi
 
@@ -909,6 +937,7 @@ PY
     sc_row freshness s1 realistic-baseline 1 0 2 0
     sc_row freshness s1 steelman-baseline  1 1 2 0
     sc_row freshness s1 memory-off         1 0 2 0
+    sc_row freshness s1 length-matched-placebo         1 0 2 0
   } > "$rig"
   if aggregate_scorecard "$rig" 0.10 1 | grep -q '\-> freshness:.*=> no'; then echo "ok: re-rig guard — losing to steelman fails the dimension"; else echo "BUG: re-rig not caught"; fail=1; fi
 
@@ -919,6 +948,7 @@ PY
     sc_row freshness s1 realistic-baseline 1 0 2 0
     sc_row freshness s1 steelman-baseline  1 1 2 0
     sc_row freshness s1 memory-off         1 0 2 0
+    sc_row freshness s1 length-matched-placebo         1 0 2 0
   } > "$unsafe"
   if aggregate_scorecard "$unsafe" 0.10 1 >/dev/null; then echo "BUG: memory-induced error did not fail the safety gate"; fail=1; else echo "ok: memory-induced error fails the safety gate"; fi
 
@@ -944,6 +974,7 @@ PY
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 6000 0    0    100 false
+    sc_row retrieval_scale a1 length-matched-placebo         1 0 5 0 0.01 6000 0    0    100 false
   } > "$ratify"
   if aggregate_scorecard "$ratify" 0.10 1 | grep -qF 'RATIFY Opt 3'; then echo "ok: ADR-3 ratify when accuracy + cost within bounds"; else echo "BUG: ADR-3 ratify verdict"; aggregate_scorecard "$ratify" 0.10 1; fail=1; fi
 
@@ -954,6 +985,7 @@ PY
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 100   4000 9900 100 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 100   4000 9900 100 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 10000 0    0    100 false
+    sc_row retrieval_scale a1 length-matched-placebo         1 0 5 0 0.01 10000 0    0    100 false
   } > "$opt2"
   if aggregate_scorecard "$opt2" 0.10 1 | grep -qF 'Opt 2 candidate'; then echo "ok: ADR-3 Opt 2 candidate when cost > 20% worse"; else echo "BUG: ADR-3 opt2 verdict"; aggregate_scorecard "$opt2" 0.10 1; fail=1; fi
 
@@ -977,6 +1009,7 @@ PY
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0 0 0 0 0 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0 0 0 0 0 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0 0 0 0 0 false
+    sc_row retrieval_scale a1 length-matched-placebo         1 0 5 0 0 0 0 0 0 false
   } > "$zcost"
   local zout; zout="$(aggregate_scorecard "$zcost" 0.10 1)"
   if printf '%s' "$zout" | grep -qF 'SKIP cost verdict (zero/absent total_cost_usd'; then echo "ok: ADR-3 fails closed on zero/absent cost (non-errored)"; else echo "BUG: ADR-3 zero-cost skip"; printf '%s\n' "$zout"; fail=1; fi
@@ -993,6 +1026,7 @@ PY
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 steelman-baseline  2 1 3 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 6000 0    0    100 false
+    sc_row retrieval_scale a1 length-matched-placebo         1 0 5 0 0.01 6000 0    0    100 false
   } > "$pcost"
   local pout; pout="$(aggregate_scorecard "$pcost" 0.10 1)"
   if printf '%s' "$pout" | grep -qF 'SKIP cost verdict (zero/absent total_cost_usd'; then echo "ok: ADR-3 fails closed on a PARTIAL zero-cost run (mean stays positive)"; else echo "BUG: ADR-3 partial zero-cost skip"; printf '%s\n' "$pout"; fail=1; fi
@@ -1014,7 +1048,7 @@ PY
   } > "$wil"
   if aggregate_scorecard "$wil" 0.10 1 | grep -qE 'memory-on.*80% \[37\.6-96\.4\]'; then echo "ok: Wilson CI for 4/5 = 80% [37.6-96.4]"; else echo "BUG: Wilson CI wrong"; aggregate_scorecard "$wil" 0.10 1 | grep memory-on; fail=1; fi
 
-  # Complete gating run: all four arms at N=5 (>= min_runs), memory-on beats
+  # Complete gating run: all five arms at N=5 (>= min_runs), memory-on beats
   # realistic AND ties steelman, zero MIE => gates SAFE, dimension PASS, and is
   # NOT directional / not incomplete (locks the gating path vs the directional cases).
   local full="$tmp/full.tsv"
@@ -1024,6 +1058,7 @@ PY
     for t in 1 2 3 4;   do sc_row d s steelman-baseline  "$t" 1 2 0; done
                            sc_row d s steelman-baseline  5   0 2 0
     for t in 1 2 3 4 5; do sc_row d s memory-off         "$t" 0 5 0; done
+    for t in 1 2 3 4 5; do sc_row d s length-matched-placebo         "$t" 0 5 0; done
   } > "$full"
   local fout; fout="$(aggregate_scorecard "$full" 0.10 5)"
   if echo "$fout" | grep -q 'result: SAFE' && echo "$fout" | grep -q '\-> d:.*=> PASS' \
@@ -1193,7 +1228,7 @@ elif ! scorecard_agent_supported "$AGENT"; then
   exit 0
 fi
 
-# ---- live run prerequisites (the four-arm runner; needs API) -----------------
+# ---- live run prerequisites (the five-arm runner; needs API) -----------------
 [ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
 [ -d "$BIN_DIR" ] || { echo "bin dir not found: $BIN_DIR (build first with 'cargo build --release', or pass --bin-dir DIR)" >&2; exit 1; }
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
@@ -1223,6 +1258,7 @@ elif command -v gtimeout >/dev/null 2>&1; then SESSION_TIMEOUT="gtimeout ${RB_SC
 unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE RUSTY_BRAIN_IDLE_TIMEOUT_SECS
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-scorecard.XXXXXX")"
 RESULTS="${OUT:-$WORKROOT/scorecard.tsv}"; : > "$RESULTS"
+python3 "$REPO_ROOT/scripts/scorecard-controls.py" metadata "$RESULTS.metadata.json"
 if [ -n "$PRE_SCORECARD_ROWS" ]; then
   printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RESULTS"
 fi
@@ -1331,8 +1367,14 @@ score_session() { # dim id arm run proj home work expect forbid stale [cap_fidel
   local cap_fidelity="${11:-na}" cap_reason="${12:-na}" cap_summary_count="${13:-0}" cap_mcp_bypass_count="${14:-0}"
   local diagnostics_dir="${15:-}"
   local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark"
+  if [ "$arm" = "memory-on" ]; then
+    python3 "$REPO_ROOT/scripts/scorecard-controls.py" install-record "$proj" "$proj/../injections"
+  fi
+  local file_tokens injection_metrics
+  file_tokens="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" file-tokens "$proj/CLAUDE.md")"
   : > "$marker"
   run_session "$home" "$proj" "$work" "$jlog" --output-format stream-json --verbose
+  injection_metrics="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" metrics "$proj/../injections" "$file_tokens")"
   local u is_err turns cost inp cc cr out
   u="$(extract_usage "$jlog")"   # is_err turns cost input cc cr out
   is_err="$(cut -f1 <<<"$u")"; turns="$(cut -f2 <<<"$u")"; cost="$(cut -f3 <<<"$u")"
@@ -1352,15 +1394,15 @@ score_session() { # dim id arm run proj home work expect forbid stale [cap_fidel
   if [ "$arm" = "memory-on" ] && [ -n "$diagnostics_dir" ]; then
     finalize_memory_diagnostics "$diagnostics_dir" "$success" "$mie" "$expect" "$stale"
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$dim" "$id" "$arm" "$run" "$success" "$turns" "$mie" \
     "$cost" "$inp" "$cc" "$cr" "$out" "$is_err" \
-    "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count" >> "$RESULTS"
+    "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count" "$injection_metrics" >> "$RESULTS"
   local cap_msg=""
   if [ "$cap_fidelity" != "na" ]; then
     cap_msg=" cap=$cap_fidelity/$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
   fi
-  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=$mie$cap_msg"
+  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=$mie$cap_msg injected_est[start,prompt,file,total,estimator]=${injection_metrics//$'\t'/,}"
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array
@@ -1570,7 +1612,7 @@ run_scenario() { # row
           run_session "$ph" "$pp" "$plant_session" "$plog" --output-format stream-json --verbose
           IFS=$'\t' read -r cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count \
             < <(measure_capture_fidelity "$wh" "$capture_expect" "$capture_forbid")
-          echo "   [$dim/$id memory-on r$run] capture_fidelity=$cap_fidelity reason=$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
+          # Capture status is printed with its work-session injection sizes by score_session.
         else
           echo "ERROR: unknown plant_mode '$plant_mode' for $id" >&2
           exit 1
@@ -1582,7 +1624,7 @@ run_scenario() { # row
     )
     rm -rf "$sockdir" 2>/dev/null || true
 
-    # realistic-baseline + steelman-baseline + memory-off. For Class A the
+    # realistic-baseline + steelman-baseline + placebo + memory-off. For Class A the
     # distractor corpus is written into BOTH baselines' CLAUDE.md so the buried
     # target is the ONLY difference: steelman holds target + distractors (diligent
     # human), realistic holds distractors only (target omitted — the common
@@ -1594,6 +1636,14 @@ run_scenario() { # row
     local sb="$base/steelman"; seed_home "$sb/h" "$sb/p"
     write_claude_md "$sb/p/CLAUDE.md" "$steelman" "$distractors"
     score_session "$dim" "$id" "steelman-baseline" "$run" "$sb/p" "$sb/h" "$work" "$expect" "$forbid" "$stale"
+
+    # Replay neutral payloads sized from ACTUAL memory-on hook emissions, not
+    # preflight probes or planted store size. A missing/extra channel is invalid.
+    local cb="$base/placebo"; seed_home "$cb/h" "$cb/p"
+    python3 "$REPO_ROOT/scripts/scorecard-controls.py" install-placebo \
+      "$cb/p" "$cb/injections" "$mb/injections" "$expect" "$forbid" "$stale"
+    score_session "$dim" "$id" "length-matched-placebo" "$run" "$cb/p" "$cb/h" "$work" "$expect" "$forbid" "$stale"
+    python3 "$REPO_ROOT/scripts/scorecard-controls.py" validate-pair "$mb/injections" "$cb/injections"
 
     local ob="$base/off"; seed_home "$ob/h" "$ob/p"
     score_session "$dim" "$id" "memory-off" "$run" "$ob/p" "$ob/h" "$work" "$expect" "$forbid" "$stale"

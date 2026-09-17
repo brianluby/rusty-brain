@@ -1,0 +1,385 @@
+{
+  "schema_version": 1,
+  "judge_used": false,
+  "no_judge_statement": "No LLM, model judge, prose substring scoring, or external service is used. Labels are fixed locally authored memory ID sets.",
+  "fixture_sha256": "b431b1cd6e296a1646792d14a1fc883b1b9c00e2af6d930bee327ba6eb9fed88",
+  "retrieval_path": "MemoryEngine::compose_note -> SqliteBackend/SqliteStore -> MemoryEngine::recall_with_status (FTS5 + sqlite-vec + graph)",
+  "embedding_provider": "DeterministicProvider(dim=32); offline, nonsemantic",
+  "limits": [
+    "Authored finite corpus, not semantic generalization or agent task success.",
+    "No daemon transport, capture hooks, auto-link generation, or concurrency coverage.",
+    "Five-slot retrieval budget only; hook rendering and its 200-character projection are not exercised.",
+    "Namespace selection is not an authorization guarantee.",
+    "A passing class is not evidence of a reproduced baseline failure or a subsequent fix."
+  ],
+  "cases": [
+    {
+      "id": "hard-negative-environment",
+      "failure_class": "hard_negative",
+      "rationale": "Production endpoint evidence is useful; a development endpoint sharing the same terms is not evidence for production.",
+      "queries": [
+        {
+          "query": "production health endpoint port path",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000001"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000002",
+            "12180000-0000-4000-8000-000000000001"
+          ],
+          "missing_ids": [],
+          "extra_ids": [
+            "12180000-0000-4000-8000-000000000002"
+          ],
+          "duplicate_ids": [],
+          "passed": false,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000002",
+              "score": 0.46678865,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000001",
+              "score": 0.44620338,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": false
+    },
+    {
+      "id": "hard-negative-unknown",
+      "failure_class": "hard_negative",
+      "rationale": "No belief answers the payroll retention question; exact empty set is required, not a plausible unrelated memory.",
+      "queries": [
+        {
+          "query": "payroll retention policy",
+          "limit": 5,
+          "expected_ids": [],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000004"
+          ],
+          "missing_ids": [],
+          "extra_ids": [
+            "12180000-0000-4000-8000-000000000004"
+          ],
+          "duplicate_ids": [],
+          "passed": false,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000004",
+              "score": 0.22528712,
+              "channels": {
+                "fts": false,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": false
+    },
+    {
+      "id": "supersede-chain",
+      "failure_class": "supersede_resurfacing",
+      "rationale": "Only the latest deploy timeout is valid. Both ancestors are superseded through the real atomic store operation, with graph edges back to ancestors.",
+      "queries": [
+        {
+          "query": "deploy API timeout policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000007"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000007"
+          ],
+          "missing_ids": [],
+          "extra_ids": [],
+          "duplicate_ids": [],
+          "passed": true,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000007",
+              "score": 0.4214963,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "five-slot-budget",
+      "failure_class": "budget_eviction",
+      "rationale": "Five independent production deploy requirements must all survive the five-slot budget. Higher-importance session chatter about the same deployment is not a requirement.",
+      "queries": [
+        {
+          "query": "production deploy requirements",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000008",
+            "12180000-0000-4000-8000-000000000009",
+            "12180000-0000-4000-8000-000000000010",
+            "12180000-0000-4000-8000-000000000011",
+            "12180000-0000-4000-8000-000000000012"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000009",
+            "12180000-0000-4000-8000-000000000008",
+            "12180000-0000-4000-8000-000000000012",
+            "12180000-0000-4000-8000-000000000018",
+            "12180000-0000-4000-8000-000000000014"
+          ],
+          "missing_ids": [
+            "12180000-0000-4000-8000-000000000010",
+            "12180000-0000-4000-8000-000000000011"
+          ],
+          "extra_ids": [
+            "12180000-0000-4000-8000-000000000014",
+            "12180000-0000-4000-8000-000000000018"
+          ],
+          "duplicate_ids": [],
+          "passed": false,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000009",
+              "score": 0.42000002,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000008",
+              "score": 0.27359137,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000012",
+              "score": 0.27,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000018",
+              "score": 0.2529807,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000014",
+              "score": 0.22445704,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": false
+    },
+    {
+      "id": "namespace-selection",
+      "failure_class": "namespace_leak",
+      "rationale": "Engine bound to project:precision must not select the matching project:other, global or session rows, including a cross-project graph edge. This is selection scope, not authorization.",
+      "queries": [
+        {
+          "query": "service endpoint policy production",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000019"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000019"
+          ],
+          "missing_ids": [],
+          "extra_ids": [],
+          "duplicate_ids": [],
+          "passed": true,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000019",
+              "score": 0.42000002,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "session-topic-drift",
+      "failure_class": "session_noise",
+      "rationale": "Sequential auth then storage questions share a project store. Earlier-topic evidence and captured session chatter must not contaminate either exact evidence set.",
+      "queries": [
+        {
+          "query": "authentication browser login policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000023"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000023",
+            "12180000-0000-4000-8000-000000000025",
+            "12180000-0000-4000-8000-000000000024",
+            "12180000-0000-4000-8000-000000000026",
+            "12180000-0000-4000-8000-000000000027"
+          ],
+          "missing_ids": [],
+          "extra_ids": [
+            "12180000-0000-4000-8000-000000000024",
+            "12180000-0000-4000-8000-000000000025",
+            "12180000-0000-4000-8000-000000000026",
+            "12180000-0000-4000-8000-000000000027"
+          ],
+          "duplicate_ids": [],
+          "passed": false,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000023",
+              "score": 0.4270611,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000025",
+              "score": 0.40374032,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000024",
+              "score": 0.22000001,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000026",
+              "score": 0.20106971,
+              "channels": {
+                "fts": false,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000027",
+              "score": 0.19500001,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        },
+        {
+          "query": "storage SQLite writes policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000024"
+          ],
+          "returned_ids": [
+            "12180000-0000-4000-8000-000000000024",
+            "12180000-0000-4000-8000-000000000027",
+            "12180000-0000-4000-8000-000000000023",
+            "12180000-0000-4000-8000-000000000026"
+          ],
+          "missing_ids": [],
+          "extra_ids": [
+            "12180000-0000-4000-8000-000000000023",
+            "12180000-0000-4000-8000-000000000026",
+            "12180000-0000-4000-8000-000000000027"
+          ],
+          "duplicate_ids": [],
+          "passed": false,
+          "returned_evidence": [
+            {
+              "id": "12180000-0000-4000-8000-000000000024",
+              "score": 0.42000002,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000027",
+              "score": 0.33611283,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000023",
+              "score": 0.30151278,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12180000-0000-4000-8000-000000000026",
+              "score": 0.19500001,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ]
+        }
+      ],
+      "passed": false
+    }
+  ],
+  "passed_cases": 2,
+  "total_cases": 6,
+  "score": 0.3333333333333333,
+  "precision_gate_passed": false
+}

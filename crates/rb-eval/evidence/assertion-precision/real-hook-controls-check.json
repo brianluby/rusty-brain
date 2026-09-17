@@ -1,0 +1,25 @@
+{
+  "result": "PASS",
+  "installer": "real debug binary; Claude presence detector stubbed with /usr/bin/true",
+  "daemon_store_hooks": "real debug binaries, fresh temporary DB/socket/HOME, deterministic embedding",
+  "live_claude": false,
+  "memory_on_metrics": "225\t196\t0\t421\tutf8-bytes-div4-ceil-v1",
+  "placebo_metrics": "225\t196\t0\t421\tutf8-bytes-div4-ceil-v1",
+  "pair_check": {
+    "matched": true,
+    "estimator": "utf8-bytes-div4-ceil-v1",
+    "exact_model_tokens": false,
+    "per_invocation_field_sizes": {
+      "SessionStart": [
+        [
+          225
+        ]
+      ],
+      "UserPromptSubmit": [
+        [
+          196
+        ]
+      ]
+    }
+  }
+}
