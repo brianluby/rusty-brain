@@ -1,0 +1,23 @@
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.31s
+     Running tests/assertion_precision.rs (target/debug/deps/assertion_precision-777d7605aa8d3610)
+
+running 1 test
+test offline_runner_reports_exact_sets_and_exits_for_the_gate ... FAILED
+
+failures:
+
+---- offline_runner_reports_exact_sets_and_exits_for_the_gate stdout ----
+
+thread 'offline_runner_reports_exact_sets_and_exits_for_the_gate' (34848741) panicked at crates/rb-eval/tests/assertion_precision.rs:11:29:
+runner must emit JSON, not silently skip: EOF while parsing a value at line 1 column 0; stderr=error: no bin target named `assertion-precision` in `rb-eval` package
+
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    offline_runner_reports_exact_sets_and_exits_for_the_gate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.11s
+
+error: test failed, to rerun pass `-p rb-eval --test assertion_precision`

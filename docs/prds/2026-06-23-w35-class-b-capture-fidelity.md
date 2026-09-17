@@ -61,8 +61,8 @@ Required fields:
   "dimension": "capture",
   "plant_mode": "auto-capture",
   "plant_session": "Decision: outbound HTTP uses ureq.",
-  "realistic_claude_md": "",
-  "steelman_claude_md": "Outbound HTTP uses ureq.",
+  "realistic_agents_md": "",
+  "steelman_agents_md": "Outbound HTTP uses ureq.",
   "work": "Choose the HTTP client for a new outbound call.",
   "expect": "ureq",
   "capture_expect": "ureq"

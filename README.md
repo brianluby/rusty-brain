@@ -4,12 +4,12 @@
 > (vector + keyword + graph) retrieval over SQLite, exposed via MCP and a CLI.
 >
 > **Status: early development.** The pieces described below are implemented and
-> covered by unit and integration tests. A bounded Claude Code scorecard has
-> provided **N=5 proxy capability evidence**, but this is not production proof:
-> performance, scale, sustained concurrency, resource exhaustion, semantic
-> quality beyond the supported local model's authored evaluation corpus, and
-> multi-machine adoption are still unmeasured. Treat it as a work in progress,
-> not a finished product.
+> covered by unit and integration tests. A bounded historical Claude Code
+> scorecard provided N=5 proxy evidence; the active runner is OMP-native and can
+> select configured models. Neither is production proof: performance, scale,
+> sustained concurrency, resource exhaustion, semantic quality beyond the
+> supported local model's authored evaluation corpus, and multi-machine adoption
+> remain unmeasured. Treat it as a work in progress, not a finished product.
 > Interfaces and the on-disk format may change.
 
 ## What it is
@@ -343,11 +343,27 @@ degrades silently and never blocks the agent. The agent surface is
 Claude Code, with Hermes discovery-gated. Per-agent setup, validation commands, and
 troubleshooting live in [docs/AGENTS.md](docs/AGENTS.md).
 
+For OMP, run these commands **from the project directory**:
+
+```bash
+rusty-brain-install install --agents omp
+rusty-brain-install status --agents omp
+omp --model openai-codex/gpt-5.6-luna
+# Remove only the intact, installer-owned extension:
+rusty-brain-install uninstall --agents omp
+```
+
+The installer embeds a standalone `.omp/extensions/rusty-brain.ts` with an
+absolute hooks-binary path; no repository checkout or npm package is required.
+OMP global installation is intentionally unsupported. Reinstall and uninstall
+preserve unowned or locally modified files and report the conflict.
+
 Current agent capability matrix:
 
 | Agent | Adapter | Capture | Retrieval | Config | Scorecard | Lifecycle source / limitation |
 |---|---|---|---|---|---|---|
-| `claude-code` | stable | supported | supported | supported | supported | Fixture-backed `SessionEnd` lifecycle under `crates/rb-hooks/tests/fixtures/claude_code/`. |
+| `claude-code` | stable | supported | supported | supported | unsupported | Fixture-backed `SessionEnd` lifecycle under `crates/rb-hooks/tests/fixtures/claude_code/`; its scorecard runner is retired. |
+| `omp` | experimental | supported | supported | supported | supported | Project-local native extension; OMP 18.2.4 Luna/Terra probes verify prompt recall, native write capture, and shutdown folding. Global install is unsupported; [bounded evidence](docs/eval/omp-extension-verification.json). |
 | `codex` | experimental | partial | unsupported | partial | unsupported | `Stop` remains a no-op boundary until real fixtures prove a checkpoint or terminus; `apply_patch` capture is live-fixture-verified ([openai/codex#16732](https://github.com/openai/codex/issues/16732) shipped in Codex 0.123.0). |
 | `opencode` | experimental | supported | unsupported | unsupported | unsupported | `session.idle` folds via canonical `SessionCheckpoint`; bash and `apply_patch` file-edit capture are fixture-backed. Installer/plugin support is deferred. |
 | `gemini` | experimental | partial | unsupported | partial | unsupported | Native `SessionEnd` remains canonical `Stop`; terminus mapping is descoped from the cross-CLI track. |
@@ -356,10 +372,10 @@ Current agent capability matrix:
 The scorecard runner is target-aware:
 
 ```bash
-scripts/memory-scorecard.sh --agent claude-code --runs 1
+scripts/memory-scorecard.sh --agent omp --model @slow --runs 1
 scripts/memory-scorecard.sh --agent codex --runs 1      # explicit skip today
 scripts/memory-scorecard.sh --agent opencode --runs 1   # explicit skip today
-scripts/memory-scorecard.sh --agent all --runs 1        # prints skips, then runs Claude Code
+scripts/memory-scorecard.sh --agent all --runs 1        # prints skips, then runs OMP
 ```
 
 ## Configuration
@@ -463,6 +479,32 @@ shipped runtime components.
 | `rb-contract-guard` *(CI/dev-only)* | Detects protocol/schema drift and requires an explicit compatibility decision. |
 
 ## Development
+
+Install the local supply-chain gate with `brew install cargo-deny` on macOS
+(or `cargo install cargo-deny --locked`). `cargo deny check` uses `deny.toml`,
+including its all-features graph, for the same advisory, license, ban, and source
+policy enforced by CI. An installed tool is not a clean verdict: investigate
+any findings instead of adding blanket exceptions.
+
+Optional local compiler caching: `brew install sccache`, then merge the following
+into **your user** `~/.cargo/config.toml` (not the repository):
+
+```toml
+[build]
+rustc-wrapper = "sccache"
+incremental = false # rustc incremental compilations cannot be cached by sccache
+```
+
+Keep `sccache` on `PATH`. On macOS the default disk cache is
+`~/Library/Caches/Mozilla.sccache`, capped at 10 GiB with least-recently-used
+eviction. Inspect it with `sccache --show-stats`; configure `[cache.disk]` in
+`~/Library/Application Support/Mozilla.sccache/config` to change `dir` or `size`
+(bytes), then restart the server with `sccache --stop-server` before the next build.
+The wrapper primarily reuses unchanged compilation inputs, not linking or arbitrary
+source edits. To compare with Cargo's native incremental mode for one build, use
+`RUSTC_WRAPPER= CARGO_INCREMENTAL=1 cargo build --workspace`.
+See [Vega build tooling](docs/vega-build-tooling.md) for measured cache results,
+verification evidence, and the current supply-chain finding triage.
 
 ```bash
 cargo build                                                   # default (lean) build

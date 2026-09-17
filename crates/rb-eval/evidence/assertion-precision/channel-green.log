@@ -1,0 +1,19 @@
+   Compiling ring v0.17.14
+   Compiling rustls-webpki v0.103.13
+   Compiling rustls v0.23.40
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling rb-embed v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-embed)
+   Compiling rb-engine v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-engine)
+   Compiling rb-enrich v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-enrich)
+   Compiling rb-daemon v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-daemon)
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.21s
+     Running tests/assertion_precision.rs (target/debug/deps/assertion_precision-aa2f31b1be2facb6)
+
+running 1 test
+test offline_runner_reports_exact_sets_and_exits_for_the_gate ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.67s
+

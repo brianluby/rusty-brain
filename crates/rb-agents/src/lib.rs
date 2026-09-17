@@ -17,6 +17,7 @@ mod event;
 mod gemini;
 pub mod install;
 mod namespace;
+mod omp;
 mod opencode;
 pub mod proc;
 pub mod recall_contract;
@@ -34,5 +35,6 @@ pub use install::{
     AgentInstaller, HookFragment, InstallScope, ManagedFile, ManagedTextBlock, SENTINEL,
 };
 pub use namespace::detect_namespace;
+pub use omp::OmpCli;
 pub use opencode::OpenCodeCli;
 pub use proc::run_git_bounded;

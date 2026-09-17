@@ -145,12 +145,17 @@ pub trait Store {
     /// must never get its vector resurrected (live-only vec0 partition
     /// invariant; the reembed loop treats it as a per-row skip). The embedding
     /// dimension is validated fail-closed before the write.
+    /// `expected_input` is captured from the candidate before computing its
+    /// embedding. A changed input fingerprint yields `Error::StalePlan` inside
+    /// the same transaction, leaving the vector and stale stamp untouched for
+    /// a later retry. Maintenance does not change the input fingerprint.
     fn update_vector(
         &self,
         id: &MemoryId,
         embedding: &[f32],
         model: &str,
         input_version: &str,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> Result<()>;
 }
 

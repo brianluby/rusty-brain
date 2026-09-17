@@ -1,0 +1,50 @@
+   Compiling rb-types v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-types)
+   Compiling clap_derive v4.6.1
+   Compiling clap v4.6.1
+   Compiling rb-embed v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-embed)
+   Compiling rb-search v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-search)
+   Compiling rb-proto v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-proto)
+   Compiling rb-store v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-store)
+   Compiling rb-config v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-config)
+   Compiling rb-engine v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-engine)
+   Compiling rb-mcp v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-mcp)
+   Compiling rb-enrich v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-enrich)
+   Compiling rb-daemon v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-daemon)
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 5.23s
+     Running tests/assertion_precision_baseline.rs (target/debug/deps/assertion_precision_baseline-b9bc98caad47eba8)
+
+running 5 tests
+test budget_eviction ... {"case":"five-slot-budget","class":"budget_eviction","expected_ids":["12180000-0000-4000-8000-000000000008","12180000-0000-4000-8000-000000000009","12180000-0000-4000-8000-000000000010","12180000-0000-4000-8000-000000000011","12180000-0000-4000-8000-000000000012"],"passed":false,"query":"production deploy requirements","returned_ids":["12180000-0000-4000-8000-000000000008","12180000-0000-4000-8000-000000000009","12180000-0000-4000-8000-000000000012","12180000-0000-4000-8000-000000000014","12180000-0000-4000-8000-000000000018"]}
+
+thread 'budget_eviction' (34837542) panicked at crates/rb-eval/tests/assertion_precision_baseline.rs:54:5:
+exact ID-set capability failures: [String("five-slot-budget")]
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+FAILED
+test hard_negatives ... {"case":"hard-negative-environment","class":"hard_negative","expected_ids":["12180000-0000-4000-8000-000000000001"],"passed":false,"query":"production health endpoint port path","returned_ids":["12180000-0000-4000-8000-000000000001","12180000-0000-4000-8000-000000000002"]}
+{"case":"hard-negative-unknown","class":"hard_negative","expected_ids":[],"passed":false,"query":"payroll retention policy","returned_ids":["12180000-0000-4000-8000-000000000004"]}
+
+thread 'hard_negatives' (34837543) panicked at crates/rb-eval/tests/assertion_precision_baseline.rs:54:5:
+exact ID-set capability failures: [String("hard-negative-environment"), String("hard-negative-unknown")]
+FAILED
+test namespace_leak ... {"case":"namespace-selection","class":"namespace_leak","expected_ids":["12180000-0000-4000-8000-000000000019"],"passed":true,"query":"service endpoint policy production","returned_ids":["12180000-0000-4000-8000-000000000019"]}
+ok
+test session_noise ... {"case":"session-topic-drift","class":"session_noise","expected_ids":["12180000-0000-4000-8000-000000000023"],"passed":false,"query":"authentication browser login policy","returned_ids":["12180000-0000-4000-8000-000000000023","12180000-0000-4000-8000-000000000024","12180000-0000-4000-8000-000000000025","12180000-0000-4000-8000-000000000026","12180000-0000-4000-8000-000000000027"]}
+{"case":"session-topic-drift","class":"session_noise","expected_ids":["12180000-0000-4000-8000-000000000024"],"passed":false,"query":"storage SQLite writes policy","returned_ids":["12180000-0000-4000-8000-000000000023","12180000-0000-4000-8000-000000000024","12180000-0000-4000-8000-000000000026","12180000-0000-4000-8000-000000000027"]}
+
+thread 'session_noise' (34837545) panicked at crates/rb-eval/tests/assertion_precision_baseline.rs:54:5:
+exact ID-set capability failures: [String("session-topic-drift"), String("session-topic-drift")]
+FAILED
+test supersede_resurfacing ... {"case":"supersede-chain","class":"supersede_resurfacing","expected_ids":["12180000-0000-4000-8000-000000000007"],"passed":true,"query":"deploy API timeout policy","returned_ids":["12180000-0000-4000-8000-000000000007"]}
+ok
+
+failures:
+
+failures:
+    budget_eviction
+    hard_negatives
+    session_noise
+
+test result: FAILED. 2 passed; 3 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.05s
+
+error: test failed, to rerun pass `-p rb-eval --test assertion_precision_baseline`

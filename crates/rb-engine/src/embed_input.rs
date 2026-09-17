@@ -24,7 +24,9 @@ pub const EMBEDDING_INPUT_VERSION: &str = "v2-composite";
 ///
 /// Pure and deterministic: the same note always yields the same string. The
 /// query is NOT composed this way — only the document representation changes
-/// (A-MEM does the same; query symmetry is not required).
+/// (A-MEM does the same; query symmetry is not required). If the consumed field
+/// set changes, update `rb_types::EmbeddingInputFingerprint` too: reembed uses
+/// that raw-field fingerprint to reject results raced by an input edit.
 pub fn embedding_input(note: &MemoryNote) -> String {
     let mut parts: Vec<String> = Vec::with_capacity(4);
 

@@ -28,6 +28,15 @@ pub struct ManagedFile {
     pub contents: String,
 }
 
+/// A native extension asset, managed by its content hash rather than JSON hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedAsset {
+    /// Canonical project root; every target component below it must be non-symlink.
+    pub project_root: PathBuf,
+    /// Standalone extension source, without the writer's ownership header.
+    pub contents: String,
+}
+
 /// A marker-delimited block appended to a UTF-8 text file (e.g. the W3.2(b)
 /// memory-policy block in a project `CLAUDE.md`). The writer wraps `body` in
 /// begin/end markers keyed by `marker_id`, so re-install REPLACES the block
@@ -46,15 +55,15 @@ pub struct ManagedTextBlock {
     pub body: String,
 }
 
-/// A config-file path plus the sentinel-keyed JSON block to deep-merge into it,
-/// and the non-JSON managed side-effects (permission allowlist entries, whole
-/// files, marker-delimited text blocks) the engine applies on install and
-/// reverses on uninstall. `hook_fragment` produces this purely (no I/O); Part Y
-/// performs the atomic writes.
+/// A config-file path plus either a JSON hooks merge or a native extension asset.
+/// JSON fragments may also carry permission entries, whole files, and text blocks.
+/// The engine performs writes; fragment construction may resolve filesystem paths.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookFragment {
     pub config_path: PathBuf,
     pub merge: serde_json::Value,
+    /// When set, `config_path` names this asset and `merge` is not used.
+    pub owned_asset: Option<OwnedAsset>,
     /// W3.2(c): entries unioned into the config's `permissions.allow` array
     /// (idempotent add on install, removed on uninstall). Empty for installers
     /// that need none. A permission string cannot carry the JSON sentinel, so it
@@ -76,9 +85,22 @@ impl HookFragment {
         Self {
             config_path,
             merge,
+            owned_asset: None,
             allow_entries: Vec::new(),
             managed_files: Vec::new(),
             text_blocks: Vec::new(),
+        }
+    }
+
+    /// A standalone native extension; no JSON hook configuration is written.
+    #[must_use]
+    pub fn asset(config_path: PathBuf, project_root: PathBuf, contents: String) -> Self {
+        Self {
+            owned_asset: Some(OwnedAsset {
+                project_root,
+                contents,
+            }),
+            ..Self::new(config_path, serde_json::Value::Null)
         }
     }
 
@@ -108,9 +130,9 @@ impl HookFragment {
 /// ONLY blocks carrying this sentinel; merge preserves all other user hooks.
 pub const SENTINEL: &str = "rusty-brain";
 
-/// Per-CLI installer: identity, PATH-based detection, and a PURE hook-fragment
-/// builder. `detect` runs `<binary> --version` with a short timeout (NO shell);
-/// `hook_fragment` performs no I/O.
+/// Per-CLI installer: identity, PATH-based detection, and a hook-fragment builder.
+/// `detect` runs `<binary> --version` with a short timeout (NO shell).
+/// `hook_fragment` may resolve paths but never writes files.
 pub trait AgentInstaller {
     fn id(&self) -> AgentId;
     fn detect(&self) -> Option<String>;

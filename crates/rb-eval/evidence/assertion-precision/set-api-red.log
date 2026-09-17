@@ -1,0 +1,20 @@
+   Compiling ring v0.17.14
+   Compiling rustls-webpki v0.103.13
+   Compiling rustls v0.23.40
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling rb-embed v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-embed)
+   Compiling rb-engine v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-engine)
+   Compiling rb-enrich v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-enrich)
+   Compiling rb-daemon v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-daemon)
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+error[E0432]: unresolved import `rb_eval::assertion_precision::assert_exact_ids`
+ --> crates/rb-eval/tests/assertion_precision.rs:4:5
+  |
+4 | use rb_eval::assertion_precision::assert_exact_ids;
+  |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no `assert_exact_ids` in `assertion_precision`
+
+For more information about this error, try `rustc --explain E0432`.
+error: could not compile `rb-eval` (test "assertion_precision") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...

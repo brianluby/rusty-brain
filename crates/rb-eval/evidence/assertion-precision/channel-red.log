@@ -1,0 +1,32 @@
+   Compiling ring v0.17.14
+   Compiling rustls-webpki v0.103.13
+   Compiling rustls v0.23.40
+   Compiling tokio-rustls v0.26.4
+   Compiling hyper-rustls v0.27.9
+   Compiling reqwest v0.12.28
+   Compiling rb-embed v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-embed)
+   Compiling rb-engine v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-engine)
+   Compiling rb-enrich v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-enrich)
+   Compiling rb-daemon v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-daemon)
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.68s
+     Running tests/assertion_precision.rs (target/debug/deps/assertion_precision-aa2f31b1be2facb6)
+
+running 1 test
+test offline_runner_reports_exact_sets_and_exits_for_the_gate ... FAILED
+
+failures:
+
+---- offline_runner_reports_exact_sets_and_exits_for_the_gate stdout ----
+
+thread 'offline_runner_reports_exact_sets_and_exits_for_the_gate' (34878703) panicked at crates/rb-eval/tests/assertion_precision.rs:26:66:
+return actual production scores and channel attribution
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+
+
+failures:
+    offline_runner_reports_exact_sets_and_exits_for_the_gate
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 0 filtered out; finished in 2.18s
+
+error: test failed, to rerun pass `-p rb-eval --test assertion_precision`

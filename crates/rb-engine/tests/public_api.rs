@@ -226,17 +226,23 @@ impl MemoryBackend for VecBackend {
         _embedding: Vec<f32>,
         model: String,
         input_version: String,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> rb_types::Result<()> {
         // Fail closed on a missing id, like SqliteStore::update_vector, so the
         // public-API backend matches the store-backed behavior.
         let mut guard = self.notes.lock().unwrap();
         match guard.get_mut(&id) {
-            Some(note) => {
+            Some(note) if note.archived_at.is_none() => {
+                if rb_types::EmbeddingInputFingerprint::from(&*note) != expected_input {
+                    return Err(rb_types::Error::StalePlan(
+                        "embedding inputs changed; retry reembed".into(),
+                    ));
+                }
                 note.embedding_model = model;
                 note.embedding_input_version = input_version;
                 Ok(())
             }
-            None => Err(rb_types::Error::NotFound(id)),
+            _ => Err(rb_types::Error::NotFound(id)),
         }
     }
 }

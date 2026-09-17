@@ -182,6 +182,156 @@ async fn full_round_trip_through_client() {
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recall_over_the_wire_excludes_superseded_session_decisions() {
+    let daemon = RunningDaemon::start(4).await;
+    let namespace = Namespace::Project("production-shaped-supersede".to_string());
+    let mut client = Client::connect(&daemon.socket, namespace).await.unwrap();
+
+    let first = client
+        .remember(
+            "Deploy policy: API timeout is 15 seconds.".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let second = client
+        .remember_superseding(
+            "Deploy policy: API timeout is 30 seconds.".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            first.clone(),
+        )
+        .await
+        .unwrap();
+    let current = client
+        .remember_superseding(
+            "Deploy policy: API timeout is 45 seconds.".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            second.clone(),
+        )
+        .await
+        .unwrap();
+
+    let recalled = client
+        .recall("deploy API timeout policy".to_string(), None, vec![], 5)
+        .await
+        .unwrap();
+    let recalled_ids: Vec<_> = recalled
+        .into_iter()
+        .map(|result| result.memory.id)
+        .collect();
+    assert_eq!(
+        recalled_ids,
+        vec![current],
+        "the daemon Remember(supersedes) path must archive every prior decision before recall"
+    );
+    assert!(client
+        .get(first)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
+    assert!(client
+        .get(second)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
+
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn recall_over_the_wire_stays_inside_the_handshake_namespace() {
+    let daemon = RunningDaemon::start(4).await;
+    let local = Namespace::Project("production-shaped-local".to_string());
+    let foreign = Namespace::Project("production-shaped-foreign".to_string());
+    let mut local_client = Client::connect(&daemon.socket, local).await.unwrap();
+    let mut foreign_client = Client::connect(&daemon.socket, foreign).await.unwrap();
+
+    let local_id = local_client
+        .remember(
+            "Release policy: production deployment requires an approved rollback plan.".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let foreign_id = foreign_client
+        .remember(
+            "Release policy: production deployment requires an approved rollback plan.".to_string(),
+            None,
+            MemoryType::ArchitectureDecision,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+
+    let link_error = local_client
+        .link(
+            local_id.clone(),
+            foreign_id.clone(),
+            rb_types::LinkType::References,
+            Some("must not create cross-project graph edges".to_string()),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(link_error, Error::Storage(_)),
+        "a foreign link endpoint must be rejected over the wire: {link_error:?}"
+    );
+
+    let recalled = local_client
+        .recall(
+            "production deployment approved rollback plan".to_string(),
+            None,
+            vec![],
+            5,
+        )
+        .await
+        .unwrap();
+    let recalled_ids: Vec<_> = recalled
+        .into_iter()
+        .map(|result| result.memory.id)
+        .collect();
+    assert_eq!(
+        recalled_ids,
+        vec![local_id],
+        "same-content data in another project must never cross the wire recall boundary"
+    );
+
+    daemon.stop().await;
+}
+
 // W2.2: the trust machinery is reachable end-to-end over the wire — an agent
 // can create a contradicts link and lower confidence, and reads then surface
 // `contested` and the new prior.

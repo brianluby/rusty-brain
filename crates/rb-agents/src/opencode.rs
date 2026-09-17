@@ -118,6 +118,7 @@ impl AgentCli for OpenCodeCli {
             session_id,
             // OpenCode's event payloads do not document a transcript-path field.
             transcript_path: None,
+            transcript_jsonl: None,
         }
     }
 

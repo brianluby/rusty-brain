@@ -1,7 +1,7 @@
 //! Per-CLI identity (`AgentId`), the `AgentCli` JSON-adapter trait, and the
 //! `agent_for` registry. Every `AgentId` maps to a real per-CLI adapter
-//! (`ClaudeCodeCli`/`OpenCodeCli`/`GeminiCli`/`CodexCli`) that normalizes that
-//! CLI's hook JSON into the canonical event model.
+//! (`ClaudeCodeCli`/`OpenCodeCli`/`GeminiCli`/`CodexCli`/`OmpCli`) that normalizes
+//! that CLI's hook JSON into the canonical event model.
 
 use serde_json::Value;
 
@@ -9,6 +9,7 @@ use crate::claude_code::ClaudeCodeCli;
 use crate::codex::CodexCli;
 use crate::event::{HookContext, HookResult};
 use crate::gemini::GeminiCli;
+use crate::omp::OmpCli;
 use crate::opencode::OpenCodeCli;
 
 /// The set of CLIs the agent surface targets in P4-v1.
@@ -18,6 +19,7 @@ pub enum AgentId {
     OpenCode,
     Gemini,
     Codex,
+    Omp,
 }
 
 impl AgentId {
@@ -28,6 +30,7 @@ impl AgentId {
             AgentId::OpenCode => "opencode",
             AgentId::Gemini => "gemini",
             AgentId::Codex => "codex",
+            AgentId::Omp => "omp",
         }
     }
 
@@ -38,6 +41,7 @@ impl AgentId {
             "opencode" => Some(AgentId::OpenCode),
             "gemini" => Some(AgentId::Gemini),
             "codex" => Some(AgentId::Codex),
+            "omp" => Some(AgentId::Omp),
             _ => None,
         }
     }
@@ -55,7 +59,7 @@ pub trait AgentCli: Send + Sync {
 
 /// Construct the [`AgentCli`] adapter for the given [`AgentId`].
 ///
-/// Registry: one boxed adapter per supported CLI. All four are JSON-protocol
+/// Registry: one boxed adapter per supported CLI. All five are JSON-protocol
 /// adapters; the returned trait object normalizes that CLI's hook JSON into the
 /// canonical [`HookContext`] and renders a canonical [`HookResult`] back.
 #[must_use]
@@ -65,6 +69,7 @@ pub fn agent_for(id: AgentId) -> Box<dyn AgentCli> {
         AgentId::OpenCode => Box::new(OpenCodeCli),
         AgentId::Gemini => Box::new(GeminiCli),
         AgentId::Codex => Box::new(CodexCli),
+        AgentId::Omp => Box::new(OmpCli),
     }
 }
 
@@ -80,6 +85,7 @@ mod tests {
             AgentId::OpenCode,
             AgentId::Gemini,
             AgentId::Codex,
+            AgentId::Omp,
         ] {
             let s = id.as_str();
             assert_eq!(AgentId::parse(s), Some(id));
@@ -92,6 +98,7 @@ mod tests {
         assert_eq!(AgentId::OpenCode.as_str(), "opencode");
         assert_eq!(AgentId::Gemini.as_str(), "gemini");
         assert_eq!(AgentId::Codex.as_str(), "codex");
+        assert_eq!(AgentId::Omp.as_str(), "omp");
     }
 
     #[test]
@@ -109,7 +116,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_returns_real_adapters_for_other_three() {
+    fn registry_returns_real_adapters_for_other_four() {
         let opencode = agent_for(AgentId::OpenCode);
         assert_eq!(opencode.id(), AgentId::OpenCode);
         assert_eq!(opencode.binary_name(), "opencode");
@@ -121,6 +128,10 @@ mod tests {
         let codex = agent_for(AgentId::Codex);
         assert_eq!(codex.id(), AgentId::Codex);
         assert_eq!(codex.binary_name(), "codex");
+
+        let omp = agent_for(AgentId::Omp);
+        assert_eq!(omp.id(), AgentId::Omp);
+        assert_eq!(omp.binary_name(), "omp");
     }
 
     #[test]
@@ -131,12 +142,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_for_returns_matching_id_for_all_four() {
+    fn agent_for_returns_matching_id_for_all_five() {
         for id in [
             AgentId::ClaudeCode,
             AgentId::OpenCode,
             AgentId::Gemini,
             AgentId::Codex,
+            AgentId::Omp,
         ] {
             let cli = agent_for(id);
             assert_eq!(cli.id(), id);

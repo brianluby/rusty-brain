@@ -80,6 +80,7 @@ impl AgentCli for CodexCli {
             session_id,
             // Codex's hook payloads do not document a transcript-path field.
             transcript_path: None,
+            transcript_jsonl: None,
         }
     }
 

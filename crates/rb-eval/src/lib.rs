@@ -27,6 +27,7 @@
 //! shipped crate because nothing shipped depends on `rb-eval`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+pub mod assertion_precision;
 pub mod backend;
 pub mod controlled;
 pub mod corpus;

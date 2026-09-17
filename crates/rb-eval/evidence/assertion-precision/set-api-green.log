@@ -1,0 +1,11 @@
+   Compiling rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2.24s
+     Running tests/assertion_precision.rs (target/debug/deps/assertion_precision-aa2f31b1be2facb6)
+
+running 3 tests
+test exact_assertion_rejects_any_extra_including_unknown_ids ... ok
+test exact_assertion_handles_missing_empty_order_and_duplicates ... ok
+test offline_runner_reports_exact_sets_and_exits_for_the_gate ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 3.63s
+

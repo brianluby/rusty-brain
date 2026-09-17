@@ -158,6 +158,105 @@ fn install_then_status_then_uninstall_round_trip() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn default_global_operations_configure_only_supported_agents() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let path_dir = tempfile::tempdir().unwrap();
+    fake_claude_path(path_dir.path());
+    // Include OMP on PATH: implicit global selection must skip it even when
+    // installed. Restrict PATH to the fixtures, not the host's real CLIs.
+    for name in ["gemini", "codex", "omp"] {
+        std::fs::copy(path_dir.path().join("claude"), path_dir.path().join(name)).unwrap();
+    }
+
+    for (operation, expected_status) in [
+        ("install", "configured"),
+        ("status", "present"),
+        ("uninstall", "removed"),
+        ("status", "absent"),
+    ] {
+        let output = bin()
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("PATH", path_dir.path())
+            .args(["--json", operation, "--global"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let agents = report["agents"].as_array().unwrap();
+        let ids: Vec<_> = agents
+            .iter()
+            .map(|agent| agent["agent"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, ["claude-code", "gemini", "codex"]);
+        for agent in agents {
+            assert_eq!(agent["status"], expected_status, "{report}");
+            assert!(agent["error"].is_null(), "{report}");
+        }
+        for config in [
+            ".claude/settings.json",
+            ".gemini/settings.json",
+            ".codex/hooks.json",
+        ] {
+            let settings: serde_json::Value =
+                serde_json::from_str(&std::fs::read_to_string(home.path().join(config)).unwrap())
+                    .unwrap();
+            assert_eq!(
+                has_sentinel_block(&settings),
+                matches!(expected_status, "configured" | "present")
+            );
+            assert!(!project.path().join(config).exists());
+        }
+        assert!(!home.path().join(".omp").exists());
+        assert!(!project.path().join(".omp").exists());
+    }
+}
+
+#[test]
+fn explicit_global_omp_is_rejected_even_when_not_installed() {
+    let project = tempfile::tempdir().unwrap();
+    let home = tempfile::tempdir().unwrap();
+    let empty_path = tempfile::tempdir().unwrap();
+    for args in [
+        vec!["install", "--dry-run"],
+        vec!["install"],
+        vec!["uninstall", "--dry-run"],
+        vec!["uninstall"],
+        vec!["status"],
+    ] {
+        let output = bin()
+            .current_dir(project.path())
+            .env("HOME", home.path())
+            .env("PATH", empty_path.path())
+            .args(args)
+            .args(["--json", "--global", "--agents", "omp"])
+            .assert()
+            .success()
+            .get_output()
+            .stdout
+            .clone();
+        let report: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        assert_eq!(report["status"], "failed", "{report}");
+        let agents = report["agents"].as_array().unwrap();
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0]["agent"], "omp");
+        assert_eq!(agents[0]["status"], "failed");
+        assert!(agents[0]["version"].is_null());
+        assert!(agents[0]["config_path"].is_null());
+        assert!(agents[0]["error"]
+            .as_str()
+            .unwrap()
+            .contains("[E_INSTALL_SCOPE_UNSUPPORTED]"));
+    }
+    assert!(!home.path().join(".omp").exists());
+    assert!(!project.path().join(".omp").exists());
+}
+
 #[test]
 fn unknown_agent_reports_failure_but_exits_zero() {
     let dir = tempfile::tempdir().unwrap();

@@ -104,7 +104,7 @@ pub fn version_of(binary: &Path) -> Option<String> {
 
 /// Extract the first semver-ish token (e.g. `1.2.3`) from `--version` output.
 ///
-/// Strips a leading `v`; requires a leading ASCII digit and at least one `.`.
+/// Accepts `name/version` CLI banners and a leading `v`; requires a leading digit and `.`.
 #[must_use]
 pub fn parse_version(output: &str) -> Option<String> {
     let trimmed = output.trim();
@@ -112,7 +112,11 @@ pub fn parse_version(output: &str) -> Option<String> {
         return None;
     }
     for word in trimmed.split_whitespace() {
-        let cleaned = word.trim_start_matches('v');
+        let cleaned = word
+            .rsplit('/')
+            .next()
+            .unwrap_or(word)
+            .trim_start_matches('v');
         if cleaned.chars().next().is_some_and(|c| c.is_ascii_digit()) && cleaned.contains('.') {
             return Some(cleaned.to_string());
         }
@@ -140,6 +144,7 @@ mod tests {
         assert_eq!(parse_version("claude 1.2.3"), Some("1.2.3".to_string()));
         assert_eq!(parse_version("v0.9.0"), Some("0.9.0".to_string()));
         assert_eq!(parse_version("2.0.1"), Some("2.0.1".to_string()));
+        assert_eq!(parse_version("omp/18.2.4"), Some("18.2.4".to_string()));
     }
 
     #[test]
