@@ -58,20 +58,26 @@ pub fn resolve_hooks_bin() -> PathBuf {
     }
 }
 
-/// Select installers: all shipped installers when `requested` is `None`, else
-/// exactly the named subset. Fail closed on an unknown agent id, and reject an
-/// explicitly requested agent with no persistent installer rather than silently
-/// selecting nothing.
+/// Select installers: all shipped installers supporting `scope` when `requested`
+/// is `None`, else exactly the named subset. Explicit selections retain
+/// unsupported scopes so operations report an error rather than silently skip.
+/// Fail closed on unknown agent ids or agents with no persistent installer.
 ///
 /// # Errors
 /// Returns [`InstallError::InvalidAgent`] for any unrecognized name, and
 /// [`InstallError::AgentDeferred`] when a valid agent has no installer.
 pub fn select_installers(
     requested: Option<&[String]>,
+    scope: &InstallScope,
 ) -> Result<Vec<Box<dyn AgentInstaller>>, InstallError> {
-    let all = builtins();
+    let mut all = builtins();
     match requested {
-        None => Ok(all),
+        None => {
+            if matches!(scope, InstallScope::Global) {
+                all.retain(|inst| inst.id() != AgentId::Omp);
+            }
+            Ok(all)
+        }
         Some(names) => {
             for name in names {
                 match AgentId::parse(name) {
@@ -407,8 +413,8 @@ mod tests {
     use crate::report::AgentStatus;
 
     #[test]
-    fn select_installers_all_when_none() {
-        let all = select_installers(None).unwrap();
+    fn select_installers_project_defaults_include_omp() {
+        let all = select_installers(None, &InstallScope::Project(PathBuf::from("."))).unwrap();
         let ids: Vec<_> = all.iter().map(|installer| installer.id()).collect();
         assert_eq!(
             ids,
@@ -422,8 +428,27 @@ mod tests {
     }
 
     #[test]
+    fn select_installers_global_defaults_exclude_omp() {
+        let all = select_installers(None, &InstallScope::Global).unwrap();
+        let ids: Vec<_> = all.iter().map(|installer| installer.id()).collect();
+        assert_eq!(ids, [AgentId::ClaudeCode, AgentId::Gemini, AgentId::Codex]);
+    }
+
+    #[test]
+    fn select_installers_explicit_global_mixture_retains_omp() {
+        let selected = select_installers(
+            Some(&["omp".to_string(), "codex".to_string()]),
+            &InstallScope::Global,
+        )
+        .unwrap();
+        let ids: Vec<_> = selected.iter().map(|installer| installer.id()).collect();
+        assert_eq!(ids, [AgentId::Omp, AgentId::Codex]);
+    }
+
+    #[test]
     fn select_installers_subset() {
-        let subset = select_installers(Some(&["codex".to_string()])).unwrap();
+        let subset =
+            select_installers(Some(&["codex".to_string()]), &InstallScope::Global).unwrap();
         assert_eq!(subset.len(), 1);
         assert_eq!(subset[0].id(), AgentId::Codex);
     }
@@ -433,15 +458,19 @@ mod tests {
         // Match on the result instead of `.unwrap_err()`: `Box<dyn AgentInstaller>`
         // is not `Debug`, so `unwrap_err` (which would print the Ok value) won't
         // compile. The assertion below pins the identical plan intent.
-        let result = select_installers(Some(&["cursor".to_string()]));
+        let result = select_installers(Some(&["cursor".to_string()]), &InstallScope::Global);
         assert!(matches!(result, Err(InstallError::InvalidAgent { .. })));
     }
 
     #[test]
     fn select_installers_defers_opencode_only() {
-        let result = select_installers(Some(&["opencode".to_string()]));
+        let result = select_installers(Some(&["opencode".to_string()]), &InstallScope::Global);
         assert!(matches!(result, Err(InstallError::AgentDeferred { .. })));
-        let omp = select_installers(Some(&["omp".to_string()])).unwrap();
+        let omp = select_installers(
+            Some(&["omp".to_string()]),
+            &InstallScope::Project(PathBuf::from(".")),
+        )
+        .unwrap();
         assert_eq!(omp[0].id(), AgentId::Omp);
     }
 
@@ -503,8 +532,8 @@ mod tests {
         // fresh Configure, NOT Upgraded — the old file-existence check mislabeled
         // this as Upgraded.
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
         let frag = installers[0].hook_fragment(bin, &scope).unwrap();
 
@@ -527,8 +556,8 @@ mod tests {
         // After we have already installed our block, a re-run must classify as
         // Upgraded (our sentinel is present before the merge).
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
         let frag = installers[0].hook_fragment(bin, &scope).unwrap();
 
@@ -548,8 +577,8 @@ mod tests {
     #[test]
     fn install_then_status_present_then_uninstall_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
 
         // detect() needs the binary on PATH; here it returns None (claude not

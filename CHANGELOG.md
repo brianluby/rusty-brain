@@ -27,6 +27,18 @@ All notable changes to rusty-brain are documented here. The format is based on
   chatter or changing their ordering behind durable facts.
 - Session summaries place the latest decisions before long goals so bounded
   prompt-time projections expose the outcome of the work.
+- Source priors apply to all merged retrieval candidates before final truncation,
+  so durable graph evidence cannot be evicted by unadjusted session scores.
+- Bounded transcript digests retain the latest 30 distinct decisions, refreshing
+  recency on repeats instead of freezing after the first 30.
+
+### Fixed — OMP installer and scorecard controls
+
+- Default global installer operations skip project-only OMP; explicit global OMP
+  requests still report the unsupported scope.
+- Missing scorecard-control actions report usage with exit code 2. Offline
+  routing checks resolve Bash from PATH and use an empty binary directory to
+  prevent model launches independently of host installation layout.
 
 ### Added — Scale, concurrency, and resource harness (Vikunja #57)
 

@@ -81,20 +81,26 @@ pub fn execute(cli: &Cli) -> Result<(InstallReport, bool), String> {
             global,
             dry_run,
         } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_install(&installers, &hooks_bin, &scope_for(*global), *dry_run)
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_install(&installers, &hooks_bin, &scope, *dry_run)
         }
         Command::Uninstall {
             agents,
             global,
             dry_run,
         } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_uninstall(&installers, &hooks_bin, &scope_for(*global), *dry_run)
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_uninstall(&installers, &hooks_bin, &scope, *dry_run)
         }
         Command::Status { agents, global } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_status(&installers, &hooks_bin, &scope_for(*global))
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_status(&installers, &hooks_bin, &scope)
         }
     };
     Ok((report, json))

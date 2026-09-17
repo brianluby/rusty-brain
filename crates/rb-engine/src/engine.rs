@@ -579,9 +579,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
         // hybrid (spec §7).
         let now = self.now();
+        // Retrieval limits apply per channel, not to their merged candidate set.
+        // Keep every candidate until the source prior has adjusted its score.
+        let merged_limit = signals.len();
         let mut ranked = match self.fusion_mode {
-            FusionMode::Linear => rb_search::rank(signals, self.weights, now, candidate_limit),
-            FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
+            FusionMode::Linear => rb_search::rank(signals, self.weights, now, merged_limit),
+            FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, merged_limit),
         };
         for (id, score) in &mut ranked {
             if notes.get(id).is_some_and(|note| note.session_id.is_some()) {
@@ -2457,6 +2460,51 @@ mod tests {
             expected,
             "durable facts outrank relevant captures; unrelated priors never qualify"
         );
+    }
+
+    #[tokio::test]
+    async fn session_prior_promotes_durable_graph_hit_beyond_channel_limit() {
+        for mode in [FusionMode::Linear, FusionMode::Rrf] {
+            let now = chrono::Utc::now();
+            let eng = engine().with_fixed_now(now).with_fusion_mode(mode);
+            let ids = seed_notes(&eng, 5, |i, note| {
+                note.created_at = now;
+                if i < 4 {
+                    note.session_id = Some(format!("session-{i}"));
+                    note.confidence = 0.7;
+                } else {
+                    note.importance = 10;
+                    note.confidence = 1.0;
+                }
+            })
+            .await;
+            // A one-result recall fetches four hits per channel. The four
+            // session captures match both keyword and vector retrieval, while
+            // their durable decision is reached only through a direct link.
+            let sessions = &ids[..4];
+            let durable = &ids[4];
+            eng.backend().set_keyword_results(sessions.to_vec());
+            eng.backend()
+                .set_vector_results(sessions.iter().cloned().map(|id| (id, 0.5)).collect());
+            eng.backend()
+                .set_graph_neighbors(ids[0].clone(), vec![(durable.clone(), 1)]);
+
+            // Before source adjustment all four captures outrank the durable
+            // hit under either fusion mode. Afterwards the durable hit wins:
+            // Linear 0.25 versus at most 0.2125; RRF 1/60 versus 0.0085.
+            let results = eng
+                .recall("decision", 1, &rb_types::RecallFilter::default())
+                .await
+                .unwrap();
+            assert_eq!(
+                results
+                    .into_iter()
+                    .map(|hit| hit.memory.id)
+                    .collect::<Vec<_>>(),
+                vec![durable.clone()],
+                "{mode:?} must apply the source prior before discarding merged candidates"
+            );
+        }
     }
 
     #[tokio::test]

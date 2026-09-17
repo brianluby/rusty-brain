@@ -29,6 +29,10 @@ def messages(directory):
 
 
 def main():
+    if len(sys.argv) < 2:
+        print("usage: scorecard-controls.py "
+              "{file-tokens|metrics|validate-pair|metadata} ...", file=sys.stderr)
+        raise SystemExit(2)
     action, *args = sys.argv[1:]
     if action == "file-tokens":
         path = Path(args[0])

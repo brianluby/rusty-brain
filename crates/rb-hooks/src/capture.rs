@@ -2443,6 +2443,28 @@ mod tests {
         assert!(summary.contains("Failures:") && summary.contains("1 test failed"));
     }
 
+    #[test]
+    fn build_session_summary_renders_latest_distinct_decisions_first_with_section_cap() {
+        let raw = (0..35).chain([10]).map(|i| {
+            serde_json::json!({
+                "message": {"role": "assistant", "content": format!("Decision: option {i}")}
+            })
+            .to_string()
+        });
+        let transcript = transcript::digest_from_lines(raw);
+        let summary =
+            build_session_summary(&ScratchData::default(), &[], &transcript).expect("non-empty");
+        let rendered = summary
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .collect::<Vec<_>>();
+        let expected = std::iter::once(10)
+            .chain((11..35).rev())
+            .map(|i| format!("Decision: option {i}"))
+            .collect::<Vec<_>>();
+        assert_eq!(rendered, expected);
+    }
+
     #[tokio::test]
     async fn session_end_without_scratch_continues() {
         let result = session_end(None, None, std::path::Path::new("/tmp"), None).await;

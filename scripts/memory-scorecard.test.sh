@@ -33,7 +33,11 @@ bash "$SCORECARD_SH" --agent invalid-agent >/dev/null 2>&1 || invalid_exit=$?
 [ "$invalid_exit" = 2 ] || fail "invalid --agent must exit 2, got $invalid_exit"
 pass "invalid --agent exits 2"
 
-all_output="$(PATH=/usr/bin:/bin /bin/bash "$SCORECARD_SH" --agent all 2>/dev/null || true)"
+# An empty binary directory prevents any model launch, regardless of which
+# shells or agent executables are installed on PATH.
+EMPTY_BIN_DIR="$(mktemp -d)"
+trap 'rm -rf "$EMPTY_BIN_DIR"' 0
+all_output="$(bash "$SCORECARD_SH" --bin-dir "$EMPTY_BIN_DIR" --agent all 2>/dev/null || true)"
 for agent in codex opencode gemini hermes; do
   printf '%s' "$all_output" | grep -qF "agent=$agent" \
     || fail "--agent all must report $agent as skipped"
@@ -41,8 +45,8 @@ done
 pass "--agent all reports non-OMP skips"
 
 omp_exit=0
-PATH=/usr/bin:/bin /bin/bash "$SCORECARD_SH" --agent omp --model @slow >/dev/null 2>&1 || omp_exit=$?
-[ "$omp_exit" != 0 ] || fail "OMP path unexpectedly passed without required binaries"
+bash "$SCORECARD_SH" --bin-dir "$EMPTY_BIN_DIR" --agent omp --model @slow >/dev/null 2>&1 || omp_exit=$?
+[ "$omp_exit" = 1 ] || fail "OMP path must fail the missing-binary prerequisite, got $omp_exit"
 pass "--agent omp selects the live path without starting a model"
 
 python3 -m unittest discover -s "$HERE/tests" -p test_scorecard_controls.py -v

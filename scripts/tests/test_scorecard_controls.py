@@ -32,6 +32,13 @@ class ControlsTest(unittest.TestCase):
             json.dumps({"message": message}) + "\n"
         )
 
+    def test_missing_action_is_a_usage_error(self):
+        result = self.invoke()
+        self.assertEqual(result.returncode, 2)
+        self.assertEqual(result.stdout, "")
+        self.assertIn("usage:", result.stderr.lower())
+        self.assertNotIn("Traceback", result.stderr)
+
     def test_matched_omp_receipts_emit_a_pair_receipt(self):
         self.receipt(self.on, "stored decision")
         self.receipt(self.placebo, "." * len("stored decision"))

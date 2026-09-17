@@ -40,16 +40,15 @@ pub fn has_decision_marker(text: &str) -> bool {
     DECISION_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-/// Hard cap on bytes read from a transcript (bounds work on a huge session;
-/// the first slice carries the goal + early decisions, which dominate a
-/// decision-grade summary). Reading is line-buffered so a partial trailing line
-/// is simply dropped.
+/// Hard cap on bytes read from a transcript. Only the initial input slice is
+/// parsed, not an arbitrary file tail: retained decisions are the most recent
+/// within that slice and the line budget. A partial trailing JSON line is ignored.
 const MAX_TRANSCRIPT_BYTES: u64 = 1024 * 1024;
 /// Hard cap on transcript lines parsed (a second bound independent of byte size).
 const MAX_LINES: usize = 4000;
 /// Max user prompts retained (first-seen).
 const MAX_PROMPTS: usize = 20;
-/// Max decision lines retained (first-seen).
+/// Max distinct decision lines retained, ordered by most recent occurrence.
 const MAX_DECISIONS: usize = 30;
 /// Max characters retained per extracted prompt/decision.
 const MAX_ENTRY_CHARS: usize = 1000;
@@ -59,6 +58,7 @@ const MAX_ENTRY_CHARS: usize = 1000;
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub struct TranscriptDigest {
     pub user_prompts: Vec<String>,
+    /// Oldest to newest by last occurrence within the bounded input slice.
     pub decisions: Vec<String>,
 }
 
@@ -102,24 +102,27 @@ where
         };
         if role == "user" && digest.user_prompts.len() < MAX_PROMPTS {
             let prompt = truncate(text.trim());
-            if !prompt.is_empty() && !digest.user_prompts.iter().any(|p| p == &prompt) {
-                digest.user_prompts.push(prompt);
+            if !prompt.is_empty() && !digest.user_prompts.iter().any(|p| p == prompt) {
+                digest.user_prompts.push(prompt.to_string());
             }
         }
-        // Decisions can come from either side's prose.
-        if digest.decisions.len() < MAX_DECISIONS {
-            for raw in text.lines() {
-                if digest.decisions.len() >= MAX_DECISIONS {
-                    break;
-                }
-                let cand = raw.trim();
-                if cand.is_empty() || !has_decision_marker(cand) {
-                    continue;
-                }
-                let decision = truncate(cand);
-                if !digest.decisions.iter().any(|d| d == &decision) {
-                    digest.decisions.push(decision);
-                }
+        // Decisions can come from either side's prose. Refresh exact repeats
+        // in place so they do not consume another slot or copy their text.
+        for raw in text.lines() {
+            let cand = raw.trim();
+            if cand.is_empty() || !has_decision_marker(cand) {
+                continue;
+            }
+            let decision = truncate(cand);
+            if let Some(index) = digest.decisions.iter().position(|d| d == decision) {
+                digest.decisions[index..].rotate_left(1);
+            } else if digest.decisions.len() == MAX_DECISIONS {
+                let oldest = &mut digest.decisions[0];
+                oldest.clear();
+                oldest.push_str(decision);
+                digest.decisions.rotate_left(1);
+            } else {
+                digest.decisions.push(decision.to_string());
             }
         }
     }
@@ -164,10 +167,10 @@ fn content_text(content: &serde_json::Value) -> String {
 }
 
 /// Head-truncate to [`MAX_ENTRY_CHARS`], UTF-8 safe.
-fn truncate(value: &str) -> String {
+fn truncate(value: &str) -> &str {
     match value.char_indices().nth(MAX_ENTRY_CHARS) {
-        Some((idx, _)) => value[..idx].to_string(),
-        None => value.to_string(),
+        Some((idx, _)) => &value[..idx],
+        None => value,
     }
 }
 
@@ -276,7 +279,7 @@ mod tests {
     }
 
     #[test]
-    fn prompts_and_decisions_are_capped() {
+    fn prompts_retain_first_goals_within_cap() {
         let mut raw = Vec::new();
         for i in 0..(MAX_PROMPTS + 10) {
             raw.push(format!(
@@ -284,7 +287,47 @@ mod tests {
             ));
         }
         let digest = digest_from_lines(raw);
-        assert_eq!(digest.user_prompts.len(), MAX_PROMPTS, "prompts capped");
+        assert_eq!(
+            digest.user_prompts,
+            (0..MAX_PROMPTS)
+                .map(|i| format!("goal {i}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn decisions_retain_latest_distinct_lines_within_one_turn() {
+        let content = (0..MAX_DECISIONS + 10)
+            .map(|i| format!("Decision: option {i}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let digest = digest_from_lines([
+            serde_json::json!({"message": {"role": "assistant", "content": content}}).to_string(),
+        ]);
+        assert_eq!(
+            digest.decisions,
+            (10..MAX_DECISIONS + 10)
+                .map(|i| format!("Decision: option {i}"))
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn recurring_decision_refreshes_recency_before_oldest_is_evicted() {
+        let raw = (0..MAX_DECISIONS).chain([0, MAX_DECISIONS]).map(|i| {
+            serde_json::json!({
+                "message": {"role": "assistant", "content": format!("Decision: option {i}")}
+            })
+            .to_string()
+        });
+        let digest = digest_from_lines(raw);
+        assert_eq!(
+            digest.decisions,
+            (2..MAX_DECISIONS)
+                .chain([0, MAX_DECISIONS])
+                .map(|i| format!("Decision: option {i}"))
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]

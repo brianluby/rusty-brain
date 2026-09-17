@@ -63,7 +63,9 @@ can be upgraded; a changed or unowned file is never silently overwritten or
 removed. `status` reports `drifted` and fails for ownership conflicts. Move your
 customized file outside the discovery directory before reinstalling, keeping a
 backup if needed. Symlinked asset paths are rejected. `--dry-run` validates without
-writing. `--global` fails explicitly: project scope is the only supported scope.
+writing. Explicit `--agents omp --global` fails: OMP supports project scope only.
+Without `--agents`, global install/status/uninstall select only supported global
+installers and skip OMP.
 
 **Lifecycle:**
 
@@ -239,15 +241,14 @@ config). Hooks are fail-open: a broken hook degrades silently rather than
 blocking the agent, so a misconfigured binary path looks like "nothing
 happens".
 
-**`[E_INSTALL_AGENT_DEFERRED]` when installing OpenCode or OMP.** Expected:
-OpenCode needs a JS/TS plugin, and OMP receives its native extension explicitly
-from the scorecard. Neither has a persistent installer. The OpenCode fixture
-under `scripts/fixtures/opencode-logger/` demonstrates its plugin shape.
+**`[E_INSTALL_AGENT_DEFERRED]` when installing OpenCode.** Expected: OpenCode
+needs a JS/TS plugin and has no persistent installer. The fixture under
+`scripts/fixtures/opencode-logger/` demonstrates its plugin shape.
 
 **Capture is `partial` for my agent — where did my session go?** `partial`
 means a lifecycle boundary is not fully verified. For Codex, tool observations
-reach the per-session scratch but no fold event is fixture-verified; for OMP,
-an authorized live fixture has not yet proved `session_shutdown` folding.
+reach the per-session scratch but no fold event is fixture-verified. For OMP,
+the authorized live fixture verified `session_shutdown` folding.
 Gemini remains deliberately descoped. Existing memories still recall and inject
 normally.
 
