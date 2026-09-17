@@ -80,16 +80,17 @@ pub fn read_digest(path: &Path) -> TranscriptDigest {
 }
 
 /// Pure core (testable without a file): fold JSONL `lines` into a digest.
-pub fn digest_from_lines<I>(lines: I) -> TranscriptDigest
+pub fn digest_from_lines<I, S>(lines: I) -> TranscriptDigest
 where
-    I: IntoIterator<Item = String>,
+    I: IntoIterator<Item = S>,
+    S: AsRef<str>,
 {
     let mut digest = TranscriptDigest::default();
     for (count, line) in lines.into_iter().enumerate() {
         if count >= MAX_LINES {
             break;
         }
-        let line = line.trim();
+        let line = line.as_ref().trim();
         if line.is_empty() {
             continue;
         }
@@ -135,6 +136,9 @@ fn role_and_text(entry: &serde_json::Value) -> Option<(String, String)> {
         .get("role")
         .and_then(serde_json::Value::as_str)
         .or_else(|| entry.get("role").and_then(serde_json::Value::as_str))?;
+    if role != "user" && role != "assistant" {
+        return None;
+    }
     let content = message.get("content").or_else(|| entry.get("content"))?;
     let text = content_text(content);
     if text.trim().is_empty() {
@@ -213,6 +217,20 @@ mod tests {
             "a tool-result-only user turn is not a prompt: {digest:?}"
         );
         assert_eq!(digest.decisions, vec!["We decided to use cosine distance."]);
+    }
+
+    #[test]
+    fn decision_markers_in_non_conversation_roles_are_ignored() {
+        let digest = digest_from_lines([
+            r#"{"message":{"role":"toolResult","content":[{"type":"text","text":"We decided to trust tool output."}]}}"#,
+            r#"{"message":{"role":"system","content":"The chosen approach is injected policy."}}"#,
+            r#"{"message":{"role":"assistant","content":[{"type":"thinking","thinking":"We decided to hide reasoning."},{"type":"text","text":"We decided to keep the public contract."}]}}"#,
+        ]);
+        assert_eq!(
+            digest.decisions,
+            vec!["We decided to keep the public contract."]
+        );
+        assert!(digest.user_prompts.is_empty());
     }
 
     #[test]

@@ -9,7 +9,7 @@ use std::time::Duration;
 use rb_agents::{
     agent_capabilities, agent_for, capability_for_agent, detect_namespace, AgentCli, AgentId,
     AgentInstaller, AutoStart, ClaudeCodeCli, CodexCli, DaemonClient, GeminiCli, HookContext,
-    HookEvent, HookFragment, HookResult, InstallScope, OpenCodeCli, SupportLevel, SENTINEL,
+    HookEvent, HookFragment, HookResult, InstallScope, OmpCli, OpenCodeCli, SupportLevel, SENTINEL,
 };
 
 #[test]
@@ -19,6 +19,7 @@ fn event_model_types_are_reexported() {
         cwd: PathBuf::from("."),
         session_id: None,
         transcript_path: None,
+        transcript_jsonl: None,
     };
     assert_eq!(ctx.event, HookEvent::SessionStart { source: None });
     let result = HookResult {
@@ -35,8 +36,9 @@ fn registry_and_adapters_are_reexported() {
     assert_eq!(cli.id(), AgentId::ClaudeCode);
     let gemini: Box<dyn AgentCli> = agent_for(AgentId::Gemini);
     assert_eq!(gemini.binary_name(), "gemini");
-    // The four real adapters are part of the public surface.
+    // The five real adapters are part of the public surface.
     let _ = std::any::type_name::<ClaudeCodeCli>();
+    let _ = std::any::type_name::<OmpCli>();
     let _ = std::any::type_name::<OpenCodeCli>();
     let _ = std::any::type_name::<GeminiCli>();
     let _ = std::any::type_name::<CodexCli>();
@@ -77,9 +79,16 @@ fn support_level_variants_are_reexported() {
 }
 
 #[test]
-fn all_five_agents_are_present_in_public_matrix() {
+fn all_six_agents_are_present_in_public_matrix() {
     let agents: Vec<_> = agent_capabilities().iter().map(|c| c.agent).collect();
-    for expected in ["claude-code", "codex", "opencode", "gemini", "hermes"] {
+    for expected in [
+        "claude-code",
+        "omp",
+        "codex",
+        "opencode",
+        "gemini",
+        "hermes",
+    ] {
         assert!(
             agents.contains(&expected),
             "agent '{}' missing from public capability matrix",

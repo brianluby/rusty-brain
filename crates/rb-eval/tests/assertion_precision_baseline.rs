@@ -113,7 +113,6 @@ async fn supersede_resurfacing() {
     assert_class("supersede_resurfacing").await;
 }
 #[tokio::test]
-#[ignore = "capability gate; run explicitly, not an instrument correctness test"]
 async fn budget_eviction() {
     assert_class("budget_eviction").await;
 }

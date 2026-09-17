@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios (W3.5 criterion redesign; see docs/eval/2026-06-16-w35-criterion-redesign.md). Each scenario scores memory on an axis where it STRUCTURALLY differs from a hand-maintained CLAUDE.md, against TWO baselines (P1): `realistic_claude_md` is the file a real team would actually have (here: STALE — it still records the original decision, because nobody updated the docs), and `steelman_claude_md` is a diligent human's file (current). A dimension passes only if memory-on BEATS the realistic baseline AND TIES the steelman — a win against only the strawman does not count. The runner (scripts/memory-scorecard.sh) runs four arms (memory-on, realistic-baseline, steelman-baseline, memory-off) and the ONLY hard gate is zero memory-induced errors (P4). Plant mode `explicit` stores facts via `rusty-brain remember` (isolating retrieval from lossy auto-capture, P2); a fact with `supersedes_prev:true` is stored as a superseding update of the prior fact (the supersede path Class C exercises). FRESHNESS (Class C): a decision X is later replaced by X'; memory auto-supersedes so recall returns X', while the realistic (un-updated) CLAUDE.md still says X. expect = the CURRENT value; stale_token = the superseded value (a memory-induced error iff the task fails AND the stale value appears). No `forbid` (a correct answer that names the old value in passing must not false-fail). RETRIEVAL@SCALE (Class A, dimension `retrieval_scale`; redesign §A + ADR-3 in docs/eval/2026-06-19-*): one relevant fact buried among a large corpus. A scenario sets `corpus_size` to N (500+); the runner deterministically generates N OFF-TOPIC distractors (seeded by scenario id, fictional service ports — never colliding with an expect token) and (a) bulk-plants them into the memory-on store at importance 5 via `rusty-brain remember --batch` (one process for all N — a per-fact CLI call is dominated by process spawn at scale), under a single planted TARGET at importance 8; (b) writes them into BOTH baselines' CLAUDE.md so the buried target is the ONLY difference — `steelman_claude_md` holds the target + distractors (diligent human), `realistic_claude_md` is EMPTY so only distractors are written (the common 'nobody wrote it down' reality). Accuracy on the buried target is the PRIMARY axis; token cost is SECONDARY: every session runs under stream-json so the scorecard records total_cost_usd + the four cache buckets, and the `retrieval_scale` dimension prints an ADR-3 block (cache% / ctx_vol / eff_in diagnostics + a RATIFY-Opt-3 / Opt-2 / descope verdict comparing memory-on vs steelman on accuracy AND total_cost_usd within 20%). CAPTURE (Class B, dimension `capture`) uses `plant_mode:auto-capture`: a real Claude Code plant session with hooks only writes a SessionEnd summary, then the runner directly measures hook-origin `session-summary` fidelity from `rusty-brain --json list --limit 1000` before downstream recall. REACH (Class R, dimension `reach`) explicitly plants from identity A and scores only identity B with separate homes/projects sharing one DB, socket, and namespace. Class A/B/R plant no stale value, so they do not contribute memory-induced errors unless a scenario supplies stale_token; the hard gate stays zero MIE.",
+  "_about": "Memory-value scorecard scenarios. Each scenario compares rusty-brain with two hand-maintained AGENTS.md baselines: realistic_agents_md is stale or incomplete; steelman_agents_md is current and complete. The OMP-native runner requires memory-on to beat the realistic baseline and tie the steelman, with zero memory-induced errors as the hard gate.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,
@@ -15,8 +15,8 @@
         { "content": "Decision: for outbound HTTP this project uses the `reqwest` crate." },
         { "content": "Update: we migrated off reqwest. All HTTP now uses the `ureq` crate — do NOT add reqwest to anything new; it is being removed.", "supersedes_prev": true }
       ],
-      "realistic_claude_md": "HTTP: use the `reqwest` crate for outbound HTTP.",
-      "steelman_claude_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
+      "realistic_agents_md": "HTTP: use the `reqwest` crate for outbound HTTP.",
+      "steelman_agents_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
       "work": "Add a helper that performs an HTTP GET and returns the response body. Name the HTTP crate it should use and show the dependency line.",
       "expect": "ureq",
       "stale_token": "reqwest"
@@ -29,8 +29,8 @@
         { "content": "Decision: project configuration lives in a file named `app.toml` at the repo root." },
         { "content": "Update: we renamed the config file from `app.toml` to `config/settings.toml`. `app.toml` no longer exists — always read configuration from `config/settings.toml`.", "supersedes_prev": true }
       ],
-      "realistic_claude_md": "Config: read configuration from `app.toml` at the repo root.",
-      "steelman_claude_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
+      "realistic_agents_md": "Config: read configuration from `app.toml` at the repo root.",
+      "steelman_agents_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
       "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
       "expect": "config/settings.toml",
       "stale_token": "app.toml"
@@ -43,8 +43,8 @@
         { "content": "Convention: entity identifiers in this codebase are `Uuid`." },
         { "content": "Update: we switched all entity identifiers from Uuid to `Ulid` (lexicographically sortable). New entities use Ulid; do not use Uuid for ids.", "supersedes_prev": true }
       ],
-      "realistic_claude_md": "Identifiers: entity ids are `Uuid`.",
-      "steelman_claude_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
+      "realistic_agents_md": "Identifiers: entity ids are `Uuid`.",
+      "steelman_agents_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
       "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
       "expect": "ulid",
       "stale_token": "uuid"
@@ -57,8 +57,8 @@
         { "content": "Decision: run the test suite with `cargo test`." },
         { "content": "Update: we moved the test suite to `cargo nextest run` for parallelism and isolation. Use nextest, not plain `cargo test`, in CI and locally.", "supersedes_prev": true }
       ],
-      "realistic_claude_md": "Testing: run the suite with `cargo test`.",
-      "steelman_claude_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
+      "realistic_agents_md": "Testing: run the suite with `cargo test`.",
+      "steelman_agents_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
       "work": "I need to run the project's tests. What exact command should I use?",
       "expect": "nextest",
       "stale_token": "cargo test"
@@ -71,8 +71,8 @@
       "plant": [
         { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 8 }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest (we avoid pulling in an async runtime).",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest (we avoid pulling in an async runtime).",
       "work": "Add a small helper that performs an HTTP GET to a JSON health endpoint and parses the `status` field. Name the HTTP crate it should use and show the dependency line.",
       "expect": "ureq"
     },
@@ -84,8 +84,8 @@
       "plant": [
         { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 8 }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Identifiers: entity ids are `Ulid` (lexicographically sortable), never Uuid or integer ids.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Identifiers: entity ids are `Ulid` (lexicographically sortable), never Uuid or integer ids.",
       "work": "Add a new `Order` struct that needs a unique id field. What type should the id field be?",
       "expect": "ulid"
     },
@@ -97,8 +97,8 @@
       "plant": [
         { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 8 }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",
       "work": "Add serialization for a new `Envelope` message type that goes over our internal socket. Which serializer should it use?",
       "expect": "rmp"
     },
@@ -107,8 +107,8 @@
       "dimension": "capture",
       "plant_mode": "auto-capture",
       "plant_session": "Create `docs/decision-http.md` containing exactly this project decision: outbound HTTP uses the `ureq` crate. Do not add extra alternatives.",
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Outbound HTTP uses the `ureq` crate.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Outbound HTTP uses the `ureq` crate.",
       "work": "Choose the HTTP client for a new outbound call. Name the crate and show the dependency line.",
       "expect": "ureq",
       "capture_expect": "ureq",
@@ -119,8 +119,8 @@
       "dimension": "capture",
       "plant_mode": "auto-capture",
       "plant_session": "Create `docs/decision-errors.md` containing exactly this project decision: service-layer failures use the `AppError` enum. Do not add extra alternatives.",
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Service-layer failures use the `AppError` enum.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Service-layer failures use the `AppError` enum.",
       "work": "Add a service helper that can fail. What error type should its Result use?",
       "expect": "AppError",
       "capture_expect": "AppError",
@@ -131,8 +131,8 @@
       "dimension": "capture",
       "plant_mode": "auto-capture",
       "plant_session": "Create `docs/decision-ids.md` containing exactly this project decision: new entity identifiers use `Ulid`. Do not add extra alternatives.",
-      "realistic_claude_md": "",
-      "steelman_claude_md": "New entity identifiers use `Ulid`.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "New entity identifiers use `Ulid`.",
       "work": "Add a new entity struct with an id field. What id type should it use?",
       "expect": "Ulid",
       "capture_expect": "Ulid",
@@ -145,8 +145,8 @@
       "plant": [
         { "content": "Decision: plugin metadata lives at `plugins/rusty-brain/.claude-plugin/plugin.json`." }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Plugin metadata lives at `plugins/rusty-brain/.claude-plugin/plugin.json`.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Plugin metadata lives at `plugins/rusty-brain/.claude-plugin/plugin.json`.",
       "work": "Update plugin metadata and name the manifest path.",
       "expect": "plugins/rusty-brain/.claude-plugin/plugin.json"
     },
@@ -157,8 +157,8 @@
       "plant": [
         { "content": "Decision: internal daemon socket messages are serialized with MessagePack via `rmp-serde`." }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Internal daemon socket messages are serialized with MessagePack via `rmp-serde`.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Internal daemon socket messages are serialized with MessagePack via `rmp-serde`.",
       "work": "Add a new daemon socket request type. Which serializer should it use on the wire?",
       "expect": "rmp-serde"
     },
@@ -169,8 +169,8 @@
       "plant": [
         { "content": "Decision: run the daemon end-to-end suite with `cargo test -p rb-daemon --test daemon_e2e`." }
       ],
-      "realistic_claude_md": "",
-      "steelman_claude_md": "Run the daemon end-to-end suite with `cargo test -p rb-daemon --test daemon_e2e`.",
+      "realistic_agents_md": "",
+      "steelman_agents_md": "Run the daemon end-to-end suite with `cargo test -p rb-daemon --test daemon_e2e`.",
       "work": "I need the daemon end-to-end test command. What exact command should I run?",
       "expect": "cargo test -p rb-daemon --test daemon_e2e"
     }

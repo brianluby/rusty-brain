@@ -6,6 +6,7 @@ use rb_agents::{HookContext, HookEvent, HookResult};
 
 use crate::capture;
 use crate::scratch::{self, Scratch};
+use crate::transcript;
 
 /// Dispatch one parsed hook context to its capture flow. `client` is the
 /// (best-effort) daemon connection — `None` means degraded — and `scratch` is
@@ -39,7 +40,10 @@ pub async fn dispatch(
                 client.take(),
                 scratch,
                 &ctx.cwd,
-                ctx.transcript_path.as_deref(),
+                ctx.transcript_jsonl
+                    .as_deref()
+                    .map(|jsonl| transcript::digest_from_lines(jsonl.lines()))
+                    .or_else(|| ctx.transcript_path.as_deref().map(transcript::read_digest)),
             )
             .await
         }
@@ -48,7 +52,10 @@ pub async fn dispatch(
                 client.take(),
                 scratch,
                 &ctx.cwd,
-                ctx.transcript_path.as_deref(),
+                ctx.transcript_jsonl
+                    .as_deref()
+                    .map(|jsonl| transcript::digest_from_lines(jsonl.lines()))
+                    .or_else(|| ctx.transcript_path.as_deref().map(transcript::read_digest)),
             )
             .await
         }
@@ -84,6 +91,7 @@ mod tests {
             cwd: PathBuf::from("/tmp"),
             session_id: Some("s1".to_string()),
             transcript_path: None,
+            transcript_jsonl: None,
         }
     }
 

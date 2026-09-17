@@ -1,12 +1,13 @@
-//! Per-CLI `AgentInstaller` implementations for the four JSON-protocol CLIs.
+//! Per-CLI `AgentInstaller` implementations for JSON hooks and native extensions.
 //!
 //! Each module provides a unit struct implementing
 //! [`rb_agents::install::AgentInstaller`]: `detect()` (via [`crate::detect`])
-//! and the pure `hook_fragment()` that produces the sentinel-marked JSON block.
+//! and `hook_fragment()` describing the configuration or standalone asset.
 
 mod claude_code;
 mod codex;
 mod gemini;
+mod omp;
 
 use std::path::PathBuf;
 
@@ -16,6 +17,7 @@ use rb_types::Error;
 pub use claude_code::ClaudeCodeInstaller;
 pub use codex::CodexInstaller;
 pub use gemini::GeminiInstaller;
+pub use omp::OmpInstaller;
 
 /// Every built-in installer, in display order (Claude Code first — the lead
 /// adapter). OpenCode is intentionally absent: it loads hooks via a JS/TS plugin
@@ -27,6 +29,7 @@ pub use gemini::GeminiInstaller;
 pub fn builtins() -> Vec<Box<dyn AgentInstaller>> {
     vec![
         Box::new(ClaudeCodeInstaller),
+        Box::new(OmpInstaller),
         Box::new(GeminiInstaller),
         Box::new(CodexInstaller),
     ]

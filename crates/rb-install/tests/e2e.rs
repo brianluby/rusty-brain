@@ -126,6 +126,7 @@ fn hooks_bin() -> PathBuf {
 /// (`XDG_CACHE_HOME`) and the namespace pinned. Asserts fail-open exit 0 and
 /// returns the child output.
 fn fire_hook(
+    agent: &str,
     hooks_bin: &Path,
     daemon: &RunningDaemon,
     namespace: &str,
@@ -133,7 +134,7 @@ fn fire_hook(
     event: &str,
 ) -> std::process::Output {
     let out = Command::new(hooks_bin)
-        .args(["--agent", "claude-code"])
+        .args(["--agent", agent])
         .env("RUSTY_BRAIN_SOCKET", &daemon.socket)
         .env("RUSTY_BRAIN_DB", &daemon.db)
         // Explicit namespace (W0.3 rule 1) so capture and recall agree on
@@ -317,6 +318,7 @@ async fn install_capture_uninstall_round_trip() {
     })
     .to_string();
     let hook_out = fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-e2e-fixture",
@@ -332,6 +334,7 @@ async fn install_capture_uninstall_round_trip() {
 
     // SessionEnd folds the per-session scratch into ONE summary memory.
     fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-e2e-fixture",
@@ -366,7 +369,8 @@ async fn install_capture_uninstall_round_trip() {
     }
     assert!(
         found,
-        "the SessionEnd summary must fold the PostToolUse file edit and be recallable"
+        "the SessionEnd summary must fold the PostToolUse file edit and be recallable; stored={:?}",
+        client.list(None, 100).await
     );
 
     // --- 2.5) W3.2(a): a UserPromptSubmit deterministically recalls + injects -
@@ -384,6 +388,7 @@ async fn install_capture_uninstall_round_trip() {
     })
     .to_string();
     let prompt_out = fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-e2e-fixture",
@@ -513,6 +518,7 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     })
     .to_string();
     fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-c4-db-grep",
@@ -521,6 +527,7 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     );
     // SessionEnd folds the scratch (redacted command + failure) into the summary.
     fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-c4-db-grep",
@@ -552,7 +559,8 @@ async fn planted_secrets_never_reach_the_db_file_bytes() {
     }
     assert!(
         found,
-        "the planted-secret capture must be folded into the SessionEnd summary and recallable (sentinel {SENTINEL})"
+        "the planted-secret capture must be folded into the SessionEnd summary and recallable (sentinel {SENTINEL}); stored={:?}",
+        client.list(None, 100).await
     );
 
     // Stop the daemon FIRST: closing the last SQLite connection checkpoints
@@ -645,11 +653,19 @@ async fn forty_turn_session_produces_at_most_five_memories() {
             }),
         }
         .to_string();
-        fire_hook(&hooks_bin, &daemon, "rb-gate-40turn", &project, &event);
+        fire_hook(
+            "claude-code",
+            &hooks_bin,
+            &daemon,
+            "rb-gate-40turn",
+            &project,
+            &event,
+        );
     }
 
     // The single SessionEnd folds the whole turn's scratch into ONE summary.
     fire_hook(
+        "claude-code",
         &hooks_bin,
         &daemon,
         "rb-gate-40turn",
@@ -693,4 +709,52 @@ async fn forty_turn_session_produces_at_most_five_memories() {
 
     daemon.stop().await;
     drop(proj_dir);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn omp_recalls_captured_decision_despite_a_long_goal() {
+    let project = tempfile::tempdir().unwrap();
+    let daemon = RunningDaemon::start().await;
+    let hooks = hooks_bin();
+    let transcript = [
+        serde_json::json!({"message":{"role":"user","content":
+            format!("Explain the nebula deployment decision. {}", "Background context. ".repeat(80))}}),
+        serde_json::json!({"message":{"role":"assistant","content":
+            "Decision: nebula deployment uses ORCHID-7391 and a single writer."}}),
+    ].into_iter().map(|line| line.to_string()).collect::<Vec<_>>().join("\n");
+    let shutdown = serde_json::json!({
+        "type":"session_shutdown", "cwd":project.path(), "session_id":"omp-long-goal",
+        "transcript_jsonl":transcript,
+    });
+    fire_hook(
+        "omp",
+        &hooks,
+        &daemon,
+        "omp-long-goal",
+        project.path(),
+        &shutdown.to_string(),
+    );
+    let prompt = serde_json::json!({
+        "type":"prompt", "cwd":project.path(), "session_id":"omp-next-session",
+        "prompt":"nebula deployment",
+    });
+    let output = fire_hook(
+        "omp",
+        &hooks,
+        &daemon,
+        "omp-long-goal",
+        project.path(),
+        &prompt.to_string(),
+    );
+    let response: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = response["message"].as_str().unwrap_or("");
+    assert!(
+        message.contains("ORCHID-7391"),
+        "captured decision must reach next prompt: {response}"
+    );
+    assert!(
+        message.contains("single writer"),
+        "decision must survive bounded projection: {response}"
+    );
+    daemon.stop().await;
 }

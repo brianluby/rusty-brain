@@ -1,8 +1,8 @@
 # Agent Support
 
-rusty-brain is a cross-agentic memory system: the current sprint targets
-OpenCode and Codex as first-priority agents alongside Claude Code, with Hermes
-as a discovery-gated candidate (see
+rusty-brain is a cross-agentic memory system. OMP is the active scorecard
+transport and can select configured models; OpenCode and Codex remain
+first-priority adapter targets, while Hermes is discovery-gated (see
 `docs/prds/2026-06-23-cross-agentic-agent-parity.md`).
 
 The source of truth for per-agent support is the capability matrix in
@@ -23,7 +23,7 @@ succeeding.
 
 ## Claude Code (stable)
 
-The lead adapter; fully supported on all four dimensions.
+The lead adapter; fully supported for capture, retrieval, and configuration.
 
 ```bash
 rusty-brain-install install --agents claude-code            # project scope
@@ -37,7 +37,74 @@ rusty-brain-install status
 - Retrieval: `SessionStart` injects session context; `UserPromptSubmit`
   performs prompt-time recall with untrusted-context framing and a token
   budget.
-- Scorecard: `scripts/memory-scorecard.sh --agent claude-code --runs 1`.
+- Scorecard: retired; use `scripts/memory-scorecard.sh --agent omp --model <selector> --runs 1`.
+
+## OMP (experimental)
+
+Install from the directory in which you run OMP:
+
+```bash
+rusty-brain-install install --agents omp
+rusty-brain-install status --agents omp
+omp --model openai-codex/gpt-5.6-luna
+rusty-brain-install uninstall --agents omp
+```
+
+The installer writes a self-contained `.omp/extensions/rusty-brain.ts`. OMP
+discovers this directory in its current working directory, not in ancestors.
+The asset embeds the absolute `rusty-brain-hooks` path; keep `rusty-brain` beside
+it so session startup can start the daemon. Reinstall after moving the binaries.
+The default runtime requires only OMP's Bun runtime and the installed Rust
+binaries, not this checkout. `RB_OMP_HOOKS_BIN` overrides the embedded path for
+explicit testing. Model selection stays in OMP, not in the extension.
+
+**Ownership:** a SHA-256 comment covers the installed source. Intact old versions
+can be upgraded; a changed or unowned file is never silently overwritten or
+removed. `status` reports `drifted` and fails for ownership conflicts. Move your
+customized file outside the discovery directory before reinstalling, keeping a
+backup if needed. Symlinked asset paths are rejected. `--dry-run` validates without
+writing. `--global` fails explicitly: project scope is the only supported scope.
+
+**Lifecycle:**
+
+- `session_start` ensures the daemon is available; startup context is not injected.
+- `before_agent_start` returns prompt-relevant memory in a hidden, agent-attributed
+  custom message with the shared untrusted-data framing.
+- `tool_result` records native `write.path`, hashline `edit.input`/`patch` paths
+  (including moves/removals), and shell commands in redacted per-session scratch.
+- Before switching or branching, a checkpoint folds the old session without
+  clearing scratch. Cancelled transitions are safe; later folds supersede it.
+- `session_shutdown` drains queued capture and folds text-only user/assistant
+  history into one summary. Recent transcript JSONL is capped at 256 KiB and
+  sent through stdin, never written to a temporary transcript file. Rust
+  redacts before persistence. Latest decisions precede the goal so bounded
+  recall excerpts do not hide them behind a long prompt.
+- Sessions/factories have independent state. Hooks have a 6.5-second subprocess
+  deadline, bounded I/O, and fail open on missing binaries, errors or malformed
+  output. A crash/forced kill can bypass shutdown; this is best-effort capture,
+  not a durable event journal.
+
+**Verified:** OMP 18.2.4, Bun 1.4.2, separate bounded
+`openai-codex/gpt-5.6-luna` and `openai-codex/gpt-5.6-terra` live pairs. Native
+project discovery, write capture, shutdown storage, subsequent recall after
+archiving the original seed, and placebo isolation passed. See
+[`eval/omp-extension-verification.json`](eval/omp-extension-verification.json).
+This is transport/lifecycle evidence, not model-quality or scorecard efficacy.
+
+**Troubleshooting:** run `rusty-brain-install status --agents omp` and
+`rusty-brain doctor` first. Verify the OMP working directory and binary locations.
+`--no-extensions` disables native discovery; explicitly pass
+`--extension .omp/extensions/rusty-brain.ts` when using it. If OMP ignores the
+asset because of discovery settings or ignore rules, use that explicit path.
+There is no MCP server or special memory tool to enable.
+
+The scorecard explicitly loads `scripts/scorecard-omp-extension.ts`, a re-export
+of the same shipped runtime, and replays thirteen shared scenario rows. Its
+fresh profiles require provider environment credentials or configured broker
+environment variables; local profile credentials are not copied. Use concrete
+model selectors (or provide the role through `PI_SLOW_MODEL` for `@slow`).
+Do not pool outcomes across models. See
+[`eval/scorecard-controls.md`](eval/scorecard-controls.md) for receipts and controls.
 
 ## Codex (experimental)
 
@@ -135,6 +202,7 @@ parity):
 | Agent | Mapped event | `retrieval` |
 |---|---|---|
 | claude-code | `UserPromptSubmit` (rb-hooks consumes the contract constants directly) | supported |
+| omp | `before_agent_start` native extension custom message | supported |
 | codex | none — native `UserPromptSubmit` payloads are fixture-gated | unsupported |
 | opencode | none — no prompt-submission event fixture exists | unsupported |
 | gemini | none — descoped | unsupported |
@@ -154,10 +222,10 @@ claim of native support — the matrix rows above stay authoritative.
 cargo test -p rb-agents -p rb-hooks -p rb-install
 scripts/memory-scorecard.sh --self-test
 
-scripts/memory-scorecard.sh --agent claude-code --runs 1
+scripts/memory-scorecard.sh --agent omp --model @slow --runs 1
 scripts/memory-scorecard.sh --agent codex --runs 1      # explicit skip
 scripts/memory-scorecard.sh --agent opencode --runs 1   # explicit skip
-scripts/memory-scorecard.sh --agent all --runs 1        # prints skips, runs Claude Code
+scripts/memory-scorecard.sh --agent all --runs 1        # prints skips, runs OMP
 sh scripts/memory-scorecard.test.sh                     # agent-targeting functions
 ```
 
@@ -171,18 +239,17 @@ config). Hooks are fail-open: a broken hook degrades silently rather than
 blocking the agent, so a misconfigured binary path looks like "nothing
 happens".
 
-**`[E_INSTALL_AGENT_DEFERRED]` when installing opencode.** Expected: the
-OpenCode installer is deliberately deferred (see above). Wire a JS/TS plugin
-that invokes `rusty-brain-hooks --agent opencode` instead;
-`scripts/fixtures/opencode-logger/` demonstrates the plugin shape.
+**`[E_INSTALL_AGENT_DEFERRED]` when installing OpenCode or OMP.** Expected:
+OpenCode needs a JS/TS plugin, and OMP receives its native extension explicitly
+from the scorecard. Neither has a persistent installer. The OpenCode fixture
+under `scripts/fixtures/opencode-logger/` demonstrates its plugin shape.
 
 **Capture is `partial` for my agent — where did my session go?** `partial`
-means per-tool observations reach the per-session scratch, but no fold event
-fires, so no session summary is written; the scratch ages out after 24h
-(`scratch::prune_stale`). This is the documented state for Codex (until its
-terminus event is fixture-verified) and for Gemini (deliberately descoped —
-no fixture or mapping work is planned). Existing memories still recall and
-inject normally.
+means a lifecycle boundary is not fully verified. For Codex, tool observations
+reach the per-session scratch but no fold event is fixture-verified; for OMP,
+an authorized live fixture has not yet proved `session_shutdown` folding.
+Gemini remains deliberately descoped. Existing memories still recall and inject
+normally.
 
 **Scorecard prints one line and exits 0.** That is a machine-readable skip,
 not a silent success. Fields: `agent`, `dimension`, `scenario`, `phase` (the
@@ -190,9 +257,8 @@ earliest blocked pipeline stage: `capture`, `config`, or `scoring`),
 `status=skip`, `reason`, `detail`. A supported target that fails instead
 reports per-run failures with agent and phase.
 
-**No memories injected at prompt time.** Prompt-time retrieval is
-Claude-Code-only today (see the matrix). For Codex, injection happens at
-`SessionStart` only. For OpenCode, no injection channel is active. Any agent
-whose tooling can issue an HTTP request can wire recall-before-work itself
-via the opt-in loopback listener — see "Agent-agnostic prompt-time recall
-(CA6)" above.
+**No memories injected at prompt time.** Prompt-time retrieval is supported for
+Claude Code and OMP (through `before_agent_start`). Codex and OpenCode lack a
+verified native prompt channel. Any agent whose tooling can issue an HTTP request
+can wire recall-before-work through the opt-in loopback listener; see
+"Agent-agnostic prompt-time recall (CA6)" above.

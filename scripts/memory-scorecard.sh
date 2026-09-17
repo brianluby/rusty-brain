@@ -1,19 +1,15 @@
 #!/usr/bin/env bash
 # shellcheck disable=SC2030,SC2031
-# Memory-value scorecard harness (W3.5 criterion redesign; see
-# docs/eval/2026-06-16-w35-criterion-redesign.md). The successor to the retired
-# W3.5 A/B single-fact gate. Instead of "memory-on beats one
-# CLAUDE.md baseline on one fact", it scores memory on the axes where it
-# STRUCTURALLY differs from a hand-maintained file, against TWO baselines so a
-# win cannot come from re-rigging the eval toward memory:
+# Memory-value scorecard harness. It compares rusty-brain against the
+# information channels where semantic memory differs from a hand-maintained
+# `AGENTS.md`, using OMP's native extension surface:
 #
 #   arms per scenario:
 #     memory-on          rusty-brain has the fact (planted per the scenario's mode)
-#     realistic-baseline the CLAUDE.md a real team would actually have (stale/partial/large)
-#     steelman-baseline  a diligent human's CLAUDE.md (clean/current/complete)
-#     memory-off         nothing, no hooks (the floor)
-#     length-matched-placebo neutral punctuation through BOTH actual hook channels
-#
+#     realistic-baseline the AGENTS.md a real team would actually have (stale/partial/large)
+#     steelman-baseline  a diligent human's AGENTS.md (clean/current/complete)
+#     memory-off         nothing, no extension (the floor)
+#     length-matched-placebo inert text through the same OMP prompt-time channel
 #   a dimension's claim (P1): memory-on BEATS realistic AND at least TIES steelman.
 #   the ONLY hard gate (P4): zero memory-induced errors (the safety property).
 #
@@ -32,24 +28,19 @@
 # scorecard but emits no SAFE/UNSAFE verdict and exits 0. The only hard gate
 # (P4) is zero memory-induced errors, and only from a >=min-runs run.
 #
-# Session-log retention (Vikunja #502): the ephemeral workroot (and with it
-# every per-session stream-json log) is deleted on exit, which made the
-# 2026-07-12 N=5 safety-gate MIEs undiagnosable. Opt in to retention with
-# `--log-dir DIR` (retain there) or `RB_SCORECARD_KEEP_LOGS=1` (retain under
-# `<dir of --out>/scorecard-session-logs`). Retained files are log-shaped only:
-# model/session logs plus the harness-authored read-only recall diagnostics
-# needed to classify a future MIE. They carry no key material (see
-# preserve_session_logs).
+# Session-log retention keeps OMP JSON event streams plus harness-authored
+# recall diagnostics. Retain them with `--log-dir DIR` or
+# `RB_SCORECARD_KEEP_LOGS=1`.
 #
 # Usage:
 #   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
-#   memory-scorecard.sh [--agent claude-code|codex|opencode|gemini|hermes|all] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--log-dir DIR] [--scenarios-file F]
+#   memory-scorecard.sh [--agent omp|codex|opencode|gemini|hermes|all] [--model OMP_MODEL] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--log-dir DIR] [--scenarios-file F]
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 SCENARIOS_FILE="$REPO_ROOT/crates/rb-eval/scorecard/memory_scorecard_scenarios.json"
-MODEL="${RB_SCORECARD_MODEL:-haiku}"
-MAX_BUDGET_USD="${RB_SCORECARD_MAX_BUDGET_USD:-0.50}"
+MODEL="${RB_SCORECARD_OMP_MODEL:-@slow}"
+MAX_SESSION_SECONDS="${RB_SCORECARD_SESSION_TIMEOUT_SECS:-300}"
 # Steelman tie margin (P1): memory-on must come within this of the diligent-human
 # baseline to count as a tie. A small margin absorbs haiku noise without letting a
 # real regression pass.
@@ -60,7 +51,7 @@ TIE_MARGIN="${RB_SCORECARD_TIE_MARGIN:-0.10}"
 TURNS_FAIL_SENTINEL="${RB_SCORECARD_TURNS_FAIL_SENTINEL:-99}"
 
 scorecard_agent_supported() { # agent
-  [ "$1" = "claude-code" ]
+  [ "$1" = "omp" ]
 }
 
 scorecard_skip_reason() { # agent
@@ -82,7 +73,7 @@ scorecard_skip_detail() { # agent
       printf 'OpenCode scorecard is blocked until the JS/TS plugin config path and lifecycle fixtures are implemented.'
       ;;
     gemini)
-      printf 'Gemini has an adapter, but the cross-agentic scorecard currently supports only Claude Code; Gemini scorecard support is not yet implemented.'
+      printf 'Gemini has an adapter, but the cross-agentic scorecard currently supports only OMP; Gemini scorecard support is not yet implemented.'
       ;;
     hermes)
       printf 'Hermes is discovery-gated; no hook names, config paths, or lifecycle semantics are verified.'
@@ -138,7 +129,7 @@ judge_text() {
 # are deliberately OFF-TOPIC from any scenario target (fictional service port
 # numbers) so they never accidentally contain an `expect`/`stale` token. Used by
 # the Class A (retrieval@scale) arms: planted into the memory-on store and written
-# into both baselines' CLAUDE.md so a buried target is the only thing that differs.
+# into both baselines' AGENTS.md so a buried target is the only thing that differs.
 # (Pattern carried from the retired P4a cache-trace prototype.)
 gen_corpus() {
   python3 - "$1" "$2" <<'PY'
@@ -153,48 +144,42 @@ PY
 }
 
 # ---- usage extraction (pure; ADR-3; exercised by --self-test) -----------------
-# extract_usage <stream-json-log>  -> echoes one TSV row (7 fields):
-#   is_error  num_turns  cost  input_tok  cache_create_tok  cache_read_tok  output_tok
-# read from the final `result` record of `claude -p --output-format stream-json
-# --verbose` (it carries num_turns/total_cost_usd AND the session-aggregate
-# usage.{input_tokens,cache_creation_input_tokens,cache_read_input_tokens,
-# output_tokens} — the cache economics ADR-3 needs; see docs/eval/2026-06-19-*).
-# A non-parseable log (timeout/error/budget) yields a worst-case sentinel row and
-# is_error=true, so a failed session can never look like cheap successful caching.
-# A PARSEABLE result that is itself an error (is_error=true — e.g. budget
-# exceeded) also gets the worst-case turns sentinel, so a failure never lowers an
-# arm's med_turns regardless of how it failed. (Cache-token extraction was first
-# prototyped in the retired P4a cache-trace harness; the scorecard adds the
-# parseable-error turns sentinel.)
+# extract_usage <omp-json-log> -> is_error turns cost input cache_write cache_read output
+# OMP's terminal `agent_end` contains every message produced by the run, not
+# aggregate usage on its last assistant message. Sum all assistant calls; an
+# incomplete terminal event, deadline, or provider error is a worst-case failure.
 extract_usage() {
   local log="$1"
-  local r is_err turns cost inp cc cr out
-  r="$(jq -c 'select(.type=="result")' "$log" 2>/dev/null | tail -1 || true)"
-  if [ -n "$r" ]; then
-    # `// true` would collapse an explicit false (jq's alt treats false as
-    # empty), so gate on field presence: absent is_error => assume error.
-    is_err="$(jq -r 'if has("is_error") then .is_error else true end' <<<"$r")"
-    turns="$(jq -r '.num_turns // 0'           <<<"$r")"
-    cost="$(jq -r  '.total_cost_usd // 0'      <<<"$r")"
-    inp="$(jq -r   '.usage.input_tokens // 0'                <<<"$r")"
-    cc="$(jq -r    '.usage.cache_creation_input_tokens // 0' <<<"$r")"
-    cr="$(jq -r    '.usage.cache_read_input_tokens // 0'     <<<"$r")"
-    out="$(jq -r   '.usage.output_tokens // 0' <<<"$r")"
-    # A parseable but errored result must not report a low turn count (absent/0
-    # num_turns) that undercuts the sentinel contract — force the sentinel.
-    [ "$is_err" = "true" ] && turns="$TURNS_FAIL_SENTINEL"
+  local terminal is_err turns cost inp cc cr out
+  terminal="$(jq -sc '[.[] | select(.type=="agent_end")][-1] // empty' "$log" 2>/dev/null || true)"
+  if [ -n "$terminal" ]; then
+    is_err="$(jq -r '
+      [.messages[]? | select(.role=="assistant")] as $calls |
+      ($calls | length) == 0 or
+      ($calls[-1].stopReason != "stop" and $calls[-1].stopReason != "length") or
+      any($calls[]; .stopReason == "error" or .stopReason == "aborted" or .usage == null)
+    ' <<<"$terminal")"
+    turns="$(jq -s '[.[] | select(.type=="turn_start")] | length' "$log" 2>/dev/null || printf 0)"
+    IFS=$'\t' read -r cost inp cc cr out < <(jq -r '
+      [.messages[]? | select(.role=="assistant") | .usage] as $usage |
+      [([$usage[].cost.total // 0] | add // 0),
+       ([$usage[].input // 0] | add // 0),
+       ([$usage[].cacheWrite // 0] | add // 0),
+       ([$usage[].cacheRead // 0] | add // 0),
+       ([$usage[].output // 0] | add // 0)] | @tsv
+    ' <<<"$terminal")
+    [ "$is_err" = true ] && turns="$TURNS_FAIL_SENTINEL"
   else
     is_err=true; turns="$TURNS_FAIL_SENTINEL"; cost=0; inp=0; cc=0; cr=0; out=0
   fi
   printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\n' "$is_err" "$turns" "$cost" "$inp" "$cc" "$cr" "$out"
 }
 
-# ---- baseline CLAUDE.md writer (pure; exercised by --self-test) --------------
-# Write a baseline's CLAUDE.md from a body (the realistic/steelman text) and an
-# optional distractor corpus (Class A). Writes nothing when both are empty (so a
-# Class A realistic arm with no body still gets the distractors, and a Class C arm
-# with an empty baseline gets no file at all — unchanged from before).
-write_claude_md() { # file body distractors
+# ---- baseline AGENTS.md writer (pure; exercised by --self-test) --------------
+# Write a baseline's AGENTS.md from a body (the realistic/steelman text) and an
+# optional distractor corpus. Writes nothing when both are empty (so a Class A
+# realistic arm with no body still gets distractors).
+write_agents_md() { # file body distractors
   local file="$1" body="$2" distractors="$3"
   [ -n "$body" ] || [ -n "$distractors" ] || return 0
   # Explicit if-blocks, not trailing `[ -n ... ] && ...` guards: a false guard
@@ -216,7 +201,7 @@ write_claude_md() { # file body distractors
 # AFTER mie so the existing column indices are stable). Class B appends four more
 # fields after those stable fields:
 #   cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count
-# Columns 18-22 append injected SessionStart, prompt-time, CLAUDE.md, total
+# Columns 18-22 append zero SessionStart, prompt-time, AGENTS.md, total
 # estimates and estimator ID. Legacy rows have UNKNOWN sizes, not zero.
 # Prints the per-dimension
 # scorecard — success as a Wilson 95% CI, turns as median [Q1-Q3] (P3: median +
@@ -523,36 +508,27 @@ classify_mie() { # mie stale_present current_present any_memory_present
   printf 'no_memory_evidence_surfaced_model_guessed\n'
 }
 
-# Capture the exact read-side evidence a scorecard work session is about to
-# see. Every operation here is read-only: context, recall, history, and the two
-# hook injection paths issue no writer ops. Running them before the paid model
-# session therefore cannot perturb the planted store, scores, prompt budget, or
-# answer. The direct hook outputs are the final injected text; the raw CLI JSON
-# carries candidate ids/states, scores, and per-channel contribution flags.
+# Capture the exact read-side evidence a scorecard work session is about to see.
+# The OMP bridge has one deterministic prompt-time injection channel. These
+# probes are read-only and are retained separately from the extension's actual
+# per-session receipt.
 capture_memory_diagnostics() { # home project query diagnostics_dir planted_jsonl
   local home="$1" project="$2" query="$3" dir="$4" planted="$5"
   mkdir -p "$dir"
   [ -f "$planted" ] || : > "$planted"
   (
     export HOME="$home" PATH="$BIN_DIR:$PATH"
-    # These read-only probes never call the model. Strip the paid API secret so
-    # neither the CLI nor hook diagnostics can receive it, much less log it.
-    unset ANTHROPIC_API_KEY
+    # These read-only probes never call a model or expose provider credentials.
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
     rusty-brain --json context > "$dir/context.json"
     rusty-brain --json recall "$query" --limit 5 > "$dir/recall-active.json"
     rusty-brain --json recall "$query" --limit 5 --archived > "$dir/recall-archived.json"
 
-    local sid="scorecard-diagnostic" transcript="$dir/transcript.jsonl"
-    jq -cn --arg sid "$sid" --arg transcript "$transcript" --arg cwd "$project" \
-      '{session_id:$sid,transcript_path:$transcript,cwd:$cwd,hook_event_name:"SessionStart",source:"startup"}' \
-      > "$dir/session-start-input.json"
-    rusty-brain-hooks --agent claude-code \
-      < "$dir/session-start-input.json" > "$dir/session-start-injection.json"
-
-    jq -cn --arg sid "$sid" --arg transcript "$transcript" --arg cwd "$project" --arg prompt "$query" \
-      '{session_id:$sid,transcript_path:$transcript,cwd:$cwd,permission_mode:"acceptEdits",hook_event_name:"UserPromptSubmit",prompt:$prompt}' \
+    local sid="scorecard-diagnostic"
+    jq -cn --arg sid "$sid" --arg cwd "$project" --arg prompt "$query" \
+      '{type:"prompt",session_id:$sid,cwd:$cwd,prompt:$prompt}' \
       > "$dir/prompt-time-input.json"
-    rusty-brain-hooks --agent claude-code \
+    rusty-brain-hooks --agent omp \
       < "$dir/prompt-time-input.json" > "$dir/prompt-time-injection.json"
 
     # History every planted or ranked candidate. Anchoring on both an archived
@@ -568,11 +544,9 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
     done
 
     jq -n --arg query "$query" --arg namespace "${RUSTY_BRAIN_NAMESPACE:-}" \
-      '{schema_version:1,query:$query,namespace:$namespace,recall_limit:5,
+      '{schema_version:2,query:$query,namespace:$namespace,recall_limit:5,
         evidence:{context:"context.json",active_candidates:"recall-active.json",
         archived_candidates:"recall-archived.json",planted_chain:"planted.jsonl",
-        session_start_input:"session-start-input.json",
-        session_start_injection:"session-start-injection.json",
         prompt_time_input:"prompt-time-input.json",
         prompt_time_injection:"prompt-time-injection.json",
         histories:"history-<memory-id>.json"}}' > "$dir/index.json"
@@ -586,10 +560,7 @@ finalize_memory_diagnostics() { # dir success mie expect stale
   local dir="$1" success="$2" mie="$3" expect="$4" stale="$5"
   [ -d "$dir" ] || return 0
   local injected stale_present=0 current_present=0 any_present=0 classification
-  injected="$(
-    jq -r '.hookSpecificOutput.additionalContext // .systemMessage // ""' \
-      "$dir/session-start-injection.json" "$dir/prompt-time-injection.json" 2>/dev/null || true
-  )"
+  injected="$(jq -r '.message // ""' "$dir/prompt-time-injection.json" 2>/dev/null || true)"
   [ -z "$injected" ] || any_present=1
   if [ -n "$stale" ] && grep -qiF -- "$stale" <<<"$injected"; then stale_present=1; fi
   if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$injected"; then current_present=1; fi
@@ -615,13 +586,13 @@ retainable_scorecard_artifact() { # relative_path
   if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off|placebo)/(work\.jsonl|judge\.txt)$ ]]; then
     return 0
   fi
-  if [[ "$rel" =~ ^[^/]+/(on|placebo)/injections/(session-start\.jsonl|prompt-time\.jsonl|pair-check\.json|error\.json)$ ]]; then
+  if [[ "$rel" =~ ^[^/]+/(on|placebo)/injections/(prompt-time\.jsonl|pair-check\.json|control-error\.json)$ ]]; then
     return 0
   fi
   if [[ "$rel" =~ ^[^/]+/on/(plant\.jsonl|daemon\.log)$ ]]; then
     return 0
   fi
-  if [[ "$rel" =~ ^[^/]+/on/diagnostics/(index\.json|outcome\.json|context\.json|recall-active\.json|recall-archived\.json|planted\.jsonl|session-start-input\.json|session-start-injection\.json|prompt-time-input\.json|prompt-time-injection\.json)$ ]]; then
+  if [[ "$rel" =~ ^[^/]+/on/diagnostics/(index\.json|outcome\.json|context\.json|recall-active\.json|recall-archived\.json|planted\.jsonl|prompt-time-input\.json|prompt-time-injection\.json)$ ]]; then
     return 0
   fi
   if [[ "$rel" =~ ^[^/]+/on/diagnostics/history-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}\.json$ ]]; then
@@ -635,18 +606,10 @@ retainable_scorecard_artifact() { # relative_path
 # artifacts out of the ephemeral workroot into <dest>, preserving relative
 # paths, before cleanup deletes the workroot (Vikunja #502: the 2026-07-12 N=5
 # safety-gate MIEs were undiagnosable because every session log was rm -rf'd).
-# Copies ONLY the files the harness itself writes, selected by the strict
-# allowlist above — the
-# claude stream-json session logs (work.jsonl / plant.jsonl), the judged model
-# output (judge.txt), memory-on daemon log (daemon.log), and read-only diagnostic
-# JSON — never store
-# DBs, seeded CLAUDE.md files, or stray *.jsonl the harness did not write
-# (PR #70 Copilot), so the retained tree stays small and log-shaped.
-# Best-effort per file: a failed copy WARNS naming the file and the function
-# keeps going, returning non-zero at the end (a last-command status would mask
-# early failures). SECRET-SAFE: none of these carry key material — `claude -p
-# --output-format stream-json` never echoes ANTHROPIC_API_KEY, and the
-# rusty-brain daemon never receives it.
+# Copies only the harness-authored OMP JSON logs (work.jsonl / plant.jsonl),
+# judged model output, memory-on daemon log, and read-only diagnostics — never
+# stores DBs, seeded AGENTS.md files, or arbitrary model-created JSONL. Provider
+# credentials are neither copied nor passed to the memory daemon.
 preserve_session_logs() { # workroot dest
   local workroot="$1" dest="$2" failed=0
   mkdir -p "$dest"
@@ -718,16 +681,15 @@ self_test() {
   if printf '%s' "$ga" | grep -qiwF ureq; then echo "BUG: gen_corpus leaked a target token"; fail=1; else echo "ok: gen_corpus off-topic"; fi
   check "gen_corpus emits N lines" "7" "$(gen_corpus scale-http 7 | grep -c .)"
 
-  # write_claude_md: a Class A realistic arm (empty body) gets distractors ONLY
-  # (target omitted); the steelman arm gets target + distractors; both-empty
-  # writes no file at all (a Class C arm with no baseline text).
+  # write_agents_md: a Class A realistic arm gets distractors only; the
+  # steelman gets target + distractors; both-empty writes no file.
   local wd="$tmp/wcm"; mkdir -p "$wd"
-  write_claude_md "$wd/realistic.md" "" "$(gen_corpus scale-http 2)"
-  write_claude_md "$wd/steelman.md" "HTTP: use the \`ureq\` crate." "$(gen_corpus scale-http 2)"
-  write_claude_md "$wd/none.md" "" ""
-  if grep -qF 'service-svc-' "$wd/realistic.md" && ! grep -qiF ureq "$wd/realistic.md"; then echo "ok: write_claude_md realistic = distractors only (target omitted)"; else echo "BUG: realistic CLAUDE.md"; fail=1; fi
-  if grep -qiF ureq "$wd/steelman.md" && grep -qF 'service-svc-' "$wd/steelman.md"; then echo "ok: write_claude_md steelman = target + distractors"; else echo "BUG: steelman CLAUDE.md"; fail=1; fi
-  if [ ! -f "$wd/none.md" ]; then echo "ok: write_claude_md writes nothing when body + distractors empty"; else echo "BUG: empty write_claude_md created a file"; fail=1; fi
+  write_agents_md "$wd/realistic.md" "" "$(gen_corpus scale-http 2)"
+  write_agents_md "$wd/steelman.md" "HTTP: use the \`ureq\` crate." "$(gen_corpus scale-http 2)"
+  write_agents_md "$wd/none.md" "" ""
+  if grep -qF 'service-svc-' "$wd/realistic.md" && ! grep -qiF ureq "$wd/realistic.md"; then echo "ok: write_agents_md realistic = distractors only (target omitted)"; else echo "BUG: realistic AGENTS.md"; fail=1; fi
+  if grep -qiF ureq "$wd/steelman.md" && grep -qF 'service-svc-' "$wd/steelman.md"; then echo "ok: write_agents_md steelman = target + distractors"; else echo "BUG: steelman AGENTS.md"; fail=1; fi
+  if [ ! -f "$wd/none.md" ]; then echo "ok: write_agents_md writes nothing when body + distractors empty"; else echo "BUG: empty write_agents_md created a file"; fail=1; fi
 
   # Class B direct capture parser: only live hook-origin session summaries count;
   # MCP-origin target memories are reported as bypasses, never a capture pass.
@@ -785,8 +747,8 @@ self_test() {
   else
     echo "BUG: scorecard gemini skip line"; printf '%s\n' "$skip_line"; fail=1
   fi
-  if scorecard_agent_supported claude-code && ! scorecard_agent_supported codex; then
-    echo "ok: only claude-code is currently scorecard-supported"
+  if scorecard_agent_supported omp && ! scorecard_agent_supported codex; then
+    echo "ok: only omp is currently scorecard-supported"
   else
     echo "BUG: scorecard supported-agent predicate"; fail=1
   fi
@@ -805,9 +767,25 @@ data = json.load(open(path))
 scenarios = data.get("scenarios", [])
 errors = []
 
+expected_dimension_counts = {
+    "freshness": 4,
+    "retrieval_scale": 3,
+    "capture": 3,
+    "reach": 3,
+}
+actual_dimension_counts = {
+    dimension: sum(1 for s in scenarios if s.get("dimension") == dimension)
+    for dimension in expected_dimension_counts
+}
+if actual_dimension_counts != expected_dimension_counts:
+    errors.append(
+        f"legacy scenario parity mismatch: expected {expected_dimension_counts}, "
+        f"got {actual_dimension_counts}"
+    )
+
 captures = [s for s in scenarios if s.get("dimension") == "capture"]
-if len(captures) < 3:
-    errors.append(f"need >=3 capture scenarios, got {len(captures)}")
+if len(captures) != 3:
+    errors.append(f"need exactly 3 capture scenarios, got {len(captures)}")
 for s in captures:
     sid = s.get("id", "<missing>")
     if s.get("plant_mode") != "auto-capture":
@@ -820,28 +798,28 @@ for s in captures:
         errors.append(f"{sid}: capture scenario needs capture_expect or expect")
 
 reaches = [s for s in scenarios if s.get("dimension") == "reach"]
-if len(reaches) < 3:
-    errors.append(f"need >=3 reach scenarios, got {len(reaches)}")
+if len(reaches) != 3:
+    errors.append(f"need exactly 3 reach scenarios, got {len(reaches)}")
 for s in reaches:
     sid = s.get("id", "<missing>")
     expect = str(s.get("expect") or "").lower()
-    realistic = str(s.get("realistic_claude_md") or "").lower()
-    steelman = str(s.get("steelman_claude_md") or "").lower()
+    realistic = str(s.get("realistic_agents_md") or "").lower()
+    steelman = str(s.get("steelman_agents_md") or "").lower()
     if s.get("plant_mode") != "explicit":
         errors.append(f"{sid}: reach scenario must use explicit plant")
     plant = s.get("plant")
     if not isinstance(plant, list) or not plant:
         errors.append(f"{sid}: reach scenario needs non-empty plant array")
     if expect and expect in realistic:
-        errors.append(f"{sid}: realistic B CLAUDE.md leaks expect token")
+        errors.append(f"{sid}: realistic AGENTS.md leaks expect token")
     if expect and expect not in steelman:
-        errors.append(f"{sid}: steelman B CLAUDE.md must contain expect token")
+        errors.append(f"{sid}: steelman AGENTS.md must contain expect token")
 
 if errors:
     for e in errors:
         print("BUG:", e)
     raise SystemExit(1)
-print("ok: scenario contracts cover Class B capture and Class R reach")
+print("ok: scenario contracts preserve all legacy OMP scorecard dimensions")
 PY
   then
     :
@@ -849,20 +827,19 @@ PY
     fail=1
   fi
 
-  # extract_usage: reads the session-aggregate cache buckets from the result
-  # record; a non-parseable log yields the worst-case sentinel + is_error=true.
+  # extract_usage reads OMP's terminal agent_end usage and counts turn_start.
   local elog="$tmp/work.jsonl"
   {
-    printf '{"type":"system","subtype":"init"}\n'
-    printf '{"type":"result","subtype":"success","is_error":false,"num_turns":2,"total_cost_usd":0.0123,"usage":{"input_tokens":1560,"cache_creation_input_tokens":4000,"cache_read_input_tokens":5400,"output_tokens":160},"result":"use ureq for HTTP"}\n'
+    printf '{"type":"turn_start"}\n'
+    printf '{"type":"turn_start"}\n'
+    printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"toolUse","usage":{"input":1000,"cacheWrite":4000,"cacheRead":2000,"output":100,"cost":{"total":0.01}}},{"role":"toolResult","content":[]},{"role":"assistant","stopReason":"stop","usage":{"input":560,"cacheWrite":0,"cacheRead":3400,"output":60,"cost":{"total":0.0023}}}]}\n'
   } > "$elog"
-  check "extract_usage reads aggregate cache fields" "$(printf 'false\t2\t0.0123\t1560\t4000\t5400\t160')" "$(extract_usage "$elog")"
+  check "extract_usage sums every assistant call" "$(printf 'false\t2\t0.0123\t1560\t4000\t5400\t160')" "$(extract_usage "$elog")"
   : > "$tmp/empty.jsonl"
   check "extract_usage sentinel on empty log" "$(printf 'true\t%s\t0\t0\t0\t0\t0' "$TURNS_FAIL_SENTINEL")" "$(extract_usage "$tmp/empty.jsonl")"
-  # A PARSEABLE result that is itself an error gets the worst-case turns sentinel
-  # (not its own low/absent num_turns), so a failure never lowers med_turns.
-  printf '{"type":"result","is_error":true,"num_turns":1,"total_cost_usd":0,"usage":{}}\n' > "$tmp/error-result.jsonl"
-  check "extract_usage sentinel on parseable error result" "$(printf 'true\t%s\t0\t0\t0\t0\t0' "$TURNS_FAIL_SENTINEL")" "$(extract_usage "$tmp/error-result.jsonl")"
+  # A terminal OMP provider error gets the worst-case turn sentinel.
+  printf '{"type":"agent_end","messages":[{"role":"assistant","stopReason":"error","usage":{"input":0,"cacheWrite":0,"cacheRead":0,"output":0,"cost":{"total":0}}}]}\n' > "$tmp/error-result.jsonl"
+  check "extract_usage sentinel on terminal OMP error" "$(printf 'true\t%s\t0\t0\t0\t0\t0' "$TURNS_FAIL_SENTINEL")" "$(extract_usage "$tmp/error-result.jsonl")"
 
   # Scorecard fixtures below have N=1 per arm; pass min_runs=1 (3rd arg) so they
   # still gate/verdict. The directional behavior is exercised separately.
@@ -1076,27 +1053,26 @@ PY
   check "MIE classifier: chain head missed" "current_chain_head_missed" "$(classify_mie 1 0 0 1)"
   check "MIE classifier: no evidence/guess" "no_memory_evidence_surfaced_model_guessed" "$(classify_mie 1 0 0 0)"
 
-  # Session-log retention (Vikunja #502): preserve_session_logs copies the
-  # diagnosable per-session artifacts (claude stream-json logs, judged text,
-  # daemon logs, exact hook injections, candidates, states, and histories) out
-  # of a workroot into a destination, preserving relative
-  # paths — and copies NOTHING else (no store DBs, no seeded CLAUDE.md, and —
-  # PR #70 Copilot — no stray *.jsonl the harness did not write), so the
-  # retained artifact stays small and log-shaped.
+  # Session-log retention copies diagnosable OMP JSON logs, judged text, daemon
+  # logs, exact extension injections, candidates, states, and histories out of a
+  # workroot. It copies nothing else: no store DBs, seeded AGENTS.md, or stray
+  # JSONL the harness did not write.
   local lw="$tmp/logs-workroot" ld="$tmp/logs-dest"
   mkdir -p "$lw/fresh-r1/on/diagnostics" "$lw/fresh-r1/realistic/p"
-  printf '{"type":"result"}\n' > "$lw/fresh-r1/on/work.jsonl"
-  printf 'plant\n'             > "$lw/fresh-r1/on/plant.jsonl"
-  printf 'daemon\n'            > "$lw/fresh-r1/on/daemon.log"
-  printf 'judged\n'            > "$lw/fresh-r1/realistic/judge.txt"
-  printf 'db\n'                > "$lw/fresh-r1/on/memory.db"
-  printf 'seeded\n'            > "$lw/fresh-r1/realistic/p/CLAUDE.md"
-  printf 'stray\n'             > "$lw/fresh-r1/on/other.jsonl"
+  printf '{"type":"agent_end"}\n' > "$lw/fresh-r1/on/work.jsonl"
+  printf 'plant\n'                 > "$lw/fresh-r1/on/plant.jsonl"
+  printf 'daemon\n'                > "$lw/fresh-r1/on/daemon.log"
+  printf 'judged\n'                > "$lw/fresh-r1/realistic/judge.txt"
+  printf 'db\n'                    > "$lw/fresh-r1/on/memory.db"
+  printf 'seeded\n'                > "$lw/fresh-r1/realistic/p/AGENTS.md"
+  printf 'stray\n'                 > "$lw/fresh-r1/on/other.jsonl"
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/index.json"
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/outcome.json"
   printf '[]\n'                > "$lw/fresh-r1/on/diagnostics/recall-active.json"
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json"
   printf 'must-drop\n'         > "$lw/fresh-r1/on/diagnostics/unexpected.txt"
+  mkdir -p "$lw/fresh-r1/placebo/injections"
+  printf '{"reason":"missing source"}\n' > "$lw/fresh-r1/placebo/injections/control-error.json"
   mkdir -p "$lw/fresh-r1/on/wp/on/diagnostics"
   printf 'model-spoof\n'       > "$lw/fresh-r1/on/wp/on/diagnostics/index.json"
   printf 'model-spoof\n'       > "$lw/fresh-r1/realistic/p/work.jsonl"
@@ -1105,13 +1081,13 @@ PY
   else
     echo "BUG: preserve_session_logs failed on a populated workroot"; fail=1
   fi
-  for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt; do
+  for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt fresh-r1/placebo/injections/control-error.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
   for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
-  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/CLAUDE.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt fresh-r1/on/wp/on/diagnostics/index.json fresh-r1/realistic/p/work.jsonl; do
+  for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/AGENTS.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt fresh-r1/on/wp/on/diagnostics/index.json fresh-r1/realistic/p/work.jsonl; do
     if [ ! -e "$ld/$dropped" ]; then echo "ok: preserve_session_logs drops $dropped"; else echo "BUG: preserve_session_logs copied non-log $dropped"; fail=1; fi
   done
   # An empty workroot is not an error: retention must never break the run.
@@ -1188,13 +1164,14 @@ PY
 }
 
 # ---- arg parsing -------------------------------------------------------------
-MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""; AGENT="claude-code"; PRE_SCORECARD_ROWS=""; LOG_DIR=""
+MODE="run"; BIN_DIR=""; RUNS=""; OUT=""; MIN_RUNS=""; AGENT="omp"; PRE_SCORECARD_ROWS=""; LOG_DIR=""
 while [ $# -gt 0 ]; do
   case "$1" in
     --self-test)      MODE="self-test"; shift ;;
     --agent)          AGENT="${2:?--agent needs a value}"
-                      case "$AGENT" in claude-code|codex|opencode|gemini|hermes|all) ;; *) echo "--agent must be one of: claude-code, codex, opencode, gemini, hermes, all (got '$AGENT')" >&2; exit 2 ;; esac
+                      case "$AGENT" in omp|codex|opencode|gemini|hermes|all) ;; *) echo "--agent must be one of: omp, codex, opencode, gemini, hermes, all (got '$AGENT')" >&2; exit 2 ;; esac
                       shift 2 ;;
+    --model)          MODEL="${2:?--model needs an OMP model selector}"; shift 2 ;;
     --bin-dir)        BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
     --runs)           RUNS="${2:?--runs needs a value}"; shift 2 ;;
     --min-runs)       MIN_RUNS="${2:?--min-runs needs a value}"
@@ -1214,51 +1191,38 @@ if [ "$AGENT" = "all" ]; then
   echo "== memory-value scorecard agent target: all =="
   PRE_SCORECARD_ROWS="$(scorecard_skip_line codex; scorecard_skip_line opencode; scorecard_skip_line gemini; scorecard_skip_line hermes)"
   printf '%s\n' "$PRE_SCORECARD_ROWS"
-  if [ -n "$OUT" ]; then
-    printf '%s\n' "$PRE_SCORECARD_ROWS" > "$OUT"
-  fi
-  AGENT="claude-code"
+  if [ -n "$OUT" ]; then printf '%s\n' "$PRE_SCORECARD_ROWS" > "$OUT"; fi
+  AGENT="omp"
 elif ! scorecard_agent_supported "$AGENT"; then
   skip_line="$(scorecard_skip_line "$AGENT")"
   echo "== memory-value scorecard agent target: $AGENT =="
   printf '%s\n' "$skip_line"
-  if [ -n "$OUT" ]; then
-    printf '%s\n' "$skip_line" > "$OUT"
-  fi
+  if [ -n "$OUT" ]; then printf '%s\n' "$skip_line" > "$OUT"; fi
   exit 0
 fi
 
-# ---- live run prerequisites (the five-arm runner; needs API) -----------------
+# ---- live run prerequisites (the five-arm runner) -----------------------------
 [ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
 [ -d "$BIN_DIR" ] || { echo "bin dir not found: $BIN_DIR (build first with 'cargo build --release', or pass --bin-dir DIR)" >&2; exit 1; }
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
-for bin in rusty-brain rusty-brain-hooks rusty-brain-install; do
+for bin in rusty-brain rusty-brain-hooks; do
   [ -x "$BIN_DIR/$bin" ] || { echo "missing binary: $BIN_DIR/$bin" >&2; exit 1; }
 done
-command -v claude  >/dev/null 2>&1 || { echo "claude not on PATH" >&2; exit 1; }
+command -v omp     >/dev/null 2>&1 || { echo "omp not on PATH" >&2; exit 1; }
 command -v jq      >/dev/null 2>&1 || { echo "jq not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH" >&2; exit 1; }
-[ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "ANTHROPIC_API_KEY is not set" >&2; exit 1; }
 [ -f "$SCENARIOS_FILE" ] || { echo "scenarios file not found: $SCENARIOS_FILE" >&2; exit 1; }
 [ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 5' "$SCENARIOS_FILE")"
 [ -n "$MIN_RUNS" ] || MIN_RUNS="$(jq -r '.config.min_runs // 5' "$SCENARIOS_FILE")"
-# RB_SCORECARD_TIE_MARGIN (env) overrides config; otherwise honor config.tie_margin
-# (alias: steelman_tie), else 0.10.
 if [ -z "${RB_SCORECARD_TIE_MARGIN+x}" ]; then
   TIE_MARGIN="$(jq -r '.config.tie_margin // .config.steelman_tie // 0.10' "$SCENARIOS_FILE")"
 fi
-# Validate min_runs regardless of source (CLI or config): a non-numeric/0 value
-# coerces to 0 in awk, silently disabling the directional guard.
 case "$MIN_RUNS" in ''|*[!0-9]*|0) echo "min_runs must be a positive integer (got '$MIN_RUNS')" >&2; exit 2 ;; esac
-
-SESSION_TIMEOUT=""
-if command -v timeout >/dev/null 2>&1; then SESSION_TIMEOUT="timeout ${RB_SCORECARD_SESSION_TIMEOUT_SECS:-300}"
-elif command -v gtimeout >/dev/null 2>&1; then SESSION_TIMEOUT="gtimeout ${RB_SCORECARD_SESSION_TIMEOUT_SECS:-300}"; fi
 
 unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE RUSTY_BRAIN_IDLE_TIMEOUT_SECS
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-scorecard.XXXXXX")"
 RESULTS="${OUT:-$WORKROOT/scorecard.tsv}"; : > "$RESULTS"
-python3 "$REPO_ROOT/scripts/scorecard-controls.py" metadata "$RESULTS.metadata.json"
+python3 "$REPO_ROOT/scripts/scorecard-controls.py" metadata "$RESULTS.metadata.json" "$MODEL" "$(omp --version)" "$REPO_ROOT/crates/rb-install/assets/omp-extension.ts"
 if [ -n "$PRE_SCORECARD_ROWS" ]; then
   printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RESULTS"
 fi
@@ -1279,117 +1243,64 @@ cleanup() {
 }
 trap cleanup EXIT
 
-seed_home() { # home [proj]
-  # claude >= 2.1.x ignores project settings (hooks, permissions.allow, MCP)
-  # in a workspace with no recorded trust decision, and `-p` mode cannot show
-  # the trust dialog — so a generated project must be pre-trusted in the
-  # home's .claude.json (keyed by the project's REAL path; macOS tmpdirs
-  # resolve /var -> /private/var).
+seed_home() { # home [project]
   mkdir -p "$1"
-  if [ -n "${2:-}" ]; then
-    mkdir -p "$2"
-    python3 - "$1/.claude.json" "$2" <<'PY'
-import json, os, sys
-path, proj = sys.argv[1], os.path.realpath(sys.argv[2])
-json.dump(
-    {"hasCompletedOnboarding": True,
-     "projects": {proj: {"hasTrustDialogAccepted": True}}},
-    open(path, "w"), indent=2)
-PY
-  else
-    printf '{"hasCompletedOnboarding": true}\n' > "$1/.claude.json"
-  fi
+  [ -z "${2:-}" ] || mkdir -p "$2"
 }
 
-run_session() { # home proj prompt log [extra args...]
-  local home="$1" proj="$2" prompt="$3" log="$4"; shift 4
+run_session() { # home project prompt log
+  local home="$1" project="$2" prompt="$3" log="$4"
+  local extension=()
+  if [ "${RB_SCORECARD_USE_EXTENSION:-0}" = "1" ]; then
+    extension=(--extension "$REPO_ROOT/scripts/scorecard-omp-extension.ts")
+  fi
   (
-    export HOME="$home"
-    unset XDG_RUNTIME_DIR XDG_CACHE_HOME XDG_DATA_HOME XDG_CONFIG_HOME XDG_STATE_HOME
-    export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
-    # `</dev/null`: claude -p reads stdin; without this it drains whatever fd 0
-    # is (e.g. a caller's `while read` source), silently truncating the run.
-    ${SESSION_TIMEOUT} claude -p "$prompt" \
-      --setting-sources project --model "$MODEL" --max-budget-usd "$MAX_BUDGET_USD" \
-      --permission-mode acceptEdits --allowedTools "Bash Edit Write" "$@" \
+    export HOME="$home" PI_CODING_AGENT_DIR="$home/.omp/agent"
+    export PATH="$BIN_DIR:$PATH" RB_OMP_HOOKS_BIN="$BIN_DIR/rusty-brain-hooks"
+    cd "$project" || return 1
+    omp --no-extensions "${extension[@]}" --mode json --session-dir "$home/.omp/sessions" \
+      --model "$MODEL" --max-time "${MAX_SESSION_SECONDS}s" --auto-approve -p "$prompt" \
       </dev/null >"$log" 2>&1 || true
   )
 }
 
-install_claude_hooks() { # home proj
-  local home="$1" proj="$2"
-  (
-    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
-    rusty-brain-install install --agents claude-code >/dev/null
-  )
-}
-
-install_rusty_brain() { # home proj
-  local home="$1" proj="$2"
-  install_claude_hooks "$home" "$proj"
-  (
-    export HOME="$home"; export PATH="$BIN_DIR:$PATH"; cd "$proj" || return 1
-    python3 - "$proj/.claude/settings.json" "$proj/.mcp.json" "$BIN_DIR/rusty-brain" <<'PY'
-import json, sys
-sp, mp, cmd = sys.argv[1], sys.argv[2], sys.argv[3]
-json.dump({"mcpServers": {"rusty-brain": {"command": cmd, "args": ["mcp"]}}}, open(mp, "w"), indent=2)
-s = json.load(open(sp)); s["enableAllProjectMcpServers"] = True
-json.dump(s, open(sp, "w"), indent=2)
-PY
-  )
-}
-
-install_rusty_brain_hooks_only() { # home proj
-  local home="$1" proj="$2"
-  install_claude_hooks "$home" "$proj"
-  rm -f "$proj/.mcp.json"
-  python3 - "$proj/.claude/settings.json" <<'PY'
-import json, os, sys
-p = sys.argv[1]
-if not os.path.exists(p):
-    raise SystemExit(0)
-s = json.load(open(p))
-s.pop("enableAllProjectMcpServers", None)
-json.dump(s, open(p, "w"), indent=2)
-PY
-}
-
-# Score one work session and append a scorecard row. The first 13 fields are
-# stable; Class B capture metrics append four fields after them. The session runs
-# under `--output-format stream-json --verbose` so the final result record
-# carries num_turns, total_cost_usd, AND the session-aggregate cache buckets
-# (ADR-3, docs/eval/2026-06-19-*); extract_usage reads them. The judged text is
-# the model OUTPUT only: the final `.result` plus files written this session
-# (mtime newer than a marker, size-capped) — never the seeded CLAUDE.md, so the
-# baselines' planted distractors/target are not self-graded.
-score_session() { # dim id arm run proj home work expect forbid stale [cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count diagnostics_dir]
+# Score one OMP work session and append a scorecard row. OMP's terminal
+# `agent_end` event supplies usage; judged text is assistant output plus touched
+# workspace files, never the seeded AGENTS.md.
+score_session() { # dim id arm run proj home work expect forbid stale [capture... diagnostics]
   local dim="$1" id="$2" arm="$3" run="$4" proj="$5" home="$6" work="$7" expect="$8" forbid="$9" stale="${10}"
   local cap_fidelity="${11:-na}" cap_reason="${12:-na}" cap_summary_count="${13:-0}" cap_mcp_bypass_count="${14:-0}"
   local diagnostics_dir="${15:-}"
-  local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark"
-  if [ "$arm" = "memory-on" ]; then
-    python3 "$REPO_ROOT/scripts/scorecard-controls.py" install-record "$proj" "$proj/../injections"
-  fi
+  local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark" injections="$proj/../injections"
+  mkdir -p "$injections"
   local file_tokens injection_metrics
-  file_tokens="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" file-tokens "$proj/CLAUDE.md")"
+  file_tokens="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" file-tokens "$proj/AGENTS.md")"
   : > "$marker"
-  run_session "$home" "$proj" "$work" "$jlog" --output-format stream-json --verbose
-  injection_metrics="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" metrics "$proj/../injections" "$file_tokens")"
+  case "$arm" in
+    memory-on)
+      RB_SCORECARD_USE_EXTENSION=1 RB_SCORECARD_INJECTION_DIR="$injections" \
+        run_session "$home" "$proj" "$work" "$jlog"
+      ;;
+    length-matched-placebo)
+      RB_SCORECARD_USE_EXTENSION=1 RB_SCORECARD_INJECTION_DIR="$injections" \
+        RB_SCORECARD_PLACEBO_SOURCE="${RB_SCORECARD_PLACEBO_SOURCE:?placebo source missing}" \
+        RB_SCORECARD_FORBIDDEN="$expect"$'\n'"$forbid"$'\n'"$stale" \
+        run_session "$home" "$proj" "$work" "$jlog"
+      ;;
+    *) run_session "$home" "$proj" "$work" "$jlog" ;;
+  esac
+  injection_metrics="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" metrics "$injections" "$file_tokens")"
   local u is_err turns cost inp cc cr out
-  u="$(extract_usage "$jlog")"   # is_err turns cost input cc cr out
+  u="$(extract_usage "$jlog")"
   is_err="$(cut -f1 <<<"$u")"; turns="$(cut -f2 <<<"$u")"; cost="$(cut -f3 <<<"$u")"
   inp="$(cut -f4 <<<"$u")"; cc="$(cut -f5 <<<"$u")"; cr="$(cut -f6 <<<"$u")"; out="$(cut -f7 <<<"$u")"
-  if jq -e 'select(.type=="result")|.result' "$jlog" >/dev/null 2>&1; then
-    jq -r 'select(.type=="result")|.result' "$jlog" | tail -1 > "$jtext"
-  else
-    cp "$jlog" "$jtext"
-  fi
+  jq -r 'select(.type=="agent_end") | .messages[]? | select(.role=="assistant") | .content[]? | select(.type=="text") | .text' "$jlog" \
+    > "$jtext" 2>/dev/null || cp "$jlog" "$jtext"
   find "$proj" -type f -not -path '*/.*' -newer "$marker" -size -256k -print0 2>/dev/null \
     | xargs -0 cat >> "$jtext" 2>/dev/null || true
   local res success mie
   res="$(judge_text "$jtext" "$expect" "$forbid" "$stale" "$arm")"
   success="${res% *}"; mie="${res#* }"
-  # A server-level error forces failure: it must never look like a cheap success.
   if [ "$is_err" = "true" ]; then success=0; fi
   if [ "$arm" = "memory-on" ] && [ -n "$diagnostics_dir" ]; then
     finalize_memory_diagnostics "$diagnostics_dir" "$success" "$mie" "$expect" "$stale"
@@ -1449,12 +1360,10 @@ plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array> [diagnostic-ma
 }
 
 # Class A (retrieval@scale): bulk-plant N off-topic distractors (importance 5)
-# into the memory-on store so the TARGET (planted by plant_explicit at importance
-# 8) is buried. Uses `rusty-brain remember --batch` — ONE process + ONE daemon
-# connection for all N facts — because at 500+ facts a per-fact CLI invocation is
-# dominated by process spawn + handshake (embeds are the cheap deterministic
-# fallback). The leading markdown bullet is stripped so the stored content matches
-# the bare fact (the bullet is only for the baselines' CLAUDE.md rendering).
+# into the memory-on store so the target (planted by plant_explicit at importance
+# 8) is buried. A batch uses one CLI process and daemon connection; at 500+ facts
+# per-fact process spawn dominates. The markdown bullet is stripped so stored text
+# matches the bare fact used in AGENTS.md baselines.
 plant_corpus_distractors() { # home scenario_id n
   local home="$1" sid="$2" n="$3"
   [ "$n" -gt 0 ] || return 0
@@ -1508,8 +1417,8 @@ run_scenario() { # row
   plant_mode="$(jq -r '.plant_mode' <<<"$row")"
   work="$(jq -r '.work' <<<"$row")"; expect="$(jq -r '.expect' <<<"$row")"
   forbid="$(jq -r '.forbid // ""' <<<"$row")"; stale="$(jq -r '.stale_token // ""' <<<"$row")"
-  realistic="$(jq -r '.realistic_claude_md // ""' <<<"$row")"
-  steelman="$(jq -r '.steelman_claude_md // ""' <<<"$row")"
+  realistic="$(jq -r '.realistic_agents_md // ""' <<<"$row")"
+  steelman="$(jq -r '.steelman_agents_md // ""' <<<"$row")"
   facts="$(jq -c '.plant // []' <<<"$row")"
   plant_session="$(jq -r '.plant_session // ""' <<<"$row")"
   capture_expect="$(jq -r '.capture_expect // .expect // ""' <<<"$row")"
@@ -1535,7 +1444,7 @@ run_scenario() { # row
     local wh="$mb/hw" wp="$mb/wp"
     if [ "$dim" != "reach" ]; then
       seed_home "$wh" "$wp"
-      install_rusty_brain "$wh" "$wp"; rm -f "$wp/CLAUDE.md"; rm -rf "$wp/.claude/skills"
+      rm -f "$wp/AGENTS.md"
     fi
     local sockdir; sockdir="$(mktemp -d /tmp/rbsc.XXXXXX)"; local sock="$sockdir/s"
     (
@@ -1554,10 +1463,9 @@ run_scenario() { # row
       # only the SOCKET needs the short /tmp path (unix socket length limits).
       mkdir -p "$mb"
       derr="$mb/daemon.log"
-      # The scorecard shell needs ANTHROPIC_API_KEY for Claude sessions, but
-      # the memory daemon does not. Remove it from this child environment so a
-      # future daemon error path cannot include or expose the secret.
-      env -u ANTHROPIC_API_KEY rusty-brain serve >"$derr" 2>&1 &
+      # The daemon receives no model credential. OMP resolves the selected
+      # provider from its isolated profile environment.
+      env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY rusty-brain serve >"$derr" 2>&1 &
       dpid=$!
       # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
       cleanup_memory_on() {
@@ -1593,7 +1501,7 @@ run_scenario() { # row
         IFS=$'\t' read -r ha pa hb pb < <(reach_identity_paths "$mb")
         : "$pa" # tab-split placeholder; A needs no project dir
         seed_home "$ha"; seed_home "$hb" "$pb"
-        install_rusty_brain "$hb" "$pb"; rm -f "$pb/CLAUDE.md"; rm -rf "$pb/.claude/skills"
+        rm -f "$pb/AGENTS.md"
         plant_explicit "$ha" "$facts" "$plant_manifest"
         capture_memory_diagnostics "$hb" "$pb" "$work" "$diagnostics_dir" "$plant_manifest"
         score_session "$dim" "$id" "memory-on" "$run" "$pb" "$hb" "$work" "$expect" "$forbid" "$stale" \
@@ -1606,10 +1514,10 @@ run_scenario() { # row
         elif [ "$plant_mode" = "auto-capture" ]; then
           local ph="$mb/hp" pp="$mb/pp" plog="$mb/plant.jsonl"
           seed_home "$ph" "$pp"
-          install_rusty_brain_hooks_only "$ph" "$pp"; rm -f "$pp/CLAUDE.md"; rm -rf "$pp/.claude/skills"
-          # Auto-capture plant: a real Claude Code session whose SessionEnd hook
-          # (no MCP) is the only path that writes memory for this dimension.
-          run_session "$ph" "$pp" "$plant_session" "$plog" --output-format stream-json --verbose
+          rm -f "$pp/AGENTS.md"
+          # Auto-capture plant: a real OMP session whose native extension folds
+          # the session transcript at shutdown; no MCP path writes this memory.
+          RB_SCORECARD_USE_EXTENSION=1 run_session "$ph" "$pp" "$plant_session" "$plog"
           IFS=$'\t' read -r cap_fidelity cap_reason cap_summary_count cap_mcp_bypass_count \
             < <(measure_capture_fidelity "$wh" "$capture_expect" "$capture_forbid")
           # Capture status is printed with its work-session injection sizes by score_session.
@@ -1624,25 +1532,21 @@ run_scenario() { # row
     )
     rm -rf "$sockdir" 2>/dev/null || true
 
-    # realistic-baseline + steelman-baseline + placebo + memory-off. For Class A the
-    # distractor corpus is written into BOTH baselines' CLAUDE.md so the buried
-    # target is the ONLY difference: steelman holds target + distractors (diligent
-    # human), realistic holds distractors only (target omitted — the common
-    # "nobody wrote it down" reality).
+    # realistic-baseline + steelman-baseline + placebo + memory-off. For Class A
+    # the distractor corpus is written into both AGENTS.md baselines so the
+    # buried target is the only difference.
     local rb="$base/realistic"; seed_home "$rb/h" "$rb/p"
-    write_claude_md "$rb/p/CLAUDE.md" "$realistic" "$distractors"
+    write_agents_md "$rb/p/AGENTS.md" "$realistic" "$distractors"
     score_session "$dim" "$id" "realistic-baseline" "$run" "$rb/p" "$rb/h" "$work" "$expect" "$forbid" "$stale"
 
     local sb="$base/steelman"; seed_home "$sb/h" "$sb/p"
-    write_claude_md "$sb/p/CLAUDE.md" "$steelman" "$distractors"
+    write_agents_md "$sb/p/AGENTS.md" "$steelman" "$distractors"
     score_session "$dim" "$id" "steelman-baseline" "$run" "$sb/p" "$sb/h" "$work" "$expect" "$forbid" "$stale"
 
-    # Replay neutral payloads sized from ACTUAL memory-on hook emissions, not
-    # preflight probes or planted store size. A missing/extra channel is invalid.
+    # Replay neutral text sized from the actual OMP prompt-time receipt.
     local cb="$base/placebo"; seed_home "$cb/h" "$cb/p"
-    python3 "$REPO_ROOT/scripts/scorecard-controls.py" install-placebo \
-      "$cb/p" "$cb/injections" "$mb/injections" "$expect" "$forbid" "$stale"
-    score_session "$dim" "$id" "length-matched-placebo" "$run" "$cb/p" "$cb/h" "$work" "$expect" "$forbid" "$stale"
+    RB_SCORECARD_PLACEBO_SOURCE="$mb/injections" \
+      score_session "$dim" "$id" "length-matched-placebo" "$run" "$cb/p" "$cb/h" "$work" "$expect" "$forbid" "$stale"
     python3 "$REPO_ROOT/scripts/scorecard-controls.py" validate-pair "$mb/injections" "$cb/injections"
 
     local ob="$base/off"; seed_home "$ob/h" "$ob/p"
@@ -1652,10 +1556,9 @@ run_scenario() { # row
   done
 }
 
-echo "== memory-value scorecard (agent=$AGENT, model=$MODEL, budget=\$$MAX_BUDGET_USD/session, runs=$RUNS) =="
-# Read ALL scenarios into an array BEFORE running any (not streamed): a
-# streaming `while read < <(jq)` shares fd 0 with the loop body, and a body
-# command that consumes stdin (claude -p) would eat the remaining scenario lines.
+echo "== memory-value scorecard (agent=$AGENT, model=$MODEL, timeout=${MAX_SESSION_SECONDS}s, runs=$RUNS) =="
+# Read all scenarios before running any: OMP print mode must not consume the
+# loop's input stream.
 scenario_rows=()
 while IFS= read -r row; do scenario_rows+=("$row"); done < <(jq -c '.scenarios[]' "$SCENARIOS_FILE")
 for row in "${scenario_rows[@]}"; do run_scenario "$row"; done

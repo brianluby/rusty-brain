@@ -6,6 +6,18 @@ use rb_embed::{EmbedKind, EmbeddingProvider};
 use rb_search::{FusionMode, RrfConfig, Weights};
 use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace};
 use std::sync::Arc;
+/// Transcript/session provenance is weaker evidence than a durable memory.
+///
+/// This is a source-quality ranking prior, not an admission filter: relevant
+/// session matches remain eligible, but incidental session chatter does not
+/// consume a fixed prompt-time recall budget ahead of durable facts.
+const SESSION_PROVENANCE_SCORE_MULTIPLIER: f32 = 0.4;
+
+/// A durable FTS hit has retrieval evidence even when its rank-derived score is
+/// below the default general floor. The lower floor is the prior-only ceiling;
+/// vector-only, graph-only, and session-derived candidates keep the general
+/// relevance floor (scaled with the session ranking prior where applicable).
+const DURABLE_KEYWORD_SCORE_FLOOR: f32 = 0.15;
 
 /// Input to `remember`. Mirrors the proto `Request::Remember` payload, plus
 /// the connection-scoped provenance the daemon resolves at handshake (W0.5).
@@ -567,28 +579,46 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // preserves prior behavior byte-for-byte; `Rrf` is the opt-in two-stage
         // hybrid (spec §7).
         let now = self.now();
-        let ranked = match self.fusion_mode {
+        let mut ranked = match self.fusion_mode {
             FusionMode::Linear => rb_search::rank(signals, self.weights, now, candidate_limit),
             FusionMode::Rrf => rb_search::rank_rrf(signals, self.rrf_config, now, candidate_limit),
         };
+        for (id, score) in &mut ranked {
+            if notes.get(id).is_some_and(|note| note.session_id.is_some()) {
+                *score *= SESSION_PROVENANCE_SCORE_MULTIPLIER;
+            }
+        }
+        ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
-        // Assemble results in ranked order, truncating to limit. Under `Linear`
-        // the score floor (W1.3) drops below-floor candidates: `ranked` is
-        // sorted descending, so the first below-floor score ends assembly and
-        // recall may return fewer than `limit` — or nothing — instead of
-        // padding with junk the KNN leg surfaced by construction (F30). `Rrf`
-        // scores live on a different scale and stay unfloored until calibrated
-        // (W2.2/W4.1).
+        // Assemble source-adjusted results in ranked order, truncating to
+        // `limit`. Under `Linear`, the default W1.3 floor drops weak
+        // candidates; durable FTS evidence uses the bounded source-aware floor
+        // below. `Rrf` scores live on a different scale and stay unfloored
+        // until calibrated (W2.2/W4.1).
         let floor = match self.fusion_mode {
             FusionMode::Linear => self.score_floor,
             FusionMode::Rrf => f32::NEG_INFINITY,
         };
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
         for (id, score) in ranked {
-            if score < floor {
-                break;
-            }
             let Some(note) = notes.get(&id) else {
+                continue;
+            };
+            let durable_keyword = note.session_id.is_none()
+                && channel_map.get(&id).is_some_and(|channels| channels.fts);
+            let candidate_floor = if note.session_id.is_some() {
+                // The source prior changes ordering, not retrieval relevance.
+                // Applying it only to scores would silently raise the admission
+                // bar 2.5x and hide ordinary keyword-matched hook summaries.
+                floor * SESSION_PROVENANCE_SCORE_MULTIPLIER
+            } else if durable_keyword {
+                floor.min(DURABLE_KEYWORD_SCORE_FLOOR)
+            } else {
+                floor
+            };
+            if score < candidate_floor {
+                // Source-aware candidate floors mean a lower-ranked durable
+                // keyword hit may still qualify; do not stop at this row.
                 continue;
             };
             results.push(rb_types::SearchResult {
@@ -2378,6 +2408,55 @@ mod tests {
 
         assert_eq!(results.len(), 3);
         assert!(results.iter().all(|r| matching_ids.contains(&r.memory.id)));
+    }
+
+    #[tokio::test]
+    async fn session_prior_preserves_relevant_capture_but_excludes_prior_only_chatter() {
+        let eng = engine();
+        let durable = note(
+            Namespace::Project("rb".into()),
+            "durable deployment convention",
+            MemoryType::Insight,
+            6,
+            &[],
+        );
+        let mut captured = note(
+            Namespace::Project("rb".into()),
+            "session deployment decision",
+            MemoryType::Insight,
+            6,
+            &[],
+        );
+        captured.session_id = Some("captured-session".into());
+        captured.confidence = 0.7;
+        let mut chatter = note(
+            Namespace::Project("rb".into()),
+            "unrelated session chatter",
+            MemoryType::Insight,
+            6,
+            &[],
+        );
+        chatter.session_id = Some("other-session".into());
+        chatter.confidence = 0.7;
+        let expected = vec![durable.id.clone(), captured.id.clone()];
+        eng.backend().set_keyword_results(expected.clone());
+        eng.backend()
+            .set_vector_results(vec![(chatter.id.clone(), 2.0)]);
+        for candidate in [durable, captured, chatter] {
+            eng.backend().insert_note(candidate);
+        }
+        let results = eng
+            .recall("deployment", 5, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            results
+                .into_iter()
+                .map(|hit| hit.memory.id)
+                .collect::<Vec<_>>(),
+            expected,
+            "durable facts outrank relevant captures; unrelated priors never qualify"
+        );
     }
 
     #[tokio::test]

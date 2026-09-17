@@ -157,7 +157,7 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
 }
 
 /// Resolve every file path a file-mutation tool touched. `Edit`/`Write` carry
-/// one path directly as `file_path`; an `apply_patch` tool instead carries a
+/// one path directly as `file_path` (OMP uses `path`); an `apply_patch` tool carries a
 /// V4A patch whose `*** Add|Update|Delete File: <path>` directives (plus the
 /// `*** Move to: <path>` rename destination) name the targets — and one patch
 /// can touch SEVERAL files in a single call, so every directive is captured
@@ -167,13 +167,25 @@ fn str_field<'a>(input: &'a serde_json::Value, key: &str) -> &'a str {
 /// `tests/fixtures/codex/post_tool_use_apply_patch.json` — openai/codex#16732
 /// shipped PostToolUse for `apply_patch` in Codex 0.123.0). Both share the V4A
 /// format, so one hunk-aware parser ([`v4a_patch_paths`]) covers either field.
+/// OMP hashline edits carry `input` (or the extension's `patch` envelope), with
+/// `[path#HASH]` sections and `MV` destinations; only structural rows count.
 /// Falls back to `["unknown"]` (matching `str_field`) so an unidentified file
 /// touch is still recorded rather than silently dropped.
 fn edited_paths(tool_input: &serde_json::Value) -> Vec<String> {
-    if let Some(p) = tool_input.get("file_path").and_then(|v| v.as_str()) {
-        return vec![p.to_string()];
+    for field in ["file_path", "path"] {
+        if let Some(path) = tool_input.get(field).and_then(|v| v.as_str()) {
+            return vec![path.to_string()];
+        }
     }
-    for field in ["patchText", "command"] {
+    for field in ["input", "patch"] {
+        if let Some(patch) = tool_input.get(field).and_then(|v| v.as_str()) {
+            let paths = hashline_patch_paths(patch);
+            if !paths.is_empty() {
+                return paths;
+            }
+        }
+    }
+    for field in ["patchText", "command", "input"] {
         if let Some(patch) = tool_input.get(field).and_then(|v| v.as_str()) {
             let paths = v4a_patch_paths(patch);
             if !paths.is_empty() {
@@ -182,6 +194,64 @@ fn edited_paths(tool_input: &serde_json::Value) -> Vec<String> {
         }
     }
     vec![str_field(tool_input, "file_path").to_string()]
+}
+
+/// Extract targets, never replacement text, from OMP's hashline patch grammar.
+/// Every body row starts `+`, so a header or `MV` embedded in source cannot
+/// invent a touched file. Unlike V4A, OMP permits absolute target paths.
+fn hashline_patch_paths(patch_text: &str) -> Vec<String> {
+    let mut lines = patch_text.lines();
+    if lines.next() != Some("*** Begin Patch") {
+        return Vec::new();
+    }
+    let mut paths = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    let mut in_section = false;
+    let mut push = |raw: &str| {
+        let path = raw.trim();
+        if !path.is_empty()
+            && !path.chars().any(char::is_control)
+            && !path.split('/').any(|part| part == "..")
+        {
+            let path = path.trim_start_matches("./");
+            if !path.is_empty() && seen.insert(path.to_string()) {
+                paths.push(path.to_string());
+            }
+        }
+    };
+    for line in lines {
+        if line == "*** End Patch" {
+            break;
+        }
+        if line.starts_with('+') {
+            continue;
+        }
+        if let Some(header) = line.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+            in_section = false;
+            if let Some((path, tag)) = header.rsplit_once('#') {
+                if !path.contains('#')
+                    && tag.len() == 4
+                    && tag.bytes().all(|b| b.is_ascii_hexdigit())
+                {
+                    push(path);
+                    in_section = true;
+                }
+            }
+        } else if in_section {
+            if let Some(destination) = line.strip_prefix("MV ") {
+                let destination = destination.trim();
+                push(
+                    destination
+                        .strip_prefix('"')
+                        .and_then(|s| s.strip_suffix('"'))
+                        .unwrap_or(destination),
+                );
+            } else if line != "REM" && !line.starts_with("PUT ") && !line.starts_with("CUT ") {
+                in_section = false;
+            }
+        }
+    }
+    paths
 }
 
 /// Parse every target path out of a V4A `apply_patch` patch text: each
@@ -783,9 +853,9 @@ pub async fn session_end(
     client: Option<&mut DaemonClient>,
     scratch: Option<&Scratch>,
     cwd: &Path,
-    transcript_path: Option<&Path>,
+    transcript: Option<TranscriptDigest>,
 ) -> HookResult {
-    fold_session_summary(client, scratch, cwd, transcript_path, FoldMode::End).await
+    fold_session_summary(client, scratch, cwd, transcript, FoldMode::End).await
 }
 
 /// SessionCheckpoint flow: non-Claude fallback for CLIs that expose a
@@ -797,16 +867,16 @@ pub async fn session_checkpoint(
     client: Option<&mut DaemonClient>,
     scratch: Option<&Scratch>,
     cwd: &Path,
-    transcript_path: Option<&Path>,
+    transcript: Option<TranscriptDigest>,
 ) -> HookResult {
-    fold_session_summary(client, scratch, cwd, transcript_path, FoldMode::Checkpoint).await
+    fold_session_summary(client, scratch, cwd, transcript, FoldMode::Checkpoint).await
 }
 
 async fn fold_session_summary(
     client: Option<&mut DaemonClient>,
     scratch: Option<&Scratch>,
     cwd: &Path,
-    transcript_path: Option<&Path>,
+    transcript: Option<TranscriptDigest>,
     mode: FoldMode,
 ) -> HookResult {
     let Some(scratch) = scratch else {
@@ -814,10 +884,7 @@ async fn fold_session_summary(
     };
     let data = scratch.read();
     let git_files = git_modified_files(cwd).await;
-    let transcript = match transcript_path {
-        Some(path) => transcript::read_digest(path),
-        None => TranscriptDigest::default(),
-    };
+    let transcript = transcript.unwrap_or_default();
 
     let Some(content) = build_session_summary(&data, &git_files, &transcript) else {
         // Nothing worth folding: a true SessionEnd clears the empty buffer; a
@@ -934,13 +1001,26 @@ fn build_session_summary(
     }
     let files = union_touched_files(data, git_files);
     let mut out = String::from("Session summary.\n");
+    // Recall projects a bounded prefix of this content. Put the latest decisions
+    // first so a long goal cannot consume the whole projection before the result
+    // of the work becomes visible. Keep the full goal and observations below.
+    if !transcript.decisions.is_empty() {
+        out.push_str("\nDecisions:\n");
+        for decision in transcript
+            .decisions
+            .iter()
+            .rev()
+            .take(SUMMARY_SECTION_LIMIT)
+        {
+            out.push_str(&format!("- {decision}\n"));
+        }
+    }
     if let Some(goal) = transcript.user_prompts.first() {
         out.push_str(&format!("\nGoal: {goal}\n"));
         for also in transcript.user_prompts.iter().skip(1).take(4) {
             out.push_str(&format!("- also: {also}\n"));
         }
     }
-    push_section(&mut out, "Decisions", &transcript.decisions);
     push_section(&mut out, "Files touched", &files);
     push_section(&mut out, "Commands run", &data.commands);
     push_section(&mut out, "Failures", &data.failures);
@@ -1169,6 +1249,46 @@ mod tests {
         ] {
             assert!(!is_captured(t), "{t} (gemini) should not be captured");
         }
+    }
+
+    #[tokio::test]
+    async fn omp_hashline_patch_captures_targets_without_source_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = scratch_at(dir.path());
+        let patch = concat!(
+            "*** Begin Patch\n",
+            "[src/old.rs#AB12]\n",
+            "PUT 1.=1:\n",
+            "+[phantom.rs#CDEF]\n",
+            "+MV injected.rs\n",
+            "+password=hunter2\n",
+            "MV \"src/new name.rs\"\n",
+            "[src/deleted.rs#1234]\n",
+            "REM\n",
+            "[/work/absolute.rs#ABCD]\n",
+            "CUT 1.=2\n",
+            "*** End Patch\n",
+        );
+        post_tool_use(
+            Some(&scratch),
+            "edit",
+            &serde_json::json!({"patch": patch}),
+            &serde_json::json!({"is_error": false}),
+        )
+        .await;
+        assert_eq!(
+            scratch.read().files,
+            vec![
+                "src/old.rs",
+                "src/new name.rs",
+                "src/deleted.rs",
+                "/work/absolute.rs",
+            ]
+        );
+        let persisted = std::fs::read_to_string(dir.path().join("scratch.json")).unwrap();
+        assert!(!persisted.contains("hunter2"));
+        assert!(!persisted.contains("phantom.rs"));
+        assert!(!persisted.contains("injected.rs"));
     }
 
     #[test]

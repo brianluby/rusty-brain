@@ -13,10 +13,12 @@ pub enum InstallError {
     #[error("[E_INSTALL_AGENT_NOT_FOUND] agent '{agent}' not found on this system")]
     AgentNotFound { agent: String },
     #[error(
-        "[E_INSTALL_INVALID_AGENT] unknown agent '{agent}'. supported: claude-code, gemini, codex"
+        "[E_INSTALL_INVALID_AGENT] unknown agent '{agent}'. supported: claude-code, omp, opencode, gemini, codex"
     )]
     InvalidAgent { agent: String },
-    #[error("[E_INSTALL_AGENT_DEFERRED] opencode integration is deferred (requires a JS/TS plugin) and is not available yet")]
+    #[error(
+        "[E_INSTALL_AGENT_DEFERRED] agent '{agent}' integration is deferred: no persistent installer is available through rusty-brain-install"
+    )]
     AgentDeferred { agent: String },
     #[error("[E_INSTALL_IO_ERROR] i/o error at '{path}': {message}")]
     IoError { path: PathBuf, message: String },
@@ -33,6 +35,8 @@ pub enum AgentStatus {
     Removed,
     Present,
     Absent,
+    /// A native asset exists but its ownership hash no longer matches.
+    Drifted,
     NotFound,
     WouldConfigure,
     WouldRemove,
@@ -92,7 +96,9 @@ impl InstallReport {
                 agents,
             };
         }
-        let any_failed = agents.iter().any(|a| a.status == AgentStatus::Failed);
+        let any_failed = agents
+            .iter()
+            .any(|a| matches!(a.status, AgentStatus::Failed | AgentStatus::Drifted));
         let any_ok = agents.iter().any(|a| {
             matches!(
                 a.status,

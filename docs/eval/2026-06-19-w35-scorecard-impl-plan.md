@@ -115,8 +115,8 @@ is a bare rate.
   `dimension: "retrieval-scale"`, `plant_mode: "explicit"`, a **500+ fact**
   explicit plant (note: `plant_explicit` loops one `remember` per fact — accept
   the latency, or add a bulk-load subcommand as a sub-task).
-  `steelman_claude_md` = large file containing the target fact;
-  `realistic_claude_md` = large/stale file that buries or omits it; `expect` =
+  `steelman_agents_md` = large file containing the target fact;
+  `realistic_agents_md` = large/stale file that buries or omits it; `expect` =
   the one buried fact.
 - **P4c aggregation:** add per-arm token reporting (informational) + the
   caching-adjusted comparison per ADR-3.

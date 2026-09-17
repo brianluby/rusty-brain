@@ -1,9 +1,14 @@
 # Assertion-grade retrieval precision (task #1218)
 
-**Instrument implemented; capability gate NOT met.** On production revision
+**Baseline capability gate NOT met.** On production revision
 `d98de4c4f093860ea16a827c83445fed25267748`, **2/6 cases pass**
 (`score = 0.3333333333333333`). The executable exits **1**, not a success/skip.
-No production engine, store, search, embedding, or type code was changed.
+
+**Current revised-gate evidence:** the unchanged `five-slot-budget` fixture
+passes exactly after source-aware ranking admits durable FTS evidence ahead of
+session-derived chatter. The all-case precision executable remains **3/6**
+(`score = 0.5`) and exits **1** because hard-negative and topic-drift cases
+remain unresolved.
 
 **No LLM or model judge is used.** No answer generation, prose substring matching,
 remote API, model download, or external service participates in the evaluation.
@@ -24,7 +29,11 @@ cargo run --offline --locked --quiet -p rb-eval --bin assertion-precision \
 # Instrument correctness, deliberately independent of capability success:
 cargo test --offline --locked -p rb-eval --test assertion_precision
 
-# Direct capability assertions, including failures on the current engine:
+# Enforced budget-eviction red-to-green regression:
+cargo test --offline --locked -p rb-eval --test assertion_precision_baseline \
+  budget_eviction -- --exact
+
+# Opt-in capability probes for all other classes:
 cargo test --offline --locked -p rb-eval --test assertion_precision_baseline \
   -- --ignored --nocapture --test-threads=1
 
@@ -104,13 +113,50 @@ Namespaces here are **selection scopes, not authorization boundaries**. The
 cross-scope links are seeded through the store to test defensive retrieval, not
 claimed to be creatable through the namespace-bound engine link API.
 
-The task's stronger gate asks for demonstrated baseline failures and subsequent
-fixes for **supersede resurfacing, budget eviction, and namespace leakage**.
-That gate is **not satisfied**: only budget eviction reproduces among those three;
-supersede resurfacing and namespace leakage do not reproduce in these cases.
-No corresponding production fixes were made or claimed. Existing passing checks
-remain regression probes, not evidence of a red-to-green fix. Do not manufacture a
-failure or change a label to make the desired story true.
+The revised task gate requires demonstrated **budget eviction** on the baseline
+and the unchanged fixture to pass after the retrieval fix. Supersede-chain
+exclusion and namespace isolation remain required passing regression invariants;
+no missing trace is relabeled as a baseline failure. The corresponding task
+comment records the evidence audit and decision.
+
+The archived baseline has the two missing requirement IDs and two extra session
+IDs; the current exact-ID regression returns only `...008`–`...012`. The
+permanent `budget_eviction` test records this red-to-green behavior.
+
+
+### Production-shaped wire probes
+
+`crates/rb-daemon/tests/daemon_e2e.rs` separately runs two deterministic,
+offline daemon probes through the public Unix-socket protocol:
+
+- three `Remember` operations linked through the actual `supersedes` request
+  field, followed by `Recall`, must return only the current decision;
+- two clients with identical records in different handshake namespaces cannot
+  link across that boundary, and local `Recall` must return only the local ID.
+
+These exercise the daemon's writer, handshakes, `Request::Remember`,
+`Request::Recall`, and namespace checks instead of the evaluator bridge. They
+are regression probes, not a manufactured baseline: a pass means the tested
+production path did not reproduce that defect class and therefore cannot count
+as the task's required red-to-green evidence.
+
+### Trace availability
+
+The only identified real operational antecedent is Vikunja task `#50`: two
+memory-on scorecard runs answered an obsolete command despite the store holding
+the supersede chain. Its retained record explicitly says session logs were
+deleted and the mechanism was not established: archived recall, a missed
+current head, ignored current evidence, and no recalled evidence remain
+distinct possibilities. It cannot serve as a red baseline for *superseded
+value resurfacing*.
+
+The committed `session_replay` fixtures are invented/sanitized parser examples,
+not corresponding production retrieval traces. No retained trace demonstrates
+a namespace leak. A qualifying gate baseline must preserve a reviewed,
+sanitized request sequence and store state sufficient to replay the observed
+wrong ID set; a current engine or wire-probe pass cannot be relabeled as such
+a failure.
+
 
 ### Fixes still needed / investigation targets
 
@@ -118,13 +164,16 @@ failure or change a label to make the desired story true.
   an unrelated memory even for the empty-evidence query. Investigate query-aware
   relevance/admission and an evidence-aware abstention gate, not corpus-specific
   ID/text exclusions. A score-floor change alone needs separate recall validation.
-- **Budget eviction:** same-topic, higher-importance session chatter consumes
-  slots required by operational facts. Investigate source/topic-sensitive ranking
-  or denoising before the fixed top-five selection; do not enlarge the budget or
-  suppress returned extras in the evaluator.
-- **Topic drift:** session provenance does not stop previous-topic evidence and
-  session chatter from contaminating later recall. Validate a general topic/noise
-  policy against the same frozen queries and independent holdouts.
+- **Budget eviction:** fixed by a source-quality prior for `session_id` memories
+  plus a bounded lower floor for durable FTS hits. The source prior changes
+  ordering, not relevance eligibility: session admission floors scale with the
+  same multiplier as their scores. This prevents ordinary captured decisions
+  from disappearing while retaining the prior-only rejection gate. The separate
+  durable-FTS floor remains at the prior-only ceiling.
+- **Topic drift:** source ranking does not solve query-aware admission; the
+  unchanged topic-drift case still fails. Validate admission changes against
+  the frozen queries and independent
+  holdouts.
 - **Supersede and namespace:** no defect/fix is established by these passing
   probes. Broader independently motivated cases may be added, but the existing
   successful results must not be relabeled as failures.
@@ -156,6 +205,10 @@ All artifacts are under
 5. Added fixture-label validity and repeated real-engine run checks. These validate
    existing behavior and pass without forced failures. The subprocess test now
    invokes Cargo's built binary directly, avoiding nested build jobs.
+6. Promoted `budget_eviction` from opt-in capability probe to the permanent
+   regression after the archived baseline red and post-fix exact-ID green. The
+   fix applies a session source-quality prior and a durable-FTS admission floor;
+   it does not change the fixture, result limit, or evaluator output.
 
 `report-d98de4c.json` is the executable's actual JSON output, exit **1**.
 `provenance.json` records the revision, host, fixture/report hashes and production
@@ -163,27 +216,35 @@ source comparison. The report has no hardcoded claim about the running Git SHA;
 use the provenance sidecar for this archived run, and capture provenance again
 for future runs.
 
-`crate-tests.log`: **109 passed, 0 failed, 14 ignored** (five new opt-in capability
-class tests are among the ignored tests). These are instrument/regression results,
-not a green precision gate. The initial `clippy.log` found a test-only explicit
-panic lint; `clippy-green.log` records the corrected final strict check.
+`crate-tests.log`: **109 passed, 0 failed, 14 ignored** at the original
+instrument capture, including five opt-in capability class tests. It is
+historical instrument/regression evidence, not a green precision gate. The
+initial `clippy.log` found a test-only explicit panic lint; `clippy-green.log`
+records the corrected final strict check.
 
-## Legacy scorecard mapping: conceptual overlap only
+## Legacy scorecard mapping: shared OMP scenario source
 
-Do **not** replace `scripts/memory-scorecard.sh` or its substring proxy on the
-strength of this fixture. Equivalent legacy coverage is not achieved:
+`scripts/memory-scorecard.sh` now replays the legacy scorecard’s exact thirteen
+scenario rows through OMP’s native extension:
 
-- The four `fresh-*` scenarios share the supersede/freshness concept with
-  `supersede-chain`, but their HTTP/config/ID/test-runner facts and downstream
-  agent tasks are not replayed here.
-- `scale-http-buried`, `scale-id-type-buried`, and `scale-wire-format-buried` have
-  500/1,000-distractor scale arms. The eleven-belief budget case is not scale
-  coverage or an equivalent agent/context-budget experiment.
-- The three `cap-*` scenarios exercise auto-capture; this fixture seeds beliefs
-  directly and has no capture coverage.
-- The three `reach-*` scenarios exercise agent/tool reach and downstream tasks;
-  direct engine recall is not equivalent coverage.
+| Legacy dimension | Rows | OMP scorecard treatment |
+|---|---:|---|
+| Freshness | 4 | Explicit supersede chains and stale/current baseline contrast. |
+| Retrieval at scale | 3 | The original 500/1,000-distractor corpus arms. |
+| Auto-capture | 3 | The original plant-session and shutdown-capture rows. |
+| Reach | 3 | The original identity-A-to-B rows. |
 
-The two instruments answer different questions. This one provides exact-ID
-retrieval evidence with an honest failing gate; the legacy script remains a
-prose-token proxy with its existing limitations.
+The shared source is
+[`memory_scorecard_scenarios.json`](../../crates/rb-eval/scorecard/memory_scorecard_scenarios.json);
+the runner's deterministic self-test checks those dimension counts. Migration
+renamed runner-specific baseline fields from `*_claude_md` to `*_agents_md`
+while retaining the scenario rows. Shared inputs do not establish equivalent
+host lifecycle, model behavior, or assertion coverage: full OMP scorecard
+outcomes require a separate live run.
+
+The offline fixture described above is deliberately **not** that scorecard. It
+continues to provide exact-ID retrieval assertions for six focused cases, without
+a model or task judge. It does not claim auto-capture, model response, or
+identity/reach outcome equivalence, and must not replace the OMP scorecard’s
+legacy proxy gate. Its metadata correctly remains `coverage_equivalent: false`
+for the assertion fixture, not for the shared scorecard scenario source.

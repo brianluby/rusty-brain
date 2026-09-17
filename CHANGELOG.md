@@ -5,6 +5,29 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Native OMP extension
+
+- Project-local `rusty-brain-install --agents omp` installation, status, dry-run
+  and uninstall for a standalone, embedded native extension. Content-hash
+  ownership preserves local modifications and unrelated files; symlink targets
+  are rejected. Global OMP installation remains unsupported.
+- Bounded fail-open lifecycle bridge: prompt recall, native write/hashline edit
+  capture, switch/branch checkpoints and shutdown folding. Transcript text
+  travels over stdin and is redacted before persistence, without temporary
+  transcript files.
+- Deterministic Bun lifecycle/control regressions and separate live OMP 18.2.4
+  Luna/Terra memory-on/placebo probes. The scorecard uses the same runtime,
+  records ordered receipts and model/version/asset metadata, and sums usage
+  across every assistant call.
+
+### Fixed — Captured-memory recall
+
+- Session-source ranking penalties now scale the admission floor as well as the
+  score, retaining relevant captured summaries without promoting prior-only
+  chatter or changing their ordering behind durable facts.
+- Session summaries place the latest decisions before long goals so bounded
+  prompt-time projections expose the outcome of the work.
+
 ### Added — Scale, concurrency, and resource harness (Vikunja #57)
 
 - Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,

@@ -29,8 +29,8 @@ pub struct Cli {
 pub enum Command {
     /// Merge our sentinel-marked hook block into each CLI's config.
     Install {
-        /// Restrict to these agents (claude-code, gemini, codex; opencode is
-        /// deferred — it needs a JS/TS plugin).
+        /// Restrict to these agents (claude-code, omp, gemini, codex; opencode is
+        /// deferred). OMP currently supports project scope only.
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Install into the per-user (global) config instead of the project.
@@ -122,7 +122,7 @@ pub fn render(report: &InstallReport, json: bool) -> String {
             | AgentStatus::WouldConfigure
             | AgentStatus::WouldRemove => "[ok]",
             AgentStatus::Absent | AgentStatus::NotFound => "[--]",
-            AgentStatus::Failed => "[xx]",
+            AgentStatus::Failed | AgentStatus::Drifted => "[xx]",
         };
         let path = a
             .config_path
