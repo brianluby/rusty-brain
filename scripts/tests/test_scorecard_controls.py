@@ -147,22 +147,26 @@ class ControlsTest(unittest.TestCase):
             "0", "1", "7", "8", "utf8-bytes-div4-ceil-v1"
         ])
 
-    def test_stale_evidence_requires_a_valid_prompt_receipt(self):
-        result = self.invoke("stale-evidence", str(self.on), "reqwest")
+    def test_stale_evidence_requires_a_unique_stale_record_marker(self):
+        marker = "for outbound HTTP this project uses the `reqwest` crate"
+        result = self.invoke("stale-evidence", str(self.on), marker)
         self.assertEqual(result.stdout.strip(), "unknown\tmissing_prompt_receipt")
 
-        self.receipt(self.on, "Use reqwest for outbound HTTP")
-        result = self.invoke("stale-evidence", str(self.on), "REQWEST")
-        self.assertEqual(result.stdout.strip(), "1\tstale_injected")
-
-        self.receipt(self.on, "Use ureq for outbound HTTP")
-        result = self.invoke("stale-evidence", str(self.on), "reqwest")
+        self.receipt(
+            self.on,
+            "Update: we migrated off reqwest. All HTTP now uses ureq.",
+        )
+        result = self.invoke("stale-evidence", str(self.on), marker)
         self.assertEqual(result.stdout.strip(), "0\tstale_not_injected")
+
+        self.receipt(self.on, f"Decision: {marker}.")
+        result = self.invoke("stale-evidence", str(self.on), marker.upper())
+        self.assertEqual(result.stdout.strip(), "1\tstale_injected")
 
     def test_stale_evidence_is_not_required_without_a_stale_candidate(self):
         result = self.invoke("stale-evidence", str(self.on), "")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(result.stdout.strip(), "na\tno_stale_token")
+        self.assertEqual(result.stdout.strip(), "na\tno_stale_marker")
 
     def test_paired_failure_with_injected_stale_content_is_attributed(self):
         rows = self.attribute(
@@ -248,9 +252,10 @@ class ControlsTest(unittest.TestCase):
         path = self.assertion_report()
         report = json.loads(path.read_text())
         query = report["cases"][0]["queries"][0]
-        query["returned_evidence"] = [{"id": "a"}, {"id": "a"}]
-        query["duplicate_ids"] = ["a"]
-        query["returned_ids"] = ["a", "a"]
+        returned_id = query["expected_ids"][0]
+        query["returned_evidence"] = [{"id": returned_id}, {"id": returned_id}]
+        query["duplicate_ids"] = [returned_id]
+        query["returned_ids"] = [returned_id, returned_id]
         path.write_text(json.dumps(report) + "\n")
         result = self.invoke("assertion-gate", str(path))
         self.assertNotEqual(result.returncode, 0)

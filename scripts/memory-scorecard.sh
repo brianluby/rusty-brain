@@ -504,6 +504,10 @@ aggregate_scorecard() {
         # would default its rate to 0 and could falsify beats_realistic.
         if (n[d SUBSEP "memory-on"]>0 && n[d SUBSEP "realistic-baseline"]>0 && n[d SUBSEP "steelman-baseline"]>0) {
           on=rate[d SUBSEP "memory-on"]; rb=rate[d SUBSEP "realistic-baseline"]; sm=rate[d SUBSEP "steelman-baseline"];
+          source_complete = (scale_source_n == n[d SUBSEP "memory-on"]);
+          if (d == "retrieval_scale") {
+            on = (source_complete && scale_source_n > 0) ? scale_query_success / scale_source_n : -1;
+          }
           beats_realistic = (on > rb);
           ties_steelman   = (on >= sm - tie);
           if (d == "capture") {
@@ -513,12 +517,11 @@ aggregate_scorecard() {
             printf "  -> %s: beats_realistic=%s ties_steelman=%s capture_fidelity_target=%s  => %s\n\n",
                    d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (cap_target_met?"yes":"NO"), verdict;
           } else if (d == "retrieval_scale") {
-            source_complete = (scale_source_n == n[d SUBSEP "memory-on"]);
             query_evidenced = (source_complete && scale_query_success > 0);
             verdict = (beats_realistic && ties_steelman && query_evidenced) ? "PASS" : "no";
             if (beats_realistic && ties_steelman && query_evidenced) pass_dims++;
-            printf "  -> %s: beats_realistic=%s ties_steelman=%s query_retrieval_evidenced=%s  => %s\n\n",
-                   d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (query_evidenced?"yes":"NO"), verdict;
+            printf "  -> %s: query_accuracy=%.2f beats_realistic=%s ties_steelman=%s query_retrieval_evidenced=%s  => %s\n\n",
+                   d, on, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (query_evidenced?"yes":"NO"), verdict;
           } else {
             verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
             if (beats_realistic && ties_steelman) pass_dims++;
@@ -608,11 +611,10 @@ aggregate_scorecard() {
           # RATIFY. Skip the verdict whenever either arm has even one such run.
           printf "  -> retrieval_scale: SKIP cost verdict (zero/absent total_cost_usd on a non-errored run — verify the result-record usage path)\n";
         } else {
-          on_acc=rate[onk]; stl_acc=rate[stl];
-          # A scale accuracy claim needs both observed answers and at least one
-          # successful query-only row; startup-provided answers do not prove
-          # discriminating retrieval among the competitor corpus.
-          acc_ok = (on_acc >= stl_acc) && (s[onk] > 0 && s[stl] > 0) && (scale_query_success > 0);
+          on_acc=scale_query_success/scale_source_n; stl_acc=rate[stl];
+          # Every measured memory-on row is in the denominator. Startup-backed
+          # and unattributed successes therefore count as retrieval failures.
+          acc_ok = (on_acc >= stl_acc) && (scale_query_success > 0 && s[stl] > 0);
           # ADR-3 cost axis is total_cost_usd; "within 20%" => on <= 1.2*stl
           # (both costs are guaranteed > 0 by the fail-closed guard above).
           cost_ok = (on_cost <= 1.2 * stl_cost);
@@ -620,7 +622,7 @@ aggregate_scorecard() {
           else if (acc_ok && !cost_ok)  v="Opt 2 candidate (query-specific accuracy wins; cost > 20% worse)";
           else if (!acc_ok && cost_ok)  v="query retrieval loses / is not evidenced at scale (cost fine)";
           else                          v="descope token-cost axis (value is capture/freshness/reach per ADR-1)";
-          printf "  -> retrieval_scale: response acc on %.2f (%s) vs stl %.2f (%s) | query-specific successes %d/%d [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
+          printf "  -> retrieval_scale: query-attributed acc on %.2f (%s) vs stl %.2f (%s) | query-specific successes %d/%d [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
                  on_acc, injected(onk), stl_acc, injected(stl), scale_query_success, scale_source_n,
                  (acc_ok?"ok":"NO"), on_cost, stl_cost, (cost_ok?"ok":"NO");
           printf "     => %s\n", v;
@@ -929,7 +931,7 @@ JSON
       "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-0}" "${9:-0}" "${10:-0}" "${11:-0}" "${12:-0}" "${13:-false}" \
       "${14:-na}" "${15:-na}" "${16:-0}" "${17:-0}" \
       "${18:-0}" "${19:-0}" "${20:-0}" "${21:-0}" "${22:-utf8-bytes-div4-ceil-v1}" \
-      "${23:-na}" "${24:-na}" "${25:-na}" "${26:-no_stale_token}" \
+      "${23:-na}" "${24:-na}" "${25:-na}" "${26:-no_stale_marker}" \
       "${27:-not_memory_induced}" "${28:-no_stale_candidate}"
   }
   sc_causal_row() { # first 7 stable fields, then stale evidence/reason + attribution/reason
@@ -946,7 +948,7 @@ JSON
     local start_answer="$1" prompt_answer="$2"
     shift 2
     sc_row "$@" na na 0 0 0 0 0 0 utf8-bytes-div4-ceil-v1 \
-      "$start_answer" "$prompt_answer" na no_stale_token not_memory_induced no_stale_candidate
+      "$start_answer" "$prompt_answer" na no_stale_marker not_memory_induced no_stale_candidate
   }
 
   # Class A corpora are deterministic, domain-plausible, collision-free, and
@@ -957,7 +959,7 @@ JSON
     scale_rows=$((scale_rows + 1))
     local scale_id guards targets marker
     scale_id="$(jq -r '.id' <<<"$scale_row")"
-    guards="$(jq -c '[.expect?, .stale_token?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$scale_row")"
+    guards="$(jq -c '[.expect?, .stale_marker?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$scale_row")"
     targets="$(jq -c '[.plant[]?.content]' <<<"$scale_row")"
     case "$scale_id" in
       scale-http-buried)        marker="Outbound HTTP convention:" ;;
@@ -1102,6 +1104,21 @@ for s in freshness:
         errors.append(f"{sid}: assertion exact value must be non-empty")
     if artifact and artifact not in str(s.get("work") or ""):
         errors.append(f"{sid}: work prompt must name the asserted artifact")
+    marker = s.get("stale_marker")
+    plant = s.get("plant")
+    if not isinstance(marker, str) or not marker:
+        errors.append(f"{sid}: stale_marker must be a non-empty string")
+    elif not isinstance(plant, list) or len(plant) < 2:
+        errors.append(f"{sid}: stale marker needs a predecessor and current record")
+    elif not isinstance(plant[0], dict) or not isinstance(plant[-1], dict):
+        errors.append(f"{sid}: stale marker records must be objects")
+    else:
+        stale_content = str(plant[0].get("content") or "")
+        current_content = str(plant[-1].get("content") or "")
+        if marker.casefold() not in stale_content.casefold():
+            errors.append(f"{sid}: stale_marker must identify the stale predecessor")
+        if marker.casefold() in current_content.casefold():
+            errors.append(f"{sid}: stale_marker must be absent from the current record")
 
 for s in scenarios:
     if "forbid" in s:
@@ -1343,6 +1360,25 @@ JSON
     echo "ok: SessionStart-backed success does not become a query retrieval claim"
   else
     echo "BUG: startup evidence was misreported as query retrieval"; printf '%s\n' "$startup_out"; fail=1
+  fi
+
+  # Mixed source evidence must not let one query-only success launder
+  # SessionStart-backed successes into a retrieval@scale PASS.
+  local mixed_scale="$tmp/mixed-scale.tsv"
+  {
+    source_row 0 1 retrieval_scale a1 memory-on          1 1 3 0 0.02 600 4000 4400 100 false
+    source_row 1 1 retrieval_scale a1 memory-on          2 1 3 0 0.02 600 4000 4400 100 false
+    sc_row retrieval_scale a1 realistic-baseline         1 0 5 0 0.02 300 4000 8700 100 false
+    sc_row retrieval_scale a1 realistic-baseline         2 0 5 0 0.02 300 4000 8700 100 false
+    sc_row retrieval_scale a1 steelman-baseline          1 1 3 0 0.02 300 4000 8700 100 false
+    sc_row retrieval_scale a1 steelman-baseline          2 1 3 0 0.02 300 4000 8700 100 false
+  } > "$mixed_scale"
+  local mixed_out; mixed_out="$(aggregate_scorecard "$mixed_scale" 0.10 1)"
+  if printf '%s' "$mixed_out" | grep -qF 'query_accuracy=0.50' \
+     && ! printf '%s' "$mixed_out" | grep -qF 'RATIFY Opt 3'; then
+    echo "ok: mixed startup successes cannot inflate query-attributed accuracy"
+  else
+    echo "BUG: mixed source evidence inflated retrieval accuracy"; printf '%s\n' "$mixed_out"; fail=1
   fi
 
   # ADR-3: Opt 2 candidate when accuracy wins but total_cost_usd > 20% worse.
@@ -1826,7 +1862,7 @@ run_scenario() { # row
   id="$(jq -r '.id' <<<"$row")"; dim="$(jq -r '.dimension' <<<"$row")"
   plant_mode="$(jq -r '.plant_mode' <<<"$row")"
   work="$(jq -r '.work' <<<"$row")"; expect="$(jq -r '.expect' <<<"$row")"
-  stale="$(jq -r '.stale_token // ""' <<<"$row")"
+  stale="$(jq -r '.stale_marker // ""' <<<"$row")"
   outcome_path="$(jq -r '.outcome_assertion.path // ""' <<<"$row")"
   outcome_exact="$(jq -r '.outcome_assertion.exact // ""' <<<"$row")"
   realistic="$(jq -r '.realistic_agents_md // ""' <<<"$row")"
@@ -1842,7 +1878,7 @@ run_scenario() { # row
   corpus_importance="$(jq -r '.corpus_importance // 5' <<<"$row")"
   case "$corpus" in ''|*[!0-9]*) echo "ERROR: $id corpus_size must be a non-negative integer (got '$corpus')" >&2; return 1 ;; esac
   case "$corpus_importance" in ''|*[!0-9]*|0) echo "ERROR: $id corpus_importance must be a positive integer (got '$corpus_importance')" >&2; return 1 ;; esac
-  collision_guards="$(jq -c '[.expect?, .stale_token?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$row")"
+  collision_guards="$(jq -c '[.expect?, .stale_marker?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$row")"
   target_contents="$(jq -c '[.plant[]?.content | select(type == "string" and length > 0)]' <<<"$row")"
   local distractors=""
   if [ "$corpus" -gt 0 ]; then

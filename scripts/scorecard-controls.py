@@ -35,10 +35,10 @@ def messages(directory):
             if isinstance(record.get("message"), str)]
 
 
-def stale_evidence(directory, stale):
-    """Return whether a stale marker appears in an actual prompt-time receipt."""
-    if not stale:
-        return "na", "no_stale_token"
+def stale_evidence(directory, stale_marker):
+    """Return whether a stale-record-only marker appears in a prompt receipt."""
+    if not stale_marker:
+        return "na", "no_stale_marker"
     directory = Path(directory)
     if (directory / "control-error.json").exists():
         return "unknown", "control_error"
@@ -60,7 +60,7 @@ def stale_evidence(directory, stale):
         for row in rows
     ):
         return "unknown", "malformed_prompt_receipt"
-    needle = stale.casefold()
+    needle = stale_marker.casefold()
     present = any(needle in row["message"].casefold() for row in rows)
     return ("1", "stale_injected") if present else ("0", "stale_not_injected")
 

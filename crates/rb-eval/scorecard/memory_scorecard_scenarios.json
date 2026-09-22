@@ -19,7 +19,7 @@
       "steelman_agents_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
       "work": "Choose the HTTP crate for a new outbound GET helper. Write only the crate name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ureq",
-      "stale_token": "reqwest",
+      "stale_marker": "for outbound HTTP this project uses the `reqwest` crate",
       "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "ureq" }
     },
     {
@@ -34,7 +34,7 @@
       "steelman_agents_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
       "work": "Choose the config path for loading `timeout_secs` at startup. Write only the path to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "config/settings.toml",
-      "stale_token": "app.toml",
+      "stale_marker": "project configuration lives in a file named `app.toml` at the repo root",
       "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "config/settings.toml" }
     },
     {
@@ -49,7 +49,7 @@
       "steelman_agents_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
       "work": "Choose the identifier type for a new `Order`. Write only the Rust type name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ulid",
-      "stale_token": "uuid",
+      "stale_marker": "entity identifiers in this codebase are `Uuid`",
       "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "Ulid" }
     },
     {
@@ -64,7 +64,7 @@
       "steelman_agents_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
       "work": "Choose the exact command for the project's test suite. Write only the command to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "nextest",
-      "stale_token": "cargo test",
+      "stale_marker": "run the test suite with `cargo test`",
       "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "cargo nextest run" }
     },
     {
