@@ -105,23 +105,24 @@ asymmetry (above) means the choice of token metric is load-bearing.
 "token cost" axis means `total_cost_usd`. The harness change lands now so A's
 runner inherits it rather than retrofitting.
 
-**Methodology re-homed in the scorecard, 2026-06-21.** Although the trace/cache
-instrumentation above was retired in the gate cutover, the ADR-3 methodology it
-recorded was not lost — it now lives in the unified memory-value scorecard.
-`scripts/memory-scorecard.sh` runs every session under `--output-format
-stream-json --verbose`, records `total_cost_usd` + the four `tok_*` buckets into a
-13-field TSV, and for the `retrieval_scale` dimension prints the cache diagnostics
-(`cache%`, `ctx_vol` = in+cc+cr, `eff_in` = in+1.25·cc+0.1·cr) plus a SINGLE
-per-dimension RATIFY-Opt-3 / Opt-2 / descope verdict (memory-on vs steelman on
-accuracy AND `total_cost_usd` within 20%; the verdict fails closed — it SKIPs on
-session errors or zero/absent cost). The scorecard pools all `retrieval_scale`
-scenarios into one dimension cell (no per-corpus ladder — the retired prototype's
-corpus ladder did not carry over; cost is averaged across the corpus sizes). The
-Class A scenarios (`corpus_size` 500/500/1000) live in
-`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`; their 500+ distractors
-are bulk-planted via the new `rusty-brain remember --batch` (one process for the
-whole corpus). All of this is exercised by `--self-test` (no API); the measured
-run (real sessions at N≥5) stays deferred on a key + spend.
+**Methodology re-homed in the scorecard, 2026-06-21; scale validity corrected
+2026-09-22.** Although the trace/cache instrumentation above was retired in the
+gate cutover, the ADR-3 cost methodology now lives in the unified memory-value
+scorecard. `scripts/memory-scorecard.sh` records `total_cost_usd` and the four
+`tok_*` buckets, printing cache diagnostics (`cache%`, `ctx_vol` = in+cc+cr,
+`eff_in` = in+1.25·cc+0.1·cr) alongside its verdict. The three Class A scenarios
+(`corpus_size` 500/500/1000) bulk-plant deterministic same-domain competitors
+through `rusty-brain remember --batch`; each target and every competitor uses
+importance 5. Candidate generation rejects collisions with expected, stale,
+forbidden, and target-specific identifiers.
+
+The TSV also records whether expected-answer evidence appeared in the
+SessionStart hook context or prompt-time/query recall. Response accuracy alone
+cannot ratify Class A: at least one successful row must be query-only (startup
+absent, prompt recall present), and legacy rows without source fields are
+explicitly unmeasured. This corrects the original importance-8 target versus
+importance-5 off-topic corpus, whose measured Class A interpretation is
+withdrawn by Vikunja #75.
 
 **Deferred to the measured run (this is the "low spend" boundary).**
 

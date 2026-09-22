@@ -7,6 +7,14 @@
 > dimension-A runner if/when it is built on the memory-value scorecard scaffold
 > ([`2026-06-16-w35-criterion-redesign.md`](2026-06-16-w35-criterion-redesign.md)).
 > File paths below no longer exist.
+>
+> **INVALIDATED SCALE INTERPRETATION (2026-09-22, Vikunja #75).** The later
+> implementation planted its target at importance 8 and off-topic distractors at
+> importance 5. SessionStart could therefore expose the answer without
+> discriminating among the corpus. The historical design and numbers below are
+> preserved, not rewritten, but they do not prove retrieval at scale. The current
+> harness equalizes importance, uses collision-checked same-domain competitors,
+> and requires query-only source evidence for a Class A retrieval claim.
 
 - **Status:** **RETIRED** (harness removed in the gate cutover; findings + provisional
   ADR-3 kept as a record). Originally: investigation findings established + harness

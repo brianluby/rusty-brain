@@ -234,6 +234,8 @@ def main():
                 "injected_agents_md_est",
                 "injected_total_est",
                 "injected_estimator",
+                "session_start_answer_present",
+                "prompt_recall_answer_present",
                 "injected_stale_evidence",
                 "injection_evidence_reason",
                 "causal_attribution",

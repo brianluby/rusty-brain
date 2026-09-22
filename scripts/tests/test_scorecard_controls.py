@@ -201,7 +201,8 @@ class ControlsTest(unittest.TestCase):
         self.assertFalse(metadata["assertion_fixture"]["executed_by_this_run"])
         self.assertFalse(metadata["assertion_fixture"]["coverage_equivalent"])
         self.assertIn("before_agent_start", metadata["injected_tokens"]["scope"])
-        self.assertEqual(metadata["tsv_appended_columns"][-4:], [
+        self.assertEqual(metadata["tsv_appended_columns"][-6:], [
+            "session_start_answer_present", "prompt_recall_answer_present",
             "injected_stale_evidence", "injection_evidence_reason",
             "causal_attribution", "causal_reason",
         ])

@@ -22,9 +22,9 @@ use `rusty-brain-install install --agents omp`; see [Agent Support](../AGENTS.md
 
 | Arm | Treatment |
 |---|---|
-| `memory-on` | The native extension forwards `session_start`, prompt-time recall, tool results, and shutdown to `rusty-brain-hooks --agent omp`. |
-| `realistic-baseline` | Scenario-provided realistic `AGENTS.md` plus distractors; no extension. |
-| `steelman-baseline` | Scenario-provided steelman `AGENTS.md` plus distractors; no extension. |
+| `memory-on` | The native extension forwards `session_start`, prompt-time recall, tool results, and shutdown to `rusty-brain-hooks --agent omp`. OMP does not inject the SessionStart hook response; the harness still records that response diagnostically so a scale claim cannot depend on startup-visible evidence. |
+| `realistic-baseline` | Scenario-provided realistic `AGENTS.md` plus same-domain competitors; no extension. |
+| `steelman-baseline` | Scenario-provided steelman `AGENTS.md` plus same-domain competitors; no extension. |
 | `length-matched-placebo` | A native extension injects neutral punctuation through the same OMP `before_agent_start` custom-message channel. |
 | `memory-off` | No extension or seeded `AGENTS.md`; fresh home and project. |
 
@@ -86,7 +86,8 @@ estimated_tokens(text) = ceil(len(text.encode("utf-8")) / 4)
 ```
 
 The TSV's first thirteen columns remain stable. Columns 14-17 retain Class B
-capture diagnostics, and columns 18-22 retain injection estimates:
+capture diagnostics, columns 18-22 retain injection estimates, and columns
+23-24 append answer-source evidence:
 
 | Column | Meaning |
 |---:|---|
@@ -95,6 +96,13 @@ capture diagnostics, and columns 18-22 retain injection estimates:
 | 20 | Seeded `AGENTS.md` estimate. |
 | 21 | Sum of columns 18–20. |
 | 22 | Estimator ID. |
+| 23 | Expected answer present in the diagnostic SessionStart hook context (`0`/`1`; `na` outside memory-on). |
+| 24 | Expected answer present in prompt-time/query recall (`0`/`1`; `na` outside memory-on). |
+
+Class A reports SessionStart-present, prompt-recall-present, and query-only rows
+separately. A response-level success supports the retrieval-at-scale claim only
+when column 23 is `0` and column 24 is `1`; historical rows without these fields
+remain readable but are explicitly unmeasured for query-source attribution.
 
 The causal postprocessor appends four fields without repurposing earlier data:
 

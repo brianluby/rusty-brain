@@ -151,23 +151,115 @@ PY
 }
 
 # ---- corpus generator (pure; deterministic; exercised by --self-test) --------
-# gen_corpus <scenario_id> <n>  -> prints n markdown-bullet distractor lines.
-# Deterministic (seeded by scenario_id) so re-runs are reproducible. Distractors
-# are deliberately OFF-TOPIC from any scenario target (fictional service port
-# numbers) so they never accidentally contain an `expect`/`stale` token. Used by
-# the Class A (retrieval@scale) arms: planted into the memory-on store and written
-# into both baselines' AGENTS.md so a buried target is the only thing that differs.
-# (Pattern carried from the retired P4a cache-trace prototype.)
+# gen_corpus <scenario_id> <n> [collision-guards-json] [target-content-json]
+# prints n markdown-bullet distractor lines. Each Class A scenario has its own
+# deterministic, same-domain candidate pool: HTTP crates, identifier types, or
+# configuration/wire-format conventions. Expected/stale/forbidden tokens and
+# explicit collision tokens are rejected case-insensitively; target facts are
+# rejected both verbatim and by their backtick-delimited identifiers.
 gen_corpus() {
-  python3 - "$1" "$2" <<'PY'
-import sys, hashlib, random
+  python3 - "$1" "$2" "${3:-[]}" "${4:-[]}" <<'PY'
+import hashlib
+import json
+import random
+import re
+import sys
+
 sid, n = sys.argv[1], int(sys.argv[2])
-seed = int(hashlib.sha256(sid.encode()).hexdigest()[:12], 16)
-random.seed(seed)
-ports = random.sample(range(4000, 60000), n)
-for i in range(n):
-    print(f"- Service port convention: `service-svc-{i:04d}` listens on port {ports[i]}; do not reassign it.")
+guards = [value for value in json.loads(sys.argv[3]) if isinstance(value, str) and value]
+targets = [value for value in json.loads(sys.argv[4]) if isinstance(value, str) and value]
+for target in targets:
+    guards.extend(re.findall(r"`([^`]+)`", target))
+
+adjectives = (
+    "account", "admin", "audit", "billing", "catalog", "checkout", "customer",
+    "delivery", "event", "gateway", "inventory", "ledger", "metrics", "order",
+    "partner", "profile", "reporting", "search", "shipping", "worker",
+)
+nouns = ("adapter", "api", "client", "consumer", "daemon", "job", "service", "worker")
+components = [f"{adjective}-{noun}" for adjective in adjectives for noun in nouns]
+
+if sid == "scale-http-buried":
+    alternatives = (
+        ("hyper", "an async connection pool"),
+        ("isahc", "libcurl-backed requests"),
+        ("surf", "an async client facade"),
+        ("awc", "Actix-native requests"),
+        ("minreq", "minimal synchronous requests"),
+        ("curl", "direct libcurl bindings"),
+        ("attohttpc", "small synchronous requests"),
+        ("http-client", "runtime-neutral requests"),
+    )
+    candidates = [
+        f"Outbound HTTP convention: the `{component}` uses the `{crate_name}` crate for {purpose}."
+        for component in components
+        for crate_name, purpose in alternatives
+    ]
+elif sid == "scale-id-type-buried":
+    alternatives = (
+        ("Ksuid", "roughly time-sortable identifiers"),
+        ("Cuid2", "collision-resistant application ids"),
+        ("Nanoid", "compact URL-safe identifiers"),
+        ("SnowflakeId", "distributed sortable identifiers"),
+        ("ObjectId", "timestamp-prefixed document ids"),
+        ("Xid", "compact globally unique identifiers"),
+        ("TypeId", "typed UUID-compatible identifiers"),
+        ("i64", "database-assigned numeric identifiers"),
+    )
+    candidates = [
+        f"Identifier convention: the `{component}` record uses `{id_type}` for {reason}."
+        for component in components
+        for id_type, reason in alternatives
+    ]
+elif sid == "scale-wire-format-buried":
+    alternatives = (
+        ("CBOR", "ciborium"),
+        ("Bincode", "bincode"),
+        ("Protocol Buffers", "prost"),
+        ("Apache Avro", "apache-avro"),
+        ("Cap'n Proto", "capnp"),
+        ("FlatBuffers", "flatbuffers"),
+        ("RON", "ron"),
+        ("Postcard", "postcard"),
+    )
+    config_names = (
+        "codec.toml", "transport.toml", "protocol.toml", "serialization.toml",
+        "socket.toml", "envelope.toml", "messages.toml", "ipc.toml",
+    )
+    candidates = [
+        f"Wire-format convention: `{component}` uses {format_name} via `{library}`; its codec settings live in `config/{config_names[index % len(config_names)]}`."
+        for component in components
+        for index, (format_name, library) in enumerate(alternatives)
+    ]
+else:
+    raise SystemExit(f"unsupported retrieval-scale scenario: {sid}")
+
+blocked = tuple(value.casefold() for value in guards)
+target_text = {value.casefold().strip() for value in targets}
+eligible = [
+    candidate for candidate in candidates
+    if candidate.casefold().strip() not in target_text
+    and not any(token in candidate.casefold() for token in blocked)
+]
+random.Random(int(hashlib.sha256(sid.encode()).hexdigest()[:12], 16)).shuffle(eligible)
+if len(eligible) < n:
+    raise SystemExit(
+        f"{sid}: only {len(eligible)} collision-free same-domain candidates for requested corpus {n}"
+    )
+for candidate in eligible[:n]:
+    print(f"- {candidate}")
 PY
+}
+
+# A scale scenario is valid only when every explicitly planted target has the
+# same importance as the generated competitor corpus.
+scale_importance_valid() { # scenario-json
+  jq -e '
+    (.corpus_size // 0) == 0 or
+    (((.plant // []) | length) > 0 and
+      ((.corpus_importance // 5) as $importance |
+        all(.plant[]; (.importance // 5) == $importance)))
+  ' >/dev/null <<<"$1"
 }
 
 # ---- usage extraction (pure; ADR-3; exercised by --self-test) -----------------
@@ -225,16 +317,17 @@ write_agents_md() { # file body distractors
 # Reads an attributed results TSV. The first 13 fields are stable:
 #   dimension scenario arm run success turns mie cost tok_in tok_cc tok_cr tok_out is_error
 # Fields 14-17 are Class B capture diagnostics. Fields 18-22 are injection-size
-# estimates. The causal postprocessor appends:
-#   23 injected_stale_evidence (0|1|unknown|na)
-#   24 injection_evidence_reason
-#   25 causal_attribution (memory_induced|not_memory_induced|unassessable|na)
-#   26 causal_reason
-# Legacy rows still parse, but a memory-on row without causal fields is
-# unassessable and can never produce SAFE.
+# estimates. Fields 23-24 append answer-evidence booleans for SessionStart and
+# prompt-time/query hook output. The causal postprocessor appends:
+#   25 injected_stale_evidence (0|1|unknown|na)
+#   26 injection_evidence_reason
+#   27 causal_attribution (memory_induced|not_memory_induced|unassessable|na)
+#   28 causal_reason
+# Legacy rows still parse, but they cannot support query-source claims and a
+# memory-on row without causal fields is unassessable and can never produce SAFE.
 # Prints the per-dimension scorecard — success as a Wilson 95% CI, turns as
 # median [Q1-Q3] (P3: median + spread, never a bare mean), and mean
-# total_cost_usd — plus the existing diagnostic blocks.
+# total_cost_usd — plus query-source attribution, cost diagnostics, and safety.
 # Exit code: 0 for a DIRECTIONAL run (any arm below min_runs, or a missing arm —
 # prints no SAFE/UNSAFE verdict, never gates); otherwise 0 iff the causal safety
 # proxy has zero attributed MIEs and zero unassessable required pairs.
@@ -293,8 +386,9 @@ aggregate_scorecard() {
       dim=$1; arm=$3; succ=$5; turns=$6; mie=$7;
       cost=$8; inp=$9; cc=$10; cr=$11; is_err=$13;
       cap_fid=$14; cap_reason=$15; cap_summary=$16; cap_mcp=$17;
-      causal_attr=(NF >= 25 ? $25 : "unassessable");
-      causal_reason=(NF >= 26 ? $26 : "missing_causal_fields");
+      start_answer=(NF >= 24 ? $23 : "na"); prompt_answer=(NF >= 24 ? $24 : "na");
+      causal_attr=(NF >= 27 ? $27 : "unassessable");
+      causal_reason=(NF >= 28 ? $28 : "missing_causal_fields");
       key = dim SUBSEP arm;
       n[key]++; s[key]+=succ; add_inj(key);
       co[key]+=cost; ci_in[key]+=inp; ci_cc[key]+=cc; ci_cr[key]+=cr;
@@ -321,6 +415,24 @@ aggregate_scorecard() {
           unassessable_total++;
           unassessable_list = unassessable_list sprintf(
             "    - %s / %s run %s (%s)\n", dim, $2, $4, causal_reason);
+        }
+      }
+      if (dim=="retrieval_scale" && arm=="memory-on") {
+        if (NF < 24 || (start_answer != "0" && start_answer != "1") ||
+            (prompt_answer != "0" && prompt_answer != "1")) {
+          scale_source_unknown++;
+        } else {
+          scale_source_n++;
+          scale_start_present += start_answer;
+          scale_prompt_present += prompt_answer;
+          if (start_answer == 0 && prompt_answer == 1) {
+            scale_query_only++;
+            if (succ == 1) scale_query_success++;
+          } else if (start_answer == 1 && succ == 1) {
+            scale_startup_success++;
+          } else if (succ == 1) {
+            scale_unattributed_success++;
+          }
         }
       }
       if (dim=="capture" && arm=="memory-on" && cap_fid != "" && cap_fid != "na") {
@@ -369,6 +481,13 @@ aggregate_scorecard() {
             if (beats_realistic && ties_steelman && cap_target_met) pass_dims++;
             printf "  -> %s: beats_realistic=%s ties_steelman=%s capture_fidelity_target=%s  => %s\n\n",
                    d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (cap_target_met?"yes":"NO"), verdict;
+          } else if (d == "retrieval_scale") {
+            source_complete = (scale_source_n == n[d SUBSEP "memory-on"]);
+            query_evidenced = (source_complete && scale_query_success > 0);
+            verdict = (beats_realistic && ties_steelman && query_evidenced) ? "PASS" : "no";
+            if (beats_realistic && ties_steelman && query_evidenced) pass_dims++;
+            printf "  -> %s: beats_realistic=%s ties_steelman=%s query_retrieval_evidenced=%s  => %s\n\n",
+                   d, (beats_realistic?"yes":"NO"), (ties_steelman?"yes":"NO"), (query_evidenced?"yes":"NO"), verdict;
           } else {
             verdict = (beats_realistic && ties_steelman) ? "PASS" : "no";
             if (beats_realistic && ties_steelman) pass_dims++;
@@ -411,15 +530,15 @@ aggregate_scorecard() {
       }
 
       # --- ADR-3 retrieval@scale token/cost (docs/eval/2026-06-19-*) ----------
-      # Accuracy is the PRIMARY axis (the dimension verdict above); cost
-      # (total_cost_usd, cache-adjusted by construction) is the SECONDARY axis;
-      # the cache buckets are diagnostic, never a pass/fail metric (they
-      # double-count cheap cache reads). This block is informational — the hard
-      # gate is the paired stale-injection causal proxy.
+      # Query-attributed accuracy is the PRIMARY axis (the dimension verdict
+      # above); response accuracy without source evidence is diagnostic only.
+      # Cost (total_cost_usd, cache-adjusted by construction) is secondary; cache
+      # buckets are diagnostic and never a pass/fail metric. This block remains
+      # informational; the hard gate is the paired stale-injection causal proxy.
       has_scale = 0; for (d in dims) if (d=="retrieval_scale") has_scale=1;
       if (has_scale) {
         rk = "retrieval_scale";
-        printf "\n== ADR-3 retrieval@scale token/cost (memory-on vs steelman-baseline; accuracy primary, cost secondary) ==\n";
+        printf "\n== ADR-3 retrieval@scale token/cost (query-specific evidence required; memory-on vs steelman-baseline) ==\n";
         printf "%-20s %5s %6s %9s %10s %10s %10s %7s %9s %9s\n",
                "arm", "runs", "succ", "mcost$", "m_input", "m_ccrea", "m_cread", "cache%", "ctx_vol", "eff_in";
         for (i=1;i<=5;i++) {
@@ -432,10 +551,23 @@ aggregate_scorecard() {
                  a, n[key], 100*rate[key], mc, mi, mcc, mcr,
                  100*ratio(ci_cr[key], ci_in[key]), mi+mcc+mcr, mi+1.25*mcc+0.1*mcr, injected(key);
         }
+        if (scale_source_n == n[rk SUBSEP "memory-on"]) {
+          printf "  -> query-source evidence: session_start_present=%d/%d prompt_recall_present=%d/%d query_only=%d/%d\n",
+                 scale_start_present, scale_source_n, scale_prompt_present, scale_source_n,
+                 scale_query_only, scale_source_n;
+          printf "     query-retrieval-specific successes=%d/%d startup-context successes=%d/%d unattributed successes=%d/%d\n",
+                 scale_query_success, scale_source_n, scale_startup_success, scale_source_n,
+                 scale_unattributed_success, scale_source_n;
+        } else {
+          printf "  -> query-source evidence: UNMEASURED (%d/%d memory-on rows have source fields; legacy rows cannot support a retrieval claim)\n",
+                 scale_source_n, n[rk SUBSEP "memory-on"];
+        }
         onk=rk SUBSEP "memory-on"; stl=rk SUBSEP "steelman-baseline";
         on_cost=(n[onk]>0 ? co[onk]/n[onk] : 0); stl_cost=(n[stl]>0 ? co[stl]/n[stl] : 0);
         if (n[onk]==0 || n[stl]==0) {
           printf "  -> retrieval_scale: SKIP cost verdict (memory-on or steelman-baseline produced no runs)\n";
+        } else if (scale_source_n != n[onk]) {
+          printf "  -> retrieval_scale: SKIP cost verdict (query-source evidence incomplete; response accuracy is not proof of retrieval)\n";
         } else if (err[onk]+err[stl] > 0) {
           printf "  -> retrieval_scale: SKIP cost verdict (session errors in memory-on or steelman-baseline)\n";
         } else if (bad_cost[onk] + bad_cost[stl] > 0) {
@@ -447,18 +579,20 @@ aggregate_scorecard() {
           printf "  -> retrieval_scale: SKIP cost verdict (zero/absent total_cost_usd on a non-errored run — verify the result-record usage path)\n";
         } else {
           on_acc=rate[onk]; stl_acc=rate[stl];
-          # acc floor: both arms must land the buried fact at least once, else a
-          # 0-vs-0 tie would falsely read as "accuracy ok".
-          acc_ok = (on_acc >= stl_acc) && (s[onk] > 0 && s[stl] > 0);
+          # A scale accuracy claim needs both observed answers and at least one
+          # successful query-only row; startup-provided answers do not prove
+          # discriminating retrieval among the competitor corpus.
+          acc_ok = (on_acc >= stl_acc) && (s[onk] > 0 && s[stl] > 0) && (scale_query_success > 0);
           # ADR-3 cost axis is total_cost_usd; "within 20%" => on <= 1.2*stl
           # (both costs are guaranteed > 0 by the fail-closed guard above).
           cost_ok = (on_cost <= 1.2 * stl_cost);
-          if (acc_ok && cost_ok)        v="RATIFY Opt 3 (accuracy >= steelman AND total_cost_usd within 20%)";
-          else if (acc_ok && !cost_ok)  v="Opt 2 candidate (accuracy wins; cost > 20% worse — consider caching the SessionStart digest)";
-          else if (!acc_ok && cost_ok)  v="accuracy loses / not meaningful at scale (cost fine) — investigate retrieval, not caching";
+          if (acc_ok && cost_ok)        v="RATIFY Opt 3 (query-specific accuracy >= steelman AND total_cost_usd within 20%)";
+          else if (acc_ok && !cost_ok)  v="Opt 2 candidate (query-specific accuracy wins; cost > 20% worse)";
+          else if (!acc_ok && cost_ok)  v="query retrieval loses / is not evidenced at scale (cost fine)";
           else                          v="descope token-cost axis (value is capture/freshness/reach per ADR-1)";
-          printf "  -> retrieval_scale: acc on %.2f (%s) vs stl %.2f (%s) [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
-                 on_acc, injected(onk), stl_acc, injected(stl), (acc_ok?"ok":"NO"), on_cost, stl_cost, (cost_ok?"ok":"NO");
+          printf "  -> retrieval_scale: response acc on %.2f (%s) vs stl %.2f (%s) | query-specific successes %d/%d [%s] | cost$ on %.4f vs stl %.4f [%s]\n",
+                 on_acc, injected(onk), stl_acc, injected(stl), scale_query_success, scale_source_n,
+                 (acc_ok?"ok":"NO"), on_cost, stl_cost, (cost_ok?"ok":"NO");
           printf "     => %s\n", v;
         }
       }
@@ -545,9 +679,10 @@ reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
 
 
 # Capture the exact read-side evidence a scorecard work session is about to see.
-# The OMP bridge has one deterministic prompt-time injection channel. These
-# probes are read-only and are retained separately from the extension's actual
-# per-session receipt.
+# SessionStart and prompt-time hook outputs are retained separately so Class A
+# can distinguish an answer already present at startup from one surfaced by the
+# query-specific recall path. These probes are read-only and separate from the
+# extension's actual per-session receipt.
 capture_memory_diagnostics() { # home project query diagnostics_dir planted_jsonl
   local home="$1" project="$2" query="$3" dir="$4" planted="$5"
   mkdir -p "$dir"
@@ -556,16 +691,24 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
     export HOME="$home" PATH="$BIN_DIR:$PATH"
     # These read-only probes never call a model or expose provider credentials.
     unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
+    # Probe startup before any query path can refresh a target's access time.
     rusty-brain --json context > "$dir/context.json"
-    rusty-brain --json recall "$query" --limit 5 > "$dir/recall-active.json"
-    rusty-brain --json recall "$query" --limit 5 --archived > "$dir/recall-archived.json"
-
     local sid="scorecard-diagnostic"
+    jq -cn --arg sid "$sid" --arg cwd "$project" \
+      '{type:"session_start",source:"startup",session_id:$sid,cwd:$cwd}' \
+      > "$dir/session-start-input.json"
+    rusty-brain-hooks --agent omp \
+      < "$dir/session-start-input.json" > "$dir/session-start-injection.json"
+
     jq -cn --arg sid "$sid" --arg cwd "$project" --arg prompt "$query" \
       '{type:"prompt",session_id:$sid,cwd:$cwd,prompt:$prompt}' \
       > "$dir/prompt-time-input.json"
     rusty-brain-hooks --agent omp \
       < "$dir/prompt-time-input.json" > "$dir/prompt-time-injection.json"
+    # Candidate snapshots follow the hook probes so they cannot influence either
+    # source classification through access-time refresh.
+    rusty-brain --json recall "$query" --limit 5 > "$dir/recall-active.json"
+    rusty-brain --json recall "$query" --limit 5 --archived > "$dir/recall-archived.json"
 
     # History every planted or ranked candidate. Anchoring on both an archived
     # predecessor and its active head makes the full supersede-chain ids
@@ -580,30 +723,38 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
     done
 
     jq -n --arg query "$query" --arg namespace "${RUSTY_BRAIN_NAMESPACE:-}" \
-      '{schema_version:2,query:$query,namespace:$namespace,recall_limit:5,
+      '{schema_version:3,query:$query,namespace:$namespace,recall_limit:5,
         evidence:{context:"context.json",active_candidates:"recall-active.json",
         archived_candidates:"recall-archived.json",planted_chain:"planted.jsonl",
+        session_start_input:"session-start-input.json",
+        session_start_injection:"session-start-injection.json",
         prompt_time_input:"prompt-time-input.json",
         prompt_time_injection:"prompt-time-injection.json",
         histories:"history-<memory-id>.json"}}' > "$dir/index.json"
   )
 }
 
-# Add the scored outcome and receipt evidence to the retained diagnostics.
-# `scorecard-controls.py attribute-results` adds the paired memory-off outcome
-# and final causal attribution after every arm has completed.
-finalize_memory_diagnostics() { # dir success stale_evidence evidence_reason expect stale
+# Add scored outcome, source attribution, and receipt evidence to retained
+# diagnostics. `scorecard-controls.py attribute-results` adds the paired
+# memory-off outcome and final causal attribution after every arm completes.
+finalize_memory_diagnostics() { # dir success stale_evidence evidence_reason expect stale -> start<TAB>prompt
   local dir="$1" success="$2" stale_evidence="$3" evidence_reason="$4" expect="$5" stale="$6"
-  [ -d "$dir" ] || return 0
-  local injected probe_stale=0 probe_current=0 probe_any=0
-  injected="$(jq -r '.message // ""' "$dir/prompt-time-injection.json" 2>/dev/null || true)"
-  [ -z "$injected" ] || probe_any=1
-  if [ -n "$stale" ] && grep -qiF -- "$stale" <<<"$injected"; then probe_stale=1; fi
-  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$injected"; then probe_current=1; fi
+  [ -d "$dir" ] || { printf 'na\tna\n'; return 0; }
+  local startup prompt probe_stale=0 probe_current=0 probe_any=0
+  local startup_current_present=0 prompt_current_present=0
+  startup="$(jq -r '.message // ""' "$dir/session-start-injection.json" 2>/dev/null || true)"
+  prompt="$(jq -r '.message // ""' "$dir/prompt-time-injection.json" 2>/dev/null || true)"
+  [ -z "$prompt" ] || probe_any=1
+  if [ -n "$stale" ] && grep -qiF -- "$stale" <<<"$prompt"; then probe_stale=1; fi
+  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$prompt"; then probe_current=1; fi
+  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$startup"; then startup_current_present=1; fi
+  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$prompt"; then prompt_current_present=1; fi
   jq -n --argjson success "$success" --arg stale_evidence "$stale_evidence" \
     --arg evidence_reason "$evidence_reason" \
     --argjson probe_stale "$probe_stale" --argjson probe_current "$probe_current" \
     --argjson probe_any "$probe_any" \
+    --argjson startup_current_present "$startup_current_present" \
+    --argjson prompt_current_present "$prompt_current_present" \
     '{success:$success,memory_induced_error:false,
       causal_attribution:"unassessable",causal_reason:"pending_memory_off_pair",
       injected_stale_evidence:
@@ -612,7 +763,12 @@ finalize_memory_diagnostics() { # dir success stale_evidence evidence_reason exp
       injection_evidence_reason:$evidence_reason,
       diagnostic_probe_stale_present:($probe_stale == 1),
       diagnostic_probe_current_present:($probe_current == 1),
-      diagnostic_probe_any_memory:($probe_any == 1)}' > "$dir/outcome.json"
+      diagnostic_probe_any_memory:($probe_any == 1),
+      session_start_answer_present:($startup_current_present == 1),
+      prompt_recall_answer_present:($prompt_current_present == 1),
+      query_only_answer_evidence:($startup_current_present == 0 and $prompt_current_present == 1)}' \
+    > "$dir/outcome.json"
+  printf '%s\t%s\n' "$startup_current_present" "$prompt_current_present"
 }
 
 # Strict allowlist for retained scorecard artifacts. Diagnostic names are
@@ -632,7 +788,7 @@ retainable_scorecard_artifact() { # relative_path
   if [[ "$rel" =~ ^[^/]+/on/(plant\.jsonl|daemon\.log)$ ]]; then
     return 0
   fi
-  if [[ "$rel" =~ ^[^/]+/on/diagnostics/(index\.json|outcome\.json|context\.json|recall-active\.json|recall-archived\.json|planted\.jsonl|prompt-time-input\.json|prompt-time-injection\.json)$ ]]; then
+  if [[ "$rel" =~ ^[^/]+/on/diagnostics/(index\.json|outcome\.json|context\.json|recall-active\.json|recall-archived\.json|planted\.jsonl|session-start-input\.json|session-start-injection\.json|prompt-time-input\.json|prompt-time-injection\.json)$ ]]; then
     return 0
   fi
   if [[ "$rel" =~ ^[^/]+/on/diagnostics/history-[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}\.json$ ]]; then
@@ -727,22 +883,58 @@ self_test() {
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\t0\t0\t0\t0\tfalse\n' \
       "$1" "$2" "$3" "$4" "$5" "$6" "$7"
   }
+  # source_row start-answer prompt-answer <sc_row args...>
+  source_row() {
+    local start_answer="$1" prompt_answer="$2"
+    shift 2
+    printf '%s\t0\t0\t0\t0\tunknown\t%s\t%s\n' \
+      "$(sc_row "$@")" "$start_answer" "$prompt_answer"
+  }
 
-  # gen_corpus: deterministic, off-topic, emits exactly N lines.
-  local ga gb
-  ga="$(gen_corpus scale-http 3)"; gb="$(gen_corpus scale-http 3)"
-  check "gen_corpus deterministic" "$ga" "$gb"
-  if printf '%s' "$ga" | grep -qiwF ureq; then echo "BUG: gen_corpus leaked a target token"; fail=1; else echo "ok: gen_corpus off-topic"; fi
-  check "gen_corpus emits N lines" "7" "$(gen_corpus scale-http 7 | grep -c .)"
+  # Class A corpora are deterministic, domain-plausible, collision-free, and
+  # keep target/distractor importance equal in every committed scale scenario.
+  local ga gb scale_rows=0
+  local scenarios="$REPO_ROOT/crates/rb-eval/scorecard/memory_scorecard_scenarios.json"
+  while IFS= read -r scale_row; do
+    scale_rows=$((scale_rows + 1))
+    local scale_id guards targets marker
+    scale_id="$(jq -r '.id' <<<"$scale_row")"
+    guards="$(jq -c '[.expect?, .stale_token?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$scale_row")"
+    targets="$(jq -c '[.plant[]?.content]' <<<"$scale_row")"
+    case "$scale_id" in
+      scale-http-buried)        marker="Outbound HTTP convention:" ;;
+      scale-id-type-buried)     marker="Identifier convention:" ;;
+      scale-wire-format-buried) marker="Wire-format convention:" ;;
+      *) echo "BUG: unknown scale scenario $scale_id"; fail=1; continue ;;
+    esac
+    ga="$(gen_corpus "$scale_id" 12 "$guards" "$targets")"
+    gb="$(gen_corpus "$scale_id" 12 "$guards" "$targets")"
+    check "$scale_id corpus deterministic" "$ga" "$gb"
+    check "$scale_id corpus emits N lines" "12" "$(grep -c . <<<"$ga")"
+    if grep -qF "$marker" <<<"$ga"; then echo "ok: $scale_id competitors are same-domain"; else echo "BUG: $scale_id competitors are not domain-plausible"; fail=1; fi
+    local collision=0 token
+    while IFS= read -r token; do
+      if [ -n "$token" ] && grep -qiF -- "$token" <<<"$ga"; then collision=1; fi
+    done < <(jq -r '.[]' <<<"$guards")
+    if [ "$collision" -eq 0 ]; then echo "ok: $scale_id guards expected/stale/forbidden/target tokens"; else echo "BUG: $scale_id corpus collision"; fail=1; fi
+    if scale_importance_valid "$scale_row"; then echo "ok: $scale_id target and distractors have equal importance"; else echo "BUG: $scale_id importance mismatch"; fail=1; fi
+  done < <(jq -c '.scenarios[] | select(.dimension == "retrieval_scale")' "$scenarios")
+  check "exactly three retrieval-scale scenarios" "3" "$scale_rows"
+  if scale_importance_valid '{"corpus_size":1,"corpus_importance":5,"plant":[{"content":"target","importance":8}]}'; then
+    echo "BUG: unequal scale importance accepted"; fail=1
+  else
+    echo "ok: unequal scale importance rejected"
+  fi
 
-  # write_agents_md: a Class A realistic arm gets distractors only; the
-  # steelman gets target + distractors; both-empty writes no file.
+  # A Class A realistic arm gets competitors only; the steelman gets target +
+  # competitors; both-empty writes no file.
   local wd="$tmp/wcm"; mkdir -p "$wd"
-  write_agents_md "$wd/realistic.md" "" "$(gen_corpus scale-http 2)"
-  write_agents_md "$wd/steelman.md" "HTTP: use the \`ureq\` crate." "$(gen_corpus scale-http 2)"
+  local http_guards='["ureq","reqwest"]'
+  write_agents_md "$wd/realistic.md" "" "$(gen_corpus scale-http-buried 2 "$http_guards" '[]')"
+  write_agents_md "$wd/steelman.md" "HTTP: use the \`ureq\` crate." "$(gen_corpus scale-http-buried 2 "$http_guards" '[]')"
   write_agents_md "$wd/none.md" "" ""
-  if grep -qF 'service-svc-' "$wd/realistic.md" && ! grep -qiF ureq "$wd/realistic.md"; then echo "ok: write_agents_md realistic = distractors only (target omitted)"; else echo "BUG: realistic AGENTS.md"; fail=1; fi
-  if grep -qiF ureq "$wd/steelman.md" && grep -qF 'service-svc-' "$wd/steelman.md"; then echo "ok: write_agents_md steelman = target + distractors"; else echo "BUG: steelman AGENTS.md"; fail=1; fi
+  if grep -qF 'Outbound HTTP convention:' "$wd/realistic.md" && ! grep -qiF ureq "$wd/realistic.md"; then echo "ok: write_agents_md realistic = competitors only (target omitted)"; else echo "BUG: realistic AGENTS.md"; fail=1; fi
+  if grep -qiF ureq "$wd/steelman.md" && grep -qF 'Outbound HTTP convention:' "$wd/steelman.md"; then echo "ok: write_agents_md steelman = target + competitors"; else echo "BUG: steelman AGENTS.md"; fail=1; fi
   if [ ! -f "$wd/none.md" ]; then echo "ok: write_agents_md writes nothing when body + distractors empty"; else echo "BUG: empty write_agents_md created a file"; fail=1; fi
 
   # Class B direct capture parser: only live hook-origin session summaries count;
@@ -1059,7 +1251,7 @@ PY
   # total_cost_usd within 20% of steelman.
   local ratify="$tmp/ratify.tsv"
   {
-    sc_row retrieval_scale a1 memory-on          1 1 3 0 0.02 600  4000 4400 100 false
+    source_row 0 1 retrieval_scale a1 memory-on          1 1 3 0 0.02 600  4000 4400 100 false
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 6000 0    0    100 false
@@ -1067,10 +1259,28 @@ PY
   } > "$ratify"
   if aggregate_scorecard "$ratify" 0.10 1 | grep -qF 'RATIFY Opt 3'; then echo "ok: ADR-3 ratify when accuracy + cost within bounds"; else echo "BUG: ADR-3 ratify verdict"; aggregate_scorecard "$ratify" 0.10 1; fail=1; fi
 
+  # A correct answer already present at SessionStart is reported honestly and
+  # cannot satisfy the query-retrieval-specific Class A claim.
+  local startup_scale="$tmp/startup-scale.tsv"
+  {
+    source_row 1 1 retrieval_scale a1 memory-on          1 1 3 0 0.02 600 4000 4400 100 false
+    sc_row retrieval_scale a1 realistic-baseline         1 0 5 0 0.02 300 4000 8700 100 false
+    sc_row retrieval_scale a1 steelman-baseline          1 1 3 0 0.02 300 4000 8700 100 false
+    sc_row retrieval_scale a1 memory-off                 1 0 5 0 0.01 6000 0 0 100 false
+    sc_row retrieval_scale a1 length-matched-placebo     1 0 5 0 0.01 6000 0 0 100 false
+  } > "$startup_scale"
+  local startup_out; startup_out="$(aggregate_scorecard "$startup_scale" 0.10 1)"
+  if printf '%s' "$startup_out" | grep -qF 'query_retrieval_evidenced=NO' \
+     && printf '%s' "$startup_out" | grep -qF 'query-retrieval-specific successes=0/1 startup-context successes=1/1'; then
+    echo "ok: SessionStart-backed success does not become a query retrieval claim"
+  else
+    echo "BUG: startup evidence was misreported as query retrieval"; printf '%s\n' "$startup_out"; fail=1
+  fi
+
   # ADR-3: Opt 2 candidate when accuracy wins but total_cost_usd > 20% worse.
   local opt2="$tmp/opt2.tsv"
   {
-    sc_row retrieval_scale a1 memory-on          1 1 3 0 0.03 4000  4000 6000 100 false
+    source_row 0 1 retrieval_scale a1 memory-on          1 1 3 0 0.03 4000  4000 6000 100 false
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 100   4000 9900 100 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 100   4000 9900 100 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0.01 10000 0    0    100 false
@@ -1082,7 +1292,7 @@ PY
   # failed session reads cost=0 and must not look like a cheap RATIFY).
   local serr="$tmp/serr.tsv"
   {
-    sc_row retrieval_scale a1 memory-on         1 0 99 0 0 0 0 0 0 true
+    source_row 0 0 retrieval_scale a1 memory-on         1 0 99 0 0 0 0 0 0 true
     sc_row retrieval_scale a1 steelman-baseline 1 0 99 0 0 0 0 0 0 true
   } > "$serr"
   local serr_out; serr_out="$(aggregate_scorecard "$serr" 0.10 1)"
@@ -1094,7 +1304,7 @@ PY
   # is unverified, so a collapsed cost axis must never silently RATIFY).
   local zcost="$tmp/zcost.tsv"
   {
-    sc_row retrieval_scale a1 memory-on          1 1 3 0 0 0 0 0 0 false
+    source_row 0 1 retrieval_scale a1 memory-on          1 1 3 0 0 0 0 0 0 false
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0 0 0 0 0 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0 0 0 0 0 false
     sc_row retrieval_scale a1 memory-off         1 0 5 0 0 0 0 0 0 false
@@ -1109,8 +1319,8 @@ PY
   # still SKIP (the mean-only check would have wrongly RATIFIED here).
   local pcost="$tmp/pcost.tsv"
   {
-    sc_row retrieval_scale a1 memory-on          1 1 3 0 0.02 600  4000 4400 100 false
-    sc_row retrieval_scale a1 memory-on          2 1 3 0 0    600  4000 4400 100 false
+    source_row 0 1 retrieval_scale a1 memory-on          1 1 3 0 0.02 600  4000 4400 100 false
+    source_row 0 1 retrieval_scale a1 memory-on          2 1 3 0 0    600  4000 4400 100 false
     sc_row retrieval_scale a1 realistic-baseline 1 0 5 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 steelman-baseline  1 1 3 0 0.02 300  4000 8700 100 false
     sc_row retrieval_scale a1 steelman-baseline  2 1 3 0 0.02 300  4000 8700 100 false
@@ -1157,6 +1367,19 @@ PY
     echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
   fi
 
+  # Injection-source diagnostics distinguish startup-visible evidence from a
+  # target surfaced only by the prompt query.
+  local source_diag="$tmp/source-diagnostics"; mkdir -p "$source_diag"
+  printf '{"continue":true,"message":"startup has another decision"}\n' > "$source_diag/session-start-injection.json"
+  printf '{"continue":true,"message":"prompt recalled use ureq"}\n' > "$source_diag/prompt-time-injection.json"
+  check "diagnostics report query-only answer evidence" "$(printf '0\t1')" \
+    "$(finalize_memory_diagnostics "$source_diag" 1 0 receipt_empty ureq "")"
+  if jq -e '.session_start_answer_present == false and .prompt_recall_answer_present == true and .query_only_answer_evidence == true' \
+      "$source_diag/outcome.json" >/dev/null; then
+    echo "ok: diagnostics outcome preserves separate injection sources"
+  else
+    echo "BUG: diagnostics outcome merged injection sources"; fail=1
+  fi
   # Session-log retention copies diagnosable OMP JSON logs, judged text, daemon
   # logs, exact extension injections, candidates, states, and histories out of a
   # workroot. It copies nothing else: no store DBs, seeded AGENTS.md, or stray
@@ -1174,6 +1397,8 @@ PY
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/outcome.json"
   printf '[]\n'                > "$lw/fresh-r1/on/diagnostics/recall-active.json"
   printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json"
+  printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/session-start-input.json"
+  printf '{}\n'                > "$lw/fresh-r1/on/diagnostics/session-start-injection.json"
   printf 'must-drop\n'         > "$lw/fresh-r1/on/diagnostics/unexpected.txt"
   mkdir -p "$lw/fresh-r1/placebo/injections"
   printf '{"reason":"missing source"}\n' > "$lw/fresh-r1/placebo/injections/control-error.json"
@@ -1188,7 +1413,7 @@ PY
   for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt fresh-r1/placebo/injections/control-error.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
-  for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
+  for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/session-start-input.json fresh-r1/on/diagnostics/session-start-injection.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
   for dropped in fresh-r1/on/memory.db fresh-r1/realistic/p/AGENTS.md fresh-r1/on/other.jsonl fresh-r1/on/diagnostics/unexpected.txt fresh-r1/on/wp/on/diagnostics/index.json fresh-r1/realistic/p/work.jsonl; do
@@ -1405,26 +1630,26 @@ score_session() { # dim id arm run proj home work expect stale outcome_path outc
     > "$jtext" 2>/dev/null || cp "$jlog" "$jtext"
   find "$proj" -type f -not -path '*/.*' -newer "$marker" -size -256k -print0 2>/dev/null \
     | xargs -0 cat >> "$jtext" 2>/dev/null || true
-  local success mie=0 stale_evidence="na" evidence_reason="not_memory_on_arm"
+  local success mie=0 stale_evidence="na" evidence_reason="not_memory_on_arm" source_metrics=$'na\tna'
   success="$(judge_outcome "$proj" "$jtext" "$expect" "$outcome_path" "$outcome_exact")"
   if [ "$is_err" = "true" ]; then success=0; fi
   if [ "$arm" = "memory-on" ]; then
     IFS=$'\t' read -r stale_evidence evidence_reason \
       < <(python3 "$REPO_ROOT/scripts/scorecard-controls.py" stale-evidence "$injections" "$stale")
     if [ -n "$diagnostics_dir" ]; then
-      finalize_memory_diagnostics "$diagnostics_dir" "$success" "$stale_evidence" "$evidence_reason" "$expect" "$stale"
+      source_metrics="$(finalize_memory_diagnostics "$diagnostics_dir" "$success" "$stale_evidence" "$evidence_reason" "$expect" "$stale")"
     fi
   fi
-  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+  printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
     "$dim" "$id" "$arm" "$run" "$success" "$turns" "$mie" \
     "$cost" "$inp" "$cc" "$cr" "$out" "$is_err" \
     "$cap_fidelity" "$cap_reason" "$cap_summary_count" "$cap_mcp_bypass_count" \
-    "$injection_metrics" "$stale_evidence" "$evidence_reason" >> "$RAW_RESULTS"
+    "$injection_metrics" "$source_metrics" "$stale_evidence" "$evidence_reason" >> "$RAW_RESULTS"
   local cap_msg=""
   if [ "$cap_fidelity" != "na" ]; then
     cap_msg=" cap=$cap_fidelity/$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
   fi
-  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=pending-pair$cap_msg stale_evidence=$stale_evidence/$evidence_reason injected_est[start,prompt,file,total,estimator]=${injection_metrics//$'\t'/,}"
+  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=pending-pair$cap_msg stale_evidence=$stale_evidence/$evidence_reason injected_est[start,prompt,file,total,estimator]=${injection_metrics//$'\t'/,} answer_evidence[start,prompt]=${source_metrics//$'\t'/,}"
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array
@@ -1439,8 +1664,8 @@ score_session() { # dim id arm run proj home work expect stale outcome_path outc
 # stored as a SUPERSEDING update of the immediately prior planted fact (Class C: X
 # then X' replacing X), archiving the predecessor so recall returns only the
 # current value — explicit, no lossy auto-capture (P2). Class A plants a single
-# TARGET here (importance 8 so it surfaces over the importance-5 distractor corpus
-# planted by plant_corpus_distractors).
+# target here at the scenario's `corpus_importance`; run_scenario rejects a scale
+# scenario unless every target uses the same importance as its distractors.
 plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array> [diagnostic-manifest.jsonl]
   local home="$1" facts="$2" manifest="${3:-}"
   ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"
@@ -1470,17 +1695,16 @@ plant_explicit() { # home (env: RUSTY_BRAIN_*) <facts-json-array> [diagnostic-ma
   )
 }
 
-# Class A (retrieval@scale): bulk-plant N off-topic distractors (importance 5)
-# into the memory-on store so the target (planted by plant_explicit at importance
-# 8) is buried. A batch uses one CLI process and daemon connection; at 500+ facts
-# per-fact process spawn dominates. The markdown bullet is stripped so stored text
-# matches the bare fact used in AGENTS.md baselines.
-plant_corpus_distractors() { # home scenario_id n
-  local home="$1" sid="$2" n="$3"
+# Class A (retrieval@scale): bulk-plant N deterministic same-domain competitors
+# at exactly the target's importance. A batch uses one CLI process and daemon
+# connection; at 500+ facts per-fact process spawn dominates. The markdown bullet
+# is stripped so stored text matches the bare fact used in AGENTS.md baselines.
+plant_corpus_distractors() { # home scenario_id n importance guards_json targets_json
+  local home="$1" sid="$2" n="$3" importance="$4" guards="$5" targets="$6"
   [ "$n" -gt 0 ] || return 0
   ( export HOME="$home"; export PATH="$BIN_DIR:$PATH"
-    gen_corpus "$sid" "$n" | sed 's/^- //' \
-      | rusty-brain remember --batch --type insight --importance 5 >/dev/null \
+    gen_corpus "$sid" "$n" "$guards" "$targets" | sed 's/^- //' \
+      | rusty-brain remember --batch --type insight --importance "$importance" >/dev/null \
       || { echo "ERROR: bulk corpus plant failed for $sid (n=$n)" >&2; return 1; }
   )
 }
@@ -1524,7 +1748,7 @@ measure_capture_fidelity() { # home expect forbid
 run_scenario() { # row
   local row="$1"
   local id dim plant_mode work expect stale realistic steelman facts corpus plant_session capture_expect capture_forbid
-  local outcome_path outcome_exact
+  local outcome_path outcome_exact corpus_importance collision_guards target_contents
   id="$(jq -r '.id' <<<"$row")"; dim="$(jq -r '.dimension' <<<"$row")"
   plant_mode="$(jq -r '.plant_mode' <<<"$row")"
   work="$(jq -r '.work' <<<"$row")"; expect="$(jq -r '.expect' <<<"$row")"
@@ -1537,13 +1761,23 @@ run_scenario() { # row
   plant_session="$(jq -r '.plant_session // ""' <<<"$row")"
   capture_expect="$(jq -r '.capture_expect // .expect // ""' <<<"$row")"
   capture_forbid="$(jq -r '.capture_forbid // ""' <<<"$row")"
-  # corpus_size (Class A): N off-topic distractors that bury the target. Generated
-  # ONCE per scenario (deterministic, seeded by id) so every run + arm sees the
-  # same corpus. 0 (default, e.g. Class C) => no distractors, behavior unchanged.
+  # Class A generates one deterministic same-domain corpus per scenario so every
+  # run and arm sees identical competitors. Scale rows fail closed unless every
+  # target and distractor has exactly the declared corpus importance.
   corpus="$(jq -r '.corpus_size // 0' <<<"$row")"
+  corpus_importance="$(jq -r '.corpus_importance // 5' <<<"$row")"
   case "$corpus" in ''|*[!0-9]*) echo "ERROR: $id corpus_size must be a non-negative integer (got '$corpus')" >&2; return 1 ;; esac
+  case "$corpus_importance" in ''|*[!0-9]*|0) echo "ERROR: $id corpus_importance must be a positive integer (got '$corpus_importance')" >&2; return 1 ;; esac
+  collision_guards="$(jq -c '[.expect?, .stale_token?, .forbid?] + (.distractor_collision_tokens // []) | map(select(type == "string" and length > 0))' <<<"$row")"
+  target_contents="$(jq -c '[.plant[]?.content | select(type == "string" and length > 0)]' <<<"$row")"
   local distractors=""
-  if [ "$corpus" -gt 0 ]; then distractors="$(gen_corpus "$id" "$corpus")"; fi
+  if [ "$corpus" -gt 0 ]; then
+    if ! scale_importance_valid "$row"; then
+      echo "ERROR: $id target importance must equal distractor importance $corpus_importance" >&2
+      return 1
+    fi
+    distractors="$(gen_corpus "$id" "$corpus" "$collision_guards" "$target_contents")"
+  fi
   local run=1
   while [ "$run" -le "$RUNS" ]; do
     local base="$WORKROOT/$id-r$run"
@@ -1623,8 +1857,8 @@ run_scenario() { # row
       else
         if [ "$plant_mode" = "explicit" ]; then
           plant_explicit "$wh" "$facts" "$plant_manifest"
-          # Class A: bury the planted target under the distractor corpus (bulk-load).
-          plant_corpus_distractors "$wh" "$id" "$corpus"
+          # Class A: bury the target among equal-importance same-domain competitors.
+          plant_corpus_distractors "$wh" "$id" "$corpus" "$corpus_importance" "$collision_guards" "$target_contents"
         elif [ "$plant_mode" = "auto-capture" ]; then
           local ph="$mb/hp" pp="$mb/pp" plog="$mb/plant.jsonl"
           seed_home "$ph" "$pp"

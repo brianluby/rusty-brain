@@ -72,8 +72,10 @@
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 500,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["ureq", "reqwest"],
       "plant": [
-        { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 8 }
+        { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest (we avoid pulling in an async runtime).",
@@ -85,8 +87,10 @@
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 500,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["Ulid", "Uuid"],
       "plant": [
-        { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 8 }
+        { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "Identifiers: entity ids are `Ulid` (lexicographically sortable), never Uuid or integer ids.",
@@ -98,8 +102,10 @@
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 1000,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["rmp", "rmp-serde", "MessagePack", "JSON"],
       "plant": [
-        { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 8 }
+        { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",

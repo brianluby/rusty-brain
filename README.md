@@ -547,10 +547,12 @@ portable performance**:
   replay fallbacks. A scheduled five-instant comparison keeps Linear as the default;
   RRF currently regresses MRR/NDCG.
 - **Bounded N=5 capability scorecard**: the 2026-07-12 Claude Code recovery
-  run was safe with zero memory-induced errors; reach and freshness passed,
-  while capture and retrieval-at-scale missed their steelman comparisons
-  (2/4 tracked dimensions passed). This is small-sample proxy evidence, not a
-  user-adoption study. See
+  run was safe with zero memory-induced errors; reach and freshness passed and
+  capture missed its steelman comparison. Its Class A rows used a privileged
+  importance-8 target against importance-5 off-topic distractors and did not
+  attribute startup versus query evidence, so they are historical response/cost
+  data, not retrieval-at-scale proof. A corrected reread remains outstanding.
+  This is small-sample proxy evidence, not a user-adoption study. See
   [`docs/eval/2026-07-12-w35-scorecard-n5-run.md`](docs/eval/2026-07-12-w35-scorecard-n5-run.md).
 - **Nightly real-agent smoke** (`.github/workflows/nightly-claude-smoke.yml`): a
   scheduled macOS job drives a real headless Claude Code session (`claude -p`) against

@@ -163,16 +163,18 @@ scorecard so the headline value is not silently dropped.
   `docs/eval/2026-06-19-p4a-caching-study.md`); the methodology now lives in the
   dimension-A runner built directly on this scaffold (next bullet). The measured run
   (scale corpus + spend) stays deferred.
-- **Built (harness), 2026-06-21.** Dimension A is now instantiated in the unified
-  scorecard: `crates/rb-eval/scorecard/memory_scorecard_scenarios.json` carries
-  `retrieval_scale` scenarios (`corpus_size` 500+, one explicitly-planted target
-  at importance 8 buried under deterministically-generated off-topic distractors),
-  and `scripts/memory-scorecard.sh` scores every session under stream-json,
-  recording `total_cost_usd` + the four cache buckets and printing the ADR-3
-  per-dimension verdict (RATIFY Opt 3 / Opt 2 candidate / descope) — all exercised
-  by `--self-test` with no API. Distractors are bulk-planted via `rusty-brain
-  remember --batch` (one process for the whole corpus). The measured run (real
-  haiku sessions at N≥5) remains deferred on `ANTHROPIC_API_KEY` + spend.
+- **Built (harness), corrected 2026-09-22.** Dimension A is instantiated in the
+  unified scorecard: `crates/rb-eval/scorecard/memory_scorecard_scenarios.json`
+  carries three `retrieval_scale` scenarios with 500/500/1,000 deterministic
+  same-domain competitors. Target and competitors are all importance 5; generated
+  content is collision-checked against expected, stale, forbidden, and
+  target-specific identifiers. `scripts/memory-scorecard.sh` bulk-plants the
+  competitor corpus, records `total_cost_usd` and cache buckets, and reports
+  expected-answer evidence from SessionStart separately from prompt-time/query
+  recall. Only a successful row with no startup answer and a prompt-recall answer
+  supports the retrieval-at-scale claim. The original importance-8/off-topic
+  setup and its measured interpretation are invalidated by Vikunja #75; historical
+  artifacts remain preserved and annotated.
 
 ### B — Capture fidelity (build third; expect it to be the hardest bar)
 

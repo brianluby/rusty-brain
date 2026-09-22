@@ -101,11 +101,13 @@ State values are intentionally restricted to `measured`, `landed, unmeasured`,
 
 ## Addendum (2026-07-12): the deferred N>=5 read has been taken
 
-The "landed, unmeasured" state above is closed:
-`docs/eval/2026-07-12-w35-scorecard-n5-run.md` records the first full N=5
-measured run (Classes A, B, C, R; run 29203432198). Headlines: ADR-3
-**ratified** (Opt 3), capture fidelity 100% (the expected-red that wasn't),
-reach 33% vs 0% realistic, and the safety gate **fired** (2 memory-induced
-errors, `fresh-test-runner`) — tracked as Vikunja #502. Vikunja #381/#382/#383
-(the follow-ups filed by this closeout as #13/#14/#15) are delivered by that
-artifact.
+The measured artifact now exists:
+`docs/eval/2026-07-12-w35-scorecard-n5-run.md` records the first full N=5 run
+(Classes A, B, C, R; run 29203432198). It established capture fidelity 100%,
+reach 33% vs 0% realistic, and triggered the safety response with two
+`fresh-test-runner` memory-induced errors. Its original ADR-3 Opt 3 ratification
+and closure of the Class A follow-up are **withdrawn by Vikunja #75**: the target
+was importance 8 against importance-5 off-topic distractors, and the run did not
+separate SessionStart evidence from query recall. The raw result remains
+historical; only a corrected equal-importance, same-domain, source-attributed run
+can close the retrieval-at-scale claim.
