@@ -41,6 +41,10 @@ async fn real_engine_report_is_repeatable() {
     let second = rb_eval::assertion_precision::run_committed().await.unwrap();
     assert_eq!(first, second);
     assert_eq!(first.fixture_sha256.len(), 64);
+    assert_eq!(first.required_cases, 3);
+    assert_eq!(first.passed_required_cases, 3);
+    assert!(first.precision_gate_passed);
+    assert!(!first.all_cases_passed);
 }
 
 #[test]
@@ -48,10 +52,15 @@ fn committed_labels_are_nonvacuous_and_in_scope() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/assertion_precision.json")).unwrap();
     let mut classes = std::collections::BTreeSet::new();
+    assert_eq!(fixture["schema_version"], 2);
     let mut case_ids = std::collections::BTreeSet::new();
+    let mut required_case_ids = std::collections::BTreeSet::new();
     for case in fixture["cases"].as_array().unwrap() {
         assert!(case_ids.insert(case["id"].as_str().unwrap()));
         classes.insert(case["failure_class"].as_str().unwrap());
+        if case["gate_required"].as_bool().unwrap() {
+            required_case_ids.insert(case["id"].as_str().unwrap());
+        }
         let memories = case["memories"].as_array().unwrap();
         let ids: std::collections::BTreeSet<_> =
             memories.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -81,6 +90,12 @@ fn committed_labels_are_nonvacuous_and_in_scope() {
         }
     }
     assert_eq!(
+        required_case_ids,
+        ["supersede-chain", "five-slot-budget", "namespace-selection"]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
         classes,
         [
             "hard_negative",
@@ -104,13 +119,17 @@ fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect(&error_context);
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["judge_used"], false);
     assert!(report["no_judge_statement"]
         .as_str()
         .unwrap()
         .contains("No LLM"));
     let cases = report["cases"].as_array().unwrap();
+    assert_eq!(report["required_cases"], 3);
+    assert_eq!(report["passed_required_cases"], 3);
+    assert_eq!(report["precision_gate_passed"], true);
+    assert_eq!(report["all_cases_passed"], false);
     assert_eq!(cases.len(), 6);
     let mut passed = 0;
     for case in cases {
@@ -161,9 +180,6 @@ fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
         report["score"].as_f64().unwrap(),
         passed as f64 / cases.len() as f64
     );
-    assert_eq!(report["precision_gate_passed"], passed == cases.len());
-    assert_eq!(
-        output.status.code(),
-        Some(if passed == cases.len() { 0 } else { 1 })
-    );
+    let gate_passed = report["precision_gate_passed"].as_bool().unwrap();
+    assert_eq!(output.status.code(), Some(if gate_passed { 0 } else { 1 }));
 }

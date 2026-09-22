@@ -28,11 +28,11 @@ use `rusty-brain-install install --agents omp`; see [Agent Support](../AGENTS.md
 | `length-matched-placebo` | A native extension injects neutral punctuation through the same OMP `before_agent_start` custom-message channel. |
 | `memory-off` | No extension or seeded `AGENTS.md`; fresh home and project. |
 
-The runner reads the same thirteen legacy rows from
-`crates/rb-eval/scorecard/memory_scorecard_scenarios.json`: four freshness,
-three retrieval-at-scale, three auto-capture, and three reach scenarios. The
-scenario source is therefore scorecard-equivalent to the retired Claude runner;
-the model transport and baseline file convention are now OMP/`AGENTS.md`.
+The runner reads the same thirteen legacy live scenarios: four freshness, three
+retrieval-at-scale, three auto-capture, and three reach. Their historical
+substring metric remains report-only and excludes assistant prose; it cannot
+produce the hard result. Live agent-task correctness is explicitly unsupported
+where no deterministic outcome assertion exists.
 
 The four stale/freshness scenarios use exact delivered-artifact assertions:
 `scorecard-answer.txt` must equal the scenario's current value (apart from one
@@ -53,6 +53,11 @@ satisfied that rule. `UNSAFE` means at least one pair satisfied the rule or was
 unassessable. Neither label proves overall task correctness or strict causality:
 model runs are nondeterministic controls, and the receipt limitation below
 remains.
+Before launching live arms, the runner executes the offline
+`assertion-precision` binary and validates its schema-2 JSON independently. The
+validator recomputes missing, extra, and duplicate IDs, atomic query/case
+verdicts, aggregate totals, the fixed three required case IDs, and
+`judge_used = false`. This exact-ID result is the hard gate.
 
 ## Placebo contract
 
@@ -108,29 +113,40 @@ The causal postprocessor appends four fields without repurposing earlier data:
 
 | Column | Meaning |
 |---:|---|
-| 23 | `injected_stale_evidence`: `0`, `1`, `unknown`, or `na`. |
-| 24 | Injection evidence reason code. |
-| 25 | `causal_attribution`: `memory_induced`, `not_memory_induced`, `unassessable`, or `na`. |
-| 26 | Causal reason code, including `both_arms_failed`, `stale_not_injected`, `missing_memory_off_pair`, and receipt/session errors. |
+| 25 | `injected_stale_evidence`: `0`, `1`, `unknown`, or `na`. |
+| 26 | Injection evidence reason code. |
+| 27 | `causal_attribution`: `memory_induced`, `not_memory_induced`, `unassessable`, or `na`. |
+| 28 | Causal reason code, including `both_arms_failed`, `stale_not_injected`, `missing_memory_off_pair`, and receipt/session errors. |
+
+No assertion data is squeezed into or appended to those row fields. The
+schema-versioned exact evidence report is `RESULTS.tsv.assertions.json`; this
+preserves backward TSV readers and keeps per-query ID arrays structured.
 
 This is a byte-based proxy, not provider token accounting. Usage is summed over
 every assistant call in OMP's terminal `agent_end`, rather than taking only the
 last call. Provider framing, user prompts, tool traffic, plant sessions, and the
 model's own tokenization are outside placebo matching.
 
-`--out RESULTS.tsv` writes `RESULTS.tsv.metadata.json`: model selector, OMP
-version, canonical extension SHA-256, estimator, the exact causal rule,
-SAFE/UNSAFE definitions, residual limitations, and independent assertion-fixture
-status. Resolved provider/model fields remain in each retained `work.jsonl`; use
-`--log-dir` to retain those records and receipts. Retained `outcome.json` files
-include the paired memory-off outcome, attribution, reason, and causal rule.
-The assertion fixture is not executed by scorecard runs and remains explicitly
-`coverage_equivalent: false`: it is an offline retrieval assertion, not an
-agent-task evaluator.
+`--out RESULTS.tsv` also writes `RESULTS.tsv.metadata.json` and
+`RESULTS.tsv.assertions.json`. Metadata schema 4 records the model selector, OMP
+version, canonical extension SHA-256, estimator, assertion-report hash, exact
+required/all-case counts, explicit no-judge status, exact causal rule,
+SAFE/UNSAFE definitions, and residual limitations. Resolved provider/model
+fields remain in retained `work.jsonl`; use `--log-dir` to retain those records
+and receipts. Retained `outcome.json` files include the paired memory-off
+outcome, attribution, reason, and causal rule.
+
+The assertion sidecar is executed by each scorecard run. The hard assertion
+result is `ASSERTION-PASS` only when all three fixed required exact-ID cases
+pass. Non-required hard-negative/topic-drift cases remain visible through
+`passed_cases`, `total_cases`, and `all_cases_passed`; they are never averaged
+away or silently called green. A complete live run must also satisfy the paired
+causal safety gate.
 
 ## Verification
 
 ```bash
+cargo build --release -p rb-eval --bin assertion-precision
 bash -n scripts/memory-scorecard.sh
 bun test scripts/tests/omp-extension.test.ts
 bash scripts/memory-scorecard.sh --self-test
@@ -169,6 +185,9 @@ redaction in actual DB/WAL bytes, status, and uninstall.
 - Legacy non-freshness dimensions still use compatibility substring outcomes;
   the stale safety scenarios use exact artifact equality.
 - Exact-ID retrieval assertions do not constitute semantic task grading.
+- The report-only live substring proxy is not exact-ID evidence or semantic task
+  grading. Assistant prose alone cannot make it a hit, and it never controls
+  `ASSERTION-PASS`.
 - Capture is best-effort: a forced kill can bypass shutdown, and transcript/input
   caps can omit content. These probes certify neither crash recovery nor other
   OMP versions.

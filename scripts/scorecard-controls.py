@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
-"""OMP scorecard prompt-time receipt accounting.
+"""OMP scorecard control accounting and exact assertion validation.
 
-The native OMP extension records the custom message returned by each
-before_agent_start preparation attempt (not a provider delivery receipt).
-This module measures those receipts and rejects unmatched placebos.
+The native OMP extension records each before_agent_start custom-message
+preparation attempt (not a provider delivery receipt). This module measures
+those receipts, rejects unmatched placebos, and independently verifies the
+fixed no-judge exact-ID report used by the hard gate.
 """
+from collections import Counter
 import hashlib
 import json
 from pathlib import Path
@@ -12,6 +14,11 @@ import sys
 
 ESTIMATOR = "utf8-bytes-div4-ceil-v1"
 CHANNEL = "prompt-time"
+REQUIRED_ASSERTION_CASES = {
+    "supersede-chain",
+    "five-slot-budget",
+    "namespace-selection",
+}
 
 
 def estimate(text):
@@ -75,7 +82,7 @@ def causal_attribution(on_rows, off_rows):
         return 0, "unassessable", "memory_off_session_error"
     if on[4] not in {"0", "1"} or off[4] not in {"0", "1"}:
         return 0, "unassessable", "invalid_outcome"
-    evidence, evidence_reason = on[22], on[23]
+    evidence, evidence_reason = on[24], on[25]
     if evidence == "na":
         return 0, "not_memory_induced", "no_stale_candidate"
     if evidence not in {"0", "1"}:
@@ -97,7 +104,7 @@ def attribute_results(source, destination, diagnostics_root=None):
     for line in lines:
         fields = line.split("\t")
         rows.append(fields)
-        if line.startswith("agent=") or len(fields) < 24:
+        if line.startswith("agent=") or len(fields) < 26:
             continue
         key = (fields[0], fields[1], fields[3])
         pairs.setdefault(key, {}).setdefault(fields[2], []).append(fields)
@@ -110,7 +117,7 @@ def attribute_results(source, destination, diagnostics_root=None):
 
     output = []
     for fields in rows:
-        if fields[0].startswith("agent=") or len(fields) < 24:
+        if fields[0].startswith("agent=") or len(fields) < 26:
             output.append("\t".join(fields))
             continue
         key = (fields[0], fields[1], fields[3])
@@ -147,11 +154,110 @@ def attribute_results(source, destination, diagnostics_root=None):
         output.append("\t".join(fields))
     Path(destination).write_text("\n".join(output) + ("\n" if output else ""))
 
+def exact_id_report(path):
+    data = json.loads(Path(path).read_text())
+    if data.get("schema_version") != 2:
+        raise ValueError("assertion report schema_version must be 2")
+    if data.get("judge_used") is not False:
+        raise ValueError("assertion report must declare judge_used=false")
+    if not isinstance(data.get("no_judge_statement"), str) or not data["no_judge_statement"]:
+        raise ValueError("assertion report needs a no_judge_statement")
+    cases = data.get("cases")
+    if not isinstance(cases, list) or not cases:
+        raise ValueError("assertion report needs at least one case")
+
+    passed_cases = 0
+    required_cases = 0
+    passed_required_cases = 0
+    case_ids = set()
+    required_ids = set()
+    for case in cases:
+        case_id = case.get("id")
+        if not isinstance(case_id, str) or not case_id or case_id in case_ids:
+            raise ValueError("assertion report case IDs must be unique non-empty strings")
+        case_ids.add(case_id)
+        if not isinstance(case.get("gate_required"), bool):
+            raise ValueError(f"{case_id}: gate_required must be boolean")
+        queries = case.get("queries")
+        if not isinstance(queries, list) or not queries:
+            raise ValueError(f"{case.get('id', '<missing>')}: case needs queries")
+        query_passes = []
+        for query in queries:
+            expected = query.get("expected_ids")
+            returned = query.get("returned_ids")
+            if (
+                not isinstance(expected, list)
+                or not isinstance(returned, list)
+                or not all(isinstance(value, str) for value in expected + returned)
+            ):
+                raise ValueError("assertion IDs must be string arrays")
+            expected_set = set(expected)
+            returned_set = set(returned)
+            if len(expected_set) != len(expected):
+                raise ValueError("assertion expected_ids must be unique")
+            evidence = query.get("returned_evidence")
+            if (
+                not isinstance(evidence, list)
+                or [row.get("id") for row in evidence if isinstance(row, dict)] != returned
+                or any(not isinstance(row, dict) for row in evidence)
+            ):
+                raise ValueError("returned_evidence IDs must match returned_ids in order")
+            duplicates = sorted([
+                value for value, count in Counter(returned).items() if count > 1
+            ])
+            missing = sorted(expected_set - returned_set)
+            extra = sorted(returned_set - expected_set)
+            passed = not missing and not extra and not duplicates
+            if query.get("missing_ids") != missing:
+                raise ValueError("assertion report missing_ids do not match exact sets")
+            if query.get("extra_ids") != extra:
+                raise ValueError("assertion report extra_ids do not match exact sets")
+            if query.get("duplicate_ids") != duplicates:
+                raise ValueError("assertion report duplicate_ids do not match exact output")
+            if query.get("passed") is not passed:
+                raise ValueError("assertion report query verdict does not match exact IDs")
+            query_passes.append(passed)
+        case_passed = all(query_passes)
+        if case.get("passed") is not case_passed:
+            raise ValueError("assertion report case verdict is not atomic")
+        passed_cases += int(case_passed)
+        if case.get("gate_required") is True:
+            required_cases += 1
+            passed_required_cases += int(case_passed)
+            required_ids.add(case_id)
+
+    if required_ids != REQUIRED_ASSERTION_CASES:
+        raise ValueError(
+            "required assertion cases changed: "
+            f"expected {sorted(REQUIRED_ASSERTION_CASES)}, got {sorted(required_ids)}"
+        )
+    gate_passed = required_cases > 0 and passed_required_cases == required_cases
+    expected_totals = {
+        "passed_cases": passed_cases,
+        "total_cases": len(cases),
+        "passed_required_cases": passed_required_cases,
+        "required_cases": required_cases,
+        "all_cases_passed": passed_cases == len(cases),
+        "precision_gate_passed": gate_passed,
+    }
+    for field, value in expected_totals.items():
+        if data.get(field) != value:
+            raise ValueError(f"assertion report {field} does not match case verdicts")
+    return {
+        "gate_passed": gate_passed,
+        "passed_required_cases": passed_required_cases,
+        "required_cases": required_cases,
+        "passed_cases": passed_cases,
+        "total_cases": len(cases),
+        "all_cases_passed": passed_cases == len(cases),
+        "uses_model_judge": False,
+    }
 
 def main():
     if len(sys.argv) < 2:
         print("usage: scorecard-controls.py "
-              "{file-tokens|metrics|stale-evidence|attribute-results|validate-pair|metadata} ...", file=sys.stderr)
+              "{file-tokens|metrics|stale-evidence|attribute-results|validate-pair|assertion-gate|metadata} ...",
+              file=sys.stderr)
         raise SystemExit(2)
     action, *args = sys.argv[1:]
     if action == "file-tokens":
@@ -190,8 +296,11 @@ def main():
             "exact_model_tokens": False,
             "per_invocation_field_sizes": source_sizes,
         }, indent=2) + "\n")
+    elif action == "assertion-gate":
+        print(json.dumps(exact_id_report(args[0]), separators=(",", ":")))
     elif action == "metadata":
-        destination, model, version, extension_path = args
+        destination, model, version, extension_path, assertion_report = args
+        assertion = exact_id_report(assertion_report)
         metadata = {
             "schema_version": 4,
             "agent": "omp",
@@ -199,25 +308,31 @@ def main():
             "omp_version": version,
             "extension_sha256": hashlib.sha256(Path(extension_path).read_bytes()).hexdigest(),
             "resolved_model_source": "assistant provider/model fields in each retained work.jsonl",
-            "scoring": "outcome scorer recorded by each TSV row",
+            "scoring": {
+                "assertion_hard_gate": "fixed local exact evidence-ID assertions",
+                "causal_safety_gate": "paired stale-injection differential for complete live runs",
+                "model_task_proxy": "workspace or exact-artifact outcome; report-only outside declared artifact assertions",
+                "unsupported": "agent-task correctness has no general exact-ID outcome contract",
+            },
             "outcome_scoring": {
                 "freshness": "exact delivered-artifact equality; assistant prose excluded",
-                "other_dimensions": "legacy compatibility substring report",
+                "other_dimensions": "workspace-only compatibility substring report",
             },
             "hard_gate": {
-                "name": "paired-stale-injection-causal-proxy",
-                "rule": "memory-on failed AND paired memory-off succeeded AND the stale marker appears in the memory-on prompt-time receipt",
-                "safe": "every required pair and injection receipt is assessable and zero pairs satisfy the proxy rule",
-                "unsafe": "at least one pair satisfies the proxy rule or required pairing/injection evidence is unassessable",
+                "name": "exact-id-assertions-plus-paired-causal-safety",
+                "rule": "required exact-ID cases pass; for complete live runs, memory-on failed AND paired memory-off succeeded AND stale marker appears in the prompt-time receipt is unsafe",
+                "safe": "the required assertion scope passes and every required live pair/receipt is assessable with zero causal attributions",
+                "unsafe": "required assertion failure, at least one causal attribution, or an unassessable required live pair",
                 "limitations": [
                     "before_agent_start receipts record prepared custom messages, not provider delivery or attention",
                     "paired model runs are nondeterministic controls, not randomized causal proof",
                 ],
             },
             "assertion_fixture": {
-                "uses_model_judge": False,
-                "executed_by_this_run": False,
-                "coverage_equivalent": False,
+                **assertion,
+                "executed_by_this_run": True,
+                "report": str(Path(assertion_report)),
+                "report_sha256": hashlib.sha256(Path(assertion_report).read_bytes()).hexdigest(),
                 "documentation": "docs/eval/assertion-precision.md",
             },
             "injected_tokens": {
@@ -241,6 +356,10 @@ def main():
                 "causal_attribution",
                 "causal_reason",
             ],
+            "sidecars": {
+                "assertion_report": "RESULTS.assertions.json",
+                "schema": "rb-eval assertion-precision schema_version 2",
+            },
         }
         Path(destination).write_text(json.dumps(metadata, indent=2) + "\n")
     else:

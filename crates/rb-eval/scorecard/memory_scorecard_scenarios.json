@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios. Each scenario compares rusty-brain with two hand-maintained AGENTS.md baselines: realistic_agents_md is stale or incomplete; steelman_agents_md is current and complete. The OMP-native runner requires memory-on to beat the realistic baseline and tie the steelman. Its causal safety proxy requires zero paired memory-induced errors and zero unassessable pairs.",
+  "_about": "Memory-value scorecard live scenarios. Each compares rusty-brain with realistic and steelman AGENTS.md baselines across five arms. Live outcomes are report-only except where an exact delivered-artifact assertion is declared. The fixed local exact evidence-ID assertion sidecar is the no-model-judge retrieval hard gate; complete live runs also require zero paired causal memory-induced errors and zero unassessable pairs.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,

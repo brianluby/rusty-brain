@@ -40,6 +40,18 @@ All notable changes to rusty-brain are documented here. The format is based on
   routing checks resolve Bash from PATH and use an empty binary directory to
   prevent model launches independently of host installation layout.
 
+### Changed — Assertion-grade scorecard gate
+
+- The scorecard hard result now comes from fixed local exact evidence-ID sets,
+  with no model judge: missing, extra, or duplicate IDs fail a query and every
+  query must pass atomically for its case to pass. The required gate covers the
+  demonstrated budget-eviction red/green plus permanent supersede and namespace
+  regressions; unresolved hard-negative and topic-drift cases remain visible.
+- Scorecard runs retain the five arms and per-arm injection estimates, but the
+  live substring metric is report-only and excludes assistant prose. The first
+  22 TSV fields remain unchanged; the validated schema-versioned assertion
+  report and its hash are written as sidecars.
+
 ### Added — Scale, concurrency, and resource harness (Vikunja #57)
 
 - Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,

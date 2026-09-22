@@ -10,30 +10,32 @@
 #     steelman-baseline  a diligent human's AGENTS.md (clean/current/complete)
 #     memory-off         nothing, no extension (the floor)
 #     length-matched-placebo inert text through the same OMP prompt-time channel
-#   a dimension's claim (P1): memory-on BEATS realistic AND at least TIES steelman.
-#   the hard safety gate is the paired stale-injection causal proxy described below.
+#   dimension comparisons remain diagnostic.
+#   the fixed local exact evidence-ID assertion report is always a hard gate;
+#   complete live runs also gate on the paired stale-injection causal proxy.
 #
 # Plant modes (P2): `explicit` (rusty-brain remember — isolates retrieval) vs
 # `auto-capture` (a real SessionEnd fold — exercises capture). Retrieval/freshness
 # dimensions plant explicitly; capture is its own dimension.
 #
-# This file ships the PURE scoring core (artifact assertion + paired scorecard
-# aggregation) with a `--self-test` that needs NO API, plus the live five-arm runner.
+# This file ships pure exact assertion-report validation, exact artifact scoring,
+# paired causal attribution, and scorecard aggregation with a `--self-test` that
+# needs no model API, plus the live five-arm runner. Workspace substring outcomes
+# are report-only, exclude assistant prose, and cannot satisfy the assertion gate.
 # Injected sizes use a documented UTF-8 estimator, NOT exact model tokens.
 # See docs/eval/scorecard-controls.md for pairing, artifacts, and limitations.
 #
-# Variance protocol (P3): success is reported as a Wilson 95% CI and turns as
-# median [Q1-Q3]; a single run never gates. A run with any arm below --min-runs
-# (default 5, or config.min_runs) is DIRECTIONAL ONLY — it still prints the
-# scorecard but emits no SAFE/UNSAFE verdict and exits 0. The hard gate requires
-# zero attributed MIEs and zero unassessable causal pairs in a >=min-runs run.
+# Variance protocol (P3): live success is reported as a Wilson 95% CI and turns
+# as median [Q1-Q3]. The exact evidence-ID gate always evaluates independently of
+# live run count. A complete live run additionally requires zero attributed MIEs
+# and zero unassessable causal pairs; incomplete live arms remain DIRECTIONAL.
 #
 # Session-log retention keeps OMP JSON event streams plus harness-authored
 # recall diagnostics. Retain them with `--log-dir DIR` or
 # `RB_SCORECARD_KEEP_LOGS=1`.
 #
 # Usage:
-#   memory-scorecard.sh --self-test                       # judge + aggregation math, no API
+#   memory-scorecard.sh --self-test                       # assertion + proxy math, no API
 #   memory-scorecard.sh [--agent omp|codex|opencode|gemini|hermes|all] [--model OMP_MODEL] [--bin-dir DIR] [--runs N] [--min-runs N] [--out FILE] [--log-dir DIR] [--scenarios-file F]
 set -euo pipefail
 
@@ -106,14 +108,23 @@ scorecard_skip_line() { # agent
     "$agent" "$(scorecard_skip_phase "$agent")" "$(scorecard_skip_reason "$agent")" "$(scorecard_skip_detail "$agent")"
 }
 
-# ---- pure outcome scoring (exercised by --self-test) -------------------------
-# judge_text <textfile> <expect> -> success
-#   Compatibility-only fallback for scenarios without an artifact assertion.
-judge_text() {
-  local file="$1" expect="$2"
-  local success=0
+# ---- outcome scoring and report-only proxy (exercised by --self-test) --------
+# legacy_proxy_text returns `<proxy_hit> <legacy_mie_proxy>`. It reads only
+# workspace evidence and never controls the exact-ID hard gate.
+legacy_proxy_text() {
+  local file="$1" expect="$2" forbid="$3" stale="$4" arm="$5"
+  local success=0 mie=0
   grep -iqF -- "$expect" "$file" 2>/dev/null && success=1
-  echo "$success"
+  [ -n "$forbid" ] && grep -iqF -- "$forbid" "$file" 2>/dev/null && success=0
+  if [ "$arm" = "memory-on" ] && [ "$success" -eq 0 ] && [ -n "$stale" ] \
+     && grep -iqF -- "$stale" "$file" 2>/dev/null; then mie=1; fi
+  printf '%s %s\n' "$success" "$mie"
+}
+
+judge_text() {
+  local result
+  result="$(legacy_proxy_text "$1" "$2" "" "" report-only)"
+  printf '%s\n' "${result% *}"
 }
 
 # judge_outcome <project> <judged-text> <expect> <artifact-path> <exact> -> success
@@ -148,6 +159,15 @@ if actual.endswith("\n"):
     actual = actual[:-1]
 print(1 if actual == expected else 0)
 PY
+}
+
+# Build the report-only proxy input from files created/changed during the work
+# session. OMP assistant prose is intentionally not an input.
+collect_workspace_proxy() { # project marker output
+  local project="$1" marker="$2" output="$3"
+  : > "$output"
+  find "$project" -type f -not -path '*/.*' -newer "$marker" -size -256k -print0 2>/dev/null \
+    | xargs -0 cat >> "$output" 2>/dev/null || true
 }
 
 # ---- corpus generator (pure; deterministic; exercised by --self-test) --------
@@ -313,34 +333,48 @@ write_agents_md() { # file body distractors
   } > "$file"
 }
 
-# ---- pure scorecard aggregation (exercised by --self-test) -------------------
+# ---- scorecard aggregation (exercised by --self-test) ------------------------
 # Reads an attributed results TSV. The first 13 fields are stable:
 #   dimension scenario arm run success turns mie cost tok_in tok_cc tok_cr tok_out is_error
-# Fields 14-17 are Class B capture diagnostics. Fields 18-22 are injection-size
-# estimates. Fields 23-24 append answer-evidence booleans for SessionStart and
-# prompt-time/query hook output. The causal postprocessor appends:
-#   25 injected_stale_evidence (0|1|unknown|na)
-#   26 injection_evidence_reason
-#   27 causal_attribution (memory_induced|not_memory_induced|unassessable|na)
-#   28 causal_reason
-# Legacy rows still parse, but they cannot support query-source claims and a
-# memory-on row without causal fields is unassessable and can never produce SAFE.
-# Prints the per-dimension scorecard — success as a Wilson 95% CI, turns as
-# median [Q1-Q3] (P3: median + spread, never a bare mean), and mean
-# total_cost_usd — plus query-source attribution, cost diagnostics, and safety.
-# Exit code: 0 for a DIRECTIONAL run (any arm below min_runs, or a missing arm —
-# prints no SAFE/UNSAFE verdict, never gates); otherwise 0 iff the causal safety
-# proxy has zero attributed MIEs and zero unassessable required pairs.
+# Fields 14-17 are Class B capture diagnostics; 18-22 are injection estimates;
+# 23-24 are SessionStart and prompt/query answer-source evidence; and 25-28 are
+# injected-stale evidence/reason plus causal attribution/reason. The schema-2
+# exact-ID assertion sidecar is argument 4 (or ASSERTION_REPORT), so no TSV field
+# is repurposed. Legacy rows parse but cannot support query-source or causal claims.
+# The report includes Wilson success intervals, turn spread, source attribution,
+# cost diagnostics, the always-on exact-ID gate, and the complete-run causal gate.
 #
-#   $1 = tsv, $2 = steelman tie margin (default $TIE_MARGIN), $3 = min_runs (default 5).
+# Live task success and MIE remain legacy report-only proxies. Assistant prose is
+# excluded, and dimensions without deterministic exact-ID task-output assertions
+# are explicitly unsupported as correctness claims.
+#
+#   $1 = tsv, $2 = steelman tie margin, $3 = min_runs, $4 = assertion report.
 aggregate_scorecard() {
   local tsv="$1" tie_margin="${2:-${TIE_MARGIN:-0.10}}" min_runs="${3:-5}"
-  echo "scoring: paired-stale-injection-causal-proxy; task outcome scorer is recorded per row; independent no-judge assertion fixture is reported separately."
+  local assertion_report="${4:-${ASSERTION_REPORT:-}}"
+  if [ -z "$assertion_report" ] || [ ! -f "$assertion_report" ]; then
+    echo "assertion gate: missing schema-versioned report" >&2
+    return 2
+  fi
+  local assertion_json assertion_gate required_passed required_total all_passed all_total
+  if ! assertion_json="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" assertion-gate "$assertion_report")"; then
+    echo "assertion gate: invalid report '$assertion_report'" >&2
+    return 2
+  fi
+  assertion_gate="$(jq -r '.gate_passed' <<<"$assertion_json")"
+  required_passed="$(jq -r '.passed_required_cases' <<<"$assertion_json")"
+  required_total="$(jq -r '.required_cases' <<<"$assertion_json")"
+  all_passed="$(jq -r '.passed_cases' <<<"$assertion_json")"
+  all_total="$(jq -r '.total_cases' <<<"$assertion_json")"
+  echo "scoring: fixed local exact evidence-ID assertions plus paired stale-injection causal safety; no model judge or assistant-prose substring enters either gate."
   echo "causal_rule: memory_induced iff memory-on failed AND the same scenario/run memory-off succeeded AND stale evidence appears in the memory-on prompt-time receipt."
-  echo "SAFE: every required pair and injection receipt is assessable and zero pairs satisfy causal_rule. UNSAFE: at least one attributed pair or one unassessable required pair."
-  echo "limitations: before_agent_start receipts prove message preparation, not provider delivery/attention; paired nondeterministic runs are a causal proxy, not randomized causal proof."
+  echo "SAFE: required assertions pass and every complete-run pair/receipt is assessable with zero causal attributions."
+  echo "limitations: workspace substring outcomes are report-only; before_agent_start receipts prove preparation, not delivery/attention; paired runs are not randomized causal proof."
   echo "injected_est: per-arm mean [start,prompt,file,total], utf8-bytes-div4-ceil-v1; not exact model tokens; excludes prompts/tool traffic/plant sessions. Legacy sizes are unknown."
-  awk -F'\t' -v tie="$tie_margin" -v min_runs="$min_runs" '
+  awk -F'\t' -v tie="$tie_margin" -v min_runs="$min_runs" \
+    -v assertion_gate="$assertion_gate" -v required_passed="$required_passed" \
+    -v required_total="$required_total" -v all_passed="$all_passed" \
+    -v all_total="$all_total" '
     /^agent=/ { next }
     # cache-read fraction cr/(cr+in) — 0 when there is no input (ADR-3 diag).
     function ratio(cr, inp) { if (cr + inp == 0) return 0; return cr / (cr + inp) }
@@ -450,7 +484,7 @@ aggregate_scorecard() {
     END {
       directional = 0;
       split("memory-on realistic-baseline steelman-baseline memory-off length-matched-placebo", order, " ");
-      printf "%-15s %-18s %5s %16s %16s %9s\n", "dimension", "arm", "runs", "success [95% CI]", "med_turns [Q1-Q3]", "mcost$";
+      printf "%-15s %-18s %5s %16s %16s %9s\n", "dimension", "arm", "runs", "proxy [95% CI]", "med_turns [Q1-Q3]", "mcost$";
       pass_dims=0; total_dims=0;
       for (d in dims) {
         total_dims++;
@@ -498,7 +532,7 @@ aggregate_scorecard() {
           printf "  -> %s: incomplete arms (no verdict)\n\n", d;
         }
       }
-      printf "scorecard: dimensions_passed=%d dimensions_evaluated=%d (tracked, non-gating)\n", pass_dims, total_dims;
+      printf "legacy_proxy: dimensions_passed=%d dimensions_evaluated=%d (unsupported for correctness; non-gating)\n", pass_dims, total_dims;
 
       if (cap_total_n > 0) {
         split("cap_ok cap_no_session_summary cap_summary_missing_fact cap_forbidden_token cap_list_error cap_timeout cap_mcp_bypass_detected", reason_order, " ");
@@ -530,11 +564,10 @@ aggregate_scorecard() {
       }
 
       # --- ADR-3 retrieval@scale token/cost (docs/eval/2026-06-19-*) ----------
-      # Query-attributed accuracy is the PRIMARY axis (the dimension verdict
-      # above); response accuracy without source evidence is diagnostic only.
-      # Cost (total_cost_usd, cache-adjusted by construction) is secondary; cache
-      # buckets are diagnostic and never a pass/fail metric. This block remains
-      # informational; the hard gate is the paired stale-injection causal proxy.
+      # Query-attributed accuracy is the PRIMARY diagnostic axis; response
+      # accuracy without source evidence cannot prove query retrieval. Cost is
+      # secondary and cache buckets are diagnostic. This block is informational;
+      # exact-ID assertions and complete-run paired causal safety are the gates.
       has_scale = 0; for (d in dims) if (d=="retrieval_scale") has_scale=1;
       if (has_scale) {
         rk = "retrieval_scale";
@@ -598,17 +631,23 @@ aggregate_scorecard() {
       }
 
       printf "%s", causal_lines;
-      printf "SAFETY — paired causal proxy: memory_induced=%d unassessable=%d (allowed 0/0)\n",
+      printf "CAUSAL SAFETY — memory_induced=%d unassessable=%d (allowed 0/0)\n",
              mie_total+0, unassessable_total+0;
       if (mie_total+0 > 0) { printf "  attributed:\n%s", mie_list }
       if (unassessable_total+0 > 0) { printf "  unassessable (fails closed):\n%s", unassessable_list }
+      printf "ASSERTION GATE — required exact-ID cases: %d/%d; all scored cases: %d/%d\n",
+             required_passed, required_total, all_passed, all_total;
+      if (assertion_gate != "true") {
+        printf "result: ASSERTION-FAIL\n";
+        exit 1;
+      }
       if (directional) {
-        printf "DIRECTIONAL ONLY — an arm is below min_runs=%d; single runs never gate (P3)\n", min_runs;
-        printf "result: DIRECTIONAL (not gating)\n";
+        printf "DIRECTIONAL LIVE PROXY — an arm is below min_runs=%d; exact assertions pass, causal live gate not evaluated\n", min_runs;
+        printf "result: ASSERTION-PASS (live causal result directional)\n";
         exit 0;
       }
       safety_fail = (mie_total+0 > 0 || unassessable_total+0 > 0);
-      printf "result: %s\n", (safety_fail ? "UNSAFE" : "SAFE");
+      printf "result: %s\n", (safety_fail ? "UNSAFE" : "ASSERTION-PASS + CAUSAL-SAFE");
       exit (safety_fail ? 1 : 0);
     }
   ' "$tsv"
@@ -779,7 +818,7 @@ retainable_scorecard_artifact() { # relative_path
   # Fixed-depth regexes matter: shell case globs let `*` match `/`, so a path
   # like `fresh-r1/on/wp/on/diagnostics/index.json` (inside the model-writable
   # project) would otherwise masquerade as a harness-owned artifact.
-  if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off|placebo)/(work\.jsonl|judge\.txt)$ ]]; then
+  if [[ "$rel" =~ ^[^/]+/(on|realistic|steelman|off|placebo)/(work\.jsonl|legacy-proxy\.txt)$ ]]; then
     return 0
   fi
   if [[ "$rel" =~ ^[^/]+/(on|placebo)/injections/(prompt-time\.jsonl|pair-check\.json|control-error\.json)$ ]]; then
@@ -802,10 +841,10 @@ retainable_scorecard_artifact() { # relative_path
 # artifacts out of the ephemeral workroot into <dest>, preserving relative
 # paths, before cleanup deletes the workroot (Vikunja #502: the 2026-07-12 N=5
 # safety-gate MIEs were undiagnosable because every session log was rm -rf'd).
-# Copies only the harness-authored OMP JSON logs (work.jsonl / plant.jsonl),
-# judged model output, memory-on daemon log, and read-only diagnostics — never
-# stores DBs, seeded AGENTS.md files, or arbitrary model-created JSONL. Provider
-# credentials are neither copied nor passed to the memory daemon.
+# Copies only harness-authored OMP JSON logs (work.jsonl / plant.jsonl),
+# report-only workspace proxy text, memory-on daemon log, and read-only
+# diagnostics — never DBs, seeded AGENTS.md files, or arbitrary model-created
+# JSONL. Provider credentials are neither copied nor passed to the memory daemon.
 preserve_session_logs() { # workroot dest
   local workroot="$1" dest="$2" failed=0
   mkdir -p "$dest"
@@ -846,10 +885,18 @@ resolve_log_dir() { # log_dir_flag keep_logs_env out
 
 # ---- self-test (no API) ------------------------------------------------------
 self_test() {
-  echo "== memory-scorecard self-test (judge + scorecard math; no API) =="
+  echo "== memory-scorecard self-test (assertion gate + report-only proxy math; no API) =="
   local tmp fail=0
   tmp="$(mktemp -d "${TMPDIR:-/tmp}/rb-scorecard-selftest.XXXXXX")"
   trap 'rm -rf "$tmp"' RETURN
+  local ASSERTION_REPORT="$tmp/assertions.json"
+  cat > "$ASSERTION_REPORT" <<'JSON'
+{"schema_version":2,"judge_used":false,"no_judge_statement":"No model judge.","passed_cases":3,"total_cases":3,"passed_required_cases":3,"required_cases":3,"all_cases_passed":true,"precision_gate_passed":true,"cases":[
+  {"id":"supersede-chain","gate_required":true,"passed":true,"queries":[{"expected_ids":["a"],"returned_ids":["a"],"returned_evidence":[{"id":"a"}],"missing_ids":[],"extra_ids":[],"duplicate_ids":[],"passed":true}]},
+  {"id":"five-slot-budget","gate_required":true,"passed":true,"queries":[{"expected_ids":["b"],"returned_ids":["b"],"returned_evidence":[{"id":"b"}],"missing_ids":[],"extra_ids":[],"duplicate_ids":[],"passed":true}]},
+  {"id":"namespace-selection","gate_required":true,"passed":true,"queries":[{"expected_ids":["c"],"returned_ids":["c"],"returned_evidence":[{"id":"c"}],"missing_ids":[],"extra_ids":[],"duplicate_ids":[],"passed":true}]}
+]}
+JSON
 
   mkdir -p "$tmp/task"
   printf 'I used the current ureq value in prose.\n' > "$tmp/task/judge.txt"
@@ -864,31 +911,49 @@ self_test() {
   check "legacy non-safety fallback remains parse-compatible" "1" \
     "$(judge_outcome "$tmp/task" "$tmp/task/judge.txt" current "" "")"
 
+  local proxy_project="$tmp/proxy-project" proxy_marker="$tmp/proxy-marker" proxy_input="$tmp/proxy-input"
+  mkdir -p "$proxy_project"
+  touch -t 202001010000 "$proxy_marker"
+  printf '{"assistant_prose":"use ureq"}\n' > "$tmp/assistant.jsonl"
+  collect_workspace_proxy "$proxy_project" "$proxy_marker" "$proxy_input"
+  check "assistant prose alone cannot produce proxy hit" "0 0" \
+    "$(legacy_proxy_text "$proxy_input" ureq '' reqwest memory-on)"
+  printf 'use ureq\n' > "$proxy_project/change.txt"
+  collect_workspace_proxy "$proxy_project" "$proxy_marker" "$proxy_input"
+  check "touched workspace evidence remains a report-only proxy" "1 0" \
+    "$(legacy_proxy_text "$proxy_input" ureq '' reqwest memory-on)"
+  check "current workspace evidence => proxy hit, no mie"   "1 0" "$(legacy_proxy_text "$tmp/new.txt"       ureq '' reqwest memory-on)"
+  check "names superseded value => proxy hit"               "1 0" "$(legacy_proxy_text "$tmp/names-old.txt" ureq '' reqwest memory-on)"
+  check "stale workspace evidence => miss + legacy mie"     "0 1" "$(legacy_proxy_text "$tmp/old.txt"       ureq '' reqwest memory-on)"
+  check "stale baseline evidence => miss, no legacy mie"    "0 0" "$(legacy_proxy_text "$tmp/old.txt"       ureq '' reqwest steelman-baseline)"
+
   # Emit one attributed results row. The first 13 fields remain stable; capture
-  # fields are 14-17, injection sizes 18-22, and causal evidence/attribution 23-26.
+  # fields are 14-17, injection sizes 18-22, answer-source evidence 23-24,
+  # stale-injection evidence 25-26, and causal attribution 27-28.
   # sc_row dim scenario arm run success turns mie [cost in cc cr out is_err cap_fid cap_reason cap_summary cap_mcp ...]
   sc_row() {
-    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+    printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
       "$1" "$2" "$3" "$4" "$5" "$6" "$7" "${8:-0}" "${9:-0}" "${10:-0}" "${11:-0}" "${12:-0}" "${13:-false}" \
       "${14:-na}" "${15:-na}" "${16:-0}" "${17:-0}" \
       "${18:-0}" "${19:-0}" "${20:-0}" "${21:-0}" "${22:-utf8-bytes-div4-ceil-v1}" \
-      "${23:-na}" "${24:-no_stale_token}" "${25:-not_memory_induced}" "${26:-no_stale_candidate}"
+      "${23:-na}" "${24:-na}" "${25:-na}" "${26:-no_stale_token}" \
+      "${27:-not_memory_induced}" "${28:-no_stale_candidate}"
   }
   sc_causal_row() { # first 7 stable fields, then stale evidence/reason + attribution/reason
     sc_row "$1" "$2" "$3" "$4" "$5" "$6" "$7" \
       0 0 0 0 0 false na na 0 0 0 0 0 0 utf8-bytes-div4-ceil-v1 \
-      "$8" "$9" "${10}" "${11}"
+      na na "$8" "$9" "${10}" "${11}"
   }
   legacy_row() { # original 13-field schema
     printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t0\t0\t0\t0\t0\tfalse\n' \
       "$1" "$2" "$3" "$4" "$5" "$6" "$7"
   }
-  # source_row start-answer prompt-answer <sc_row args...>
+  # source_row start-answer prompt-answer <13 stable sc_row args>
   source_row() {
     local start_answer="$1" prompt_answer="$2"
     shift 2
-    printf '%s\t0\t0\t0\t0\tunknown\t%s\t%s\n' \
-      "$(sc_row "$@")" "$start_answer" "$prompt_answer"
+    sc_row "$@" na na 0 0 0 0 0 0 utf8-bytes-div4-ceil-v1 \
+      "$start_answer" "$prompt_answer" na no_stale_token not_memory_induced no_stale_candidate
   }
 
   # Class A corpora are deterministic, domain-plausible, collision-free, and
@@ -1110,7 +1175,7 @@ PY
   # Scorecard fixtures below have N=1 per arm; pass min_runs=1 (3rd arg) so they
   # still gate/verdict. The directional behavior is exercised separately.
 
-  # A scorecard where memory beats realistic AND ties steelman, zero mie => SAFE, dim passes.
+  # A scorecard where the report-only proxy beats realistic and ties steelman.
   local good="$tmp/good.tsv"
   {
     scorecard_skip_line codex
@@ -1120,7 +1185,7 @@ PY
     sc_row freshness s1 memory-off         1 0 2 0
     sc_row freshness s1 length-matched-placebo         1 0 2 0
   } > "$good"
-  if aggregate_scorecard "$good" 0.10 1 >/dev/null; then echo "ok: clean scorecard is SAFE"; else echo "BUG: clean scorecard flagged unsafe"; fail=1; fi
+  if aggregate_scorecard "$good" 0.10 1 >/dev/null; then echo "ok: exact assertion gate passes"; else echo "BUG: exact assertion gate failed"; fail=1; fi
   if aggregate_scorecard "$good" 0.10 1 | grep -q '\-> freshness:.*=> PASS'; then echo "ok: dimension passes when it beats realistic + ties steelman"; else echo "BUG: dimension did not pass"; fail=1; fi
   # A Class-C-only scorecard must NOT print the ADR-3 retrieval@scale block.
   if aggregate_scorecard "$good" 0.10 1 | grep -q 'ADR-3 retrieval@scale'; then echo "BUG: ADR-3 block printed without retrieval_scale data"; fail=1; else echo "ok: ADR-3 block omitted when no retrieval_scale dimension"; fi
@@ -1186,6 +1251,7 @@ PY
 
   # SAFETY: only a memory-on failure whose same-run memory-off succeeds and
   # whose actual prompt receipt contains stale evidence is attributed as MIE.
+  # This live causal gate is independent of the exact-ID assertion gate.
   local unsafe="$tmp/unsafe.tsv"
   {
     sc_causal_row freshness s1 memory-on 1 0 2 1 1 stale_injected memory_induced memory_on_only_failure_with_stale_injection
@@ -1208,8 +1274,6 @@ PY
   if aggregate_scorecard "$bothfail" 0.10 1 | grep -qF $'attribution=not_memory_induced\treason=both_arms_failed'; then echo "ok: both-arms failure is not attributed to memory"; else echo "BUG: both-arms failure attribution"; fail=1; fi
   if aggregate_scorecard "$bothfail" 0.10 1 >/dev/null; then echo "ok: both-arms failure does not fail causal safety"; else echo "BUG: both-arms failure charged as causal MIE"; fail=1; fi
 
-  # Missing receipt evidence is not relabeled SAFE: it is explicitly
-  # unassessable and fails the complete-run gate.
   local noev="$tmp/no-evidence.tsv"
   {
     sc_causal_row freshness s1 memory-on 1 0 2 0 unknown missing_prompt_receipt unassessable missing_prompt_receipt
@@ -1220,8 +1284,6 @@ PY
   } > "$noev"
   if aggregate_scorecard "$noev" 0.10 1 >/dev/null; then echo "BUG: missing causal evidence did not fail closed"; fail=1; else echo "ok: missing causal evidence fails closed"; fi
 
-  # Historical 13-field rows remain parseable but lack the causal evidence needed
-  # for SAFE, so complete legacy data is explicitly unassessable.
   local legacy="$tmp/legacy.tsv"
   {
     legacy_row freshness s1 memory-on 1 0 2 0
@@ -1233,11 +1295,23 @@ PY
   if aggregate_scorecard "$legacy" 0.10 1 >/dev/null; then echo "BUG: legacy TSV without causal evidence did not fail closed"; fail=1; else echo "ok: legacy TSV parses and fails closed"; fi
   if aggregate_scorecard "$legacy" 0.10 1 | grep -qF 'reason=missing_causal_fields'; then echo "ok: legacy TSV names missing causal fields"; else echo "BUG: legacy TSV missing reason"; fail=1; fi
 
-  # P3 — single runs never gate: the same unsafe data at min_runs=5 is
-  # DIRECTIONAL, exits 0, yet retains the pair attribution.
-  if aggregate_scorecard "$unsafe" 0.10 5 >/dev/null; then echo "ok: sub-min-runs unsafe run is directional (exit 0)"; else echo "BUG: sub-min-runs run gated"; fail=1; fi
-  if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'DIRECTIONAL ONLY'; then echo "ok: sub-min-runs run prints DIRECTIONAL ONLY"; else echo "BUG: no DIRECTIONAL banner"; fail=1; fi
+  if aggregate_scorecard "$unsafe" 0.10 5 >/dev/null; then echo "ok: sub-min-runs unsafe run is directional"; else echo "BUG: sub-min-runs run gated"; fail=1; fi
+  if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'DIRECTIONAL LIVE PROXY'; then echo "ok: sub-min-runs run prints directional banner"; else echo "BUG: no directional banner"; fail=1; fi
   if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'memory_induced=1'; then echo "ok: causal MIE remains enumerated when directional"; else echo "BUG: causal MIE not enumerated when directional"; fail=1; fi
+
+  local failed_assertions="$tmp/assertions-fail.json"
+  cat > "$failed_assertions" <<'JSON'
+{"schema_version":2,"judge_used":false,"no_judge_statement":"No model judge.","passed_cases":2,"total_cases":3,"passed_required_cases":2,"required_cases":3,"all_cases_passed":false,"precision_gate_passed":false,"cases":[
+  {"id":"supersede-chain","gate_required":true,"passed":true,"queries":[{"expected_ids":["a"],"returned_ids":["a"],"returned_evidence":[{"id":"a"}],"missing_ids":[],"extra_ids":[],"duplicate_ids":[],"passed":true}]},
+  {"id":"five-slot-budget","gate_required":true,"passed":false,"queries":[{"expected_ids":["b"],"returned_ids":["x"],"returned_evidence":[{"id":"x"}],"missing_ids":["b"],"extra_ids":["x"],"duplicate_ids":[],"passed":false}]},
+  {"id":"namespace-selection","gate_required":true,"passed":true,"queries":[{"expected_ids":["c"],"returned_ids":["c"],"returned_evidence":[{"id":"c"}],"missing_ids":[],"extra_ids":[],"duplicate_ids":[],"passed":true}]}
+]}
+JSON
+  if aggregate_scorecard "$good" 0.10 1 "$failed_assertions" >/dev/null; then
+    echo "BUG: failed exact-ID assertion did not fail the hard gate"; fail=1
+  else
+    echo "ok: failed exact-ID assertion fails the hard gate"
+  fi
 
   # mcost$ column reports the per-arm mean total_cost_usd (0.02, 0.04 => 0.0300).
   local costf="$tmp/cost.tsv"
@@ -1347,9 +1421,8 @@ PY
   } > "$wil"
   if aggregate_scorecard "$wil" 0.10 1 | grep -qE 'memory-on.*80% \[37\.6-96\.4\]'; then echo "ok: Wilson CI for 4/5 = 80% [37.6-96.4]"; else echo "BUG: Wilson CI wrong"; aggregate_scorecard "$wil" 0.10 1 | grep memory-on; fail=1; fi
 
-  # Complete gating run: all five arms at N=5 (>= min_runs), memory-on beats
-  # realistic AND ties steelman, zero MIE => gates SAFE, dimension PASS, and is
-  # NOT directional / not incomplete (locks the gating path vs the directional cases).
+  # Complete live run: the exact-ID sidecar gates PASS; proxy dimension reporting
+  # remains non-gating and is neither directional nor incomplete.
   local full="$tmp/full.tsv"
   {
     for t in 1 2 3 4 5; do sc_row d s memory-on          "$t" 1 2 0; done
@@ -1360,9 +1433,9 @@ PY
     for t in 1 2 3 4 5; do sc_row d s length-matched-placebo         "$t" 0 5 0; done
   } > "$full"
   local fout; fout="$(aggregate_scorecard "$full" 0.10 5)"
-  if echo "$fout" | grep -q 'result: SAFE' && echo "$fout" | grep -q '\-> d:.*=> PASS' \
+  if echo "$fout" | grep -q 'result: ASSERTION-PASS' && echo "$fout" | grep -q '\-> d:.*=> PASS' \
      && ! echo "$fout" | grep -q 'DIRECTIONAL' && ! echo "$fout" | grep -q 'incomplete arms'; then
-    echo "ok: complete N=5 run gates SAFE + PASS, not directional"
+    echo "ok: complete N=5 run reports assertion PASS + proxy PASS, not directional"
   else
     echo "BUG: complete gating run mis-handled"; echo "$fout"; fail=1
   fi
@@ -1389,7 +1462,7 @@ PY
   printf '{"type":"agent_end"}\n' > "$lw/fresh-r1/on/work.jsonl"
   printf 'plant\n'                 > "$lw/fresh-r1/on/plant.jsonl"
   printf 'daemon\n'                > "$lw/fresh-r1/on/daemon.log"
-  printf 'judged\n'                > "$lw/fresh-r1/realistic/judge.txt"
+  printf 'proxy\n'                 > "$lw/fresh-r1/realistic/legacy-proxy.txt"
   printf 'db\n'                    > "$lw/fresh-r1/on/memory.db"
   printf 'seeded\n'                > "$lw/fresh-r1/realistic/p/AGENTS.md"
   printf 'stray\n'                 > "$lw/fresh-r1/on/other.jsonl"
@@ -1410,7 +1483,7 @@ PY
   else
     echo "BUG: preserve_session_logs failed on a populated workroot"; fail=1
   fi
-  for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/judge.txt fresh-r1/placebo/injections/control-error.json; do
+  for kept in fresh-r1/on/work.jsonl fresh-r1/on/plant.jsonl fresh-r1/on/daemon.log fresh-r1/realistic/legacy-proxy.txt fresh-r1/placebo/injections/control-error.json; do
     if [ -f "$ld/$kept" ]; then echo "ok: preserve_session_logs kept $kept"; else echo "BUG: preserve_session_logs lost $kept"; fail=1; fi
   done
   for kept in fresh-r1/on/diagnostics/index.json fresh-r1/on/diagnostics/outcome.json fresh-r1/on/diagnostics/recall-active.json fresh-r1/on/diagnostics/session-start-input.json fresh-r1/on/diagnostics/session-start-injection.json fresh-r1/on/diagnostics/history-00000000-0000-0000-0000-000000000000.json; do
@@ -1534,7 +1607,7 @@ fi
 [ -n "$BIN_DIR" ] || BIN_DIR="$REPO_ROOT/target/release"
 [ -d "$BIN_DIR" ] || { echo "bin dir not found: $BIN_DIR (build first with 'cargo build --release', or pass --bin-dir DIR)" >&2; exit 1; }
 BIN_DIR="$(cd "$BIN_DIR" && pwd)"
-for bin in rusty-brain rusty-brain-hooks; do
+for bin in rusty-brain rusty-brain-hooks assertion-precision; do
   [ -x "$BIN_DIR/$bin" ] || { echo "missing binary: $BIN_DIR/$bin" >&2; exit 1; }
 done
 command -v omp     >/dev/null 2>&1 || { echo "omp not on PATH" >&2; exit 1; }
@@ -1552,7 +1625,17 @@ unset RUSTY_BRAIN_DB RUSTY_BRAIN_SOCKET RUSTY_BRAIN_NAMESPACE RUSTY_BRAIN_IDLE_T
 WORKROOT="$(mktemp -d "${TMPDIR:-/tmp}/rb-scorecard.XXXXXX")"
 RESULTS="${OUT:-$WORKROOT/scorecard.tsv}"
 RAW_RESULTS="$WORKROOT/scorecard-raw.tsv"; : > "$RAW_RESULTS"
-python3 "$REPO_ROOT/scripts/scorecard-controls.py" metadata "$RESULTS.metadata.json" "$MODEL" "$(omp --version)" "$REPO_ROOT/crates/rb-install/assets/omp-extension.ts"
+ASSERTION_REPORT="$RESULTS.assertions.json"
+assertion_exit=0
+"$BIN_DIR/assertion-precision" > "$ASSERTION_REPORT" || assertion_exit=$?
+case "$assertion_exit" in
+  0|1) ;;
+  *) echo "assertion-precision execution/report failed with exit $assertion_exit" >&2; exit 2 ;;
+esac
+python3 "$REPO_ROOT/scripts/scorecard-controls.py" assertion-gate "$ASSERTION_REPORT" >/dev/null \
+  || { echo "assertion-precision emitted an invalid exact-ID report" >&2; exit 2; }
+python3 "$REPO_ROOT/scripts/scorecard-controls.py" metadata "$RESULTS.metadata.json" \
+  "$MODEL" "$(omp --version)" "$REPO_ROOT/crates/rb-install/assets/omp-extension.ts" "$ASSERTION_REPORT"
 if [ -n "$PRE_SCORECARD_ROWS" ]; then
   printf '%s\n' "$PRE_SCORECARD_ROWS" >> "$RAW_RESULTS"
 fi
@@ -1564,7 +1647,7 @@ fi
 LOG_DIR="$(resolve_log_dir "$LOG_DIR" "${RB_SCORECARD_KEEP_LOGS:-0}" "$OUT")" || exit 2
 cleanup() {
   # Retention is best-effort by design: a copy failure must never mask the
-  # run's own exit code (the safety gate) — but it runs BEFORE the rm.
+  # run's own exact-ID gate result — but it runs BEFORE the rm.
   if [ -n "$LOG_DIR" ]; then
     preserve_session_logs "$WORKROOT" "$LOG_DIR" \
       || echo "WARN: session-log retention to $LOG_DIR failed (continuing cleanup)" >&2
@@ -1595,15 +1678,15 @@ run_session() { # home project prompt log
 }
 
 # Score one OMP work session and append an unattributed scorecard row. OMP's
-# terminal `agent_end` event supplies usage. Scenarios with an artifact assertion
-# are judged solely on that file; the compatibility fallback uses assistant output
-# plus touched workspace files, never the seeded AGENTS.md.
+# terminal event supplies usage. Declared artifact assertions use exact file
+# equality; other dimensions use touched workspace files only, never assistant
+# prose or seeded AGENTS.md.
 score_session() { # dim id arm run proj home work expect stale outcome_path outcome_exact [capture... diagnostics]
   local dim="$1" id="$2" arm="$3" run="$4" proj="$5" home="$6" work="$7" expect="$8" stale="$9"
   local outcome_path="${10:-}" outcome_exact="${11:-}"
   local cap_fidelity="${12:-na}" cap_reason="${13:-na}" cap_summary_count="${14:-0}" cap_mcp_bypass_count="${15:-0}"
   local diagnostics_dir="${16:-}"
-  local jlog="$proj/../work.jsonl" jtext="$proj/../judge.txt" marker="$proj/../mark" injections="$proj/../injections"
+  local jlog="$proj/../work.jsonl" proxy_text="$proj/../legacy-proxy.txt" marker="$proj/../mark" injections="$proj/../injections"
   mkdir -p "$injections"
   local file_tokens injection_metrics
   file_tokens="$(python3 "$REPO_ROOT/scripts/scorecard-controls.py" file-tokens "$proj/AGENTS.md")"
@@ -1626,12 +1709,9 @@ score_session() { # dim id arm run proj home work expect stale outcome_path outc
   u="$(extract_usage "$jlog")"
   is_err="$(cut -f1 <<<"$u")"; turns="$(cut -f2 <<<"$u")"; cost="$(cut -f3 <<<"$u")"
   inp="$(cut -f4 <<<"$u")"; cc="$(cut -f5 <<<"$u")"; cr="$(cut -f6 <<<"$u")"; out="$(cut -f7 <<<"$u")"
-  jq -r 'select(.type=="agent_end") | .messages[]? | select(.role=="assistant") | .content[]? | select(.type=="text") | .text' "$jlog" \
-    > "$jtext" 2>/dev/null || cp "$jlog" "$jtext"
-  find "$proj" -type f -not -path '*/.*' -newer "$marker" -size -256k -print0 2>/dev/null \
-    | xargs -0 cat >> "$jtext" 2>/dev/null || true
+  collect_workspace_proxy "$proj" "$marker" "$proxy_text"
   local success mie=0 stale_evidence="na" evidence_reason="not_memory_on_arm" source_metrics=$'na\tna'
-  success="$(judge_outcome "$proj" "$jtext" "$expect" "$outcome_path" "$outcome_exact")"
+  success="$(judge_outcome "$proj" "$proxy_text" "$expect" "$outcome_path" "$outcome_exact")"
   if [ "$is_err" = "true" ]; then success=0; fi
   if [ "$arm" = "memory-on" ]; then
     IFS=$'\t' read -r stale_evidence evidence_reason \
@@ -1649,7 +1729,7 @@ score_session() { # dim id arm run proj home work expect stale outcome_path outc
   if [ "$cap_fidelity" != "na" ]; then
     cap_msg=" cap=$cap_fidelity/$cap_reason summaries=$cap_summary_count mcp_bypass=$cap_mcp_bypass_count"
   fi
-  echo "   [$dim/$id $arm r$run] success=$success turns=$turns cost=$cost mie=pending-pair$cap_msg stale_evidence=$stale_evidence/$evidence_reason injected_est[start,prompt,file,total,estimator]=${injection_metrics//$'\t'/,} answer_evidence[start,prompt]=${source_metrics//$'\t'/,}"
+  echo "   [$dim/$id $arm r$run] outcome_success=$success turns=$turns cost=$cost mie=pending-pair$cap_msg stale_evidence=$stale_evidence/$evidence_reason injected_est[start,prompt,file,total,estimator]=${injection_metrics//$'\t'/,} answer_evidence[start,prompt]=${source_metrics//$'\t'/,}"
 }
 
 # Explicit plant (P2): each fact is stored via `rusty-brain remember`, in array

@@ -1,5 +1,6 @@
-//! Direct production probes authored before the evaluator. Intentionally opt-in:
-//! instrument correctness and currently unmet capability assertions are separate.
+//! Direct production exact-ID probes authored before the evaluator. Required
+//! budget/supersede/namespace cases are permanent regressions; unresolved
+//! capability investigations remain opt-in.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 use rb_embed::DeterministicProvider;
 use rb_engine::{MemoryBackend, MemoryEngine, Provenance, RememberInput};
@@ -108,7 +109,6 @@ async fn hard_negatives() {
     assert_class("hard_negative").await;
 }
 #[tokio::test]
-#[ignore = "capability gate; run explicitly, not an instrument correctness test"]
 async fn supersede_resurfacing() {
     assert_class("supersede_resurfacing").await;
 }
@@ -117,7 +117,6 @@ async fn budget_eviction() {
     assert_class("budget_eviction").await;
 }
 #[tokio::test]
-#[ignore = "capability gate; run explicitly, not an instrument correctness test"]
 async fn namespace_leak() {
     assert_class("namespace_leak").await;
 }

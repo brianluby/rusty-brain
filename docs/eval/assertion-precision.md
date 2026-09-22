@@ -1,39 +1,39 @@
 # Assertion-grade retrieval precision (task #1218)
 
-**Baseline capability gate NOT met.** On production revision
-`d98de4c4f093860ea16a827c83445fed25267748`, **2/6 cases pass**
-(`score = 0.3333333333333333`). The executable exits **1**, not a success/skip.
+**Required exact-ID gate met.** The gate has three fixed cases:
+`supersede-chain`, `five-slot-budget`, and `namespace-selection`. All three pass
+through the production retrieval path. The unchanged budget fixture is the sole
+demonstrated baseline-red/post-fix-green case; supersede and namespace were
+already green and remain regressions rather than manufactured baseline defects.
 
-**Current revised-gate evidence:** the unchanged `five-slot-budget` fixture
-passes exactly after source-aware ranking admits durable FTS evidence ahead of
-session-derived chatter. The all-case precision executable remains **3/6**
-(`score = 0.5`) and exits **1** because hard-negative and topic-drift cases
-remain unresolved.
+The broader capability score remains honestly **3/6** (`score = 0.5`):
+hard-negative admission and topic-drift cases are still red, are emitted in the
+same report, and set `all_cases_passed = false`. They are not averaged into the
+required gate and are not silently called passing.
 
-**No LLM or model judge is used.** No answer generation, prose substring matching,
-remote API, model download, or external service participates in the evaluation.
-Expected memory ID sets are fixed, locally authored labels, not inferred from
-retrieval output. This is a bounded retrieval assertion, not semantic quality or
-agent task-success evidence.
+**No LLM or model judge is used.** No answer generation, prose/file substring
+matching, remote API, model download, or external service participates in the
+gate. Expected memory ID sets are fixed, locally authored labels, not inferred
+from retrieval output. This is a bounded retrieval assertion, not semantic
+quality or agent task-success evidence.
 
 ## Run offline
 
 From the repository root (with the locked Rust dependencies already cached):
 
 ```bash
-# JSON to stdout on either a passing or an unmet precision gate.
+# JSON to stdout on either a passing or an unmet required gate.
 cargo run --offline --locked --quiet -p rb-eval --bin assertion-precision \
   > /tmp/assertion-precision.json
-# Exit: 0 = all cases pass; 1 = precision gate unmet; 2 = execution/report error.
+# Exit: 0 = all required cases pass; 1 = a required case fails; 2 = execution/report error.
 
 # Instrument correctness, deliberately independent of capability success:
 cargo test --offline --locked -p rb-eval --test assertion_precision
 
-# Enforced budget-eviction red-to-green regression:
-cargo test --offline --locked -p rb-eval --test assertion_precision_baseline \
-  budget_eviction -- --exact
+# Required exact-ID regressions (budget plus supersede/namespace invariants):
+cargo test --offline --locked -p rb-eval --test assertion_precision_baseline
 
-# Opt-in capability probes for all other classes:
+# Opt-in unresolved hard-negative and topic-drift probes:
 cargo test --offline --locked -p rb-eval --test assertion_precision_baseline \
   -- --ignored --nocapture --test-threads=1
 
@@ -56,14 +56,20 @@ session provenance. Each query has an explicit expected UUID set and five-result
 limit. Cases reset storage; sequential queries inside the topic-drift case share
 one store. The clock is pinned to `2026-01-01T00:00:00Z`.
 
+Each case declares `gate_required`. The required set is fixed to the revised
+ticket gate (budget eviction plus the supersede and namespace regressions);
+hard-negative and topic-drift cases remain scored, visible investigation cases.
+
 - A query passes only when **returned ID set == expected ID set**, with no duplicate
   returned IDs. One extra memory fails even when every expected memory is present.
 - Empty expected sets require empty output. Missing expected IDs fail too.
 - Returned IDs are taken directly from engine results, with no fixture-key lookup
   that might silently discard an unknown/extra ID.
 - A case passes only when **every** query in that case passes.
-- The score is `fully passing cases / total cases`, not mean per-query recall.
-  No partial credit, judge interpretation, tolerance, or threshold calibration.
+- The all-case score is `fully passing cases / total cases`, not mean per-query
+  recall. The required gate is separately `passed required cases == required
+  cases`, with at least one required case. Neither calculation grants partial
+  credit, judge interpretation, tolerance, or threshold calibration.
 - The report includes ranked returned IDs, missing/extra/duplicate IDs, actual
   production scores and channel attribution, per-query/per-case verdicts, fixture
   SHA-256, explicit no-judge statement, and measurement limits.
@@ -121,7 +127,8 @@ comment records the evidence audit and decision.
 
 The archived baseline has the two missing requirement IDs and two extra session
 IDs; the current exact-ID regression returns only `...008`–`...012`. The
-permanent `budget_eviction` test records this red-to-green behavior.
+permanent `budget_eviction` test records this red-to-green behavior. Supersede
+and namespace are also permanent exact-ID regressions.
 
 
 ### Production-shaped wire probes
@@ -178,8 +185,9 @@ a failure.
   probes. Broader independently motivated cases may be added, but the existing
   successful results must not be relabeled as failures.
 
-These are capability investigation targets, not verified fixes. Passing this small,
-nonsemantic corpus would still not establish semantic generalization.
+These are capability investigation targets, not verified fixes. Their failures
+remain in the report and keep `all_cases_passed` false. Passing the required
+small, nonsemantic corpus still does not establish semantic generalization.
 
 ## TDD and retained evidence
 
@@ -205,22 +213,21 @@ All artifacts are under
 5. Added fixture-label validity and repeated real-engine run checks. These validate
    existing behavior and pass without forced failures. The subprocess test now
    invokes Cargo's built binary directly, avoiding nested build jobs.
-6. Promoted `budget_eviction` from opt-in capability probe to the permanent
-   regression after the archived baseline red and post-fix exact-ID green. The
-   fix applies a session source-quality prior and a durable-FTS admission floor;
-   it does not change the fixture, result limit, or evaluator output.
+6. Promoted budget eviction, supersede exclusion, and namespace isolation to
+   permanent regressions. Only budget has archived red-to-green evidence. The
+   production fix applies a session source-quality prior and durable-FTS
+   admission floor without changing fixture expectations or the five-result
+   budget.
 
-`report-d98de4c.json` is the executable's actual JSON output, exit **1**.
-`provenance.json` records the revision, host, fixture/report hashes and production
-source comparison. The report has no hardcoded claim about the running Git SHA;
-use the provenance sidecar for this archived run, and capture provenance again
-for future runs.
+`report-d98de4c.json` is the executable's actual baseline JSON output, exit
+**1** under the original all-case gate. `provenance.json` records its revision,
+host, fixture/report hashes, and production-source comparison. Schema 2 adds
+gate-scope metadata without rewriting that archived output; current runs emit
+the required/all-case split directly.
 
-`crate-tests.log`: **109 passed, 0 failed, 14 ignored** at the original
-instrument capture, including five opt-in capability class tests. It is
-historical instrument/regression evidence, not a green precision gate. The
-initial `clippy.log` found a test-only explicit panic lint; `clippy-green.log`
-records the corrected final strict check.
+`crate-tests.log` is historical instrument evidence from the original capture,
+not current validation. The initial `clippy.log` found a test-only explicit
+panic lint; `clippy-green.log` records the corrected historical check.
 
 ## Legacy scorecard mapping: shared OMP scenario source
 
@@ -242,9 +249,15 @@ while retaining the scenario rows. Shared inputs do not establish equivalent
 host lifecycle, model behavior, or assertion coverage: full OMP scorecard
 outcomes require a separate live run.
 
-The offline fixture described above is deliberately **not** that scorecard. It
-continues to provide exact-ID retrieval assertions for six focused cases, without
-a model or task judge. It does not claim auto-capture, model response, or
-identity/reach outcome equivalence, and must not replace the OMP scorecard’s
-legacy proxy gate. Its metadata correctly remains `coverage_equivalent: false`
-for the assertion fixture, not for the shared scorecard scenario source.
+The fixture is deliberately **not** an agent-task judge. The live scorecard
+executes `assertion-precision` once, writes `RESULTS.tsv.assertions.json`,
+independently recomputes every exact set/case verdict, verifies the fixed three
+required case IDs and `judge_used = false`, and uses that result as its hard
+gate. A malformed or missing report fails closed.
+
+The five live arms remain represented, including memory-off and the
+length-matched placebo with their per-arm injection estimates. Their historical
+substring metric is explicitly report-only, excludes assistant prose, and is
+unsupported as task-correctness evidence; it cannot produce `ASSERTION-PASS`.
+Auto-capture, model response, identity/reach outcomes, and causal MIE attribution
+remain outside this fixture rather than being silently declared successful.

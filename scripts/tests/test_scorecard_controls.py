@@ -39,7 +39,7 @@ class ControlsTest(unittest.TestCase):
             "0", "0", "0", "0", "0", is_error,
             "na", "na", "0", "0",
             "0", "0", "0", "0", "utf8-bytes-div4-ceil-v1",
-            stale_evidence, evidence_reason,
+            "na", "na", stale_evidence, evidence_reason,
         ]
         return "\t".join(fields)
 
@@ -50,6 +50,56 @@ class ControlsTest(unittest.TestCase):
         result = self.invoke("attribute-results", str(source), str(destination))
         self.assertEqual(result.returncode, 0, result.stderr)
         return [line.split("\t") for line in destination.read_text().splitlines()]
+    def assertion_report(self):
+        path = self.root / "assertions.json"
+        required_cases = [
+            {
+                "id": case_id,
+                "gate_required": True,
+                "passed": True,
+                "queries": [{
+                    "expected_ids": [case_id],
+                    "returned_ids": [case_id],
+                    "returned_evidence": [{"id": case_id}],
+                    "missing_ids": [],
+                    "extra_ids": [],
+                    "duplicate_ids": [],
+                    "passed": True,
+                }],
+            }
+            for case_id in (
+                "supersede-chain",
+                "five-slot-budget",
+                "namespace-selection",
+            )
+        ]
+        report = {
+            "schema_version": 2,
+            "judge_used": False,
+            "no_judge_statement": "No model judge.",
+            "passed_cases": 3,
+            "total_cases": 4,
+            "passed_required_cases": 3,
+            "required_cases": 3,
+            "all_cases_passed": False,
+            "precision_gate_passed": True,
+            "cases": required_cases + [{
+                "id": "investigation",
+                "gate_required": False,
+                "passed": False,
+                "queries": [{
+                    "expected_ids": [],
+                    "returned_ids": ["b"],
+                    "returned_evidence": [{"id": "b"}],
+                    "missing_ids": [],
+                    "extra_ids": ["b"],
+                    "duplicate_ids": [],
+                    "passed": False,
+                }],
+            }],
+        }
+        path.write_text(json.dumps(report) + "\n")
+        return path
 
     def test_missing_action_is_a_usage_error(self):
         result = self.invoke()
@@ -120,7 +170,7 @@ class ControlsTest(unittest.TestCase):
             self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
         )
         self.assertEqual(rows[0][6], "1")
-        self.assertEqual(rows[0][24:], [
+        self.assertEqual(rows[0][26:], [
             "memory_induced", "memory_on_only_failure_with_stale_injection"
         ])
 
@@ -130,7 +180,7 @@ class ControlsTest(unittest.TestCase):
             self.score_row("memory-off", 0, "na", "not_memory_on_arm"),
         )
         self.assertEqual(rows[0][6], "0")
-        self.assertEqual(rows[0][24:], [
+        self.assertEqual(rows[0][26:], [
             "not_memory_induced", "both_arms_failed"
         ])
 
@@ -140,7 +190,7 @@ class ControlsTest(unittest.TestCase):
             self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
         )
         self.assertEqual(rows[0][6], "0")
-        self.assertEqual(rows[0][24:], [
+        self.assertEqual(rows[0][26:], [
             "not_memory_induced", "stale_not_injected"
         ])
 
@@ -149,7 +199,7 @@ class ControlsTest(unittest.TestCase):
             self.score_row("memory-on", 0, "unknown", "missing_prompt_receipt")
         )
         self.assertEqual(rows[0][6], "0")
-        self.assertEqual(rows[0][24:], [
+        self.assertEqual(rows[0][26:], [
             "unassessable", "missing_memory_off_pair"
         ])
 
@@ -157,7 +207,7 @@ class ControlsTest(unittest.TestCase):
             self.score_row("memory-on", 0, "unknown", "missing_prompt_receipt"),
             self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
         )
-        self.assertEqual(rows[0][24:], [
+        self.assertEqual(rows[0][26:], [
             "unassessable", "missing_prompt_receipt"
         ])
 
@@ -185,21 +235,43 @@ class ControlsTest(unittest.TestCase):
             "memory_on_only_failure_with_stale_injection",
         )
 
-    def test_metadata_names_omp_and_separate_assertion_fixture(self):
+    def test_assertion_gate_recomputes_exact_ids_and_required_scope(self):
+        result = self.invoke("assertion-gate", str(self.assertion_report()))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        gate = json.loads(result.stdout)
+        self.assertTrue(gate["gate_passed"])
+        self.assertEqual(gate["passed_required_cases"], 3)
+        self.assertEqual(gate["required_cases"], 3)
+        self.assertFalse(gate["all_cases_passed"])
+
+    def test_assertion_gate_rejects_duplicate_ids_even_if_report_claims_pass(self):
+        path = self.assertion_report()
+        report = json.loads(path.read_text())
+        query = report["cases"][0]["queries"][0]
+        query["returned_evidence"] = [{"id": "a"}, {"id": "a"}]
+        query["duplicate_ids"] = ["a"]
+        query["returned_ids"] = ["a", "a"]
+        path.write_text(json.dumps(report) + "\n")
+        result = self.invoke("assertion-gate", str(path))
+        self.assertNotEqual(result.returncode, 0)
+
+    def test_metadata_records_integrated_no_judge_and_causal_gates(self):
         metadata_path = self.root / "metadata.json"
+        assertion_report = self.assertion_report()
         result = self.invoke("metadata", str(metadata_path), "openai/test-model",
-                             "test-version", str(CONTROLS))
+                             "test-version", str(CONTROLS), str(assertion_report))
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(metadata_path.read_text())
         self.assertEqual(metadata["agent"], "omp")
         self.assertEqual(metadata["schema_version"], 4)
         self.assertEqual(metadata["hard_gate"]["name"],
-                         "paired-stale-injection-causal-proxy")
+                         "exact-id-assertions-plus-paired-causal-safety")
         self.assertIn("memory-on failed", metadata["hard_gate"]["rule"])
         self.assertIn("unassessable", metadata["hard_gate"]["unsafe"])
         self.assertFalse(metadata["assertion_fixture"]["uses_model_judge"])
-        self.assertFalse(metadata["assertion_fixture"]["executed_by_this_run"])
-        self.assertFalse(metadata["assertion_fixture"]["coverage_equivalent"])
+        self.assertTrue(metadata["assertion_fixture"]["executed_by_this_run"])
+        self.assertTrue(metadata["assertion_fixture"]["gate_passed"])
+        self.assertEqual(metadata["assertion_fixture"]["required_cases"], 3)
         self.assertIn("before_agent_start", metadata["injected_tokens"]["scope"])
         self.assertEqual(metadata["tsv_appended_columns"][-6:], [
             "session_start_answer_present", "prompt_recall_answer_present",

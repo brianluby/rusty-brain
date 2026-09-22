@@ -1,4 +1,5 @@
 {
+  "manifest_schema_version": 2,
   "production_revision": "d98de4c4f093860ea16a827c83445fed25267748",
   "branch": "fix/reembed-input-guard-1228",
   "host": "vega.local",
@@ -14,9 +15,12 @@
     ],
     "empty": true
   },
-  "fixture_sha256": "b431b1cd6e296a1646792d14a1fc883b1b9c00e2af6d930bee327ba6eb9fed88",
+  "baseline_report_fixture_sha256": "b431b1cd6e296a1646792d14a1fc883b1b9c00e2af6d930bee327ba6eb9fed88",
+  "current_fixture_sha256": "daf37ec3ca9aa76c350ed313655cc310add3ef54ef316e795ffd0e9343fe61e6",
+  "current_fixture_change": "schema-2 gate_required metadata only; belief content, queries, limits, and expected ID sets unchanged",
   "baseline_fixture_sha256_before_authorship_metadata_clarification": "8ba9d33090fea870058f9ecf7ef832c0b69086a9c158f33946a9f543b2fc4c3f",
-  "baseline_expected_and_returned_sets_equal_final_report": true,
+  "baseline_report_artifact_preserved": true,
+  "schema2_expected_id_sets_equal_baseline_expected_id_sets": true,
   "baseline_test_exit_code": 101,
   "report_exit_code": 1,
   "crate_tests": {
@@ -24,16 +28,26 @@
     "failed": 0,
     "ignored": 14
   },
-  "precision_gate": {
+  "baseline_all_case_result": {
     "passed_cases": 2,
     "total_cases": 6,
     "score": 0.3333333333333333,
     "passed": false
   },
+  "current_required_gate_contract": {
+    "uses_model_judge": false,
+    "required_cases": [
+      "supersede-chain",
+      "five-slot-budget",
+      "namespace-selection"
+    ],
+    "non_required_failures_remain_visible": true,
+    "all_case_score_is_not_the_gate": true
+  },
   "requested_failure_classes": {
-    "supersede_resurfacing": "not reproduced; no fix claimed",
-    "budget_eviction": "reproduced; unfixed",
-    "namespace_leak": "not reproduced; no fix claimed"
+    "supersede_resurfacing": "not reproduced on baseline; required passing regression, no red-to-green fix claimed",
+    "budget_eviction": "reproduced on d98de4c; fixed by source-aware production ranking in 77f42b4 and candidate retention in e07f0a2; permanent exact-ID regression",
+    "namespace_leak": "not reproduced on baseline; required passing regression, no red-to-green fix claimed"
   },
   "artifacts_sha256": {
     "baseline-d98de4c.log": "2a76de1bd5dad80e917524fa39291f2683c4f8185db80c84e03bfb77b3a55deb",
