@@ -3,8 +3,9 @@
 - **Status:** **MEASURED — first read RED; post-fix N=5 reread SAFE with zero
   memory-induced errors.** First complete N=5 read of the unified scorecard,
   closing the "landed, unmeasured" state recorded in
-  `docs/eval/2026-06-23-w35-scorecard-closeout.md`. Delivers Vikunja #381
-  (Class A + ADR-3), #382 (Class B), and #383 (Class R).
+  `docs/eval/2026-06-23-w35-scorecard-closeout.md`. It delivered Vikunja #382
+  (Class B) and #383 (Class R); its then-claimed #381 Class A delivery is
+  invalidated by the #75 correction below.
 - **Date:** 2026-07-12.
 - **Run URL:** <https://github.com/brianluby/rusty-brain/actions/runs/29203432198>
   (`memory-scorecard.yml`, `runs=5`, main @ `1d3473c1`).
@@ -15,6 +16,14 @@
   `haiku`, `--max-budget-usd 0.50`/session, macOS runner. Harness fixes
   required to run at all: PR #65 (claude 2.1.x workspace-trust gate;
   `write_claude_md` `set -e` latent kill).
+
+> **Class A correction (2026-09-22, Vikunja #75):** the target in this run was
+> importance 8 while its off-topic distractors were importance 5. The answer
+> could therefore arrive in SessionStart context rather than through
+> discriminating query retrieval. The raw TSV and the response/cost numbers below
+> remain historical evidence, but the Class A PASS and ADR-3 ratification do
+> **not** establish retrieval at scale. A valid reread requires equal-importance,
+> same-domain competitors and separate SessionStart/query source reporting.
 
 ## Recovery reread after PR #70 (Vikunja #502)
 
@@ -30,11 +39,10 @@
   retrieval-at-scale miss their steelman comparisons, so 2/4 dimensions pass.
   Those dimensions are deliberately non-gating and do not weaken the recovered
   safety result. Direct capture fidelity remains 15/15 (100% [79.6–100.0]).
-- **Retrieval-at-scale reading:** memory-on 20% vs steelman 40%; cost remains
-  favorable ($0.0131 vs $0.0368), but accuracy loses. The run correctly says
-  to investigate retrieval rather than caching. This is input to the
-  preregistered production-embedding gate, not a reason to alter ranking under
-  #502.
+- **Historical Class A response reading:** memory-on 20% vs steelman 40%; cost
+  remained favorable ($0.0131 vs $0.0368). Because the run did not separate
+  SessionStart evidence from query recall and retained the unequal-importance
+  corpus, it is not retrieval-at-scale evidence and must not drive ranking.
 
 The reread satisfies #502's live zero-MIE criterion and confirms the PR #70
 framing fix. It does not retroactively change the first-run measurements below;
@@ -50,9 +58,9 @@ change.
 | axis | reading | verdict |
 |---|---|---|
 | SAFETY (the one hard gate, P4) | **2 memory-induced errors** (allowed 0): `freshness/fresh-test-runner` runs 3 and 4 | **UNSAFE — gate RED** |
-| Scorecard (tracked, non-gating) | reach PASS, freshness PASS, retrieval_scale PASS, capture no (steelman tie missed) | 3/4 pass |
+| Scorecard (tracked, non-gating) | reach PASS, freshness PASS, historical retrieval_scale PASS (invalidated by #75), capture no (steelman tie missed) | 2 valid passes; historical output said 3/4 |
 | Class B capture fidelity (report-only) | **15/15 = 100%** [79.6–100.0], target >= 80% | met |
-| ADR-3 (Class A cost methodology) | accuracy 0.47 vs steelman 0.33 AND cost $0.0132 vs $0.0376 | **RATIFY Opt 3** |
+| ADR-3 (Class A cost methodology) | response accuracy 0.47 vs steelman 0.33 AND cost $0.0132 vs $0.0376; source unattributed | **Historical RATIFY withdrawn by #75** |
 
 The first run exited non-zero **by design**: the safety gate is the only hard
 gate and it fired. Everything below preserves the honest first-run read that
@@ -159,6 +167,11 @@ pre-registered gates this stays a tracked signal, not a blocker.
 
 Target fact buried under a 500-fact distractor corpus:
 
+> **Invalidated interpretation; historical numbers follow.** This run did not
+> record whether the expected answer came from SessionStart or prompt-time
+> recall. Its success rate is a response-level measurement only and cannot be
+> cited as query-retrieval accuracy.
+
 ```
 arm                   runs   succ    mcost$    m_input    m_ccrea    m_cread  cache%   ctx_vol    eff_in
 memory-on               15    47%    0.0132         10       7613      17299   99.9%     24922     11256
@@ -169,12 +182,11 @@ memory-off              15     7%    0.0439         21       6841     51986  100
      => RATIFY Opt 3 (accuracy >= steelman AND total_cost_usd within 20%)
 ```
 
-**ADR-3 decision: RATIFIED (Option 3).** At scale, memory-on beats the
-steelman on accuracy (47% vs 33%) at ~35% of its per-session cost — selective
-recall injects ~11k effective input tokens vs the steelman's ~35k
-(everything-in-CLAUDE.md), and caching does not erase the difference
-(cache% ~100% on both). Accuracy-at-scale is confirmed as the primary metric;
-cost is reported diagnostically per the resolved methodology.
+**Historical ADR-3 verdict: RATIFIED (Option 3), withdrawn by #75.** The run
+recorded response accuracy of 47% versus 33% and cost of $0.0132 versus $0.0376,
+but did not attribute answer evidence to SessionStart versus query recall.
+Consequently the cost observation remains historical while the claimed
+retrieval-accuracy win and resulting ratification do not.
 
 ## Class R — reach/team proxy (Vikunja #383)
 
@@ -187,14 +199,16 @@ the Phase 5 two-user/two-machine pilot.
 
 ## What the first run and recovery reread close and open
 
-- Closes: Vikunja #381, #382, #383 (the "landed, unmeasured" deferrals from
-  the 2026-06-23 closeout) — measured artifacts now exist for A, B, and R.
+- Historical closeout: Vikunja #382 and #383 have measured artifacts. The run
+  also closed #381 at the time, but Vikunja #75 invalidates that Class A
+  retrieval interpretation; the raw artifact remains available for audit.
 - Resolves #502's live safety gate: PR #70 identified mechanism (c), hardened
   the injection frame, the recovery reread returned zero MIE, and this PR lands
   the diagnostic-evidence follow-up described above, closing the task.
 - Continues the non-gating quality work under the preregistered production-
-  embedding gate: the recovery run's retrieval-at-scale accuracy lost to the
-  steelman even though cost remained favorable. Do not treat that signal as a
-  reason to reopen #502 or apply an unconditional rank boost.
+  embedding gate. The recovery run's Class A response accuracy lost to the
+  steelman even though cost remained favorable, but neither original run
+  separated startup evidence from query recall. Do not treat either as a
+  retrieval-at-scale result or as a reason to reopen #502.
 - The weekly cron continues to enforce zero MIE. Any future red run now retains
   enough evidence to classify the failure without guessing at its mechanism.

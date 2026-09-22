@@ -4,12 +4,14 @@ use rb_eval::assertion_precision::assert_exact_ids;
 use rb_types::MemoryId;
 use std::process::Command;
 
+/// Build deterministic IDs, including unseeded IDs used to probe extra evidence.
 fn id(suffix: u8) -> MemoryId {
     format!("12180000-0000-4000-8000-{suffix:012}")
         .parse()
         .unwrap()
 }
 
+/// Extra returned evidence must fail even when every required ID is present.
 #[test]
 fn exact_assertion_rejects_any_extra_including_unknown_ids() {
     let expected = [id(1)];
@@ -21,6 +23,7 @@ fn exact_assertion_rejects_any_extra_including_unknown_ids() {
     }
 }
 
+/// Set equality ignores rank but rejects omissions, unexpected rows, and duplicates.
 #[test]
 fn exact_assertion_handles_missing_empty_order_and_duplicates() {
     assert!(assert_exact_ids(&[], &[]).passed);
@@ -35,23 +38,34 @@ fn exact_assertion_handles_missing_empty_order_and_duplicates() {
     assert_eq!(duplicate.duplicate_ids, [id(1).to_string()]);
 }
 
+/// Fresh production stores must reproduce the required gate and visible capability failures.
 #[tokio::test]
 async fn real_engine_report_is_repeatable() {
     let first = rb_eval::assertion_precision::run_committed().await.unwrap();
     let second = rb_eval::assertion_precision::run_committed().await.unwrap();
     assert_eq!(first, second);
     assert_eq!(first.fixture_sha256.len(), 64);
+    assert_eq!(first.required_cases, 3);
+    assert_eq!(first.passed_required_cases, 3);
+    assert!(first.precision_gate_passed);
+    assert!(!first.all_cases_passed);
 }
 
+/// Frozen labels must name seeded, current evidence inside the query's namespace.
 #[test]
 fn committed_labels_are_nonvacuous_and_in_scope() {
     let fixture: serde_json::Value =
         serde_json::from_str(include_str!("../fixtures/assertion_precision.json")).unwrap();
     let mut classes = std::collections::BTreeSet::new();
+    assert_eq!(fixture["schema_version"], 2);
     let mut case_ids = std::collections::BTreeSet::new();
+    let mut required_case_ids = std::collections::BTreeSet::new();
     for case in fixture["cases"].as_array().unwrap() {
         assert!(case_ids.insert(case["id"].as_str().unwrap()));
         classes.insert(case["failure_class"].as_str().unwrap());
+        if case["gate_required"].as_bool().unwrap() {
+            required_case_ids.insert(case["id"].as_str().unwrap());
+        }
         let memories = case["memories"].as_array().unwrap();
         let ids: std::collections::BTreeSet<_> =
             memories.iter().map(|m| m["id"].as_str().unwrap()).collect();
@@ -81,6 +95,12 @@ fn committed_labels_are_nonvacuous_and_in_scope() {
         }
     }
     assert_eq!(
+        required_case_ids,
+        ["supersede-chain", "five-slot-budget", "namespace-selection"]
+            .into_iter()
+            .collect()
+    );
+    assert_eq!(
         classes,
         [
             "hard_negative",
@@ -94,6 +114,7 @@ fn committed_labels_are_nonvacuous_and_in_scope() {
     );
 }
 
+/// The CLI's verdict and exit status must agree with its independently recomputed ID sets.
 #[test]
 fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
     let output = Command::new(env!("CARGO_BIN_EXE_assertion-precision"))
@@ -104,13 +125,13 @@ fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
         String::from_utf8_lossy(&output.stderr)
     );
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect(&error_context);
-    assert_eq!(report["schema_version"], 1);
+    assert_eq!(report["schema_version"], 2);
     assert_eq!(report["judge_used"], false);
-    assert!(report["no_judge_statement"]
-        .as_str()
-        .unwrap()
-        .contains("No LLM"));
     let cases = report["cases"].as_array().unwrap();
+    assert_eq!(report["required_cases"], 3);
+    assert_eq!(report["passed_required_cases"], 3);
+    assert_eq!(report["precision_gate_passed"], true);
+    assert_eq!(report["all_cases_passed"], false);
     assert_eq!(cases.len(), 6);
     let mut passed = 0;
     for case in cases {
@@ -161,9 +182,6 @@ fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
         report["score"].as_f64().unwrap(),
         passed as f64 / cases.len() as f64
     );
-    assert_eq!(report["precision_gate_passed"], passed == cases.len());
-    assert_eq!(
-        output.status.code(),
-        Some(if passed == cases.len() { 0 } else { 1 })
-    );
+    let gate_passed = report["precision_gate_passed"].as_bool().unwrap();
+    assert_eq!(output.status.code(), Some(if gate_passed { 0 } else { 1 }));
 }

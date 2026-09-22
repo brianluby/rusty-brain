@@ -40,6 +40,31 @@ All notable changes to rusty-brain are documented here. The format is based on
   routing checks resolve Bash from PATH and use an empty binary directory to
   prevent model launches independently of host installation layout.
 
+### Changed — Assertion-grade scorecard gate
+
+- The scorecard hard result now comes from fixed local exact evidence-ID sets,
+  with no model judge: missing, extra, or duplicate IDs fail a query and every
+  query must pass atomically for its case to pass. The required gate covers the
+  demonstrated budget-eviction red/green plus permanent supersede and namespace
+  regressions; unresolved hard-negative and topic-drift cases remain visible.
+- Scorecard runs retain the five arms and per-arm injection estimates, but the
+  live substring metric is report-only and excludes assistant prose. The first
+  22 TSV columns retain their layout and order, not their scoring semantics:
+  freshness success uses exact artifact equality and causal attribution can
+  upgrade the MIE flag. The validated schema-versioned assertion report and
+  its hash are written as sidecars.
+- Review hardening confines attribution sidecars to the diagnostics root, rejects
+  malformed TSV layouts, preserves existing failure flags, and requires a clean
+  memory-off control. Malformed receipts fail closed; damaged optional outcome
+  sidecars no longer discard otherwise valid results.
+- Live scoring snapshots only the designated artifact, excluding seeded context,
+  harness files, symlinks, and unchanged pre-session content. Scenario failures
+  retain completed evidence and a status sidecar, continue remaining scenarios,
+  and force a failed final verdict.
+- The scheduled workflow provisions pinned OMP/Bun versions and an explicit
+  provider mapping for the default model role. Extension-disabled arms also
+  work under macOS Bash 3 with strict unset-variable checks.
+
 ### Added — Scale, concurrency, and resource harness (Vikunja #57)
 
 - Added a release-only `rb-eval` load harness covering 1k/10k/25k corpora,
@@ -224,9 +249,12 @@ All notable changes to rusty-brain are documented here. The format is based on
   `29210642539` on main @ `2d46dd1c` completed `SAFE` with **zero
   memory-induced errors**. Freshness still passed (memory-on 60%, realistic
   0%, steelman 45%); its unsuccessful rows were ordinary misses, not stale
-  answers. Capture and retrieval-at-scale each missed their tracked,
-  non-gating steelman comparison and remain evaluation work rather than safety
-  regressions.
+  answers. Capture missed its tracked, non-gating steelman comparison. The
+  historical Class A response result is no longer interpreted as
+  retrieval-at-scale evidence: its target was importance 8 against importance-5
+  off-topic distractors and the run did not distinguish startup from query
+  evidence. A corrected equal-importance reread remains evaluation work, not a
+  safety regression.
 - **Mechanism established** for the 2026-07-12 N=5 scorecard safety-gate RED
   (`freshness/fresh-test-runner`, memory-on runs 3 and 4): NOT an
   archived-value leak and NOT a recall miss — a deterministic local
@@ -529,6 +557,14 @@ All notable changes to rusty-brain are documented here. The format is based on
   `remember --batch`, and written into both baselines' CLAUDE.md (steelman:
   target + distractors; realistic: distractors only). Accuracy on the buried fact
   is primary.
+  **Correction (2026-09-22, Vikunja #75):** that original scale setup privileged
+  the target through the importance-8 SessionStart path and used off-topic
+  competitors, so its response accuracy cannot establish discriminating
+  retrieval. Current scale rows plant target and same-domain competitors at
+  importance 5, collision-check expected/stale/forbidden/target identifiers,
+  and report SessionStart versus query-only evidence separately. Historical raw
+  results remain preserved, but their Class A retrieval interpretation is
+  withdrawn pending an equal-importance rerun.
 - **ADR-3 token/cost reporting in the scorecard** (`scripts/memory-scorecard.sh`):
   every session now runs under `--output-format stream-json --verbose`; the TSV
   grew to 13 fields with `total_cost_usd` + the four cache buckets, the per-arm

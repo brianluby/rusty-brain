@@ -1,10 +1,12 @@
 # Memory-value scorecard (W3.5 criterion redesign). Drives
-# scripts/memory-scorecard.sh: for each scenario it runs four arms (memory-on,
-# realistic-baseline, steelman-baseline, memory-off) and scores the dimension
-# (memory-on must BEAT the realistic baseline AND TIE the steelman), with the only
-# hard gate being zero memory-induced errors. Covers freshness (Class C),
-# retrieval@scale (Class A: a buried target among 500+ explicitly planted
-# distractors, scored on accuracy + total_cost_usd per ADR-3), capture fidelity
+# scripts/memory-scorecard.sh: for each scenario it runs five arms (memory-on,
+# realistic-baseline, steelman-baseline, length-matched-placebo, memory-off) and
+# reports dimension comparisons. The fixed offline exact-ID assertion gate always
+# applies; complete live runs also require zero paired causal memory-induced
+# errors and zero unassessable pairs. Covers freshness (Class C), retrieval@scale
+# (Class A: an equal-importance target among 500+ explicitly planted same-domain
+# competitors, with query-only evidence separated from SessionStart context and
+# cost reported per ADR-3), capture fidelity
 # (Class B: real Claude Code hook-origin SessionEnd summaries), and reach/team
 # simulation (Class R: identity A plants, identity B is scored). See
 # docs/eval/2026-06-16-w35-criterion-redesign.md, docs/eval/2026-06-19-*, and the
@@ -17,20 +19,20 @@
 #
 # Uploads a structured TSV whose first 13 fields are stable
 # (dimension/scenario/arm/run/success/turns/mie/cost/tok_in/tok_cc/tok_cr/tok_out/
-# is_error), followed by Class B capture fields
-# (cap_fidelity/cap_reason/cap_summary_count/cap_mcp_bypass_count). It contains
-# counts, costs, booleans, and bounded reason codes, not model free-text.
-# On FAILURE it additionally uploads the per-session evidence the harness
-# retained via --log-dir (Vikunja #502): model/session transcripts, daemon
+# is_error), followed by capture, injection-size, answer-source, stale-receipt,
+# and causal-attribution fields; no model free-text. The always-uploaded assertion
+# and metadata JSON sidecars preserve the exact IDs, gate counts, and report hash.
+# On FAILURE the workflow additionally uploads per-session evidence retained
+# via --log-dir (Vikunja #502): model/session transcripts, daemon
 # logs, exact SessionStart/prompt-time injections, raw active/archived recall
 # candidates (ids, states, scores, channel flags), and supersede histories.
 # These diagnostics are synthetic scorecard data and never key material.
 #
 # Required repository secret:
-#   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.
-#   A run is (scenarios x 4 arms x N) sessions; the per-session cap bounds spend.
-#   Per the variance protocol (P3) a single run never gates — the scheduled run
-#   uses N=5 for a real read; dispatch N=1 for a cheap plumbing smoke.
+#   ANTHROPIC_API_KEY — the scorecard's default @slow role is mapped to Haiku.
+#   A run is (scenarios x 5 arms x N) sessions, each with the harness's default
+#   300-second timeout. OMP has no per-session dollar cap in this runner.
+#   Scheduled runs use N=5; dispatch N=1 for a directional plumbing smoke.
 name: memory scorecard
 
 on:
@@ -150,20 +152,28 @@ jobs:
       - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
 
       - name: Build release binaries
-        run: cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
-
-      - name: Install Claude Code CLI
         run: |
-          npm install -g @anthropic-ai/claude-code
-          claude --version
+          cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
+          cargo build --release --locked -p rb-eval --bin assertion-precision
 
-      - name: Self-test (judge + scorecard math, no API)
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.2"
+      - name: Install OMP CLI
+        run: |
+          bun install --global @oh-my-pi/pi-coding-agent@18.2.4
+          echo "${HOME}/.bun/bin" >> "$GITHUB_PATH"
+          "${HOME}/.bun/bin/omp" --version
+
+      - name: Self-test (assertion gate + scorecard math, no API)
         run: scripts/memory-scorecard.sh --self-test
 
       - name: Run the scorecard
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          RB_SCORECARD_MAX_BUDGET_USD: "0.50"
+          # Fresh profiles do not inherit local role aliases. Keep the harness's
+          # @slow selector and timeout defaults; bind the role to this provider.
+          PI_SLOW_MODEL: "anthropic/claude-haiku-4-5"
           # Pass the dispatch input via env (never interpolate ${{ }} into the
           # shell) and validate it's a positive integer before use.
           RUNS_INPUT: ${{ github.event.inputs.runs || '5' }}
@@ -177,20 +187,24 @@ jobs:
           # harness otherwise deletes with its workroot. The first 2026-07-12
           # N=5 safety-gate MIEs were undiagnosable without this evidence
           # (Vikunja #502). It is uploaded only on failure (below) and carries
-          # no key material: claude -p never echoes ANTHROPIC_API_KEY, the
-          # daemon never receives it, and the scorecard corpus is synthetic.
+          # no key material: the scorecard does not request credential output,
+          # the daemon never receives it, and the corpus is synthetic.
           scripts/memory-scorecard.sh \
             --bin-dir target/release \
             --runs "$RUNS_INPUT" \
             --out "${RUNNER_TEMP}/memory-scorecard.tsv" \
             --log-dir "${RUNNER_TEMP}/scorecard-session-logs"
 
-      - name: Upload the scorecard TSV
+      - name: Upload scorecard evidence
         if: always()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
         with:
           name: memory-scorecard-report
-          path: ${{ runner.temp }}/memory-scorecard.tsv
+          path: |
+            ${{ runner.temp }}/memory-scorecard.tsv
+            ${{ runner.temp }}/memory-scorecard.tsv.assertions.json
+            ${{ runner.temp }}/memory-scorecard.tsv.metadata.json
+            ${{ runner.temp }}/memory-scorecard.tsv.scenario-status.tsv
           if-no-files-found: ignore
 
       - name: Upload per-session diagnostics (failure diagnosis, Vikunja #502)

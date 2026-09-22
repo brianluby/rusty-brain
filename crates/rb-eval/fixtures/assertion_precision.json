@@ -1,11 +1,12 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "authorship": "Fixed locally authored fictional beliefs; no runtime model or judge-generated labels.",
   "clock": "2026-01-01T00:00:00Z",
   "cases": [
     {
       "id": "hard-negative-environment",
       "failure_class": "hard_negative",
+      "gate_required": false,
       "rationale": "Production endpoint evidence is useful; a development endpoint sharing the same terms is not evidence for production.",
       "namespace": "project:precision",
       "memories": [
@@ -39,6 +40,7 @@
     {
       "id": "hard-negative-unknown",
       "failure_class": "hard_negative",
+      "gate_required": false,
       "rationale": "No belief answers the payroll retention question; exact empty set is required, not a plausible unrelated memory.",
       "namespace": "project:precision",
       "memories": [
@@ -70,6 +72,7 @@
     {
       "id": "supersede-chain",
       "failure_class": "supersede_resurfacing",
+      "gate_required": true,
       "rationale": "Only the latest deploy timeout is valid. Both ancestors are superseded through the real atomic store operation, with graph edges back to ancestors.",
       "namespace": "project:precision",
       "memories": [
@@ -128,6 +131,7 @@
     {
       "id": "five-slot-budget",
       "failure_class": "budget_eviction",
+      "gate_required": true,
       "rationale": "Five independent production deploy requirements must all survive the five-slot budget. Higher-importance session chatter about the same deployment is not a requirement.",
       "namespace": "project:precision",
       "memories": [
@@ -228,6 +232,7 @@
     {
       "id": "namespace-selection",
       "failure_class": "namespace_leak",
+      "gate_required": true,
       "rationale": "Engine bound to project:precision must not select the matching project:other, global or session rows, including a cross-project graph edge. This is selection scope, not authorization.",
       "namespace": "project:precision",
       "memories": [
@@ -288,6 +293,7 @@
     {
       "id": "session-topic-drift",
       "failure_class": "session_noise",
+      "gate_required": false,
       "rationale": "Sequential auth then storage questions share a project store. Earlier-topic evidence and captured session chatter must not contaminate either exact evidence set.",
       "namespace": "project:precision",
       "memories": [

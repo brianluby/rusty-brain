@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios. Each scenario compares rusty-brain with two hand-maintained AGENTS.md baselines: realistic_agents_md is stale or incomplete; steelman_agents_md is current and complete. The OMP-native runner requires memory-on to beat the realistic baseline and tie the steelman, with zero memory-induced errors as the hard gate.",
+  "_about": "Memory-value scorecard live scenarios. Each compares rusty-brain with realistic and steelman AGENTS.md baselines across five arms. Live outcomes are report-only except where an exact delivered-artifact assertion is declared. The fixed local exact evidence-ID assertion sidecar is the no-model-judge retrieval hard gate; complete live runs also require zero paired causal memory-induced errors and zero unassessable pairs.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,
@@ -17,9 +17,10 @@
       ],
       "realistic_agents_md": "HTTP: use the `reqwest` crate for outbound HTTP.",
       "steelman_agents_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
-      "work": "Add a helper that performs an HTTP GET and returns the response body. Name the HTTP crate it should use and show the dependency line.",
+      "work": "Choose the HTTP crate for a new outbound GET helper. Write only the crate name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ureq",
-      "stale_token": "reqwest"
+      "stale_marker": "for outbound HTTP this project uses the `reqwest` crate",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "ureq" }
     },
     {
       "id": "fresh-config-rename",
@@ -31,9 +32,10 @@
       ],
       "realistic_agents_md": "Config: read configuration from `app.toml` at the repo root.",
       "steelman_agents_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
-      "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
+      "work": "Choose the config path for loading `timeout_secs` at startup. Write only the path to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "config/settings.toml",
-      "stale_token": "app.toml"
+      "stale_marker": "project configuration lives in a file named `app.toml` at the repo root",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "config/settings.toml" }
     },
     {
       "id": "fresh-id-type",
@@ -45,9 +47,10 @@
       ],
       "realistic_agents_md": "Identifiers: entity ids are `Uuid`.",
       "steelman_agents_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
-      "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
+      "work": "Choose the identifier type for a new `Order`. Write only the Rust type name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ulid",
-      "stale_token": "uuid"
+      "stale_marker": "entity identifiers in this codebase are `Uuid`",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "Ulid" }
     },
     {
       "id": "fresh-test-runner",
@@ -59,17 +62,20 @@
       ],
       "realistic_agents_md": "Testing: run the suite with `cargo test`.",
       "steelman_agents_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
-      "work": "I need to run the project's tests. What exact command should I use?",
+      "work": "Choose the exact command for the project's test suite. Write only the command to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "nextest",
-      "stale_token": "cargo test"
+      "stale_marker": "run the test suite with `cargo test`",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "cargo nextest run" }
     },
     {
       "id": "scale-http-buried",
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 500,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["ureq", "reqwest"],
       "plant": [
-        { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 8 }
+        { "content": "Decision: for ALL outbound HTTP this project uses the `ureq` crate. We deliberately avoid reqwest — we want a tiny blocking client and no async runtime pulled in.", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "HTTP: use the `ureq` crate for all outbound HTTP. Do not use reqwest (we avoid pulling in an async runtime).",
@@ -81,8 +87,10 @@
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 500,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["Ulid", "Uuid"],
       "plant": [
-        { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 8 }
+        { "content": "Convention: every entity identifier in this codebase is a `Ulid` (lexicographically sortable). We do not use Uuid or autoincrement integers for entity ids.", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "Identifiers: entity ids are `Ulid` (lexicographically sortable), never Uuid or integer ids.",
@@ -94,8 +102,10 @@
       "dimension": "retrieval_scale",
       "plant_mode": "explicit",
       "corpus_size": 1000,
+      "corpus_importance": 5,
+      "distractor_collision_tokens": ["rmp", "rmp-serde", "MessagePack", "JSON"],
       "plant": [
-        { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 8 }
+        { "content": "Decision: our internal wire format is MessagePack via `rmp-serde`. We do NOT serialize messages to JSON on the wire (JSON is only for human-facing CLI output).", "importance": 5 }
       ],
       "realistic_agents_md": "",
       "steelman_agents_md": "Wire format: serialize internal messages with MessagePack (`rmp-serde`), not JSON.",

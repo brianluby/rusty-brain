@@ -9,9 +9,12 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const FIXTURE: &str = include_str!("../fixtures/assertion_precision.json");
+const REQUIRED_GATE_CASES: [&str; 3] =
+    ["supersede-chain", "five-slot-budget", "namespace-selection"];
 
 #[derive(Deserialize)]
 struct Fixture {
+    schema_version: u32,
     clock: chrono::DateTime<chrono::Utc>,
     cases: Vec<Case>,
 }
@@ -19,6 +22,7 @@ struct Fixture {
 struct Case {
     id: String,
     failure_class: String,
+    gate_required: bool,
     rationale: String,
     namespace: String,
     memories: Vec<Belief>,
@@ -96,6 +100,7 @@ pub struct QueryReport {
 pub struct CaseReport {
     pub id: String,
     pub failure_class: String,
+    pub gate_required: bool,
     pub rationale: String,
     pub queries: Vec<QueryReport>,
     pub passed: bool,
@@ -113,8 +118,13 @@ pub struct PrecisionReport {
     pub cases: Vec<CaseReport>,
     pub passed_cases: usize,
     pub total_cases: usize,
+    /// Required cases are fixed by `REQUIRED_GATE_CASES`, not inferred from results.
+    pub passed_required_cases: usize,
+    pub required_cases: usize,
+    pub all_cases_passed: bool,
     /// Fraction of fully passing cases, not average hit recall or prose similarity.
     pub score: f64,
+    /// True only when the non-empty fixed required set passes exactly.
     pub precision_gate_passed: bool,
 }
 
@@ -123,6 +133,27 @@ pub struct PrecisionReport {
 /// fusion weights, score floor, metadata filter and candidate assembly stay default.
 pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
     let fixture: Fixture = serde_json::from_str(FIXTURE)?;
+    anyhow::ensure!(
+        fixture.schema_version == 2,
+        "unsupported assertion fixture schema {}",
+        fixture.schema_version
+    );
+    let case_ids: BTreeSet<&str> = fixture.cases.iter().map(|case| case.id.as_str()).collect();
+    anyhow::ensure!(
+        case_ids.len() == fixture.cases.len(),
+        "assertion fixture case IDs must be unique"
+    );
+    let required_cases: BTreeSet<&str> = fixture
+        .cases
+        .iter()
+        .filter(|case| case.gate_required)
+        .map(|case| case.id.as_str())
+        .collect();
+    let expected_required_cases: BTreeSet<&str> = REQUIRED_GATE_CASES.iter().copied().collect();
+    anyhow::ensure!(
+        required_cases == expected_required_cases,
+        "required assertion cases changed: expected {expected_required_cases:?}, got {required_cases:?}"
+    );
     let mut cases = Vec::new();
     for case in fixture.cases {
         let engine = MemoryEngine::new(
@@ -205,17 +236,23 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
         cases.push(CaseReport {
             id: case.id,
             failure_class: case.failure_class,
+            gate_required: case.gate_required,
             rationale: case.rationale,
             queries,
             passed,
         });
     }
-    let passed_cases = cases.iter().filter(|c| c.passed).count();
+    let passed_cases = cases.iter().filter(|case| case.passed).count();
     let total_cases = cases.len();
+    let passed_required_cases = cases
+        .iter()
+        .filter(|case| case.gate_required && case.passed)
+        .count();
+    let required_cases = cases.iter().filter(|case| case.gate_required).count();
     Ok(PrecisionReport {
-        schema_version: 1,
+        schema_version: 2,
         judge_used: false,
-        no_judge_statement: "No LLM, model judge, prose substring scoring, or external service is used. Labels are fixed locally authored memory ID sets.".into(),
+        no_judge_statement: "No LLM, model judge, prose or file substring scoring, or external service is used. Labels are fixed locally authored memory ID sets; every missing, extra, or duplicate ID fails its query, and every query must pass for its case to pass.".into(),
         fixture_sha256: format!("{:x}", Sha256::digest(FIXTURE.as_bytes())),
         retrieval_path: "MemoryEngine::compose_note -> SqliteBackend/SqliteStore -> MemoryEngine::recall_with_status (FTS5 + sqlite-vec + graph)".into(),
         embedding_provider: format!("DeterministicProvider(dim={EVAL_DIM}); offline, nonsemantic"),
@@ -224,10 +261,19 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
             "No daemon transport, capture hooks, auto-link generation, or concurrency coverage.".into(),
             "Five-slot retrieval budget only; hook rendering and its 200-character projection are not exercised.".into(),
             "Namespace selection is not an authorization guarantee.".into(),
-            "A passing class is not evidence of a reproduced baseline failure or a subsequent fix.".into(),
+            "Non-required cases remain scored and visible as capability evidence; they cannot be averaged into or silently weaken the required gate.".into(),
         ],
-        cases, passed_cases, total_cases,
-        score: if total_cases == 0 { 0.0 } else { passed_cases as f64 / total_cases as f64 },
-        precision_gate_passed: total_cases > 0 && passed_cases == total_cases,
+        cases,
+        passed_cases,
+        total_cases,
+        passed_required_cases,
+        required_cases,
+        all_cases_passed: total_cases > 0 && passed_cases == total_cases,
+        score: if total_cases == 0 {
+            0.0
+        } else {
+            passed_cases as f64 / total_cases as f64
+        },
+        precision_gate_passed: required_cases > 0 && passed_required_cases == required_cases,
     })
 }
