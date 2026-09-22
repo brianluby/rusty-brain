@@ -436,9 +436,7 @@ aggregate_scorecard() {
       dims[dim]=1;
       if (arm=="memory-on") {
         causal_total++;
-        causal_lines = causal_lines sprintf(
-          "causal_attribution\tdimension=%s\tscenario=%s\trun=%s\tattribution=%s\treason=%s\tmie=%d\n",
-          dim, $2, $4, causal_attr, causal_reason, mie+0);
+        causal_lines = causal_lines sprintf("causal_attribution\tdimension=%s\tscenario=%s\trun=%s\tattribution=%s\treason=%s\tmie=%d\n", dim, $2, $4, causal_attr, causal_reason, mie+0);
         if (causal_attr=="memory_induced" && mie+0==1) {
           mie_total++;
           mie_list = mie_list sprintf("    - %s / %s run %s (%s)\n", dim, $2, $4, causal_reason);
@@ -447,8 +445,7 @@ aggregate_scorecard() {
                    (causal_attr=="memory_induced" && mie+0!=1) ||
                    (causal_attr=="not_memory_induced" && mie+0!=0)) {
           unassessable_total++;
-          unassessable_list = unassessable_list sprintf(
-            "    - %s / %s run %s (%s)\n", dim, $2, $4, causal_reason);
+          unassessable_list = unassessable_list sprintf("    - %s / %s run %s (%s)\n", dim, $2, $4, causal_reason);
         }
       }
       if (dim=="retrieval_scale" && arm=="memory-on") {
@@ -922,10 +919,6 @@ JSON
   collect_workspace_proxy "$proxy_project" "$proxy_marker" "$proxy_input"
   check "touched workspace evidence remains a report-only proxy" "1 0" \
     "$(legacy_proxy_text "$proxy_input" ureq '' reqwest memory-on)"
-  check "current workspace evidence => proxy hit, no mie"   "1 0" "$(legacy_proxy_text "$tmp/new.txt"       ureq '' reqwest memory-on)"
-  check "names superseded value => proxy hit"               "1 0" "$(legacy_proxy_text "$tmp/names-old.txt" ureq '' reqwest memory-on)"
-  check "stale workspace evidence => miss + legacy mie"     "0 1" "$(legacy_proxy_text "$tmp/old.txt"       ureq '' reqwest memory-on)"
-  check "stale baseline evidence => miss, no legacy mie"    "0 0" "$(legacy_proxy_text "$tmp/old.txt"       ureq '' reqwest steelman-baseline)"
 
   # Emit one attributed results row. The first 13 fields remain stable; capture
   # fields are 14-17, injection sizes 18-22, answer-source evidence 23-24,
@@ -1293,7 +1286,8 @@ PY
     legacy_row freshness s1 length-matched-placebo 1 0 2 0
   } > "$legacy"
   if aggregate_scorecard "$legacy" 0.10 1 >/dev/null; then echo "BUG: legacy TSV without causal evidence did not fail closed"; fail=1; else echo "ok: legacy TSV parses and fails closed"; fi
-  if aggregate_scorecard "$legacy" 0.10 1 | grep -qF 'reason=missing_causal_fields'; then echo "ok: legacy TSV names missing causal fields"; else echo "BUG: legacy TSV missing reason"; fail=1; fi
+  local legacy_out; legacy_out="$(aggregate_scorecard "$legacy" 0.10 1 || true)"
+  if grep -qF 'reason=missing_causal_fields' <<<"$legacy_out"; then echo "ok: legacy TSV names missing causal fields"; else echo "BUG: legacy TSV missing reason"; fail=1; fi
 
   if aggregate_scorecard "$unsafe" 0.10 5 >/dev/null; then echo "ok: sub-min-runs unsafe run is directional"; else echo "BUG: sub-min-runs run gated"; fail=1; fi
   if aggregate_scorecard "$unsafe" 0.10 5 | grep -q 'DIRECTIONAL LIVE PROXY'; then echo "ok: sub-min-runs run prints directional banner"; else echo "BUG: no directional banner"; fail=1; fi

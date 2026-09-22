@@ -9,11 +9,8 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeSet;
 
 const FIXTURE: &str = include_str!("../fixtures/assertion_precision.json");
-const REQUIRED_GATE_CASES: [&str; 3] = [
-    "supersede-chain",
-    "five-slot-budget",
-    "namespace-selection",
-];
+const REQUIRED_GATE_CASES: [&str; 3] =
+    ["supersede-chain", "five-slot-budget", "namespace-selection"];
 
 #[derive(Deserialize)]
 struct Fixture {
@@ -141,11 +138,7 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
         "unsupported assertion fixture schema {}",
         fixture.schema_version
     );
-    let case_ids: BTreeSet<&str> = fixture
-        .cases
-        .iter()
-        .map(|case| case.id.as_str())
-        .collect();
+    let case_ids: BTreeSet<&str> = fixture.cases.iter().map(|case| case.id.as_str()).collect();
     anyhow::ensure!(
         case_ids.len() == fixture.cases.len(),
         "assertion fixture case IDs must be unique"
@@ -156,8 +149,7 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
         .filter(|case| case.gate_required)
         .map(|case| case.id.as_str())
         .collect();
-    let expected_required_cases: BTreeSet<&str> =
-        REQUIRED_GATE_CASES.iter().copied().collect();
+    let expected_required_cases: BTreeSet<&str> = REQUIRED_GATE_CASES.iter().copied().collect();
     anyhow::ensure!(
         required_cases == expected_required_cases,
         "required assertion cases changed: expected {expected_required_cases:?}, got {required_cases:?}"
