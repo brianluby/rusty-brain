@@ -28,10 +28,130 @@ def messages(directory):
             if isinstance(record.get("message"), str)]
 
 
+def stale_evidence(directory, stale):
+    """Return whether a stale marker appears in an actual prompt-time receipt."""
+    if not stale:
+        return "na", "no_stale_token"
+    directory = Path(directory)
+    if (directory / "control-error.json").exists():
+        return "unknown", "control_error"
+    receipt = directory / f"{CHANNEL}.jsonl"
+    if not receipt.exists():
+        return "unknown", "missing_prompt_receipt"
+    try:
+        rows = [
+            json.loads(line)
+            for line in receipt.read_text().splitlines()
+            if line.strip()
+        ]
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        return "unknown", "malformed_prompt_receipt"
+    if not rows:
+        return "unknown", "empty_prompt_receipt"
+    if any(
+        not isinstance(row, dict) or not isinstance(row.get("message"), str)
+        for row in rows
+    ):
+        return "unknown", "malformed_prompt_receipt"
+    needle = stale.casefold()
+    present = any(needle in row["message"].casefold() for row in rows)
+    return ("1", "stale_injected") if present else ("0", "stale_not_injected")
+
+
+def causal_attribution(on_rows, off_rows):
+    """Attribute one scenario/run pair without treating correlation as proof."""
+    if len(on_rows) != 1:
+        return 0, "unassessable", (
+            "missing_memory_on_pair" if not on_rows else "duplicate_memory_on_pair"
+        )
+    if len(off_rows) != 1:
+        return 0, "unassessable", (
+            "missing_memory_off_pair" if not off_rows else "duplicate_memory_off_pair"
+        )
+    on, off = on_rows[0], off_rows[0]
+    if on[12] == "true":
+        return 0, "unassessable", "memory_on_session_error"
+    if off[12] == "true":
+        return 0, "unassessable", "memory_off_session_error"
+    if on[4] not in {"0", "1"} or off[4] not in {"0", "1"}:
+        return 0, "unassessable", "invalid_outcome"
+    evidence, evidence_reason = on[22], on[23]
+    if evidence == "na":
+        return 0, "not_memory_induced", "no_stale_candidate"
+    if evidence not in {"0", "1"}:
+        return 0, "unassessable", evidence_reason or "missing_injection_evidence"
+    if on[4] == "1":
+        return 0, "not_memory_induced", "memory_on_succeeded"
+    if off[4] == "0":
+        return 0, "not_memory_induced", "both_arms_failed"
+    if evidence == "0":
+        return 0, "not_memory_induced", "stale_not_injected"
+    return 1, "memory_induced", "memory_on_only_failure_with_stale_injection"
+
+
+def attribute_results(source, destination, diagnostics_root=None):
+    """Append causal fields, replace column 7, and retain pair diagnostics."""
+    lines = Path(source).read_text().splitlines()
+    rows = []
+    pairs = {}
+    for line in lines:
+        fields = line.split("\t")
+        rows.append(fields)
+        if line.startswith("agent=") or len(fields) < 24:
+            continue
+        key = (fields[0], fields[1], fields[3])
+        pairs.setdefault(key, {}).setdefault(fields[2], []).append(fields)
+
+    attributed = {}
+    for key, arms in pairs.items():
+        attributed[key] = causal_attribution(
+            arms.get("memory-on", []), arms.get("memory-off", [])
+        )
+
+    output = []
+    for fields in rows:
+        if fields[0].startswith("agent=") or len(fields) < 24:
+            output.append("\t".join(fields))
+            continue
+        key = (fields[0], fields[1], fields[3])
+        mie, attribution, reason = attributed[key]
+        if fields[2] == "memory-on":
+            fields[6] = str(mie)
+            fields.extend([attribution, reason])
+            if diagnostics_root:
+                outcome = (
+                    Path(diagnostics_root)
+                    / f"{fields[1]}-r{fields[3]}"
+                    / "on"
+                    / "diagnostics"
+                    / "outcome.json"
+                )
+                if outcome.exists():
+                    data = json.loads(outcome.read_text())
+                    data.update({
+                        "paired_memory_off_success":
+                            pairs[key].get("memory-off", [[None] * 5])[0][4]
+                            == "1"
+                            if len(pairs[key].get("memory-off", [])) == 1
+                            else None,
+                        "memory_induced_error": bool(mie),
+                        "causal_attribution": attribution,
+                        "causal_reason": reason,
+                        "causal_rule":
+                            "memory-on failed AND paired memory-off succeeded "
+                            "AND stale evidence appeared in the prompt-time receipt",
+                    })
+                    outcome.write_text(json.dumps(data, indent=2) + "\n")
+        else:
+            fields.extend(["na", "not_memory_on_arm"])
+        output.append("\t".join(fields))
+    Path(destination).write_text("\n".join(output) + ("\n" if output else ""))
+
+
 def main():
     if len(sys.argv) < 2:
         print("usage: scorecard-controls.py "
-              "{file-tokens|metrics|validate-pair|metadata} ...", file=sys.stderr)
+              "{file-tokens|metrics|stale-evidence|attribute-results|validate-pair|metadata} ...", file=sys.stderr)
         raise SystemExit(2)
     action, *args = sys.argv[1:]
     if action == "file-tokens":
@@ -41,6 +161,11 @@ def main():
         directory, file_tokens = args
         prompt_tokens = sum(estimate(message) for message in messages(directory))
         print(f"0\t{prompt_tokens}\t{int(file_tokens)}\t{prompt_tokens + int(file_tokens)}\t{ESTIMATOR}")
+    elif action == "stale-evidence":
+        evidence, reason = stale_evidence(*args)
+        print(f"{evidence}\t{reason}")
+    elif action == "attribute-results":
+        attribute_results(*args)
     elif action == "validate-pair":
         source, placebo = args
         source_error = Path(source) / "control-error.json"
@@ -68,14 +193,27 @@ def main():
     elif action == "metadata":
         destination, model, version, extension_path = args
         metadata = {
-            "schema_version": 3,
+            "schema_version": 4,
             "agent": "omp",
             "model_selector": model,
             "omp_version": version,
             "extension_sha256": hashlib.sha256(Path(extension_path).read_bytes()).hexdigest(),
             "resolved_model_source": "assistant provider/model fields in each retained work.jsonl",
-            "scoring": "legacy-substring-proxy",
-            "hard_gate": "legacy zero memory-induced-error proxy (unchanged)",
+            "scoring": "outcome scorer recorded by each TSV row",
+            "outcome_scoring": {
+                "freshness": "exact delivered-artifact equality; assistant prose excluded",
+                "other_dimensions": "legacy compatibility substring report",
+            },
+            "hard_gate": {
+                "name": "paired-stale-injection-causal-proxy",
+                "rule": "memory-on failed AND paired memory-off succeeded AND the stale marker appears in the memory-on prompt-time receipt",
+                "safe": "every required pair and injection receipt is assessable and zero pairs satisfy the proxy rule",
+                "unsafe": "at least one pair satisfies the proxy rule or required pairing/injection evidence is unassessable",
+                "limitations": [
+                    "before_agent_start receipts record prepared custom messages, not provider delivery or attention",
+                    "paired model runs are nondeterministic controls, not randomized causal proof",
+                ],
+            },
             "assertion_fixture": {
                 "uses_model_judge": False,
                 "executed_by_this_run": False,
@@ -96,6 +234,10 @@ def main():
                 "injected_agents_md_est",
                 "injected_total_est",
                 "injected_estimator",
+                "injected_stale_evidence",
+                "injection_evidence_reason",
+                "causal_attribution",
+                "causal_reason",
             ],
         }
         Path(destination).write_text(json.dumps(metadata, indent=2) + "\n")

@@ -34,10 +34,25 @@ three retrieval-at-scale, three auto-capture, and three reach scenarios. The
 scenario source is therefore scorecard-equivalent to the retired Claude runner;
 the model transport and baseline file convention are now OMP/`AGENTS.md`.
 
-The legacy substring proxy remains the scorecard outcome metric. It judges final
-assistant prose and size-capped touched files, retains the existing zero-MIE hard
-gate, and reports incomplete cells as directional. `SAFE` is neither a semantic
-correctness claim nor causal safety proof.
+The four stale/freshness scenarios use exact delivered-artifact assertions:
+`scorecard-answer.txt` must equal the scenario's current value (apart from one
+optional trailing newline). Assistant prose is not part of that outcome. Thus a
+response that names the current value but ships an obsolete artifact fails. The
+remaining legacy dimensions still report their compatibility substring outcome;
+the independent exact-ID assertion fixture remains a separate no-judge gate.
+
+The safety result is a paired causal proxy. A pair is `memory_induced` only when
+all three conditions hold: the memory-on task failed, the same scenario/run's
+memory-off task succeeded, and the stale marker appeared in the memory-on
+prompt-time receipt. A both-arms failure is `not_memory_induced`. Missing or
+duplicate pairs, session errors, malformed outcomes, and missing receipt evidence
+are `unassessable` and fail a complete run closed.
+
+`SAFE` means every required pair and injection receipt was assessable and none
+satisfied that rule. `UNSAFE` means at least one pair satisfied the rule or was
+unassessable. Neither label proves overall task correctness or strict causality:
+model runs are nondeterministic controls, and the receipt limitation below
+remains.
 
 ## Placebo contract
 
@@ -58,8 +73,9 @@ placebo fallback from leaking a memory-on recall message.
 
 Receipts append in preparation order. OMP can re-enter policy preparation or
 discard an attempt after another extension changes policy or cancels delivery.
-These are **not provider-delivery receipts**; matched counts/sizes alone cannot
-prove that both models consumed identical placements.
+These are **not provider-delivery receipts**. The proxy proves that the native
+memory channel prepared stale content for injection, not that the provider
+consumed or attended to it.
 
 ## Counting and output
 
@@ -69,7 +85,8 @@ Estimator ID: **`utf8-bytes-div4-ceil-v1`**.
 estimated_tokens(text) = ceil(len(text.encode("utf-8")) / 4)
 ```
 
-The TSV's original seventeen columns are unchanged. Five columns are appended:
+The TSV's first thirteen columns remain stable. Columns 14-17 retain Class B
+capture diagnostics, and columns 18-22 retain injection estimates:
 
 | Column | Meaning |
 |---:|---|
@@ -79,15 +96,26 @@ The TSV's original seventeen columns are unchanged. Five columns are appended:
 | 21 | Sum of columns 18–20. |
 | 22 | Estimator ID. |
 
+The causal postprocessor appends four fields without repurposing earlier data:
+
+| Column | Meaning |
+|---:|---|
+| 23 | `injected_stale_evidence`: `0`, `1`, `unknown`, or `na`. |
+| 24 | Injection evidence reason code. |
+| 25 | `causal_attribution`: `memory_induced`, `not_memory_induced`, `unassessable`, or `na`. |
+| 26 | Causal reason code, including `both_arms_failed`, `stale_not_injected`, `missing_memory_off_pair`, and receipt/session errors. |
+
 This is a byte-based proxy, not provider token accounting. Usage is summed over
 every assistant call in OMP's terminal `agent_end`, rather than taking only the
 last call. Provider framing, user prompts, tool traffic, plant sessions, and the
 model's own tokenization are outside placebo matching.
 
 `--out RESULTS.tsv` writes `RESULTS.tsv.metadata.json`: model selector, OMP
-version, canonical extension SHA-256, estimator, legacy scorer, hard gate, and
-independent assertion-fixture status. Resolved provider/model fields remain in
-each retained `work.jsonl`; use `--log-dir` to retain those records and receipts.
+version, canonical extension SHA-256, estimator, the exact causal rule,
+SAFE/UNSAFE definitions, residual limitations, and independent assertion-fixture
+status. Resolved provider/model fields remain in each retained `work.jsonl`; use
+`--log-dir` to retain those records and receipts. Retained `outcome.json` files
+include the paired memory-off outcome, attribution, reason, and causal rule.
 The assertion fixture is not executed by scorecard runs and remains explicitly
 `coverage_equivalent: false`: it is an offline retrieval assertion, not an
 agent-task evaluator.
@@ -124,10 +152,15 @@ redaction in actual DB/WAL bytes, status, and uninstall.
 
 ## Limits
 
-- Matching estimated punctuation length does not establish equal provider tokens,
-  prompt placement, or causal equivalence.
-- The scorecard’s legacy substring proxy does not replace exact-ID retrieval
-  assertions or semantic task grading.
+- Matching estimated punctuation length does not establish equal provider tokens
+  or prompt placement.
+- A prompt-time receipt proves preparation by the injection channel, not provider
+  delivery, model attention, or causal equivalence.
+- The paired memory-off differential is a causal proxy across nondeterministic
+  runs, not a randomized causal estimate.
+- Legacy non-freshness dimensions still use compatibility substring outcomes;
+  the stale safety scenarios use exact artifact equality.
+- Exact-ID retrieval assertions do not constitute semantic task grading.
 - Capture is best-effort: a forced kill can bypass shutdown, and transcript/input
   caps can omit content. These probes certify neither crash recovery nor other
   OMP versions.

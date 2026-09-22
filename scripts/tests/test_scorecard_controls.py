@@ -32,6 +32,25 @@ class ControlsTest(unittest.TestCase):
             json.dumps({"message": message}) + "\n"
         )
 
+    def score_row(self, arm, success, stale_evidence, evidence_reason, run="1",
+                  is_error="false"):
+        fields = [
+            "freshness", "scenario", arm, run, str(success), "2", "0",
+            "0", "0", "0", "0", "0", is_error,
+            "na", "na", "0", "0",
+            "0", "0", "0", "0", "utf8-bytes-div4-ceil-v1",
+            stale_evidence, evidence_reason,
+        ]
+        return "\t".join(fields)
+
+    def attribute(self, *rows):
+        source = self.root / "raw.tsv"
+        destination = self.root / "results.tsv"
+        source.write_text("\n".join(rows) + "\n")
+        result = self.invoke("attribute-results", str(source), str(destination))
+        self.assertEqual(result.returncode, 0, result.stderr)
+        return [line.split("\t") for line in destination.read_text().splitlines()]
+
     def test_missing_action_is_a_usage_error(self):
         result = self.invoke()
         self.assertEqual(result.returncode, 2)
@@ -78,6 +97,94 @@ class ControlsTest(unittest.TestCase):
             "0", "1", "7", "8", "utf8-bytes-div4-ceil-v1"
         ])
 
+    def test_stale_evidence_requires_a_valid_prompt_receipt(self):
+        result = self.invoke("stale-evidence", str(self.on), "reqwest")
+        self.assertEqual(result.stdout.strip(), "unknown\tmissing_prompt_receipt")
+
+        self.receipt(self.on, "Use reqwest for outbound HTTP")
+        result = self.invoke("stale-evidence", str(self.on), "REQWEST")
+        self.assertEqual(result.stdout.strip(), "1\tstale_injected")
+
+        self.receipt(self.on, "Use ureq for outbound HTTP")
+        result = self.invoke("stale-evidence", str(self.on), "reqwest")
+        self.assertEqual(result.stdout.strip(), "0\tstale_not_injected")
+
+    def test_stale_evidence_is_not_required_without_a_stale_candidate(self):
+        result = self.invoke("stale-evidence", str(self.on), "")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout.strip(), "na\tno_stale_token")
+
+    def test_paired_failure_with_injected_stale_content_is_attributed(self):
+        rows = self.attribute(
+            self.score_row("memory-on", 0, "1", "stale_injected"),
+            self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
+        )
+        self.assertEqual(rows[0][6], "1")
+        self.assertEqual(rows[0][24:], [
+            "memory_induced", "memory_on_only_failure_with_stale_injection"
+        ])
+
+    def test_both_arms_failure_is_not_memory_induced(self):
+        rows = self.attribute(
+            self.score_row("memory-on", 0, "1", "stale_injected"),
+            self.score_row("memory-off", 0, "na", "not_memory_on_arm"),
+        )
+        self.assertEqual(rows[0][6], "0")
+        self.assertEqual(rows[0][24:], [
+            "not_memory_induced", "both_arms_failed"
+        ])
+
+    def test_failure_without_injected_stale_content_is_not_attributed(self):
+        rows = self.attribute(
+            self.score_row("memory-on", 0, "0", "stale_not_injected"),
+            self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
+        )
+        self.assertEqual(rows[0][6], "0")
+        self.assertEqual(rows[0][24:], [
+            "not_memory_induced", "stale_not_injected"
+        ])
+
+    def test_missing_pair_or_evidence_is_unassessable(self):
+        rows = self.attribute(
+            self.score_row("memory-on", 0, "unknown", "missing_prompt_receipt")
+        )
+        self.assertEqual(rows[0][6], "0")
+        self.assertEqual(rows[0][24:], [
+            "unassessable", "missing_memory_off_pair"
+        ])
+
+        rows = self.attribute(
+            self.score_row("memory-on", 0, "unknown", "missing_prompt_receipt"),
+            self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
+        )
+        self.assertEqual(rows[0][24:], [
+            "unassessable", "missing_prompt_receipt"
+        ])
+
+    def test_attribution_is_retained_in_memory_on_diagnostics(self):
+        diagnostics = self.root / "scenario-r1" / "on" / "diagnostics"
+        diagnostics.mkdir(parents=True)
+        outcome = diagnostics / "outcome.json"
+        outcome.write_text(json.dumps({"success": 0}) + "\n")
+        source = self.root / "raw.tsv"
+        destination = self.root / "results.tsv"
+        source.write_text("\n".join([
+            self.score_row("memory-on", 0, "1", "stale_injected"),
+            self.score_row("memory-off", 1, "na", "not_memory_on_arm"),
+        ]) + "\n")
+        result = self.invoke(
+            "attribute-results", str(source), str(destination), str(self.root)
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        retained = json.loads(outcome.read_text())
+        self.assertTrue(retained["paired_memory_off_success"])
+        self.assertTrue(retained["memory_induced_error"])
+        self.assertEqual(retained["causal_attribution"], "memory_induced")
+        self.assertEqual(
+            retained["causal_reason"],
+            "memory_on_only_failure_with_stale_injection",
+        )
+
     def test_metadata_names_omp_and_separate_assertion_fixture(self):
         metadata_path = self.root / "metadata.json"
         result = self.invoke("metadata", str(metadata_path), "openai/test-model",
@@ -85,11 +192,19 @@ class ControlsTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(metadata_path.read_text())
         self.assertEqual(metadata["agent"], "omp")
-        self.assertEqual(metadata["schema_version"], 3)
+        self.assertEqual(metadata["schema_version"], 4)
+        self.assertEqual(metadata["hard_gate"]["name"],
+                         "paired-stale-injection-causal-proxy")
+        self.assertIn("memory-on failed", metadata["hard_gate"]["rule"])
+        self.assertIn("unassessable", metadata["hard_gate"]["unsafe"])
         self.assertFalse(metadata["assertion_fixture"]["uses_model_judge"])
         self.assertFalse(metadata["assertion_fixture"]["executed_by_this_run"])
         self.assertFalse(metadata["assertion_fixture"]["coverage_equivalent"])
         self.assertIn("before_agent_start", metadata["injected_tokens"]["scope"])
+        self.assertEqual(metadata["tsv_appended_columns"][-4:], [
+            "injected_stale_evidence", "injection_evidence_reason",
+            "causal_attribution", "causal_reason",
+        ])
 
 
 if __name__ == "__main__":

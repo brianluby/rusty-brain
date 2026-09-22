@@ -1,5 +1,5 @@
 {
-  "_about": "Memory-value scorecard scenarios. Each scenario compares rusty-brain with two hand-maintained AGENTS.md baselines: realistic_agents_md is stale or incomplete; steelman_agents_md is current and complete. The OMP-native runner requires memory-on to beat the realistic baseline and tie the steelman, with zero memory-induced errors as the hard gate.",
+  "_about": "Memory-value scorecard scenarios. Each scenario compares rusty-brain with two hand-maintained AGENTS.md baselines: realistic_agents_md is stale or incomplete; steelman_agents_md is current and complete. The OMP-native runner requires memory-on to beat the realistic baseline and tie the steelman. Its causal safety proxy requires zero paired memory-induced errors and zero unassessable pairs.",
   "config": {
     "runs_per_scenario": 5,
     "memory_induced_errors_allowed": 0,
@@ -17,9 +17,10 @@
       ],
       "realistic_agents_md": "HTTP: use the `reqwest` crate for outbound HTTP.",
       "steelman_agents_md": "HTTP: use the `ureq` crate for outbound HTTP. (Migrated off reqwest; do not use reqwest.)",
-      "work": "Add a helper that performs an HTTP GET and returns the response body. Name the HTTP crate it should use and show the dependency line.",
+      "work": "Choose the HTTP crate for a new outbound GET helper. Write only the crate name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ureq",
-      "stale_token": "reqwest"
+      "stale_token": "reqwest",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "ureq" }
     },
     {
       "id": "fresh-config-rename",
@@ -31,9 +32,10 @@
       ],
       "realistic_agents_md": "Config: read configuration from `app.toml` at the repo root.",
       "steelman_agents_md": "Config: read configuration from `config/settings.toml`. (Renamed from app.toml, which no longer exists.)",
-      "work": "Add code that loads a new `timeout_secs` setting at startup. Which config file path should it read from?",
+      "work": "Choose the config path for loading `timeout_secs` at startup. Write only the path to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "config/settings.toml",
-      "stale_token": "app.toml"
+      "stale_token": "app.toml",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "config/settings.toml" }
     },
     {
       "id": "fresh-id-type",
@@ -45,9 +47,10 @@
       ],
       "realistic_agents_md": "Identifiers: entity ids are `Uuid`.",
       "steelman_agents_md": "Identifiers: entity ids are `Ulid` (switched from Uuid; do not use Uuid for ids).",
-      "work": "Add a new `Order` struct that needs a unique id field. What type should the id be?",
+      "work": "Choose the identifier type for a new `Order`. Write only the Rust type name to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "ulid",
-      "stale_token": "uuid"
+      "stale_token": "uuid",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "Ulid" }
     },
     {
       "id": "fresh-test-runner",
@@ -59,9 +62,10 @@
       ],
       "realistic_agents_md": "Testing: run the suite with `cargo test`.",
       "steelman_agents_md": "Testing: run the suite with `cargo nextest run` (moved off plain cargo test).",
-      "work": "I need to run the project's tests. What exact command should I use?",
+      "work": "Choose the exact command for the project's test suite. Write only the command to `scorecard-answer.txt`; the delivered file is the scored outcome. You may explain your choice in the final response.",
       "expect": "nextest",
-      "stale_token": "cargo test"
+      "stale_token": "cargo test",
+      "outcome_assertion": { "path": "scorecard-answer.txt", "exact": "cargo nextest run" }
     },
     {
       "id": "scale-http-buried",
