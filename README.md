@@ -127,6 +127,13 @@ Implemented and test-covered (correctness is the primary coverage; see [Testing]
   provider, and an optional local ONNX provider behind a feature flag.
 - **Best-effort capture hooks** (`rusty-brain-hooks`) and an installer
   (`rusty-brain-install`) for wiring memory capture into agent CLIs.
+- **Opt-in maintenance jobs** for link decay, near-duplicate consolidation, and
+  importance recalibration. All are disabled by default. Consolidation selects a
+  surviving memory and supersedes duplicates; it does not synthesize a merged note
+  or adjudicate contradictions. Importance recalibration uses access/recency signals,
+  not explicit usefulness feedback.
+- **Usefulness feedback** (`helpful`/`wrong`/`stale`) adjusts a memory's confidence;
+  **supersession** keeps replaced memories out of active recall.
 
 Planned / deferred (designed but not built): LLM-assisted memory evolution
 (reconciliation, reflection), a networked multi-host surface with real auth, and an
@@ -459,7 +466,7 @@ shipped runtime components.
 | `rb-agents` | CLI-agnostic agent hook spine: event model and per-CLI adapters. |
 | `rb-hooks` | The `rusty-brain-hooks` capture binary (fail-open). |
 | `rb-install` | The `rusty-brain-install` binary: wire/unwire hooks into agent CLIs. |
-| `rb-eval` *(dev-only)* | Offline deterministic regression harness; excluded from the shipped binary. |
+| `rb-eval` *(dev-only)* | Retrieval regression harness with deterministic and recorded real-model embeddings; excluded from the shipped binary. |
 | `rb-contract-guard` *(CI/dev-only)* | Detects protocol/schema drift and requires an explicit compatibility decision. |
 
 ## Development
@@ -522,9 +529,10 @@ benchmark or a real-world value study.
 
 ## Roadmap
 
-Implemented through the retrieval-quality phase (store/recall, the daemon, MCP and CLI
-surfaces, agent capture hooks, composite embeddings, RRF, confidence, and contradiction
-surfacing). Designed but not yet built:
+Implemented: store/recall, the daemon, MCP and CLI surfaces, agent capture hooks,
+composite embeddings, RRF, confidence and usefulness feedback, contradiction
+surfacing, supersession, opt-in maintenance jobs, and real-model replay evaluation.
+Designed but not yet built:
 
 - LLM-assisted memory **evolution** (reconciliation and reflection) beyond the
   deterministic consolidation, decay, and importance-recalibration jobs that
