@@ -64,6 +64,7 @@ mod tests {
     fn parses_each_agent_id() {
         for (raw, expected) in [
             ("claude-code", AgentId::ClaudeCode),
+            ("omp", AgentId::Omp),
             ("opencode", AgentId::OpenCode),
             ("gemini", AgentId::Gemini),
             ("codex", AgentId::Codex),

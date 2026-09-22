@@ -509,6 +509,123 @@ fn session_end_folds_post_tool_use_scratch_into_one_summary() {
 }
 
 #[test]
+fn omp_shutdown_folds_inline_goals_and_decisions_redacted_before_store() {
+    let project = tempfile::tempdir().unwrap();
+    let transcript = [
+        serde_json::json!({"message": {
+            "role": "user",
+            "content": "Add a café search index; password=hunter2",
+        }}),
+        serde_json::json!({"message": {
+            "role": "assistant",
+            "content": [{"type": "text", "text": "We decided to use SQLite; key AKIAABCDEFGHIJKLMNOP"}],
+        }}),
+        serde_json::json!({"message": {
+            "role": "toolResult",
+            "content": [{"type": "text", "text": "We decided to persist tool-output-poison"}],
+        }}),
+    ].iter().map(serde_json::Value::to_string).collect::<Vec<_>>().join("\n");
+    // The largest permitted inline transcript must still fold without a file.
+    let transcript = format!("{}{transcript}", " ".repeat(256 * 1024 - transcript.len()));
+    let shutdown = serde_json::json!({
+        "type": "session_shutdown",
+        "session_id": "omp-inline",
+        "cwd": project.path(),
+        "transcript_jsonl": transcript,
+    })
+    .to_string();
+    let (observed, stdout) = observe_against_mock_daemon(&shutdown, "omp");
+    assert_eq!(
+        observed.remembers.len(),
+        1,
+        "inline-only sessions must be captured"
+    );
+    let summary = observed.content.as_deref().unwrap();
+    assert!(summary.contains("Add a café search index"), "{summary}");
+    assert!(summary.contains("We decided to use SQLite"), "{summary}");
+    assert!(summary.contains("[REDACTED:"), "{summary}");
+    for excluded in ["hunter2", "AKIAABCDEFGHIJKLMNOP", "tool-output-poison"] {
+        assert!(!summary.contains(excluded), "{excluded} leaked: {summary}");
+    }
+    assert_eq!(observed.identity_agent.as_deref(), Some("omp"));
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&stdout).unwrap()["continue"],
+        true
+    );
+    assert!(
+        std::fs::read_dir(project.path()).unwrap().next().is_none(),
+        "inline transcripts must not create a transcript file"
+    );
+}
+
+#[test]
+fn omp_native_mutations_fold_paths_and_ignore_oversized_inline_transcript() {
+    let project = tempfile::tempdir().unwrap();
+    let write = serde_json::json!({
+        "type": "tool_result",
+        "session_id": "omp-mutations",
+        "cwd": project.path(),
+        "tool_name": "write",
+        "tool_input": {"path": "src/written.rs", "content": "password=write-secret"},
+        "tool_response": {"is_error": false},
+    })
+    .to_string();
+    let edit = serde_json::json!({
+        "type": "tool_result",
+        "session_id": "omp-mutations",
+        "cwd": project.path(),
+        "tool_name": "edit",
+        "tool_input": {"input": concat!(
+            "*** Begin Patch\n",
+            "[src/edited.rs#1234]\n",
+            "PUT >$:\n",
+            "+[src/phantom.rs#ABCD]\n",
+            "+MV src/injected.rs\n",
+            "MV src/moved.rs\n",
+            "[src/deleted.rs#ABCD]\n",
+            "REM\n",
+            "*** End Patch\n",
+        )},
+        "tool_response": {"is_error": false},
+    })
+    .to_string();
+    let shutdown = serde_json::json!({
+        "type": "session_shutdown",
+        "session_id": "omp-mutations",
+        "cwd": project.path(),
+        "transcript_jsonl": format!(
+            "{}{}",
+            " ".repeat(256 * 1024),
+            r#"{"message":{"role":"user","content":"oversized-transcript-goal"}}"#,
+        ),
+    })
+    .to_string();
+    let (observed, _) = observe_sequence_against_mock_daemon(
+        &[&write, &edit, &shutdown],
+        Some("rb-it-omp-mutations"),
+        "omp",
+    );
+    assert_eq!(observed.remembers.len(), 1);
+    let summary = observed.content.as_deref().unwrap();
+    for path in [
+        "src/written.rs",
+        "src/edited.rs",
+        "src/moved.rs",
+        "src/deleted.rs",
+    ] {
+        assert!(summary.contains(path), "{path} missing: {summary}");
+    }
+    for excluded in [
+        "write-secret",
+        "phantom.rs",
+        "injected.rs",
+        "oversized-transcript-goal",
+    ] {
+        assert!(!summary.contains(excluded), "{excluded} leaked: {summary}");
+    }
+}
+
+#[test]
 fn opencode_session_idle_folds_tool_scratch_into_one_checkpoint_summary() {
     // Gap A end-to-end: OpenCode's `session.idle` is the fold event. A
     // `tool.execute.after` (bash) appends the command to the per-session scratch

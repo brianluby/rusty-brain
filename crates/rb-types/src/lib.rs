@@ -7,6 +7,7 @@
 
 mod anchor;
 mod change;
+mod embedding;
 mod error;
 mod feedback_kind;
 mod history;
@@ -28,6 +29,7 @@ pub use anchor::{
     parse_kind as parse_anchor_kind, MemoryAnchor,
 };
 pub use change::{ChangeKind, MemoryChanged};
+pub use embedding::EmbeddingInputFingerprint;
 pub use error::{Error, Result};
 pub use feedback_kind::FeedbackKind;
 pub use history::{HistoryEdge, HistoryEntry, MemoryHistory};

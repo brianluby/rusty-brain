@@ -127,6 +127,10 @@ pub struct HookContext {
     /// PreCompact redesign reads decisions out of it. CLIs without an
     /// equivalent parse it as `None`.
     pub transcript_path: Option<PathBuf>,
+    /// Bounded in-memory JSONL supplied by adapters without a transcript file.
+    /// OMP supplies only user/assistant text at capture boundaries; never persist
+    /// this raw text. The pipeline digests and redacts it before storing a summary.
+    pub transcript_jsonl: Option<String>,
 }
 
 #[cfg(test)]
@@ -152,6 +156,7 @@ mod tests {
             cwd: PathBuf::from("/work/project"),
             session_id: Some("sess-1".to_string()),
             transcript_path: Some(PathBuf::from("/work/transcript.jsonl")),
+            transcript_jsonl: None,
         };
         assert_eq!(
             ctx.event,

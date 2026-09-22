@@ -1777,6 +1777,7 @@ impl Store for SqliteStore {
         embedding: &[f32],
         model: &str,
         input_version: &str,
+        expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> Result<()> {
         // Fail-closed dimension check before any write, identical to the search
         // path: a wrong-length vector must never land in the vec0 table.
@@ -1788,6 +1789,21 @@ impl Store for SqliteStore {
         }
 
         immediate_tx(&self.conn, || {
+            // Reembed-vs-edit guard: compare the candidate's INPUTS, not its
+            // model/version stamp (an edit can write the same stale '' sentinel).
+            // BEGIN IMMEDIATE encloses this read, the stamp, and the vec0 write,
+            // so no writer can change the inputs after this comparison. Reject
+            // without touching the vector/stamp; the next pass retries the row.
+            let current = self
+                .get_memory(id)?
+                .filter(|note| note.archived_at.is_none())
+                .ok_or_else(|| Error::NotFound(id.clone()))?;
+            if rb_types::EmbeddingInputFingerprint::from(&current) != expected_input {
+                return Err(Error::StalePlan(
+                    "embedding inputs changed; retry reembed".to_string(),
+                ));
+            }
+
             // Stamp the memory row. 0 rows updated means the id does not exist
             // OR the row is archived: fail closed (NotFound) so the whole
             // transaction rolls back rather than leaving a vector update with
@@ -5316,7 +5332,15 @@ mod vector_write_hygiene_tests {
         );
         store.insert_memory(&m, None).unwrap();
         let v = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        store.update_vector(&m.id, &v, "det", "v2").unwrap();
+        store
+            .update_vector(
+                &m.id,
+                &v,
+                "det",
+                "v2",
+                rb_types::EmbeddingInputFingerprint::from(&m),
+            )
+            .unwrap();
 
         let hits = store.vector_search(&ns, &v, 5).unwrap();
         assert_eq!(hits.len(), 1);
@@ -5339,6 +5363,8 @@ mod vector_write_hygiene_tests {
         let store = SqliteStore::open_in_memory(DIM).unwrap();
         let ns = Namespace::Project("race".into());
         let id = insert_vec(&store, &ns, "soon archived", &[1.0; DIM]);
+        let expected_input =
+            rb_types::EmbeddingInputFingerprint::from(&store.get_memory(&id).unwrap().unwrap());
 
         // W1.7: archive deletes the vec0 row in the same transaction...
         store.archive_memory(&id).unwrap();
@@ -5347,7 +5373,7 @@ mod vector_write_hygiene_tests {
         // ...and a reembed write that raced past the candidate scan fails
         // closed instead of re-INSERTing the vector via the fallback path.
         let err = store
-            .update_vector(&id, &[0.5; DIM], "det", "v2")
+            .update_vector(&id, &[0.5; DIM], "det", "v2", expected_input)
             .unwrap_err();
         assert!(matches!(err, Error::NotFound(_)), "got {err:?}");
         assert_eq!(

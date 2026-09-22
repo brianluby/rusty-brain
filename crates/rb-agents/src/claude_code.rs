@@ -83,6 +83,7 @@ impl AgentCli for ClaudeCodeCli {
             session_id,
             // Claude Code sends `transcript_path` on every hook event.
             transcript_path: opt_str(raw, "transcript_path").map(PathBuf::from),
+            transcript_jsonl: None,
         }
     }
 

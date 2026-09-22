@@ -1,0 +1,25 @@
+    Checking rb-types v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-types)
+    Checking rb-redact v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-redact)
+    Checking rb-embed v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-embed)
+    Checking rb-search v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-search)
+    Checking rb-proto v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-proto)
+    Checking rb-config v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-config)
+    Checking rb-store v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-store)
+    Checking rb-engine v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-engine)
+    Checking rb-enrich v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-enrich)
+    Checking rb-mcp v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-mcp)
+    Checking rb-daemon v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-daemon)
+    Checking rb-eval v0.0.1 (/Users/bluby/repos/rusty-brain/crates/rb-eval)
+error: `panic` should not be present in production code
+   --> crates/rb-eval/tests/assertion_precision.rs:103:9
+    |
+103 | /         panic!(
+104 | |             "runner must emit JSON, not silently skip: {e}; stderr={}",
+105 | |             String::from_utf8_lossy(&output.stderr)
+106 | |         )
+    | |_________^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/rust-1.97.0/index.html#panic
+    = note: requested on the command line with `-D clippy::panic`
+
+error: could not compile `rb-eval` (test "assertion_precision") due to 1 previous error

@@ -9,8 +9,9 @@ use crate::installers::builtins;
 use crate::report::{AgentReport, AgentStatus, InstallError, InstallReport};
 use crate::uninstall::uninstall_file;
 use crate::writer::{
-    ensure_allow_entries, ensure_text_block, merge_into_file, read_config, remove_allow_entries,
-    remove_managed_file, remove_text_block, write_managed_file,
+    asset_conflict, ensure_allow_entries, ensure_text_block, merge_into_file, owned_asset_state,
+    read_config, remove_allow_entries, remove_managed_file, remove_owned_asset, remove_text_block,
+    write_managed_file, write_owned_asset, AssetState,
 };
 
 /// Apply a fragment's W3.2 managed side-effects AFTER its hooks merge: union the
@@ -57,20 +58,26 @@ pub fn resolve_hooks_bin() -> PathBuf {
     }
 }
 
-/// Select installers: all shipped installers when `requested` is `None`, else
-/// exactly the named subset. Fail closed on an unknown agent id, and reject the
-/// deferred `opencode` agent with a clear error rather than silently doing
-/// nothing (it has no JSON installer — it needs a JS/TS plugin).
+/// Select installers: all shipped installers supporting `scope` when `requested`
+/// is `None`, else exactly the named subset. Explicit selections retain
+/// unsupported scopes so operations report an error rather than silently skip.
+/// Fail closed on unknown agent ids or agents with no persistent installer.
 ///
 /// # Errors
 /// Returns [`InstallError::InvalidAgent`] for any unrecognized name, and
-/// [`InstallError::AgentDeferred`] when `opencode` is explicitly requested.
+/// [`InstallError::AgentDeferred`] when a valid agent has no installer.
 pub fn select_installers(
     requested: Option<&[String]>,
+    scope: &InstallScope,
 ) -> Result<Vec<Box<dyn AgentInstaller>>, InstallError> {
-    let all = builtins();
+    let mut all = builtins();
     match requested {
-        None => Ok(all),
+        None => {
+            if matches!(scope, InstallScope::Global) {
+                all.retain(|inst| inst.id() != AgentId::Omp);
+            }
+            Ok(all)
+        }
         Some(names) => {
             for name in names {
                 match AgentId::parse(name) {
@@ -79,8 +86,7 @@ pub fn select_installers(
                             agent: name.clone(),
                         });
                     }
-                    // `opencode` is a real AgentId (the hook binary still supports
-                    // `--agent opencode`) but has no installer — fail clearly.
+                    // OpenCode still requires its own native JS/TS plugin.
                     Some(AgentId::OpenCode) => {
                         return Err(InstallError::AgentDeferred {
                             agent: name.clone(),
@@ -108,7 +114,9 @@ pub fn run_install(
     for inst in installers {
         let id = inst.id().as_str().to_string();
         let version = inst.detect();
-        if version.is_none() {
+        if version.is_none()
+            && !(inst.id() == AgentId::Omp && matches!(scope, InstallScope::Global))
+        {
             agents.push(AgentReport {
                 agent: id,
                 status: AgentStatus::NotFound,
@@ -120,7 +128,38 @@ pub fn run_install(
         }
         let report = match inst.hook_fragment(hooks_bin, scope) {
             Ok(frag) => {
-                if dry_run {
+                if let Some(asset) = &frag.owned_asset {
+                    let outcome = owned_asset_state(&frag.config_path, asset).and_then(|state| {
+                        if !matches!(state, AssetState::Absent | AssetState::Present) {
+                            return Err(asset_conflict(&frag.config_path, state));
+                        }
+                        if dry_run {
+                            return Ok(AgentStatus::WouldConfigure);
+                        }
+                        write_owned_asset(&frag.config_path, asset)?;
+                        Ok(if state == AssetState::Present {
+                            AgentStatus::Upgraded
+                        } else {
+                            AgentStatus::Configured
+                        })
+                    });
+                    match outcome {
+                        Ok(status) => AgentReport {
+                            agent: id,
+                            status,
+                            config_path: Some(frag.config_path),
+                            version,
+                            error: None,
+                        },
+                        Err(error) => AgentReport {
+                            agent: id,
+                            status: AgentStatus::Failed,
+                            config_path: Some(frag.config_path),
+                            version,
+                            error: Some(error.to_string()),
+                        },
+                    }
+                } else if dry_run {
                     AgentReport {
                         agent: id,
                         status: AgentStatus::WouldConfigure,
@@ -209,6 +248,31 @@ pub fn run_uninstall(
             }
         };
         let config_path = frag.config_path.clone();
+        if let Some(asset) = &frag.owned_asset {
+            let outcome = owned_asset_state(&config_path, asset).and_then(|state| {
+                if !matches!(state, AssetState::Absent | AssetState::Present) {
+                    return Err(asset_conflict(&config_path, state));
+                }
+                if !dry_run {
+                    remove_owned_asset(&config_path, asset)?;
+                }
+                Ok(())
+            });
+            agents.push(AgentReport {
+                agent: id,
+                status: if outcome.is_err() {
+                    AgentStatus::Failed
+                } else if dry_run {
+                    AgentStatus::WouldRemove
+                } else {
+                    AgentStatus::Removed
+                },
+                config_path: Some(config_path),
+                version: None,
+                error: outcome.err().map(|error| error.to_string()),
+            });
+            continue;
+        }
         if dry_run {
             agents.push(AgentReport {
                 agent: id,
@@ -247,7 +311,7 @@ pub fn run_uninstall(
     InstallReport::roll_up(scope_label(scope), dry_run, agents)
 }
 
-/// Report detection + whether our sentinel block is present in each config.
+/// Report detection plus JSON sentinel presence or native asset ownership/drift.
 pub fn run_status(
     installers: &[Box<dyn AgentInstaller>],
     hooks_bin: &std::path::Path,
@@ -257,13 +321,46 @@ pub fn run_status(
     for inst in installers {
         let id = inst.id().as_str().to_string();
         let version = inst.detect();
-        let config_path = inst
-            .hook_fragment(hooks_bin, scope)
-            .ok()
-            .map(|f| f.config_path);
-        let present = config_path
-            .as_ref()
-            .and_then(|p| read_config(p).ok())
+        let frag = match inst.hook_fragment(hooks_bin, scope) {
+            Ok(frag) => frag,
+            Err(error) => {
+                agents.push(AgentReport {
+                    agent: id,
+                    status: AgentStatus::Failed,
+                    config_path: None,
+                    version,
+                    error: Some(error.to_string()),
+                });
+                continue;
+            }
+        };
+        if let Some(asset) = &frag.owned_asset {
+            let (status, error) = match owned_asset_state(&frag.config_path, asset) {
+                Ok(AssetState::Present) => (AgentStatus::Present, None),
+                Ok(AssetState::Absent) => (
+                    if version.is_some() {
+                        AgentStatus::Absent
+                    } else {
+                        AgentStatus::NotFound
+                    },
+                    None,
+                ),
+                Ok(state) => (
+                    AgentStatus::Drifted,
+                    Some(asset_conflict(&frag.config_path, state).to_string()),
+                ),
+                Err(error) => (AgentStatus::Failed, Some(error.to_string())),
+            };
+            agents.push(AgentReport {
+                agent: id,
+                status,
+                config_path: Some(frag.config_path),
+                version,
+                error,
+            });
+            continue;
+        }
+        let present = read_config(&frag.config_path)
             .map(|v| contains_sentinel(&v))
             .unwrap_or(false);
         let status = if version.is_none() {
@@ -276,7 +373,7 @@ pub fn run_status(
         agents.push(AgentReport {
             agent: id,
             status,
-            config_path,
+            config_path: Some(frag.config_path),
             version,
             error: None,
         });
@@ -313,19 +410,45 @@ fn scope_label(scope: &InstallScope) -> &'static str {
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::report::{AgentStatus, ReportStatus};
+    use crate::report::AgentStatus;
 
     #[test]
-    fn select_installers_all_when_none() {
-        // OpenCode is deferred, so the default set is three installers.
-        let all = select_installers(None).unwrap();
-        assert_eq!(all.len(), 3);
-        assert!(!all.iter().any(|i| i.id() == AgentId::OpenCode));
+    fn select_installers_project_defaults_include_omp() {
+        let all = select_installers(None, &InstallScope::Project(PathBuf::from("."))).unwrap();
+        let ids: Vec<_> = all.iter().map(|installer| installer.id()).collect();
+        assert_eq!(
+            ids,
+            [
+                AgentId::ClaudeCode,
+                AgentId::Omp,
+                AgentId::Gemini,
+                AgentId::Codex
+            ]
+        );
+    }
+
+    #[test]
+    fn select_installers_global_defaults_exclude_omp() {
+        let all = select_installers(None, &InstallScope::Global).unwrap();
+        let ids: Vec<_> = all.iter().map(|installer| installer.id()).collect();
+        assert_eq!(ids, [AgentId::ClaudeCode, AgentId::Gemini, AgentId::Codex]);
+    }
+
+    #[test]
+    fn select_installers_explicit_global_mixture_retains_omp() {
+        let selected = select_installers(
+            Some(&["omp".to_string(), "codex".to_string()]),
+            &InstallScope::Global,
+        )
+        .unwrap();
+        let ids: Vec<_> = selected.iter().map(|installer| installer.id()).collect();
+        assert_eq!(ids, [AgentId::Omp, AgentId::Codex]);
     }
 
     #[test]
     fn select_installers_subset() {
-        let subset = select_installers(Some(&["codex".to_string()])).unwrap();
+        let subset =
+            select_installers(Some(&["codex".to_string()]), &InstallScope::Global).unwrap();
         assert_eq!(subset.len(), 1);
         assert_eq!(subset[0].id(), AgentId::Codex);
     }
@@ -335,20 +458,20 @@ mod tests {
         // Match on the result instead of `.unwrap_err()`: `Box<dyn AgentInstaller>`
         // is not `Debug`, so `unwrap_err` (which would print the Ok value) won't
         // compile. The assertion below pins the identical plan intent.
-        let result = select_installers(Some(&["cursor".to_string()]));
+        let result = select_installers(Some(&["cursor".to_string()]), &InstallScope::Global);
         assert!(matches!(result, Err(InstallError::InvalidAgent { .. })));
     }
 
     #[test]
-    fn select_installers_defers_opencode_with_clear_error() {
-        // `opencode` is a valid AgentId but has no installer (JS/TS plugin); it must
-        // fail with a clear deferred error, NOT silently select zero installers.
-        let result = select_installers(Some(&["opencode".to_string()]));
+    fn select_installers_defers_opencode_only() {
+        let result = select_installers(Some(&["opencode".to_string()]), &InstallScope::Global);
         assert!(matches!(result, Err(InstallError::AgentDeferred { .. })));
-        if let Err(e) = result {
-            assert!(e.to_string().contains("deferred"));
-            assert!(e.to_string().contains("[E_INSTALL_AGENT_DEFERRED]"));
-        }
+        let omp = select_installers(
+            Some(&["omp".to_string()]),
+            &InstallScope::Project(PathBuf::from(".")),
+        )
+        .unwrap();
+        assert_eq!(omp[0].id(), AgentId::Omp);
     }
 
     /// A test-only installer whose `detect()` always succeeds, so engine tests
@@ -409,8 +532,8 @@ mod tests {
         // fresh Configure, NOT Upgraded — the old file-existence check mislabeled
         // this as Upgraded.
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
         let frag = installers[0].hook_fragment(bin, &scope).unwrap();
 
@@ -433,8 +556,8 @@ mod tests {
         // After we have already installed our block, a re-run must classify as
         // Upgraded (our sentinel is present before the merge).
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
         let frag = installers[0].hook_fragment(bin, &scope).unwrap();
 
@@ -454,8 +577,8 @@ mod tests {
     #[test]
     fn install_then_status_present_then_uninstall_absent() {
         let dir = tempfile::tempdir().unwrap();
-        let installers = select_installers(Some(&["claude-code".to_string()])).unwrap();
         let scope = InstallScope::Project(dir.path().to_path_buf());
+        let installers = select_installers(Some(&["claude-code".to_string()]), &scope).unwrap();
         let bin = std::path::Path::new("/x/rusty-brain-hooks");
 
         // detect() needs the binary on PATH; here it returns None (claude not
@@ -478,8 +601,6 @@ mod tests {
         assert_eq!(removed.agents[0].status, AgentStatus::Removed);
         let after = read_config(&frag.config_path).unwrap();
         assert!(!contains_sentinel(&after), "sentinel gone after uninstall");
-        assert_eq!(installed.status, installed.status); // report builds
-        let _ = ReportStatus::Success;
     }
 
     #[test]

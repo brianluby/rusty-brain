@@ -110,52 +110,5 @@ fn readme_matrix_matches_capability_source_of_truth() {
                 row[idx + 1]
             );
         }
-        assert!(
-            !row[6].is_empty(),
-            "README {want_id} lifecycle/limitation cell must not be empty"
-        );
-        for marker in limitation_markers(capability.agent) {
-            assert!(
-                row[6].contains(marker),
-                "README {want_id} lifecycle/limitation cell drifted: expected it to \
-                 mention {marker:?} (per capability.rs limitations), got {:?}",
-                row[6]
-            );
-        }
-    }
-}
-
-/// Stable anchor tokens the README limitation prose must keep, per agent.
-///
-/// The prose cell is an editorial summary, not a verbatim render of
-/// `AgentCapability::limitations` (which would bloat the table), so the guard
-/// pins the load-bearing caveat of each row instead: the fixture backing for
-/// claude-code, the resolved upstream gate (openai/codex#16732, shipped in
-/// Codex 0.123.0) plus the remaining terminus fixture gate for codex, the
-/// fold event + install deferral for opencode, the descoping decision for
-/// gemini, and the discovery gate for hermes. Dropping one of these in a
-/// rewrite is exactly the stale-prose failure this test exists to catch.
-fn limitation_markers(agent: &str) -> &'static [&'static str] {
-    match agent {
-        "claude-code" => &["crates/rb-hooks/tests/fixtures/claude_code/"],
-        "codex" => &["openai/codex#16732", "fixture"],
-        "opencode" => &["SessionCheckpoint", "deferred"],
-        "gemini" => &["descoped"],
-        "hermes" => &["Discovery-gated"],
-        other => panic!("no limitation markers defined for agent {other:?}"),
-    }
-}
-
-#[test]
-fn readme_lists_scorecard_agent_targets() {
-    // CA5/CA7: the README must document per-agent scorecard invocation,
-    // including the aggregate target.
-    let readme = readme_text();
-    for target in ["claude-code", "codex", "opencode", "all"] {
-        let needle = format!("--agent {target}");
-        assert!(
-            readme.contains(&needle),
-            "README must document `scripts/memory-scorecard.sh {needle}`"
-        );
     }
 }

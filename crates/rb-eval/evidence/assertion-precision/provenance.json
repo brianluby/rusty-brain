@@ -1,0 +1,51 @@
+{
+  "production_revision": "d98de4c4f093860ea16a827c83445fed25267748",
+  "branch": "fix/reembed-input-guard-1228",
+  "host": "vega.local",
+  "captured_at_utc": "2026-09-17T10:21:56.132033+00:00",
+  "production_source_diff_against_base": {
+    "base": "d98de4c4f093860ea16a827c83445fed25267748",
+    "paths": [
+      "crates/rb-engine",
+      "crates/rb-store",
+      "crates/rb-search",
+      "crates/rb-embed",
+      "crates/rb-types"
+    ],
+    "empty": true
+  },
+  "fixture_sha256": "b431b1cd6e296a1646792d14a1fc883b1b9c00e2af6d930bee327ba6eb9fed88",
+  "baseline_fixture_sha256_before_authorship_metadata_clarification": "8ba9d33090fea870058f9ecf7ef832c0b69086a9c158f33946a9f543b2fc4c3f",
+  "baseline_expected_and_returned_sets_equal_final_report": true,
+  "baseline_test_exit_code": 101,
+  "report_exit_code": 1,
+  "crate_tests": {
+    "passed": 109,
+    "failed": 0,
+    "ignored": 14
+  },
+  "precision_gate": {
+    "passed_cases": 2,
+    "total_cases": 6,
+    "score": 0.3333333333333333,
+    "passed": false
+  },
+  "requested_failure_classes": {
+    "supersede_resurfacing": "not reproduced; no fix claimed",
+    "budget_eviction": "reproduced; unfixed",
+    "namespace_leak": "not reproduced; no fix claimed"
+  },
+  "artifacts_sha256": {
+    "baseline-d98de4c.log": "2a76de1bd5dad80e917524fa39291f2683c4f8185db80c84e03bfb77b3a55deb",
+    "channel-green.log": "9c54cab163b4b238143541c3028c5ed6bd7e6dc2a3fff4500b0a1df1d24f49bb",
+    "channel-red.log": "c976f3f33f3a64dc1d10d4d14ee8bcf7313e097bc67320868f873e8a0ad87c0d",
+    "clippy-green.log": "04a25ceedfb5da0a27d60b61068bdacbe0a0826087c80aa5608d1aa9f3fef837",
+    "clippy.log": "0e2271d7dc644fbd45ee804b7fe1a00aa6b7053171bd9f9d6a2a8d541606bfa9",
+    "crate-tests.log": "7c7580793253d3f8e1abc6f59a202d37f9363f89bcdd220ff5eb2ed009f1ec6e",
+    "instrument-green.log": "483296673245d8b20042c2a146c529b7e3f637734da6f2a43037f299fb8edbeb",
+    "instrument-red.log": "09368d5e723299e25ddc5ca9cbcadd470212fdeb180f369bdb679b1143e2e9b3",
+    "report-d98de4c.json": "e07cb5949d255d3ef7da04ce446764733f6dd0a9b3310e9627d0fbacb409fad1",
+    "set-api-green.log": "b70023adb05a42fd288f3b8aaa13fbe4bcc573df8bfe7ab78686fe2b4eb04fab",
+    "set-api-red.log": "6204a2aa0458eacaffd2d7a136313479609f49a81fa116a1dfd8c67da141031a"
+  }
+}

@@ -1,5 +1,5 @@
 #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
-//! Cross-adapter normalization: all four CLI dialects map their
+//! Cross-adapter normalization: all five CLI dialects map their
 //! post-tool-execution event to the canonical `HookEvent::PostToolUse` with the
 //! same `tool_name`.
 
@@ -50,14 +50,22 @@ fn post_tool_payload(id: AgentId) -> serde_json::Value {
             "tool_input": {"command": "*** Begin Patch\n*** Add File: notes.txt\n+recorded.\n*** End Patch\n"},
             "tool_response": "Exit code: 0\nOutput:\nSuccess. Updated the following files:\nA notes.txt\n"
         }),
+        AgentId::Omp => serde_json::json!({
+            "type": "tool_result",
+            "cwd": "/proj",
+            "session_id": "s",
+            "tool_name": "write",
+            "tool_input": {"file_path": "/x"},
+            "tool_response": {"ok": true}
+        }),
     }
 }
 
 #[test]
-fn all_four_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
+fn all_five_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
     // Every dialect maps its post-tool event to canonical `PostToolUse`. The
     // adapter preserves the CLI's *native* tool-name spelling verbatim
-    // (Claude/Gemini capitalize `Write`; OpenCode reports lowercase `write`;
+    // (Claude/Gemini capitalize `Write`; OpenCode/OMP report lowercase `write`;
     // Codex reports `apply_patch` for file edits); normalizing to a single
     // canonical name is the capture layer's job.
     let cases = [
@@ -65,6 +73,7 @@ fn all_four_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
         (AgentId::OpenCode, "write"),
         (AgentId::Gemini, "Write"),
         (AgentId::Codex, "apply_patch"),
+        (AgentId::Omp, "write"),
     ];
     for (id, expected) in cases {
         let cli = agent_for(id);
@@ -80,13 +89,14 @@ fn all_four_adapters_normalize_post_tool_use_event_with_cli_native_tool_name() {
 }
 
 #[test]
-fn render_output_continue_is_true_for_all_four() {
+fn render_output_continue_is_true_for_all_five() {
     use rb_agents::HookResult;
     for id in [
         AgentId::ClaudeCode,
         AgentId::OpenCode,
         AgentId::Gemini,
         AgentId::Codex,
+        AgentId::Omp,
     ] {
         let cli = agent_for(id);
         let out = cli.render_output(&HookResult {

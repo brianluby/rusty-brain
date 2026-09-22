@@ -51,8 +51,8 @@ Add at least two, preferably three, rows with:
   "dimension": "reach",
   "plant_mode": "explicit",
   "plant": "Decision: plugin metadata lives at plugins/rusty-brain/.claude-plugin/plugin.json.",
-  "realistic_claude_md": "",
-  "steelman_claude_md": "Plugin metadata lives at plugins/rusty-brain/.claude-plugin/plugin.json.",
+  "realistic_agents_md": "",
+  "steelman_agents_md": "Plugin metadata lives at plugins/rusty-brain/.claude-plugin/plugin.json.",
   "work": "Update plugin metadata and name the manifest path.",
   "expect": "plugins/rusty-brain/.claude-plugin/plugin.json"
 }

@@ -29,8 +29,8 @@ pub struct Cli {
 pub enum Command {
     /// Merge our sentinel-marked hook block into each CLI's config.
     Install {
-        /// Restrict to these agents (claude-code, gemini, codex; opencode is
-        /// deferred — it needs a JS/TS plugin).
+        /// Restrict to these agents (claude-code, omp, gemini, codex; opencode is
+        /// deferred). OMP currently supports project scope only.
         #[arg(long, value_delimiter = ',')]
         agents: Option<Vec<String>>,
         /// Install into the per-user (global) config instead of the project.
@@ -81,20 +81,26 @@ pub fn execute(cli: &Cli) -> Result<(InstallReport, bool), String> {
             global,
             dry_run,
         } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_install(&installers, &hooks_bin, &scope_for(*global), *dry_run)
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_install(&installers, &hooks_bin, &scope, *dry_run)
         }
         Command::Uninstall {
             agents,
             global,
             dry_run,
         } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_uninstall(&installers, &hooks_bin, &scope_for(*global), *dry_run)
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_uninstall(&installers, &hooks_bin, &scope, *dry_run)
         }
         Command::Status { agents, global } => {
-            let installers = select_installers(agents.as_deref()).map_err(|e| e.to_string())?;
-            run_status(&installers, &hooks_bin, &scope_for(*global))
+            let scope = scope_for(*global);
+            let installers =
+                select_installers(agents.as_deref(), &scope).map_err(|e| e.to_string())?;
+            run_status(&installers, &hooks_bin, &scope)
         }
     };
     Ok((report, json))
@@ -122,7 +128,7 @@ pub fn render(report: &InstallReport, json: bool) -> String {
             | AgentStatus::WouldConfigure
             | AgentStatus::WouldRemove => "[ok]",
             AgentStatus::Absent | AgentStatus::NotFound => "[--]",
-            AgentStatus::Failed => "[xx]",
+            AgentStatus::Failed | AgentStatus::Drifted => "[xx]",
         };
         let path = a
             .config_path

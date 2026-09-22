@@ -18,6 +18,7 @@ contract_version = 2
 "crates/rb-types/src/anchor.rs::MemoryAnchor" = "db65d4fee2c23b5628270cdcb7b19ce99056eb3656de73aa0e50fc77090a9277"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
+"crates/rb-types/src/embedding.rs::EmbeddingInputFingerprint" = "073401e15c3580d9a4ed7ebd4471a2ae3966bf9cccf9554f1122d187a64425e2"
 "crates/rb-types/src/feedback_kind.rs::FeedbackKind" = "8ca2edbd8aca8e2b087ea630e10209a51a307efdf1a84b0bbccc74a06f2da7b6"
 "crates/rb-types/src/history.rs::HistoryEdge" = "2eeaea0b396c0c0e1b4fc9d88088f34c3d701115e0d3af739b335f057c656195"
 "crates/rb-types/src/history.rs::HistoryEntry" = "01c147087fa036cb389172d86036870275dc164578edb7320666e003f3fc6abc"
@@ -131,3 +132,8 @@ note = "Vikunja #53 preserves scrub counts with an optional checkpoint-error dia
 contract_version = 2
 intent = "additive"
 note = "active_contradicts links-first query plus migration 011 target-side memory_links index; no wire change"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "Add internal EmbeddingInputFingerprint for reembed optimistic concurrency; no serialized payload, wire version, or database schema changes."

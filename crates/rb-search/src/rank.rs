@@ -5,10 +5,12 @@ use rb_types::MemoryId;
 /// on the recency term. Documented, fixed constant for deterministic ranking.
 pub const HALF_LIFE: f32 = 30.0;
 
-/// Minimum `Linear` score a recall result must reach to be returned (W1.3,
-/// F30 "junk default recall"). Results scoring below this are dropped so
-/// recall may return fewer than `limit` — or nothing — instead of padding
-/// with junk; callers render an explicit empty state.
+/// Default `Linear` score floor for recall results (W1.3, F30 "junk default
+/// recall"). The engine may apply a documented, source-aware admission floor
+/// to candidates with explicit durable FTS evidence. Otherwise, results
+/// scoring below this are dropped so recall may return fewer than `limit` — or
+/// nothing — instead of padding with junk; callers render an explicit empty
+/// state.
 ///
 /// Derivation (recorded per the W1.3 spec; recalibrate if `Weights::default`
 /// or the W1.1 cosine scale changes):

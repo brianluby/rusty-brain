@@ -9,8 +9,9 @@
 use std::fs;
 use std::path::Path;
 
-use rb_agents::install::{ManagedFile, ManagedTextBlock, SENTINEL};
+use rb_agents::install::{ManagedFile, ManagedTextBlock, OwnedAsset, SENTINEL};
 use rb_types::{Error, Result};
+use sha2::{Digest, Sha256};
 
 /// Read `path` as JSON, returning `{}` if the file is absent or empty.
 ///
@@ -203,6 +204,177 @@ pub fn remove_managed_file(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+const ASSET_HEADER: &str = "// rusty-brain-owned-asset:v1 sha256=";
+
+/// An asset is owned only when its stored digest still matches its full source.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AssetState {
+    Absent,
+    Present,
+    Drifted,
+    Unowned,
+}
+
+/// Reject symlinks at every component below the canonical project root, including
+/// dangling links and the final file. Never follow a user-controlled extension
+/// directory to another project on install, status, or uninstall.
+fn validate_asset_path(path: &Path, asset: &OwnedAsset) -> Result<()> {
+    let root = &asset.project_root;
+    let relative = path.strip_prefix(root).map_err(|_| {
+        Error::Io(format!(
+            "asset target '{}' is outside its project",
+            path.display()
+        ))
+    })?;
+    if !root.is_absolute()
+        || relative.as_os_str().is_empty()
+        || relative
+            .components()
+            .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Err(Error::Io(
+            "asset target must be strictly inside its project".to_string(),
+        ));
+    }
+    let root_meta = fs::symlink_metadata(root).map_err(|e| Error::Io(e.to_string()))?;
+    if !root_meta.is_dir() || root_meta.file_type().is_symlink() {
+        return Err(Error::Io(format!(
+            "project root '{}' is not a real directory",
+            root.display()
+        )));
+    }
+    let mut current = root.clone();
+    for part in relative.components() {
+        current.push(part);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink()
+                    || (current != path && !meta.is_dir())
+                    || (current == path && !meta.is_file())
+                {
+                    return Err(Error::Io(format!(
+                        "refusing unsafe asset path '{}'; move the symlink or non-regular entry before retrying",
+                        current.display()
+                    )));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(Error::Io(e.to_string())),
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn owned_asset_state(path: &Path, asset: &OwnedAsset) -> Result<AssetState> {
+    validate_asset_path(path, asset)?;
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(AssetState::Absent),
+        Err(e) => return Err(Error::Io(e.to_string())),
+    };
+    let Some(newline) = bytes.iter().position(|byte| *byte == b'\n') else {
+        return Ok(AssetState::Unowned);
+    };
+    let header = std::str::from_utf8(&bytes[..newline]).unwrap_or("");
+    let Some(expected) = header.strip_prefix(ASSET_HEADER) else {
+        return Ok(if header.starts_with("// rusty-brain-owned-asset:") {
+            AssetState::Drifted
+        } else {
+            AssetState::Unowned
+        });
+    };
+    let actual = format!("{:x}", Sha256::digest(&bytes[newline + 1..]));
+    Ok(if expected == actual {
+        AssetState::Present
+    } else {
+        AssetState::Drifted
+    })
+}
+
+pub(crate) fn asset_conflict(path: &Path, state: AssetState) -> Error {
+    let reason = if state == AssetState::Drifted {
+        "the managed extension has local changes"
+    } else {
+        "the existing extension is not owned by rusty-brain"
+    };
+    Error::Io(format!(
+        "preserving '{}': {reason}; move the file aside to keep your changes, then retry",
+        path.display()
+    ))
+}
+
+/// One-file ownership manifest: hash the source in a comment header. Older
+/// installed source remains upgradeable without retaining historical bundles,
+/// while any local modification prevents both replacement and removal.
+pub(crate) fn write_owned_asset(path: &Path, asset: &OwnedAsset) -> Result<()> {
+    let before = owned_asset_state(path, asset)?;
+    if !matches!(before, AssetState::Absent | AssetState::Present) {
+        return Err(asset_conflict(path, before));
+    }
+    let parent = path
+        .parent()
+        .ok_or_else(|| Error::Io("asset has no parent".to_string()))?;
+    let relative = parent
+        .strip_prefix(&asset.project_root)
+        .map_err(|e| Error::Io(e.to_string()))?;
+    let mut dir = asset.project_root.clone();
+    for part in relative.components() {
+        dir.push(part);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(Error::Io(e.to_string())),
+        }
+        validate_asset_path(path, asset)?;
+    }
+    let body = format!(
+        "{ASSET_HEADER}{:x}\n{}",
+        Sha256::digest(asset.contents.as_bytes()),
+        asset.contents
+    );
+    let (temp, file) = create_tempfile_in(parent)?;
+    let outcome = (|| {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            file.set_permissions(fs::Permissions::from_mode(0o644))
+                .map_err(|e| Error::Io(e.to_string()))?;
+        }
+        write_and_sync(&file, &body)?;
+        drop(file);
+        let current = owned_asset_state(path, asset)?;
+        if current != before {
+            return Err(Error::Io(format!(
+                "asset '{}' changed during installation; preserving it",
+                path.display()
+            )));
+        }
+        if before == AssetState::Absent {
+            // Atomic no-clobber publication: a racing user-created file wins.
+            fs::hard_link(&temp, path).map_err(|e| Error::Io(e.to_string()))?;
+        } else {
+            rename_replacing(&temp, path)?;
+        }
+        #[cfg(unix)]
+        fs::File::open(parent)
+            .and_then(|dir| dir.sync_all())
+            .map_err(|e| Error::Io(e.to_string()))?;
+        Ok(())
+    })();
+    // Only the unique temp file belongs to this operation. Never roll back by
+    // deleting the destination, which may predate this install or have changed.
+    let _ = fs::remove_file(&temp);
+    outcome
+}
+
+pub(crate) fn remove_owned_asset(path: &Path, asset: &OwnedAsset) -> Result<()> {
+    match owned_asset_state(path, asset)? {
+        AssetState::Absent => Ok(()),
+        AssetState::Present => fs::remove_file(path).map_err(|e| Error::Io(e.to_string())),
+        state => Err(asset_conflict(path, state)),
+    }
 }
 
 pub fn ensure_text_block(block: &ManagedTextBlock) -> Result<()> {
@@ -692,12 +864,13 @@ mod tests {
     }
 
     #[test]
-    fn agent_id_round_trips_for_all_four() {
+    fn agent_id_round_trips_for_all_five() {
         for id in [
             AgentId::ClaudeCode,
             AgentId::OpenCode,
             AgentId::Gemini,
             AgentId::Codex,
+            AgentId::Omp,
         ] {
             assert_eq!(AgentId::parse(id.as_str()), Some(id));
         }

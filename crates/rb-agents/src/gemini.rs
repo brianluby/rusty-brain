@@ -84,6 +84,7 @@ impl AgentCli for GeminiCli {
             session_id,
             // Gemini's hook payloads do not document a transcript-path field.
             transcript_path: None,
+            transcript_jsonl: None,
         }
     }
 

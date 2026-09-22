@@ -58,11 +58,24 @@ const CAPABILITIES: &[AgentCapability] = &[
         capture: SupportLevel::Supported,
         retrieval: SupportLevel::Supported,
         config: SupportLevel::Supported,
-        scorecard: SupportLevel::Supported,
+        scorecard: SupportLevel::Unsupported,
         verified_lifecycle_source: "crates/rb-hooks/tests/fixtures/claude_code/",
         limitations: &[
             "SessionEnd lifecycle is fixture-backed.",
-            "Scorecard runner uses the Claude Code headless CLI.",
+            "The retired Claude scorecard is not runnable; use OMP with a configured model selector.",
+        ],
+    },
+    AgentCapability {
+        agent: "omp",
+        adapter_status: AdapterStatus::Experimental,
+        capture: SupportLevel::Supported,
+        retrieval: SupportLevel::Supported,
+        config: SupportLevel::Supported,
+        scorecard: SupportLevel::Supported,
+        verified_lifecycle_source: "docs/eval/omp-extension-verification.json",
+        limitations: &[
+            "Project-local native extension installation; global scope is unsupported.",
+            "OMP 18.2.4 live Luna/Terra probes verified recall, native write capture, shutdown folding, and placebo isolation; other host versions and crash recovery are not certified.",
         ],
     },
     AgentCapability {
@@ -148,18 +161,25 @@ mod tests {
             .collect();
         assert_eq!(
             agents,
-            vec!["claude-code", "codex", "opencode", "gemini", "hermes"]
+            vec![
+                "claude-code",
+                "omp",
+                "codex",
+                "opencode",
+                "gemini",
+                "hermes"
+            ]
         );
     }
 
     #[test]
-    fn claude_code_is_the_only_supported_scorecard_agent() {
+    fn omp_is_the_only_supported_scorecard_agent() {
         let supported: Vec<_> = agent_capabilities()
             .iter()
             .filter(|capability| capability.scorecard == SupportLevel::Supported)
             .map(|capability| capability.agent)
             .collect();
-        assert_eq!(supported, vec!["claude-code"]);
+        assert_eq!(supported, vec!["omp"]);
     }
 
     #[test]
@@ -199,10 +219,10 @@ mod tests {
     // --- Regression / boundary tests ----------------------------------------
 
     #[test]
-    fn agent_count_is_exactly_five() {
+    fn agent_count_is_exactly_six() {
         // Regression: adding or removing an agent without updating related
         // logic (scorecard routing, docs table, changelog) is a common mistake.
-        assert_eq!(agent_capabilities().len(), 5);
+        assert_eq!(agent_capabilities().len(), 6);
     }
 
     #[test]
@@ -244,13 +264,13 @@ mod tests {
     // --- Adapter status tests ------------------------------------------------
 
     #[test]
-    fn experimental_agents_are_codex_opencode_gemini() {
+    fn experimental_agents_are_omp_codex_opencode_gemini() {
         let experimental: Vec<_> = agent_capabilities()
             .iter()
             .filter(|c| c.adapter_status == AdapterStatus::Experimental)
             .map(|c| c.agent)
             .collect();
-        assert_eq!(experimental, vec!["codex", "opencode", "gemini"]);
+        assert_eq!(experimental, vec!["omp", "codex", "opencode", "gemini"]);
     }
 
     #[test]
@@ -266,12 +286,12 @@ mod tests {
     // --- Capability level exhaustiveness ------------------------------------
 
     #[test]
-    fn claude_code_has_all_four_capabilities_supported() {
+    fn claude_code_scorecard_is_retired_but_other_capabilities_stay_supported() {
         let cc = capability_for_agent("claude-code").expect("claude-code row");
         assert_eq!(cc.capture, SupportLevel::Supported, "capture");
         assert_eq!(cc.retrieval, SupportLevel::Supported, "retrieval");
         assert_eq!(cc.config, SupportLevel::Supported, "config");
-        assert_eq!(cc.scorecard, SupportLevel::Supported, "scorecard");
+        assert_eq!(cc.scorecard, SupportLevel::Unsupported, "scorecard");
     }
 
     #[test]
@@ -308,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn retrieval_is_unsupported_for_all_non_claude_experimental_agents() {
+    fn retrieval_is_unsupported_for_non_omp_experimental_agents() {
         for agent in ["codex", "opencode", "gemini"] {
             let capability = capability_for_agent(agent).expect("agent row");
             assert_eq!(

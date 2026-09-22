@@ -1,0 +1,350 @@
+{
+  "schema_version": 1,
+  "authorship": "Fixed locally authored fictional beliefs; no runtime model or judge-generated labels.",
+  "clock": "2026-01-01T00:00:00Z",
+  "cases": [
+    {
+      "id": "hard-negative-environment",
+      "failure_class": "hard_negative",
+      "rationale": "Production endpoint evidence is useful; a development endpoint sharing the same terms is not evidence for production.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000001",
+          "content": "Production health endpoint listens on port 8443 at path /ready.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000002",
+          "content": "Development health endpoint listens on port 3000 at path /preview.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        }
+      ],
+      "supersedes": [],
+      "links": [],
+      "queries": [
+        {
+          "query": "production health endpoint port path",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000001"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "hard-negative-unknown",
+      "failure_class": "hard_negative",
+      "rationale": "No belief answers the payroll retention question; exact empty set is required, not a plausible unrelated memory.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000003",
+          "content": "Garden irrigation uses a timer every morning.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000004",
+          "content": "The office coffee grinder uses a medium setting.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        }
+      ],
+      "supersedes": [],
+      "links": [],
+      "queries": [
+        {
+          "query": "payroll retention policy",
+          "limit": 5,
+          "expected_ids": []
+        }
+      ]
+    },
+    {
+      "id": "supersede-chain",
+      "failure_class": "supersede_resurfacing",
+      "rationale": "Only the latest deploy timeout is valid. Both ancestors are superseded through the real atomic store operation, with graph edges back to ancestors.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000005",
+          "content": "Deploy API timeout policy: 15 seconds.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000006",
+          "content": "Deploy API timeout policy: 30 seconds.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000007",
+          "content": "Deploy API timeout policy: 45 seconds.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        }
+      ],
+      "supersedes": [
+        [
+          "12180000-0000-4000-8000-000000000005",
+          "12180000-0000-4000-8000-000000000006"
+        ],
+        [
+          "12180000-0000-4000-8000-000000000006",
+          "12180000-0000-4000-8000-000000000007"
+        ]
+      ],
+      "links": [
+        [
+          "12180000-0000-4000-8000-000000000007",
+          "12180000-0000-4000-8000-000000000005"
+        ],
+        [
+          "12180000-0000-4000-8000-000000000007",
+          "12180000-0000-4000-8000-000000000006"
+        ]
+      ],
+      "queries": [
+        {
+          "query": "deploy API timeout policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000007"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "five-slot-budget",
+      "failure_class": "budget_eviction",
+      "rationale": "Five independent production deploy requirements must all survive the five-slot budget. Higher-importance session chatter about the same deployment is not a requirement.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000008",
+          "content": "Production deploy requires a signed release artifact.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000009",
+          "content": "Production deploy requires two reviewer approvals.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000010",
+          "content": "Production deploy requires a passing migration check.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000011",
+          "content": "Production deploy requires an encrypted backup snapshot.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000012",
+          "content": "Production deploy requires a rollback runbook.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000013",
+          "content": "Production deploy session note: opened the terminal window.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000014",
+          "content": "Production deploy session note: resized the dashboard panel.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000015",
+          "content": "Production deploy session note: changed the editor theme.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000016",
+          "content": "Production deploy session note: scrolled through the terminal.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000017",
+          "content": "Production deploy session note: closed a browser tab.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000018",
+          "content": "Production deploy session note: adjusted the desk lamp.",
+          "importance": 9,
+          "namespace": "project:precision",
+          "session_id": "deploy-chat"
+        }
+      ],
+      "supersedes": [],
+      "links": [],
+      "queries": [
+        {
+          "query": "production deploy requirements",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000008",
+            "12180000-0000-4000-8000-000000000009",
+            "12180000-0000-4000-8000-000000000010",
+            "12180000-0000-4000-8000-000000000011",
+            "12180000-0000-4000-8000-000000000012"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "namespace-selection",
+      "failure_class": "namespace_leak",
+      "rationale": "Engine bound to project:precision must not select the matching project:other, global or session rows, including a cross-project graph edge. This is selection scope, not authorization.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000019",
+          "content": "Service endpoint policy: production uses port 8443.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000020",
+          "content": "Service endpoint policy: production uses port 9443.",
+          "importance": 7,
+          "namespace": "project:other",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000021",
+          "content": "Service endpoint policy: production uses port 7443.",
+          "importance": 7,
+          "namespace": "global",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000022",
+          "content": "Service endpoint policy: production uses port 6443.",
+          "importance": 7,
+          "namespace": "session:precision:other",
+          "session_id": null
+        }
+      ],
+      "supersedes": [],
+      "links": [
+        [
+          "12180000-0000-4000-8000-000000000019",
+          "12180000-0000-4000-8000-000000000020"
+        ],
+        [
+          "12180000-0000-4000-8000-000000000019",
+          "12180000-0000-4000-8000-000000000021"
+        ],
+        [
+          "12180000-0000-4000-8000-000000000019",
+          "12180000-0000-4000-8000-000000000022"
+        ]
+      ],
+      "queries": [
+        {
+          "query": "service endpoint policy production",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000019"
+          ]
+        }
+      ]
+    },
+    {
+      "id": "session-topic-drift",
+      "failure_class": "session_noise",
+      "rationale": "Sequential auth then storage questions share a project store. Earlier-topic evidence and captured session chatter must not contaminate either exact evidence set.",
+      "namespace": "project:precision",
+      "memories": [
+        {
+          "id": "12180000-0000-4000-8000-000000000023",
+          "content": "Authentication policy: browser login uses an HttpOnly session cookie.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000024",
+          "content": "Storage policy: SQLite writes use a single writer and WAL mode.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": null
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000025",
+          "content": "Authentication session note: inspected the login screenshot.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": "auth-session"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000026",
+          "content": "Storage session note: opened the database dashboard.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": "storage-session"
+        },
+        {
+          "id": "12180000-0000-4000-8000-000000000027",
+          "content": "Session note: after login investigation switched to SQLite storage debugging.",
+          "importance": 7,
+          "namespace": "project:precision",
+          "session_id": "drifting-session"
+        }
+      ],
+      "supersedes": [],
+      "links": [],
+      "queries": [
+        {
+          "query": "authentication browser login policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000023"
+          ]
+        },
+        {
+          "query": "storage SQLite writes policy",
+          "limit": 5,
+          "expected_ids": [
+            "12180000-0000-4000-8000-000000000024"
+          ]
+        }
+      ]
+    }
+  ]
+}

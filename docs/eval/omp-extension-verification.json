@@ -1,0 +1,111 @@
+{
+  "schema_version": 1,
+  "verified_at": "2026-09-17T14:03:36.123258+00:00",
+  "omp_version": "omp/18.2.4",
+  "bun_version": "1.4.2",
+  "extension_sha256": "3b8fac7d46618d812703a3317f01e36d4a9422c4c134cd9d88cc6e3909d81415",
+  "installed_asset_sha256": "5818715829c40171b2a6a34d382167992204b630c06ceb2d36c9ac6dab3e9ed8",
+  "embedding_provider": "deterministic (512 dimensions); transport proof, not semantic quality evidence",
+  "per_session_deadline_seconds": 60,
+  "synthetic_task": "Use the remembered Nebula deployment convention. Write convention.txt containing its codename only. Then state a brief Decision line identifying that codename and the writer policy. If no convention is available, write UNKNOWN instead. Do not inspect other files.",
+  "expected_memory_on_file": "ORCHID-7391",
+  "expected_placebo_file": "UNKNOWN",
+  "runs": [
+    {
+      "model_selector": "openai-codex/gpt-5.6-luna",
+      "memory_on": {
+        "exit_code": 0,
+        "resolved_models": [
+          "openai-codex/gpt-5.6-luna"
+        ],
+        "assistant_calls": 2,
+        "terminal_stop_reason": "stop",
+        "usage": {
+          "input": 1547,
+          "output": 106,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 1653
+        },
+        "reported_cost_usd": 0.0004366
+      },
+      "placebo": {
+        "exit_code": 0,
+        "resolved_models": [
+          "openai-codex/gpt-5.6-luna"
+        ],
+        "assistant_calls": 2,
+        "terminal_stop_reason": "stop",
+        "usage": {
+          "input": 1275,
+          "output": 135,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 1410
+        },
+        "reported_cost_usd": 0.000417
+      },
+      "matched_receipt_estimates": [
+        201
+      ],
+      "memory_on_file_verified": true,
+      "placebo_file_verified": true
+    },
+    {
+      "model_selector": "openai-codex/gpt-5.6-terra",
+      "memory_on": {
+        "exit_code": 0,
+        "resolved_models": [
+          "openai-codex/gpt-5.6-terra"
+        ],
+        "assistant_calls": 2,
+        "terminal_stop_reason": "stop",
+        "usage": {
+          "input": 1615,
+          "output": 142,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 1757
+        },
+        "reported_cost_usd": 0.004934
+      },
+      "placebo": {
+        "exit_code": 0,
+        "resolved_models": [
+          "openai-codex/gpt-5.6-terra"
+        ],
+        "assistant_calls": 2,
+        "terminal_stop_reason": "stop",
+        "usage": {
+          "input": 1253,
+          "output": 107,
+          "cacheRead": 0,
+          "cacheWrite": 0,
+          "totalTokens": 1360
+        },
+        "reported_cost_usd": 0.00379
+      },
+      "matched_receipt_estimates": [
+        219
+      ],
+      "memory_on_file_verified": true,
+      "placebo_file_verified": true
+    }
+  ],
+  "verified_properties": {
+    "standalone_install_from_quoted_unicode_binary_path": true,
+    "native_project_discovery": true,
+    "native_write_capture": true,
+    "shutdown_inline_capture": true,
+    "redaction_before_database_and_wal_persistence": true,
+    "recall_of_captured_decision_after_seed_archive": true,
+    "placebo_preserves_database_rows": true,
+    "uninstall_removes_only_owned_asset": true
+  },
+  "limits": [
+    "One successful pair per model; no scorecard efficacy claim or pooling.",
+    "Prompt receipts describe preparation attempts, not host commit acknowledgements.",
+    "Byte/4 placebo matching does not assert equal provider tokens.",
+    "Initial live probes exposed and led to fixes for session admission flooring and long-goal decision projection; these rows are post-fix verification."
+  ]
+}
