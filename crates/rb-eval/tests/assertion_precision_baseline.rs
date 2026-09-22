@@ -9,6 +9,7 @@ use rb_types::{LinkType, MemoryId, MemoryLink, MemoryType, Namespace, RecallFilt
 use serde_json::Value;
 use std::collections::BTreeSet;
 
+/// Replay one failure class against production storage and require exact evidence sets.
 async fn assert_class(class: &str) {
     let fixture: Value =
         serde_json::from_str(include_str!("../fixtures/assertion_precision.json")).unwrap();
@@ -103,23 +104,28 @@ async fn assert_class(class: &str) {
     );
 }
 
+/// Probe unresolved abstention failures without making them required regressions.
 #[tokio::test]
 #[ignore = "capability gate; run explicitly, not an instrument correctness test"]
 async fn hard_negatives() {
     assert_class("hard_negative").await;
 }
+/// Superseded ancestors must not resurface through retrieval or graph links.
 #[tokio::test]
 async fn supersede_resurfacing() {
     assert_class("supersede_resurfacing").await;
 }
+/// Session noise must not evict any of the five required durable facts.
 #[tokio::test]
 async fn budget_eviction() {
     assert_class("budget_eviction").await;
 }
+/// Matching content and graph links must not cross the selected namespace.
 #[tokio::test]
 async fn namespace_leak() {
     assert_class("namespace_leak").await;
 }
+/// Probe unresolved topic drift across sequential queries on the same store.
 #[tokio::test]
 #[ignore = "capability gate; run explicitly, not an instrument correctness test"]
 async fn session_noise() {

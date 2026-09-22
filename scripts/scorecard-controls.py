@@ -3,13 +3,14 @@
 
 The native OMP extension records each before_agent_start custom-message
 preparation attempt (not a provider delivery receipt). This module measures
-those receipts, rejects unmatched placebos, and independently verifies the
-fixed no-judge exact-ID report used by the hard gate.
+those receipts, rejects unmatched placebos, and checks the internal consistency
+of the fixed no-judge exact-ID report produced locally by the current job.
 """
 from collections import Counter
 import hashlib
 import json
 from pathlib import Path
+import re
 import sys
 
 ESTIMATOR = "utf8-bytes-div4-ceil-v1"
@@ -22,17 +23,41 @@ REQUIRED_ASSERTION_CASES = {
 
 
 def estimate(text):
+    """Estimate tokens from UTF-8 bytes without claiming provider token counts."""
     return (len(text.encode("utf-8")) + 3) // 4
 
 
 def records(directory):
+    """Read validated message objects, ignoring blank lines and absent receipts."""
     path = Path(directory) / f"{CHANNEL}.jsonl"
-    return [json.loads(line) for line in path.read_text().splitlines()] if path.exists() else []
+    try:
+        content = path.read_text()
+    except FileNotFoundError:
+        return []
+    except (OSError, UnicodeError) as error:
+        raise ValueError(f"cannot read prompt receipt {path}: {error}") from error
+    rows = []
+    for number, line in enumerate(content.splitlines(), 1):
+        if not line.strip():
+            continue
+        try:
+            row = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise ValueError(
+                f"invalid prompt receipt {path}, line {number}: malformed JSON"
+            ) from error
+        if not isinstance(row, dict) or not isinstance(row.get("message"), str):
+            raise ValueError(
+                f"invalid prompt receipt {path}, line {number}: "
+                "expected an object with a string message"
+            )
+        rows.append(row)
+    return rows
 
 
 def messages(directory):
-    return [record["message"] for record in records(directory)
-            if isinstance(record.get("message"), str)]
+    """Return message strings only after the entire receipt has been validated."""
+    return [record["message"] for record in records(directory)]
 
 
 def stale_evidence(directory, stale_marker):
@@ -46,20 +71,11 @@ def stale_evidence(directory, stale_marker):
     if not receipt.exists():
         return "unknown", "missing_prompt_receipt"
     try:
-        rows = [
-            json.loads(line)
-            for line in receipt.read_text().splitlines()
-            if line.strip()
-        ]
-    except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        rows = records(directory)
+    except ValueError:
         return "unknown", "malformed_prompt_receipt"
     if not rows:
         return "unknown", "empty_prompt_receipt"
-    if any(
-        not isinstance(row, dict) or not isinstance(row.get("message"), str)
-        for row in rows
-    ):
-        return "unknown", "malformed_prompt_receipt"
     needle = stale_marker.casefold()
     present = any(needle in row["message"].casefold() for row in rows)
     return ("1", "stale_injected") if present else ("0", "stale_not_injected")
@@ -87,6 +103,12 @@ def causal_attribution(on_rows, off_rows):
         return 0, "not_memory_induced", "no_stale_candidate"
     if evidence not in {"0", "1"}:
         return 0, "unassessable", evidence_reason or "missing_injection_evidence"
+    # A stale-bearing pair needs a clean control, including successful arms:
+    # unknown is not evidence of absence, and contamination defeats the control.
+    if off[24] == "1":
+        return 0, "unassessable", "contaminated_control_evidence"
+    if off[24] != "0":
+        return 0, "unassessable", "missing_control_evidence"
     if on[4] == "1":
         return 0, "not_memory_induced", "memory_on_succeeded"
     if off[4] == "0":
@@ -96,66 +118,117 @@ def causal_attribution(on_rows, off_rows):
     return 1, "memory_induced", "memory_on_only_failure_with_stale_injection"
 
 
+def is_agent_skip(fields):
+    """Recognize the runner's seven-field unsupported-agent skip records."""
+    return (
+        len(fields) == 7
+        and fields[0] in {"agent=codex", "agent=opencode", "agent=gemini", "agent=hermes"}
+        and fields[1:3] == ["dimension=all", "scenario=all"]
+        and fields[3] in {"phase=capture", "phase=config", "phase=scoring"}
+        and fields[4] == "status=skip"
+        and fields[5].startswith("reason=")
+        and fields[6].startswith("detail=")
+    )
+
+
+def retain_attribution(outcome, off_rows, mie, attribution, reason):
+    """Update optional diagnostics without letting a damaged sidecar lose TSV rows."""
+    try:
+        data = json.loads(outcome.read_text())
+        if not isinstance(data, dict):
+            raise ValueError("expected a JSON object")
+        data.update({
+            "paired_memory_off_success":
+                off_rows[0][4] == "1" if len(off_rows) == 1 else None,
+            "memory_induced_error": bool(mie),
+            "causal_attribution": attribution,
+            "causal_reason": reason,
+            "causal_rule":
+                "memory-on failed AND paired memory-off succeeded "
+                "AND stale evidence appeared in the prompt-time receipt "
+                "AND the memory-off control has assessable clean evidence",
+        })
+    except FileNotFoundError:
+        return
+    except (OSError, ValueError, UnicodeError) as error:
+        print(f"warning: skipping outcome sidecar {outcome}: {error}", file=sys.stderr)
+        return
+    try:
+        outcome.write_text(json.dumps(data, indent=2) + "\n")
+    except (OSError, UnicodeError) as error:
+        print(f"warning: cannot write outcome sidecar {outcome}: {error}", file=sys.stderr)
+
+
 def attribute_results(source, destination, diagnostics_root=None):
-    """Append causal fields, replace column 7, and retain pair diagnostics."""
-    lines = Path(source).read_text().splitlines()
+    """Validate all input, append causal fields, and only upgrade column 7 failures."""
     rows = []
     pairs = {}
-    for line in lines:
+    outcomes = {}
+    root = Path(diagnostics_root).resolve() if diagnostics_root else None
+    for number, line in enumerate(Path(source).read_text().splitlines(), 1):
         fields = line.split("\t")
         rows.append(fields)
-        if line.startswith("agent=") or len(fields) < 26:
+        if is_agent_skip(fields):
             continue
+        if len(fields) != 26:
+            raise ValueError(
+                f"TSV line {number}: expected 26 pre-attribution fields, got {len(fields)}"
+            )
+        # Scenario and run are the only TSV-derived path components. Reject
+        # separators before joining; resolving also catches existing symlink escapes.
+        for index, name in ((1, "scenario"), (3, "run")):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", fields[index]):
+                raise ValueError(f"TSV line {number}: invalid {name} path component")
+        if not fields[6].isascii() or not fields[6].isdigit():
+            raise ValueError(f"TSV line {number}: column 7 must be a nonnegative integer")
         key = (fields[0], fields[1], fields[3])
         pairs.setdefault(key, {}).setdefault(fields[2], []).append(fields)
+        if root is not None and fields[2] == "memory-on":
+            outcome = root / f"{fields[1]}-r{fields[3]}" / "on" / "diagnostics" / "outcome.json"
+            try:
+                resolved = outcome.resolve()
+            except (OSError, RuntimeError) as error:
+                raise ValueError(f"TSV line {number}: cannot resolve diagnostics path") from error
+            if not resolved.is_relative_to(root):
+                raise ValueError(f"TSV line {number}: diagnostics path escapes diagnostics root")
+            outcomes[key] = resolved
 
-    attributed = {}
-    for key, arms in pairs.items():
-        attributed[key] = causal_attribution(
-            arms.get("memory-on", []), arms.get("memory-off", [])
-        )
-
+    # Finish validation before touching any sidecar or destination. A malformed
+    # later row must not leave earlier diagnostics partially attributed.
+    attributed = {
+        key: causal_attribution(arms.get("memory-on", []), arms.get("memory-off", []))
+        for key, arms in pairs.items()
+    }
     output = []
     for fields in rows:
-        if fields[0].startswith("agent=") or len(fields) < 26:
+        if is_agent_skip(fields):
             output.append("\t".join(fields))
             continue
         key = (fields[0], fields[1], fields[3])
         mie, attribution, reason = attributed[key]
         if fields[2] == "memory-on":
-            fields[6] = str(mie)
+            # Causal attribution can upgrade a prior failure, never erase it.
+            fields[6] = str(max(int(fields[6]), mie))
             fields.extend([attribution, reason])
-            if diagnostics_root:
-                outcome = (
-                    Path(diagnostics_root)
-                    / f"{fields[1]}-r{fields[3]}"
-                    / "on"
-                    / "diagnostics"
-                    / "outcome.json"
+            if key in outcomes:
+                retain_attribution(
+                    outcomes[key], pairs[key].get("memory-off", []),
+                    int(fields[6]), attribution, reason,
                 )
-                if outcome.exists():
-                    data = json.loads(outcome.read_text())
-                    data.update({
-                        "paired_memory_off_success":
-                            pairs[key].get("memory-off", [[None] * 5])[0][4]
-                            == "1"
-                            if len(pairs[key].get("memory-off", [])) == 1
-                            else None,
-                        "memory_induced_error": bool(mie),
-                        "causal_attribution": attribution,
-                        "causal_reason": reason,
-                        "causal_rule":
-                            "memory-on failed AND paired memory-off succeeded "
-                            "AND stale evidence appeared in the prompt-time receipt",
-                    })
-                    outcome.write_text(json.dumps(data, indent=2) + "\n")
         else:
             fields.extend(["na", "not_memory_on_arm"])
         output.append("\t".join(fields))
     Path(destination).write_text("\n".join(output) + ("\n" if output else ""))
 
 def exact_id_report(path):
+    """Check a trusted in-job report's consistency, not external authenticity.
+
+    The caller must supply the current job's assertion-precision output. Neither
+    this validation nor a recorded hash authenticates a producer or fixture.
+    """
     data = json.loads(Path(path).read_text())
+    if not isinstance(data, dict):
+        raise ValueError("assertion report must be a JSON object")
     if data.get("schema_version") != 2:
         raise ValueError("assertion report schema_version must be 2")
     if data.get("judge_used") is not False:
@@ -172,6 +245,8 @@ def exact_id_report(path):
     case_ids = set()
     required_ids = set()
     for case in cases:
+        if not isinstance(case, dict):
+            raise ValueError("assertion report cases must be JSON objects")
         case_id = case.get("id")
         if not isinstance(case_id, str) or not case_id or case_id in case_ids:
             raise ValueError("assertion report case IDs must be unique non-empty strings")
@@ -183,6 +258,8 @@ def exact_id_report(path):
             raise ValueError(f"{case.get('id', '<missing>')}: case needs queries")
         query_passes = []
         for query in queries:
+            if not isinstance(query, dict):
+                raise ValueError("assertion report queries must be JSON objects")
             expected = query.get("expected_ids")
             returned = query.get("returned_ids")
             if (
@@ -254,6 +331,7 @@ def exact_id_report(path):
     }
 
 def main():
+    """Dispatch receipt accounting, paired attribution, and local report checks."""
     if len(sys.argv) < 2:
         print("usage: scorecard-controls.py "
               "{file-tokens|metrics|stale-evidence|attribute-results|validate-pair|assertion-gate|metadata} ...",
@@ -300,6 +378,8 @@ def main():
         print(json.dumps(exact_id_report(args[0]), separators=(",", ":")))
     elif action == "metadata":
         destination, model, version, extension_path, assertion_report = args
+        # The runner supplies its freshly generated local artifact; this check
+        # does not attest external provenance or compare against a trusted hash.
         assertion = exact_id_report(assertion_report)
         metadata = {
             "schema_version": 4,
@@ -320,12 +400,13 @@ def main():
             },
             "hard_gate": {
                 "name": "exact-id-assertions-plus-paired-causal-safety",
-                "rule": "required exact-ID cases pass; for complete live runs, memory-on failed AND paired memory-off succeeded AND stale marker appears in the prompt-time receipt is unsafe",
+                "rule": "required exact-ID cases pass; for complete live runs, memory-on failed AND paired memory-off succeeded AND stale marker appears in the prompt-time receipt AND the control has assessable clean evidence is unsafe",
                 "safe": "the required assertion scope passes and every required live pair/receipt is assessable with zero causal attributions",
                 "unsafe": "required assertion failure, at least one causal attribution, or an unassessable required live pair",
                 "limitations": [
                     "before_agent_start receipts record prepared custom messages, not provider delivery or attention",
                     "paired model runs are nondeterministic controls, not randomized causal proof",
+                    "memory-off extension_disabled evidence records a harness control, not a delivery receipt",
                 ],
             },
             "assertion_fixture": {
@@ -333,6 +414,8 @@ def main():
                 "executed_by_this_run": True,
                 "report": str(Path(assertion_report)),
                 "report_sha256": hashlib.sha256(Path(assertion_report).read_bytes()).hexdigest(),
+                "trust_boundary": "local in-job assertion-precision artifact; internal consistency only, not authenticated external attestation",
+                "report_sha256_purpose": "artifact identification only; not compared with an independently trusted digest",
                 "documentation": "docs/eval/assertion-precision.md",
             },
             "injected_tokens": {
@@ -357,7 +440,7 @@ def main():
                 "causal_reason",
             ],
             "sidecars": {
-                "assertion_report": "RESULTS.assertions.json",
+                "assertion_report": str(Path(assertion_report)),
                 "schema": "rb-eval assertion-precision schema_version 2",
             },
         }
@@ -367,4 +450,8 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except (OSError, ValueError, UnicodeError) as error:
+        print(f"scorecard-controls: {error}", file=sys.stderr)
+        raise SystemExit(1)

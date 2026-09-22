@@ -49,8 +49,21 @@ All notable changes to rusty-brain are documented here. The format is based on
   regressions; unresolved hard-negative and topic-drift cases remain visible.
 - Scorecard runs retain the five arms and per-arm injection estimates, but the
   live substring metric is report-only and excludes assistant prose. The first
-  22 TSV fields remain unchanged; the validated schema-versioned assertion
-  report and its hash are written as sidecars.
+  22 TSV columns retain their layout and order, not their scoring semantics:
+  freshness success uses exact artifact equality and causal attribution can
+  upgrade the MIE flag. The validated schema-versioned assertion report and
+  its hash are written as sidecars.
+- Review hardening confines attribution sidecars to the diagnostics root, rejects
+  malformed TSV layouts, preserves existing failure flags, and requires a clean
+  memory-off control. Malformed receipts fail closed; damaged optional outcome
+  sidecars no longer discard otherwise valid results.
+- Live scoring snapshots only the designated artifact, excluding seeded context,
+  harness files, symlinks, and unchanged pre-session content. Scenario failures
+  retain completed evidence and a status sidecar, continue remaining scenarios,
+  and force a failed final verdict.
+- The scheduled workflow provisions pinned OMP/Bun versions and an explicit
+  provider mapping for the default model role. Extension-disabled arms also
+  work under macOS Bash 3 with strict unset-variable checks.
 
 ### Added — Scale, concurrency, and resource harness (Vikunja #57)
 

@@ -38,16 +38,24 @@ The four stale/freshness scenarios use exact delivered-artifact assertions:
 `scorecard-answer.txt` must equal the scenario's current value (apart from one
 optional trailing newline). Assistant prose is not part of that outcome. Thus a
 response that names the current value but ships an obsolete artifact fails. The
-remaining legacy dimensions still report their compatibility substring outcome;
-the independent exact-ID assertion fixture remains a separate no-judge gate.
+remaining legacy dimensions still report their compatibility substring outcome
+from the designated `scorecard-answer.txt` artifact, which their work prompts
+explicitly request. Arbitrary workspace files, seeded `AGENTS.md`, and harness
+diagnostics are not scoring inputs. Artifact reads are bounded, confined to
+the project, and checked for changes during the read; symlinks are excluded.
+The independent exact-ID assertion fixture remains a separate no-judge gate.
 
 The safety result is a paired causal proxy. A pair is `memory_induced` only when
-all three conditions hold: the memory-on task failed, the same scenario/run's
-memory-off task succeeded, and a stale-record-only marker appeared in the
-memory-on prompt-time receipt. Each freshness fixture requires that marker to be
-present in the predecessor and absent from the current superseding record, so a
-current migration note that merely names the old value is not stale evidence. A
-both-arms failure is `not_memory_induced`. Missing or duplicate pairs, session
+the memory-on task failed, the same scenario/run's memory-off task succeeded,
+a stale-record-only marker appeared in the memory-on prompt-time receipt, and
+the memory-off control is assessable and clean. The runner explicitly disables
+extensions for the memory-off arm; its `0` / `extension_disabled` evidence
+records that launch configuration, not a fabricated prompt-delivery receipt.
+An unknown or contaminated control cannot support attribution.
+Each freshness fixture requires the marker to be present in the predecessor
+and absent from the current superseding record, so a current migration note
+that merely names the old value is not stale evidence. A both-arms failure with
+assessable controls is `not_memory_induced`. Missing or duplicate pairs, session
 errors, malformed outcomes, and missing receipt evidence are `unassessable` and
 fail a complete run closed.
 
@@ -63,6 +71,12 @@ verdicts, aggregate totals, the fixed three required case IDs, and
 `judge_used = false`. This exact-ID result is the always-on hard gate; a complete
 live run must also pass the paired causal safety gate.
 
+This validator trusts the local producer: the report must come from the
+just-built `assertion-precision` execution in this job, never external input.
+Internal consistency and a recorded SHA-256 do not authenticate an artifact or
+prove execution. The checkout, binary, and artifact directory are trusted;
+the hashes identify evidence for later comparison, not producer attestation.
+
 ## Placebo contract
 
 `before_agent_start` is the only model-visible memory injection channel in this
@@ -77,8 +91,10 @@ For the placebo, the extension reads the corresponding memory-on receipt and
 injects a `.` string with the same estimated size. It never invokes
 `rusty-brain-hooks` in placebo mode. Missing source receipts, prohibited padding,
 extra/missing invocations, or a `control-error.json` cause
-`scorecard-controls.py validate-pair` to fail before aggregation. This prevents
-placebo fallback from leaking a memory-on recall message.
+`scorecard-controls.py validate-pair` to fail that scenario. Completed rows are
+retained, remaining scenarios still run, and aggregation forces `RUN-FAIL`.
+This prevents placebo fallback from leaking a memory-on recall message without
+discarding other scenarios' evidence.
 
 Receipts append in preparation order. OMP can re-enter policy preparation or
 discard an attempt after another extension changes policy or cancels delivery.
@@ -94,9 +110,9 @@ Estimator ID: **`utf8-bytes-div4-ceil-v1`**.
 estimated_tokens(text) = ceil(len(text.encode("utf-8")) / 4)
 ```
 
-The TSV's first thirteen columns remain stable. Columns 14-17 retain Class B
-capture diagnostics, columns 18-22 retain injection estimates, and columns
-23-24 append answer-source evidence:
+The TSV's first thirteen columns retain their layout and order, not necessarily
+their scoring semantics. Columns 14-17 retain Class B capture diagnostics,
+columns 18-22 retain injection estimates, and columns 23-24 carry answer-source evidence:
 
 | Column | Meaning |
 |---:|---|
@@ -110,10 +126,15 @@ capture diagnostics, columns 18-22 retain injection estimates, and columns
 
 Class A reports SessionStart-present, prompt-recall-present, and query-only rows
 separately. A response-level success supports the retrieval-at-scale claim only
-when column 23 is `0` and column 24 is `1`; historical rows without these fields
-remain readable but are explicitly unmeasured for query-source attribution.
+when column 23 is `0` and column 24 is `1`. Historical rows lacking these fields
+are not valid input to the current gate; analyze them with their original schema.
 
-The causal postprocessor appends four fields without repurposing earlier data:
+The runner emits columns 25-26 and the causal postprocessor appends columns
+27-28. It can upgrade column 7 to `1`, but never erase an existing failure flag,
+including when the pair is unassessable. Attribution status distinguishes a
+causal finding from a retained legacy flag. Aggregation requires exactly 28
+fields; attribution input requires exactly 26. Known unsupported-agent skip
+records are separate from these session rows.
 
 | Column | Meaning |
 |---:|---|
@@ -123,8 +144,8 @@ The causal postprocessor appends four fields without repurposing earlier data:
 | 28 | Causal reason code, including `both_arms_failed`, `stale_not_injected`, `missing_memory_off_pair`, and receipt/session errors. |
 
 No assertion data is squeezed into or appended to those row fields. The
-schema-versioned exact evidence report is `RESULTS.tsv.assertions.json`; this
-preserves backward TSV readers and keeps per-query ID arrays structured.
+schema-versioned exact evidence report is `RESULTS.tsv.assertions.json`; per-query
+ID arrays remain structured separately from session rows.
 
 This is a byte-based proxy, not provider token accounting. Usage is summed over
 every assistant call in OMP's terminal `agent_end`, rather than taking only the
@@ -139,6 +160,11 @@ SAFE/UNSAFE definitions, and residual limitations. Resolved provider/model
 fields remain in retained `work.jsonl`; use `--log-dir` to retain those records
 and receipts. Retained `outcome.json` files include the paired memory-off
 outcome, attribution, reason, and causal rule.
+
+`RESULTS.tsv.scenario-status.tsv` records each attempted scenario and its exit
+status (`0` for completion). A scenario failure cannot produce a passing verdict,
+even when the remaining live data is only directional. The workflow uploads
+this status sidecar alongside the TSV, assertions, and metadata on every run.
 
 The assertion sidecar is executed by each scorecard run. The hard assertion
 result is `ASSERTION-PASS` only when all three fixed required exact-ID cases

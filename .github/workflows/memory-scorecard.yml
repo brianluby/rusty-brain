@@ -29,10 +29,10 @@
 # These diagnostics are synthetic scorecard data and never key material.
 #
 # Required repository secret:
-#   ANTHROPIC_API_KEY — each session runs --model haiku --max-budget-usd 0.50.
-#   A run is (scenarios x 5 arms x N) sessions; the per-session cap bounds spend.
-#   Per the variance protocol (P3) a single run never gates — the scheduled run
-#   uses N=5 for a real read; dispatch N=1 for a cheap plumbing smoke.
+#   ANTHROPIC_API_KEY — the scorecard's default @slow role is mapped to Haiku.
+#   A run is (scenarios x 5 arms x N) sessions, each with the harness's default
+#   300-second timeout. OMP has no per-session dollar cap in this runner.
+#   Scheduled runs use N=5; dispatch N=1 for a directional plumbing smoke.
 name: memory scorecard
 
 on:
@@ -156,10 +156,14 @@ jobs:
           cargo build --release --locked -p rusty-brain -p rb-hooks -p rb-install
           cargo build --release --locked -p rb-eval --bin assertion-precision
 
-      - name: Install Claude Code CLI
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6 # v2
+        with:
+          bun-version: "1.4.2"
+      - name: Install OMP CLI
         run: |
-          npm install -g @anthropic-ai/claude-code
-          claude --version
+          bun install --global @oh-my-pi/pi-coding-agent@18.2.4
+          echo "${HOME}/.bun/bin" >> "$GITHUB_PATH"
+          "${HOME}/.bun/bin/omp" --version
 
       - name: Self-test (assertion gate + scorecard math, no API)
         run: scripts/memory-scorecard.sh --self-test
@@ -167,7 +171,9 @@ jobs:
       - name: Run the scorecard
         env:
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          RB_SCORECARD_MAX_BUDGET_USD: "0.50"
+          # Fresh profiles do not inherit local role aliases. Keep the harness's
+          # @slow selector and timeout defaults; bind the role to this provider.
+          PI_SLOW_MODEL: "anthropic/claude-haiku-4-5"
           # Pass the dispatch input via env (never interpolate ${{ }} into the
           # shell) and validate it's a positive integer before use.
           RUNS_INPUT: ${{ github.event.inputs.runs || '5' }}
@@ -181,8 +187,8 @@ jobs:
           # harness otherwise deletes with its workroot. The first 2026-07-12
           # N=5 safety-gate MIEs were undiagnosable without this evidence
           # (Vikunja #502). It is uploaded only on failure (below) and carries
-          # no key material: claude -p never echoes ANTHROPIC_API_KEY, the
-          # daemon never receives it, and the scorecard corpus is synthetic.
+          # no key material: the scorecard does not request credential output,
+          # the daemon never receives it, and the corpus is synthetic.
           scripts/memory-scorecard.sh \
             --bin-dir target/release \
             --runs "$RUNS_INPUT" \
@@ -198,6 +204,7 @@ jobs:
             ${{ runner.temp }}/memory-scorecard.tsv
             ${{ runner.temp }}/memory-scorecard.tsv.assertions.json
             ${{ runner.temp }}/memory-scorecard.tsv.metadata.json
+            ${{ runner.temp }}/memory-scorecard.tsv.scenario-status.tsv
           if-no-files-found: ignore
 
       - name: Upload per-session diagnostics (failure diagnosis, Vikunja #502)

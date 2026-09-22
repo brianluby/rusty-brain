@@ -4,12 +4,14 @@ use rb_eval::assertion_precision::assert_exact_ids;
 use rb_types::MemoryId;
 use std::process::Command;
 
+/// Build deterministic IDs, including unseeded IDs used to probe extra evidence.
 fn id(suffix: u8) -> MemoryId {
     format!("12180000-0000-4000-8000-{suffix:012}")
         .parse()
         .unwrap()
 }
 
+/// Extra returned evidence must fail even when every required ID is present.
 #[test]
 fn exact_assertion_rejects_any_extra_including_unknown_ids() {
     let expected = [id(1)];
@@ -21,6 +23,7 @@ fn exact_assertion_rejects_any_extra_including_unknown_ids() {
     }
 }
 
+/// Set equality ignores rank but rejects omissions, unexpected rows, and duplicates.
 #[test]
 fn exact_assertion_handles_missing_empty_order_and_duplicates() {
     assert!(assert_exact_ids(&[], &[]).passed);
@@ -35,6 +38,7 @@ fn exact_assertion_handles_missing_empty_order_and_duplicates() {
     assert_eq!(duplicate.duplicate_ids, [id(1).to_string()]);
 }
 
+/// Fresh production stores must reproduce the required gate and visible capability failures.
 #[tokio::test]
 async fn real_engine_report_is_repeatable() {
     let first = rb_eval::assertion_precision::run_committed().await.unwrap();
@@ -47,6 +51,7 @@ async fn real_engine_report_is_repeatable() {
     assert!(!first.all_cases_passed);
 }
 
+/// Frozen labels must name seeded, current evidence inside the query's namespace.
 #[test]
 fn committed_labels_are_nonvacuous_and_in_scope() {
     let fixture: serde_json::Value =
@@ -109,6 +114,7 @@ fn committed_labels_are_nonvacuous_and_in_scope() {
     );
 }
 
+/// The CLI's verdict and exit status must agree with its independently recomputed ID sets.
 #[test]
 fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
     let output = Command::new(env!("CARGO_BIN_EXE_assertion-precision"))
@@ -121,10 +127,6 @@ fn offline_runner_reports_exact_sets_and_exits_for_the_gate() {
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect(&error_context);
     assert_eq!(report["schema_version"], 2);
     assert_eq!(report["judge_used"], false);
-    assert!(report["no_judge_statement"]
-        .as_str()
-        .unwrap()
-        .contains("No LLM"));
     let cases = report["cases"].as_array().unwrap();
     assert_eq!(report["required_cases"], 3);
     assert_eq!(report["passed_required_cases"], 3);

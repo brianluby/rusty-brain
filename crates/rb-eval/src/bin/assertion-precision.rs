@@ -1,4 +1,5 @@
 //! Offline assertion-grade required-case gate. JSON always retains all scored cases.
+/// Emit all case evidence; distinguish unmet required assertions from execution errors.
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> std::process::ExitCode {
     match rb_eval::assertion_precision::run_committed().await {

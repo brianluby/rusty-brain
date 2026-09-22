@@ -47,6 +47,17 @@ score. Dependency caching is a build prerequisite; the resulting executable has
 no network/model/provider requirement. It does not start the daemon or touch the
 user's memory database.
 
+### Local report trust boundary
+
+The scorecard must generate its assertion report by executing the just-built
+`assertion-precision` binary in the same job. Do not substitute a downloaded,
+cached, or hand-authored report. `scorecard-controls.py assertion-gate` checks
+schema and internal exact-ID consistency; it does not authenticate the producer
+or independently replay retrieval. The fixture and report SHA-256 values are
+provenance identifiers, not signatures or comparisons against trusted digests.
+The build, checkout, executable, and local artifact directory therefore remain
+inside the trusted job boundary.
+
 ## Frozen corpus and criterion
 
 [`assertion_precision.json`](../../crates/rb-eval/fixtures/assertion_precision.json)
