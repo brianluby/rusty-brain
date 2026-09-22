@@ -8,8 +8,10 @@ Cargo.lock.orig
 .serena/
 # fastembed ONNX model cache (created by rb-eval recording / rb-embed local smoke tests)
 .fastembed_cache/
-# Claude Code personal/local settings override (never committed; the committed
-# .claude/settings.json is the shared rusty-brain dogfood config / reference template).
+# Local task-tracker and agent configuration.
+/.veans.yml
+/.claude/settings.json
+/.mcp.json
 .claude/settings.local.json
 .worktrees
 # Cross-agent fixture recorder home (scripts/record-agent-fixtures.sh). The
