@@ -455,6 +455,40 @@ impl MemoryBackend for MockBackend {
         note.embedding_input_version = input_version;
         Ok(())
     }
+
+    async fn corpus_snapshot(
+        &self,
+        ns: Namespace,
+    ) -> rb_types::Result<Option<rb_types::CorpusSnapshot>> {
+        // Same derivation shape as the store: row count, a monotonically
+        // increasing generation (insert count here — the mock has no rowid),
+        // and the newest write timestamp.
+        let notes: Vec<MemoryNote> = self
+            .notes
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|n| n.namespace == ns)
+            .cloned()
+            .collect();
+        if notes.is_empty() {
+            return Ok(Some(rb_types::CorpusSnapshot {
+                memories: 0,
+                generation: 0,
+                last_write_epoch_s: 0,
+            }));
+        }
+        let last_write = notes
+            .iter()
+            .map(|n| n.updated_at.timestamp())
+            .max()
+            .unwrap_or(0);
+        Ok(Some(rb_types::CorpusSnapshot {
+            memories: notes.len() as u64,
+            generation: notes.len() as u64,
+            last_write_epoch_s: last_write,
+        }))
+    }
 }
 
 /// In-test enricher returning fixed values so `remember` wiring is assertable

@@ -212,7 +212,9 @@ fn record_and_respond(req: Request, observed: &mut Observed, corpus: &MockCorpus
         Request::Recall { .. } => Response::Recalled {
             results: corpus.results.clone(),
             degraded: false,
-        },
+                abstained: None,
+                snapshot: None,
+            },
         Request::Ping => Response::Pong {
             contract_version: CONTRACT_VERSION,
             recall_channels: None,

@@ -184,6 +184,25 @@ impl DaemonClient {
             Ok(Err(_)) | Err(_) => None,
         }
     }
+
+    /// [`DaemonClient::recall`] that also surfaces the ABSTAIN verdict
+    /// (Vikunja #62): the calibrated gate refusing to serve a weak match is
+    /// a distinct outcome from an empty hit list — the injection contract
+    /// renders an explicit no-memory path instead of ambiguous silence. A
+    /// degraded transport/error still returns `None` (fail-open, unchanged).
+    pub async fn recall_with_abstain(
+        &mut self,
+        query: String,
+        limit: usize,
+    ) -> Option<(Vec<SearchResult>, Option<rb_types::AbstainReason>)> {
+        let fut =
+            self.client
+                .recall_filtered_with_status(query, rb_types::RecallFilter::default(), limit);
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok((results, _degraded, abstained, _snapshot))) => Some((results, abstained)),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
 }
 
 /// Connect + handshake within `timeout`; any error or timeout => `None`.
@@ -262,6 +281,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };

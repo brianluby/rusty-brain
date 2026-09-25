@@ -54,6 +54,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http,
         };
@@ -264,6 +265,7 @@ async fn non_loopback_bind_fails_closed_at_daemon_bind() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             bind: "0.0.0.0:0".parse().unwrap(),

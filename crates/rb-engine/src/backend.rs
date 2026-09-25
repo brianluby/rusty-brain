@@ -132,6 +132,18 @@ pub trait MemoryBackend: Send + Sync {
         input_version: String,
         expected_input: rb_types::EmbeddingInputFingerprint,
     ) -> rb_types::Result<()>;
+    /// Read-time corpus snapshot for `ns` (Vikunja #62): a cheap, READ-ONLY
+    /// derivation (one aggregate query on real stores) pinning the corpus
+    /// state a recall outcome was computed against, so a preregistered eval
+    /// run can record it. `None` on backends without a derivation (the
+    /// in-memory test mocks) — the engine treats the snapshot as
+    /// observability, never a gate, and fails open on errors.
+    async fn corpus_snapshot(
+        &self,
+        _ns: Namespace,
+    ) -> rb_types::Result<Option<rb_types::CorpusSnapshot>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]

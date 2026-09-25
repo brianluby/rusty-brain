@@ -38,6 +38,42 @@ pub const HALF_LIFE: f32 = 30.0;
 /// calibrated (W2.2/W4.1).
 pub const SCORE_FLOOR: f32 = 0.18;
 
+/// Default recall ABSTENTION threshold (Vikunja #62): when the BEST final
+/// blend score of a query's candidates falls below this, recall abstains
+/// (`AbstainReason::BelowThreshold`) instead of returning the nearest weak
+/// match — the 5th-best candidate no longer rides the same framing as the
+/// 1st. Like [`SCORE_FLOOR`] this gates `Linear` only; `Rrf` lives on a
+/// different, uncalibrated scale and stays ungated (an abstention threshold
+/// there waits on the W2.2/W4.1 calibration).
+///
+/// Derivation (from the same recorded distributions behind
+/// [`SCORE_FLOOR`]; re-derive with the `score_floor_diag` sweep if
+/// `Weights::default` or the W1.1 cosine scale changes):
+///
+/// 1. Above the no-evidence bands: a candidate with ZERO retrieval signal
+///    tops out at the prior-only ceiling `0.15`, and a fresh default-importance
+///    graph-ONLY neighbor at `~0.1999`. The threshold exceeds both, so a
+///    query whose best evidence is priors or a bare 1-hop neighbor abstains.
+///    This deliberately departs from the floor's graph-preservation clause
+///    (SCORE_FLOOR clause 2): the floor governs ADMISSION of non-top results
+///    beside stronger hits, while abstention judges whether the BEST hit is
+///    an answer at all — when the strongest thing retrieval found is an
+///    unrelated graph neighbor, declining is the intended behavior.
+/// 2. Headroom below the weakest golden: the weakest expected hit counted by
+///    recall@5 scores 0.2724 (real-vector replay) / 0.2800 (deterministic
+///    gate). SCORE_FLOOR keeps 0.05 headroom below it for the full
+///    recency-aging swing; the abstention threshold keeps the same margin:
+///    `0.2724 - 0.05 = 0.2224`, rounded to 0.22. Verified behaviorally: no
+///    golden or holdout query abstains at this value (the rb-eval
+///    `abstention_gate` harness), so the committed baselines hold.
+/// 3. Source-aware comparison (applied by the engine, mirroring the W1.3
+///    candidate-floor rule): a session-scoped top result is compared against
+///    `ABSTAIN_THRESHOLD * SESSION_PROVENANCE_SCORE_MULTIPLIER`, because the
+///    session prior rescales the whole score; an unscaled bar would silently
+///    raise the admission bar 2.5x for ordinary keyword-matched hook
+///    summaries.
+pub const ABSTAIN_THRESHOLD: f32 = 0.22;
+
 /// Floor for the confidence dampener (Feature C, spec §9). The final score is
 /// multiplied by `CONFIDENCE_FLOOR + (1 - CONFIDENCE_FLOOR) * confidence`, so a
 /// confidence-1.0 memory is unchanged (no-op) and a confidence-0.0 memory keeps

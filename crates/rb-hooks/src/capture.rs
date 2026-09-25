@@ -708,17 +708,45 @@ pub async fn user_prompt_submit(
     if query.is_empty() {
         return continue_only();
     }
-    match client.recall(query.to_string(), RECALL_INJECT_LIMIT).await {
-        Some(results) => match format_user_prompt_submit(&results) {
-            Some(message) => HookResult {
-                system_message: Some(message),
-                continue_execution: true,
-                injection_event: InjectionEvent::UserPromptSubmit,
-            },
-            None => continue_only(),
-        },
+    match client
+        .recall_with_abstain(query.to_string(), RECALL_INJECT_LIMIT)
+        .await
+    {
+        Some((results, abstained)) => {
+            let message = if let Some(reason) = abstained {
+                // Vikunja #62 explicit no-memory path: the calibrated gate
+                // refused to serve a weak match. The model sees the refusal
+                // (and why) instead of filler — or silence it might read as
+                // "nothing relevant was checked".
+                format_user_prompt_abstain(reason)
+            } else {
+                format_user_prompt_submit(&results)
+            };
+            match message {
+                Some(message) => HookResult {
+                    system_message: Some(message),
+                    continue_execution: true,
+                    injection_event: InjectionEvent::UserPromptSubmit,
+                },
+                None => continue_only(),
+            }
+        }
         None => continue_only(),
     }
+}
+
+/// The ABSTAIN injection (Vikunja #62): recall ran, and the calibrated trust
+/// gate found NO memory worth injecting — distinct from an empty result set
+/// (nothing matched) and from silence (recall never ran). One bounded line
+/// inside the shared untrusted-data posture; the reason code is fixed enum
+/// text, never content-derived.
+fn format_user_prompt_abstain(reason: rb_types::AbstainReason) -> Option<String> {
+    Some(format!(
+        "# Rusty Brain — No memory injected\n{}\nRecall abstained ({reason}): no stored \
+         memory clears the trust gate for this prompt. Treat the corpus as not \
+         covering this topic rather than guessing at weak matches.\n",
+        UNTRUSTED_DATA_FRAME
+    ))
 }
 
 /// Pure: format recalled memories into the markdown `additionalContext` block
@@ -2331,6 +2359,37 @@ mod tests {
             lines, RECALL_INJECT_LIMIT,
             "injection capped at RECALL_INJECT_LIMIT items"
         );
+    }
+
+    #[test]
+    fn abstain_injection_is_an_explicit_no_memory_path() {
+        // Vikunja #62: ABSTAIN is not silence and not filler — the model is
+        // told recall ran and declined, with the fixed enum reason code, so
+        // it treats the corpus as not covering the topic rather than
+        // guessing at weak matches.
+        let msg = format_user_prompt_abstain(rb_types::AbstainReason::BelowThreshold)
+            .expect("the abstain path always injects");
+        assert!(
+            msg.contains("Recall abstained (below_threshold)"),
+            "reason code surfaced: {msg}"
+        );
+        assert!(
+            msg.contains("No memory injected"),
+            "explicit no-memory header: {msg}"
+        );
+        assert!(
+            msg.contains(UNTRUSTED_DATA_FRAME),
+            "the shared untrusted-data framing still applies: {msg}"
+        );
+        // Every remaining code renders (below_threshold asserted above).
+        for reason in [
+            rb_types::AbstainReason::NoCandidates,
+            rb_types::AbstainReason::FilterExcluded,
+            rb_types::AbstainReason::DegradedBackend,
+        ] {
+            let msg = format_user_prompt_abstain(reason).unwrap();
+            assert!(msg.contains(reason.as_str()), "code rendered: {msg}");
+        }
     }
 
     #[tokio::test]

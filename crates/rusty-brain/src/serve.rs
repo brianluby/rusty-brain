@@ -114,6 +114,9 @@ pub async fn run_serve(
             Some("rrf") => rb_daemon::FusionMode::Rrf,
             _ => rb_daemon::FusionMode::Linear,
         },
+        // Vikunja #62: [search] abstain_threshold (None = calibrated
+        // default; 0.0 disables the recall abstention gate).
+        abstain_threshold: effective.abstain_threshold,
         // Vikunja #69: resolved (fail-closed) [write_gate] policy — the
         // daemon enforces it at the engine compose seam.
         write_gate: effective.write_gate.clone(),
@@ -365,6 +368,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };

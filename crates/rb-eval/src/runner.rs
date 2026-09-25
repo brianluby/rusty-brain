@@ -38,6 +38,15 @@ pub struct EvalReport {
     /// Per-channel hit-contribution aggregates across golden queries (W1.0).
     #[serde(default)]
     pub channels: ChannelContribution,
+    /// Fraction of golden queries where recall ABSTAINED instead of serving
+    /// (Vikunja #62): the abstention gate withholding a below-bar best match.
+    /// `#[serde(default)]` so reports serialized before the field parse.
+    #[serde(default)]
+    pub abstain_rate: f64,
+    /// Absolute count of abstention events across the run (Vikunja #62) —
+    /// small corpora make the rate's denominator noisy; the count is exact.
+    #[serde(default)]
+    pub abstain_events: usize,
     /// p50 recall latency in microseconds.
     pub p50_latency_us: u64,
     /// p99 recall latency in microseconds.
@@ -262,6 +271,11 @@ pub struct QueryDetail {
     pub ndcg: f64,
     /// Which channels contributed the returned results (W1.0 attribution).
     pub channels: QueryChannelHits,
+    /// Why recall abstained on this query, when it did (Vikunja #62): `None`
+    /// on a served query. Scorecards read this to separate "declined to
+    /// answer" from "answered and missed".
+    #[serde(default)]
+    pub abstained: Option<rb_types::AbstainReason>,
 }
 
 /// Full run output: the aggregate report plus per-query detail.
@@ -322,10 +336,12 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
 
     for q in &corpus.golden_queries {
         let started = Instant::now();
-        let results = engine
-            .recall(&q.query, RECALL_LIMIT, &rb_types::RecallFilter::default())
+        let outcome = engine
+            .recall_with_status(&q.query, RECALL_LIMIT, &rb_types::RecallFilter::default())
             .await?;
         latencies_us.push(started.elapsed().as_micros() as u64);
+        let results = outcome.results;
+        let abstained = outcome.abstained;
 
         let ranked: Vec<String> = results.iter().map(|r| r.memory.id.to_string()).collect();
         let expected: Vec<String> = q
@@ -362,6 +378,7 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
             dedup_precision: dedup,
             ndcg,
             channels,
+            abstained,
         });
     }
 
@@ -375,6 +392,15 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
     );
     let ndcg = mean(&per_query.iter().map(|d| d.ndcg).collect::<Vec<_>>());
     let channels = aggregate_channels(&per_query);
+    // Abstention events (Vikunja #62): rate + exact count, so a no-answer
+    // holdout can assert "abstention rises" while golden runs assert "no
+    // golden abstains" from the same report.
+    let abstain_events = per_query.iter().filter(|d| d.abstained.is_some()).count();
+    let abstain_rate = if per_query.is_empty() {
+        0.0
+    } else {
+        abstain_events as f64 / per_query.len() as f64
+    };
 
     let report = EvalReport {
         mean_recall_at_k,
@@ -382,6 +408,8 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
         dedup_precision,
         ndcg,
         channels,
+        abstain_rate,
+        abstain_events,
         p50_latency_us: metrics::p50(&latencies_us),
         p99_latency_us: metrics::p99(&latencies_us),
     };

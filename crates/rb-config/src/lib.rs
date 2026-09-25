@@ -548,6 +548,10 @@ pub struct EffectiveConfig {
     /// (the idle-timeout precedent). The daemon parses this into its
     /// `FusionMode` — rb-config stays a leaf over rb-types.
     pub fusion_mode: Option<String>,
+    /// Recall ABSTENTION threshold (Vikunja #62): `None` = the calibrated
+    /// `rb_search::ABSTAIN_THRESHOLD` default; `Some(0.0)` disables the
+    /// gate. Validated fail-closed at resolve (finite, 0.0..=1.0).
+    pub abstain_threshold: Option<f32>,
     /// Validated `[retention]` policy; `None` when the section is absent
     /// (forgetting stays a no-op — retention PRD RET-1). Fail-closed: an
     /// invalid section aborts resolution instead of warning.
@@ -579,6 +583,17 @@ impl EffectiveConfig {
             file_string(&config.search.fusion),
             &mut warnings,
         );
+        // Vikunja #62: fail-closed on non-finite or out-of-range thresholds —
+        // a security-relevant recall gate never warn-and-repairs.
+        let abstain_threshold = match config.search.abstain_threshold {
+            None => None,
+            Some(t) if t.is_finite() && (0.0..=1.0).contains(&t) => Some(t),
+            Some(t) => {
+                return Err(Error::InvalidArgument(format!(
+                    "[search] abstain_threshold {t} must be finite and within 0.0..=1.0"
+                )));
+            }
+        };
         Ok(Self {
             socket_path: socket_path_with(&config)?,
             db_path: db_path_with(&config)?,
@@ -593,6 +608,7 @@ impl EffectiveConfig {
             jobs_config: env_override(JOBS_CONFIG_ENV).or_else(|| file_path(&config.jobs_config)),
             idle_timeout_secs,
             fusion_mode,
+            abstain_threshold,
             retention: resolve_retention(&config.retention)?,
             http: resolve_http(&config.http)?,
             write_gate: resolve_write_gate(&config.write_gate)?,

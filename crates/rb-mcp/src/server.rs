@@ -265,7 +265,9 @@ mod tests {
             stale: false,
         }],
                     degraded: false,
-                },
+                abstained: None,
+                snapshot: None,
+            },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),
                 },

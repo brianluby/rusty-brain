@@ -12,9 +12,11 @@ contract_version = 2
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
 "crates/rb-proto/src/messages.rs::Request" = "047d3de75f8c318383332d2dc8275df06d9d53a4b0e0b82a70b37934f76e04b5"
-"crates/rb-proto/src/messages.rs::Response" = "8eadc7e8be732b895abe42ca67222cc68e235a96404e7ce6ec0a410f7386f04b"
+"crates/rb-proto/src/messages.rs::Response" = "1fffc25a1e07edc354a958a1185774c1b1112e6dca5f2741b569de36d681fc4d"
 "crates/rb-proto/src/messages.rs::ScrubCheckpoint" = "dfe99a03b49da585b2e26b8825493a07cb95b11c615bf1ed4b48a339ea6976cc"
 "crates/rb-proto/src/messages.rs::ScrubResult" = "89eb31711254dae32468bce07ea31c707f4fa0a6d32dfe9ca33dc4707f922918"
+"crates/rb-types/src/abstention.rs::AbstainReason" = "4bc07498ec9861b37f02e12677cfee436787b3ece8e6817566e036afce48b282"
+"crates/rb-types/src/abstention.rs::CorpusSnapshot" = "b701ad8ebbf056d8693132379f666bf922bcbd70bf59300b2ce17205ec452dd0"
 "crates/rb-types/src/anchor.rs::MemoryAnchor" = "db65d4fee2c23b5628270cdcb7b19ce99056eb3656de73aa0e50fc77090a9277"
 "crates/rb-types/src/change.rs::ChangeKind" = "430e596bd1727da88b410e86c1983963e6460e510733dbe7c16487d0c5e2344e"
 "crates/rb-types/src/change.rs::MemoryChanged" = "3647593fa6f3e2fa56fc6acc5ee24b079f638564598be97a4dd6ca9b5c314773"
@@ -156,3 +158,8 @@ note = "Vikunja #69: MemoryNote gains optional origin_channel (daemon-stamped wr
 contract_version = 2
 intent = "additive"
 note = "Vikunja #63: MemoryNote gains trust_class (daemon-derived, backfilled agent_attested); SearchResult gains stale; RecallFilter gains trust_classes; ClientIdentity gains optional cwd; Remember frame gains optional evidence (CaptureEvidence); new TrustClass ladder + RepoSnapshot"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "Vikunja #62: Recalled response gains optional abstained (AbstainReason) + snapshot (CorpusSnapshot); new rb-types abstention module (AbstainReason, CorpusSnapshot); recall client tuple widened"

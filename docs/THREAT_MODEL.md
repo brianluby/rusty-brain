@@ -134,6 +134,29 @@ Scope (same posture as the ladder's own docs): these gates separate honest
 capture paths; they are not a defense against hostile same-user code (which
 can write the SQLite file directly).
 
+## Recall abstention (Vikunja #62)
+
+The recall contract used to inject up to 5 memories with a confidence
+dampener but no refusal path — the 5th-best match rode the same framing as
+the 1st. Now a calibrated gate over the final Linear blend (default 0.22,
+derived from the recorded score distributions behind the W1.3 floor; see
+`rb_search::ABSTAIN_THRESHOLD`) withholds EVERYTHING when the best surviving
+candidate falls below the bar, and every empty outcome carries a
+machine-readable reason (`no_candidates` / `below_threshold` /
+`filter_excluded` / `degraded_backend`) on the wire. ABSTAIN is a distinct
+outcome from an empty result set on every surface: the CLI and MCP render
+the refusal and its code, and the UserPromptSubmit injection emits an
+explicit no-memory path ("recall abstained … treat the corpus as not
+covering this topic") instead of silence or filler.
+
+The gate is source-aware (a session-scoped top is compared against the bar
+scaled by the session prior, mirroring the W1.3 candidate-floor rule), is
+skipped for `Rrf` (uncalibrated scale), and rides a served recall's
+read-time corpus snapshot (count, generation, last-write, fingerprint) so a
+preregistered eval run can pin the corpus it scored against. `[search]
+abstain_threshold` overrides the calibration (0.0 disables); the scorecard
+records per-query abstention plus run-level `abstain_rate`/`abstain_events`.
+
 ## The opt-in HTTP listener (HTTP PRD 2026-07-02)
 
 `serve --http [bind]` (or `[http] enabled = true` in the user config) adds a

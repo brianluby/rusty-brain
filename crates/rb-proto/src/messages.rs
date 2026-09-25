@@ -439,6 +439,19 @@ pub enum Response {
         /// frame byte-identical to the pre-W1.6 shape.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         degraded: bool,
+        /// Why recall ABSTAINED instead of returning the nearest weak match
+        /// (Vikunja #62): machine-readable code, `None` on a served recall
+        /// (including an honestly-empty result set — ABSTAIN and empty are
+        /// distinct outcomes). Additive + serde defaults: byte-identical for
+        /// old peers, no contract-version bump (the `degraded` precedent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abstained: Option<rb_types::AbstainReason>,
+        /// Read-time corpus snapshot (Vikunja #62): pins the corpus a served
+        /// recall drew from (count, rowid-derived generation, last-write
+        /// epoch, fingerprint) so a preregistered eval run is reproducible.
+        /// Observability only — never a gate. Additive + skipped when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<rb_types::CorpusSnapshot>,
     },
     Got {
         memory: Option<MemoryNote>,
@@ -1096,10 +1109,14 @@ mod tests {
             stale: false,
         }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Response::Recalled {
                 results: Vec::new(),
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Response::Got {
                 memory: Some(note()),
@@ -1249,7 +1266,10 @@ mod tests {
         // decode, defaulting the flag off.
         let back: Response = serde_json::from_str(r#"{"result":"Recalled","results":[]}"#).unwrap();
         match back {
-            Response::Recalled { results, degraded } => {
+            Response::Recalled { results, degraded,
+                abstained: None,
+                snapshot: None,
+            } => {
                 assert!(results.is_empty());
                 assert!(!degraded, "absent degraded key must default to false");
             }
@@ -1264,14 +1284,18 @@ mod tests {
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: false,
-        })
+                abstained: None,
+                snapshot: None,
+            })
         .unwrap();
         assert_eq!(json, r#"{"result":"Recalled","results":[]}"#);
 
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: true,
-        })
+                abstained: None,
+                snapshot: None,
+            })
         .unwrap();
         assert_eq!(
             json,
