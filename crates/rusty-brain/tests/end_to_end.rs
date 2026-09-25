@@ -503,9 +503,17 @@ fn import_dry_run_prints_plan_and_stores_nothing() {
         .expect("recall dry-run sentinel");
     assert!(recall.status.success());
     let stdout = String::from_utf8_lossy(&recall.stdout);
+    // An empty corpus serves no hits — which, since #62, renders as either
+    // the plain empty state or an abstention with `no_candidates`. Both
+    // prove the dry run stored nothing; neither contains the imported text.
     assert!(
-        stdout.contains("No stored memories match"),
+        stdout.contains("No stored memories match")
+            || stdout.contains("abstained (no_candidates)"),
         "dry-run must not store the imported text; got: {stdout}"
+    );
+    assert!(
+        !stdout.contains("dry-run-only sentinel content"),
+        "the imported text must never surface; got: {stdout}"
     );
 }
 
