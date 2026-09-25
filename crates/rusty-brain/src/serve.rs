@@ -114,6 +114,9 @@ pub async fn run_serve(
             Some("rrf") => rb_daemon::FusionMode::Rrf,
             _ => rb_daemon::FusionMode::Linear,
         },
+        // Vikunja #69: resolved (fail-closed) [write_gate] policy — the
+        // daemon enforces it at the engine compose seam.
+        write_gate: effective.write_gate.clone(),
         // Opt-in loopback HTTP listener (HTTP PRD): flag > config file, both
         // through the same loopback-only fail-closed validator. `None` =
         // zero footprint.
@@ -362,6 +365,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let err = run_with_kind(

@@ -358,11 +358,12 @@ impl SqliteStore {
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        origin_user, origin_host, origin_agent, origin_source, origin_channel,
+                        session_id,
                         base_importance
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
                      )",
                 rusqlite::params![
                     note.id.to_string(),
@@ -388,6 +389,10 @@ impl SqliteStore {
                     note.origin_host,
                     note.origin_agent,
                     note.origin_source,
+                    // Vikunja #69: daemon-stamped write channel, in its own
+                    // column outside the client-writable record body. The SQL
+                    // CHECK backstops the rb-types fail-closed parse.
+                    note.origin_channel.map(|c| c.as_str()),
                     note.session_id,
                     // W1.9: the author-set importance prior. Stamped once at
                     // insert; the recalibration job never writes it, so the
@@ -720,6 +725,13 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         origin_host: go("origin_host")?,
         origin_agent: go("origin_agent")?,
         origin_source: go("origin_source")?,
+        // Vikunja #69 channel tag: nullable by-name decode (the provenance
+        // precedent). Fail-closed parse — an unknown db string is a storage
+        // error, never a silent `None` (which would read as a trusted row).
+        origin_channel: go("origin_channel")?
+            .map(|s| rb_types::WriteChannel::parse(&s))
+            .transpose()
+            .map_err(|e| Error::Storage(e.to_string()))?,
         session_id: go("session_id")?,
         anchors,
     })
@@ -797,7 +809,8 @@ fn build_list_filtered_query(
                 keywords, tags, context, memory_type, importance, confidence,
                 related_files, access_count, last_accessed_at, archived_at,
                 superseded_by, embedding_model, embedding_input_version,
-                origin_user, origin_host, origin_agent, origin_source, session_id
+                origin_user, origin_host, origin_agent, origin_source, session_id,
+                origin_channel
          FROM memories m
          WHERE m.namespace = ?1",
     );
@@ -1075,7 +1088,8 @@ impl Store for SqliteStore {
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id
+                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        origin_channel
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1653,7 +1667,8 @@ impl Store for SqliteStore {
                     keywords, tags, context, memory_type, importance, confidence,
                     related_files, access_count, last_accessed_at, archived_at,
                     superseded_by, embedding_model, embedding_input_version,
-                    origin_user, origin_host, origin_agent, origin_source, session_id
+                    origin_user, origin_host, origin_agent, origin_source, session_id,
+                    origin_channel
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -1747,7 +1762,8 @@ impl Store for SqliteStore {
                         keywords, tags, context, memory_type, importance, confidence,
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id
+                        origin_user, origin_host, origin_agent, origin_source, session_id,
+                        origin_channel
                  FROM memories
                  WHERE archived_at IS NULL
                    AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
@@ -5239,6 +5255,84 @@ mod provenance_tests {
         // And get_many.
         let many = store.get_many(&n.namespace, &[n.id.clone()]).unwrap();
         assert_eq!(many[0].session_id.as_deref(), Some("s-123"));
+    }
+
+    #[test]
+    fn origin_channel_round_trips_and_null_stays_null() {
+        use rb_types::WriteChannel;
+
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut stamped = MemoryNote::new(
+            Namespace::Project("chan".into()),
+            "channel stamped".into(),
+            MemoryType::Insight,
+            5,
+        );
+        stamped.origin_channel = Some(WriteChannel::Http);
+        stamped.origin_source = Some("http".into());
+        store.insert_memory(&stamped, None).unwrap();
+
+        let mut legacy = MemoryNote::new(
+            Namespace::Project("chan".into()),
+            "legacy unstamped".into(),
+            MemoryType::Insight,
+            5,
+        );
+        legacy.origin_source = Some("hook".into());
+        store.insert_memory(&legacy, None).unwrap();
+
+        // All read projections decode the stamped channel…
+        let got = store.get_memory(&stamped.id).unwrap().unwrap();
+        assert_eq!(got.origin_channel, Some(WriteChannel::Http));
+        assert!(got.is_quarantined());
+        let listed = store.list(&stamped.namespace, None, 10).unwrap();
+        assert_eq!(
+            listed.iter().find(|m| m.id == stamped.id).unwrap().origin_channel,
+            Some(WriteChannel::Http)
+        );
+        let many = store
+            .get_many(&stamped.namespace, &[stamped.id.clone()])
+            .unwrap();
+        assert_eq!(many[0].origin_channel, Some(WriteChannel::Http));
+
+        // …and pre-migration rows keep None (no backfill, the 004 precedent).
+        let got = store.get_memory(&legacy.id).unwrap().unwrap();
+        assert_eq!(got.origin_channel, None);
+        assert!(!got.is_quarantined());
+    }
+
+    #[test]
+    fn sql_check_rejects_unknown_channel_string() {
+        // The migration 013 CHECK is the backstop for the rb-types fail-closed
+        // parse: a hand-forged db value must never insert.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let n = MemoryNote::new(
+            Namespace::Project("chan".into()),
+            "bad channel".into(),
+            MemoryType::Insight,
+            5,
+        );
+        let err = store
+            .conn
+            .execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content,
+                    summary, keywords, tags, context, memory_type, importance, confidence,
+                    related_files, access_count, base_importance, embedding_model, origin_channel)
+                 VALUES (?1, ?2, ?3, ?4, ?5, '', '[]', '[]', '', ?6, 5, 1.0, '[]', 0, 5, '', 'carrier-pigeon')",
+                rusqlite::params![
+                    n.id.to_string(),
+                    n.namespace.as_db_string(),
+                    0i64,
+                    0i64,
+                    n.content,
+                    n.memory_type.as_str(),
+                ],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("CHECK"),
+            "unknown channel must trip the CHECK constraint: {err}"
+        );
     }
 }
 #[cfg(test)]

@@ -79,12 +79,16 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         };
         // Surface the contested flag (Feature C) inline for the human reader.
         let contested = if n.contested { " [contested]" } else { "" };
+        // Vikunja #69: quarantined rows stay listed but visibly demoted —
+        // quarantine is never silent deletion.
+        let quarantined = if n.is_quarantined() { " [quarantined]" } else { "" };
         out.push_str(&format!(
-            "{} (imp {}, {}){} {}{}\n",
+            "{} (imp {}, {}){}{} {}{}\n",
             n.id,
             n.importance,
             n.memory_type.as_str(),
             contested,
+            quarantined,
             summary,
             anchors_suffix(n)
         ));
@@ -105,15 +109,18 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             // Surface the contested flag (Feature C) on the get read path too, so
             // every human surface (recall/list/context/get) marks a contradicted note.
             let contested = if n.contested { " [contested]" } else { "" };
+            // Vikunja #69: quarantine is visible on every human surface.
+            let quarantined = if n.is_quarantined() { " [quarantined]" } else { "" };
             let anchors = if n.anchors.is_empty() {
                 String::new()
             } else {
                 format!("\nanchors: {}", anchor_labels(n))
             };
             format!(
-                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
+                "{}{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
                 n.id,
                 contested,
+                quarantined,
                 n.namespace.as_db_string(),
                 n.memory_type.as_str(),
                 n.importance,
@@ -1065,6 +1072,22 @@ mod tests {
         n.contested = true;
         let out = render_notes(std::slice::from_ref(&n), false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
+    fn human_list_and_get_mark_quarantined_notes() {
+        // Vikunja #69: a quarantined (untrusted-origin) row stays listed but
+        // visibly marked on every human surface — demotion, never deletion.
+        let mut n = note("poisoned row", 5);
+        n.origin_channel = Some(rb_types::WriteChannel::Http);
+        let out = render_notes(std::slice::from_ref(&n), false);
+        assert!(out.contains("[quarantined]"), "list marker shown: {out}");
+        let out = render_get(&Some(n.clone()), false);
+        assert!(out.contains("[quarantined]"), "get marker shown: {out}");
+
+        // And the JSON surfaces the channel itself for machine consumers.
+        let out = render_notes(std::slice::from_ref(&n), true);
+        assert!(out.contains("\"origin_channel\""), "json channel: {out}");
     }
 
     #[test]

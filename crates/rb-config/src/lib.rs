@@ -439,6 +439,81 @@ fn resolve_http(file_value: &Option<file::HttpFileConfig>) -> Result<Option<Http
     Ok(Some(HttpConfig { bind }))
 }
 
+/// Resolve the `[write_gate]` section into the validated per-namespace write
+/// policy the daemon enforces pre-insert (Vikunja #69). An absent section
+/// resolves to the built-in default policy (all types/channels permitted,
+/// always-on size ceilings) — the gate is on even without configuration.
+fn resolve_write_gate(
+    file_value: &Option<file::WriteGateFileConfig>,
+) -> Result<rb_types::WriteGateConfig> {
+    fn resolve_policy(
+        section: &file::NamespaceWriteGateFileConfig,
+        // Fallback for unset knobs: the built-in defaults for the section
+        // level, the resolved section defaults for a namespace entry — an
+        // override inherits every knob it does not set.
+        parent: &rb_types::WriteGatePolicy,
+    ) -> Result<rb_types::WriteGatePolicy> {
+        let allowed_types = match &section.allowed_types {
+            Some(strings) => strings
+                .iter()
+                .map(|s| {
+                    rb_types::MemoryType::parse(s.trim()).map_err(|e| {
+                        Error::InvalidArgument(format!(
+                            "[write_gate] allowed_types: {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => parent.allowed_types.clone(),
+        };
+        let permitted_channels = match &section.permitted_channels {
+            Some(strings) => strings
+                .iter()
+                .map(|s| {
+                    rb_types::WriteChannel::parse(s.trim()).map_err(|e| {
+                        Error::InvalidArgument(format!(
+                            "[write_gate] permitted_channels: {e}"
+                        ))
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            None => parent.permitted_channels.clone(),
+        };
+        let policy = rb_types::WriteGatePolicy {
+            allowed_types,
+            max_content_bytes: section.max_content_bytes.unwrap_or(parent.max_content_bytes),
+            max_context_bytes: section.max_context_bytes.unwrap_or(parent.max_context_bytes),
+            min_anchors: section.min_anchors.unwrap_or(parent.min_anchors),
+            permitted_channels,
+            allow_unverified_channel: section
+                .allow_unverified_channel
+                .unwrap_or(parent.allow_unverified_channel),
+        };
+        if policy.max_content_bytes == 0 || policy.max_context_bytes == 0 {
+            return Err(Error::InvalidArgument(
+                "[write_gate] max_content_bytes and max_context_bytes must be positive"
+                    .to_string(),
+            ));
+        }
+        Ok(policy)
+    }
+
+    let Some(section) = file_value else {
+        return Ok(rb_types::WriteGateConfig::default());
+    };
+    let default = resolve_policy(&section.defaults, &rb_types::WriteGatePolicy::default())?;
+    let mut namespaces = Vec::with_capacity(section.namespaces.len());
+    for (key, ns_section) in &section.namespaces {
+        let namespace = rb_types::Namespace::parse_db_string(key).map_err(|e| {
+            Error::InvalidArgument(format!(
+                "[write_gate] namespaces key {key:?}: {e}"
+            ))
+        })?;
+        namespaces.push((namespace, resolve_policy(ns_section, &default)?));
+    }
+    Ok(rb_types::WriteGateConfig { default, namespaces })
+}
+
 /// The fully resolved per-process configuration: env var > user config file >
 /// built-in default, per knob (CLI flags are applied above this by the
 /// binaries). Resolved identically by the CLI, the hooks, and the daemon —
@@ -478,6 +553,10 @@ pub struct EffectiveConfig {
     /// with a loopback bind (HTTP PRD HTTP-1/HTTP-2). Fail-closed: an
     /// invalid or non-loopback bind aborts resolution instead of warning.
     pub http: Option<HttpConfig>,
+    /// Validated `[write_gate]` policy (Vikunja #69); the built-in default
+    /// when the section is absent (the always-on size ceilings still apply).
+    /// Fail-closed: an invalid section aborts resolution instead of warning.
+    pub write_gate: rb_types::WriteGateConfig,
     /// Non-fatal findings (unknown config keys, ignored invalid values).
     /// Callers surface these (`tracing::warn!`); they never fail resolution.
     pub warnings: Vec<String>,
@@ -513,6 +592,7 @@ impl EffectiveConfig {
             fusion_mode,
             retention: resolve_retention(&config.retention)?,
             http: resolve_http(&config.http)?,
+            write_gate: resolve_write_gate(&config.write_gate)?,
             warnings,
         })
     }
@@ -895,6 +975,133 @@ mod tests {
         );
         let err = EffectiveConfig::resolve().unwrap_err();
         assert!(err.to_string().contains("max_age_days"), "{err}");
+    }
+
+    // Vikunja #69: [write_gate] resolves into the per-namespace daemon policy
+    // (config-file-only knob — no env equivalent).
+    #[test]
+    fn write_gate_section_resolves_defaults_and_namespace_overrides() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [write_gate]
+            max_content_bytes = 4096
+
+            [write_gate.namespaces."project:strict"]
+            permitted_channels = ["hook", "cli"]
+            allow_unverified_channel = false
+            allowed_types = ["insight", "bug_fix"]
+            min_anchors = 1
+            "#,
+        );
+        let effective = EffectiveConfig::resolve().unwrap();
+        let gate = &effective.write_gate;
+
+        // Section-level default: overridden size, everything else built-in.
+        assert_eq!(gate.default.max_content_bytes, 4096);
+        assert_eq!(
+            gate.default.max_content_bytes,
+            gate.default.max_content_bytes
+        );
+        assert_eq!(
+            gate.default.permitted_channels,
+            rb_types::WriteChannel::all().to_vec()
+        );
+
+        // Namespace override applies; other namespaces see the default.
+        let strict = gate
+            .policy_for(&rb_types::Namespace::parse_db_string("project:strict").unwrap())
+            .clone();
+        assert_eq!(
+            strict.permitted_channels,
+            vec![
+                rb_types::WriteChannel::Hook,
+                rb_types::WriteChannel::Cli
+            ]
+        );
+        assert!(!strict.allow_unverified_channel);
+        assert_eq!(strict.min_anchors, 1);
+        assert_eq!(strict.allowed_types.len(), 2);
+        assert_eq!(strict.max_content_bytes, 4096, "unset knobs inherit");
+        let global_ns = rb_types::Namespace::parse_db_string("global").unwrap();
+        assert_eq!(gate.policy_for(&global_ns), &gate.default);
+        assert!(effective.warnings.is_empty(), "{:?}", effective.warnings);
+    }
+
+    #[test]
+    fn absent_write_gate_section_resolves_to_default_policy() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(&confdir, "");
+        let effective = EffectiveConfig::resolve().unwrap();
+        assert_eq!(
+            effective.write_gate.default,
+            rb_types::WriteGatePolicy::default()
+        );
+        assert!(effective.write_gate.namespaces.is_empty());
+    }
+
+    #[test]
+    fn invalid_write_gate_values_fail_resolution_closed() {
+        // Unknown channel string: fail closed, never warn-and-repair.
+        let _lock = ENV_LOCK.lock().unwrap();
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [write_gate]
+            permitted_channels = ["hook", "carrier-pigeon"]
+            "#,
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(
+            err.to_string().contains("permitted_channels"),
+            "must name the offending key: {err}"
+        );
+
+        // Invalid namespace key: fail closed.
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [write_gate.namespaces."not a namespace!"]
+            max_content_bytes = 1024
+            "#,
+        );
+        let err = EffectiveConfig::resolve().unwrap_err();
+        assert!(
+            err.to_string().contains("namespaces key"),
+            "must name the offending key: {err}"
+        );
+
+        // Zero size ceiling: incoherent, fail closed.
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [write_gate]
+            max_content_bytes = 0
+            "#,
+        );
+        assert!(EffectiveConfig::resolve().is_err());
+    }
+
+    #[test]
+    fn write_gate_unknown_keys_fail_closed_at_parse() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        // deny_unknown_fields (the [retention]/[http] precedent): a typo'd
+        // guard key is a config error, not a warning.
+        let (_guards, confdir) = isolated_config_env();
+        write_config(
+            &confdir,
+            r#"
+            [write_gate]
+            permited_channels = ["hook"]
+            "#,
+        );
+        assert!(EffectiveConfig::resolve().is_err());
     }
 
     // HTTP PRD HTTP-1/HTTP-2: off by default at every layer — no [http]

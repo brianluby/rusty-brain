@@ -154,6 +154,10 @@ pub struct DaemonConfig {
     /// `FusionMode::Linear` is the default; the default flip to RRF is
     /// deferred to W4.1 eval evidence.
     pub fusion_mode: rb_engine::FusionMode,
+    /// Resolved `[write_gate]` policy (Vikunja #69): per-namespace pre-insert
+    /// validation enforced in the engine's compose seam. The built-in default
+    /// permits today's traffic — the gate is on even without configuration.
+    pub write_gate: rb_types::WriteGateConfig,
     /// Opt-in loopback HTTP listener (HTTP PRD HTTP-1/HTTP-2). `None` (the
     /// default posture) means ZERO footprint: no TCP socket is bound and no
     /// listener task is spawned. The bind address is re-validated at
@@ -184,6 +188,7 @@ pub struct Daemon {
     retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
     fusion_mode: rb_engine::FusionMode,
+    write_gate: rb_types::WriteGateConfig,
     /// Bound opt-in HTTP listener + its config; `None` when disabled (the
     /// default): nothing is bound and `run` spawns no HTTP task.
     http: Option<(tokio::net::TcpListener, crate::http::HttpListenerConfig)>,
@@ -310,6 +315,7 @@ impl Daemon {
             retention_policy: config.retention_policy,
             request_idle_timeout,
             fusion_mode: config.fusion_mode,
+            write_gate: config.write_gate,
             http,
             http_addr,
         })
@@ -349,6 +355,7 @@ impl Daemon {
             retention_policy,
             request_idle_timeout,
             fusion_mode,
+            write_gate,
             http,
             http_addr: _http_addr,
         } = self;
@@ -381,6 +388,7 @@ impl Daemon {
                 retention_policy: retention_policy.clone(),
                 recall_counters: recall_counters.clone(),
                 fusion_mode,
+                write_gate: write_gate.clone(),
                 provider_model: embedder.model_id().to_string(),
             });
             tokio::spawn(crate::http::run(
@@ -425,6 +433,7 @@ impl Daemon {
                                     continue;
                                 }
                             };
+                            let write_gate = write_gate.clone();
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
                                 if let Err(e) = handle_connection(
@@ -437,6 +446,7 @@ impl Daemon {
                                     request_idle_timeout,
                                     recall_counters,
                                     fusion_mode,
+                                    write_gate,
                                 )
                                 .await
                                 {
@@ -700,7 +710,6 @@ fn process_euid() -> u32 {
 ///
 /// EXHAUSTIVE on purpose (no `_` arm): a newly added `Request` variant fails
 /// to compile here until its author makes a deliberate admin/non-admin
-/// decision. A wildcard default would silently ship a new cross-namespace op
 /// ungated, defeating the W2.6 admin boundary.
 fn is_admin_op(req: &Request) -> bool {
     match req {
@@ -737,6 +746,24 @@ fn is_admin_op(req: &Request) -> bool {
     }
 }
 
+/// Map a kernel-verified same-host UDS peer's declared surface onto the
+/// write-channel trust tag (Vikunja #69). Only recognized first-party
+/// surfaces earn a channel; everything else — old clients, unknown sources —
+/// stays `None` (unverified), never a guess. The value lands in the
+/// `origin_channel` column, outside any client-controlled payload field.
+fn uds_write_channel(source: Option<&str>) -> Option<rb_types::WriteChannel> {
+    use rb_types::WriteChannel;
+    match source {
+        Some("hook") => Some(WriteChannel::Hook),
+        Some("mcp") => Some(WriteChannel::Mcp),
+        Some("cli") => Some(WriteChannel::Cli),
+        // "startup" (session digest), "job", and unknown surfaces are not
+        // write channels; the write gate decides whether an unverified
+        // channel may write at all (`allow_unverified_channel`, default on).
+        _ => None,
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
@@ -748,6 +775,7 @@ async fn handle_connection(
     request_idle_timeout: std::time::Duration,
     recall_counters: Arc<RecallChannelCounters>,
     fusion_mode: rb_engine::FusionMode,
+    write_gate: rb_types::WriteGateConfig,
 ) -> Result<()> {
     // W2.6 peer identity: read the kernel-verified peer credentials
     // (`getpeereid`/`SO_PEERCRED` via tokio's `peer_cred`) BEFORE any frame is
@@ -813,8 +841,15 @@ async fn handle_connection(
         origin_user: identity.user.or_else(rb_config::current_user),
         origin_host: identity.host.or_else(rb_config::current_hostname),
         origin_agent: identity.agent,
-        origin_source: identity.source,
+        origin_source: identity.source.clone(),
         session_id: identity.session_id,
+        // Vikunja #69 daemon-stamped write channel: derived from the
+        // kernel-verified same-host peer's declared surface, NOT from any
+        // request payload — a client cannot forge the column. Recognized
+        // first-party surfaces map to their channel; anything else (old
+        // client, unknown source) stays `None` = unverified, which the
+        // write gate treats via `allow_unverified_channel`.
+        channel: uds_write_channel(identity.source.as_deref()),
     };
 
     let store_for_stream = store.clone();
@@ -823,8 +858,9 @@ async fn handle_connection(
     // engine; the stats path reports it alongside the DB's recorded model.
     let provider_model = embedder.model_id().to_string();
     let engine = {
-        let base =
-            MemoryEngine::new(store, embedder, namespace.clone()).with_fusion_mode(fusion_mode);
+        let base = MemoryEngine::new(store, embedder, namespace.clone())
+            .with_fusion_mode(fusion_mode)
+            .with_write_gate(write_gate);
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -1967,6 +2003,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         assert_eq!(
@@ -2045,6 +2082,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let daemon = Daemon::bind(
@@ -2088,6 +2126,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let socket = config.socket_path.clone();
@@ -2196,6 +2235,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             retention_policy: None,
             http: None,
         };

@@ -5,6 +5,27 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+
+### Added — Write-path validation gate, channel trust tags, compaction source filtering (#69)
+
+- Pre-insert write gate at the engine's compose seam: per-namespace
+  `[write_gate]` policy (permitted channels, allowed types, content/context
+  size ceilings, minimum anchors) validated before any enrichment, embedding,
+  or store write; violations fail closed with structured
+  `[write-gate:<code>]` rejections. The built-in default policy keeps today's
+  traffic flowing — the gate is on even when unconfigured.
+- Daemon-stamped write-channel trust tags (`hook`/`mcp`/`cli` over UDS,
+  `http` for the loopback listener) stored in a dedicated `origin_channel`
+  column outside any client-writable payload; untrusted-origin rows are
+  quarantined out of recall and the session digest but stay listed with a
+  visible `[quarantined]` marker (CLI and MCP surfaces).
+- Compaction source filtering for hook folds (MPBench V-P2/V-S3):
+  instruction-shaped entries — standing directives aimed at a future agent —
+  are dropped from session summaries and pre-compact decision snapshots
+  before they become durable; the fold trigger remains lifecycle-structural,
+  never content length. Capability tests prove a planted payload never lands.
+- `docs/THREAT_MODEL.md` documents the three-layer write-path defense.
+
 ### Added — Native OMP extension
 
 - Project-local `rusty-brain-install --agents omp` installation, status, dry-run

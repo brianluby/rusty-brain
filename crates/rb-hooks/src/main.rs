@@ -11,6 +11,7 @@ mod capture;
 mod cli;
 mod dispatch;
 mod io;
+mod poison;
 mod scratch;
 mod transcript;
 

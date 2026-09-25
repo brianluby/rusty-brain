@@ -71,6 +71,12 @@ pub struct FileConfig {
     /// off by default at every layer.
     #[serde(default)]
     pub http: Option<HttpFileConfig>,
+    /// `[write_gate]` section: the pre-insert write-path policy (Vikunja #69).
+    /// `None` when the section is absent — the daemon then enforces the
+    /// built-in default policy (bounded size ceilings; all first-party
+    /// channels permitted).
+    #[serde(default)]
+    pub write_gate: Option<WriteGateFileConfig>,
 }
 
 /// `[embed]` section of the config file.
@@ -163,6 +169,55 @@ pub struct HttpFileConfig {
     pub bind: Option<String>,
 }
 
+/// `[write_gate]` section of the config file (Vikunja #69).
+///
+/// DELIBERATE strictness deviation (the `[retention]`/`[http]` precedent):
+/// unknown keys fail closed (`deny_unknown_fields`). This section drives a
+/// security policy on the write path — a typo'd `permitted_channels` that
+/// silently no-ops would defeat the gate. Semantic validation (channel and
+/// namespace strings, positive sizes) happens at resolve time via
+/// [`crate::resolve_write_gate`] and fails resolution, never warn-and-repair.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WriteGateFileConfig {
+    /// Section-level defaults applied to namespaces without their own entry.
+    #[serde(flatten)]
+    pub defaults: NamespaceWriteGateFileConfig,
+    /// Per-namespace overrides, keyed by db namespace string (e.g.
+    /// `"project:foo"`, `"global"`). An invalid key fails resolution.
+    #[serde(default)]
+    pub namespaces: std::collections::BTreeMap<String, NamespaceWriteGateFileConfig>,
+}
+
+/// The per-namespace knobs of the write gate. Every field optional; absent
+/// means "use the built-in default" at resolve time.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NamespaceWriteGateFileConfig {
+    /// Memory types this namespace accepts (db strings, e.g.
+    /// `["insight", "bug_fix"]`). Default: all types.
+    #[serde(default)]
+    pub allowed_types: Option<Vec<String>>,
+    /// Maximum `content` size in bytes. Default: 256 KiB
+    /// (`rb_types::DEFAULT_MAX_CONTENT_BYTES`) — the ceiling applies even
+    /// with no config at all.
+    #[serde(default)]
+    pub max_content_bytes: Option<usize>,
+    /// Maximum `context` size in bytes. Default: 64 KiB.
+    #[serde(default)]
+    pub max_context_bytes: Option<usize>,
+    /// Minimum anchor count a write must carry. Default: 0 (no requirement).
+    #[serde(default)]
+    pub min_anchors: Option<usize>,
+    /// Stamped channels allowed to write (db strings). Default: all four.
+    #[serde(default)]
+    pub permitted_channels: Option<Vec<String>>,
+    /// Whether an unverified-stamp write (peer executable not recognized as
+    /// a first-party binary) is accepted. Default: true.
+    #[serde(default)]
+    pub allow_unverified_channel: Option<bool>,
+}
+
 /// A loaded (or absent) config file plus any non-fatal warnings produced while
 /// parsing it.
 #[derive(Debug, Clone, Default)]
@@ -246,14 +301,15 @@ fn warn_unknown_keys(table: &toml::Table, source: &Path, warnings: &mut Vec<Stri
         "search",
         "retention",
         "http",
+        "write_gate",
     ];
     const EMBED: &[&str] = &["backend", "local_model"];
     const ENRICH: &[&str] = &["base_url", "model"];
     const SEARCH: &[&str] = &["fusion"];
-    // No RETENTION or HTTP list here: `[retention]` and `[http]` unknown keys
-    // FAIL CLOSED via `deny_unknown_fields` on their section structs (see
-    // their doc comments), so the warn path never applies to them.
-
+    // No RETENTION, HTTP, or WRITE_GATE list here: `[retention]`, `[http]`,
+    // and `[write_gate]` unknown keys FAIL CLOSED via `deny_unknown_fields`
+    // on their section structs (see their doc comments), so the warn path
+    // never applies to them.
     for key in table.keys() {
         if !TOP_LEVEL.contains(&key.as_str()) {
             warnings.push(unknown_key_warning(key, source));

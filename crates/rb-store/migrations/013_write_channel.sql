@@ -1,0 +1,19 @@
+-- 013_write_channel.sql
+-- Vikunja #69: daemon-stamped write-channel trust tag.
+--
+-- `origin_channel` records WHICH SURFACE a write arrived on
+-- (hook|cli|mcp|http), stamped by the daemon from connection/request context:
+-- the kernel-verified peer executable over UDS, the HTTP listener for HTTP.
+-- It is deliberately OUTSIDE the client-writable record body — a client
+-- cannot set it, and the handshake's client-declared `identity.source`
+-- (stored as advisory `origin_source`) can never move it.
+--
+-- Nullable with NO default and NO backfill, exactly like 004_provenance:
+-- an UPDATE here would fire the `mem_au` trigger and rewrite the FTS index
+-- for every existing row. Old rows keep NULL (decoded as `None`: a legacy
+-- row, a daemon-internal job write, or a UDS peer whose executable could
+-- not be verified — none of which carry HTTP's network-origin risk).
+-- ALTER ... ADD COLUMN is metadata-only in SQLite (no row rewrite, no
+-- trigger fire), and the FTS triggers reference fixed column lists.
+ALTER TABLE memories ADD COLUMN origin_channel TEXT
+  CHECK (origin_channel IN ('hook','cli','mcp','http') OR origin_channel IS NULL);

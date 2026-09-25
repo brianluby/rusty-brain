@@ -23,6 +23,7 @@ mod retention;
 mod review;
 mod stats;
 mod validate;
+mod write_gate;
 
 pub use anchor::{
     kind_str as anchor_kind_str, normalize_anchor_value, parse_file_filter,
@@ -57,3 +58,8 @@ pub use review::{
 };
 pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 pub use validate::{validate_confidence, validate_importance};
+
+pub use write_gate::{
+    validate_write, WriteChannel, WriteGateConfig, WriteGatePolicy, WriteRejection,
+    DEFAULT_MAX_CONTENT_BYTES, DEFAULT_MAX_CONTEXT_BYTES,
+};

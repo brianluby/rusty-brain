@@ -60,8 +60,16 @@ pub struct Provenance {
     pub origin_user: Option<String>,
     pub origin_host: Option<String>,
     pub origin_agent: Option<String>,
-    /// Producer surface: `hook` | `mcp` | `cli` | `job`.
+    /// Producer surface: `hook` | `mcp` | `cli` | `job` (client-declared,
+    /// advisory provenance only).
     pub origin_source: Option<String>,
+    /// Daemon-stamped write channel (Vikunja #69): `None` for direct engine
+    /// callers (tests/eval); the daemon sets it from connection/request
+    /// context — kernel-verified peer executable over UDS, the listener for
+    /// HTTP — and it flows into the row's `origin_channel` column. Kept beside
+    /// the advisory fields for plumbing only; it is NOT client-declared and
+    /// never read from a payload.
+    pub channel: Option<rb_types::WriteChannel>,
     pub session_id: Option<String>,
 }
 
@@ -82,6 +90,11 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     /// scale and stay unfloored until RRF is reachable and calibrated
     /// (W2.2/W4.1). See `rb_search::SCORE_FLOOR` for the derivation.
     score_floor: f32,
+    /// Pre-insert write gate (Vikunja #69): per-namespace policy enforced in
+    /// `compose_note` — the single seam every durable write composes through
+    /// (`remember`, review merge). The permissive default keeps direct engine
+    /// callers (tests, eval) working; the daemon sets the resolved policy.
+    write_gate: rb_types::WriteGateConfig,
     /// Determinism hook for eval/tests: when set, `remember` stamps
     /// created/updated at this instant and ranking computes recency against
     /// it, so (now - created_at) deltas are reproducible across runs instead
@@ -104,6 +117,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             namespace,
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             score_floor: rb_search::SCORE_FLOOR,
             fixed_now: None,
         }
@@ -151,6 +165,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// a caller flips it through the config plumbing.
     pub fn with_fusion_mode(mut self, mode: FusionMode) -> Self {
         self.fusion_mode = mode;
+        self
+    }
+
+    /// Install the pre-insert write gate policy (Vikunja #69). The daemon
+    /// passes the resolved `[write_gate]` config; direct engine callers keep
+    /// the permissive default.
+    pub fn with_write_gate(mut self, gate: rb_types::WriteGateConfig) -> Self {
+        self.write_gate = gate;
         self
     }
 
@@ -232,6 +254,23 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         &self,
         input: RememberInput,
     ) -> rb_types::Result<(MemoryNote, Option<Vec<f32>>)> {
+        // Vikunja #69 pre-insert write gate: NOTHING composes — let alone
+        // reaches the store — without passing the per-namespace policy. First
+        // checked so a rejected write costs no enrichment or embedding work.
+        // The structured rejection carries its machine-readable code
+        // (`[write-gate:<code>]`) through `InvalidArgument`.
+        rb_types::validate_write(
+            self.write_gate.policy_for(&self.namespace),
+            &self.namespace,
+            input.provenance.channel,
+            &input.memory_type,
+            &input.content,
+            input.context.as_deref(),
+            input.anchors.len(),
+        )
+        .map_err(|rejection| {
+            rb_types::Error::InvalidArgument(rejection.to_string())
+        })?;
         rb_types::validate_importance(input.importance)?;
         // Fail-closed confidence range check on an EXPLICIT caller prior
         // (mirrors the storage CHECK, but surfaces as a clean validation error
@@ -266,6 +305,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         note.origin_host = input.provenance.origin_host;
         note.origin_agent = input.provenance.origin_agent;
         note.origin_source = input.provenance.origin_source;
+        // Vikunja #69: the daemon-stamped channel lands in its own column.
+        // The value comes ONLY from the daemon-side stamp on `Provenance` —
+        // compose starts from `MemoryNote::new`, so a client-supplied note
+        // field can never reach this assignment.
+        note.origin_channel = input.provenance.channel;
         note.session_id = input.provenance.session_id;
         // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
         // the caller left empty; an enricher error degrades to the heuristic.
@@ -509,7 +553,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             // `get_many` is already namespace-scoped; `filter.matches` covers
             // every metadata dimension including the archived-state scope
             // (default: active-only, the historical behavior).
-            if !self.in_namespace(&note) || !filter.matches(&note) {
+            //
+            // Vikunja #69 quarantine: untrusted-origin rows (stamped HTTP
+            // channel) are EXCLUDED from recall entirely — not rank-demoted.
+            // Recall feeds every injection channel, so a poisoned row must
+            // never ride into a prompt; visibility stays on list/get.
+            if !self.in_namespace(&note) || !filter.matches(&note) || note.is_quarantined() {
                 continue;
             }
             // Carry confidence into ranking (Feature C): low-confidence memories
@@ -985,6 +1034,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Project context payload: recent memories (by recency) plus important ones
     /// (importance >= 8), with a total count of the recent window.
+    ///
+    /// Vikunja #69 quarantine: this projection feeds the SessionStart digest
+    /// injection channel, so untrusted-origin rows (stamped HTTP channel) are
+    /// EXCLUDED here too — recall parity, never silently injected. The total
+    /// still counts the pre-filter window; list/get stay visible with the
+    /// marker.
     pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         const CONTEXT_LIMIT: usize = 50;
         const IMPORTANT_FLOOR: u8 = 8;
@@ -1008,6 +1063,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             )
             .await?;
         let total = recent.len();
+        recent.retain(|n| !n.is_quarantined());
+        important.retain(|n| !n.is_quarantined());
         // Annotate contested on both context halves (Feature C, fail-open).
         self.annotate_contested(&mut recent).await;
         self.annotate_contested(&mut important).await;
@@ -1605,6 +1662,7 @@ mod tests {
             origin_host: Some("devbox".into()),
             origin_agent: Some("claude-code".into()),
             origin_source: Some("hook".into()),
+            channel: Some(rb_types::WriteChannel::Hook),
             session_id: Some("s-1".into()),
         };
         let id = eng.remember(inp).await.unwrap();
@@ -3325,6 +3383,127 @@ mod tests {
         // heuristic summary == trimmed content (< 150 chars); keywords non-empty.
         assert_eq!(note.summary, content);
         assert!(!note.keywords.is_empty());
+    }
+
+    // ---- Vikunja #69: channel stamping + retrieval quarantine -------------
+
+    #[tokio::test]
+    async fn provenance_channel_lands_on_the_stored_note() {
+        let eng = engine();
+        let mut inp = input("written over the loopback listener", 5);
+        inp.provenance.channel = Some(rb_types::WriteChannel::Http);
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.origin_channel, Some(rb_types::WriteChannel::Http));
+        assert!(note.is_quarantined());
+
+        // Default provenance (direct engine callers) keeps the column empty.
+        let id = eng.remember(input("direct engine write", 5)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.origin_channel, None);
+        assert!(!note.is_quarantined());
+    }
+
+    #[tokio::test]
+    async fn write_gate_rejects_before_anything_reaches_the_backend() {
+        // Restrictive per-namespace policy: this project namespace permits
+        // only `cli` writes of `bug_fix` memories.
+        let policy = rb_types::WriteGatePolicy {
+            allowed_types: vec![rb_types::MemoryType::BugFix],
+            permitted_channels: vec![rb_types::WriteChannel::Cli],
+            ..rb_types::WriteGatePolicy::default()
+        };
+        let eng = engine().with_write_gate(rb_types::WriteGateConfig {
+            default: rb_types::WriteGatePolicy::default(),
+            namespaces: vec![(Namespace::Project("rb".into()), policy)].into_iter().collect(),
+        });
+
+        // Channel violation: an HTTP-channel write into the restricted
+        // namespace never composes and never reaches the backend.
+        let mut inp = input("poisoned http write", 5);
+        inp.provenance.channel = Some(rb_types::WriteChannel::Http);
+        let err = eng.remember(inp).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[write-gate:channel_not_permitted]"),
+            "unexpected error: {err}"
+        );
+
+        // Type violation: permitted channel, disallowed type.
+        let mut inp = input("insight over cli", 5);
+        inp.memory_type = rb_types::MemoryType::Insight;
+        inp.provenance.channel = Some(rb_types::WriteChannel::Cli);
+        // Both rejections left the backend untouched — nothing composed.
+        assert_eq!(eng.backend().count(), 0);
+
+        // The default (permissive) engine still accepts the same write: the
+        // gate only bites where a policy restricts.
+        let permissive = engine();
+        let id = permissive
+            .remember(input("permissive default write", 5))
+            .await
+            .unwrap();
+        assert!(permissive.backend().note_of(&id).is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_and_context_exclude_quarantined_rows_but_list_keeps_them() {
+        let eng = engine();
+        let _trusted = seed_notes(&eng, 2, |i, note| {
+            note.content = format!("quarantine probe trusted fact {i}");
+            note.origin_channel = Some(rb_types::WriteChannel::Cli);
+        })
+        .await;
+        let poisoned = seed_notes(&eng, 1, |_, note| {
+            note.content = "quarantine probe poisoned fact".to_string();
+            note.origin_channel = Some(rb_types::WriteChannel::Http);
+        })
+        .await;
+
+        // Recall never returns the quarantined row, trusted rows still do.
+        let results = eng
+            .recall("quarantine probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.memory.id != poisoned[0]),
+            "quarantined row must never surface in recall"
+        );
+        assert!(!results.is_empty(), "trusted rows still recall");
+
+        // The context projection (SessionStart digest feed) excludes it too.
+        let (recent, important, _total) = eng.context().await.unwrap();
+        assert!(
+            recent.iter().chain(important.iter()).all(|n| n.id != poisoned[0]),
+            "quarantined row must never reach the digest feed"
+        );
+
+        // list stays visible (quarantine is not silent deletion).
+        let listed = eng
+            .list(&rb_types::RecallFilter::default(), 10)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|n| n.id == poisoned[0]));
+        assert!(listed.iter().find(|n| n.id == poisoned[0]).unwrap().is_quarantined());
+    }
+
+    #[tokio::test]
+    async fn legacy_http_rows_are_quarantined_via_origin_source_fallback() {
+        // Pre-migration row: no channel column value, but origin_source was
+        // daemon-stamped "http" by the listener. The derived fallback must
+        // quarantine it exactly like a stamped row.
+        let eng = engine();
+        let legacy = seed_notes(&eng, 1, |_, note| {
+            note.origin_source = Some("http".to_string());
+        })
+        .await;
+        let results = eng
+            .recall("seeded searchable content", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.memory.id != legacy[0]),
+            "legacy http row must be quarantined out of recall"
+        );
     }
 
     #[tokio::test]
