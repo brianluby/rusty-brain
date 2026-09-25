@@ -54,6 +54,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http,
         };
         let daemon = Daemon::bind(cfg, SharedEmbedder::new(DeterministicProvider::new(DIM)))
@@ -262,6 +263,7 @@ async fn non_loopback_bind_fails_closed_at_daemon_bind() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             bind: "0.0.0.0:0".parse().unwrap(),
             ..Default::default()
@@ -409,8 +411,8 @@ async fn namespace_header_scopes_http_requests() {
         ],
         Some(&body),
     );
-    let (status, body) = raw_round_trip(addr, &req).await;
-    assert_eq!(status, 200, "{body}");
+    let (status, remember_body) = raw_round_trip(addr, &req).await;
+    assert_eq!(status, 200, "{remember_body}");
 
     // Same recall in another namespace: no hits.
     let recall_body = shortcut_body(&recall_request("namespaced memory"));
@@ -429,7 +431,11 @@ async fn namespace_header_scopes_http_requests() {
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
 
-    // And in the writing namespace: hit.
+    // In the WRITING namespace the row exists — but recall over HTTP no
+    // longer surfaces it (Vikunja #69): every HTTP write carries the `http`
+    // channel tag, and untrusted-origin rows are quarantined out of recall.
+    // Namespace scoping is still proven here by LIST (which keeps
+    // quarantined rows visible, with their stamped channel).
     let req = build_request(
         "POST",
         "/recall",
@@ -443,8 +449,49 @@ async fn namespace_header_scopes_http_requests() {
     let (status, body) = raw_round_trip(addr, &req).await;
     assert_eq!(status, 200, "{body}");
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(!parsed["results"].as_array().unwrap().is_empty());
+    assert_eq!(
+        parsed["results"].as_array().unwrap().len(),
+        0,
+        "an http-origin write is quarantined out of recall"
+    );
 
+    // Scoping is proven by GET (recall would prove nothing here: the row is
+    // quarantined out of recall by design). Capture the id from the write.
+    // NOTE: `body` is the recall response here; the write's id was captured
+    // at the remember round-trip above (`remember_body`).
+    let written: serde_json::Value = serde_json::from_str(&remember_body).unwrap();
+    let id = written["id"]
+        .as_str()
+        .expect("remember returns the id")
+        .to_string();
+    let get_in = |id: String, ns: String| {
+        let host = host.clone();
+        async move {
+            let req = build_request(
+                "GET",
+                &format!("/memories/{id}"),
+                Some(&host),
+                &[("x-rusty-brain-namespace", ns.as_str())],
+                None,
+            );
+            raw_round_trip(addr, &req).await
+        }
+    };
+    let (status, body) = get_in(id.clone(), "project:alpha".to_string()).await;
+    assert_eq!(status, 200, "{body}");
+    let got: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let memory = &got["memory"];
+    assert_eq!(
+        memory["origin_channel"], "Http",
+        "the daemon stamped the http channel: {memory}"
+    );
+    let (status, body) = get_in(id, "project:beta".to_string()).await;
+    assert_eq!(status, 200, "{body}");
+    let got: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        got["memory"].is_null(),
+        "the write is invisible from the other namespace: {got}"
+    );
     daemon.stop().await;
 }
 

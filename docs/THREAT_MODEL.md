@@ -64,6 +64,43 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    not greppable from the DB in plaintext *when the redactor catches it*
    (see redaction below).
 
+
+## The write path (Vikunja #69: write gate + channel trust tags)
+
+Namespaces are organization, not authorization (above) — so the durable
+write path itself is the defense surface against memory poisoning. Three
+layers, all enforced server-side:
+
+1. **Pre-insert write gate.** Every durable write composes through the
+   engine's single compose seam, which validates it against the resolved
+   `[write_gate]` policy (per-namespace overrides of the built-in default):
+   permitted channels, allowed memory types, content/context size ceilings,
+   minimum anchor count. A violation is a structured rejection
+   (`[write-gate:<code>]`) — nothing composes, nothing embeds, nothing
+   reaches SQLite. The gate is on with the built-in default policy even
+   when unconfigured.
+
+2. **Channel trust tags.** The daemon stamps every write with the channel
+   it arrived on — `hook`/`mcp`/`cli` from a kernel-verified same-host UDS
+   peer's declared surface, `http` for the loopback listener, `None`
+   (unverified) for old/unknown clients — into a dedicated `origin_channel`
+   column OUTSIDE any client-writable payload field. Retrieval quarantines
+   untrusted-origin rows: they never surface in recall or the SessionStart
+   digest, but stay listed (visibly marked `[quarantined]`) — demotion,
+   never silent deletion.
+
+3. **Compaction source filtering.** The hook fold is a compaction-driven
+   write (MPBench V-P2/V-S3): scratch observations, transcript "decisions",
+   and `/compact` custom instructions all become durable memory at the
+   fold. Instruction-shaped entries — standing directives aimed at a future
+   agent — are filtered before the summary is assembled (see
+   `rb_hooks::poison`); a session whose only content is a planted directive
+   stores nothing. The fold trigger is structural (session lifecycle events
+   from the CLI host), never content length: scratch growth alone cannot
+   mint a memory. The false-positive posture is deliberate — the hook
+   channel records observations, not directives; a real convention phrased
+   imperatively can still be stored deliberately via the CLI/MCP channel.
+
 ## The opt-in HTTP listener (HTTP PRD 2026-07-02)
 
 `serve --http [bind]` (or `[http] enabled = true` in the user config) adds a

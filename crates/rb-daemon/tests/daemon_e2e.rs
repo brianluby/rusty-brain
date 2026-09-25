@@ -47,6 +47,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let daemon = Daemon::bind(cfg, embedder).await.unwrap();
@@ -558,6 +559,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
@@ -583,6 +585,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
@@ -598,6 +601,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
@@ -2201,6 +2205,7 @@ async fn retention_forget_flow_over_the_wire_respects_guards() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
     let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));

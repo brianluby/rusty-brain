@@ -139,6 +139,7 @@ pub(crate) struct HttpState {
     pub retention_policy: Option<rb_types::RetentionPolicy>,
     pub recall_counters: Arc<RecallChannelCounters>,
     pub fusion_mode: rb_engine::FusionMode,
+    pub write_gate: rb_types::WriteGateConfig,
     pub provider_model: String,
 }
 
@@ -383,6 +384,11 @@ async fn process_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -
         origin_agent: None,
         origin_source: Some("http".to_string()),
         session_id: None,
+        // Vikunja #69: HTTP peers are untrusted by construction (no
+        // kernel-verified credential over TCP). Every write on this
+        // connection carries the `http` channel tag — the tag the retrieval
+        // path quarantines.
+        channel: Some(rb_types::WriteChannel::Http),
     };
     let engine = {
         let base = MemoryEngine::new(
@@ -390,7 +396,8 @@ async fn process_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -
             state.embedder.clone(),
             namespace.clone(),
         )
-        .with_fusion_mode(state.fusion_mode);
+        .with_fusion_mode(state.fusion_mode)
+        .with_write_gate(state.write_gate.clone());
         match state.enricher.clone() {
             Some(e) => base.with_enricher(e),
             None => base,

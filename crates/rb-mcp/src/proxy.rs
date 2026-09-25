@@ -460,14 +460,23 @@ fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
         })
         .collect();
     let contested = if m.contested { " ⚠ contested" } else { "" };
+    // Vikunja #69: quarantined rows stay visible in listings (quarantine is
+    // demotion from recall/injection, never silent deletion) — and the model
+    // must SEE why before it reaches for one by id.
+    let quarantined = if m.is_quarantined() {
+        " ⛔ quarantined (untrusted origin)"
+    } else {
+        ""
+    };
     format!(
-        "[{}, imp {}, {}] {} (id {}){}",
+        "[{}, imp {}, {}] {} (id {}){}{}",
         m.memory_type.as_str(),
         m.importance,
         relative_age(m.created_at, now),
         body,
         m.id,
         contested,
+        quarantined,
     )
 }
 
@@ -698,6 +707,26 @@ mod tests {
         )
     }
 
+
+    #[test]
+    fn md_line_marks_quarantined_memories() {
+        // Vikunja #69: quarantined (untrusted-origin) rows stay listed but
+        // visibly marked — the model sees the demotion before reaching for
+        // the row by id.
+        let mut m = note();
+        m.origin_channel = Some(rb_types::WriteChannel::Http);
+        let line = memory_md_line(&m, chrono::Utc::now());
+        assert!(
+            line.contains("quarantined (untrusted origin)"),
+            "marker shown: {line}"
+        );
+
+        let clean = memory_md_line(&note(), chrono::Utc::now());
+        assert!(
+            !clean.contains("quarantined"),
+            "trusted rows unmarked: {clean}"
+        );
+    }
     #[test]
     fn build_remember_request_with_defaults() {
         let req = build_request("remember", &json!({ "content": "hello" })).unwrap();

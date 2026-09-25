@@ -395,6 +395,7 @@ mod tests {
             origin_agent: Some("cli".to_string()),
             origin_source: Some("cli".to_string()),
             session_id: None,
+            origin_channel: None,
             anchors: Vec::new(),
         }
     }
