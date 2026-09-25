@@ -7,11 +7,11 @@ contract_version = 2
 
 [wire]
 "crates/rb-proto/src/messages.rs::CONTRACT_VERSION" = "3f9208b6b23ee097c0f8177f4e0c94696a2c17f0cc02d4f3db93854566d67791"
-"crates/rb-proto/src/messages.rs::ClientIdentity" = "4c817d16fbee936cf94e023e4d4ddf9330df312bc4e3bd7ce98f0b983de35fa1"
+"crates/rb-proto/src/messages.rs::ClientIdentity" = "df5f6b27a044d45c548a0e3429088261fe240f7cb4277e5b03d73d52427b936d"
 "crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
-"crates/rb-proto/src/messages.rs::Request" = "4ea3877bcfbbc0c0a3b824baefe860629eafb07f77d1ced5e64be1ac87420926"
+"crates/rb-proto/src/messages.rs::Request" = "047d3de75f8c318383332d2dc8275df06d9d53a4b0e0b82a70b37934f76e04b5"
 "crates/rb-proto/src/messages.rs::Response" = "8eadc7e8be732b895abe42ca67222cc68e235a96404e7ce6ec0a410f7386f04b"
 "crates/rb-proto/src/messages.rs::ScrubCheckpoint" = "dfe99a03b49da585b2e26b8825493a07cb95b11c615bf1ed4b48a339ea6976cc"
 "crates/rb-proto/src/messages.rs::ScrubResult" = "89eb31711254dae32468bce07ea31c707f4fa0a6d32dfe9ca33dc4707f922918"
@@ -26,7 +26,7 @@ contract_version = 2
 "crates/rb-types/src/job.rs::JobKind" = "3a57cc7d386b30a18c67877d0e822f778a36659a4bba51dc314720dd3c84d243"
 "crates/rb-types/src/link.rs::MemoryLink" = "7e1c5377ec99d7e609c289b14fed82fa2a2c5275650bb688ea1afbe03fb37f4d"
 "crates/rb-types/src/link_type.rs::LinkType" = "2394c0b6dc86235d55ce3e3bb9b7d5d8b058672f07b1e57532930e897ca644f2"
-"crates/rb-types/src/memory.rs::MemoryNote" = "0f5817a729e3e963d6eb4c8c3d95f92217d57fd155c471a0c10afd4f2e3db8cb"
+"crates/rb-types/src/memory.rs::MemoryNote" = "99fa3eb090b9d6f87d15d923a721b84e20e099183718b8c619dbb103a6f8d84e"
 "crates/rb-types/src/memory_id.rs::MemoryId" = "688b5e41d43d9004ae80916922636c569b7dceb0e4b9ab80e1e83d9d1ed622f0"
 "crates/rb-types/src/memory_type.rs::MemoryType" = "238c3095d32261dc60d19ec7e787249c1f3a0e1bfd40917a5e670fa8e4270ac3"
 "crates/rb-types/src/namespace.rs::Namespace" = "7ba4f747be391c0b6b298ddc89b0654e92a7cd13e69f54c6debf3c01116c7c51"
@@ -35,9 +35,9 @@ contract_version = 2
 "crates/rb-types/src/query.rs::ChannelHits" = "34168a59378e913813f5c759c87925242ee72ef8a2fb107e4d460a6e87d3b298"
 "crates/rb-types/src/query.rs::MemoryState" = "62ea53a8a4e8ec3040760fb8ccb113b12d3d84c7619f9d3be88354491e544904"
 "crates/rb-types/src/query.rs::MemoryUpdates" = "06e908ddd047725e8997facef27fbf79dcba980db9c0058151ffe6834ed1cd4e"
-"crates/rb-types/src/query.rs::RecallFilter" = "e4fb4ac996e62ad354a3538b9e4e6c4f3f429e28d684d3fcabd4cf3ec0a3a017"
+"crates/rb-types/src/query.rs::RecallFilter" = "a40a6e31598e2c173707205f9d7f546650e033f961e7ca281a842628ed231302"
 "crates/rb-types/src/query.rs::SearchQuery" = "09cf14ba050d24ee74a6757b4b30eb8dd9baa81b6df9e5c1f50340f2b402197b"
-"crates/rb-types/src/query.rs::SearchResult" = "6553d26249a902d241e3377a24777ed772ab9ecb4451c708b3a34507a684b171"
+"crates/rb-types/src/query.rs::SearchResult" = "6548eb7adde3d6f30bc1a1fcc729ca39589f847919efd3ee732c30ac1b8cbda5"
 "crates/rb-types/src/retention.rs::ForgetCandidate" = "05a732f57b5fd9a4dbe8b5836f2c21a23b527fc5b94f199cfdb034949263c518"
 "crates/rb-types/src/retention.rs::ForgetMode" = "8a2683b9ca3b876f1202b32e5cd228192e2c4999ee9e9822ded82d60dbf5b290"
 "crates/rb-types/src/retention.rs::ForgetOutcome" = "6dfe661fd676d2e430c7c71a7bbd575d3b341e2d121f85938c3e437bf28e1dcc"
@@ -55,10 +55,13 @@ contract_version = 2
 "crates/rb-types/src/review.rs::ReviewReason" = "37eb2d83f358bca5209cd609f6aa41404b4e1c572049c77100553b64aba4f306"
 "crates/rb-types/src/review.rs::ReviewResolution" = "86028eeb5d8bff0514cb84c606bb62b63b933d871b80fa5fc5330c430d679b39"
 "crates/rb-types/src/review.rs::ReviewTotals" = "24036939b87eb2632d012eee8db2df6ef41a93511c2bf5c0802e2096461df8f9"
+"crates/rb-types/src/staleness.rs::RepoSnapshot" = "7e81abbfd10e4c2d94f50b99c541bfcf5e17dba14aab8ba25daa45dd32170ecc"
 "crates/rb-types/src/stats.rs::FeedbackTotals" = "ab6a1ea796d5866a566a9372536caed43217046b16245604cf41225963bbcd23"
 "crates/rb-types/src/stats.rs::GrowthBucket" = "552aa8d7fcb065ccc8275263b55fb0b5e1aad3493bbffa4e1c695bcd14174de6"
 "crates/rb-types/src/stats.rs::MemoryStats" = "ed42bc5a916a5f0ac3f939e516e89d7770cff334c8d06b033200bbcba1bc045d"
 "crates/rb-types/src/stats.rs::TopRecalled" = "8d416dd284f9995cd45563cfe7d9fa56db1ca81e211dce44e09b45e850db8dd6"
+"crates/rb-types/src/trust_class.rs::CaptureEvidence" = "9979e1e3ffe3c887d266edcb7c2acf6d248bc8b15e5e41a5ab0639a4c43f527b"
+"crates/rb-types/src/trust_class.rs::TrustClass" = "70d4abb23bd2faf014d2f321db594d0c98a72f90ecace74bcf5f8d4cd96062fa"
 "crates/rb-types/src/write_gate.rs::WriteChannel" = "5c6bb8c0f38af4f5c4cbf63ecc4467966e2fba26fce342bf48ab89b113d97a6b"
 "crates/rb-types/src/write_gate.rs::WriteGateConfig" = "ce7a28d592d6d95f022f80d24d0a095076424c1a059e06f7d68d7a9c4c7e18d6"
 "crates/rb-types/src/write_gate.rs::WriteGatePolicy" = "1d945e7e79ab643f5c74ca9cec300fa9528bc81f175ca7fe30d86b6aa7c66687"
@@ -76,6 +79,7 @@ contract_version = 2
 "009_memory_anchors.sql" = "d65aa99503a1573dfc55e65c60eb4045087e26680e2e6e426fdd6b9be1b3f6eb"
 "010_review_state.sql" = "a174de82d5ebbf75cd68e28369b1ef7ce549daa9874d5d497a5efde067b86d45"
 "011_memory_links_target_index.sql" = "0dc6147340f050df5ae3cac4f3492f6717001e9d02c9bb2a4a98db3fed8c7597"
+"012_trust_class.sql" = "468d6dbd2143ca0e002e9d2b4e573cc3dacfac52c556a9b763e2a15fb48503c3"
 "013_write_channel.sql" = "ffaf297c82976b02e0a4397913ac44f9da407b8fc12b5ceb30b1218e8adf9c6b"
 
 [[log]]
@@ -147,3 +151,8 @@ note = "Add internal EmbeddingInputFingerprint for reembed optimistic concurrenc
 contract_version = 2
 intent = "additive"
 note = "Vikunja #69: MemoryNote gains optional origin_channel (daemon-stamped write-channel trust tag); new rb-types write_gate module (WriteChannel, WriteGatePolicy/Config, WriteRejection, validate_write)"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "Vikunja #63: MemoryNote gains trust_class (daemon-derived, backfilled agent_attested); SearchResult gains stale; RecallFilter gains trust_classes; ClientIdentity gains optional cwd; Remember frame gains optional evidence (CaptureEvidence); new TrustClass ladder + RepoSnapshot"

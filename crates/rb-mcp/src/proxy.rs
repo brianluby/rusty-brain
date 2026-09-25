@@ -268,6 +268,10 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 // (W3.1) is driven by the hook capture path, not this tool.
                 supersedes: None,
                 anchors: parse_capture_anchors(args)?,
+                // The MCP tool surface is agent-authored: no evidence, no
+                // class — the write lands at the channel's context default
+                // (`agent_attested`) like every plain tool write.
+                evidence: None,
             })
         }
         "recall" => Ok(Request::Recall {
@@ -1392,7 +1396,8 @@ mod tests {
                     memory: note(),
                     score: 0.5,
                     channels: rb_types::ChannelHits::default(),
-                }],
+            stale: false,
+        }],
                 degraded: false,
             },
             now,
@@ -1476,7 +1481,8 @@ mod tests {
                     memory: contested,
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-                }],
+            stale: false,
+        }],
                 degraded: false,
             },
             Utc::now(),
@@ -1524,7 +1530,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-                }],
+            stale: false,
+        }],
                 degraded: false,
             },
             Utc::now(),
@@ -1546,7 +1553,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-                }],
+            stale: false,
+        }],
                 degraded: true,
             },
             Utc::now(),

@@ -360,10 +360,11 @@ impl SqliteStore {
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, origin_channel,
                         session_id,
-                        base_importance
+                        base_importance, trust_class
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
-                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26
+                        ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
+                        ?26, ?27
                      )",
                 rusqlite::params![
                     note.id.to_string(),
@@ -398,6 +399,9 @@ impl SqliteStore {
                     // insert; the recalibration job never writes it, so the
                     // bounded-delta formula stays anchored to author intent.
                     note.importance as i64,
+                    // Trust-class ladder (Vikunja #63): the daemon-derived
+                    // tier; the SQL CHECK is the storage backstop.
+                    note.trust_class.as_str(),
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -734,6 +738,9 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
             .map_err(|e| Error::Storage(e.to_string()))?,
         session_id: go("session_id")?,
         anchors,
+        // Trust-class ladder (Vikunja #63): NOT NULL since migration 012;
+        // pre-ladder rows read their backfilled `agent_attested`.
+        trust_class: rb_types::TrustClass::parse(&g("trust_class")?)?,
     })
 }
 /// Build a safe FTS5 MATCH expression from raw user text (W1.2).
@@ -810,7 +817,7 @@ fn build_list_filtered_query(
                 related_files, access_count, last_accessed_at, archived_at,
                 superseded_by, embedding_model, embedding_input_version,
                 origin_user, origin_host, origin_agent, origin_source, session_id,
-                origin_channel
+                origin_channel, trust_class
          FROM memories m
          WHERE m.namespace = ?1",
     );
@@ -909,6 +916,24 @@ fn build_list_filtered_query(
         ));
         for s in &filter.sources {
             params.push(Box::new(s.clone()));
+        }
+    }
+    if !filter.trust_classes.is_empty() {
+        // Any-of over the canonical db strings, one placeholder per class —
+        // the exact SQL form of the `types` filter above. `trust_class` is
+        // NOT NULL since migration 012, so every row matches an IN probe.
+        // Kept in lockstep with `RecallFilter::matches` by the
+        // `trust_class_filter_agrees_with_recall_filter_matches` drift test.
+        let start = params.len() + 1;
+        let placeholders: Vec<String> = (0..filter.trust_classes.len())
+            .map(|i| format!("?{}", start + i))
+            .collect();
+        sql.push_str(&format!(
+            " AND m.trust_class IN ({})",
+            placeholders.join(", ")
+        ));
+        for class in &filter.trust_classes {
+            params.push(Box::new(class.as_str().to_string()));
         }
     }
     for tag in &filter.tags {
@@ -1089,7 +1114,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel
+                        origin_channel, trust_class
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1668,7 +1693,7 @@ impl Store for SqliteStore {
                     related_files, access_count, last_accessed_at, archived_at,
                     superseded_by, embedding_model, embedding_input_version,
                     origin_user, origin_host, origin_agent, origin_source, session_id,
-                    origin_channel
+                    origin_channel, trust_class
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -1763,7 +1788,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel
+                        origin_channel, trust_class
                  FROM memories
                  WHERE archived_at IS NULL
                    AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
@@ -3578,6 +3603,79 @@ mod list_filtered_tests {
             assert_eq!(
                 sql_ids, matches_ids,
                 "SQL anchor predicate must agree with RecallFilter::matches for {filter:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn insert_persists_and_reads_back_the_trust_class() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        for class in rb_types::TrustClass::all() {
+            let mut m =
+                MemoryNote::new(ns(), "trust ladder round trip".into(), MemoryType::Insight, 5);
+            m.trust_class = class;
+            store.insert_memory(&m, None).unwrap();
+            let back = store.get_memory(&m.id).unwrap().expect("row exists");
+            assert_eq!(back.trust_class, class, "{}", class.as_str());
+            // The db string is exactly the ladder vocabulary (migration 012
+            // CHECK lockstep).
+            let db: String = store
+                .conn
+                .query_row(
+                    "SELECT trust_class FROM memories WHERE memory_id = ?1",
+                    rusqlite::params![m.id.to_string()],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert_eq!(db, class.as_str());
+        }
+    }
+
+    #[test]
+    fn trust_class_filter_agrees_with_recall_filter_matches() {
+        // Drift guard (the anchor-filter pattern): the SQL `trust_class IN`
+        // predicate in `list_filtered` and `RecallFilter::matches` are two
+        // expressions of ONE any-of semantics. If either changes alone, this
+        // fails.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut inserted = Vec::new();
+        for (i, class) in rb_types::TrustClass::all().into_iter().enumerate() {
+            let mut m = MemoryNote::new(ns(), format!("trust variant {i}"), MemoryType::Insight, 5);
+            m.created_at -= chrono::Duration::seconds(i as i64);
+            m.trust_class = class;
+            store.insert_memory(&m, None).unwrap();
+            inserted.push(m);
+        }
+        let filters = vec![
+            RecallFilter {
+                trust_classes: vec![rb_types::TrustClass::MeasuredCi],
+                ..Default::default()
+            },
+            RecallFilter {
+                trust_classes: vec![
+                    rb_types::TrustClass::MeasuredLocal,
+                    rb_types::TrustClass::AgentAttested,
+                ],
+                ..Default::default()
+            },
+            RecallFilter {
+                trust_classes: rb_types::TrustClass::all().to_vec(),
+                ..Default::default()
+            },
+        ];
+        for filter in filters {
+            let sql_ids: std::collections::HashSet<_> =
+                ids(&store.list_filtered(&ns(), &filter, 100).unwrap())
+                    .into_iter()
+                    .collect();
+            let matches_ids: std::collections::HashSet<_> = inserted
+                .iter()
+                .filter(|m| filter.matches(m))
+                .map(|m| m.id.clone())
+                .collect();
+            assert_eq!(
+                sql_ids, matches_ids,
+                "SQL trust_class predicate must agree with RecallFilter::matches for {filter:?}"
             );
         }
     }

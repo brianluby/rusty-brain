@@ -142,6 +142,9 @@ fn run() -> serde_json::Value {
         agent: Some(cli.id().as_str().to_string()),
         session_id: ctx.session_id.clone(),
         source: Some("hook".to_string()),
+        // Vikunja #63: the hook's cwd is the repo the session is working in;
+        // the daemon snapshots its git state once for staleness evaluation.
+        cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
         ..Default::default()
     };
 

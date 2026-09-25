@@ -452,6 +452,7 @@ pub async fn store_items(
                 None,
                 item.anchors.clone(),
                 None,
+                None,
             )
             .await
         {

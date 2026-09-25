@@ -38,3 +38,4 @@ pub use namespace::detect_namespace;
 pub use omp::OmpCli;
 pub use opencode::OpenCodeCli;
 pub use proc::run_git_bounded;
+pub use proc::run_git_status_bounded;

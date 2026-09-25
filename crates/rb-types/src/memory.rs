@@ -3,6 +3,7 @@ use crate::link::MemoryLink;
 use crate::memory_id::MemoryId;
 use crate::memory_type::MemoryType;
 use crate::namespace::Namespace;
+use crate::trust_class::TrustClass;
 use serde::{Deserialize, Serialize};
 
 /// A single unit of memory: content plus enrichment, metadata, and links.
@@ -75,6 +76,14 @@ pub struct MemoryNote {
     /// NO CONTRACT_VERSION bump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<MemoryAnchor>,
+    /// Evidence-derived trust tier (Vikunja #63 trust ladder): what backs
+    /// this memory, as DERIVED by the daemon from channel-substantiatable
+    /// evidence — never a caller-declared field. `#[serde(default)]` so
+    /// pre-ladder payloads (and rows read by old clients) decode to
+    /// [`TrustClass::AgentAttested`], the same value migration 012 backfills
+    /// legacy rows with, so old payloads and old rows agree.
+    #[serde(default)]
+    pub trust_class: TrustClass,
 }
 
 impl MemoryNote {
@@ -117,6 +126,9 @@ impl MemoryNote {
             origin_channel: None,
             session_id: None,
             anchors: Vec::new(),
+            // The conservative pre-evidence default; the daemon's derivation
+            // overwrites it before any durable write.
+            trust_class: TrustClass::default(),
         }
     }
 

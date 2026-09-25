@@ -919,12 +919,14 @@ fn stocked_corpus() -> MockCorpus {
                 memory: tip,
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
-            },
+            stale: false,
+        },
             rb_types::SearchResult {
                 memory: disputed,
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
-            },
+            stale: false,
+        },
         ],
     }
 }

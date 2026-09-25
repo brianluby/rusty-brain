@@ -18,6 +18,7 @@ fn public_surface_is_reachable_and_stable() {
         agent: Some("claude-code".into()),
         session_id: Some("s-1".into()),
         source: Some("cli".into()),
+        cwd: None,
     };
     let _hs = Handshake {
         contract_version: CONTRACT_VERSION,
@@ -41,6 +42,7 @@ fn public_surface_is_reachable_and_stable() {
         confidence: Some(0.7),
         supersedes: Some(MemoryId::new()),
         anchors: vec![],
+        evidence: None,
     };
 
     // Error mapping helpers, round-tripping through the wire form.

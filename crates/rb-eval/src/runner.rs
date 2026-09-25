@@ -172,6 +172,7 @@ async fn ingest<P: EmbeddingProvider>(
                 confidence: None,
                 provenance: Default::default(),
                 anchors: Vec::new(),
+                trust_class: None,
             })
             .await?;
         // Apply the authored confidence (no-op at the 1.0 default).
