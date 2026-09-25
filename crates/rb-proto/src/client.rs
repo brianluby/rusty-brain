@@ -234,6 +234,7 @@ where
             confidence,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -257,6 +258,7 @@ where
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Result<MemoryId> {
         self.ensure_anchor_capable(!anchors.is_empty())?;
         for anchor in &anchors {
@@ -273,6 +275,7 @@ where
             confidence,
             anchors,
             supersedes,
+            evidence,
         )
         .await
     }
@@ -306,6 +309,7 @@ where
             confidence,
             Vec::new(),
             Some(supersedes),
+            None,
         )
         .await
     }
@@ -323,6 +327,7 @@ where
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
         // with the same error class the daemon would round-trip back. None
@@ -346,6 +351,7 @@ where
                 confidence,
                 supersedes,
                 anchors,
+                evidence,
             })
             .await?;
         match resp {
@@ -1088,6 +1094,7 @@ mod wrapper_tests {
                             memory: note(),
                             score: 0.5,
                             channels: rb_types::ChannelHits::default(),
+                            stale: false,
                         }]
                     };
                     // Filter-parity probes: a hit comes back ONLY when the
@@ -1482,6 +1489,7 @@ mod wrapper_tests {
                 None,
                 vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()],
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1505,6 +1513,7 @@ mod wrapper_tests {
                 vec![],
                 None,
                 vec![],
+                None,
                 None,
             )
             .await
@@ -1550,6 +1559,7 @@ mod wrapper_tests {
                     rb_types::MemoryAnchor::new(AnchorKind::Symbol, "Foo::bar").unwrap(),
                 ],
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1590,6 +1600,7 @@ mod wrapper_tests {
                     start_line: Some(1),
                     end_line: None,
                 }],
+                None,
                 None,
             )
             .await

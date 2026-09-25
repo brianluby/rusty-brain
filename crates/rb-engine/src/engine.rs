@@ -39,7 +39,18 @@ pub struct RememberInput {
     /// links stored with the memory. Validated fail-closed; empty is the
     /// pre-anchor behavior (anchors are never required).
     pub anchors: Vec<rb_types::MemoryAnchor>,
+    /// Pre-derived trust class (Vikunja #63 trust ladder). `None` keeps the
+    /// conservative context-only default for the channel
+    /// ([`rb_types::TrustClass::context_default`]). The DAEMON passes `Some`
+    /// only after validating capture evidence server-side
+    /// (`rb_types::derive_trust_class`) — the no-self-promotion rule. This is
+    /// an in-process API, not a wire field: untrusted callers can never state
+    /// a class, only evidence, and only the daemon maps one to the other.
+    /// Daemon-internal continuity paths (the review merge) carry the strongest
+    /// member's already-derived class rather than re-deriving from nothing.
+    pub trust_class: Option<rb_types::TrustClass>,
 }
+
 
 /// What `recall_with_status` returns (W1.6d): the ranked results plus whether
 /// retrieval DEGRADED to keyword + graph because the embedder errored. The
@@ -100,6 +111,11 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     /// it, so (now - created_at) deltas are reproducible across runs instead
     /// of riding the wall clock. `None` (production) uses `Utc::now()`.
     fixed_now: Option<chrono::DateTime<chrono::Utc>>,
+    /// Repository-state provider for state-bound staleness (Vikunja #63):
+    /// when set, recall compares each result's commit anchors against the
+    /// provider's snapshot and annotates `SearchResult.stale`. `None` (the
+    /// default for engine-only callers) disables staleness claims entirely.
+    repo_state: Option<Arc<dyn crate::repo_state::RepoStateProvider>>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -120,7 +136,18 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             write_gate: rb_types::WriteGateConfig::default(),
             score_floor: rb_search::SCORE_FLOOR,
             fixed_now: None,
+            repo_state: None,
         }
+    }
+
+    /// Wire a repository-state provider for state-bound staleness (Vikunja
+    /// #63). See the `repo_state` field docs.
+    pub fn with_repo_state_provider(
+        mut self,
+        provider: Arc<dyn crate::repo_state::RepoStateProvider>,
+    ) -> Self {
+        self.repo_state = Some(provider);
+        self
     }
 
     /// Pin the engine's clock (eval/test determinism): `remember` stamps
@@ -284,6 +311,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             anchor.validate()?;
         }
 
+        // Derive the trust class BEFORE any field of `input` is moved into
+        // the note: the daemon's pre-derived class when present, else the
+        // channel's context-only default (Vikunja #63).
+        let trust_class = input.trust_class.unwrap_or_else(|| {
+            rb_types::TrustClass::context_default(input.provenance.origin_source.as_deref())
+        });
         let mut note = MemoryNote::new(
             self.namespace.clone(),
             input.content,
@@ -328,6 +361,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             Some(s) => s,
             None => default_summary(&note.content),
         };
+        // Trust-class ladder (Vikunja #63): the class is pre-derived by the
+        // daemon's evidence validation when the write came through one;
+        // engine-direct callers keep the conservative context-only default
+        // for their channel (an in-process caller cannot submit evidence).
+        note.trust_class = trust_class;
         note.keywords = if !input.keywords.is_empty() {
             input.keywords
         } else if let Some(en) = enrichment.as_ref().filter(|e| !e.keywords.is_empty()) {
@@ -640,6 +678,17 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 *score *= SESSION_PROVENANCE_SCORE_MULTIPLIER;
             }
         }
+        // Trust-class ladder (Vikunja #63): the class is a multiplicative
+        // prior like the session-provenance one — measured/human-confirmed
+        // evidence outranks otherwise-identical agent-attested rows, and the
+        // admission floor below scales by the same factor so the prior
+        // reorders but never raises the bar (the session-multiplier
+        // precedent; see `TrustClass::score_multiplier`).
+        for (id, score) in &mut ranked {
+            if let Some(note) = notes.get(id) {
+                *score *= note.trust_class.score_multiplier();
+            }
+        }
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Assemble source-adjusted results in ranked order, truncating to
@@ -652,6 +701,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             FusionMode::Rrf => f32::NEG_INFINITY,
         };
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
+        // One repo-state read per recall (Vikunja #63): implementations may
+        // shell out to git; never per-result.
+        let repo_snapshot = self.repo_state.as_ref().and_then(|p| p.snapshot());
+        let repo_snapshot = repo_snapshot.as_ref();
         for (id, score) in ranked {
             let Some(note) = notes.get(&id) else {
                 continue;
@@ -667,16 +720,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 floor.min(DURABLE_KEYWORD_SCORE_FLOOR)
             } else {
                 floor
-            };
+            } * note.trust_class.score_multiplier();
             if score < candidate_floor {
                 // Source-aware candidate floors mean a lower-ranked durable
                 // keyword hit may still qualify; do not stop at this row.
                 continue;
-            };
+            }
+            // State-bound staleness (Vikunja #63): a commit-anchored memory
+            // whose evidence no longer matches HEAD/worktree reports STALE
+            // on the result — never silently injected as current. With no
+            // provider (direct engine callers) staleness stays `false`.
+            let stale = rb_types::evaluate_staleness(&note.anchors, repo_snapshot);
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
                 channels: channel_map.get(&id).copied().unwrap_or_default(),
+                stale,
             });
             if results.len() == limit {
                 break;
@@ -1104,6 +1163,9 @@ mod tests {
             confidence: None,
             provenance: Provenance::default(),
             anchors: Vec::new(),
+            // Direct engine caller: no daemon-derivation, the compose seam
+            // applies the channel's context default (agent_attested).
+            trust_class: None,
         }
     }
 
@@ -3386,6 +3448,92 @@ mod tests {
     }
 
     // ---- Vikunja #69: channel stamping + retrieval quarantine -------------
+
+    // ---- Vikunja #63: trust ladder + state-bound staleness ---------------
+
+    #[tokio::test]
+    async fn measured_memory_outranks_identical_agent_attested_one() {
+        // Gate criterion (Vikunja #63): on the same query, otherwise
+        // IDENTICAL memories rank by evidence class — measured over attested.
+        let eng = engine();
+        let ids = seed_notes(&eng, 2, |i, note| {
+            // Identical content for both: class is the ONLY differentiator.
+            note.content = "identical rank probe kata statement".to_string();
+            note.summary = "identical rank probe kata statement".to_string();
+            note.trust_class = if i == 0 {
+                rb_types::TrustClass::AgentAttested
+            } else {
+                rb_types::TrustClass::MeasuredCi
+            };
+        })
+        .await;
+        let results = eng
+            .recall("identical rank probe kata", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(results.len(), 2, "both admitted: the floor scales with the prior");
+        assert_eq!(
+            results[0].memory.id, ids[1],
+            "the measured_ci row must rank above the agent_attested row"
+        );
+        assert_eq!(results[1].memory.id, ids[0]);
+    }
+
+    #[tokio::test]
+    async fn commit_anchored_memory_reports_stale_once_head_moves() {
+        // Gate criterion (Vikunja #63): anchored evidence never silently
+        // injects as current — once HEAD moves past the anchor, the result
+        // is marked STALE.
+        use rb_types::{MemoryAnchor, RepoSnapshot};
+        let anchored = MemoryAnchor::new(rb_types::AnchorKind::Commit, "aaaaaaaa").unwrap();
+        let snapshot = |head: Option<&str>, clean: bool| {
+            Some(RepoSnapshot {
+                head: head.map(str::to_string),
+                clean_worktree: clean,
+            })
+        };
+
+        let seed = || async {
+            let eng = engine();
+            let mut inp = input("anchored stale probe decision", 5);
+            inp.anchors = vec![anchored.clone()];
+            let id = eng.remember(inp).await.unwrap();
+            (eng, id)
+        };
+
+        // HEAD == anchor, clean worktree: current, not stale.
+        let (eng, id) = seed().await;
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(
+            crate::FixedRepoState::new(snapshot(Some("aaaaaaaa"), true)),
+        ));
+        let results = eng
+            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(!hit.stale, "on-anchor + clean = current");
+
+        // HEAD moved past the anchor: STALE, surfaced on the result.
+        let (eng, id) = seed().await;
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(
+            crate::FixedRepoState::new(snapshot(Some("bbbbbbbb"), true)),
+        ));
+        let results = eng
+            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(hit.stale, "moved HEAD must mark the anchored memory stale");
+
+        // No provider at all: staleness claims are OFF (never guessed).
+        let (eng, id) = seed().await;
+        let results = eng
+            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(!hit.stale, "no provider = no staleness claim");
+    }
 
     #[tokio::test]
     async fn provenance_channel_lands_on_the_stored_note() {

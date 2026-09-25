@@ -396,6 +396,7 @@ mod tests {
             origin_source: Some("cli".to_string()),
             session_id: None,
             origin_channel: None,
+            trust_class: rb_types::TrustClass::AgentAttested,
             anchors: Vec::new(),
         }
     }

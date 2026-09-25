@@ -84,6 +84,7 @@ impl DaemonClient {
             confidence,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -112,6 +113,7 @@ impl DaemonClient {
             confidence,
             Vec::new(),
             Some(supersedes),
+            None,
         )
         .await
     }
@@ -132,6 +134,7 @@ impl DaemonClient {
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Option<MemoryId> {
         let anchors = if anchors.is_empty() || self.client.supports_anchors() {
             anchors
@@ -153,6 +156,7 @@ impl DaemonClient {
             confidence,
             anchors,
             supersedes,
+            evidence,
         );
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(id)) => Some(id),
@@ -345,7 +349,8 @@ mod tests {
                 Some(0.7),
                 anchors.clone(),
                 None,
-            )
+            None,
+        )
             .await
             .expect("anchored remember must return an id");
         let (recent, important, _total) = client.context().await.expect("context");

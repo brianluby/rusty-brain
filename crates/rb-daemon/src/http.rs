@@ -429,6 +429,11 @@ enum BodyKind {
     Tagged(&'static str),
 }
 
+// `Request` grew with the additive `Remember.evidence` field (Vikunja #63);
+// the enum has exactly two variants and `Body` is tiny, so the size
+// difference is the wire struct's own — boxing `Op` would add an allocation
+// to every routed request for no benefit.
+#[allow(clippy::large_enum_variant)]
 enum Routed {
     /// A complete `Request` needing no body.
     Op(Request),

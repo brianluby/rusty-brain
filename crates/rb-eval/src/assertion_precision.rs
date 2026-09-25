@@ -175,6 +175,7 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
                     confidence: Some(1.0),
                     provenance: Provenance::default(),
                     anchors: Vec::new(),
+                    trust_class: None,
                 })
                 .await?;
             // Compose uses real heuristic enrichment + production document embeddings.

@@ -43,6 +43,13 @@ pub struct ClientIdentity {
     /// Producer surface, declared per binary: `hook` | `mcp` | `cli`.
     #[serde(default)]
     pub source: Option<String>,
+    /// The client's working directory (Vikunja #63), when known — the repo
+    /// context the client is operating in. The daemon snapshots its git
+    /// state ONCE per connection (bounded) to evaluate state-bound staleness
+    /// of commit-anchored memories; it never reaches the stored record body.
+    /// Additive + `#[serde(default)]`: old clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Capability string a daemon advertises when it evaluates typed code
@@ -117,6 +124,17 @@ pub enum Request {
         /// (see `Client::remember_anchored`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         anchors: Vec<rb_types::MemoryAnchor>,
+        /// Verifiable capture evidence backing the write (Vikunja #63).
+        /// The ONLY trust-related thing a caller may put on the wire — never
+        /// a class. The daemon gates each evidence kind against the channel
+        /// that can substantiate it (`rb_types::derive_trust_class`) and
+        /// derives the stored `trust_class` server-side; an unsubstantiatable
+        /// claim is a hard rejection. Additive + `#[serde(default,
+        /// skip_serializing_if)]`: byte-identical wire for old clients and
+        /// evidence-less writes — no CONTRACT_VERSION bump (the `confidence`
+        /// precedent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<rb_types::CaptureEvidence>,
     },
     Recall {
         query: String,
@@ -606,6 +624,7 @@ mod tests {
                 agent: Some("claude-code".into()),
                 session_id: Some("s-1".into()),
                 source: Some("hook".into()),
+                cwd: None,
             }),
         };
         let json = serde_json::to_string(&hs).unwrap();
@@ -669,6 +688,7 @@ mod tests {
             confidence: Some(0.3),
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         // Some(x) serializes the key and round-trips back to Some(x).
         let json = serde_json::to_value(&explicit).unwrap();
@@ -706,6 +726,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -731,6 +752,7 @@ mod tests {
             confidence: None,
             supersedes: Some(old.clone()),
             anchors: vec![],
+            evidence: None,
         };
         // Some(id) serializes the key and round-trips back to the same id.
         let json = serde_json::to_value(&explicit).unwrap();
@@ -765,6 +787,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -850,6 +873,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs:2-4").unwrap()],
+            evidence: None,
         };
         let json = serde_json::to_value(&explicit).unwrap();
         assert!(
@@ -885,6 +909,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -925,6 +950,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("a.rs").unwrap()],
+            evidence: None,
         }));
         // Anchor-free frames are never flagged.
         assert!(!request_uses_anchors(&Request::Recall {
@@ -951,7 +977,8 @@ mod tests {
                 confidence: Some(0.7),
                 supersedes: Some(id.clone()),
                 anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/lib.rs:3-9").unwrap()],
-            },
+            evidence: None,
+        },
             Request::Recall {
                 query: "q".into(),
                 memory_type: Some(MemoryType::BugFix),
@@ -1066,7 +1093,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-                }],
+            stale: false,
+        }],
                 degraded: false,
             },
             Response::Recalled {

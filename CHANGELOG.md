@@ -26,6 +26,29 @@ All notable changes to rusty-brain are documented here. The format is based on
   never content length. Capability tests prove a planted payload never lands.
 - `docs/THREAT_MODEL.md` documents the three-layer write-path defense.
 
+
+### Added — Memory trust-class ladder with state-bound staleness (#63)
+
+- `trust_class` ladder (`measured_ci > measured_local > human_confirmed >
+  agent_attested > inferred_activity`) on every memory (migration 012;
+  legacy rows backfill to `agent_attested`), with a documented ranking
+  multiplier and a recall filter dimension on the wire.
+- No self-promotion: callers may state only `CaptureEvidence` on the wire —
+  never a class. The daemon derives the class per channel: `hook` can claim
+  `measured_local` only for commands it observed (the session fold does
+  exactly that); `cli` (the human's typed surface) can claim `measured_ci`
+  (requires a `--commit` anchor) or `human_confirmed` via
+  `rb remember --evidence-ci/--evidence-confirmed`. Everything else is a
+  hard rejection.
+- State-bound staleness: clients declare their working directory; the
+  daemon snapshots its git state once per connection (bounded, fail-open).
+  Commit-anchored memories whose state moved past them return `stale: true`
+  and inject with an explicit `[stale]` marker — never silently reused as
+  current.
+- Every injected memory line carries its class (`· trust=<class>`) inside
+  the single provenance bracket; the CLI/MCP surfaces expose `trust_class`.
+- `docs/THREAT_MODEL.md` documents the ladder and its scope.
+
 ### Added — Native OMP extension
 
 - Project-local `rusty-brain-install --agents omp` installation, status, dry-run

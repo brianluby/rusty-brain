@@ -50,6 +50,7 @@ fn build_recall_filter(
     anchors: Vec<rb_types::AnchorFilter>,
 ) -> rb_types::RecallFilter {
     rb_types::RecallFilter {
+        trust_classes: Vec::new(),
         types: memory_type.into_iter().collect(),
         tags,
         min_importance,
@@ -365,6 +366,8 @@ async fn run_client(
             commit,
             symbol,
             batch,
+            evidence_ci,
+            evidence_confirmed,
         } => {
             // Typed code anchors: parse-validated per flag; one flat list on
             // the wire. Applied uniformly in --batch mode (like --tags).
@@ -397,6 +400,7 @@ async fn run_client(
                             None,
                             anchors.clone(),
                             None,
+                            None,
                         )
                         .await
                         .with_context(|| {
@@ -419,6 +423,21 @@ async fn run_client(
                 let supersedes = supersedes
                     .map(|old| parse_id(&old).context("--supersedes must be a memory UUID"))
                     .transpose()?;
+                // Evidence (Vikunja #63): the CLI is the human's typed
+                // surface — it may claim a CI measurement (requires a
+                // commit anchor, enforced daemon-side) or a human
+                // confirmation. Batch mode plants raw facts and carries no
+                // evidence.
+                let evidence: Option<rb_types::CaptureEvidence> = if let Some(run_ref) =
+                    evidence_ci
+                {
+                    Some(rb_types::CaptureEvidence::MeasuredCi { run_ref })
+                } else {
+                    // `Some(None)` = bare flag (human confirmed, no
+                    // attribution); `Some(Some(by))` names who.
+                    evidence_confirmed
+                        .map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
+                };
                 let id = client
                     .remember_anchored(
                         content,
@@ -431,6 +450,7 @@ async fn run_client(
                         None,
                         anchors,
                         supersedes,
+                        evidence,
                     )
                     .await
                     .context("remember failed")?;

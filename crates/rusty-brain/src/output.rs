@@ -1029,6 +1029,7 @@ mod tests {
             memory: n.clone(),
             score: 0.91,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("0.91"), "score shown: {out}");
@@ -1047,6 +1048,7 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
@@ -1060,6 +1062,7 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1097,6 +1100,7 @@ mod tests {
             memory: n,
             score: 0.5,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();

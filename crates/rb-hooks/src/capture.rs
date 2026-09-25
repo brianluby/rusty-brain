@@ -571,10 +571,17 @@ fn memory_line(memory: &rb_types::MemoryNote, max_chars: usize) -> String {
     // The marker sits OUTSIDE the provenance bracket (its own bracket, fixed
     // text) so a hostile provenance value can never spoof or suppress it.
     let contested = if memory.contested { "[contested]" } else { "" };
+    // Trust-class ladder (Vikunja #63): every injected line carries its class
+    // so the model can weigh measured/human-confirmed evidence above
+    // agent-attested context. Rendered INSIDE the single provenance bracket
+    // (no additional brackets: the one-bracket-per-line frame invariant
+    // below keeps content from forging structure). Fixed enum text.
+    let trust = format!(" · trust={}", memory.trust_class.as_str());
     format!(
-        "[{}{}]{} \"{}{}\"",
+        "[{}{}{}]{} \"{}{}\"",
         memory.memory_type.as_str(),
         provenance_label(memory),
+        trust,
         contested,
         frame_quoted(shown),
         ellipsis
@@ -728,9 +735,15 @@ fn format_user_prompt_submit(results: &[SearchResult]) -> Option<String> {
     out.push_str("# Rusty Brain — Memories relevant to this prompt\n");
     out.push_str(UNTRUSTED_DATA_FRAME);
     for r in results.iter().take(RECALL_INJECT_LIMIT) {
+        // State-bound staleness (Vikunja #63): a commit-anchored memory
+        // whose repo state moved past it is still SHOWN (it may hold
+        // relevant history) but explicitly marked — never silently injected
+        // as current. Fixed marker text; content cannot forge it.
+        let stale = if r.stale { "[stale]" } else { "" };
         out.push_str(&format!(
-            "- {}\n",
-            memory_line(&r.memory, RECALL_LINE_CHARS)
+            "- {}{}\n",
+            memory_line(&r.memory, RECALL_LINE_CHARS),
+            stale
         ));
     }
     Some(out)
@@ -910,8 +923,14 @@ async fn fold_session_summary(
     let Some(client) = client else {
         return continue_only();
     };
-    if let Some(new_id) =
-        store_session_summary(client, content, data.prior_summary_id.as_deref(), anchors).await
+    if let Some(new_id) = store_session_summary(
+        client,
+        content,
+        data.prior_summary_id.as_deref(),
+        anchors,
+        data.commands.clone(),
+    )
+    .await
     {
         let new_id = new_id.to_string();
         match mode {
@@ -963,11 +982,12 @@ async fn store_session_summary(
     content: String,
     prior_summary_id: Option<&str>,
     anchors: Vec<rb_types::MemoryAnchor>,
+    observed_commands: Vec<String>,
 ) -> Option<MemoryId> {
     let tags = vec!["hook".to_string(), "session-summary".to_string()];
     // A non-None id that fails to parse is a (rare) corrupt scratch: log it and
-    // degrade to a plain store. The prior summary may then go un-superseded — the
-    // hook near-dup backstop and the consolidation job remain the safety nets.
+    // degrade to a plain store. The prior summary may then go un-superseded —
+    // the hook near-dup backstop and the consolidation job remain the safety nets.
     let prior = prior_summary_id.and_then(|s| {
         MemoryId::from_str(s)
             .map_err(|e| {
@@ -975,6 +995,20 @@ async fn store_session_summary(
             })
             .ok()
     });
+    // Trust-class ladder (Vikunja #63): when the fold carries commands THIS
+    // hook observed executing, the summary is machine-measured evidence
+    // (`measured_local`) — the strongest class the hook channel can
+    // substantiate, and it can only state it because the observations are its
+    // own. Without observed commands the write lands at the channel's honest
+    // default (`agent_attested`). The daemon re-checks the channel before
+    // accepting the class; evidence never carries a class itself.
+    let evidence = if observed_commands.is_empty() {
+        None
+    } else {
+        Some(rb_types::CaptureEvidence::MeasuredLocal {
+            commands: observed_commands,
+        })
+    };
     client
         .remember_anchored(
             content,
@@ -985,6 +1019,7 @@ async fn store_session_summary(
             Some(HOOK_CONFIDENCE),
             anchors,
             prior,
+            evidence,
         )
         .await
 }
@@ -1089,7 +1124,9 @@ mod tests {
     /// supersedes) it received, and the id it issued back, in order.
     #[derive(Default)]
     struct MockObserved {
-        remembers: Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
+        remembers:
+            Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
+        evidence: Vec<Option<rb_types::CaptureEvidence>>,
         issued: Vec<MemoryId>,
     }
 
@@ -1124,11 +1161,13 @@ mod tests {
                     content,
                     supersedes,
                     anchors,
+                    evidence,
                     ..
                 } => {
                     let id = MemoryId::new();
                     let mut s = state.lock().unwrap();
                     s.remembers.push((content, supersedes, anchors));
+                    s.evidence.push(evidence);
                     s.issued.push(id.clone());
                     Response::Remembered { id }
                 }
@@ -1917,6 +1956,7 @@ mod tests {
             memory: tip,
             score: 0.4,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }])
         .expect("non-empty hits");
         for (channel, msg) in [("SessionStart", digest), ("UserPromptSubmit", recall)] {
@@ -1956,6 +1996,7 @@ mod tests {
             memory: poisoned,
             score: 0.9,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }])
         .expect("non-empty hits");
         for (channel, msg) in [("SessionStart", digest), ("UserPromptSubmit", recall)] {
@@ -2012,12 +2053,14 @@ mod tests {
                 memory: disputed,
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
-            },
+            stale: false,
+        },
             SearchResult {
                 memory: clean,
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
-            },
+            stale: false,
+        },
         ])
         .expect("non-empty hits");
         for (channel, msg) in [("SessionStart", digest), ("UserPromptSubmit", recall)] {
@@ -2232,6 +2275,7 @@ mod tests {
             memory: sample_note(content, importance),
             score: 0.9,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }
     }
 
@@ -2822,6 +2866,58 @@ mod tests {
         let observed = state.lock().unwrap();
         assert_eq!(observed.remembers.len(), 1);
         assert!(observed.remembers[0].0.contains("write gate #69"));
+
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn fold_with_observed_commands_claims_measured_local_evidence() {
+        // Trust ladder (Vikunja #63): a fold whose scratch carries commands
+        // THIS hook observed sends `MeasuredLocal` evidence (the strongest
+        // class the hook channel can substantiate — and only because the
+        // observations are its own). A fold with no observed commands sends
+        // NO evidence: it lands at the channel's honest `agent_attested`
+        // default instead. The daemon re-checks the channel against the
+        // evidence kind; no hook path can claim a class it cannot back.
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let state = Arc::new(Mutex::new(MockObserved::default()));
+        let server = tokio::spawn(serve_remembers(listener, Arc::clone(&state)));
+
+        let mut client = DaemonClient::connect(
+            &socket,
+            Namespace::Project("rb-evidence-test".into()),
+            Duration::from_secs(5),
+            None,
+            None,
+        )
+        .await
+        .expect("connect to the mock daemon");
+
+        // Fold #1: observed commands present → MeasuredLocal evidence.
+        let scratch = scratch_at(tmp.path());
+        scratch.append(scratch::Kind::Command, "cargo test -p rb-store");
+        session_end(Some(&mut client), Some(&scratch), tmp.path(), None).await;
+        // Fold #2: only files observed → no evidence.
+        let scratch2 = scratch_at(&tmp.path().join("second"));
+        std::fs::create_dir_all(tmp.path().join("second")).unwrap();
+        scratch2.append(scratch::Kind::File, "src/lib.rs");
+        session_end(Some(&mut client), Some(&scratch2), tmp.path(), None).await;
+
+        let observed = state.lock().unwrap();
+        assert_eq!(observed.evidence.len(), 2);
+        match &observed.evidence[0] {
+            Some(rb_types::CaptureEvidence::MeasuredLocal { commands }) => {
+                assert_eq!(commands, &vec!["cargo test -p rb-store".to_string()]);
+            }
+            other => panic!("expected MeasuredLocal evidence, got {other:?}"),
+        }
+        assert!(
+            observed.evidence[1].is_none(),
+            "a command-less fold claims no evidence: {:?}",
+            observed.evidence[1]
+        );
 
         server.abort();
     }

@@ -42,7 +42,8 @@ async fn remember(
             confidence: Some(confidence),
             provenance: Provenance::default(),
             anchors: Vec::new(),
-        })
+                trust_class: None,
+            })
         .await
         .unwrap()
 }

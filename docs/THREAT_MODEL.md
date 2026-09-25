@@ -101,6 +101,39 @@ layers, all enforced server-side:
    channel records observations, not directives; a real convention phrased
    imperatively can still be stored deliberately via the CLI/MCP channel.
 
+
+## The trust-class ladder (Vikunja #63)
+
+Confidence was caller-declared; nothing distinguished a memory backed by a
+measured test result from one the model asserted. The ladder (Lians-derived)
+fixes the write path AND the read path:
+
+1. **Classes.** `measured_ci > measured_local > human_confirmed >
+   agent_attested > inferred_activity`. Legacy rows backfill to
+   `agent_attested` (migration 012); internal job rows infer.
+2. **No self-promotion.** A caller may put ONLY evidence on the wire —
+   never a class. The daemon derives the class server-side
+   (`derive_trust_class`): only the `hook` channel can claim a local
+   measurement (commands the hook itself observed), only `cli` (the human's
+   typed surface) a CI run — which additionally requires a commit anchor —
+   or a human confirmation. Anything else is a hard rejection. The hook
+   fold claims `measured_local` exactly when its scratch carries observed
+   commands.
+3. **Ranking + surfacing.** Class is a multiplicative recall prior (top of
+   the ladder keeps its score; each rung steps down), with the admission
+   floor scaled identically so the prior reorders without raising the bar.
+   Every injected line carries its class (`· trust=<class>`) inside the
+   single provenance bracket.
+4. **State-bound staleness.** Clients declare their working directory; the
+   daemon snapshots its git state ONCE per connection (bounded, fail-open).
+   A commit-anchored memory whose HEAD/worktree moved past its anchor is
+   returned with `stale: true` and injected with an explicit `[stale]`
+   marker — anchored evidence is never silently reused as current.
+
+Scope (same posture as the ladder's own docs): these gates separate honest
+capture paths; they are not a defense against hostile same-user code (which
+can write the SQLite file directly).
+
 ## The opt-in HTTP listener (HTTP PRD 2026-07-02)
 
 `serve --http [bind]` (or `[http] enabled = true` in the user config) adds a

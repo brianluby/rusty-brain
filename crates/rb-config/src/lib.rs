@@ -13,7 +13,10 @@
 //! frozen, never extended.
 
 pub mod file;
+mod git_proc;
 pub mod namespace;
+
+pub use git_proc::{run_git_bounded, run_git_status_bounded};
 
 use std::path::{Path, PathBuf};
 

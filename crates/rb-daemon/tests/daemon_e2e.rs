@@ -1424,6 +1424,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
             Some(0.9),
             anchors.clone(),
             None,
+            None,
         )
         .await
         .unwrap();

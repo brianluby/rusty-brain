@@ -469,4 +469,54 @@ mod tests {
             .unwrap();
         assert_eq!(link_count, 1, "migration must preserve existing links");
     }
+
+    #[test]
+    fn trust_class_backfills_legacy_rows_to_agent_attested() {
+        // Migration 012 (Vikunja #63): a populated pre-012 schema upgrades in
+        // place — every legacy row lands on the documented backfill default
+        // `agent_attested` (the highest class pre-ladder capture could
+        // self-substantiate), the column is NOT NULL, and the SQL CHECK is
+        // the storage backstop for the typed enum.
+        let c = conn();
+        run_migrations_up_to(&c, 11).unwrap();
+        c.execute_batch(
+            "INSERT INTO memories (
+                 memory_id, namespace, created_at, updated_at, content, summary,
+                 keywords, tags, memory_type, importance, confidence, embedding_model
+             ) VALUES
+                 ('legacy1', 'global', 1, 1, 'old fact', '', '[]', '[]', 'insight', 5, 1.0, ''),
+                 ('legacy2', 'global', 2, 2, 'older fact', '', '[]', '[]', 'insight', 6, 1.0, '');",
+        )
+        .unwrap();
+
+        run_migrations(&c).unwrap();
+
+        let backfilled: Vec<(String, String)> = c
+            .prepare("SELECT memory_id, trust_class FROM memories ORDER BY memory_id")
+            .unwrap()
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .unwrap();
+        assert_eq!(
+            backfilled,
+            vec![
+                ("legacy1".to_string(), "agent_attested".to_string()),
+                ("legacy2".to_string(), "agent_attested".to_string()),
+            ],
+            "legacy rows must backfill to agent_attested"
+        );
+
+        // The CHECK rejects any value outside the ladder.
+        let bad = c.execute(
+            "INSERT INTO memories (
+                 memory_id, namespace, created_at, updated_at, content, summary,
+                 keywords, tags, memory_type, importance, confidence, embedding_model,
+                 trust_class
+             ) VALUES ('bad','global',0,0,'c','s','[]','[]','insight',5,1.0,'',
+                       'divine_revelation')",
+            [],
+        );
+        assert!(bad.is_err(), "CHECK constraint rejects unknown trust_class");
+    }
 }

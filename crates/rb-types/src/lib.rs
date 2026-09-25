@@ -22,6 +22,8 @@ mod query;
 mod retention;
 mod review;
 mod stats;
+mod staleness;
+mod trust_class;
 mod validate;
 mod write_gate;
 
@@ -56,7 +58,9 @@ pub use review::{
     REVIEW_KEEP_BUMP, REVIEW_LOW_CONFIDENCE_BOUND, REVIEW_MAX_LIMIT, REVIEW_MAX_SNOOZE_DAYS,
     REVIEW_MIN_THRESHOLD, REVIEW_STALE_DAYS,
 };
+pub use staleness::{evaluate_staleness, RepoSnapshot};
 pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
+pub use trust_class::{derive_trust_class, CaptureEvidence, TrustClass};
 pub use validate::{validate_confidence, validate_importance};
 
 pub use write_gate::{

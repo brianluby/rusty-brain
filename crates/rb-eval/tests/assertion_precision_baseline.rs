@@ -43,7 +43,8 @@ async fn assert_class(class: &str) {
                     confidence: Some(1.0),
                     provenance: Provenance::default(),
                     anchors: Vec::new(),
-                })
+                trust_class: None,
+            })
                 .await
                 .unwrap();
             note.id = row["id"].as_str().unwrap().parse().unwrap();

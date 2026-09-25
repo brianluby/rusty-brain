@@ -224,6 +224,7 @@ fn remember_request(content: &str) -> Request {
         confidence: None,
         supersedes: None,
         anchors: vec![],
+        evidence: None,
     }
 }
 

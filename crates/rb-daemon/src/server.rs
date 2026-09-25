@@ -764,6 +764,45 @@ fn uds_write_channel(source: Option<&str>) -> Option<rb_types::WriteChannel> {
     }
 }
 
+/// Bounded git state read for state-bound staleness (Vikunja #63): HEAD sha
+/// plus whether the worktree is clean of TRACKED modifications. Uses the
+/// shared `run_git_bounded` (hardcoded args, 2s kill bound, no shell);
+/// fail-open to `head: None` ("state unresolvable"), which DISABLES
+/// staleness claims rather than guessing. Untracked files are ignored (see
+/// `rb_types::RepoSnapshot`). Runs once per connection at handshake.
+async fn git_repo_snapshot(cwd: &std::path::Path) -> Option<rb_types::RepoSnapshot> {
+    const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    let head = tokio::task::spawn_blocking({
+        let cwd = cwd.to_path_buf();
+        move || rb_config::run_git_bounded(&cwd, &["rev-parse", "HEAD"], GIT_DEADLINE)
+    })
+    .await
+    .ok()??;
+    let head = String::from_utf8(head).ok()?.trim().to_string();
+    if head.is_empty() {
+        return None;
+    }
+    // `git diff-index --quiet HEAD` prints nothing and exits 0 when no
+    // tracked file differs; a non-zero exit means modifications exist.
+    let clean = tokio::task::spawn_blocking({
+        let cwd = cwd.to_path_buf();
+        move || {
+            rb_config::run_git_status_bounded(
+                &cwd,
+                &["diff-index", "--quiet", "HEAD"],
+                GIT_DEADLINE,
+            )
+        }
+    })
+    .await
+    .ok()?;
+    Some(rb_types::RepoSnapshot {
+        head: Some(head),
+        clean_worktree: clean.unwrap_or(false),
+    })
+}
+
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
@@ -852,6 +891,20 @@ async fn handle_connection(
         channel: uds_write_channel(identity.source.as_deref()),
     };
 
+    // State-bound staleness (Vikunja #63): snapshot the client-declared
+    // working directory's git state ONCE per connection (bounded, fail-open
+    // to "unresolvable" — which disables staleness claims rather than
+    // guessing). The snapshot is fixed for the connection's lifetime: an
+    // anchored memory is judged against the state the session opened with.
+    let repo_state: std::sync::Arc<dyn rb_engine::RepoStateProvider> = {
+        let snap = match identity.cwd.as_deref().map(std::path::PathBuf::from) {
+            Some(cwd) => git_repo_snapshot(&cwd).await,
+            // No declared cwd (old client, HTTP peer): state unresolvable —
+            // staleness stays off rather than guessed.
+            None => None,
+        };
+        std::sync::Arc::new(rb_engine::FixedRepoState::new(snap))
+    };
     let store_for_stream = store.clone();
     let job_store = store.clone();
     // Snapshot the provider identity before the embedder moves into the
@@ -860,7 +913,8 @@ async fn handle_connection(
     let engine = {
         let base = MemoryEngine::new(store, embedder, namespace.clone())
             .with_fusion_mode(fusion_mode)
-            .with_write_gate(write_gate);
+            .with_write_gate(write_gate)
+            .with_repo_state_provider(repo_state);
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -1216,6 +1270,10 @@ where
                     related_files,
                     confidence: Some(a.confidence.max(b.confidence)),
                     provenance: provenance.clone(),
+                    // Daemon-internal continuity (Vikunja #63): the merged
+                    // row carries the strongest member's already-derived
+                    // class — never re-derived from the merge itself.
+                    trust_class: Some(a.trust_class.max(b.trust_class)),
                     anchors,
                 })
                 .await?;
@@ -1467,7 +1525,20 @@ where
             confidence,
             supersedes,
             anchors,
+            evidence,
         } => {
+            // Trust-class ladder (Vikunja #63): NO caller states a class on
+            // the wire — only evidence. The daemon derives the class
+            // server-side against the kernel-verified channel; an
+            // unsubstantiatable claim is a hard rejection (no self-promotion).
+            let trust_class = match rb_types::derive_trust_class(
+                provenance.origin_source.as_deref(),
+                evidence.as_ref(),
+                anchors.iter().any(|a| a.kind == rb_types::AnchorKind::Commit),
+            ) {
+                Ok(class) => class,
+                Err(e) => return error_to_response(e),
+            };
             let input = RememberInput {
                 content,
                 context,
@@ -1479,6 +1550,7 @@ where
                 confidence,
                 provenance: provenance.clone(),
                 anchors,
+                trust_class: Some(trust_class),
             };
             match engine.remember(input).await {
                 Ok(id) => {
@@ -2044,6 +2116,7 @@ mod tests {
             ),
             score: 0.5,
             channels: ChannelHits { fts, vector, graph },
+            stale: false,
         };
 
         let counters = RecallChannelCounters::default();
@@ -2469,6 +2542,7 @@ mod tests {
                     confidence: Some(1.0),
                     provenance: provenance.clone(),
                     anchors: vec![],
+                    trust_class: None,
                 })
                 .await
                 .unwrap();
