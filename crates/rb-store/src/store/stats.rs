@@ -255,6 +255,30 @@ impl SqliteStore {
             last_forget_at,
         })
     }
+
+    /// Read-time corpus snapshot for `ns` (Vikunja #62): ONE aggregate query
+    /// deriving the fingerprint a recall outcome was computed against — row
+    /// count (all states), `MAX(rowid)` as a monotonically increasing
+    /// generation, and `MAX(updated_at)` (unix seconds) catching same-count
+    /// rewrites. Pure read, no schema change: safe on the read pool, cheap
+    /// enough to run per recall. See `rb_types::CorpusSnapshot`.
+    pub fn corpus_snapshot(&self, ns: &Namespace) -> Result<rb_types::CorpusSnapshot> {
+        let ns_str = ns.as_db_string();
+        self.conn
+            .query_row(
+                "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(updated_at), 0)
+                 FROM memories WHERE namespace = ?1",
+                rusqlite::params![ns_str],
+                |row| {
+                    Ok(rb_types::CorpusSnapshot {
+                        memories: row.get::<_, i64>(0)?.max(0) as u64,
+                        generation: row.get::<_, i64>(1)?.max(0) as u64,
+                        last_write_epoch_s: row.get::<_, i64>(2)?,
+                    })
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 /// Unix seconds of the namespace's most recent bulk `retention_sweep` oplog
@@ -292,6 +316,53 @@ mod tests {
         let id = note.id.clone();
         store.insert_memory(&note, Some(&[0.1f32; DIM])).unwrap();
         id
+    }
+
+    #[test]
+    fn corpus_snapshot_pins_namespace_state_and_moves_on_every_write() {
+        // Vikunja #62: the fingerprint must (a) stay namespace-scoped,
+        // (b) move on insert (generation), and (c) move on a same-count
+        // update (last write time) — the three components each catch a
+        // different mutation class.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let store = open(&path);
+        let ns = Namespace::Project("snap".to_string());
+        let other = Namespace::Project("elsewhere".to_string());
+
+        let empty = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(empty.fingerprint(), "0:0:0");
+
+        let a = seed(&store, &ns, "first");
+        seed(&store, &other, "other namespace");
+        let one = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(one.memories, 1, "namespace-scoped, not whole-DB");
+        assert_eq!(one.generation, 1, "rowid-derived generation");
+        assert!(one.last_write_epoch_s > 0);
+        assert_ne!(empty.fingerprint(), one.fingerprint());
+
+        // Same count, new write: only last_write moves — still a new
+        // fingerprint, so same-count rewrites cannot masquerade as the same
+        // corpus.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store
+            .update_memory(
+                &a,
+                &rb_types::MemoryUpdates {
+                    importance: Some(6),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let bumped = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(bumped.memories, 1);
+        assert!(
+            bumped.last_write_epoch_s > one.last_write_epoch_s,
+            "an update must advance last_write ({} -> {})",
+            one.last_write_epoch_s,
+            bumped.last_write_epoch_s
+        );
+        assert_ne!(one.fingerprint(), bumped.fingerprint());
     }
 
     #[test]

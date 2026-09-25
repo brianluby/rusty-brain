@@ -49,6 +49,29 @@ All notable changes to rusty-brain are documented here. The format is based on
   the single provenance bracket; the CLI/MCP surfaces expose `trust_class`.
 - `docs/THREAT_MODEL.md` documents the ladder and its scope.
 
+
+### Added — Recall abstention with reason codes (#62)
+
+- Calibrated abstention gate over the final Linear blend
+  (`rb_search::ABSTAIN_THRESHOLD` = 0.22, derived from the recorded score
+  distributions behind the W1.3 floor): when the best surviving candidate
+  falls below the bar, recall withholds everything and returns a
+  machine-readable reason (`no_candidates`, `below_threshold`,
+  `filter_excluded`, `degraded_backend`) — the 5th-best match no longer
+  rides the 1st's framing. Source-aware (session-scoped tops compare against
+  the prior-scaled bar); skipped for `Rrf`; `[search] abstain_threshold`
+  overrides (0.0 disables, out-of-range fails closed at resolve).
+- ABSTAIN is distinct from an empty result set on every surface: CLI JSON
+  (`{"abstained":"<code>","results":[]}`) and human text, MCP text +
+  structuredContent, and a read-time corpus snapshot (count, generation,
+  last-write epoch, fingerprint) rides served recalls so preregistered eval
+  runs pin the corpus.
+- The UserPromptSubmit injection emits an explicit no-memory path ("Recall
+  abstained (…) — treat the corpus as not covering this topic") instead of
+  silence or filler; the scorecard records per-query abstention and run-level
+  `abstain_rate`/`abstain_events`.
+- `docs/THREAT_MODEL.md` documents the gate and its calibration.
+
 ### Added — Native OMP extension
 
 - Project-local `rusty-brain-install --agents omp` installation, status, dry-run

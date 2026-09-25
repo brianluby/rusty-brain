@@ -426,6 +426,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: Some(HttpListenerConfig::default()),
         };
@@ -1995,6 +1996,7 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_daemon::FusionMode::Linear,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             request_timeout: Some(Duration::from_millis(20)),
@@ -2065,7 +2067,9 @@ mod tests {
                 Request::Recall { .. } => Response::Recalled {
                     results: Vec::new(),
                     degraded: false,
-                },
+                abstained: None,
+                snapshot: None,
+            },
                 _ => Response::Pong {
                     contract_version: rb_proto::CONTRACT_VERSION,
                     recall_channels: None,

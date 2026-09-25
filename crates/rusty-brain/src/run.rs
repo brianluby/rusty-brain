@@ -489,20 +489,27 @@ async fn run_client(
                 archived,
                 collect_anchor_filters(file, commit, symbol),
             );
-            let (results, degraded) = client
+            let (results, degraded, abstained, _snapshot) = client
                 .recall_filtered_with_status(query, filter, limit)
                 .await
                 .context("recall failed")?;
-            if degraded {
-                // stderr so `--json` stdout stays machine-parseable. Mirrors
-                // the rb-mcp warning: without it a CLI user during an embedder
-                // outage sees ordinary-looking, vector-blind results (W1.6d).
-                eprintln!(
-                    "warning: vector search unavailable (embedding provider \
-                     error); results from keyword and graph channels only"
-                );
+            // ABSTAIN (Vikunja #62) is a distinct outcome from an empty
+            // result set: the gate refused to serve a weak match; render the
+            // refusal and its code in both human and JSON modes.
+            if let Some(reason) = &abstained {
+                println!("{}", output::render_recall_abstained(reason, json));
+            } else {
+                if degraded {
+                    // stderr so `--json` stdout stays machine-parseable. Mirrors
+                    // the rb-mcp warning: without it a CLI user during an embedder
+                    // outage sees ordinary-looking, vector-blind results (W1.6d).
+                    eprintln!(
+                        "warning: vector search unavailable (embedding provider \
+                         error); results from keyword and graph channels only"
+                    );
+                }
+                println!("{}", output::render_recall(&results, json));
             }
-            println!("{}", output::render_recall(&results, json));
         }
         Command::Get { id } => {
             let id = parse_id(&id).context("invalid memory id")?;

@@ -525,10 +525,20 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         Response::Remembered { id } => ToolContent::json(json!({ "id": id.to_string() }), false),
         // W3.3: recall renders as compact markdown (one line per hit) for the
         // model; the full results ride structuredContent. W1.3 empty state +
-        // W1.6d degraded warning are preserved. Projection only — the wire
-        // `Response` is unchanged (no CONTRACT_VERSION bump).
-        Response::Recalled { results, degraded } => {
-            let text = if results.is_empty() {
+        // W1.6d degraded warning, and the Vikunja #62 ABSTAIN distinction
+        // (refusal with a reason code ≠ an honestly-empty result set) are
+        // all preserved. Projection only — no CONTRACT_VERSION bump.
+        Response::Recalled {
+            results,
+            degraded,
+            abstained,
+            snapshot,
+        } => {
+            let text = if let Some(reason) = &abstained {
+                // ABSTAIN: the gate refused to serve a weak match — the model
+                // sees the refusal and its code, never filler content.
+                format!("recall abstained ({reason}) — no memory clears the trust gate")
+            } else if results.is_empty() {
                 let mut t = "no stored memories match".to_string();
                 if degraded {
                     t.push_str(" (vector search unavailable — keyword + graph channels only)");
@@ -544,11 +554,22 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
                 }
                 t
             };
-            let mut structured = if results.is_empty() {
+            let mut structured = if abstained.is_some() {
+                json!({
+                    "results": [],
+                    "abstained": abstained,
+                    "hint": "recall abstained; no memory clears the trust gate",
+                })
+            } else if results.is_empty() {
                 json!({ "results": [], "hint": "no stored memories match" })
             } else {
                 json!({ "results": results })
             };
+            if let Some(snap) = &snapshot {
+                if let Some(obj) = structured.as_object_mut() {
+                    obj.insert("snapshot".to_string(), json!(snap));
+                }
+            }
             if degraded {
                 if let Some(obj) = structured.as_object_mut() {
                     obj.insert(
@@ -1399,6 +1420,8 @@ mod tests {
             stale: false,
         }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             now,
         );
@@ -1484,6 +1507,8 @@ mod tests {
             stale: false,
         }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1507,6 +1532,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1533,6 +1560,8 @@ mod tests {
             stale: false,
         }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1556,6 +1585,8 @@ mod tests {
             stale: false,
         }],
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1576,6 +1607,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1598,6 +1631,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );

@@ -417,6 +417,8 @@ mod tests {
             dedup_precision: 0.1,
             ndcg: 0.1,
             channels: crate::runner::ChannelContribution::default(),
+            abstain_rate: 0.0,
+            abstain_events: 0,
             p50_latency_us: 0,
             p99_latency_us: 0,
         };

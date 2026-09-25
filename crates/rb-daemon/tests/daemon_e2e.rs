@@ -47,6 +47,10 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            // The e2e harness exercises wire/filter mechanics, not the #62
+            // calibrated abstention bar; its fixtures score below it on
+            // purpose. Gate OFF here — engine/config tests cover the gate.
+            abstain_threshold: Some(0.0),
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
@@ -559,6 +563,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -585,6 +590,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -601,6 +607,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -1166,7 +1173,10 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
     .unwrap();
     let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
     match resp {
-        rb_proto::Response::Recalled { results, degraded } => {
+        rb_proto::Response::Recalled { results, degraded,
+                abstained: None,
+                snapshot: None,
+            } => {
             assert!(degraded, "embedder outage must flag the wire response");
             assert!(
                 results.iter().any(|r| r.memory.id == id),
@@ -1240,7 +1250,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
     let from_mcp = remember_with(&mut mcp_client, "filterable from mcp", 8, 0.9).await;
 
     // Confidence range (recall).
-    let (results, _) = cli_client
+    let (results, _, _, _) = cli_client
         .recall_filtered_with_status(
             "filterable".to_string(),
             RecallFilter {
@@ -1296,7 +1306,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
     assert_eq!(listed.len(), 3, "since-before-writes must include all");
 
     // Composition: source + min_importance + min_confidence.
-    let (results, _) = cli_client
+    let (results, _, _, _) = cli_client
         .recall_filtered_with_status(
             "filterable".to_string(),
             RecallFilter {
@@ -1380,7 +1390,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
             .collect::<Vec<_>>(),
         vec![low_conf.clone()]
     );
-    let (archived_recall, _) = cli_client
+    let (archived_recall, _, _, _) = cli_client
         .recall_filtered_with_status(
             "filterable".to_string(),
             RecallFilter {
@@ -1435,7 +1445,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
         }],
         ..Default::default()
     };
-    let (results, _) = cli_client
+    let (results, _, _, _) = cli_client
         .recall_filtered_with_status("filterable".to_string(), file_filter("src/server.rs"), 10)
         .await
         .unwrap();
@@ -1451,7 +1461,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
         results[0].memory.anchors, anchors,
         "anchors ride the result payload"
     );
-    let (absent, _) = cli_client
+    let (absent, _, _, _) = cli_client
         .recall_filtered_with_status("filterable".to_string(), file_filter("src/other.rs"), 10)
         .await
         .unwrap();
@@ -2206,6 +2216,7 @@ async fn retention_forget_flow_over_the_wire_respects_guards() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };

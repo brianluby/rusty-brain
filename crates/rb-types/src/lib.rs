@@ -5,6 +5,7 @@
 //! `MemoryLink`, `SearchQuery`, `SearchResult`, `MemoryUpdates`, `Error`) used
 //! across the engine, store, daemon, and binary.
 
+mod abstention;
 mod anchor;
 mod change;
 mod embedding;
@@ -27,12 +28,13 @@ mod trust_class;
 mod validate;
 mod write_gate;
 
+pub use abstention::{AbstainReason, CorpusSnapshot};
 pub use anchor::{
     kind_str as anchor_kind_str, normalize_anchor_value, parse_file_filter,
     parse_kind as parse_anchor_kind, MemoryAnchor,
 };
-pub use change::{ChangeKind, MemoryChanged};
 pub use embedding::EmbeddingInputFingerprint;
+pub use change::{ChangeKind, MemoryChanged};
 pub use error::{Error, Result};
 pub use feedback_kind::FeedbackKind;
 pub use history::{HistoryEdge, HistoryEntry, MemoryHistory};

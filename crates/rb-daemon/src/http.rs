@@ -139,6 +139,7 @@ pub(crate) struct HttpState {
     pub retention_policy: Option<rb_types::RetentionPolicy>,
     pub recall_counters: Arc<RecallChannelCounters>,
     pub fusion_mode: rb_engine::FusionMode,
+    pub abstain_threshold: Option<f32>,
     pub write_gate: rb_types::WriteGateConfig,
     pub provider_model: String,
 }
@@ -397,6 +398,7 @@ async fn process_request(req: hyper::Request<Incoming>, state: Arc<HttpState>) -
             namespace.clone(),
         )
         .with_fusion_mode(state.fusion_mode)
+        .with_abstain_threshold(state.abstain_threshold)
         .with_write_gate(state.write_gate.clone());
         match state.enricher.clone() {
             Some(e) => base.with_enricher(e),

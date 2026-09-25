@@ -49,6 +49,7 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };

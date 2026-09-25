@@ -4,6 +4,20 @@ use crate::import::{BatchInfo, ImportCounts, ImportItem, UndoCounts};
 use rb_redact::redact;
 use rb_types::{MemoryNote, SearchResult};
 
+/// Render a recall that ABSTAINED (Vikunja #62): no results were served and
+/// `reason` says why. JSON: `{"abstained": "<code>", "results": []}` —
+/// machine-distinguishable from an honestly-empty result set. Human: the
+/// refusal and its reason, never filler content.
+pub fn render_recall_abstained(reason: &rb_types::AbstainReason, json: bool) -> String {
+    if json {
+        return format!(
+            "{{\"abstained\":\"{}\",\"results\":[]}}",
+            reason.as_str()
+        );
+    }
+    format!("Recall abstained ({}) — no memory clears the trust gate.", reason)
+}
+
 /// Render recall hits. JSON: the raw `Vec<SearchResult>`. Human: one line per hit.
 pub fn render_recall(results: &[SearchResult], json: bool) -> String {
     if json {
@@ -1093,6 +1107,26 @@ mod tests {
         assert!(out.contains("\"origin_channel\""), "json channel: {out}");
     }
 
+
+    #[test]
+    fn abstaining_recall_is_distinguishable_from_empty_in_both_modes() {
+        // Vikunja #62: ABSTAIN (the gate refused a weak match) must render
+        // differently from an honestly-empty result set, in JSON (machine
+        // consumers read `abstained`) and human text alike.
+        let json = render_recall_abstained(&rb_types::AbstainReason::BelowThreshold, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["abstained"], "below_threshold");
+        assert_eq!(
+            parsed["results"].as_array().unwrap().len(),
+            0,
+            "no results ride an abstention"
+        );
+
+        let human = render_recall_abstained(&rb_types::AbstainReason::BelowThreshold, false);
+        assert!(human.contains("abstained"), "human refusal: {human}");
+        // And distinct from the plain empty-state wording.
+        assert_ne!(human, render_recall(&[], false));
+    }
     #[test]
     fn json_recall_is_parseable_array() {
         let n = note("body", 5);

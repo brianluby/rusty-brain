@@ -154,6 +154,9 @@ pub struct DaemonConfig {
     /// `FusionMode::Linear` is the default; the default flip to RRF is
     /// deferred to W4.1 eval evidence.
     pub fusion_mode: rb_engine::FusionMode,
+    /// Recall ABSTENTION threshold (Vikunja #62): `None` = the calibrated
+    /// `rb_search::ABSTAIN_THRESHOLD`; `Some(0.0)` disables the gate.
+    pub abstain_threshold: Option<f32>,
     /// Resolved `[write_gate]` policy (Vikunja #69): per-namespace pre-insert
     /// validation enforced in the engine's compose seam. The built-in default
     /// permits today's traffic — the gate is on even without configuration.
@@ -189,6 +192,7 @@ pub struct Daemon {
     request_idle_timeout: std::time::Duration,
     fusion_mode: rb_engine::FusionMode,
     write_gate: rb_types::WriteGateConfig,
+    abstain_threshold: Option<f32>,
     /// Bound opt-in HTTP listener + its config; `None` when disabled (the
     /// default): nothing is bound and `run` spawns no HTTP task.
     http: Option<(tokio::net::TcpListener, crate::http::HttpListenerConfig)>,
@@ -315,6 +319,7 @@ impl Daemon {
             retention_policy: config.retention_policy,
             request_idle_timeout,
             fusion_mode: config.fusion_mode,
+            abstain_threshold: config.abstain_threshold,
             write_gate: config.write_gate,
             http,
             http_addr,
@@ -355,6 +360,7 @@ impl Daemon {
             retention_policy,
             request_idle_timeout,
             fusion_mode,
+            abstain_threshold,
             write_gate,
             http,
             http_addr: _http_addr,
@@ -388,6 +394,7 @@ impl Daemon {
                 retention_policy: retention_policy.clone(),
                 recall_counters: recall_counters.clone(),
                 fusion_mode,
+                abstain_threshold,
                 write_gate: write_gate.clone(),
                 provider_model: embedder.model_id().to_string(),
             });
@@ -446,6 +453,7 @@ impl Daemon {
                                     request_idle_timeout,
                                     recall_counters,
                                     fusion_mode,
+                                    abstain_threshold,
                                     write_gate,
                                 )
                                 .await
@@ -814,6 +822,7 @@ async fn handle_connection(
     request_idle_timeout: std::time::Duration,
     recall_counters: Arc<RecallChannelCounters>,
     fusion_mode: rb_engine::FusionMode,
+    abstain_threshold: Option<f32>,
     write_gate: rb_types::WriteGateConfig,
 ) -> Result<()> {
     // W2.6 peer identity: read the kernel-verified peer credentials
@@ -913,6 +922,7 @@ async fn handle_connection(
     let engine = {
         let base = MemoryEngine::new(store, embedder, namespace.clone())
             .with_fusion_mode(fusion_mode)
+            .with_abstain_threshold(abstain_threshold)
             .with_write_gate(write_gate)
             .with_repo_state_provider(repo_state);
         match enricher {
@@ -1614,6 +1624,8 @@ where
                 Response::Recalled {
                     results: outcome.results,
                     degraded: outcome.degraded,
+                    abstained: outcome.abstained,
+                    snapshot: outcome.snapshot,
                 }
             }
             Err(e) => error_to_response(e),
@@ -2075,6 +2087,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
@@ -2155,6 +2168,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
@@ -2199,6 +2213,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
@@ -2308,6 +2323,7 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
             write_gate: rb_types::WriteGateConfig::default(),
             retention_policy: None,
             http: None,

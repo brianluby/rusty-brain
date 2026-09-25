@@ -112,6 +112,14 @@ pub struct SearchFileConfig {
     /// equivalent: `RB_FUSION_MODE`. Unknown values warn and are ignored.
     #[serde(default)]
     pub fusion: Option<String>,
+    /// Recall ABSTENTION threshold override (Vikunja #62): when the best
+    /// final Linear blend score of a query's candidates falls below this,
+    /// recall ABSTAINS with `below_threshold` instead of serving the nearest
+    /// weak match. Absent = the calibrated default
+    /// (`rb_search::ABSTAIN_THRESHOLD`); `0.0` disables the gate. Range
+    /// 0.0..=1.0, fail-closed at resolve on anything else.
+    #[serde(default)]
+    pub abstain_threshold: Option<f32>,
 }
 
 /// `[retention]` section of the config file (retention PRD RET-1).
@@ -305,7 +313,7 @@ fn warn_unknown_keys(table: &toml::Table, source: &Path, warnings: &mut Vec<Stri
     ];
     const EMBED: &[&str] = &["backend", "local_model"];
     const ENRICH: &[&str] = &["base_url", "model"];
-    const SEARCH: &[&str] = &["fusion"];
+    const SEARCH: &[&str] = &["fusion", "abstain_threshold"];
     // No RETENTION, HTTP, or WRITE_GATE list here: `[retention]`, `[http]`,
     // and `[write_gate]` unknown keys FAIL CLOSED via `deny_unknown_fields`
     // on their section structs (see their doc comments), so the warn path
