@@ -69,12 +69,17 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
         } else {
             ""
         };
+        // State-bound staleness (Vikunja #63, PR #89 review): a commit-
+        // anchored memory whose repo moved past its anchor is visibly STALE,
+        // never silently served as current. Fixed marker text.
+        let stale = if r.stale { " [stale]" } else { "" };
         out.push_str(&format!(
-            "[{:.2}] {} ({}){} {}\n",
+            "[{:.2}] {} ({}){}{} {}\n",
             r.score,
             r.memory.id,
             r.memory.memory_type.as_str(),
             contested,
+            stale,
             summary
         ));
     }
@@ -1099,6 +1104,32 @@ mod tests {
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
+    fn human_recall_marks_stale_results() {
+        // Vikunja #63 / PR #89 review: the human recall line shows the stale
+        // marker — a commit-anchored memory whose repo moved past its anchor
+        // is visibly stale, never silently served as current.
+        let results = vec![
+            SearchResult {
+                memory: note("current fact", 5),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+                stale: false,
+            },
+            SearchResult {
+                memory: note("anchored fact from an older head", 5),
+                score: 0.8,
+                channels: rb_types::ChannelHits::default(),
+                stale: true,
+            },
+        ];
+        let out = render_recall(&results, false);
+        assert!(
+            out.matches("[stale]").count() == 1,
+            "exactly the stale hit is marked: {out}"
+        );
     }
 
     #[test]

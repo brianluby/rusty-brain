@@ -497,6 +497,26 @@ fn render_indexed<'a>(
     out
 }
 
+/// Recall results as a numbered compact markdown list, carrying the STALE
+/// marker (Vikunja #63, PR #89 review): a commit-anchored memory whose repo
+/// state moved past its anchor must be visibly stale in the model-facing
+/// text — never silently injected as current — matching the UserPromptSubmit
+/// injection's `[stale]` and sitting alongside the contested/quarantined
+/// markers. Fixed marker text; content cannot forge it.
+fn render_indexed_results(results: &[rb_types::SearchResult], now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    for (i, r) in results.iter().enumerate() {
+        let stale = if r.stale { " ⚠ stale" } else { "" };
+        out.push_str(&format!(
+            "{}. {}{}\n",
+            i + 1,
+            memory_md_line(&r.memory, now),
+            stale
+        ));
+    }
+    out
+}
+
 /// Compact markdown for the `context` projection: a total count plus Important
 /// and Recent sections (each a numbered list).
 fn render_context_md(
@@ -562,7 +582,7 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
                 }
                 t
             } else {
-                let mut t = render_indexed(results.iter().map(|r| &r.memory), now);
+                let mut t = render_indexed_results(&results, now);
                 if degraded {
                     t.push_str(
                         "⚠ vector search unavailable (embedding provider error); \
@@ -766,6 +786,49 @@ mod tests {
         assert!(
             !clean.contains("quarantined"),
             "trusted rows unmarked: {clean}"
+        );
+    }
+
+    #[test]
+    fn recall_text_marks_stale_results() {
+        // Vikunja #63 / PR #89 review: the model-facing recall projection
+        // must show the stale marker, not only structuredContent — a
+        // commit-anchored memory whose repo moved past its anchor is never
+        // silently injected as current.
+        let mut stale = note();
+        stale.content = "anchored fact from an older head".into();
+        let results = vec![
+            rb_types::SearchResult {
+                memory: note(),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+                stale: false,
+            },
+            rb_types::SearchResult {
+                memory: stale,
+                score: 0.8,
+                channels: rb_types::ChannelHits::default(),
+                stale: true,
+            },
+        ];
+        let content = response_to_content(
+            Response::Recalled {
+                results,
+                degraded: false,
+                abstained: None,
+                snapshot: None,
+            },
+            Utc::now(),
+        );
+        assert!(
+            content.text.matches("⚠ stale").count() == 1,
+            "exactly the stale hit is marked: {}",
+            content.text
+        );
+        assert!(
+            content.text.contains("anchored fact from an older head"),
+            "the stale memory is still shown (marked, not dropped): {}",
+            content.text
         );
     }
     #[test]
