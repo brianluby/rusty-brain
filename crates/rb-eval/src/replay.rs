@@ -90,14 +90,18 @@ fn decode_vector(s: &str) -> Result<Vec<f32>, String> {
     }
     let mut bytes = Vec::with_capacity(s.len() / 2);
     let chars = s.as_bytes();
-    for pair in chars.chunks_exact(2) {
+    // Length is a validated multiple of 2, so the remainder is empty.
+    for pair in chars.as_chunks::<2>().0 {
         let hi = hex_digit(pair[0])?;
         let lo = hex_digit(pair[1])?;
         bytes.push((hi << 4) | lo);
     }
+    // Same multiple-of-4 invariant for the f32 decode below.
     Ok(bytes
-        .chunks_exact(4)
-        .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|c| f32::from_le_bytes(*c))
         .collect())
 }
 
