@@ -754,11 +754,16 @@ fn is_admin_op(req: &Request) -> bool {
     }
 }
 
-/// Map a kernel-verified same-host UDS peer's declared surface onto the
-/// write-channel trust tag (Vikunja #69). Only recognized first-party
-/// surfaces earn a channel; everything else — old clients, unknown sources —
-/// stays `None` (unverified), never a guess. The value lands in the
-/// `origin_channel` column, outside any client-controlled payload field.
+/// Map a same-host UDS peer's DECLARED surface onto the write-channel tag
+/// (Vikunja #69). Honesty note (PR #89 review): the kernel credential
+/// verifies *which user* connected (`getpeereid`/`SO_PEERCRED`), not *which
+/// binary* — `source` is the honest first-party client's self-report, so
+/// this separates honest first-party paths and degrades unknown/old clients
+/// to `None` (unverified); it is NOT a defense against a hostile same-user
+/// process, which the threat model already treats as inside the boundary.
+/// Only recognized first-party surfaces earn a channel; everything else
+/// stays `None`, never a guess. The value lands in the `origin_channel`
+/// column, outside any client-controlled *request* payload field.
 fn uds_write_channel(source: Option<&str>) -> Option<rb_types::WriteChannel> {
     use rb_types::WriteChannel;
     match source {
@@ -804,12 +809,17 @@ async fn git_repo_snapshot(cwd: &std::path::Path) -> Option<rb_types::RepoSnapsh
     })
     .await
     .ok()?;
+    // `None` from the probe (timeout / spawn failure) means "could not
+    // determine," NOT "dirty": propagating it makes the whole snapshot
+    // unresolvable, which DISABLES staleness claims for the connection —
+    // the module contract ("no unsubstantiated staleness claim") and the
+    // fail-open posture of the HEAD probe above (PR #89 review).
+    let clean = clean?;
     Some(rb_types::RepoSnapshot {
         head: Some(head),
-        clean_worktree: clean.unwrap_or(false),
+        clean_worktree: clean,
     })
 }
-
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
@@ -891,12 +901,14 @@ async fn handle_connection(
         origin_agent: identity.agent,
         origin_source: identity.source.clone(),
         session_id: identity.session_id,
-        // Vikunja #69 daemon-stamped write channel: derived from the
-        // kernel-verified same-host peer's declared surface, NOT from any
-        // request payload — a client cannot forge the column. Recognized
-        // first-party surfaces map to their channel; anything else (old
-        // client, unknown source) stays `None` = unverified, which the
-        // write gate treats via `allow_unverified_channel`.
+        // Vikunja #69 daemon-stamped write channel: derived once from the
+        // handshake identity's declared surface, NOT from any per-request
+        // payload — request fields cannot forge the column. The kernel
+        // verifies the peer's UID; the surface string itself is the honest
+        // client's self-report (see `uds_write_channel`), so the tag
+        // separates first-party paths and degrades everything else to
+        // `None` = unverified, which the write gate treats via
+        // `allow_unverified_channel`.
         channel: uds_write_channel(identity.source.as_deref()),
     };
 
@@ -1226,6 +1238,20 @@ where
         }
         ReviewAction::Merge => {
             let (a, b) = (&notes[0], &notes[1]);
+            // Quarantine is demotion, never laundering (PR #89 review):
+            // `peek` does not filter quarantined rows, and a merged row is
+            // composed fresh under THIS connection's channel — merging a
+            // quarantined member would move its untrusted-origin content
+            // into a clean row without the user ever seeing a
+            // `[quarantined]` marker. Refuse; the quarantine must be
+            // explicitly resolved (e.g. admin forget) first.
+            if a.is_quarantined() || b.is_quarantined() {
+                return Err(Error::InvalidArgument(
+                    "merge refused: one member is quarantined (untrusted origin); \
+                     resolve its quarantine before merging"
+                        .to_string(),
+                ));
+            }
             // Deterministic combine: identical contents collapse to one;
             // otherwise both bodies are kept, first member first. Metadata
             // keeps the strongest signal (max importance/confidence) and the
@@ -1280,10 +1306,12 @@ where
                     related_files,
                     confidence: Some(a.confidence.max(b.confidence)),
                     provenance: provenance.clone(),
-                    // Daemon-internal continuity (Vikunja #63): the merged
-                    // row carries the strongest member's already-derived
-                    // class — never re-derived from the merge itself.
-                    trust_class: Some(a.trust_class.max(b.trust_class)),
+                    // Daemon-internal continuity (Vikunja #63), conservative
+                    // (PR #89 review): the merged body is only as backed as
+                    // its WEAKEST member — max() would let an
+                    // agent-attested near-duplicate ride a measured row's
+                    // class, the exact self-promotion the ladder forbids.
+                    trust_class: Some(a.trust_class.min(b.trust_class)),
                     anchors,
                 })
                 .await?;
@@ -1544,7 +1572,9 @@ where
             let trust_class = match rb_types::derive_trust_class(
                 provenance.origin_source.as_deref(),
                 evidence.as_ref(),
-                anchors.iter().any(|a| a.kind == rb_types::AnchorKind::Commit),
+                anchors
+                    .iter()
+                    .any(|a| a.kind == rb_types::AnchorKind::Commit),
             ) {
                 Ok(class) => class,
                 Err(e) => return error_to_response(e),

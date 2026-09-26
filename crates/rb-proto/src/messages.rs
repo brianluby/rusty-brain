@@ -990,8 +990,8 @@ mod tests {
                 confidence: Some(0.7),
                 supersedes: Some(id.clone()),
                 anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/lib.rs:3-9").unwrap()],
-            evidence: None,
-        },
+                evidence: None,
+            },
             Request::Recall {
                 query: "q".into(),
                 memory_type: Some(MemoryType::BugFix),
@@ -1106,8 +1106,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-            stale: false,
-        }],
+                    stale: false,
+                }],
                 degraded: false,
                 abstained: None,
                 snapshot: None,
@@ -1266,7 +1266,9 @@ mod tests {
         // decode, defaulting the flag off.
         let back: Response = serde_json::from_str(r#"{"result":"Recalled","results":[]}"#).unwrap();
         match back {
-            Response::Recalled { results, degraded,
+            Response::Recalled {
+                results,
+                degraded,
                 abstained: None,
                 snapshot: None,
             } => {
@@ -1284,18 +1286,18 @@ mod tests {
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: false,
-                abstained: None,
-                snapshot: None,
-            })
+            abstained: None,
+            snapshot: None,
+        })
         .unwrap();
         assert_eq!(json, r#"{"result":"Recalled","results":[]}"#);
 
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: true,
-                abstained: None,
-                snapshot: None,
-            })
+            abstained: None,
+            snapshot: None,
+        })
         .unwrap();
         assert_eq!(
             json,

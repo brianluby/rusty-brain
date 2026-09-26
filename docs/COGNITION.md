@@ -220,9 +220,10 @@ Upstream's minimum is who/what/when/why. Every memory carries:
 - **Who** — W0.5 provenance: `origin_user`, `origin_host`, `origin_agent`,
   `origin_source` (`hook|mcp|cli|job`), `session_id`
   (`crates/rb-store/migrations/004_provenance.sql`), plus the daemon-stamped
-  `origin_channel` trust tag — `hook`/`mcp`/`cli` from the kernel-verified UDS
-  peer, `http` on the loopback listener, never client-settable
-  (`crates/rb-store/migrations/013_origin_channel.sql`, #69); injections label
+  `origin_channel` trust tag — `hook`/`mcp`/`cli` from the UDS peer's
+  handshake-declared surface, `http` on the loopback listener, never
+  settable from a request payload
+  (`crates/rb-store/migrations/013_write_channel.sql`, #69); injections label
   each memory with it (§6.1).
 - **When** — `created_at` / `updated_at` (schema), both filterable.
 - **What** — typed code anchors: structured file (+ optional 1-based line range),
@@ -361,9 +362,11 @@ the memory lifecycle, and poisoning detection on high-trust memories.
 Every write path declares its provenance: `origin_user`, `origin_host`,
 `origin_agent`, `origin_source` (`hook|mcp|cli|job`), `session_id`
 (`crates/rb-store/migrations/004_provenance.sql`, W0.5), and — stamped by the
-daemon, never by the client — `origin_channel` (`hook|mcp|cli` from the
-kernel-verified UDS peer, `http` on the loopback listener,
-`crates/rb-store/migrations/013_origin_channel.sql`, #69). Rows that predate
+daemon, never from a request payload — `origin_channel` (`hook|mcp|cli`
+from the UDS peer's handshake-declared surface, `http` on the loopback
+listener, `crates/rb-store/migrations/013_write_channel.sql`, #69; the
+credential proves the UID, the surface is the honest client's self-report).
+Rows that predate
 the migrations keep honest `NULL`s — provenance was deliberately never
 backfilled or faked. Injected memories carry their provenance label into the
 prompt (§3.1).

@@ -86,11 +86,12 @@ pub struct Provenance {
     /// advisory provenance only).
     pub origin_source: Option<String>,
     /// Daemon-stamped write channel (Vikunja #69): `None` for direct engine
-    /// callers (tests/eval); the daemon sets it from connection/request
-    /// context — kernel-verified peer executable over UDS, the listener for
-    /// HTTP — and it flows into the row's `origin_channel` column. Kept beside
-    /// the advisory fields for plumbing only; it is NOT client-declared and
-    /// never read from a payload.
+    /// callers (tests/eval); the daemon sets it from the connection's
+    /// handshake identity (the loopback listener for HTTP) and it flows into
+    /// the row's `origin_channel` column. Kept beside the advisory fields
+    /// for plumbing only; it is never read from a per-REQUEST payload. The
+    /// handshake surface itself is the honest client's self-report over the
+    /// kernel-verified same-uid UDS peer (see `MemoryNote::origin_channel`).
     pub channel: Option<rb_types::WriteChannel>,
     pub session_id: Option<String>,
 }
@@ -332,9 +333,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.context.as_deref(),
             input.anchors.len(),
         )
-        .map_err(|rejection| {
-            rb_types::Error::InvalidArgument(rejection.to_string())
-        })?;
+        .map_err(|rejection| rb_types::Error::InvalidArgument(rejection.to_string()))?;
         rb_types::validate_importance(input.importance)?;
         // Fail-closed confidence range check on an EXPLICIT caller prior
         // (mirrors the storage CHECK, but surfaces as a clean validation error
@@ -624,6 +623,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .await?;
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        // Distinguish "the user's filter excluded every candidate"
+        // (`FilterExcluded`) from quarantine/namespace drops, which are not
+        // filter decisions (PR #89 review).
+        let mut filter_dropped_any = false;
         for note in fetched {
             // `get_many` is already namespace-scoped; `filter.matches` covers
             // every metadata dimension including the archived-state scope
@@ -633,7 +636,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             // channel) are EXCLUDED from recall entirely — not rank-demoted.
             // Recall feeds every injection channel, so a poisoned row must
             // never ride into a prompt; visibility stays on list/get.
-            if !self.in_namespace(&note) || !filter.matches(&note) || note.is_quarantined() {
+            let filter_dropped = !filter.matches(&note);
+            if !self.in_namespace(&note) || filter_dropped || note.is_quarantined() {
+                filter_dropped_any |= filter_dropped;
                 continue;
             }
             // Carry confidence into ranking (Feature C): low-confidence memories
@@ -659,7 +664,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .backend
                 .active_contradicts(self.namespace.clone(), ids)
                 .await?;
+            let before = notes.len();
             notes.retain(|id, _| contested.contains(id) == want_contested);
+            // The contested tri-state IS a filter decision: drops here count
+            // toward `FilterExcluded` too (PR #89 review).
+            filter_dropped_any |= notes.len() < before;
             meta.retain(|id, _| notes.contains_key(id));
             contested_for_annotation = Some(contested);
         }
@@ -785,9 +794,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // `AbstainReason::BelowThreshold` instead of the 5th-best memory with
         // the 1st's framing. Source-aware like the W1.3 candidate floors: a
         // session-scoped top is compared against the bar scaled by
-        // SESSION_PROVENANCE_SCORE_MULTIPLIER, because the session prior
-        // rescales the whole score — an unscaled bar would silently raise the
-        // admission bar 2.5x for ordinary keyword-matched hook summaries.
+        // SESSION_PROVENANCE_SCORE_MULTIPLIER, and the bar is scaled by the
+        // TOP's `score_multiplier()` — the trust prior rescales the whole
+        // score, so an unscaled bar would silently raise the effective bar
+        // 1.25x for a default-class (`agent_attested`, 0.80) corpus and
+        // abstain on calibrated hits (the derivation's weakest golden scores
+        // 0.2724 → 0.218 at 0.80, under the 0.22 bar; PR #89 review).
         // `Linear` only: `Rrf` scores live on a different, uncalibrated scale
         // (the SCORE_FLOOR precedent).
         let mut abstained: Option<rb_types::AbstainReason> = None;
@@ -797,7 +809,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                     threshold * SESSION_PROVENANCE_SCORE_MULTIPLIER
                 } else {
                     threshold
-                };
+                } * top.memory.trust_class.score_multiplier();
                 if top.score < bar {
                     tracing::debug!(
                         top_score = top.score,
@@ -814,19 +826,24 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         }
         // Every empty outcome still carries a machine-readable reason so
         // surfaces can tell "responsibly declined" apart from a plain empty
-        // set. Precedence (most actionable first): no channel surfaced
-        // anything at all → the corpus simply has no candidate; the backend
-        // was degraded → warn/retry before concluding anything about the
-        // corpus; the filter excluded every candidate → the query may be
-        // answerable unfiltered; otherwise the best candidate fell below the
-        // calibrated gate (or the W1.3 floor).
+        // set. Precedence (PR #89 review, most conservative first): the
+        // backend was DEGRADED → warn/retry before concluding anything about
+        // the corpus (a down channel hid hits; "no candidates" is not
+        // established); no channel surfaced anything at all → the corpus
+        // simply has no candidate; the user's FILTER (or contested tri-state)
+        // excluded every candidate → the query may be answerable unfiltered;
+        // candidates existed but none survived → the calibrated gate or the
+        // W1.3 floor dropped them. Quarantine/namespace drops are not filter
+        // decisions and fall through to the honest "no candidate" reading.
         if results.is_empty() && abstained.is_none() {
-            abstained = Some(if order.is_empty() {
-                rb_types::AbstainReason::NoCandidates
-            } else if degraded {
+            abstained = Some(if degraded {
                 rb_types::AbstainReason::DegradedBackend
-            } else if notes.is_empty() {
+            } else if order.is_empty() {
+                rb_types::AbstainReason::NoCandidates
+            } else if filter_dropped_any {
                 rb_types::AbstainReason::FilterExcluded
+            } else if notes.is_empty() {
+                rb_types::AbstainReason::NoCandidates
             } else {
                 rb_types::AbstainReason::BelowThreshold
             });
@@ -2528,13 +2545,9 @@ mod tests {
         // prior-only candidates (score <= 0.15) are exactly the weak-nearest
         // class it exists to refuse (see
         // recall_abstains_when_the_only_candidate_is_a_weak_match).
-        let eng = engine()
-            .with_score_floor(0.0)
-            .with_abstain_threshold(None);
-        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[])
-            .await;
-        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[])
-            .await;
+        let eng = engine().with_score_floor(0.0).with_abstain_threshold(None);
+        let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
+        let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
         eng.backend().set_keyword_results(vec![]);
         eng.backend()
             .set_vector_results(vec![(a.clone(), 1.0), (b.clone(), 1.0)]);
@@ -2558,7 +2571,14 @@ mod tests {
         // default-importance priors (0.10): blend ~= 0.19 — above the W1.3
         // admission floor (0.18) but below the abstention gate (0.22).
         let eng = engine();
-        let id = seed(&eng, "distant topically unrelated note", MemoryType::Insight, 5, &[]).await;
+        let id = seed(
+            &eng,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
         eng.backend().set_keyword_results(vec![]);
         eng.backend().set_vector_results(vec![(id.clone(), 0.8)]);
 
@@ -2581,8 +2601,14 @@ mod tests {
         // The contrast that defines the feature: with the gate disabled, the
         // SAME query serves the same weak memory (the old behavior).
         let ungated = engine().with_abstain_threshold(None);
-        let id2 = seed(&ungated, "distant topically unrelated note", MemoryType::Insight, 5, &[])
-            .await;
+        let id2 = seed(
+            &ungated,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
         ungated.backend().set_keyword_results(vec![]);
         ungated
             .backend()
@@ -2604,11 +2630,22 @@ mod tests {
         // Keyword rank 0 + importance 9 + fresh: ~= 0.44, comfortably over
         // the gate. A served recall carries abstained = None.
         let eng = engine();
-        let id = seed(&eng, "strong keyword evidence note", MemoryType::Insight, 9, &[]).await;
+        let id = seed(
+            &eng,
+            "strong keyword evidence note",
+            MemoryType::Insight,
+            9,
+            &[],
+        )
+        .await;
         eng.backend().set_keyword_results(vec![id.clone()]);
         eng.backend().set_vector_results(vec![(id, 1.0)]);
         let outcome = eng
-            .recall_with_status("strong keyword evidence", 10, &rb_types::RecallFilter::default())
+            .recall_with_status(
+                "strong keyword evidence",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         assert_eq!(outcome.abstained, None, "a strong match serves normally");
@@ -2623,7 +2660,10 @@ mod tests {
             .recall_with_status("anything at all", 10, &rb_types::RecallFilter::default())
             .await
             .unwrap();
-        assert_eq!(outcome.abstained, Some(rb_types::AbstainReason::NoCandidates));
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::NoCandidates)
+        );
         assert!(outcome.results.is_empty());
         assert!(!outcome.degraded);
     }
@@ -2727,6 +2767,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn recall_abstention_bar_scales_for_trust_class_tops() {
+        // PR #89 review: the trust prior rescales the WHOLE score, so the
+        // bar must scale by the same factor — the score_multiplier promise
+        // ("uniform-class corpora scale scores and floors identically")
+        // otherwise breaks at the gate. A default-class (agent_attested,
+        // x0.80) durable keyword hit must SERVE under a threshold it could
+        // never clear unscaled: with a fixture scoring s post-trust, an
+        // unscaled bar t > s abstains (the old behavior) while the scaled
+        // bar 0.80*t <= s serves.
+        let eng = engine().with_abstain_threshold(Some(0.80));
+        let n = note(
+            Namespace::Project("rb".into()),
+            "durable keyword evidence for the trust-scaled bar",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let id = n.id.clone();
+        eng.backend().insert_note(n);
+        eng.backend().set_keyword_results(vec![id]);
+        let outcome = eng
+            .recall_with_status("trust-scaled bar", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained, None,
+            "the bar must scale by the top's trust multiplier"
+        );
+        assert_eq!(outcome.results.len(), 1);
+        let score = outcome.results[0].score;
+        assert!(
+            (0.80 * rb_types::TrustClass::default().score_multiplier()..0.80).contains(&score),
+            "fixture must sit between the scaled bar (0.64) and the unscaled \
+             one (0.80): {score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_degraded_outranks_no_candidates_when_the_corpus_looks_empty() {
+        // PR #89 review: with the embedder down AND zero keyword/graph
+        // candidates, "the corpus has nothing" is NOT established — the
+        // outage may have hidden the only hits. The reason must be
+        // DegradedBackend (warn/retry), not NoCandidates.
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            QueryFailingProvider,
+            Namespace::Project("rb".into()),
+        );
+        eng.backend().set_keyword_results(vec![]);
+        let outcome = eng
+            .recall_with_status("anything at all", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert!(outcome.degraded);
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::DegradedBackend),
+            "a down channel must not be reported as an empty corpus"
+        );
+    }
+
+    #[tokio::test]
     async fn recall_rrf_mode_skips_the_abstention_top_gate() {
         // RRF scores live on a different, uncalibrated scale (the
         // SCORE_FLOOR precedent): the below-threshold top gate must not
@@ -2740,7 +2842,10 @@ mod tests {
             .recall_with_status("unrelated query", 10, &rb_types::RecallFilter::default())
             .await
             .unwrap();
-        assert_eq!(outcome.abstained, None, "RRF is not gated by the Linear bar");
+        assert_eq!(
+            outcome.abstained, None,
+            "RRF is not gated by the Linear bar"
+        );
         assert_eq!(outcome.results.len(), 1);
     }
 
@@ -2772,7 +2877,14 @@ mod tests {
         // A withheld (abstained) candidate must not be counted as recalled:
         // access stats feed the review sweep and importance recalibration.
         let eng = engine();
-        let id = seed(&eng, "distant topically unrelated note", MemoryType::Insight, 5, &[]).await;
+        let id = seed(
+            &eng,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
         eng.backend().set_keyword_results(vec![]);
         eng.backend().set_vector_results(vec![(id, 0.8)]);
         eng.recall("unrelated query", 10, &rb_types::RecallFilter::default())
@@ -2943,8 +3055,10 @@ mod tests {
             // This test isolates the source-prior/floor interaction (W1.3):
             // its prior-only junk scores sit below the calibrated abstention
             // bar (Vikunja #62) on purpose, so the gate is disabled here.
-            let eng =
-                engine().with_fixed_now(now).with_fusion_mode(mode).with_abstain_threshold(None);
+            let eng = engine()
+                .with_fixed_now(now)
+                .with_fusion_mode(mode)
+                .with_abstain_threshold(None);
             let ids = seed_notes(&eng, 5, |i, note| {
                 note.created_at = now;
                 if i < 4 {
@@ -3826,10 +3940,18 @@ mod tests {
         })
         .await;
         let results = eng
-            .recall("identical rank probe kata", 10, &rb_types::RecallFilter::default())
+            .recall(
+                "identical rank probe kata",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
-        assert_eq!(results.len(), 2, "both admitted: the floor scales with the prior");
+        assert_eq!(
+            results.len(),
+            2,
+            "both admitted: the floor scales with the prior"
+        );
         assert_eq!(
             results[0].memory.id, ids[1],
             "the measured_ci row must rank above the agent_attested row"
@@ -3861,11 +3983,15 @@ mod tests {
 
         // HEAD == anchor, clean worktree: current, not stale.
         let (eng, id) = seed().await;
-        let eng = eng.with_repo_state_provider(std::sync::Arc::new(
-            crate::FixedRepoState::new(snapshot(Some("aaaaaaaa"), true)),
-        ));
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(crate::FixedRepoState::new(
+            snapshot(Some("aaaaaaaa"), true),
+        )));
         let results = eng
-            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         let hit = results.iter().find(|r| r.memory.id == id).unwrap();
@@ -3873,11 +3999,15 @@ mod tests {
 
         // HEAD moved past the anchor: STALE, surfaced on the result.
         let (eng, id) = seed().await;
-        let eng = eng.with_repo_state_provider(std::sync::Arc::new(
-            crate::FixedRepoState::new(snapshot(Some("bbbbbbbb"), true)),
-        ));
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(crate::FixedRepoState::new(
+            snapshot(Some("bbbbbbbb"), true),
+        )));
         let results = eng
-            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         let hit = results.iter().find(|r| r.memory.id == id).unwrap();
@@ -3886,7 +4016,11 @@ mod tests {
         // No provider at all: staleness claims are OFF (never guessed).
         let (eng, id) = seed().await;
         let results = eng
-            .recall("anchored stale probe", 10, &rb_types::RecallFilter::default())
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         let hit = results.iter().find(|r| r.memory.id == id).unwrap();
@@ -3921,7 +4055,9 @@ mod tests {
         };
         let eng = engine().with_write_gate(rb_types::WriteGateConfig {
             default: rb_types::WriteGatePolicy::default(),
-            namespaces: vec![(Namespace::Project("rb".into()), policy)].into_iter().collect(),
+            namespaces: vec![(Namespace::Project("rb".into()), policy)]
+                .into_iter()
+                .collect(),
         });
 
         // Channel violation: an HTTP-channel write into the restricted
@@ -3930,7 +4066,8 @@ mod tests {
         inp.provenance.channel = Some(rb_types::WriteChannel::Http);
         let err = eng.remember(inp).await.unwrap_err();
         assert!(
-            err.to_string().contains("[write-gate:channel_not_permitted]"),
+            err.to_string()
+                .contains("[write-gate:channel_not_permitted]"),
             "unexpected error: {err}"
         );
 
@@ -3938,6 +4075,11 @@ mod tests {
         let mut inp = input("insight over cli", 5);
         inp.memory_type = rb_types::MemoryType::Insight;
         inp.provenance.channel = Some(rb_types::WriteChannel::Cli);
+        let err = eng.remember(inp).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[write-gate:type_not_allowed]"),
+            "unexpected error: {err}"
+        );
         // Both rejections left the backend untouched — nothing composed.
         assert_eq!(eng.backend().count(), 0);
 
@@ -3979,7 +4121,10 @@ mod tests {
         // The context projection (SessionStart digest feed) excludes it too.
         let (recent, important, _total) = eng.context().await.unwrap();
         assert!(
-            recent.iter().chain(important.iter()).all(|n| n.id != poisoned[0]),
+            recent
+                .iter()
+                .chain(important.iter())
+                .all(|n| n.id != poisoned[0]),
             "quarantined row must never reach the digest feed"
         );
 
@@ -3989,7 +4134,11 @@ mod tests {
             .await
             .unwrap();
         assert!(listed.iter().any(|n| n.id == poisoned[0]));
-        assert!(listed.iter().find(|n| n.id == poisoned[0]).unwrap().is_quarantined());
+        assert!(listed
+            .iter()
+            .find(|n| n.id == poisoned[0])
+            .unwrap()
+            .is_quarantined());
     }
 
     #[tokio::test]
@@ -4003,7 +4152,11 @@ mod tests {
         })
         .await;
         let results = eng
-            .recall("seeded searchable content", 10, &rb_types::RecallFilter::default())
+            .recall(
+                "seeded searchable content",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
             .await
             .unwrap();
         assert!(

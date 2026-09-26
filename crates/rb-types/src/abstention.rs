@@ -68,9 +68,13 @@ impl std::fmt::Display for AbstainReason {
 ///
 /// Components (all namespace-scoped):
 /// - `memories` — row count (all states: active + archived),
-/// - `generation` — `MAX(rowid)`: monotonically increasing with inserts,
+/// - `generation` — the namespace's `MAX(memory_oplog.seq)`: every mutating
+///   path (insert, update, delete, AND ranking-input writes like feedback
+///   that deliberately leave `updated_at` alone) logs an oplog row
+///   transactionally, so the generation moves on each (PR #89 review —
+///   `MAX(rowid)` missed no-`updated_at` rewrites),
 /// - `last_write_epoch_s` — `MAX(updated_at)`: unix seconds of the newest
-///   write, catching same-count rewrites (supersede, feedback, archive).
+///   row-timestamped write.
 ///
 /// Not a content hash by design: hashing every row would cost a full corpus
 /// scan on every recall. The triple pins the corpus state for the realistic
@@ -80,7 +84,9 @@ impl std::fmt::Display for AbstainReason {
 pub struct CorpusSnapshot {
     /// Rows in the namespace, active and archived.
     pub memories: u64,
-    /// `MAX(rowid)` in the namespace: increases with every insert.
+    /// The namespace's `MAX(memory_oplog.seq)`: moves on EVERY mutating
+    /// write, including ranking-input writes (feedback, recalibration,
+    /// vector updates) that leave `updated_at` unchanged.
     pub generation: u64,
     /// `MAX(updated_at)` in unix seconds; `0` for an empty namespace.
     pub last_write_epoch_s: i64,
@@ -92,7 +98,10 @@ impl CorpusSnapshot {
     /// visible to the snapshot query changes it.
     #[must_use]
     pub fn fingerprint(&self) -> String {
-        format!("{}:{}:{}", self.memories, self.generation, self.last_write_epoch_s)
+        format!(
+            "{}:{}:{}",
+            self.memories, self.generation, self.last_write_epoch_s
+        )
     }
 }
 
@@ -115,7 +124,10 @@ mod tests {
             (AbstainReason::FilterExcluded, "filter_excluded"),
             (AbstainReason::DegradedBackend, "degraded_backend"),
         ] {
-            assert_eq!(serde_json::to_string(&reason).unwrap(), format!("\"{wire}\""));
+            assert_eq!(
+                serde_json::to_string(&reason).unwrap(),
+                format!("\"{wire}\"")
+            );
             let back: AbstainReason = serde_json::from_str(&format!("\"{wire}\"")).unwrap();
             assert_eq!(back, reason);
             assert_eq!(reason.as_str(), wire);
@@ -141,11 +153,7 @@ mod tests {
         // Every component participates.
         assert_ne!(
             a.fingerprint(),
-            CorpusSnapshot {
-                memories: 13,
-                ..a
-            }
-            .fingerprint()
+            CorpusSnapshot { memories: 13, ..a }.fingerprint()
         );
         assert_ne!(
             a.fingerprint(),

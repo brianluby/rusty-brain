@@ -81,10 +81,16 @@ layers, all enforced server-side:
    when unconfigured.
 
 2. **Channel trust tags.** The daemon stamps every write with the channel
-   it arrived on — `hook`/`mcp`/`cli` from a kernel-verified same-host UDS
-   peer's declared surface, `http` for the loopback listener, `None`
+   it arrived on — `hook`/`mcp`/`cli` from the same-host UDS peer's
+   handshake-declared surface, `http` for the loopback listener, `None`
    (unverified) for old/unknown clients — into a dedicated `origin_channel`
-   column OUTSIDE any client-writable payload field. Retrieval quarantines
+   column OUTSIDE any per-request payload field. Honesty note (PR #89
+   review): the UDS kernel credential proves the peer's UID, not its
+   binary — the surface string is the honest client's self-report, so the
+   tag separates first-party paths and degrades unknown peers to `None`;
+   it is not a defense against a hostile same-user process, which this
+   threat model already treats as inside the boundary (the admin gate
+   trusts same-euid for the same reason). Retrieval quarantines
    untrusted-origin rows: they never surface in recall or the SessionStart
    digest, but stay listed (visibly marked `[quarantined]`) — demotion,
    never silent deletion.

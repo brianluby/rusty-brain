@@ -3,20 +3,26 @@
 //! structured rejection the daemon surfaces when a write fails the gate.
 //!
 //! Trust posture (see docs/THREAT_MODEL.md, "The write-path gate"):
-//! - [`WriteChannel`] is stamped BY THE DAEMON from connection/request
-//!   context (kernel-verified peer executable over UDS; the listener for
-//!   HTTP). It is NEVER read from a client payload — a client-declared
-//!   `origin_source` stays advisory provenance and cannot move the tag.
+//! - [`WriteChannel`] is stamped BY THE DAEMON from the connection's
+//!   handshake identity (the loopback listener for HTTP). It is NEVER read
+//!   from a per-REQUEST payload — request fields cannot move the tag.
+//!   Honesty note (PR #89 review): over the UDS the kernel credential
+//!   verifies the peer's UID, not its executable — the surface string is
+//!   the honest first-party client's self-report, so the tag separates
+//!   honest first-party paths and degrades unknown/old clients to `None`.
+//!   It is NOT a defense against a hostile same-user process, which the
+//!   threat model already treats as inside the boundary (same-user
+//!   privilege is the boundary the admin gate uses too).
 //! - Rows whose stamped channel is untrusted ([`WriteChannel::Http`], the
-//!   surface with no kernel-verified peer identity) are QUARANTINED at
+//!   surface with no UDS peer credential at all) are QUARANTINED at
 //!   retrieval: excluded from recall/injection, still visible on list/get
 //!   surfaces with an explicit marker. Quarantine — not rank demotion — is
 //!   the documented choice: a poisoned row must not ride into a prompt.
 //! - `origin_channel == None` means one of (a) a pre-migration row (the
 //!   004 no-backfill precedent applies here too), (b) a daemon-internal
-//!   write (jobs), or (c) a UDS peer whose executable could not be verified
-//!   as a first-party binary. None of those carries Http's network-origin
-//!   risk, so they keep today's retrieval behavior.
+//!   write (jobs), or (c) a handshake surface the daemon does not
+//!   recognize as a first-party writer. None of those carries Http's
+//!   network-origin risk, so they keep today's retrieval behavior.
 
 use crate::memory_type::MemoryType;
 use crate::namespace::Namespace;
@@ -238,8 +244,7 @@ impl WriteRejection {
                 let channel = channel
                     .map(|c| c.as_str().to_string())
                     .unwrap_or_else(|| WriteChannel::UNVERIFIED_LABEL.to_string());
-                let permitted: Vec<&str> =
-                    permitted.iter().map(WriteChannel::as_str).collect();
+                let permitted: Vec<&str> = permitted.iter().map(WriteChannel::as_str).collect();
                 format!(
                     "write on channel '{channel}' is not permitted for namespace '{}' \
                      (permitted: {}; unverified peers {})",
@@ -426,7 +431,9 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, WriteRejection::ContentOversized { .. }));
         assert_eq!(err.code(), "content_oversized");
-        assert!(err.to_string().starts_with("[write-gate:content_oversized]"));
+        assert!(err
+            .to_string()
+            .starts_with("[write-gate:content_oversized]"));
         assert!(err.to_string().contains("project:gate"));
 
         // Oversized context.
@@ -510,32 +517,28 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(err.code(), "anchors_required");
-        assert!(
-            validate_write(
-                &anchored,
-                &ns,
-                Some(WriteChannel::Hook),
-                &MemoryType::Insight,
-                "ok",
-                None,
-                1
-            )
-            .is_ok()
-        );
+        assert!(validate_write(
+            &anchored,
+            &ns,
+            Some(WriteChannel::Hook),
+            &MemoryType::Insight,
+            "ok",
+            None,
+            1
+        )
+        .is_ok());
 
         // A plain conforming write passes the default policy.
-        assert!(
-            validate_write(
-                &default,
-                &ns,
-                Some(WriteChannel::Hook),
-                &MemoryType::Insight,
-                "session summary",
-                Some("ctx"),
-                2
-            )
-            .is_ok()
-        );
+        assert!(validate_write(
+            &default,
+            &ns,
+            Some(WriteChannel::Hook),
+            &MemoryType::Insight,
+            "session summary",
+            Some("ctx"),
+            2
+        )
+        .is_ok());
     }
 
     #[test]

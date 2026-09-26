@@ -258,15 +258,23 @@ impl SqliteStore {
 
     /// Read-time corpus snapshot for `ns` (Vikunja #62): ONE aggregate query
     /// deriving the fingerprint a recall outcome was computed against — row
-    /// count (all states), `MAX(rowid)` as a monotonically increasing
-    /// generation, and `MAX(updated_at)` (unix seconds) catching same-count
-    /// rewrites. Pure read, no schema change: safe on the read pool, cheap
-    /// enough to run per recall. See `rb_types::CorpusSnapshot`.
+    /// count (all states), the namespace's `MAX(memory_oplog.seq)` as the
+    /// generation, and `MAX(updated_at)` (unix seconds). Generation uses the
+    /// OPLOG, not `MAX(rowid)` (PR #89 review): ranking-input writes —
+    /// feedback (confidence), importance recalibration, vector updates —
+    /// bump the oplog but deliberately leave `updated_at` alone, so a
+    /// rowid+updated_at pair could pin two corpus states that rank
+    /// differently to the same fingerprint; every mutating path logs an
+    /// oplog row transactionally, and `idx_oplog_ns_seq` keeps the MAX
+    /// cheap. Pure read, no schema change: safe on the read pool. See
+    /// `rb_types::CorpusSnapshot`.
     pub fn corpus_snapshot(&self, ns: &Namespace) -> Result<rb_types::CorpusSnapshot> {
         let ns_str = ns.as_db_string();
         self.conn
             .query_row(
-                "SELECT COUNT(*), COALESCE(MAX(rowid), 0), COALESCE(MAX(updated_at), 0)
+                "SELECT COUNT(*),
+                        COALESCE((SELECT MAX(seq) FROM memory_oplog WHERE namespace = ?1), 0),
+                        COALESCE(MAX(updated_at), 0)
                  FROM memories WHERE namespace = ?1",
                 rusqlite::params![ns_str],
                 |row| {
@@ -363,6 +371,22 @@ mod tests {
             bumped.last_write_epoch_s
         );
         assert_ne!(one.fingerprint(), bumped.fingerprint());
+
+        // PR #89 review: ranking-input writes that deliberately leave
+        // `updated_at` alone (feedback → confidence) must STILL move the
+        // fingerprint — the oplog-based generation catches them now.
+        let before = store.corpus_snapshot(&ns).unwrap();
+        store
+            .record_feedback(&a, rb_types::FeedbackKind::Helpful, None)
+            .unwrap();
+        let after = store.corpus_snapshot(&ns).unwrap();
+        assert!(
+            after.generation > before.generation,
+            "feedback (confidence) bumps the oplog generation: {} -> {}",
+            before.generation,
+            after.generation
+        );
+        assert_ne!(before.fingerprint(), after.fingerprint());
     }
 
     #[test]

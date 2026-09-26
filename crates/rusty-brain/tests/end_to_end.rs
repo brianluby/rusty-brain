@@ -507,8 +507,7 @@ fn import_dry_run_prints_plan_and_stores_nothing() {
     // the plain empty state or an abstention with `no_candidates`. Both
     // prove the dry run stored nothing; neither contains the imported text.
     assert!(
-        stdout.contains("No stored memories match")
-            || stdout.contains("abstained (no_candidates)"),
+        stdout.contains("No stored memories match") || stdout.contains("abstained (no_candidates)"),
         "dry-run must not store the imported text; got: {stdout}"
     );
     assert!(

@@ -139,8 +139,9 @@ Implemented and test-covered (correctness is the primary coverage; see [Testing]
   **supersession** keeps replaced memories out of active recall.
 - **Write-path defenses** — every durable write passes a per-namespace
   validation gate (permitted channels, types, size, anchors) before it can
-  reach SQLite; writes are tagged with the daemon-stamped **channel trust
-  class** (hook/mcp/cli over the UDS, http for the loopback listener) and
+  reach SQLite; writes carry the daemon-stamped **channel tag**
+  (`origin_channel`: hook/mcp/cli over the UDS, http for the loopback
+  listener — a separate column from the evidence-derived `trust_class`) and
   untrusted-origin rows are quarantined out of recall. Hook folds are
   source-filtered, so instruction-shaped content planted mid-session never
   becomes a durable memory, and commit-anchored memories report **STALE**

@@ -136,5 +136,3 @@ pub fn run_git_status_bounded(dir: &Path, args: &[&str], timeout: Duration) -> O
         std::thread::sleep(POLL_INTERVAL);
     }
 }
-
-

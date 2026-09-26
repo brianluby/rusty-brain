@@ -388,8 +388,9 @@ where
         limit: usize,
     ) -> Result<(Vec<SearchResult>, bool)> {
         let filter = rb_types::RecallFilter::default().fold_recall_legacy(memory_type, tags);
-        let (results, degraded, _abstained, _snapshot) =
-            self.recall_filtered_with_status(query, filter, limit).await?;
+        let (results, degraded, _abstained, _snapshot) = self
+            .recall_filtered_with_status(query, filter, limit)
+            .await?;
         Ok((results, degraded))
     }
 

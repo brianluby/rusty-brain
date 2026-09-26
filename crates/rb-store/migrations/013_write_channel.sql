@@ -2,11 +2,13 @@
 -- Vikunja #69: daemon-stamped write-channel trust tag.
 --
 -- `origin_channel` records WHICH SURFACE a write arrived on
--- (hook|cli|mcp|http), stamped by the daemon from connection/request context:
--- the kernel-verified peer executable over UDS, the HTTP listener for HTTP.
--- It is deliberately OUTSIDE the client-writable record body — a client
--- cannot set it, and the handshake's client-declared `identity.source`
--- (stored as advisory `origin_source`) can never move it.
+-- (hook|cli|mcp|http), stamped by the daemon from the connection's
+-- handshake identity: the HTTP listener for HTTP, the peer's DECLARED
+-- surface over UDS. The kernel credential verifies the peer's UID, not its
+-- executable — the surface is the honest first-party client's self-report
+-- (same-user honest-path separation, not binary verification). It is
+-- deliberately OUTSIDE the client-writable record body — no REQUEST payload
+-- can set it, and the advisory `origin_source` can never move it.
 --
 -- Nullable with NO default and NO backfill, exactly like 004_provenance:
 -- an UPDATE here would fire the `mem_au` trigger and rewrite the FTS index

@@ -428,15 +428,13 @@ async fn run_client(
                 // commit anchor, enforced daemon-side) or a human
                 // confirmation. Batch mode plants raw facts and carries no
                 // evidence.
-                let evidence: Option<rb_types::CaptureEvidence> = if let Some(run_ref) =
-                    evidence_ci
+                let evidence: Option<rb_types::CaptureEvidence> = if let Some(run_ref) = evidence_ci
                 {
                     Some(rb_types::CaptureEvidence::MeasuredCi { run_ref })
                 } else {
                     // `Some(None)` = bare flag (human confirmed, no
                     // attribution); `Some(Some(by))` names who.
-                    evidence_confirmed
-                        .map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
+                    evidence_confirmed.map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
                 };
                 let id = client
                     .remember_anchored(

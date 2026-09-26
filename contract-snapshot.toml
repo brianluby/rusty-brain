@@ -82,7 +82,7 @@ contract_version = 2
 "010_review_state.sql" = "a174de82d5ebbf75cd68e28369b1ef7ce549daa9874d5d497a5efde067b86d45"
 "011_memory_links_target_index.sql" = "0dc6147340f050df5ae3cac4f3492f6717001e9d02c9bb2a4a98db3fed8c7597"
 "012_trust_class.sql" = "468d6dbd2143ca0e002e9d2b4e573cc3dacfac52c556a9b763e2a15fb48503c3"
-"013_write_channel.sql" = "ffaf297c82976b02e0a4397913ac44f9da407b8fc12b5ceb30b1218e8adf9c6b"
+"013_write_channel.sql" = "6064ec9b6050883f32b7ab1694e2c722f589aaff5df7e12264d0d025a66e46f1"
 
 [[log]]
 contract_version = 2
@@ -163,3 +163,8 @@ note = "Vikunja #63: MemoryNote gains trust_class (daemon-derived, backfilled ag
 contract_version = 2
 intent = "additive"
 note = "Vikunja #62: Recalled response gains optional abstained (AbstainReason) + snapshot (CorpusSnapshot); new rb-types abstention module (AbstainReason, CorpusSnapshot); recall client tuple widened"
+
+[[log]]
+contract_version = 2
+intent = "additive"
+note = "PR #89 review: 013_write_channel.sql comment corrected (channel derives from the handshake-declared surface of a kernel-verified same-UID peer, not a verified executable) — comment-only, no schema or wire change."

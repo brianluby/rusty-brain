@@ -59,11 +59,15 @@ pub struct MemoryNote {
     pub origin_source: Option<String>,
     /// Daemon-stamped write channel (Vikunja #69): `hook`/`cli`/`mcp`/`http`.
     /// Stored in its OWN column (migration 013), OUTSIDE the client-writable
-    /// record body — the daemon derives it from connection/request context
-    /// (kernel-verified peer executable over UDS, the listener for HTTP) and
-    /// NEVER from a client payload. `None` = pre-migration row, daemon-internal
-    /// write, or a UDS peer whose executable could not be verified. See
-    /// `write_gate` module docs and docs/THREAT_MODEL.md.
+    /// record body — the daemon derives it from the connection's handshake
+    /// identity (the listener for HTTP), never from a per-REQUEST payload.
+    /// Honesty note (PR #89 review): the UDS kernel credential verifies the
+    /// peer's UID, not its binary — the surface string is the honest
+    /// first-party client's self-report, so the tag separates honest paths
+    /// and degrades unknown/old clients to `None`; it is not a defense
+    /// against a hostile same-user process (inside the threat boundary).
+    /// `None` = pre-migration row, daemon-internal write, or an unrecognized
+    /// surface. See `write_gate` module docs and docs/THREAT_MODEL.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_channel: Option<crate::write_gate::WriteChannel>,
     #[serde(default)]

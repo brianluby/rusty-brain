@@ -735,16 +735,30 @@ pub async fn user_prompt_submit(
     }
 }
 
-/// The ABSTAIN injection (Vikunja #62): recall ran, and the calibrated trust
-/// gate found NO memory worth injecting — distinct from an empty result set
-/// (nothing matched) and from silence (recall never ran). One bounded line
-/// inside the shared untrusted-data posture; the reason code is fixed enum
-/// text, never content-derived.
+/// The ABSTAIN injection (Vikunja #62): recall ran and declined — distinct
+/// from an empty result set (nothing matched) and from silence (recall never
+/// ran). One bounded line inside the shared untrusted-data posture; the
+/// reason code is fixed enum text, never content-derived. Wording MATCHES the
+/// code (PR #89 review): `below_threshold` is the calibrated gate refusing a
+/// weak match; `degraded_backend` is a retrieval outage and must not be
+/// phrased as a finding about stored memories.
 fn format_user_prompt_abstain(reason: rb_types::AbstainReason) -> Option<String> {
+    let why = match reason {
+        rb_types::AbstainReason::NoCandidates => "the corpus has no candidate for this prompt",
+        rb_types::AbstainReason::BelowThreshold => {
+            "no stored memory clears the calibrated abstention bar for this prompt"
+        }
+        rb_types::AbstainReason::FilterExcluded => {
+            "every candidate was excluded by the active filters"
+        }
+        rb_types::AbstainReason::DegradedBackend => {
+            "retrieval was degraded (a channel failed or timed out); retry before concluding"
+        }
+    };
     Some(format!(
-        "# Rusty Brain — No memory injected\n{}\nRecall abstained ({reason}): no stored \
-         memory clears the trust gate for this prompt. Treat the corpus as not \
-         covering this topic rather than guessing at weak matches.\n",
+        "# Rusty Brain — No memory injected\n{}\nRecall abstained ({reason}): {why}. \
+         Treat the corpus as not covering this topic rather than guessing at \
+         weak matches.\n",
         UNTRUSTED_DATA_FRAME
     ))
 }
@@ -956,7 +970,11 @@ async fn fold_session_summary(
         content,
         data.prior_summary_id.as_deref(),
         anchors,
-        data.commands.clone(),
+        // Evidence must match the summary text (PR #89 review): the text
+        // drops instruction-shaped commands, so the `measured_local`
+        // evidence lists the SAME filtered set — a planted "command" can
+        // never ride into the store as machine-measured evidence.
+        crate::poison::filter_instruction_shaped(&data.commands),
     )
     .await
     {
@@ -1152,8 +1170,7 @@ mod tests {
     /// supersedes) it received, and the id it issued back, in order.
     #[derive(Default)]
     struct MockObserved {
-        remembers:
-            Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
+        remembers: Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
         evidence: Vec<Option<rb_types::CaptureEvidence>>,
         issued: Vec<MemoryId>,
     }
@@ -2081,14 +2098,14 @@ mod tests {
                 memory: disputed,
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
-            stale: false,
-        },
+                stale: false,
+            },
             SearchResult {
                 memory: clean,
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
-            stale: false,
-        },
+                stale: false,
+            },
         ])
         .expect("non-empty hits");
         for (channel, msg) in [("SessionStart", digest), ("UserPromptSubmit", recall)] {
@@ -2823,7 +2840,10 @@ mod tests {
         // Real observations worth folding…
         scratch.append(scratch::Kind::File, "src/store.rs");
         scratch.append(scratch::Kind::Command, "cargo test -p rb-store");
-        scratch.append(scratch::Kind::Failure, "error: migration 013 column mismatch");
+        scratch.append(
+            scratch::Kind::Failure,
+            "error: migration 013 column mismatch",
+        );
         // …and the planted payload riding every foldable section.
         scratch.append(
             scratch::Kind::Command,

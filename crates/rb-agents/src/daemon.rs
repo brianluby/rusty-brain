@@ -195,9 +195,11 @@ impl DaemonClient {
         query: String,
         limit: usize,
     ) -> Option<(Vec<SearchResult>, Option<rb_types::AbstainReason>)> {
-        let fut =
-            self.client
-                .recall_filtered_with_status(query, rb_types::RecallFilter::default(), limit);
+        let fut = self.client.recall_filtered_with_status(
+            query,
+            rb_types::RecallFilter::default(),
+            limit,
+        );
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok((results, _degraded, abstained, _snapshot))) => Some((results, abstained)),
             Ok(Err(_)) | Err(_) => None,
@@ -369,8 +371,8 @@ mod tests {
                 Some(0.7),
                 anchors.clone(),
                 None,
-            None,
-        )
+                None,
+            )
             .await
             .expect("anchored remember must return an id");
         let (recent, important, _total) = client.context().await.expect("context");

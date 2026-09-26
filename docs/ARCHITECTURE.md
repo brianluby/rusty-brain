@@ -254,8 +254,11 @@ path", for the threat framing):
   from *failure*. The gate is policy, not a filter: it decides whether a
   write is permitted at all, never what it says.
 - **Channel trust tags** — the daemon stamps `origin_channel` from the
-  kernel-verified peer (`hook`/`mcp`/`cli` over the UDS) or `http` on the
-  loopback listener; clients cannot set the column. Rows whose origin is not
+  connection's handshake surface (`hook`/`mcp`/`cli` over the UDS) or
+  `http` on the loopback listener; no request payload can set the column.
+  The UDS credential proves the peer's UID, not its binary — the surface is
+  the honest client's self-report (same-user honest-path separation, not
+  executable verification). Rows whose origin is not
   trusted by the namespace policy are **quarantined** — persisted for audit
   and admin `forget`, excluded from recall and context, and marked
   `[quarantined]` in CLI/MCP listings.
@@ -340,7 +343,7 @@ Ranking lives in `rb-search` as pure, deterministic functions:
   ABSTAIN is a distinct outcome from an empty result set on every surface.
   Session-scoped tops compare against the prior-scaled bar; RRF is exempt (uncalibrated
   scale). Every served recall also carries a read-time **corpus snapshot** (count,
-  rowid-derived generation, last-write epoch, fingerprint) so a preregistered eval run
+  oplog-derived generation (every mutating write), last-write epoch, fingerprint) so a preregistered eval run
   pins the corpus it scored against — observability only, never a gate.
 
 The query itself is embedded raw (only the stored *document* representation is

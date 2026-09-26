@@ -5,6 +5,40 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — PR #89 review remediations (Copilot + CodeRabbit)
+
+- Abstention bar now scales by the top result's trust-class multiplier: the
+  trust prior rescales the whole score, so an unscaled bar silently raised
+  the effective bar 1.25x for every default-class (`agent_attested`) memory
+  and could abstain on calibrated hits.
+- Empty-outcome reason precedence: `degraded_backend` outranks
+  `no_candidates` (a down channel hid hits — "the corpus is empty" is not
+  established), and `filter_excluded` is only reported when the user's
+  filter/contested tri-state actually dropped a candidate (quarantine and
+  namespace drops are not filter decisions).
+- Abstention wording matches its reason code on every surface (CLI, MCP,
+  UserPromptSubmit injection): `degraded_backend` is phrased as a retrieval
+  outage, never as a "trust gate" finding about stored memories; JSON
+  rendering goes through `serde_json`.
+- A failed/timed-out git cleanliness probe now makes the repo snapshot
+  unresolvable (staleness off for the connection) instead of marking every
+  commit-anchored memory stale.
+- Review merge refuses a quarantined member (no laundering untrusted-origin
+  content into a clean row) and keeps the WEAKEST member's trust class.
+- `measured_local` evidence from hook folds lists the same
+  instruction-filtered commands as the summary text; the hook reports the
+  agent-declared session cwd so the staleness snapshot matches namespace
+  detection.
+- Corpus snapshot generation derives from `MAX(memory_oplog.seq)`, so
+  ranking-input writes that leave `updated_at` unchanged (feedback,
+  recalibration, vector updates) can no longer pin two differently-ranking
+  corpora to one fingerprint.
+- Channel-tag docs corrected everywhere: the UDS credential proves the
+  peer's UID, not its binary — the tag is same-user honest-path separation,
+  not executable verification (also fixes the `013_write_channel.sql`
+  citation). The flatten/`deny_unknown_fields` fail-closed parse is now
+  pinned by a regression test, and a no-op self-comparison assertion in the
+  write-gate config test was replaced with a real default check.
 
 ### Added — Write-path validation gate, channel trust tags, compaction source filtering (#69)
 

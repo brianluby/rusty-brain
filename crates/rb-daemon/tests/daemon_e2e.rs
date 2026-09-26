@@ -563,7 +563,7 @@ async fn second_bind_on_live_socket_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
-            abstain_threshold: None,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -590,7 +590,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
-            abstain_threshold: None,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -607,7 +607,7 @@ async fn second_bind_before_accept_loop_fails_closed() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
-            abstain_threshold: None,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };
@@ -1173,10 +1173,12 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
     .unwrap();
     let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
     match resp {
-        rb_proto::Response::Recalled { results, degraded,
-                abstained: None,
-                snapshot: None,
-            } => {
+        rb_proto::Response::Recalled {
+            results,
+            degraded,
+            abstained: None,
+            snapshot: None,
+        } => {
             assert!(degraded, "embedder outage must flag the wire response");
             assert!(
                 results.iter().any(|r| r.memory.id == id),
@@ -2216,7 +2218,7 @@ async fn retention_forget_flow_over_the_wire_respects_guards() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
-            abstain_threshold: None,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: None,
     };

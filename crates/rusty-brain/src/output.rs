@@ -4,18 +4,43 @@ use crate::import::{BatchInfo, ImportCounts, ImportItem, UndoCounts};
 use rb_redact::redact;
 use rb_types::{MemoryNote, SearchResult};
 
+/// Human-readable, reason-specific phrasing for an abstention (Vikunja #62,
+/// PR #89 review): the message must MATCH its code — `DegradedBackend` is a
+/// retrieval outage (says nothing about stored memories), never a blanket
+/// "trust gate" claim; only `BelowThreshold` is the calibrated gate refusing
+/// to serve a weak match.
+fn abstain_explanation(reason: &rb_types::AbstainReason) -> &'static str {
+    match reason {
+        rb_types::AbstainReason::NoCandidates => "the corpus has no candidate for this query",
+        rb_types::AbstainReason::BelowThreshold => {
+            "no memory clears the calibrated abstention bar for this query"
+        }
+        rb_types::AbstainReason::FilterExcluded => {
+            "every candidate was excluded by the active filters; the query may be answerable unfiltered"
+        }
+        rb_types::AbstainReason::DegradedBackend => {
+            "retrieval was degraded (a channel failed or timed out); this says nothing about stored memories — retry before concluding"
+        }
+    }
+}
+
 /// Render a recall that ABSTAINED (Vikunja #62): no results were served and
-/// `reason` says why. JSON: `{"abstained": "<code>", "results": []}` —
+/// `reason` says why. JSON: `{"abstained":"<code>","results":[]}` —
 /// machine-distinguishable from an honestly-empty result set. Human: the
-/// refusal and its reason, never filler content.
+/// refusal with reason-specific wording, never filler content.
 pub fn render_recall_abstained(reason: &rb_types::AbstainReason, json: bool) -> String {
     if json {
-        return format!(
-            "{{\"abstained\":\"{}\",\"results\":[]}}",
-            reason.as_str()
-        );
+        return serde_json::json!({
+            "abstained": reason.as_str(),
+            "results": [],
+        })
+        .to_string();
     }
-    format!("Recall abstained ({}) — no memory clears the trust gate.", reason)
+    format!(
+        "Recall abstained ({}) — {}.",
+        reason.as_str(),
+        abstain_explanation(reason)
+    )
 }
 
 /// Render recall hits. JSON: the raw `Vec<SearchResult>`. Human: one line per hit.
@@ -95,7 +120,11 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         let contested = if n.contested { " [contested]" } else { "" };
         // Vikunja #69: quarantined rows stay listed but visibly demoted —
         // quarantine is never silent deletion.
-        let quarantined = if n.is_quarantined() { " [quarantined]" } else { "" };
+        let quarantined = if n.is_quarantined() {
+            " [quarantined]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
             "{} (imp {}, {}){}{} {}{}\n",
             n.id,
@@ -124,7 +153,11 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             // every human surface (recall/list/context/get) marks a contradicted note.
             let contested = if n.contested { " [contested]" } else { "" };
             // Vikunja #69: quarantine is visible on every human surface.
-            let quarantined = if n.is_quarantined() { " [quarantined]" } else { "" };
+            let quarantined = if n.is_quarantined() {
+                " [quarantined]"
+            } else {
+                ""
+            };
             let anchors = if n.anchors.is_empty() {
                 String::new()
             } else {
@@ -1106,7 +1139,6 @@ mod tests {
         let out = render_notes(std::slice::from_ref(&n), true);
         assert!(out.contains("\"origin_channel\""), "json channel: {out}");
     }
-
 
     #[test]
     fn abstaining_recall_is_distinguishable_from_empty_in_both_modes() {

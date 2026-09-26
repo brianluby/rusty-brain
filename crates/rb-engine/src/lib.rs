@@ -17,8 +17,8 @@ mod repo_state;
 mod test_support;
 
 pub use backend::MemoryBackend;
-pub use engine::{MemoryEngine, Provenance, RememberInput};
 pub use embed_input::{embedding_input, EMBEDDING_INPUT_VERSION};
+pub use engine::{MemoryEngine, Provenance, RememberInput};
 pub use enricher::{Enricher, Enrichment};
 pub use linker::{Linker, SimilarityLinker};
 pub use repo_state::{FixedRepoState, RepoStateProvider};

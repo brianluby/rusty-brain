@@ -65,7 +65,10 @@ impl RepoSnapshot {
 /// ASCII case (users paste uppercase hex) and surrounding whitespace, mirroring
 /// [`crate::normalize_anchor_value`].
 #[must_use]
-pub fn evaluate_staleness(anchors: &[crate::MemoryAnchor], snapshot: Option<&RepoSnapshot>) -> bool {
+pub fn evaluate_staleness(
+    anchors: &[crate::MemoryAnchor],
+    snapshot: Option<&RepoSnapshot>,
+) -> bool {
     let Some(snapshot) = snapshot else {
         return false;
     };
@@ -73,9 +76,7 @@ pub fn evaluate_staleness(anchors: &[crate::MemoryAnchor], snapshot: Option<&Rep
         return false;
     };
     let head = head.trim();
-    let commit_bound = anchors
-        .iter()
-        .any(|a| a.kind == crate::AnchorKind::Commit);
+    let commit_bound = anchors.iter().any(|a| a.kind == crate::AnchorKind::Commit);
     if !commit_bound {
         return false;
     }
@@ -94,7 +95,7 @@ pub fn evaluate_staleness(anchors: &[crate::MemoryAnchor], snapshot: Option<&Rep
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
-    use crate::{MemoryAnchor, AnchorKind};
+    use crate::{AnchorKind, MemoryAnchor};
 
     fn commit(sha: &str) -> MemoryAnchor {
         MemoryAnchor::new(AnchorKind::Commit, sha).unwrap()

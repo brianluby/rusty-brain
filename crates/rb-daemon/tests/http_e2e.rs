@@ -265,7 +265,7 @@ async fn non_loopback_bind_fails_closed_at_daemon_bind() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
-            abstain_threshold: None,
+        abstain_threshold: None,
         write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             bind: "0.0.0.0:0".parse().unwrap(),
@@ -1053,4 +1053,152 @@ async fn graceful_shutdown_covers_http_listener() {
             assert_eq!(n, 0, "post-shutdown connection must be closed empty");
         }
     }
+}
+
+/// PR #89 review: a review MERGE must refuse a quarantined member. The
+/// merged row is composed fresh under the resolver's channel, so merging a
+/// quarantined (HTTP-origin) row would move its untrusted-origin content
+/// into a clean row without the user ever seeing a `[quarantined]` marker —
+/// quarantine is demotion, never laundering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_merge_refuses_a_quarantined_member() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let ns = Namespace::Project("merge-quarantine".to_string());
+    let host = addr.to_string();
+
+    // HTTP write (stamped Http → quarantined) + identical UDS write (cli).
+    let body = shortcut_body(&remember_request("quarantine merge refusal identical fact"));
+    let req = build_request(
+        "POST",
+        "/remember",
+        Some(&host),
+        &[
+            ("Content-Type", "application/json"),
+            ("x-rusty-brain-namespace", "project:merge-quarantine"),
+        ],
+        Some(&body),
+    );
+    let (status, remember_body) = raw_round_trip(addr, &req).await;
+    assert_eq!(status, 200, "{remember_body}");
+    let http_id: rb_types::MemoryId = serde_json::from_str(&remember_body)
+        .ok()
+        .and_then(|v: serde_json::Value| v["id"].as_str().map(|s| s.parse().unwrap()))
+        .expect("id");
+
+    let mut uds = Client::connect(&daemon.socket, ns).await.unwrap();
+    let cli_id = uds
+        .remember(
+            "quarantine merge refusal identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+
+    // The merge of the near-dup pair is REFUSED, naming the quarantine.
+    let err = uds
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![http_id.clone(), cli_id.clone()],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("quarantined"),
+        "must name the refusal reason: {err}"
+    );
+    // Both members untouched: no supersession, nothing archived.
+    for id in [&http_id, &cli_id] {
+        let m = uds.get((*id).clone()).await.unwrap().unwrap();
+        assert!(m.archived_at.is_none() && m.superseded_by.is_none());
+    }
+
+    daemon.stop().await;
+}
+
+/// PR #89 review: a merged row's trust class is the WEAKEST member's — a
+/// merge must never promote an agent-attested near-duplicate onto a
+/// human-confirmed row's class (the ladder's no-self-promotion rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_merge_keeps_the_weakest_member_trust_class() {
+    let daemon = RunningDaemon::start(None).await;
+    let ns = Namespace::Project("merge-trust".to_string());
+    // Identify as the cli surface: evidence is only accepted from a
+    // channel that can substantiate it (HumanConfirmed ← cli).
+    let mut client = Client::connect_with_identity(
+        &daemon.socket,
+        ns,
+        Some(rb_proto::ClientIdentity {
+            source: Some("cli".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Identical contents: one plain (agent_attested — the cli channel's
+    // honest context default), one with human confirmation evidence.
+    let plain = client
+        .remember(
+            "merge trust floor identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+    let confirmed = client
+        .remember_anchored(
+            "merge trust floor identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+            vec![],
+            None,
+            Some(rb_types::CaptureEvidence::HumanConfirmed { by: None }),
+        )
+        .await
+        .unwrap();
+    let confirmed_row = client.get(confirmed.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        confirmed_row.trust_class,
+        rb_types::TrustClass::HumanConfirmed,
+        "fixture: the cli channel accepts human-confirmed evidence"
+    );
+
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![confirmed.clone(), plain],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+    let merged = resolution.merged_into.expect("merged");
+    let row = client.get(merged).await.unwrap().unwrap();
+    assert_eq!(
+        row.trust_class,
+        rb_types::TrustClass::AgentAttested,
+        "the merged body is only as backed as its weakest member: {:?}",
+        row.trust_class
+    );
+
+    daemon.stop().await;
 }

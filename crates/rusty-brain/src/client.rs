@@ -64,7 +64,9 @@ pub fn client_identity(source: &str) -> ClientIdentity {
         source: Some(source.to_string()),
         // Vikunja #63: the CLI's cwd is the repo context; the daemon
         // snapshots its git state once per connection for staleness.
-        cwd: std::env::current_dir().ok().map(|p| p.to_string_lossy().into_owned()),
+        cwd: std::env::current_dir()
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned()),
         ..Default::default()
     }
 }

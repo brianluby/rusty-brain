@@ -56,10 +56,29 @@ const INJECTION_MARKERS: &[&str] = &[
 /// with. Over-broad on purpose for the hook channel (see the module doc's
 /// false-positive posture).
 const DIRECTIVE_MARKERS: &[&str] = &[
-    "always ", "never ", "you must", "you should", "you are now", "you are ", "you will",
-    "from now on", "going forward,", "do not ", "don't ", "ensure ", "make sure ",
-    "be sure to", "remember to", "act as", "pretend to", "when asked", "whenever you",
-    "it is mandatory", "policy:", "rule:", "rules:",
+    "always ",
+    "never ",
+    "you must",
+    "you should",
+    "you are now",
+    "you are ",
+    "you will",
+    "from now on",
+    "going forward,",
+    "do not ",
+    "don't ",
+    "ensure ",
+    "make sure ",
+    "be sure to",
+    "remember to",
+    "act as",
+    "pretend to",
+    "when asked",
+    "whenever you",
+    "it is mandatory",
+    "policy:",
+    "rule:",
+    "rules:",
 ];
 
 /// Whether one folded line is instruction-shaped poison (see the module doc):

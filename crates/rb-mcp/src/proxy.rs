@@ -535,9 +535,26 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
             snapshot,
         } => {
             let text = if let Some(reason) = &abstained {
-                // ABSTAIN: the gate refused to serve a weak match — the model
-                // sees the refusal and its code, never filler content.
-                format!("recall abstained ({reason}) — no memory clears the trust gate")
+                // ABSTAIN: the refusal and its code, with wording that
+                // MATCHES the code (PR #89 review) — only
+                // `below_threshold` is a gate refusing a weak match;
+                // `degraded_backend` is a retrieval outage and must not be
+                // phrased as a finding about stored memories. Never filler.
+                let why = match reason {
+                    rb_types::AbstainReason::NoCandidates => {
+                        "the corpus has no candidate for this query"
+                    }
+                    rb_types::AbstainReason::BelowThreshold => {
+                        "no memory clears the calibrated abstention bar for this query"
+                    }
+                    rb_types::AbstainReason::FilterExcluded => {
+                        "every candidate was excluded by the active filters; the query may be answerable unfiltered"
+                    }
+                    rb_types::AbstainReason::DegradedBackend => {
+                        "retrieval was degraded (a channel failed or timed out); retry before concluding anything about the corpus"
+                    }
+                };
+                format!("recall abstained ({reason}) — {why}")
             } else if results.is_empty() {
                 let mut t = "no stored memories match".to_string();
                 if degraded {
@@ -558,7 +575,7 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
                 json!({
                     "results": [],
                     "abstained": abstained,
-                    "hint": "recall abstained; no memory clears the trust gate",
+                    "hint": "recall abstained; see the abstained reason code",
                 })
             } else if results.is_empty() {
                 json!({ "results": [], "hint": "no stored memories match" })
@@ -731,7 +748,6 @@ mod tests {
             8,
         )
     }
-
 
     #[test]
     fn md_line_marks_quarantined_memories() {
@@ -1417,8 +1433,8 @@ mod tests {
                     memory: note(),
                     score: 0.5,
                     channels: rb_types::ChannelHits::default(),
-            stale: false,
-        }],
+                    stale: false,
+                }],
                 degraded: false,
                 abstained: None,
                 snapshot: None,
@@ -1504,8 +1520,8 @@ mod tests {
                     memory: contested,
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-            stale: false,
-        }],
+                    stale: false,
+                }],
                 degraded: false,
                 abstained: None,
                 snapshot: None,
@@ -1557,8 +1573,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-            stale: false,
-        }],
+                    stale: false,
+                }],
                 degraded: false,
                 abstained: None,
                 snapshot: None,
@@ -1582,8 +1598,8 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
-            stale: false,
-        }],
+                    stale: false,
+                }],
                 degraded: true,
                 abstained: None,
                 snapshot: None,

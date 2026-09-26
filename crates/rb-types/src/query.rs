@@ -1020,7 +1020,11 @@ mod tests {
             5,
         ))
         .unwrap();
-        assert!(value.as_object_mut().unwrap().remove("trust_class").is_some());
+        assert!(value
+            .as_object_mut()
+            .unwrap()
+            .remove("trust_class")
+            .is_some());
         let back: MemoryNote = serde_json::from_value(value).unwrap();
         assert_eq!(back.trust_class, TrustClass::AgentAttested);
     }

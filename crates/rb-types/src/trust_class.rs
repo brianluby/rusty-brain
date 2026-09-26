@@ -183,7 +183,8 @@ pub enum CaptureEvidence {
     MeasuredLocal { commands: Vec<String> },
     /// A reference to the CI run that produced the result (URL, run id, or
     /// check name). Substantiable by the `cli` channel only — the human's
-    /// typed surface on a kernel-verified same-uid connection — and ONLY
+    /// typed surface on a same-uid UDS connection (the credential proves the
+    /// user; the surface is the client's honest self-report) — and ONLY
     /// alongside a commit anchor, which pins the claim to an auditable
     /// point in history.
     MeasuredCi { run_ref: String },
@@ -230,8 +231,10 @@ impl CaptureEvidence {
 ///   tool events, so `MeasuredLocal` is substantiated. It never observes CI
 ///   machinery (only local text claiming CI ran) and never a human's
 ///   confirmation: both are rejected.
-/// - `cli` — the human principal's typed surface over a kernel-verified
-///   same-uid connection. Can carry `HumanConfirmed`, a human-reported
+/// - `cli` — the human principal's typed surface over a same-uid UDS
+///   connection (the credential proves the user; the surface string is the
+///   honest client's self-report — same-user honesty, not binary
+///   verification). Can carry `HumanConfirmed`, a human-reported
 ///   `MeasuredLocal`, or `MeasuredCi` — the CI claim only WITH a commit
 ///   anchor (`has_commit_anchor`), because an unpinned CI reference is
 ///   unfalsifiable.
@@ -374,7 +377,9 @@ mod tests {
         }
         .validate()
         .is_ok());
-        assert!(CaptureEvidence::MeasuredLocal { commands: vec![] }.validate().is_err());
+        assert!(CaptureEvidence::MeasuredLocal { commands: vec![] }
+            .validate()
+            .is_err());
         assert!(CaptureEvidence::MeasuredLocal {
             commands: vec!["  ".to_string()]
         }
@@ -385,8 +390,14 @@ mod tests {
         }
         .validate()
         .is_ok());
-        assert!(CaptureEvidence::MeasuredCi { run_ref: String::new() }.validate().is_err());
-        assert!(CaptureEvidence::HumanConfirmed { by: None }.validate().is_ok());
+        assert!(CaptureEvidence::MeasuredCi {
+            run_ref: String::new()
+        }
+        .validate()
+        .is_err());
+        assert!(CaptureEvidence::HumanConfirmed { by: None }
+            .validate()
+            .is_ok());
     }
 
     #[test]

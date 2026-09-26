@@ -461,9 +461,7 @@ fn resolve_write_gate(
                 .iter()
                 .map(|s| {
                     rb_types::MemoryType::parse(s.trim()).map_err(|e| {
-                        Error::InvalidArgument(format!(
-                            "[write_gate] allowed_types: {e}"
-                        ))
+                        Error::InvalidArgument(format!("[write_gate] allowed_types: {e}"))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -474,9 +472,7 @@ fn resolve_write_gate(
                 .iter()
                 .map(|s| {
                     rb_types::WriteChannel::parse(s.trim()).map_err(|e| {
-                        Error::InvalidArgument(format!(
-                            "[write_gate] permitted_channels: {e}"
-                        ))
+                        Error::InvalidArgument(format!("[write_gate] permitted_channels: {e}"))
                     })
                 })
                 .collect::<Result<Vec<_>>>()?,
@@ -484,8 +480,12 @@ fn resolve_write_gate(
         };
         let policy = rb_types::WriteGatePolicy {
             allowed_types,
-            max_content_bytes: section.max_content_bytes.unwrap_or(parent.max_content_bytes),
-            max_context_bytes: section.max_context_bytes.unwrap_or(parent.max_context_bytes),
+            max_content_bytes: section
+                .max_content_bytes
+                .unwrap_or(parent.max_content_bytes),
+            max_context_bytes: section
+                .max_context_bytes
+                .unwrap_or(parent.max_context_bytes),
             min_anchors: section.min_anchors.unwrap_or(parent.min_anchors),
             permitted_channels,
             allow_unverified_channel: section
@@ -494,8 +494,7 @@ fn resolve_write_gate(
         };
         if policy.max_content_bytes == 0 || policy.max_context_bytes == 0 {
             return Err(Error::InvalidArgument(
-                "[write_gate] max_content_bytes and max_context_bytes must be positive"
-                    .to_string(),
+                "[write_gate] max_content_bytes and max_context_bytes must be positive".to_string(),
             ));
         }
         Ok(policy)
@@ -508,13 +507,14 @@ fn resolve_write_gate(
     let mut namespaces = Vec::with_capacity(section.namespaces.len());
     for (key, ns_section) in &section.namespaces {
         let namespace = rb_types::Namespace::parse_db_string(key).map_err(|e| {
-            Error::InvalidArgument(format!(
-                "[write_gate] namespaces key {key:?}: {e}"
-            ))
+            Error::InvalidArgument(format!("[write_gate] namespaces key {key:?}: {e}"))
         })?;
         namespaces.push((namespace, resolve_policy(ns_section, &default)?));
     }
-    Ok(rb_types::WriteGateConfig { default, namespaces })
+    Ok(rb_types::WriteGateConfig {
+        default,
+        namespaces,
+    })
 }
 
 /// The fully resolved per-process configuration: env var > user config file >
@@ -1020,9 +1020,11 @@ mod tests {
 
         // Section-level default: overridden size, everything else built-in.
         assert_eq!(gate.default.max_content_bytes, 4096);
+        // Unset fields keep the built-in default (the old self-comparison
+        // here was a no-op; PR #89 review).
         assert_eq!(
-            gate.default.max_content_bytes,
-            gate.default.max_content_bytes
+            gate.default.max_context_bytes,
+            rb_types::WriteGatePolicy::default().max_context_bytes
         );
         assert_eq!(
             gate.default.permitted_channels,
@@ -1035,10 +1037,7 @@ mod tests {
             .clone();
         assert_eq!(
             strict.permitted_channels,
-            vec![
-                rb_types::WriteChannel::Hook,
-                rb_types::WriteChannel::Cli
-            ]
+            vec![rb_types::WriteChannel::Hook, rb_types::WriteChannel::Cli]
         );
         assert!(!strict.allow_unverified_channel);
         assert_eq!(strict.min_anchors, 1);
@@ -1121,6 +1120,32 @@ mod tests {
             "#,
         );
         assert!(EffectiveConfig::resolve().is_err());
+
+        // PR #89 review pinned this at the PARSE layer, not just resolve:
+        // `[write_gate]` flattens its per-namespace defaults struct, and
+        // serde documents `flatten` + `deny_unknown_fields` as an
+        // unsupported combination — behavior that works today must not be
+        // able to silently become warn-and-ignore on a serde upgrade. The
+        // flattened-section typo ...
+        let err = parse_file_config(
+            "[write_gate]\nmax_content_bytse = 4096\n",
+            std::path::Path::new("pin.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("max_content_bytse"),
+            "flatten-level typo must fail closed naming the key: {err}"
+        );
+        // ... and a typo inside a per-namespace override BOTH fail at parse.
+        let err = parse_file_config(
+            "[write_gate.namespaces.\"project:x\"]\nmin_anchers = 1\n",
+            std::path::Path::new("pin.toml"),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("min_anchers"),
+            "namespace-level typo must fail closed naming the key: {err}"
+        );
     }
 
     // HTTP PRD HTTP-1/HTTP-2: off by default at every layer — no [http]

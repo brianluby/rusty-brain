@@ -1463,8 +1463,8 @@ async fn run_mixed_operation(
                     confidence: None,
                     supersedes: None,
                     anchors: vec![],
-                evidence: None,
-            },
+                    evidence: None,
+                },
             )
             .await?;
             if !response.status().is_success() {
@@ -2030,8 +2030,8 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         confidence: None,
         supersedes: None,
         anchors: vec![],
-                evidence: None,
-            };
+        evidence: None,
+    };
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/remember"))
         .header("x-rusty-brain-namespace", "project:timeout")
@@ -2067,9 +2067,9 @@ mod tests {
                 Request::Recall { .. } => Response::Recalled {
                     results: Vec::new(),
                     degraded: false,
-                abstained: None,
-                snapshot: None,
-            },
+                    abstained: None,
+                    snapshot: None,
+                },
                 _ => Response::Pong {
                     contract_version: rb_proto::CONTRACT_VERSION,
                     recall_channels: None,

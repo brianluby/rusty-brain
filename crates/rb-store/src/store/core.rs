@@ -3611,8 +3611,12 @@ mod list_filtered_tests {
     fn insert_persists_and_reads_back_the_trust_class() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         for class in rb_types::TrustClass::all() {
-            let mut m =
-                MemoryNote::new(ns(), "trust ladder round trip".into(), MemoryType::Insight, 5);
+            let mut m = MemoryNote::new(
+                ns(),
+                "trust ladder round trip".into(),
+                MemoryType::Insight,
+                5,
+            );
             m.trust_class = class;
             store.insert_memory(&m, None).unwrap();
             let back = store.get_memory(&m.id).unwrap().expect("row exists");
@@ -5385,7 +5389,11 @@ mod provenance_tests {
         assert!(got.is_quarantined());
         let listed = store.list(&stamped.namespace, None, 10).unwrap();
         assert_eq!(
-            listed.iter().find(|m| m.id == stamped.id).unwrap().origin_channel,
+            listed
+                .iter()
+                .find(|m| m.id == stamped.id)
+                .unwrap()
+                .origin_channel,
             Some(WriteChannel::Http)
         );
         let many = store
