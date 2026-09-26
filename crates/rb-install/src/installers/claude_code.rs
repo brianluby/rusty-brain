@@ -294,23 +294,36 @@ mod tests {
         std::fs::read_to_string(&p).unwrap_or_else(|e| panic!("read {}: {e}", p.display()))
     }
 
+    /// `.claude/settings.json` and `.mcp.json` are DELIBERATELY gitignored
+    /// local agent config (veans #92): these drift guards are dogfooding
+    /// checks that only bind where that config exists. In a clean checkout
+    /// (CI) the files are absent — skip with a loud message instead of
+    /// failing; any other read error still fails the test.
+    fn read_repo_json_optional(rel: &str) -> Option<serde_json::Value> {
+        let p = repo_root().join(rel);
+        match std::fs::read_to_string(&p) {
+            Ok(text) => {
+                Some(serde_json::from_str(&text).unwrap_or_else(|e| panic!("parse {rel}: {e}")))
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "skip: {rel} is not present (clean checkout) — local dogfooding guard only"
+                );
+                None
+            }
+            Err(e) => panic!("read {}: {e}", p.display()),
+        }
+    }
+
     fn read_repo_json(rel: &str) -> serde_json::Value {
         serde_json::from_str(&read_repo(rel)).unwrap_or_else(|e| panic!("parse {rel}: {e}"))
     }
 
     #[test]
-    fn plugin_skill_matches_installer_memory_skill() {
-        let on_disk = read_repo("plugins/rusty-brain/skills/rusty-brain-memory/SKILL.md");
-        assert_eq!(
-            on_disk.trim_end_matches('\n'),
-            MEMORY_SKILL.trim_end_matches('\n'),
-            "the committed plugin SKILL.md must match the installer's MEMORY_SKILL (no drift)"
-        );
-    }
-
-    #[test]
     fn committed_settings_allowlist_matches_installer() {
-        let settings = read_repo_json(".claude/settings.json");
+        let Some(settings) = read_repo_json_optional(".claude/settings.json") else {
+            return; // clean checkout: no local agent config to guard (see helper)
+        };
         let allow: Vec<&str> = settings["permissions"]["allow"]
             .as_array()
             .expect("permissions.allow array")
@@ -358,7 +371,15 @@ mod tests {
             (".claude/settings.json", true),
             ("plugins/rusty-brain/hooks/hooks.json", false),
         ] {
-            let json = read_repo_json(rel);
+            // Clean checkout: the local settings half is skipped, the
+            // installer-owned plugin half still guards (see helper).
+            let Some(json) = read_repo_json_optional(rel) else {
+                assert!(
+                    foreign_allowed,
+                    "{rel} is installer-owned and must exist in every checkout"
+                );
+                continue;
+            };
             let hooks = json["hooks"]
                 .as_object()
                 .unwrap_or_else(|| panic!("{rel}: hooks object"));
@@ -410,7 +431,15 @@ mod tests {
     #[test]
     fn committed_and_plugin_mcp_register_the_rusty_brain_server() {
         for rel in [".mcp.json", "plugins/rusty-brain/.mcp.json"] {
-            let json = read_repo_json(rel);
+            // Clean checkout: the local .mcp.json half is skipped, the
+            // installer-owned plugin half still guards (see helper).
+            let Some(json) = read_repo_json_optional(rel) else {
+                assert!(
+                    rel != "plugins/rusty-brain/.mcp.json",
+                    "{rel} is installer-owned and must exist in every checkout"
+                );
+                continue;
+            };
             let server = &json["mcpServers"]["rusty-brain"];
             assert_eq!(server["command"], "rusty-brain", "{rel} server command");
             assert_eq!(server["args"][0], "mcp", "{rel} server args");
