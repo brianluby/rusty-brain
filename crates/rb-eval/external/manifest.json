@@ -22,6 +22,31 @@
       "license": "CC BY-NC 4.0 (never committed)",
       "conversations": 10,
       "qa": 1986
+    },
+    "membench": {
+      "repository": "https://github.com/import-myself/Membench",
+      "commit": "f66d8d1028d3f68627d00f77a967b93fbb8694b6",
+      "path": "MemData/FirstAgent",
+      "license": "MIT (README badge; no LICENSE file)",
+      "files": {
+        "RecMultiSession.json": "c8c97a2fdfa1ac1a68615483c0c6764024d19e97a3fafb03b590e3e15a81e7ec",
+        "aggregative.json": "a05de17960dd41f298a5bf58df47e161526045ca4cc71fe2af6e9a3c5a9be97b",
+        "comparative.json": "aae21a7a0b9a755d3fba7ab212f6ab7f4b8bcad6cbbe94b1a6c70d3ab8099e2a",
+        "conditional.json": "9fa454f02b4f4fda075ef6cdc9199a9ec3e6243dacab5651d440d1b9876ced11",
+        "highlevel.json": "60a93a286c28bce01863f2f79ec4c6f5d0ad10905b030b13227c14d0c6385521",
+        "highlevel_rec.json": "81c19f8913cd905f53cec24e9c658e57afc99428cd0d9b8fd503bed438cf69a0",
+        "knowledge_update.json": "ab4851ff4689777bd620895aa0080ba94f3c499c34be6b90df2c5bfbd006d074",
+        "lowlevel_rec.json": "ff8d4a97021f483223354b57c6f524231906b5202a51068b9f3ded4327165d64",
+        "noisy.json": "64ac646966b165fddad6c2ab3d858a9714a6b6997550338bb2a01200df75f1a2",
+        "post_processing.json": "81070f1fd6bf394d92dc347e888a4b83ed6579e139846d42f0beb054ce371377",
+        "simple.json": "0e3bc668d5fb4f012ac0f7f07013bd87f14fbd309faeaf33f6798a46a799490a"
+      }
+    },
+    "convomem": {
+      "hf_dataset": "Salesforce/ConvoMem",
+      "hf_revision": "e3e9b39115b02346824c70d349350de738f8be41",
+      "license": "CC BY-NC 4.0 (never committed)",
+      "note": "MemPalace downloads from unpinned main; the local cache taken 2026-09-26 is the pinned snapshot, hashed per file in convomem_selection.json"
     }
   },
   "stage_a": {

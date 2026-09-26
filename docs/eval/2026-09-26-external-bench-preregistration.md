@@ -142,3 +142,59 @@ unchanged.
 - Interpretation: parity-256 within ±1.0 pp of 0.603 validates the adapter
   on LoCoMo. Native and parity-512 are separate columns. The decision gate
   (rule 4) and limitations (rule 5) apply unchanged.
+
+---
+
+## Addendum 2 — ConvoMem and MemBench (frozen before any rusty-brain run on either)
+
+No rusty-brain output on ConvoMem or MemBench existed when this addendum
+was committed. Adapter correctness rests on unit tests of the text, id and
+scoring rules.
+
+### ConvoMem
+
+- Source: HF `Salesforce/ConvoMem` (revision `e3e9b39` at download time),
+  CC BY-NC 4.0, never committed. MemPalace downloads from unpinned `main`,
+  so the local cache taken 2026-09-26 is the pinned snapshot. Each file
+  actually read is hashed in `crates/rb-eval/external/convomem_selection.json`,
+  and the runner refuses any other selection.
+- Stage A: MemPalace raw, top-10, 50 per category reproduced **0.929**
+  (published 0.929) on **250 items across 5 categories**.
+  `changing_evidence` has no `1_evidence/` folder, so MemPalace's lister
+  404s and silently skips it. The published "all categories" figure
+  therefore excludes changing facts. The adapter mirrors the skip for an
+  exact protocol match, and the report states the gap.
+- Documents: one per message. Gold message ids come from MemPalace's own
+  predicate (evidence text ⊂ message or message ⊂ evidence, trimmed and
+  lowercased), computed from the dataset before retrieval. Scoring is by
+  id. Matches that exist only because a message is empty are counted
+  (`degenerate_gold`).
+- Metric: MemPalace recall (found evidence / distinct evidence texts),
+  overall and per category.
+
+### MemBench
+
+- Source: import-myself/Membench `f66d8d1`, `MemData/FirstAgent`, MIT per
+  the README badge (no LICENSE file). All 11 files are hashed in the
+  manifest. Selection: topic `movie` plus the role- and event-keyed files,
+  giving **8,500 items**.
+- Published MemPalace figure (80.3% R@5) is **hybrid** mode, their tuned
+  reranker. The comparator here is **MemPalace raw** on the same pinned
+  data, measured in this Stage A. The hybrid run is only a data-version
+  check against the published number and is never compared to rusty-brain.
+- Documents: one per turn, `[time] [User] u [Assistant] a`, top-5. A hit
+  follows MemPalace: a target matches a retrieved turn's `sid` **or** its
+  global position. The sid-only rate is also reported, since two id spaces
+  add chance hits.
+
+### Runs and interpretation (both datasets)
+
+- Runs: parity-256, parity-512 and native. One shot each, with no tuning
+  after per-item output.
+- parity-256 within ±1.0 pp of MemPalace raw validates the adapter. If it
+  falls outside, the gap is investigated as an adapter difference, never
+  as ranking.
+- Native and parity-512 are separate columns. Rules 4 (no ranking change
+  from this benchmark alone) and 5 (limitations) apply unchanged. Latency
+  was measured on a shared machine alongside other runs and is diagnostic
+  only.

@@ -8,6 +8,7 @@ use rb_embed::{EmbeddingProvider, LocalProvider};
 use rb_eval::external::core::Memo;
 use rb_eval::external::locomo::{run_sample, QaRecord, Sample};
 use rb_eval::external::longmemeval::{aggregate, run_question, Entry, Profile, TOP_N};
+use rb_eval::external::{convomem, membench};
 use serde_json::json;
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
@@ -37,6 +38,39 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
         /// Embedding truncation in tokens (default: production, fastembed 512).
+        #[arg(long)]
+        embed_max_tokens: Option<usize>,
+    },
+    /// ConvoMem sample protocol over MemPalace's cache layout.
+    Convomem {
+        #[arg(long)]
+        cache: PathBuf,
+        #[arg(long, value_enum)]
+        profile: Profile,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value_t = 50)]
+        per_category: usize,
+        #[arg(long, default_value_t = 10)]
+        top_k: usize,
+        #[arg(long)]
+        embed_max_tokens: Option<usize>,
+        /// Write the selection pin instead of verifying it (done once, before the freeze).
+        #[arg(long)]
+        write_selection: bool,
+    },
+    /// MemBench FirstAgent files, all categories.
+    Membench {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, value_enum)]
+        profile: Profile,
+        #[arg(long)]
+        out: PathBuf,
+        #[arg(long, default_value = "movie")]
+        topic: String,
+        #[arg(long, default_value_t = 5)]
+        top_k: usize,
         #[arg(long)]
         embed_max_tokens: Option<usize>,
     },
@@ -154,6 +188,46 @@ async fn main() -> Result<()> {
             limit,
             embed_max_tokens,
         } => longmemeval(&manifest, data, profile, out, limit, embed_max_tokens).await,
+        Command::Convomem {
+            cache,
+            profile,
+            out,
+            per_category,
+            top_k,
+            embed_max_tokens,
+            write_selection,
+        } => {
+            convomem_cmd(
+                &manifest,
+                cache,
+                profile,
+                out,
+                per_category,
+                top_k,
+                embed_max_tokens,
+                write_selection,
+            )
+            .await
+        }
+        Command::Membench {
+            data,
+            profile,
+            out,
+            topic,
+            top_k,
+            embed_max_tokens,
+        } => {
+            membench_cmd(
+                &manifest,
+                data,
+                profile,
+                out,
+                topic,
+                top_k,
+                embed_max_tokens,
+            )
+            .await
+        }
         Command::Locomo {
             data,
             profile,
@@ -174,6 +248,235 @@ async fn main() -> Result<()> {
             .await
         }
     }
+}
+
+fn sha256_file(path: &std::path::Path) -> Result<String> {
+    Ok(format!("{:x}", Sha256::digest(std::fs::read(path)?)))
+}
+
+fn write_outputs(
+    out: &std::path::Path,
+    tag: &str,
+    records: &[impl serde::Serialize],
+    summary: &serde_json::Value,
+) -> Result<()> {
+    let mut jsonl =
+        std::io::BufWriter::new(std::fs::File::create(out.join(format!("{tag}.jsonl")))?);
+    for r in records {
+        serde_json::to_writer(&mut jsonl, r)?;
+        jsonl.write_all(b"\n")?;
+    }
+    jsonl.flush()?;
+    let path = out.join(format!("{tag}.summary.json"));
+    std::fs::write(&path, serde_json::to_string_pretty(summary)?)?;
+    println!("{}", serde_json::to_string_pretty(&summary["overall"])?);
+    eprintln!("wrote {}", path.display());
+    Ok(())
+}
+
+fn merge(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::Value {
+    if let (Some(a), Some(b)) = (base.as_object_mut(), extra.as_object()) {
+        a.extend(b.clone());
+    }
+    base
+}
+
+const CONVOMEM_SELECTION: &str = "crates/rb-eval/external/convomem_selection.json";
+
+#[allow(clippy::too_many_arguments)]
+async fn convomem_cmd(
+    manifest: &serde_json::Value,
+    cache: PathBuf,
+    profile: Profile,
+    out: PathBuf,
+    per_category: usize,
+    top_k: usize,
+    embed_max_tokens: Option<usize>,
+    write_selection: bool,
+) -> Result<()> {
+    let mut selected = Vec::new();
+    let mut pins = serde_json::Map::new();
+    for category in convomem::CATEGORIES {
+        let (items, files) = convomem::select(&cache, category, per_category)?;
+        let mut hashes = serde_json::Map::new();
+        let list = cache.join(format!("{category}_filelist.json"));
+        if list.exists() {
+            hashes.insert("filelist".into(), json!(sha256_file(&list)?));
+        } else {
+            hashes.insert(
+                "skipped".into(),
+                json!("no 1_evidence file list (MemPalace skips this category)"),
+            );
+        }
+        for f in &files {
+            hashes.insert(
+                f.clone(),
+                json!(sha256_file(
+                    &cache.join(category).join(f.replace('/', "_"))
+                )?),
+            );
+        }
+        pins.insert(
+            category.into(),
+            json!({"items": items.len(), "files": hashes}),
+        );
+        selected.extend(items);
+    }
+    let pins = serde_json::Value::Object(pins);
+    if write_selection {
+        std::fs::write(
+            CONVOMEM_SELECTION,
+            serde_json::to_string_pretty(&pins)? + "\n",
+        )?;
+        eprintln!("wrote {CONVOMEM_SELECTION}; commit it before any full run");
+        return Ok(());
+    }
+    let pinned: serde_json::Value =
+        serde_json::from_str(include_str!("../../external/convomem_selection.json"))?;
+    if pinned != pins {
+        bail!("ConvoMem selection differs from {CONVOMEM_SELECTION}");
+    }
+    let model = manifest["rusty_brain"]["embedding_model"]
+        .as_str()
+        .context("embedding_model")?;
+    let provider = Arc::new(LocalProvider::load_with_max_tokens(
+        model,
+        embed_max_tokens,
+    )?);
+    std::fs::create_dir_all(&out)?;
+    let wall = Instant::now();
+    let mut records = Vec::with_capacity(selected.len());
+    for s in &selected {
+        records.push(convomem::run_item(&provider, s, profile, top_k).await?);
+    }
+    let mut per_cat: BTreeMap<&str, Vec<&convomem::ItemRecord>> = BTreeMap::new();
+    for r in &records {
+        per_cat.entry(r.category).or_default().push(r);
+    }
+    let per_category: BTreeMap<&str, serde_json::Value> = per_cat
+        .iter()
+        .map(|(c, rs)| {
+            (
+                *c,
+                json!({"n": rs.len(), "recall": mean(rs.iter().map(|r| r.recall))}),
+            )
+        })
+        .collect();
+    let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
+    query_us.sort_unstable();
+    let summary = merge(
+        run_meta(manifest, profile, embed_max_tokens),
+        json!({
+            "benchmark": "convomem",
+            "complete": true,
+            "dataset_hf_revision": manifest["datasets"]["convomem"]["hf_revision"],
+            "selection": pins,
+            "granularity": "message",
+            "top_k": top_k,
+            "wall_clock_s": wall.elapsed().as_secs_f64(),
+            "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
+            "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
+            "max_rss_bytes": max_rss_bytes(),
+            "overall": {
+                "n": records.len(),
+                "recall_mempalace": mean(records.iter().map(|r| r.recall)),
+                "items_with_degenerate_gold": records.iter().filter(|r| r.degenerate_gold > 0).count(),
+                "items_without_evidence": records.iter().filter(|r| r.evidence_count == 0).count(),
+                "abstained": records.iter().filter(|r| r.abstained.is_some()).count(),
+            },
+            "per_category": per_category,
+        }),
+    );
+    let tag = format!(
+        "convomem-top{top_k}-{}{}",
+        profile_name(profile),
+        token_suffix(embed_max_tokens)
+    );
+    write_outputs(&out, &tag, &records, &summary)
+}
+
+async fn membench_cmd(
+    manifest: &serde_json::Value,
+    data: PathBuf,
+    profile: Profile,
+    out: PathBuf,
+    topic: String,
+    top_k: usize,
+    embed_max_tokens: Option<usize>,
+) -> Result<()> {
+    for (_, file) in membench::CATEGORY_FILES {
+        let path = data.join(file);
+        let want = manifest["datasets"]["membench"]["files"][file].as_str();
+        if path.exists() && Some(sha256_file(&path)?.as_str()) != want {
+            bail!("membench {file} sha256 does not match the pinned manifest");
+        }
+    }
+    let items = membench::load(&data, &topic)?;
+    let model = manifest["rusty_brain"]["embedding_model"]
+        .as_str()
+        .context("embedding_model")?;
+    let provider = Arc::new(LocalProvider::load_with_max_tokens(
+        model,
+        embed_max_tokens,
+    )?);
+    std::fs::create_dir_all(&out)?;
+    let wall = Instant::now();
+    let mut records = Vec::with_capacity(items.len());
+    for (i, item) in items.iter().enumerate() {
+        if let Some(r) = membench::run_item(&provider, item, profile, top_k).await? {
+            records.push(r);
+        }
+        if (i + 1) % 500 == 0 {
+            eprintln!(
+                "[{}/{}] {:.0}s",
+                i + 1,
+                items.len(),
+                wall.elapsed().as_secs_f64()
+            );
+        }
+    }
+    let mut per_cat: BTreeMap<&str, Vec<&membench::ItemRecord>> = BTreeMap::new();
+    for r in &records {
+        per_cat.entry(r.category).or_default().push(r);
+    }
+    let rate = |rs: &[&membench::ItemRecord], f: fn(&membench::ItemRecord) -> bool| {
+        mean(rs.iter().map(|r| f64::from(u8::from(f(r)))))
+    };
+    let per_category: BTreeMap<&str, serde_json::Value> = per_cat
+        .iter()
+        .map(|(c, rs)| (*c, json!({"n": rs.len(), "hit_at_k": rate(rs, |r| r.hit), "hit_at_k_sid_only": rate(rs, |r| r.hit_sid_only)})))
+        .collect();
+    let all: Vec<&membench::ItemRecord> = records.iter().collect();
+    let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
+    query_us.sort_unstable();
+    let summary = merge(
+        run_meta(manifest, profile, embed_max_tokens),
+        json!({
+            "benchmark": "membench",
+            "complete": true,
+            "dataset_commit": manifest["datasets"]["membench"]["commit"],
+            "topic": topic,
+            "granularity": "turn",
+            "top_k": top_k,
+            "wall_clock_s": wall.elapsed().as_secs_f64(),
+            "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
+            "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
+            "max_rss_bytes": max_rss_bytes(),
+            "overall": {
+                "n": records.len(),
+                "hit_at_k_mempalace": rate(&all, |r| r.hit),
+                "hit_at_k_sid_only": rate(&all, |r| r.hit_sid_only),
+                "abstained": records.iter().filter(|r| r.abstained.is_some()).count(),
+            },
+            "per_category": per_category,
+        }),
+    );
+    let tag = format!(
+        "membench-{topic}-top{top_k}-{}{}",
+        profile_name(profile),
+        token_suffix(embed_max_tokens)
+    );
+    write_outputs(&out, &tag, &records, &summary)
 }
 
 async fn locomo(
