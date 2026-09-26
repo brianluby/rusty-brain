@@ -13,6 +13,15 @@
       "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
       "license": "MIT",
       "questions": 500
+    },
+    "locomo10": {
+      "repository": "https://github.com/snap-research/locomo",
+      "commit": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+      "path": "data/locomo10.json",
+      "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+      "license": "CC BY-NC 4.0 (never committed)",
+      "conversations": 10,
+      "qa": 1986
     }
   },
   "stage_a": {
@@ -24,6 +33,14 @@
     "command": "cargo run --release -p rb-eval --features record-local --bin external-bench -- longmemeval --data DATA/longmemeval_s_cleaned.json --profile PROFILE --out RUNS",
     "embedding_model": "all-MiniLM-L6-v2",
     "embedding_dim": 384,
-    "top_n": 50
+    "top_n": 50,
+    "embed_max_tokens_parity": 256,
+    "embed_max_tokens_production": "512 (fastembed default)",
+    "command_locomo": "cargo run --release -p rb-eval --features record-local --bin external-bench -- locomo --data DATA/locomo/data/locomo10.json --profile PROFILE --top-k 10 --out RUNS [--embed-max-tokens 256]"
+  },
+  "stage_a_locomo": {
+    "command": "uv run --frozen python benchmarks/locomo_bench.py DATA/locomo/data/locomo10.json --granularity session --top-k 10",
+    "published_avg_recall": 0.603,
+    "tolerance_pp": 0.5
   }
 }

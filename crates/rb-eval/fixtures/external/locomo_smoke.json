@@ -1,0 +1,63 @@
+[
+ {
+  "sample_id": "smoke-conv",
+  "conversation": {
+   "speaker_a": "Ana",
+   "speaker_b": "Bo",
+   "session_1_date_time": "1 May 2023",
+   "session_1": [
+    {
+     "speaker": "Ana",
+     "dia_id": "D1:1",
+     "text": "I adopted a greyhound named Pixel."
+    },
+    {
+     "speaker": "Bo",
+     "dia_id": "D1:2",
+     "text": "Lovely!"
+    }
+   ],
+   "session_2_date_time": "2 May 2023",
+   "session_2": [
+    {
+     "speaker": "Bo",
+     "dia_id": "D2:1",
+     "text": "I started learning the cello."
+    }
+   ],
+   "session_3_date_time": "3 May 2023",
+   "session_3": [
+    {
+     "speaker": "Ana",
+     "dia_id": "D3:1",
+     "text": "Pixel ran in the park today."
+    }
+   ]
+  },
+  "qa": [
+   {
+    "question": "What is the name of Ana's greyhound?",
+    "answer": "Pixel",
+    "evidence": [
+     "D1:1",
+     "D3:1"
+    ],
+    "category": 1
+   },
+   {
+    "question": "Which instrument is Bo learning?",
+    "answer": "cello",
+    "evidence": [
+     "D2:1"
+    ],
+    "category": 4
+   },
+   {
+    "question": "What car does Ana drive?",
+    "adversarial_answer": "none",
+    "evidence": [],
+    "category": 5
+   }
+  ]
+ }
+]

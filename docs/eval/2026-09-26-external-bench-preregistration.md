@@ -85,3 +85,60 @@ for p in parity native; do
     --data $B/data/longmemeval/longmemeval_s_cleaned.json --profile $p --out $B/runs
 done
 ```
+
+---
+
+## Addendum 1 — embedding truncation and LoCoMo (frozen before any full LoCoMo run)
+
+### Finding: parity was not embedding-equivalent
+
+`rb_embed::LocalProvider` loads fastembed's all-MiniLM-L6-v2 with fastembed's
+default **512-token** truncation. MemPalace, through Chroma's ONNX MiniLM,
+truncates at **256** (sentence-transformers' `max_seq_length`). This came to
+light on a one-conversation LoCoMo adapter check, compared in aggregate only:
+
+| LoCoMo conv 1 (199 questions), parity, top-10 | Evidence recall |
+|---|---:|
+| MemPalace raw (Stage A output) | 0.6265 |
+| rusty-brain parity, 512 tokens (production default) | 0.7446 |
+| rusty-brain parity, 256 tokens | **0.6265** |
+
+At 256 tokens the adapter matches MemPalace exactly, so the gap is
+entirely embedding truncation. `LocalProvider::load_with_max_tokens` and the
+runner flag `--embed-max-tokens` were added. The production default is
+unchanged.
+
+### Consequences for LongMemEval
+
+- The preregistered LongMemEval parity and native runs (frozen commit
+  `0fa0022`) use production truncation (512). They are reported as
+  preregistered.
+- The true MemPalace-equivalent parity is a separate, clearly labelled run:
+  **parity at 256 tokens**. It measures adapter equivalence only. It is not
+  a tuning step, and no ranking changes follow from it.
+- Interpretation rule 2 (parity within ±1.0 pp of 0.966) applies to the
+  256-token run. The 512-token parity result is reported as the
+  production-embedding diagnostic.
+
+### LoCoMo protocol
+
+- Dataset: `locomo10.json` at snap-research/locomo `3eb6f2c`, sha256
+  `79fa87e9…98ff4`, CC BY-NC 4.0 (never committed).
+- Stage A reproduced MemPalace raw session top-10 at **0.603** average
+  evidence recall (published 0.603).
+- Documents: one per session, `{speaker} said, "{text}"` lines. Evidence
+  `D<n>:<m>` maps to `session_<n>`. Top-k = 10. The runner refuses a top-k
+  larger than a conversation's session count (19–32).
+- Isolation: a fresh store per **question**, unlike MemPalace's one
+  collection per conversation, so that access counts can't leak. Memoized
+  embeddings keep vectors identical across rebuilds.
+- Runs: parity-256, parity-512 (production embedding) and native (production
+  defaults). One shot each, with no tuning after per-question output.
+- Primary metric: MemPalace-definition evidence recall@10, overall and per
+  numeric category. MemPalace's category names are reported as MemPalace's;
+  LoCoMo upstream does not name them.
+- The 4 questions with empty evidence score 1.0 under MemPalace's
+  definition. `evidence_recall_excl_empty` is reported alongside.
+- Interpretation: parity-256 within ±1.0 pp of 0.603 validates the adapter
+  on LoCoMo. Native and parity-512 are separate columns. The decision gate
+  (rule 4) and limitations (rule 5) apply unchanged.
