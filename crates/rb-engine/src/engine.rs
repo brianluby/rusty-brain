@@ -582,15 +582,20 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .await?
         };
 
-        // Bounded 1-hop graph expansion of the top filter-matching in-namespace
-        // keyword hit only.
+        // Bounded 1-hop graph expansion of the top recall-eligible keyword hit
+        // only: a quarantined or confidence-exhausted hit is dropped below, so
+        // it must not spend the single seed either.
         let mut graph_seed = None;
         for id in &keyword {
             if self
                 .get_scoped(id.clone())
                 .await?
                 .as_ref()
-                .is_some_and(|note| filter.matches(note))
+                .is_some_and(|note| {
+                    filter.matches(note)
+                        && !note.is_quarantined()
+                        && !note.below_recall_confidence_floor()
+                })
             {
                 graph_seed = Some(id.clone());
                 break;
@@ -1229,11 +1234,17 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         const CONTEXT_LIMIT: usize = 50;
         const IMPORTANT_FLOOR: u8 = 8;
+        // The confidence floor goes into the query so exhausted rows cannot
+        // fill a window ahead of eligible older ones.
+        let eligible = Some(rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE);
         let mut recent = self
             .backend
             .list(
                 self.namespace.clone(),
-                rb_types::RecallFilter::default(),
+                rb_types::RecallFilter {
+                    min_confidence: eligible,
+                    ..Default::default()
+                },
                 CONTEXT_LIMIT,
             )
             .await?;
@@ -1243,14 +1254,15 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 self.namespace.clone(),
                 rb_types::RecallFilter {
                     min_importance: Some(IMPORTANT_FLOOR),
+                    min_confidence: eligible,
                     ..Default::default()
                 },
                 CONTEXT_LIMIT,
             )
             .await?;
         let total = recent.len();
-        recent.retain(|n| !n.is_quarantined() && !n.below_recall_confidence_floor());
-        important.retain(|n| !n.is_quarantined() && !n.below_recall_confidence_floor());
+        recent.retain(|n| !n.is_quarantined());
+        important.retain(|n| !n.is_quarantined());
         // Annotate contested on both context halves (Feature C, fail-open).
         self.annotate_contested(&mut recent).await;
         self.annotate_contested(&mut important).await;
