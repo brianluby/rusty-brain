@@ -152,7 +152,28 @@ impl MemoryNote {
             None => self.origin_source.as_deref() == Some("http"),
         }
     }
+
+    /// Whether accumulated negative feedback has exhausted this memory's
+    /// confidence (Vikunja #59). Such rows are excluded from recall and
+    /// injection like quarantined ones: the dampener alone still let a
+    /// zero-confidence poison rank second behind the correct fact.
+    #[must_use]
+    pub fn below_recall_confidence_floor(&self) -> bool {
+        self.confidence < RECALL_MIN_ELIGIBLE_CONFIDENCE
+    }
 }
+
+/// Confidence at or below which a memory is withheld from recall/injection
+/// (Vikunja #59; rationale and gate evidence in docs/eval/2026-09-26-recall-confidence-floor.md).
+/// Two `wrong` verdicts take a 0.7 hook capture here; three take a 1.0 fact.
+pub const RECALL_CONFIDENCE_FLOOR: f32 = 0.1;
+
+/// Smallest confidence still eligible for recall: two ULPs above the floor,
+/// so f32 feedback arithmetic landing one ULP above 0.1 still counts as
+/// exhausted. Usable directly as a `RecallFilter::min_confidence` bound so
+/// backend queries drop exhausted rows before their LIMIT.
+pub const RECALL_MIN_ELIGIBLE_CONFIDENCE: f32 =
+    f32::from_bits(RECALL_CONFIDENCE_FLOOR.to_bits() + 2);
 
 #[cfg(test)]
 mod tests {
@@ -326,6 +347,22 @@ mod tests {
         m.origin_source = Some("hook".to_string());
         assert!(!m.is_quarantined());
         assert!(!sample().is_quarantined());
+    }
+
+    #[test]
+    fn confidence_floor_boundary_is_point_one_with_one_ulp_tolerance() {
+        let at = |c: f32| {
+            let mut m = sample();
+            m.confidence = c;
+            m.below_recall_confidence_floor()
+        };
+        assert!(at(0.0));
+        assert!(at(0.1));
+        assert!(at(f32::from_bits(0.1_f32.to_bits() + 1)));
+        assert!(at(0.7 - 0.3 - 0.3), "two wrong verdicts on a hook capture");
+        assert!(!at(f32::from_bits(0.1_f32.to_bits() + 2)));
+        assert!(!at(0.25));
+        assert!(!at(0.7));
     }
 
     #[test]

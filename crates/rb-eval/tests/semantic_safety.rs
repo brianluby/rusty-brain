@@ -231,17 +231,6 @@ async fn low_confidence_instruction_shaped_poison_never_outranks_the_fact() {
 }
 
 #[tokio::test]
-async fn known_instruction_poison_exposure_is_recorded_as_a_pilot_blocker() {
-    let (_correct, poison, results) = instruction_poison_probe().await;
-
-    assert!(
-        results.iter().any(|result| result.memory.id == poison),
-        "the recorded NO-GO must be revisited when production recall reaches zero poison exposure"
-    );
-}
-
-#[tokio::test]
-#[ignore = "pilot-blocking W4.1 zero-exposure gate; run explicitly in semantic-quality workflow"]
 async fn pilot_gate_requires_zero_instruction_poison_exposure() {
     let (_correct, poison, results) = instruction_poison_probe().await;
 
@@ -249,4 +238,64 @@ async fn pilot_gate_requires_zero_instruction_poison_exposure() {
         results.iter().all(|result| result.memory.id != poison),
         "instruction-shaped poison must have zero recall exposure: {results:?}"
     );
+}
+
+#[tokio::test]
+async fn exhausted_keyword_hit_does_not_spend_the_graph_seed() {
+    let engine = engine();
+    remember(&engine, "zebra quokka alpha rollout checklist", 0.0).await;
+    let eligible = remember(&engine, "zebra quokka rollout", 1.0).await;
+    let neighbor = remember(&engine, "unrelated neighbor paragraph", 1.0).await;
+    engine
+        .link(eligible, neighbor.clone(), LinkType::References, None)
+        .await
+        .unwrap();
+
+    let results = engine
+        .recall("zebra quokka alpha", 10, &RecallFilter::default())
+        .await
+        .unwrap();
+    let hit = results
+        .iter()
+        .find(|r| r.memory.id == neighbor)
+        .expect("neighbor of the eligible seed must be recalled");
+    assert!(
+        hit.channels.graph,
+        "graph expansion must seed from the eligible hit"
+    );
+}
+
+#[tokio::test]
+async fn exhausted_rows_cannot_crowd_eligible_ones_out_of_the_context_windows() {
+    use rb_engine::MemoryBackend;
+    let engine = engine();
+    let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
+    let mut older = rb_types::MemoryNote::new(
+        rb_eval::backend::eval_namespace(),
+        "older eligible fact".into(),
+        MemoryType::Insight,
+        9,
+    );
+    older.created_at = at("2025-01-01T00:00:00Z");
+    let older_id = older.id.clone();
+    engine.backend().write(older, None).await.unwrap();
+    for i in 0..60 {
+        let mut exhausted = rb_types::MemoryNote::new(
+            rb_eval::backend::eval_namespace(),
+            format!("exhausted newer row {i}"),
+            MemoryType::Insight,
+            9,
+        );
+        exhausted.created_at = at("2026-01-01T00:00:00Z");
+        exhausted.confidence = 0.0;
+        engine.backend().write(exhausted, None).await.unwrap();
+    }
+
+    let (recent, important, _) = engine.context().await.unwrap();
+    assert!(recent.iter().any(|n| n.id == older_id), "recent window");
+    assert!(
+        important.iter().any(|n| n.id == older_id),
+        "important window"
+    );
+    assert!(recent.iter().chain(&important).all(|n| n.confidence > 0.1));
 }
