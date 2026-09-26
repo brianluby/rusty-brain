@@ -43,4 +43,4 @@ jobs:
         run: >-
           cargo test -p rb-eval --test semantic_safety
           pilot_gate_requires_zero_instruction_poison_exposure
-          -- --ignored --nocapture
+          -- --exact --nocapture

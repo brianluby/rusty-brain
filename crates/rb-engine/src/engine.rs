@@ -637,7 +637,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             // Recall feeds every injection channel, so a poisoned row must
             // never ride into a prompt; visibility stays on list/get.
             let filter_dropped = !filter.matches(&note);
-            if !self.in_namespace(&note) || filter_dropped || note.is_quarantined() {
+            if !self.in_namespace(&note)
+                || filter_dropped
+                || note.is_quarantined()
+                || note.below_recall_confidence_floor()
+            {
                 filter_dropped_any |= filter_dropped;
                 continue;
             }
@@ -1245,8 +1249,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             )
             .await?;
         let total = recent.len();
-        recent.retain(|n| !n.is_quarantined());
-        important.retain(|n| !n.is_quarantined());
+        recent.retain(|n| !n.is_quarantined() && !n.below_recall_confidence_floor());
+        important.retain(|n| !n.is_quarantined() && !n.below_recall_confidence_floor());
         // Annotate contested on both context halves (Feature C, fail-open).
         self.annotate_contested(&mut recent).await;
         self.annotate_contested(&mut important).await;
@@ -3232,7 +3236,7 @@ mod tests {
             5,
             &[],
         );
-        wrong.confidence = 0.1; // low confidence "poison"
+        wrong.confidence = 0.3; // low confidence "poison", above the recall floor
         let correct_id = correct.id.clone();
         let wrong_id = wrong.id.clone();
         // Same vector distance for both so only confidence separates them.
@@ -3253,6 +3257,46 @@ mod tests {
         );
         assert_eq!(results[1].memory.id, wrong_id);
         assert!(results[0].score > results[1].score);
+    }
+
+    #[tokio::test]
+    async fn recall_and_context_exclude_rows_at_the_confidence_floor() {
+        let eng = engine();
+        let ns = Namespace::Project("rb".into());
+        let kept = note(
+            ns.clone(),
+            "floor probe content",
+            MemoryType::Insight,
+            9,
+            &[],
+        );
+        let mut exhausted = note(ns, "floor probe content", MemoryType::Insight, 9, &[]);
+        // Two `wrong` verdicts on a 0.7 hook capture land here (f32 arithmetic).
+        exhausted.confidence = 0.7 - 0.3 - 0.3;
+        let (kept_id, exhausted_id) = (kept.id.clone(), exhausted.id.clone());
+        eng.backend().insert_note(kept);
+        eng.backend().insert_note(exhausted);
+        eng.backend().set_keyword_results(Vec::new());
+        eng.backend()
+            .set_vector_results(vec![(exhausted_id.clone(), 0.1), (kept_id.clone(), 0.2)]);
+
+        let results = eng
+            .recall("probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let ids: Vec<_> = results.iter().map(|r| r.memory.id.clone()).collect();
+        assert_eq!(
+            ids,
+            vec![kept_id.clone()],
+            "floor row must never be recalled"
+        );
+
+        let (recent, important, _) = eng.context().await.unwrap();
+        assert!(recent
+            .iter()
+            .chain(&important)
+            .all(|n| n.id != exhausted_id));
+        assert!(recent.iter().any(|n| n.id == kept_id));
     }
 
     #[tokio::test]

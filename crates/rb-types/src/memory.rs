@@ -141,9 +141,12 @@ impl MemoryNote {
     /// channel is the unauthenticated HTTP surface, or — for rows written
     /// before the channel column existed — when its daemon-stamped
     /// `origin_source` says `http` (the HTTP listener set that field itself,
-    /// so it is as unforgeable as the column). Quarantined rows are EXCLUDED
-    /// from recall/injection and surfaced with an explicit marker on
-    /// list/get surfaces (never silently hidden).
+    /// so it is as unforgeable as the column), or when it carries no
+    /// provenance at all (Vikunja #59: pre-provenance legacy rows and
+    /// identity-less clients cannot be attributed to any first-party
+    /// surface). Quarantined rows are EXCLUDED from recall/injection and
+    /// surfaced with an explicit marker on list/get surfaces (never silently
+    /// hidden).
     #[must_use]
     pub fn is_quarantined(&self) -> bool {
         match self.origin_channel {
@@ -152,7 +155,21 @@ impl MemoryNote {
             None => self.origin_source.as_deref() == Some("http"),
         }
     }
+
+    /// Whether accumulated negative feedback has exhausted this memory's
+    /// confidence (Vikunja #59). Such rows are excluded from recall and
+    /// injection like quarantined ones: the dampener alone still let a
+    /// zero-confidence poison rank second behind the correct fact.
+    #[must_use]
+    pub fn below_recall_confidence_floor(&self) -> bool {
+        self.confidence <= RECALL_CONFIDENCE_FLOOR
+    }
 }
+
+/// Confidence at or below which a memory is withheld from recall/injection
+/// (Vikunja #59; rationale and gate evidence in docs/eval/2026-09-26-recall-confidence-floor.md).
+/// Two `wrong` verdicts take a 0.7 hook capture here; three take a 1.0 fact.
+pub const RECALL_CONFIDENCE_FLOOR: f32 = 0.1 + f32::EPSILON;
 
 #[cfg(test)]
 mod tests {
