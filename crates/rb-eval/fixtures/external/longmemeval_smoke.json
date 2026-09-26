@@ -1,0 +1,161 @@
+[
+ {
+  "question_id": "smoke-1",
+  "question_type": "single-session-user",
+  "question": "Which espresso grinder did I buy?",
+  "answer": "Niche Zero",
+  "question_date": "2023/05/30",
+  "haystack_session_ids": [
+   "sharegpt_a1",
+   "answer_s1",
+   "sharegpt_a2"
+  ],
+  "haystack_dates": [
+   "2023/05/01",
+   "2023/05/02",
+   "2023/05/03"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "Plan a hiking trip to Zion.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "I just bought a Niche Zero espresso grinder.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "It grinds very evenly."
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Recommend a sci-fi novel.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "answer_s1"
+  ]
+ },
+ {
+  "question_id": "smoke-2",
+  "question_type": "multi-session",
+  "question": "How many marathons have I run in total?",
+  "answer": "3",
+  "question_date": "2023/06/30",
+  "haystack_session_ids": [
+   "answer_m1",
+   "sharegpt_b1",
+   "answer_m2",
+   "sharegpt_b2"
+  ],
+  "haystack_dates": [
+   "2023/06/01",
+   "2023/06/02",
+   "2023/06/03",
+   "2023/06/04"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "I ran my first marathon in Boston.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Explain quantum tunnelling simply.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Finished two more marathons this spring.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ],
+   [
+    {
+     "role": "assistant",
+     "content": "assistant-only session is skipped"
+    }
+   ]
+  ],
+  "answer_session_ids": [
+   "answer_m1",
+   "answer_m2"
+  ]
+ },
+ {
+  "question_id": "smoke-3_abs",
+  "question_type": "temporal-reasoning",
+  "question": "When did I adopt my parrot?",
+  "answer": "never mentioned",
+  "question_date": "2023/07/30",
+  "haystack_session_ids": [
+   "sharegpt_c1",
+   "sharegpt_c2"
+  ],
+  "haystack_dates": [
+   "2023/07/01",
+   "2023/07/02"
+  ],
+  "haystack_sessions": [
+   [
+    {
+     "role": "user",
+     "content": "My cat likes tuna.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ],
+   [
+    {
+     "role": "user",
+     "content": "Fix my bicycle chain.",
+     "has_answer": true
+    },
+    {
+     "role": "assistant",
+     "content": "ok"
+    }
+   ]
+  ],
+  "answer_session_ids": []
+ }
+]

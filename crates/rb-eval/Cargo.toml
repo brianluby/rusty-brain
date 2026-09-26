@@ -21,6 +21,11 @@ workspace = true
 # compile fastembed/ort.
 record-local = ["rb-embed/local"]
 
+[[bin]]
+name = "external-bench"
+path = "src/bin/external-bench.rs"
+required-features = ["record-local"]
+
 [dependencies]
 rb-engine = { path = "../rb-engine" }
 rb-store = { path = "../rb-store" }

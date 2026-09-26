@@ -1,0 +1,29 @@
+{
+  "schema_version": 1,
+  "mempalace": {
+    "repository": "https://github.com/MemPalace/mempalace",
+    "commit": "5b1c32eee133b5c480ce3bdd8927ce265a1bb3e6",
+    "license": "MIT",
+    "install": "uv sync --frozen --python 3.12 --extra dev"
+  },
+  "datasets": {
+    "longmemeval_s_cleaned": {
+      "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json",
+      "hf_revision": "98d7416c24c778c2fee6e6f3006e7a073259d48f",
+      "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+      "license": "MIT",
+      "questions": 500
+    }
+  },
+  "stage_a": {
+    "command": "uv run --frozen python benchmarks/longmemeval_bench.py DATA/longmemeval_s_cleaned.json --out RUNS/stageA-mempalace-raw.jsonl",
+    "published_recall_any_at_5": 0.966,
+    "tolerance_pp": 0.5
+  },
+  "rusty_brain": {
+    "command": "cargo run --release -p rb-eval --features record-local --bin external-bench -- longmemeval --data DATA/longmemeval_s_cleaned.json --profile PROFILE --out RUNS",
+    "embedding_model": "all-MiniLM-L6-v2",
+    "embedding_dim": 384,
+    "top_n": 50
+  }
+}

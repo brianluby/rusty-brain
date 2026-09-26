@@ -31,6 +31,7 @@ pub mod assertion_precision;
 pub mod backend;
 pub mod controlled;
 pub mod corpus;
+pub mod external;
 pub mod metrics;
 pub mod replay;
 pub mod runner;
