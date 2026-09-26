@@ -268,6 +268,10 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 // (W3.1) is driven by the hook capture path, not this tool.
                 supersedes: None,
                 anchors: parse_capture_anchors(args)?,
+                // The MCP tool surface is agent-authored: no evidence, no
+                // class — the write lands at the channel's context default
+                // (`agent_attested`) like every plain tool write.
+                evidence: None,
             })
         }
         "recall" => Ok(Request::Recall {
@@ -460,14 +464,23 @@ fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
         })
         .collect();
     let contested = if m.contested { " ⚠ contested" } else { "" };
+    // Vikunja #69: quarantined rows stay visible in listings (quarantine is
+    // demotion from recall/injection, never silent deletion) — and the model
+    // must SEE why before it reaches for one by id.
+    let quarantined = if m.is_quarantined() {
+        " ⛔ quarantined (untrusted origin)"
+    } else {
+        ""
+    };
     format!(
-        "[{}, imp {}, {}] {} (id {}){}",
+        "[{}, imp {}, {}] {} (id {}){}{}",
         m.memory_type.as_str(),
         m.importance,
         relative_age(m.created_at, now),
         body,
         m.id,
         contested,
+        quarantined,
     )
 }
 
@@ -480,6 +493,26 @@ fn render_indexed<'a>(
     let mut out = String::new();
     for (i, m) in memories.into_iter().enumerate() {
         out.push_str(&format!("{}. {}\n", i + 1, memory_md_line(m, now)));
+    }
+    out
+}
+
+/// Recall results as a numbered compact markdown list, carrying the STALE
+/// marker (Vikunja #63, PR #89 review): a commit-anchored memory whose repo
+/// state moved past its anchor must be visibly stale in the model-facing
+/// text — never silently injected as current — matching the UserPromptSubmit
+/// injection's `[stale]` and sitting alongside the contested/quarantined
+/// markers. Fixed marker text; content cannot forge it.
+fn render_indexed_results(results: &[rb_types::SearchResult], now: DateTime<Utc>) -> String {
+    let mut out = String::new();
+    for (i, r) in results.iter().enumerate() {
+        let stale = if r.stale { " ⚠ stale" } else { "" };
+        out.push_str(&format!(
+            "{}. {}{}\n",
+            i + 1,
+            memory_md_line(&r.memory, now),
+            stale
+        ));
     }
     out
 }
@@ -512,17 +545,44 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         Response::Remembered { id } => ToolContent::json(json!({ "id": id.to_string() }), false),
         // W3.3: recall renders as compact markdown (one line per hit) for the
         // model; the full results ride structuredContent. W1.3 empty state +
-        // W1.6d degraded warning are preserved. Projection only — the wire
-        // `Response` is unchanged (no CONTRACT_VERSION bump).
-        Response::Recalled { results, degraded } => {
-            let text = if results.is_empty() {
+        // W1.6d degraded warning, and the Vikunja #62 ABSTAIN distinction
+        // (refusal with a reason code ≠ an honestly-empty result set) are
+        // all preserved. Projection only — no CONTRACT_VERSION bump.
+        Response::Recalled {
+            results,
+            degraded,
+            abstained,
+            snapshot,
+        } => {
+            let text = if let Some(reason) = &abstained {
+                // ABSTAIN: the refusal and its code, with wording that
+                // MATCHES the code (PR #89 review) — only
+                // `below_threshold` is a gate refusing a weak match;
+                // `degraded_backend` is a retrieval outage and must not be
+                // phrased as a finding about stored memories. Never filler.
+                let why = match reason {
+                    rb_types::AbstainReason::NoCandidates => {
+                        "the corpus has no candidate for this query"
+                    }
+                    rb_types::AbstainReason::BelowThreshold => {
+                        "no memory clears the calibrated abstention bar for this query"
+                    }
+                    rb_types::AbstainReason::FilterExcluded => {
+                        "every candidate was excluded by the active filters; the query may be answerable unfiltered"
+                    }
+                    rb_types::AbstainReason::DegradedBackend => {
+                        "retrieval was degraded (a channel failed or timed out); retry before concluding anything about the corpus"
+                    }
+                };
+                format!("recall abstained ({reason}) — {why}")
+            } else if results.is_empty() {
                 let mut t = "no stored memories match".to_string();
                 if degraded {
                     t.push_str(" (vector search unavailable — keyword + graph channels only)");
                 }
                 t
             } else {
-                let mut t = render_indexed(results.iter().map(|r| &r.memory), now);
+                let mut t = render_indexed_results(&results, now);
                 if degraded {
                     t.push_str(
                         "⚠ vector search unavailable (embedding provider error); \
@@ -531,11 +591,22 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
                 }
                 t
             };
-            let mut structured = if results.is_empty() {
+            let mut structured = if abstained.is_some() {
+                json!({
+                    "results": [],
+                    "abstained": abstained,
+                    "hint": "recall abstained; see the abstained reason code",
+                })
+            } else if results.is_empty() {
                 json!({ "results": [], "hint": "no stored memories match" })
             } else {
                 json!({ "results": results })
             };
+            if let Some(snap) = &snapshot {
+                if let Some(obj) = structured.as_object_mut() {
+                    obj.insert("snapshot".to_string(), json!(snap));
+                }
+            }
             if degraded {
                 if let Some(obj) = structured.as_object_mut() {
                     obj.insert(
@@ -698,6 +769,68 @@ mod tests {
         )
     }
 
+    #[test]
+    fn md_line_marks_quarantined_memories() {
+        // Vikunja #69: quarantined (untrusted-origin) rows stay listed but
+        // visibly marked — the model sees the demotion before reaching for
+        // the row by id.
+        let mut m = note();
+        m.origin_channel = Some(rb_types::WriteChannel::Http);
+        let line = memory_md_line(&m, chrono::Utc::now());
+        assert!(
+            line.contains("quarantined (untrusted origin)"),
+            "marker shown: {line}"
+        );
+
+        let clean = memory_md_line(&note(), chrono::Utc::now());
+        assert!(
+            !clean.contains("quarantined"),
+            "trusted rows unmarked: {clean}"
+        );
+    }
+
+    #[test]
+    fn recall_text_marks_stale_results() {
+        // Vikunja #63 / PR #89 review: the model-facing recall projection
+        // must show the stale marker, not only structuredContent — a
+        // commit-anchored memory whose repo moved past its anchor is never
+        // silently injected as current.
+        let mut stale = note();
+        stale.content = "anchored fact from an older head".into();
+        let results = vec![
+            rb_types::SearchResult {
+                memory: note(),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+                stale: false,
+            },
+            rb_types::SearchResult {
+                memory: stale,
+                score: 0.8,
+                channels: rb_types::ChannelHits::default(),
+                stale: true,
+            },
+        ];
+        let content = response_to_content(
+            Response::Recalled {
+                results,
+                degraded: false,
+                abstained: None,
+                snapshot: None,
+            },
+            Utc::now(),
+        );
+        assert!(
+            content.text.matches("⚠ stale").count() == 1,
+            "exactly the stale hit is marked: {}",
+            content.text
+        );
+        assert!(
+            content.text.contains("anchored fact from an older head"),
+            "the stale memory is still shown (marked, not dropped): {}",
+            content.text
+        );
+    }
     #[test]
     fn build_remember_request_with_defaults() {
         let req = build_request("remember", &json!({ "content": "hello" })).unwrap();
@@ -1363,8 +1496,11 @@ mod tests {
                     memory: note(),
                     score: 0.5,
                     channels: rb_types::ChannelHits::default(),
+                    stale: false,
                 }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             now,
         );
@@ -1447,8 +1583,11 @@ mod tests {
                     memory: contested,
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    stale: false,
                 }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1472,6 +1611,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1495,8 +1636,11 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    stale: false,
                 }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1517,8 +1661,11 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    stale: false,
                 }],
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1539,6 +1686,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );
@@ -1561,6 +1710,8 @@ mod tests {
             Response::Recalled {
                 results: Vec::new(),
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Utc::now(),
         );

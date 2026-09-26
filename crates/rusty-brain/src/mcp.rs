@@ -426,6 +426,7 @@ mod tests {
                 related_files: vec![],
                 confidence: None,
                 supersedes: None,
+                evidence: None,
             },
             Request::Update {
                 id: id(),

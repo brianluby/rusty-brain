@@ -110,7 +110,10 @@ Implemented and test-covered (correctness is the primary coverage; see [Testing]
 - **Hybrid retrieval** fusing FTS5 keyword search, `sqlite-vec` vector similarity, and
   1-hop graph expansion. Ranking is a weighted linear blend of vector/keyword/graph/
   importance/recency signals by default, with an opt-in Reciprocal Rank Fusion (RRF)
-  mode and a confidence dampener.
+  mode and a confidence dampener. A **trust-class prior** (measured CI > measured
+  local > human-confirmed > agent-attested > inferred) reorders otherwise-identical
+  results, and a calibrated **abstention gate** withholds weak matches entirely —
+  recall returns a machine-readable abstention reason instead of the 5th-best hit.
 - **Contradiction surfacing** — results carry a `contested` flag when a memory has an
   active `contradicts` link (best-effort, never fails recall).
 - **A single-writer daemon** over SQLite WAL with a concurrent read pool, change
@@ -134,6 +137,15 @@ Implemented and test-covered (correctness is the primary coverage; see [Testing]
   not explicit usefulness feedback.
 - **Usefulness feedback** (`helpful`/`wrong`/`stale`) adjusts a memory's confidence;
   **supersession** keeps replaced memories out of active recall.
+- **Write-path defenses** — every durable write passes a per-namespace
+  validation gate (permitted channels, types, size, anchors) before it can
+  reach SQLite; writes carry the daemon-stamped **channel tag**
+  (`origin_channel`: hook/mcp/cli over the UDS, http for the loopback
+  listener — a separate column from the evidence-derived `trust_class`) and
+  untrusted-origin rows are quarantined out of recall. Hook folds are
+  source-filtered, so instruction-shaped content planted mid-session never
+  becomes a durable memory, and commit-anchored memories report **STALE**
+  (never silently reused) once the repo moves past their anchor.
 
 Planned / deferred (designed but not built): LLM-assisted memory evolution
 (reconciliation, reflection), a networked multi-host surface with real auth, and an
@@ -185,12 +197,15 @@ so you can go straight to storing and recalling:
 # CHANGELOG.md, docs/**/*.md, and recent decision-ish git commits)
 rusty-brain init --yes
 
-# preview a one-off text/markdown import without storing anything
-rusty-brain import docs/architecture.md --dry-run
-
 # store a memory (namespace is detected from the current project / git root)
 rusty-brain remember "We use a single-writer daemon over SQLite WAL" \
   --type architecture_decision --importance 8 --tags storage --tags concurrency
+
+# back a claim with verifiable evidence — the daemon derives the trust class
+# from the evidence kind + channel (a CI claim additionally needs --commit)
+rusty-brain remember "cargo test -p rb-store passes in 41s on CI #4821" \
+  --type bug_fix --commit $(git rev-parse HEAD) --evidence-ci "run-4821"
+
 
 # recall by free-text query (hybrid keyword + vector + graph)
 rusty-brain recall "how is writing serialized?" --limit 5
@@ -413,7 +428,6 @@ jobs_config = "/home/me/.config/rusty-brain/jobs.toml"
 
 [embed]
 backend = "local"            # "local" forces the local ONNX provider
-local_model = "all-MiniLM-L6-v2"
 
 [enrich]
 base_url = "http://localhost:11434/v1"
@@ -421,15 +435,22 @@ model = "llama3"             # both base_url and model required to activate
 
 [search]
 fusion = "linear"            # or "rrf" (Reciprocal Rank Fusion) for recall ranking
+abstain_threshold = 0.22     # calibrated abstention bar (0.0 disables the gate)
+
+[write_gate]                 # per-namespace write policy; the gate is on by
+min_anchors = 0              # default for namespaces without their own entry
+[write_gate.namespaces."project:rusty-brain"]   # namespace-scoped override
+min_anchors = 1
 
 [http]                       # opt-in loopback HTTP listener (off when absent)
 enabled = true               # master opt-in; `bind` alone does NOT enable
 bind = "127.0.0.1:7777"      # literal loopback ip:port only; non-loopback fails closed
 ```
 
-(Exception to warn-and-ignore: unknown keys inside `[retention]` and `[http]`
-**fail closed** — a typo'd key in a section that mutates memories or opens a
-network listener must never silently no-op.)
+(Exception to warn-and-ignore: unknown keys inside `[retention]`, `[http]`,
+and `[write_gate]` **fail closed** — a typo'd key in a section that mutates
+memories, opens a network listener, or drives a security policy must never
+silently no-op.)
 
 Two further small files exist for namespace identity (and identity ONLY — a
 repo-committed file must never be able to set sockets, paths, or backends): a

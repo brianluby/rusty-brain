@@ -84,6 +84,7 @@ impl DaemonClient {
             confidence,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -112,6 +113,7 @@ impl DaemonClient {
             confidence,
             Vec::new(),
             Some(supersedes),
+            None,
         )
         .await
     }
@@ -132,6 +134,7 @@ impl DaemonClient {
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Option<MemoryId> {
         let anchors = if anchors.is_empty() || self.client.supports_anchors() {
             anchors
@@ -153,6 +156,7 @@ impl DaemonClient {
             confidence,
             anchors,
             supersedes,
+            evidence,
         );
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(id)) => Some(id),
@@ -177,6 +181,27 @@ impl DaemonClient {
         let fut = self.client.recall(query, None, Vec::new(), limit);
         match tokio::time::timeout(self.timeout, fut).await {
             Ok(Ok(results)) => Some(results),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
+    /// [`DaemonClient::recall`] that also surfaces the ABSTAIN verdict
+    /// (Vikunja #62): the calibrated gate refusing to serve a weak match is
+    /// a distinct outcome from an empty hit list — the injection contract
+    /// renders an explicit no-memory path instead of ambiguous silence. A
+    /// degraded transport/error still returns `None` (fail-open, unchanged).
+    pub async fn recall_with_abstain(
+        &mut self,
+        query: String,
+        limit: usize,
+    ) -> Option<(Vec<SearchResult>, Option<rb_types::AbstainReason>)> {
+        let fut = self.client.recall_filtered_with_status(
+            query,
+            rb_types::RecallFilter::default(),
+            limit,
+        );
+        match tokio::time::timeout(self.timeout, fut).await {
+            Ok(Ok((results, _degraded, abstained, _snapshot))) => Some((results, abstained)),
             Ok(Err(_)) | Err(_) => None,
         }
     }
@@ -258,6 +283,8 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let embedder = SharedEmbedder::new(DeterministicProvider::new(DIM));
@@ -343,6 +370,7 @@ mod tests {
                 vec!["hook".to_string()],
                 Some(0.7),
                 anchors.clone(),
+                None,
                 None,
             )
             .await

@@ -43,6 +43,13 @@ pub struct ClientIdentity {
     /// Producer surface, declared per binary: `hook` | `mcp` | `cli`.
     #[serde(default)]
     pub source: Option<String>,
+    /// The client's working directory (Vikunja #63), when known — the repo
+    /// context the client is operating in. The daemon snapshots its git
+    /// state ONCE per connection (bounded) to evaluate state-bound staleness
+    /// of commit-anchored memories; it never reaches the stored record body.
+    /// Additive + `#[serde(default)]`: old clients omit it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cwd: Option<String>,
 }
 
 /// Capability string a daemon advertises when it evaluates typed code
@@ -117,6 +124,17 @@ pub enum Request {
         /// (see `Client::remember_anchored`).
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         anchors: Vec<rb_types::MemoryAnchor>,
+        /// Verifiable capture evidence backing the write (Vikunja #63).
+        /// The ONLY trust-related thing a caller may put on the wire — never
+        /// a class. The daemon gates each evidence kind against the channel
+        /// that can substantiate it (`rb_types::derive_trust_class`) and
+        /// derives the stored `trust_class` server-side; an unsubstantiatable
+        /// claim is a hard rejection. Additive + `#[serde(default,
+        /// skip_serializing_if)]`: byte-identical wire for old clients and
+        /// evidence-less writes — no CONTRACT_VERSION bump (the `confidence`
+        /// precedent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        evidence: Option<rb_types::CaptureEvidence>,
     },
     Recall {
         query: String,
@@ -421,6 +439,19 @@ pub enum Response {
         /// frame byte-identical to the pre-W1.6 shape.
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         degraded: bool,
+        /// Why recall ABSTAINED instead of returning the nearest weak match
+        /// (Vikunja #62): machine-readable code, `None` on a served recall
+        /// (including an honestly-empty result set — ABSTAIN and empty are
+        /// distinct outcomes). Additive + serde defaults: byte-identical for
+        /// old peers, no contract-version bump (the `degraded` precedent).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        abstained: Option<rb_types::AbstainReason>,
+        /// Read-time corpus snapshot (Vikunja #62): pins the corpus a served
+        /// recall drew from (count, rowid-derived generation, last-write
+        /// epoch, fingerprint) so a preregistered eval run is reproducible.
+        /// Observability only — never a gate. Additive + skipped when absent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        snapshot: Option<rb_types::CorpusSnapshot>,
     },
     Got {
         memory: Option<MemoryNote>,
@@ -606,6 +637,7 @@ mod tests {
                 agent: Some("claude-code".into()),
                 session_id: Some("s-1".into()),
                 source: Some("hook".into()),
+                cwd: None,
             }),
         };
         let json = serde_json::to_string(&hs).unwrap();
@@ -669,6 +701,7 @@ mod tests {
             confidence: Some(0.3),
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         // Some(x) serializes the key and round-trips back to Some(x).
         let json = serde_json::to_value(&explicit).unwrap();
@@ -706,6 +739,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -731,6 +765,7 @@ mod tests {
             confidence: None,
             supersedes: Some(old.clone()),
             anchors: vec![],
+            evidence: None,
         };
         // Some(id) serializes the key and round-trips back to the same id.
         let json = serde_json::to_value(&explicit).unwrap();
@@ -765,6 +800,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -850,6 +886,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs:2-4").unwrap()],
+            evidence: None,
         };
         let json = serde_json::to_value(&explicit).unwrap();
         assert!(
@@ -885,6 +922,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![],
+            evidence: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -925,6 +963,7 @@ mod tests {
             confidence: None,
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("a.rs").unwrap()],
+            evidence: None,
         }));
         // Anchor-free frames are never flagged.
         assert!(!request_uses_anchors(&Request::Recall {
@@ -951,6 +990,7 @@ mod tests {
                 confidence: Some(0.7),
                 supersedes: Some(id.clone()),
                 anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/lib.rs:3-9").unwrap()],
+                evidence: None,
             },
             Request::Recall {
                 query: "q".into(),
@@ -1066,12 +1106,17 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    stale: false,
                 }],
                 degraded: false,
+                abstained: None,
+                snapshot: None,
             },
             Response::Recalled {
                 results: Vec::new(),
                 degraded: true,
+                abstained: None,
+                snapshot: None,
             },
             Response::Got {
                 memory: Some(note()),
@@ -1221,7 +1266,12 @@ mod tests {
         // decode, defaulting the flag off.
         let back: Response = serde_json::from_str(r#"{"result":"Recalled","results":[]}"#).unwrap();
         match back {
-            Response::Recalled { results, degraded } => {
+            Response::Recalled {
+                results,
+                degraded,
+                abstained: None,
+                snapshot: None,
+            } => {
                 assert!(results.is_empty());
                 assert!(!degraded, "absent degraded key must default to false");
             }
@@ -1236,6 +1286,8 @@ mod tests {
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: false,
+            abstained: None,
+            snapshot: None,
         })
         .unwrap();
         assert_eq!(json, r#"{"result":"Recalled","results":[]}"#);
@@ -1243,6 +1295,8 @@ mod tests {
         let json = serde_json::to_string(&Response::Recalled {
             results: Vec::new(),
             degraded: true,
+            abstained: None,
+            snapshot: None,
         })
         .unwrap();
         assert_eq!(

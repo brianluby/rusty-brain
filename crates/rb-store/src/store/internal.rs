@@ -118,16 +118,15 @@ pub(crate) fn decode_embedding_bytes(bytes: &[u8]) -> Result<Vec<f32>> {
             bytes.len()
         )));
     }
-    let mut out = Vec::with_capacity(bytes.len() / 4);
-    for chunk in bytes.chunks_exact(4) {
-        // chunks_exact(4) yields slices of exactly 4 bytes; the conversion to a
-        // [u8; 4] cannot fail, but we handle it explicitly to avoid unwrap.
-        let arr: [u8; 4] = chunk
-            .try_into()
-            .map_err(|_| Error::Storage("embedding chunk was not 4 bytes".to_string()))?;
-        out.push(f32::from_le_bytes(arr));
-    }
-    Ok(out)
+    // The length is a validated multiple of 4 above, so `as_chunks::<4>`
+    // leaves an empty remainder and yields exactly-4-byte arrays — no
+    // per-chunk conversion error path exists.
+    Ok(bytes
+        .as_chunks::<4>()
+        .0
+        .iter()
+        .map(|chunk| f32::from_le_bytes(*chunk))
+        .collect())
 }
 /// Decode a stored unix-seconds timestamp, failing closed on out-of-range
 /// values rather than silently fabricating an epoch-0 datetime.

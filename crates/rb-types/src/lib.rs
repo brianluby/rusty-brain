@@ -5,6 +5,7 @@
 //! `MemoryLink`, `SearchQuery`, `SearchResult`, `MemoryUpdates`, `Error`) used
 //! across the engine, store, daemon, and binary.
 
+mod abstention;
 mod anchor;
 mod change;
 mod embedding;
@@ -21,9 +22,13 @@ mod namespace;
 mod query;
 mod retention;
 mod review;
+mod staleness;
 mod stats;
+mod trust_class;
 mod validate;
+mod write_gate;
 
+pub use abstention::{AbstainReason, CorpusSnapshot};
 pub use anchor::{
     kind_str as anchor_kind_str, normalize_anchor_value, parse_file_filter,
     parse_kind as parse_anchor_kind, MemoryAnchor,
@@ -55,5 +60,12 @@ pub use review::{
     REVIEW_KEEP_BUMP, REVIEW_LOW_CONFIDENCE_BOUND, REVIEW_MAX_LIMIT, REVIEW_MAX_SNOOZE_DAYS,
     REVIEW_MIN_THRESHOLD, REVIEW_STALE_DAYS,
 };
+pub use staleness::{evaluate_staleness, RepoSnapshot};
 pub use stats::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
+pub use trust_class::{derive_trust_class, CaptureEvidence, TrustClass};
 pub use validate::{validate_confidence, validate_importance};
+
+pub use write_gate::{
+    validate_write, WriteChannel, WriteGateConfig, WriteGatePolicy, WriteRejection,
+    DEFAULT_MAX_CONTENT_BYTES, DEFAULT_MAX_CONTEXT_BYTES,
+};

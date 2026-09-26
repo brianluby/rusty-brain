@@ -64,6 +64,105 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    not greppable from the DB in plaintext *when the redactor catches it*
    (see redaction below).
 
+
+## The write path (Vikunja #69: write gate + channel trust tags)
+
+Namespaces are organization, not authorization (above) — so the durable
+write path itself is the defense surface against memory poisoning. Three
+layers, all enforced server-side:
+
+1. **Pre-insert write gate.** Every durable write composes through the
+   engine's single compose seam, which validates it against the resolved
+   `[write_gate]` policy (per-namespace overrides of the built-in default):
+   permitted channels, allowed memory types, content/context size ceilings,
+   minimum anchor count. A violation is a structured rejection
+   (`[write-gate:<code>]`) — nothing composes, nothing embeds, nothing
+   reaches SQLite. The gate is on with the built-in default policy even
+   when unconfigured.
+
+2. **Channel trust tags.** The daemon stamps every write with the channel
+   it arrived on — `hook`/`mcp`/`cli` from the same-host UDS peer's
+   handshake-declared surface, `http` for the loopback listener, `None`
+   (unverified) for old/unknown clients — into a dedicated `origin_channel`
+   column OUTSIDE any per-request payload field. Honesty note (PR #89
+   review): the UDS kernel credential proves the peer's UID, not its
+   binary — the surface string is the honest client's self-report, so the
+   tag separates first-party paths and degrades unknown peers to `None`;
+   it is not a defense against a hostile same-user process, which this
+   threat model already treats as inside the boundary (the admin gate
+   trusts same-euid for the same reason). Retrieval quarantines
+   untrusted-origin rows: they never surface in recall or the SessionStart
+   digest, but stay listed (visibly marked `[quarantined]`) — demotion,
+   never silent deletion.
+
+3. **Compaction source filtering.** The hook fold is a compaction-driven
+   write (MPBench V-P2/V-S3): scratch observations, transcript "decisions",
+   and `/compact` custom instructions all become durable memory at the
+   fold. Instruction-shaped entries — standing directives aimed at a future
+   agent — are filtered before the summary is assembled (see
+   `rb_hooks::poison`); a session whose only content is a planted directive
+   stores nothing. The fold trigger is structural (session lifecycle events
+   from the CLI host), never content length: scratch growth alone cannot
+   mint a memory. The false-positive posture is deliberate — the hook
+   channel records observations, not directives; a real convention phrased
+   imperatively can still be stored deliberately via the CLI/MCP channel.
+
+
+## The trust-class ladder (Vikunja #63)
+
+Confidence was caller-declared; nothing distinguished a memory backed by a
+measured test result from one the model asserted. The ladder (Lians-derived)
+fixes the write path AND the read path:
+
+1. **Classes.** `measured_ci > measured_local > human_confirmed >
+   agent_attested > inferred_activity`. Legacy rows backfill to
+   `agent_attested` (migration 012); internal job rows infer.
+2. **No self-promotion.** A caller may put ONLY evidence on the wire —
+   never a class. The daemon derives the class server-side
+   (`derive_trust_class`): only the `hook` channel can claim a local
+   measurement (commands the hook itself observed), only `cli` (the human's
+   typed surface) a CI run — which additionally requires a commit anchor —
+   or a human confirmation. Anything else is a hard rejection. The hook
+   fold claims `measured_local` exactly when its scratch carries observed
+   commands.
+3. **Ranking + surfacing.** Class is a multiplicative recall prior (top of
+   the ladder keeps its score; each rung steps down), with the admission
+   floor scaled identically so the prior reorders without raising the bar.
+   Every injected line carries its class (`· trust=<class>`) inside the
+   single provenance bracket.
+4. **State-bound staleness.** Clients declare their working directory; the
+   daemon snapshots its git state ONCE per connection (bounded, fail-open).
+   A commit-anchored memory whose HEAD/worktree moved past its anchor is
+   returned with `stale: true` and injected with an explicit `[stale]`
+   marker — anchored evidence is never silently reused as current.
+
+Scope (same posture as the ladder's own docs): these gates separate honest
+capture paths; they are not a defense against hostile same-user code (which
+can write the SQLite file directly).
+
+## Recall abstention (Vikunja #62)
+
+The recall contract used to inject up to 5 memories with a confidence
+dampener but no refusal path — the 5th-best match rode the same framing as
+the 1st. Now a calibrated gate over the final Linear blend (default 0.22,
+derived from the recorded score distributions behind the W1.3 floor; see
+`rb_search::ABSTAIN_THRESHOLD`) withholds EVERYTHING when the best surviving
+candidate falls below the bar, and every empty outcome carries a
+machine-readable reason (`no_candidates` / `below_threshold` /
+`filter_excluded` / `degraded_backend`) on the wire. ABSTAIN is a distinct
+outcome from an empty result set on every surface: the CLI and MCP render
+the refusal and its code, and the UserPromptSubmit injection emits an
+explicit no-memory path ("recall abstained … treat the corpus as not
+covering this topic") instead of silence or filler.
+
+The gate is source-aware (a session-scoped top is compared against the bar
+scaled by the session prior, mirroring the W1.3 candidate-floor rule), is
+skipped for `Rrf` (uncalibrated scale), and rides a served recall's
+read-time corpus snapshot (count, generation, last-write, fingerprint) so a
+preregistered eval run can pin the corpus it scored against. `[search]
+abstain_threshold` overrides the calibration (0.0 disables); the scorecard
+records per-query abstention plus run-level `abstain_rate`/`abstain_events`.
+
 ## The opt-in HTTP listener (HTTP PRD 2026-07-02)
 
 `serve --http [bind]` (or `[http] enabled = true` in the user config) adds a

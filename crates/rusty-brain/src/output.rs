@@ -4,6 +4,45 @@ use crate::import::{BatchInfo, ImportCounts, ImportItem, UndoCounts};
 use rb_redact::redact;
 use rb_types::{MemoryNote, SearchResult};
 
+/// Human-readable, reason-specific phrasing for an abstention (Vikunja #62,
+/// PR #89 review): the message must MATCH its code — `DegradedBackend` is a
+/// retrieval outage (says nothing about stored memories), never a blanket
+/// "trust gate" claim; only `BelowThreshold` is the calibrated gate refusing
+/// to serve a weak match.
+fn abstain_explanation(reason: &rb_types::AbstainReason) -> &'static str {
+    match reason {
+        rb_types::AbstainReason::NoCandidates => "the corpus has no candidate for this query",
+        rb_types::AbstainReason::BelowThreshold => {
+            "no memory clears the calibrated abstention bar for this query"
+        }
+        rb_types::AbstainReason::FilterExcluded => {
+            "every candidate was excluded by the active filters; the query may be answerable unfiltered"
+        }
+        rb_types::AbstainReason::DegradedBackend => {
+            "retrieval was degraded (a channel failed or timed out); this says nothing about stored memories — retry before concluding"
+        }
+    }
+}
+
+/// Render a recall that ABSTAINED (Vikunja #62): no results were served and
+/// `reason` says why. JSON: `{"abstained":"<code>","results":[]}` —
+/// machine-distinguishable from an honestly-empty result set. Human: the
+/// refusal with reason-specific wording, never filler content.
+pub fn render_recall_abstained(reason: &rb_types::AbstainReason, json: bool) -> String {
+    if json {
+        return serde_json::json!({
+            "abstained": reason.as_str(),
+            "results": [],
+        })
+        .to_string();
+    }
+    format!(
+        "Recall abstained ({}) — {}.",
+        reason.as_str(),
+        abstain_explanation(reason)
+    )
+}
+
 /// Render recall hits. JSON: the raw `Vec<SearchResult>`. Human: one line per hit.
 pub fn render_recall(results: &[SearchResult], json: bool) -> String {
     if json {
@@ -30,12 +69,17 @@ pub fn render_recall(results: &[SearchResult], json: bool) -> String {
         } else {
             ""
         };
+        // State-bound staleness (Vikunja #63, PR #89 review): a commit-
+        // anchored memory whose repo moved past its anchor is visibly STALE,
+        // never silently served as current. Fixed marker text.
+        let stale = if r.stale { " [stale]" } else { "" };
         out.push_str(&format!(
-            "[{:.2}] {} ({}){} {}\n",
+            "[{:.2}] {} ({}){}{} {}\n",
             r.score,
             r.memory.id,
             r.memory.memory_type.as_str(),
             contested,
+            stale,
             summary
         ));
     }
@@ -79,12 +123,20 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         };
         // Surface the contested flag (Feature C) inline for the human reader.
         let contested = if n.contested { " [contested]" } else { "" };
+        // Vikunja #69: quarantined rows stay listed but visibly demoted —
+        // quarantine is never silent deletion.
+        let quarantined = if n.is_quarantined() {
+            " [quarantined]"
+        } else {
+            ""
+        };
         out.push_str(&format!(
-            "{} (imp {}, {}){} {}{}\n",
+            "{} (imp {}, {}){}{} {}{}\n",
             n.id,
             n.importance,
             n.memory_type.as_str(),
             contested,
+            quarantined,
             summary,
             anchors_suffix(n)
         ));
@@ -105,15 +157,22 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             // Surface the contested flag (Feature C) on the get read path too, so
             // every human surface (recall/list/context/get) marks a contradicted note.
             let contested = if n.contested { " [contested]" } else { "" };
+            // Vikunja #69: quarantine is visible on every human surface.
+            let quarantined = if n.is_quarantined() {
+                " [quarantined]"
+            } else {
+                ""
+            };
             let anchors = if n.anchors.is_empty() {
                 String::new()
             } else {
                 format!("\nanchors: {}", anchor_labels(n))
             };
             format!(
-                "{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
+                "{}{}{}\nnamespace: {}\ntype: {}\nimportance: {}{}\n\n{}",
                 n.id,
                 contested,
+                quarantined,
                 n.namespace.as_db_string(),
                 n.memory_type.as_str(),
                 n.importance,
@@ -1022,6 +1081,7 @@ mod tests {
             memory: n.clone(),
             score: 0.91,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("0.91"), "score shown: {out}");
@@ -1040,9 +1100,36 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, false);
         assert!(out.contains("[contested]"), "contested marker shown: {out}");
+    }
+
+    #[test]
+    fn human_recall_marks_stale_results() {
+        // Vikunja #63 / PR #89 review: the human recall line shows the stale
+        // marker — a commit-anchored memory whose repo moved past its anchor
+        // is visibly stale, never silently served as current.
+        let results = vec![
+            SearchResult {
+                memory: note("current fact", 5),
+                score: 0.9,
+                channels: rb_types::ChannelHits::default(),
+                stale: false,
+            },
+            SearchResult {
+                memory: note("anchored fact from an older head", 5),
+                score: 0.8,
+                channels: rb_types::ChannelHits::default(),
+                stale: true,
+            },
+        ];
+        let out = render_recall(&results, false);
+        assert!(
+            out.matches("[stale]").count() == 1,
+            "exactly the stale hit is marked: {out}"
+        );
     }
 
     #[test]
@@ -1053,6 +1140,7 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
@@ -1068,12 +1156,48 @@ mod tests {
     }
 
     #[test]
+    fn human_list_and_get_mark_quarantined_notes() {
+        // Vikunja #69: a quarantined (untrusted-origin) row stays listed but
+        // visibly marked on every human surface — demotion, never deletion.
+        let mut n = note("poisoned row", 5);
+        n.origin_channel = Some(rb_types::WriteChannel::Http);
+        let out = render_notes(std::slice::from_ref(&n), false);
+        assert!(out.contains("[quarantined]"), "list marker shown: {out}");
+        let out = render_get(&Some(n.clone()), false);
+        assert!(out.contains("[quarantined]"), "get marker shown: {out}");
+
+        // And the JSON surfaces the channel itself for machine consumers.
+        let out = render_notes(std::slice::from_ref(&n), true);
+        assert!(out.contains("\"origin_channel\""), "json channel: {out}");
+    }
+
+    #[test]
+    fn abstaining_recall_is_distinguishable_from_empty_in_both_modes() {
+        // Vikunja #62: ABSTAIN (the gate refused a weak match) must render
+        // differently from an honestly-empty result set, in JSON (machine
+        // consumers read `abstained`) and human text alike.
+        let json = render_recall_abstained(&rb_types::AbstainReason::BelowThreshold, true);
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed["abstained"], "below_threshold");
+        assert_eq!(
+            parsed["results"].as_array().unwrap().len(),
+            0,
+            "no results ride an abstention"
+        );
+
+        let human = render_recall_abstained(&rb_types::AbstainReason::BelowThreshold, false);
+        assert!(human.contains("abstained"), "human refusal: {human}");
+        // And distinct from the plain empty-state wording.
+        assert_ne!(human, render_recall(&[], false));
+    }
+    #[test]
     fn json_recall_is_parseable_array() {
         let n = note("body", 5);
         let results = vec![SearchResult {
             memory: n,
             score: 0.5,
             channels: rb_types::ChannelHits::default(),
+            stale: false,
         }];
         let out = render_recall(&results, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();

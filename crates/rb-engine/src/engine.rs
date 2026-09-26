@@ -39,16 +39,38 @@ pub struct RememberInput {
     /// links stored with the memory. Validated fail-closed; empty is the
     /// pre-anchor behavior (anchors are never required).
     pub anchors: Vec<rb_types::MemoryAnchor>,
+    /// Pre-derived trust class (Vikunja #63 trust ladder). `None` keeps the
+    /// conservative context-only default for the channel
+    /// ([`rb_types::TrustClass::context_default`]). The DAEMON passes `Some`
+    /// only after validating capture evidence server-side
+    /// (`rb_types::derive_trust_class`) — the no-self-promotion rule. This is
+    /// an in-process API, not a wire field: untrusted callers can never state
+    /// a class, only evidence, and only the daemon maps one to the other.
+    /// Daemon-internal continuity paths (the review merge) carry the strongest
+    /// member's already-derived class rather than re-deriving from nothing.
+    pub trust_class: Option<rb_types::TrustClass>,
 }
 
-/// What `recall_with_status` returns (W1.6d): the ranked results plus whether
-/// retrieval DEGRADED to keyword + graph because the embedder errored. The
-/// daemon forwards `degraded` on the wire so clients can warn instead of
-/// silently serving vector-blind results.
+/// What `recall_with_status` returns (W1.6d + Vikunja #62): the ranked
+/// results, whether retrieval DEGRADED to keyword + graph because the
+/// embedder errored, whether recall ABSTAINED (and why), and the read-time
+/// corpus snapshot the results were drawn from. The daemon forwards
+/// `degraded`/`abstained`/`snapshot` on the wire so clients can warn, render
+/// an explicit no-memory path, and pin eval runs instead of silently serving
+/// vector-blind or below-threshold results.
 #[derive(Debug, Clone)]
 pub struct RecallOutcome {
     pub results: Vec<rb_types::SearchResult>,
     pub degraded: bool,
+    /// `Some(reason)` when recall ABSTAINED (Vikunja #62): no results are
+    /// returned and the machine-readable code says why — `no_candidates`,
+    /// `filter_excluded`, `degraded_backend`, or `below_threshold` (the
+    /// calibrated gate over the weighted blend). `None` on a served recall.
+    pub abstained: Option<rb_types::AbstainReason>,
+    /// Read-time corpus snapshot fingerprint (Vikunja #62): `None` on
+    /// backends without a cheap derivation (tests' in-memory mocks) or when
+    /// the derivation errors — snapshot is observability, never a gate.
+    pub snapshot: Option<rb_types::CorpusSnapshot>,
 }
 
 /// Who/where/what produced a write (W0.5): the connection's handshake identity
@@ -60,8 +82,17 @@ pub struct Provenance {
     pub origin_user: Option<String>,
     pub origin_host: Option<String>,
     pub origin_agent: Option<String>,
-    /// Producer surface: `hook` | `mcp` | `cli` | `job`.
+    /// Producer surface: `hook` | `mcp` | `cli` | `job` (client-declared,
+    /// advisory provenance only).
     pub origin_source: Option<String>,
+    /// Daemon-stamped write channel (Vikunja #69): `None` for direct engine
+    /// callers (tests/eval); the daemon sets it from the connection's
+    /// handshake identity (the loopback listener for HTTP) and it flows into
+    /// the row's `origin_channel` column. Kept beside the advisory fields
+    /// for plumbing only; it is never read from a per-REQUEST payload. The
+    /// handshake surface itself is the honest client's self-report over the
+    /// kernel-verified same-uid UDS peer (see `MemoryNote::origin_channel`).
+    pub channel: Option<rb_types::WriteChannel>,
     pub session_id: Option<String>,
 }
 
@@ -82,11 +113,30 @@ pub struct MemoryEngine<B: MemoryBackend, P: EmbeddingProvider> {
     /// scale and stay unfloored until RRF is reachable and calibrated
     /// (W2.2/W4.1). See `rb_search::SCORE_FLOOR` for the derivation.
     score_floor: f32,
+    /// Pre-insert write gate (Vikunja #69): per-namespace policy enforced in
+    /// `compose_note` — the single seam every durable write composes through
+    /// (`remember`, review merge). The permissive default keeps direct engine
+    /// callers (tests, eval) working; the daemon sets the resolved policy.
+    write_gate: rb_types::WriteGateConfig,
+    /// Recall ABSTENTION threshold (Vikunja #62): when the BEST final
+    /// `Linear` blend score of a query's candidates falls below this, recall
+    /// returns NO results plus `AbstainReason::BelowThreshold` instead of the
+    /// nearest weak match. `None` disables the gate. See
+    /// `rb_search::ABSTAIN_THRESHOLD` for the derivation; comparison is
+    /// source-aware (session-scored tops scale the bar, the W1.3
+    /// candidate-floor precedent). Applies to `Linear` only — `Rrf` scores
+    /// live on a different, uncalibrated scale.
+    abstain_threshold: Option<f32>,
     /// Determinism hook for eval/tests: when set, `remember` stamps
     /// created/updated at this instant and ranking computes recency against
     /// it, so (now - created_at) deltas are reproducible across runs instead
     /// of riding the wall clock. `None` (production) uses `Utc::now()`.
     fixed_now: Option<chrono::DateTime<chrono::Utc>>,
+    /// Repository-state provider for state-bound staleness (Vikunja #63):
+    /// when set, recall compares each result's commit anchors against the
+    /// provider's snapshot and annotates `SearchResult.stale`. `None` (the
+    /// default for engine-only callers) disables staleness claims entirely.
+    repo_state: Option<Arc<dyn crate::repo_state::RepoStateProvider>>,
 }
 
 impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
@@ -104,9 +154,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             namespace,
             linker: Box::new(SimilarityLinker::default()),
             enricher: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             score_floor: rb_search::SCORE_FLOOR,
+            abstain_threshold: Some(rb_search::ABSTAIN_THRESHOLD),
             fixed_now: None,
+            repo_state: None,
         }
+    }
+
+    /// Wire a repository-state provider for state-bound staleness (Vikunja
+    /// #63). See the `repo_state` field docs.
+    pub fn with_repo_state_provider(
+        mut self,
+        provider: Arc<dyn crate::repo_state::RepoStateProvider>,
+    ) -> Self {
+        self.repo_state = Some(provider);
+        self
     }
 
     /// Pin the engine's clock (eval/test determinism): `remember` stamps
@@ -154,6 +217,14 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self
     }
 
+    /// Install the pre-insert write gate policy (Vikunja #69). The daemon
+    /// passes the resolved `[write_gate]` config; direct engine callers keep
+    /// the permissive default.
+    pub fn with_write_gate(mut self, gate: rb_types::WriteGateConfig) -> Self {
+        self.write_gate = gate;
+        self
+    }
+
     /// Override the `Rrf` tuning (k + prior weights). No effect under `Linear`.
     pub fn with_rrf_config(mut self, config: RrfConfig) -> Self {
         self.rrf_config = config;
@@ -178,6 +249,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// non-finite floor is sanitized to 0.0 (floor disabled, fail-open).
     pub fn with_score_floor(mut self, floor: f32) -> Self {
         self.score_floor = if floor.is_finite() { floor } else { 0.0 };
+        self
+    }
+
+    /// The recall abstention threshold applied under `Linear` fusion
+    /// (Vikunja #62); `None` means the gate is disabled.
+    pub fn abstain_threshold(&self) -> Option<f32> {
+        self.abstain_threshold
+    }
+
+    /// Override the recall abstention threshold (Vikunja #62). `None`
+    /// disables the gate (recall never abstains with `below_threshold`);
+    /// a non-finite value is sanitized to `None` the same way. Production
+    /// keeps the derived `rb_search::ABSTAIN_THRESHOLD` default unless the
+    /// `[search] abstain_threshold` config knob overrides it.
+    pub fn with_abstain_threshold(mut self, threshold: Option<f32>) -> Self {
+        self.abstain_threshold = threshold.filter(|t| t.is_finite());
         self
     }
 
@@ -232,6 +319,21 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         &self,
         input: RememberInput,
     ) -> rb_types::Result<(MemoryNote, Option<Vec<f32>>)> {
+        // Vikunja #69 pre-insert write gate: NOTHING composes — let alone
+        // reaches the store — without passing the per-namespace policy. First
+        // checked so a rejected write costs no enrichment or embedding work.
+        // The structured rejection carries its machine-readable code
+        // (`[write-gate:<code>]`) through `InvalidArgument`.
+        rb_types::validate_write(
+            self.write_gate.policy_for(&self.namespace),
+            &self.namespace,
+            input.provenance.channel,
+            &input.memory_type,
+            &input.content,
+            input.context.as_deref(),
+            input.anchors.len(),
+        )
+        .map_err(|rejection| rb_types::Error::InvalidArgument(rejection.to_string()))?;
         rb_types::validate_importance(input.importance)?;
         // Fail-closed confidence range check on an EXPLICIT caller prior
         // (mirrors the storage CHECK, but surfaces as a clean validation error
@@ -245,6 +347,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             anchor.validate()?;
         }
 
+        // Derive the trust class BEFORE any field of `input` is moved into
+        // the note: the daemon's pre-derived class when present, else the
+        // channel's context-only default (Vikunja #63).
+        let trust_class = input.trust_class.unwrap_or_else(|| {
+            rb_types::TrustClass::context_default(input.provenance.origin_source.as_deref())
+        });
         let mut note = MemoryNote::new(
             self.namespace.clone(),
             input.content,
@@ -266,6 +374,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         note.origin_host = input.provenance.origin_host;
         note.origin_agent = input.provenance.origin_agent;
         note.origin_source = input.provenance.origin_source;
+        // Vikunja #69: the daemon-stamped channel lands in its own column.
+        // The value comes ONLY from the daemon-side stamp on `Provenance` —
+        // compose starts from `MemoryNote::new`, so a client-supplied note
+        // field can never reach this assignment.
+        note.origin_channel = input.provenance.channel;
         note.session_id = input.provenance.session_id;
         // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
         // the caller left empty; an enricher error degrades to the heuristic.
@@ -284,6 +397,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             Some(s) => s,
             None => default_summary(&note.content),
         };
+        // Trust-class ladder (Vikunja #63): the class is pre-derived by the
+        // daemon's evidence validation when the write came through one;
+        // engine-direct callers keep the conservative context-only default
+        // for their channel (an in-process caller cannot submit evidence).
+        note.trust_class = trust_class;
         note.keywords = if !input.keywords.is_empty() {
             input.keywords
         } else if let Some(en) = enrichment.as_ref().filter(|e| !e.keywords.is_empty()) {
@@ -505,11 +623,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             .await?;
         let mut notes: HashMap<MemoryId, MemoryNote> = HashMap::new();
         let mut meta: HashMap<MemoryId, (u8, f32, chrono::DateTime<chrono::Utc>)> = HashMap::new();
+        // Distinguish "the user's filter excluded every candidate"
+        // (`FilterExcluded`) from quarantine/namespace drops, which are not
+        // filter decisions (PR #89 review).
+        let mut filter_dropped_any = false;
         for note in fetched {
             // `get_many` is already namespace-scoped; `filter.matches` covers
             // every metadata dimension including the archived-state scope
             // (default: active-only, the historical behavior).
-            if !self.in_namespace(&note) || !filter.matches(&note) {
+            //
+            // Vikunja #69 quarantine: untrusted-origin rows (stamped HTTP
+            // channel) are EXCLUDED from recall entirely — not rank-demoted.
+            // Recall feeds every injection channel, so a poisoned row must
+            // never ride into a prompt; visibility stays on list/get.
+            let filter_dropped = !filter.matches(&note);
+            if !self.in_namespace(&note) || filter_dropped || note.is_quarantined() {
+                filter_dropped_any |= filter_dropped;
                 continue;
             }
             // Carry confidence into ranking (Feature C): low-confidence memories
@@ -535,7 +664,11 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .backend
                 .active_contradicts(self.namespace.clone(), ids)
                 .await?;
+            let before = notes.len();
             notes.retain(|id, _| contested.contains(id) == want_contested);
+            // The contested tri-state IS a filter decision: drops here count
+            // toward `FilterExcluded` too (PR #89 review).
+            filter_dropped_any |= notes.len() < before;
             meta.retain(|id, _| notes.contains_key(id));
             contested_for_annotation = Some(contested);
         }
@@ -591,6 +724,17 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 *score *= SESSION_PROVENANCE_SCORE_MULTIPLIER;
             }
         }
+        // Trust-class ladder (Vikunja #63): the class is a multiplicative
+        // prior like the session-provenance one — measured/human-confirmed
+        // evidence outranks otherwise-identical agent-attested rows, and the
+        // admission floor below scales by the same factor so the prior
+        // reorders but never raises the bar (the session-multiplier
+        // precedent; see `TrustClass::score_multiplier`).
+        for (id, score) in &mut ranked {
+            if let Some(note) = notes.get(id) {
+                *score *= note.trust_class.score_multiplier();
+            }
+        }
         ranked.sort_by(|a, b| b.1.total_cmp(&a.1));
 
         // Assemble source-adjusted results in ranked order, truncating to
@@ -603,6 +747,10 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             FusionMode::Rrf => f32::NEG_INFINITY,
         };
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
+        // One repo-state read per recall (Vikunja #63): implementations may
+        // shell out to git; never per-result.
+        let repo_snapshot = self.repo_state.as_ref().and_then(|p| p.snapshot());
+        let repo_snapshot = repo_snapshot.as_ref();
         for (id, score) in ranked {
             let Some(note) = notes.get(&id) else {
                 continue;
@@ -618,22 +766,100 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 floor.min(DURABLE_KEYWORD_SCORE_FLOOR)
             } else {
                 floor
-            };
+            } * note.trust_class.score_multiplier();
             if score < candidate_floor {
                 // Source-aware candidate floors mean a lower-ranked durable
                 // keyword hit may still qualify; do not stop at this row.
                 continue;
-            };
+            }
+            // State-bound staleness (Vikunja #63): a commit-anchored memory
+            // whose evidence no longer matches HEAD/worktree reports STALE
+            // on the result — never silently injected as current. With no
+            // provider (direct engine callers) staleness stays `false`.
+            let stale = rb_types::evaluate_staleness(&note.anchors, repo_snapshot);
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
                 channels: channel_map.get(&id).copied().unwrap_or_default(),
+                stale,
             });
             if results.len() == limit {
                 break;
             }
         }
 
+        // ABSTENTION gate (Vikunja #62): a weak nearest match is not an
+        // answer. When the BEST surviving result falls below the calibrated
+        // threshold, recall returns NO results plus
+        // `AbstainReason::BelowThreshold` instead of the 5th-best memory with
+        // the 1st's framing. Source-aware like the W1.3 candidate floors: a
+        // session-scoped top is compared against the bar scaled by
+        // SESSION_PROVENANCE_SCORE_MULTIPLIER, and the bar is scaled by the
+        // TOP's `score_multiplier()` — the trust prior rescales the whole
+        // score, so an unscaled bar would silently raise the effective bar
+        // 1.25x for a default-class (`agent_attested`, 0.80) corpus and
+        // abstain on calibrated hits (the derivation's weakest golden scores
+        // 0.2724 → 0.218 at 0.80, under the 0.22 bar; PR #89 review).
+        // `Linear` only: `Rrf` scores live on a different, uncalibrated scale
+        // (the SCORE_FLOOR precedent).
+        let mut abstained: Option<rb_types::AbstainReason> = None;
+        if self.fusion_mode == FusionMode::Linear {
+            if let (Some(threshold), Some(top)) = (self.abstain_threshold, results.first()) {
+                let bar = if top.memory.session_id.is_some() {
+                    threshold * SESSION_PROVENANCE_SCORE_MULTIPLIER
+                } else {
+                    threshold
+                } * top.memory.trust_class.score_multiplier();
+                if top.score < bar {
+                    tracing::debug!(
+                        top_score = top.score,
+                        bar,
+                        "recall abstains: best candidate below the calibrated threshold"
+                    );
+                    abstained = Some(rb_types::AbstainReason::BelowThreshold);
+                    // Withhold everything: partial results below an
+                    // under-bar top would still be unsupported-memory
+                    // injection.
+                    results.clear();
+                }
+            }
+        }
+        // Every empty outcome still carries a machine-readable reason so
+        // surfaces can tell "responsibly declined" apart from a plain empty
+        // set. Precedence (PR #89 review, most conservative first): the
+        // backend was DEGRADED → warn/retry before concluding anything about
+        // the corpus (a down channel hid hits; "no candidates" is not
+        // established); no channel surfaced anything at all → the corpus
+        // simply has no candidate; the user's FILTER (or contested tri-state)
+        // excluded every candidate → the query may be answerable unfiltered;
+        // candidates existed but none survived → the calibrated gate or the
+        // W1.3 floor dropped them. Quarantine/namespace drops are not filter
+        // decisions and fall through to the honest "no candidate" reading.
+        if results.is_empty() && abstained.is_none() {
+            abstained = Some(if degraded {
+                rb_types::AbstainReason::DegradedBackend
+            } else if order.is_empty() {
+                rb_types::AbstainReason::NoCandidates
+            } else if filter_dropped_any {
+                rb_types::AbstainReason::FilterExcluded
+            } else if notes.is_empty() {
+                rb_types::AbstainReason::NoCandidates
+            } else {
+                rb_types::AbstainReason::BelowThreshold
+            });
+        }
+
+        // Read-time corpus snapshot (Vikunja #62): one cheap backend read so
+        // a response/eval run can pin the corpus state it was computed
+        // against. FAIL-OPEN: a derivation error omits the snapshot — it is
+        // observability, never a gate on retrieval.
+        let snapshot = match self.backend.corpus_snapshot(self.namespace.clone()).await {
+            Ok(snapshot) => snapshot,
+            Err(e) => {
+                tracing::debug!(error = %e, "corpus snapshot failed; omitting");
+                None
+            }
+        };
         let returned_ids: Vec<MemoryId> = results.iter().map(|r| r.memory.id.clone()).collect();
 
         // Contradiction surfacing (Feature C): for the returned (post-ranking,
@@ -658,7 +884,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 tracing::debug!(error = %e, "record_accesses failed; ignoring");
             }
         }
-        Ok(RecallOutcome { results, degraded })
+        Ok(RecallOutcome {
+            results,
+            degraded,
+            abstained,
+            snapshot,
+        })
     }
 
     /// Batch-load the subset of `ids` that have an active `contradicts` link
@@ -985,6 +1216,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Project context payload: recent memories (by recency) plus important ones
     /// (importance >= 8), with a total count of the recent window.
+    ///
+    /// Vikunja #69 quarantine: this projection feeds the SessionStart digest
+    /// injection channel, so untrusted-origin rows (stamped HTTP channel) are
+    /// EXCLUDED here too — recall parity, never silently injected. The total
+    /// still counts the pre-filter window; list/get stay visible with the
+    /// marker.
     pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         const CONTEXT_LIMIT: usize = 50;
         const IMPORTANT_FLOOR: u8 = 8;
@@ -1008,6 +1245,8 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             )
             .await?;
         let total = recent.len();
+        recent.retain(|n| !n.is_quarantined());
+        important.retain(|n| !n.is_quarantined());
         // Annotate contested on both context halves (Feature C, fail-open).
         self.annotate_contested(&mut recent).await;
         self.annotate_contested(&mut important).await;
@@ -1047,6 +1286,9 @@ mod tests {
             confidence: None,
             provenance: Provenance::default(),
             anchors: Vec::new(),
+            // Direct engine caller: no daemon-derivation, the compose seam
+            // applies the channel's context default (agent_attested).
+            trust_class: None,
         }
     }
 
@@ -1605,6 +1847,7 @@ mod tests {
             origin_host: Some("devbox".into()),
             origin_agent: Some("claude-code".into()),
             origin_source: Some("hook".into()),
+            channel: Some(rb_types::WriteChannel::Hook),
             session_id: Some("s-1".into()),
         };
         let id = eng.remember(inp).await.unwrap();
@@ -2297,8 +2540,12 @@ mod tests {
     async fn recall_score_floor_override_disables_the_floor() {
         // with_score_floor(0.0) restores pad-to-limit behavior: the same
         // prior-only candidates ARE returned, proving the default floor (and
-        // nothing else) is what drops them.
-        let eng = engine().with_score_floor(0.0);
+        // nothing else) is what drops them. The abstention gate (Vikunja #62)
+        // must be disabled here too — it is a SEPARATE knob, and these
+        // prior-only candidates (score <= 0.15) are exactly the weak-nearest
+        // class it exists to refuse (see
+        // recall_abstains_when_the_only_candidate_is_a_weak_match).
+        let eng = engine().with_score_floor(0.0).with_abstain_threshold(None);
         let a = seed(&eng, "alpha unrelated note", MemoryType::Insight, 5, &[]).await;
         let b = seed(&eng, "beta unrelated note", MemoryType::Insight, 5, &[]).await;
         eng.backend().set_keyword_results(vec![]);
@@ -2309,6 +2556,345 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(results.len(), 2, "floor disabled -> junk returned again");
+    }
+
+    // Vikunja #62 — recall abstention. The gate is calibrated against the
+    // blend scale (see rb_search::ABSTAIN_THRESHOLD); these tests pin the
+    // engine BEHAVIOR: each reason code, the source-aware bar, and the
+    // contrast case that proves a weak-only query now abstains where it used
+    // to serve the nearest weak match.
+
+    #[tokio::test]
+    async fn recall_abstains_when_the_only_candidate_is_a_weak_match() {
+        // One candidate whose ONLY retrieval evidence is a weak vector hit
+        // (cosine distance 0.8 -> similarity 0.2 -> 0.09) plus fresh
+        // default-importance priors (0.10): blend ~= 0.19 — above the W1.3
+        // admission floor (0.18) but below the abstention gate (0.22).
+        let eng = engine();
+        let id = seed(
+            &eng,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend().set_vector_results(vec![(id.clone(), 0.8)]);
+
+        let outcome = eng
+            .recall_with_status("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::BelowThreshold),
+            "a weak-only nearest match must be refused, not served"
+        );
+        assert!(
+            outcome.results.is_empty(),
+            "abstention withholds every result — partial below-bar results \
+             would still be unsupported-memory injection"
+        );
+        assert!(!outcome.degraded);
+
+        // The contrast that defines the feature: with the gate disabled, the
+        // SAME query serves the same weak memory (the old behavior).
+        let ungated = engine().with_abstain_threshold(None);
+        let id2 = seed(
+            &ungated,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        ungated.backend().set_keyword_results(vec![]);
+        ungated
+            .backend()
+            .set_vector_results(vec![(id2.clone(), 0.8)]);
+        let served = ungated
+            .recall_with_status("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(served.abstained, None);
+        assert_eq!(served.results.len(), 1);
+        assert!(
+            served.results[0].score < rb_search::ABSTAIN_THRESHOLD,
+            "the served-when-disabled score really is sub-threshold"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_does_not_abstain_on_a_strong_top_match() {
+        // Keyword rank 0 + importance 9 + fresh: ~= 0.44, comfortably over
+        // the gate. A served recall carries abstained = None.
+        let eng = engine();
+        let id = seed(
+            &eng,
+            "strong keyword evidence note",
+            MemoryType::Insight,
+            9,
+            &[],
+        )
+        .await;
+        eng.backend().set_keyword_results(vec![id.clone()]);
+        eng.backend().set_vector_results(vec![(id, 1.0)]);
+        let outcome = eng
+            .recall_with_status(
+                "strong keyword evidence",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.abstained, None, "a strong match serves normally");
+        assert_eq!(outcome.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_reason_no_candidates_on_an_empty_corpus() {
+        let eng = engine();
+        eng.backend().set_keyword_results(vec![]);
+        let outcome = eng
+            .recall_with_status("anything at all", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::NoCandidates)
+        );
+        assert!(outcome.results.is_empty());
+        assert!(!outcome.degraded);
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_reason_filter_excluded_when_the_filter_removes_everything() {
+        // A real candidate surfaces (keyword rank 0), but the requested type
+        // filter excludes it: the query may be answerable unfiltered.
+        let eng = engine();
+        let id = seed(&eng, "an insight note", MemoryType::Insight, 7, &[]).await;
+        eng.backend().set_keyword_results(vec![id]);
+        let outcome = eng
+            .recall_with_status(
+                "an insight note",
+                10,
+                &rb_types::RecallFilter {
+                    types: vec![MemoryType::BugFix],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::FilterExcluded)
+        );
+        assert!(outcome.results.is_empty());
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_reason_degraded_backend_outranks_filter_excluded() {
+        // Embedder outage + every candidate filtered: the pinned precedence
+        // blames the DEGRADED backend first (warn + retry) — the W1.6d
+        // posture — before the finer-grained filter explanation.
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            QueryFailingProvider,
+            Namespace::Project("rb".into()),
+        );
+        let n = note(
+            Namespace::Project("rb".into()),
+            "an insight note",
+            MemoryType::Insight,
+            7,
+            &[],
+        );
+        let id = n.id.clone();
+        eng.backend().insert_note(n);
+        eng.backend().set_keyword_results(vec![id]);
+        let outcome = eng
+            .recall_with_status(
+                "an insight note",
+                10,
+                &rb_types::RecallFilter {
+                    types: vec![MemoryType::BugFix],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert!(outcome.degraded);
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::DegradedBackend),
+            "degraded outranks filter-excluded in the reason precedence"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_bar_scales_for_session_scoped_tops() {
+        // W1.3 candidate-floor precedent: the session provenance prior
+        // rescales the whole score (x0.4), so the abstention bar must scale
+        // with it. A fresh keyword-rank-0 session summary scores
+        // (0.30 + 0.05 + 0.05) x 0.4 = 0.16 — under the unscaled 0.22 bar
+        // but over the scaled 0.088 one, so it must SERVE (an unscaled bar
+        // would silently hide ordinary keyword-matched hook summaries).
+        let eng = engine();
+        let mut n = note(
+            Namespace::Project("rb".into()),
+            "session summary about the nightly smoke sentinel",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        n.session_id = Some("session-1".into());
+        let id = n.id.clone();
+        eng.backend().insert_note(n);
+        eng.backend().set_keyword_results(vec![id.clone()]);
+        eng.backend().set_vector_results(vec![(id, 1.0)]);
+        let outcome = eng
+            .recall_with_status(
+                "nightly smoke sentinel",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.abstained, None, "session tops use the scaled bar");
+        assert_eq!(outcome.results.len(), 1);
+        assert!(outcome.results[0].score < rb_search::ABSTAIN_THRESHOLD);
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_bar_scales_for_trust_class_tops() {
+        // PR #89 review: the trust prior rescales the WHOLE score, so the
+        // bar must scale by the same factor — the score_multiplier promise
+        // ("uniform-class corpora scale scores and floors identically")
+        // otherwise breaks at the gate. A default-class (agent_attested,
+        // x0.80) durable keyword hit must SERVE under a threshold it could
+        // never clear unscaled: with a fixture scoring s post-trust, an
+        // unscaled bar t > s abstains (the old behavior) while the scaled
+        // bar 0.80*t <= s serves.
+        let eng = engine().with_abstain_threshold(Some(0.80));
+        let n = note(
+            Namespace::Project("rb".into()),
+            "durable keyword evidence for the trust-scaled bar",
+            MemoryType::Insight,
+            5,
+            &[],
+        );
+        let id = n.id.clone();
+        eng.backend().insert_note(n);
+        eng.backend().set_keyword_results(vec![id]);
+        let outcome = eng
+            .recall_with_status("trust-scaled bar", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained, None,
+            "the bar must scale by the top's trust multiplier"
+        );
+        assert_eq!(outcome.results.len(), 1);
+        let score = outcome.results[0].score;
+        assert!(
+            (0.80 * rb_types::TrustClass::default().score_multiplier()..0.80).contains(&score),
+            "fixture must sit between the scaled bar (0.64) and the unscaled \
+             one (0.80): {score}"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_degraded_outranks_no_candidates_when_the_corpus_looks_empty() {
+        // PR #89 review: with the embedder down AND zero keyword/graph
+        // candidates, "the corpus has nothing" is NOT established — the
+        // outage may have hidden the only hits. The reason must be
+        // DegradedBackend (warn/retry), not NoCandidates.
+        let eng = MemoryEngine::new(
+            MockBackend::default(),
+            QueryFailingProvider,
+            Namespace::Project("rb".into()),
+        );
+        eng.backend().set_keyword_results(vec![]);
+        let outcome = eng
+            .recall_with_status("anything at all", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert!(outcome.degraded);
+        assert_eq!(
+            outcome.abstained,
+            Some(rb_types::AbstainReason::DegradedBackend),
+            "a down channel must not be reported as an empty corpus"
+        );
+    }
+
+    #[tokio::test]
+    async fn recall_rrf_mode_skips_the_abstention_top_gate() {
+        // RRF scores live on a different, uncalibrated scale (the
+        // SCORE_FLOOR precedent): the below-threshold top gate must not
+        // fire. The scale-free empty reasons still apply (not exercised
+        // here — this query has a candidate and must serve it).
+        let eng = engine().with_fusion_mode(rb_search::FusionMode::Rrf);
+        let id = seed(&eng, "weak evidence note", MemoryType::Insight, 5, &[]).await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend().set_vector_results(vec![(id, 0.8)]);
+        let outcome = eng
+            .recall_with_status("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome.abstained, None,
+            "RRF is not gated by the Linear bar"
+        );
+        assert_eq!(outcome.results.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recall_outcome_carries_the_read_time_corpus_snapshot() {
+        // Vikunja #62: every outcome carries the corpus fingerprint it was
+        // computed against, and the fingerprint moves when the corpus does.
+        let eng = engine();
+        let first = eng
+            .recall_with_status("anything", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let empty = first.snapshot.expect("mock backend derives a snapshot");
+        assert_eq!(empty.memories, 0);
+        assert_eq!(empty.fingerprint(), "0:0:0");
+
+        seed(&eng, "one stored memory", MemoryType::Insight, 5, &[]).await;
+        let second = eng
+            .recall_with_status("anything", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        let one = second.snapshot.expect("snapshot after a write");
+        assert_eq!(one.memories, 1);
+        assert_ne!(empty.fingerprint(), one.fingerprint());
+    }
+
+    #[tokio::test]
+    async fn recall_abstention_records_no_access_bumps() {
+        // A withheld (abstained) candidate must not be counted as recalled:
+        // access stats feed the review sweep and importance recalibration.
+        let eng = engine();
+        let id = seed(
+            &eng,
+            "distant topically unrelated note",
+            MemoryType::Insight,
+            5,
+            &[],
+        )
+        .await;
+        eng.backend().set_keyword_results(vec![]);
+        eng.backend().set_vector_results(vec![(id, 0.8)]);
+        eng.recall("unrelated query", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert_eq!(
+            eng.backend().record_access_count(),
+            0,
+            "an abstained recall is not a recall event"
+        );
     }
 
     #[tokio::test]
@@ -2466,7 +3052,13 @@ mod tests {
     async fn session_prior_promotes_durable_graph_hit_beyond_channel_limit() {
         for mode in [FusionMode::Linear, FusionMode::Rrf] {
             let now = chrono::Utc::now();
-            let eng = engine().with_fixed_now(now).with_fusion_mode(mode);
+            // This test isolates the source-prior/floor interaction (W1.3):
+            // its prior-only junk scores sit below the calibrated abstention
+            // bar (Vikunja #62) on purpose, so the gate is disabled here.
+            let eng = engine()
+                .with_fixed_now(now)
+                .with_fusion_mode(mode)
+                .with_abstain_threshold(None);
             let ids = seed_notes(&eng, 5, |i, note| {
                 note.created_at = now;
                 if i < 4 {
@@ -3325,6 +3917,252 @@ mod tests {
         // heuristic summary == trimmed content (< 150 chars); keywords non-empty.
         assert_eq!(note.summary, content);
         assert!(!note.keywords.is_empty());
+    }
+
+    // ---- Vikunja #69: channel stamping + retrieval quarantine -------------
+
+    // ---- Vikunja #63: trust ladder + state-bound staleness ---------------
+
+    #[tokio::test]
+    async fn measured_memory_outranks_identical_agent_attested_one() {
+        // Gate criterion (Vikunja #63): on the same query, otherwise
+        // IDENTICAL memories rank by evidence class — measured over attested.
+        let eng = engine();
+        let ids = seed_notes(&eng, 2, |i, note| {
+            // Identical content for both: class is the ONLY differentiator.
+            note.content = "identical rank probe kata statement".to_string();
+            note.summary = "identical rank probe kata statement".to_string();
+            note.trust_class = if i == 0 {
+                rb_types::TrustClass::AgentAttested
+            } else {
+                rb_types::TrustClass::MeasuredCi
+            };
+        })
+        .await;
+        let results = eng
+            .recall(
+                "identical rank probe kata",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            results.len(),
+            2,
+            "both admitted: the floor scales with the prior"
+        );
+        assert_eq!(
+            results[0].memory.id, ids[1],
+            "the measured_ci row must rank above the agent_attested row"
+        );
+        assert_eq!(results[1].memory.id, ids[0]);
+    }
+
+    #[tokio::test]
+    async fn commit_anchored_memory_reports_stale_once_head_moves() {
+        // Gate criterion (Vikunja #63): anchored evidence never silently
+        // injects as current — once HEAD moves past the anchor, the result
+        // is marked STALE.
+        use rb_types::{MemoryAnchor, RepoSnapshot};
+        let anchored = MemoryAnchor::new(rb_types::AnchorKind::Commit, "aaaaaaaa").unwrap();
+        let snapshot = |head: Option<&str>, clean: bool| {
+            Some(RepoSnapshot {
+                head: head.map(str::to_string),
+                clean_worktree: clean,
+            })
+        };
+
+        let seed = || async {
+            let eng = engine();
+            let mut inp = input("anchored stale probe decision", 5);
+            inp.anchors = vec![anchored.clone()];
+            let id = eng.remember(inp).await.unwrap();
+            (eng, id)
+        };
+
+        // HEAD == anchor, clean worktree: current, not stale.
+        let (eng, id) = seed().await;
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(crate::FixedRepoState::new(
+            snapshot(Some("aaaaaaaa"), true),
+        )));
+        let results = eng
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(!hit.stale, "on-anchor + clean = current");
+
+        // HEAD moved past the anchor: STALE, surfaced on the result.
+        let (eng, id) = seed().await;
+        let eng = eng.with_repo_state_provider(std::sync::Arc::new(crate::FixedRepoState::new(
+            snapshot(Some("bbbbbbbb"), true),
+        )));
+        let results = eng
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(hit.stale, "moved HEAD must mark the anchored memory stale");
+
+        // No provider at all: staleness claims are OFF (never guessed).
+        let (eng, id) = seed().await;
+        let results = eng
+            .recall(
+                "anchored stale probe",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        let hit = results.iter().find(|r| r.memory.id == id).unwrap();
+        assert!(!hit.stale, "no provider = no staleness claim");
+    }
+
+    #[tokio::test]
+    async fn provenance_channel_lands_on_the_stored_note() {
+        let eng = engine();
+        let mut inp = input("written over the loopback listener", 5);
+        inp.provenance.channel = Some(rb_types::WriteChannel::Http);
+        let id = eng.remember(inp).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.origin_channel, Some(rb_types::WriteChannel::Http));
+        assert!(note.is_quarantined());
+
+        // Default provenance (direct engine callers) keeps the column empty.
+        let id = eng.remember(input("direct engine write", 5)).await.unwrap();
+        let note = eng.backend().note_of(&id).unwrap();
+        assert_eq!(note.origin_channel, None);
+        assert!(!note.is_quarantined());
+    }
+
+    #[tokio::test]
+    async fn write_gate_rejects_before_anything_reaches_the_backend() {
+        // Restrictive per-namespace policy: this project namespace permits
+        // only `cli` writes of `bug_fix` memories.
+        let policy = rb_types::WriteGatePolicy {
+            allowed_types: vec![rb_types::MemoryType::BugFix],
+            permitted_channels: vec![rb_types::WriteChannel::Cli],
+            ..rb_types::WriteGatePolicy::default()
+        };
+        let eng = engine().with_write_gate(rb_types::WriteGateConfig {
+            default: rb_types::WriteGatePolicy::default(),
+            namespaces: vec![(Namespace::Project("rb".into()), policy)]
+                .into_iter()
+                .collect(),
+        });
+
+        // Channel violation: an HTTP-channel write into the restricted
+        // namespace never composes and never reaches the backend.
+        let mut inp = input("poisoned http write", 5);
+        inp.provenance.channel = Some(rb_types::WriteChannel::Http);
+        let err = eng.remember(inp).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("[write-gate:channel_not_permitted]"),
+            "unexpected error: {err}"
+        );
+
+        // Type violation: permitted channel, disallowed type.
+        let mut inp = input("insight over cli", 5);
+        inp.memory_type = rb_types::MemoryType::Insight;
+        inp.provenance.channel = Some(rb_types::WriteChannel::Cli);
+        let err = eng.remember(inp).await.unwrap_err();
+        assert!(
+            err.to_string().contains("[write-gate:type_not_allowed]"),
+            "unexpected error: {err}"
+        );
+        // Both rejections left the backend untouched — nothing composed.
+        assert_eq!(eng.backend().count(), 0);
+
+        // The default (permissive) engine still accepts the same write: the
+        // gate only bites where a policy restricts.
+        let permissive = engine();
+        let id = permissive
+            .remember(input("permissive default write", 5))
+            .await
+            .unwrap();
+        assert!(permissive.backend().note_of(&id).is_some());
+    }
+
+    #[tokio::test]
+    async fn recall_and_context_exclude_quarantined_rows_but_list_keeps_them() {
+        let eng = engine();
+        let _trusted = seed_notes(&eng, 2, |i, note| {
+            note.content = format!("quarantine probe trusted fact {i}");
+            note.origin_channel = Some(rb_types::WriteChannel::Cli);
+        })
+        .await;
+        let poisoned = seed_notes(&eng, 1, |_, note| {
+            note.content = "quarantine probe poisoned fact".to_string();
+            note.origin_channel = Some(rb_types::WriteChannel::Http);
+        })
+        .await;
+
+        // Recall never returns the quarantined row, trusted rows still do.
+        let results = eng
+            .recall("quarantine probe", 10, &rb_types::RecallFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.memory.id != poisoned[0]),
+            "quarantined row must never surface in recall"
+        );
+        assert!(!results.is_empty(), "trusted rows still recall");
+
+        // The context projection (SessionStart digest feed) excludes it too.
+        let (recent, important, _total) = eng.context().await.unwrap();
+        assert!(
+            recent
+                .iter()
+                .chain(important.iter())
+                .all(|n| n.id != poisoned[0]),
+            "quarantined row must never reach the digest feed"
+        );
+
+        // list stays visible (quarantine is not silent deletion).
+        let listed = eng
+            .list(&rb_types::RecallFilter::default(), 10)
+            .await
+            .unwrap();
+        assert!(listed.iter().any(|n| n.id == poisoned[0]));
+        assert!(listed
+            .iter()
+            .find(|n| n.id == poisoned[0])
+            .unwrap()
+            .is_quarantined());
+    }
+
+    #[tokio::test]
+    async fn legacy_http_rows_are_quarantined_via_origin_source_fallback() {
+        // Pre-migration row: no channel column value, but origin_source was
+        // daemon-stamped "http" by the listener. The derived fallback must
+        // quarantine it exactly like a stamped row.
+        let eng = engine();
+        let legacy = seed_notes(&eng, 1, |_, note| {
+            note.origin_source = Some("http".to_string());
+        })
+        .await;
+        let results = eng
+            .recall(
+                "seeded searchable content",
+                10,
+                &rb_types::RecallFilter::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            results.iter().all(|r| r.memory.id != legacy[0]),
+            "legacy http row must be quarantined out of recall"
+        );
     }
 
     #[tokio::test]

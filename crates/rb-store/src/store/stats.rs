@@ -255,6 +255,38 @@ impl SqliteStore {
             last_forget_at,
         })
     }
+
+    /// Read-time corpus snapshot for `ns` (Vikunja #62): ONE aggregate query
+    /// deriving the fingerprint a recall outcome was computed against — row
+    /// count (all states), the namespace's `MAX(memory_oplog.seq)` as the
+    /// generation, and `MAX(updated_at)` (unix seconds). Generation uses the
+    /// OPLOG, not `MAX(rowid)` (PR #89 review): ranking-input writes —
+    /// feedback (confidence), importance recalibration, vector updates —
+    /// bump the oplog but deliberately leave `updated_at` alone, so a
+    /// rowid+updated_at pair could pin two corpus states that rank
+    /// differently to the same fingerprint; every mutating path logs an
+    /// oplog row transactionally, and `idx_oplog_ns_seq` keeps the MAX
+    /// cheap. Pure read, no schema change: safe on the read pool. See
+    /// `rb_types::CorpusSnapshot`.
+    pub fn corpus_snapshot(&self, ns: &Namespace) -> Result<rb_types::CorpusSnapshot> {
+        let ns_str = ns.as_db_string();
+        self.conn
+            .query_row(
+                "SELECT COUNT(*),
+                        COALESCE((SELECT MAX(seq) FROM memory_oplog WHERE namespace = ?1), 0),
+                        COALESCE(MAX(updated_at), 0)
+                 FROM memories WHERE namespace = ?1",
+                rusqlite::params![ns_str],
+                |row| {
+                    Ok(rb_types::CorpusSnapshot {
+                        memories: row.get::<_, i64>(0)?.max(0) as u64,
+                        generation: row.get::<_, i64>(1)?.max(0) as u64,
+                        last_write_epoch_s: row.get::<_, i64>(2)?,
+                    })
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
 }
 
 /// Unix seconds of the namespace's most recent bulk `retention_sweep` oplog
@@ -292,6 +324,69 @@ mod tests {
         let id = note.id.clone();
         store.insert_memory(&note, Some(&[0.1f32; DIM])).unwrap();
         id
+    }
+
+    #[test]
+    fn corpus_snapshot_pins_namespace_state_and_moves_on_every_write() {
+        // Vikunja #62: the fingerprint must (a) stay namespace-scoped,
+        // (b) move on insert (generation), and (c) move on a same-count
+        // update (last write time) — the three components each catch a
+        // different mutation class.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let store = open(&path);
+        let ns = Namespace::Project("snap".to_string());
+        let other = Namespace::Project("elsewhere".to_string());
+
+        let empty = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(empty.fingerprint(), "0:0:0");
+
+        let a = seed(&store, &ns, "first");
+        seed(&store, &other, "other namespace");
+        let one = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(one.memories, 1, "namespace-scoped, not whole-DB");
+        assert_eq!(one.generation, 1, "rowid-derived generation");
+        assert!(one.last_write_epoch_s > 0);
+        assert_ne!(empty.fingerprint(), one.fingerprint());
+
+        // Same count, new write: only last_write moves — still a new
+        // fingerprint, so same-count rewrites cannot masquerade as the same
+        // corpus.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        store
+            .update_memory(
+                &a,
+                &rb_types::MemoryUpdates {
+                    importance: Some(6),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let bumped = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(bumped.memories, 1);
+        assert!(
+            bumped.last_write_epoch_s > one.last_write_epoch_s,
+            "an update must advance last_write ({} -> {})",
+            one.last_write_epoch_s,
+            bumped.last_write_epoch_s
+        );
+        assert_ne!(one.fingerprint(), bumped.fingerprint());
+
+        // PR #89 review: ranking-input writes that deliberately leave
+        // `updated_at` alone (feedback → confidence) must STILL move the
+        // fingerprint — the oplog-based generation catches them now.
+        let before = store.corpus_snapshot(&ns).unwrap();
+        store
+            .record_feedback(&a, rb_types::FeedbackKind::Helpful, None)
+            .unwrap();
+        let after = store.corpus_snapshot(&ns).unwrap();
+        assert!(
+            after.generation > before.generation,
+            "feedback (confidence) bumps the oplog generation: {} -> {}",
+            before.generation,
+            after.generation
+        );
+        assert_ne!(before.fingerprint(), after.fingerprint());
     }
 
     #[test]

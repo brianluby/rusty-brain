@@ -154,6 +154,13 @@ pub struct DaemonConfig {
     /// `FusionMode::Linear` is the default; the default flip to RRF is
     /// deferred to W4.1 eval evidence.
     pub fusion_mode: rb_engine::FusionMode,
+    /// Recall ABSTENTION threshold (Vikunja #62): `None` = the calibrated
+    /// `rb_search::ABSTAIN_THRESHOLD`; `Some(0.0)` disables the gate.
+    pub abstain_threshold: Option<f32>,
+    /// Resolved `[write_gate]` policy (Vikunja #69): per-namespace pre-insert
+    /// validation enforced in the engine's compose seam. The built-in default
+    /// permits today's traffic — the gate is on even without configuration.
+    pub write_gate: rb_types::WriteGateConfig,
     /// Opt-in loopback HTTP listener (HTTP PRD HTTP-1/HTTP-2). `None` (the
     /// default posture) means ZERO footprint: no TCP socket is bound and no
     /// listener task is spawned. The bind address is re-validated at
@@ -184,6 +191,8 @@ pub struct Daemon {
     retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
     fusion_mode: rb_engine::FusionMode,
+    write_gate: rb_types::WriteGateConfig,
+    abstain_threshold: Option<f32>,
     /// Bound opt-in HTTP listener + its config; `None` when disabled (the
     /// default): nothing is bound and `run` spawns no HTTP task.
     http: Option<(tokio::net::TcpListener, crate::http::HttpListenerConfig)>,
@@ -310,6 +319,8 @@ impl Daemon {
             retention_policy: config.retention_policy,
             request_idle_timeout,
             fusion_mode: config.fusion_mode,
+            abstain_threshold: config.abstain_threshold,
+            write_gate: config.write_gate,
             http,
             http_addr,
         })
@@ -349,6 +360,8 @@ impl Daemon {
             retention_policy,
             request_idle_timeout,
             fusion_mode,
+            abstain_threshold,
+            write_gate,
             http,
             http_addr: _http_addr,
         } = self;
@@ -381,6 +394,8 @@ impl Daemon {
                 retention_policy: retention_policy.clone(),
                 recall_counters: recall_counters.clone(),
                 fusion_mode,
+                abstain_threshold,
+                write_gate: write_gate.clone(),
                 provider_model: embedder.model_id().to_string(),
             });
             tokio::spawn(crate::http::run(
@@ -425,6 +440,7 @@ impl Daemon {
                                     continue;
                                 }
                             };
+                            let write_gate = write_gate.clone();
                             conns.spawn(async move {
                                 let _permit = permit; // released when task completes
                                 if let Err(e) = handle_connection(
@@ -437,6 +453,8 @@ impl Daemon {
                                     request_idle_timeout,
                                     recall_counters,
                                     fusion_mode,
+                                    abstain_threshold,
+                                    write_gate,
                                 )
                                 .await
                                 {
@@ -700,7 +718,6 @@ fn process_euid() -> u32 {
 ///
 /// EXHAUSTIVE on purpose (no `_` arm): a newly added `Request` variant fails
 /// to compile here until its author makes a deliberate admin/non-admin
-/// decision. A wildcard default would silently ship a new cross-namespace op
 /// ungated, defeating the W2.6 admin boundary.
 fn is_admin_op(req: &Request) -> bool {
     match req {
@@ -737,6 +754,73 @@ fn is_admin_op(req: &Request) -> bool {
     }
 }
 
+/// Map a same-host UDS peer's DECLARED surface onto the write-channel tag
+/// (Vikunja #69). Honesty note (PR #89 review): the kernel credential
+/// verifies *which user* connected (`getpeereid`/`SO_PEERCRED`), not *which
+/// binary* — `source` is the honest first-party client's self-report, so
+/// this separates honest first-party paths and degrades unknown/old clients
+/// to `None` (unverified); it is NOT a defense against a hostile same-user
+/// process, which the threat model already treats as inside the boundary.
+/// Only recognized first-party surfaces earn a channel; everything else
+/// stays `None`, never a guess. The value lands in the `origin_channel`
+/// column, outside any client-controlled *request* payload field.
+fn uds_write_channel(source: Option<&str>) -> Option<rb_types::WriteChannel> {
+    use rb_types::WriteChannel;
+    match source {
+        Some("hook") => Some(WriteChannel::Hook),
+        Some("mcp") => Some(WriteChannel::Mcp),
+        Some("cli") => Some(WriteChannel::Cli),
+        // "startup" (session digest), "job", and unknown surfaces are not
+        // write channels; the write gate decides whether an unverified
+        // channel may write at all (`allow_unverified_channel`, default on).
+        _ => None,
+    }
+}
+
+/// Bounded git state read for state-bound staleness (Vikunja #63): HEAD sha
+/// plus whether the worktree is clean of TRACKED modifications. Uses the
+/// shared `run_git_bounded` (hardcoded args, 2s kill bound, no shell);
+/// fail-open to `head: None` ("state unresolvable"), which DISABLES
+/// staleness claims rather than guessing. Untracked files are ignored (see
+/// `rb_types::RepoSnapshot`). Runs once per connection at handshake.
+async fn git_repo_snapshot(cwd: &std::path::Path) -> Option<rb_types::RepoSnapshot> {
+    const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
+    let head = tokio::task::spawn_blocking({
+        let cwd = cwd.to_path_buf();
+        move || rb_config::run_git_bounded(&cwd, &["rev-parse", "HEAD"], GIT_DEADLINE)
+    })
+    .await
+    .ok()??;
+    let head = String::from_utf8(head).ok()?.trim().to_string();
+    if head.is_empty() {
+        return None;
+    }
+    // `git diff-index --quiet HEAD` prints nothing and exits 0 when no
+    // tracked file differs; a non-zero exit means modifications exist.
+    let clean = tokio::task::spawn_blocking({
+        let cwd = cwd.to_path_buf();
+        move || {
+            rb_config::run_git_status_bounded(
+                &cwd,
+                &["diff-index", "--quiet", "HEAD"],
+                GIT_DEADLINE,
+            )
+        }
+    })
+    .await
+    .ok()?;
+    // `None` from the probe (timeout / spawn failure) means "could not
+    // determine," NOT "dirty": propagating it makes the whole snapshot
+    // unresolvable, which DISABLES staleness claims for the connection —
+    // the module contract ("no unsubstantiated staleness claim") and the
+    // fail-open posture of the HEAD probe above (PR #89 review).
+    let clean = clean?;
+    Some(rb_types::RepoSnapshot {
+        head: Some(head),
+        clean_worktree: clean,
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: UnixStream,
@@ -748,6 +832,8 @@ async fn handle_connection(
     request_idle_timeout: std::time::Duration,
     recall_counters: Arc<RecallChannelCounters>,
     fusion_mode: rb_engine::FusionMode,
+    abstain_threshold: Option<f32>,
+    write_gate: rb_types::WriteGateConfig,
 ) -> Result<()> {
     // W2.6 peer identity: read the kernel-verified peer credentials
     // (`getpeereid`/`SO_PEERCRED` via tokio's `peer_cred`) BEFORE any frame is
@@ -813,18 +899,44 @@ async fn handle_connection(
         origin_user: identity.user.or_else(rb_config::current_user),
         origin_host: identity.host.or_else(rb_config::current_hostname),
         origin_agent: identity.agent,
-        origin_source: identity.source,
+        origin_source: identity.source.clone(),
         session_id: identity.session_id,
+        // Vikunja #69 daemon-stamped write channel: derived once from the
+        // handshake identity's declared surface, NOT from any per-request
+        // payload — request fields cannot forge the column. The kernel
+        // verifies the peer's UID; the surface string itself is the honest
+        // client's self-report (see `uds_write_channel`), so the tag
+        // separates first-party paths and degrades everything else to
+        // `None` = unverified, which the write gate treats via
+        // `allow_unverified_channel`.
+        channel: uds_write_channel(identity.source.as_deref()),
     };
 
+    // State-bound staleness (Vikunja #63): snapshot the client-declared
+    // working directory's git state ONCE per connection (bounded, fail-open
+    // to "unresolvable" — which disables staleness claims rather than
+    // guessing). The snapshot is fixed for the connection's lifetime: an
+    // anchored memory is judged against the state the session opened with.
+    let repo_state: std::sync::Arc<dyn rb_engine::RepoStateProvider> = {
+        let snap = match identity.cwd.as_deref().map(std::path::PathBuf::from) {
+            Some(cwd) => git_repo_snapshot(&cwd).await,
+            // No declared cwd (old client, HTTP peer): state unresolvable —
+            // staleness stays off rather than guessed.
+            None => None,
+        };
+        std::sync::Arc::new(rb_engine::FixedRepoState::new(snap))
+    };
     let store_for_stream = store.clone();
     let job_store = store.clone();
     // Snapshot the provider identity before the embedder moves into the
     // engine; the stats path reports it alongside the DB's recorded model.
     let provider_model = embedder.model_id().to_string();
     let engine = {
-        let base =
-            MemoryEngine::new(store, embedder, namespace.clone()).with_fusion_mode(fusion_mode);
+        let base = MemoryEngine::new(store, embedder, namespace.clone())
+            .with_fusion_mode(fusion_mode)
+            .with_abstain_threshold(abstain_threshold)
+            .with_write_gate(write_gate)
+            .with_repo_state_provider(repo_state);
         match enricher {
             Some(e) => base.with_enricher(e),
             None => base,
@@ -1126,6 +1238,20 @@ where
         }
         ReviewAction::Merge => {
             let (a, b) = (&notes[0], &notes[1]);
+            // Quarantine is demotion, never laundering (PR #89 review):
+            // `peek` does not filter quarantined rows, and a merged row is
+            // composed fresh under THIS connection's channel — merging a
+            // quarantined member would move its untrusted-origin content
+            // into a clean row without the user ever seeing a
+            // `[quarantined]` marker. Refuse; the quarantine must be
+            // explicitly resolved (e.g. admin forget) first.
+            if a.is_quarantined() || b.is_quarantined() {
+                return Err(Error::InvalidArgument(
+                    "merge refused: one member is quarantined (untrusted origin); \
+                     resolve its quarantine before merging"
+                        .to_string(),
+                ));
+            }
             // Deterministic combine: identical contents collapse to one;
             // otherwise both bodies are kept, first member first. Metadata
             // keeps the strongest signal (max importance/confidence) and the
@@ -1180,6 +1306,12 @@ where
                     related_files,
                     confidence: Some(a.confidence.max(b.confidence)),
                     provenance: provenance.clone(),
+                    // Daemon-internal continuity (Vikunja #63), conservative
+                    // (PR #89 review): the merged body is only as backed as
+                    // its WEAKEST member — max() would let an
+                    // agent-attested near-duplicate ride a measured row's
+                    // class, the exact self-promotion the ladder forbids.
+                    trust_class: Some(a.trust_class.min(b.trust_class)),
                     anchors,
                 })
                 .await?;
@@ -1431,7 +1563,22 @@ where
             confidence,
             supersedes,
             anchors,
+            evidence,
         } => {
+            // Trust-class ladder (Vikunja #63): NO caller states a class on
+            // the wire — only evidence. The daemon derives the class
+            // server-side against the kernel-verified channel; an
+            // unsubstantiatable claim is a hard rejection (no self-promotion).
+            let trust_class = match rb_types::derive_trust_class(
+                provenance.origin_source.as_deref(),
+                evidence.as_ref(),
+                anchors
+                    .iter()
+                    .any(|a| a.kind == rb_types::AnchorKind::Commit),
+            ) {
+                Ok(class) => class,
+                Err(e) => return error_to_response(e),
+            };
             let input = RememberInput {
                 content,
                 context,
@@ -1443,6 +1590,7 @@ where
                 confidence,
                 provenance: provenance.clone(),
                 anchors,
+                trust_class: Some(trust_class),
             };
             match engine.remember(input).await {
                 Ok(id) => {
@@ -1506,6 +1654,8 @@ where
                 Response::Recalled {
                     results: outcome.results,
                     degraded: outcome.degraded,
+                    abstained: outcome.abstained,
+                    snapshot: outcome.snapshot,
                 }
             }
             Err(e) => error_to_response(e),
@@ -1967,6 +2117,8 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         assert_eq!(
@@ -2007,6 +2159,7 @@ mod tests {
             ),
             score: 0.5,
             channels: ChannelHits { fts, vector, graph },
+            stale: false,
         };
 
         let counters = RecallChannelCounters::default();
@@ -2045,6 +2198,8 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let daemon = Daemon::bind(
@@ -2088,6 +2243,8 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
         let socket = config.socket_path.clone();
@@ -2196,6 +2353,8 @@ mod tests {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             retention_policy: None,
             http: None,
         };
@@ -2429,6 +2588,7 @@ mod tests {
                     confidence: Some(1.0),
                     provenance: provenance.clone(),
                     anchors: vec![],
+                    trust_class: None,
                 })
                 .await
                 .unwrap();

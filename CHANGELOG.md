@@ -5,6 +5,107 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — PR #89 review remediations (Copilot + CodeRabbit)
+
+- Abstention bar now scales by the top result's trust-class multiplier: the
+  trust prior rescales the whole score, so an unscaled bar silently raised
+  the effective bar 1.25x for every default-class (`agent_attested`) memory
+  and could abstain on calibrated hits.
+- Empty-outcome reason precedence: `degraded_backend` outranks
+  `no_candidates` (a down channel hid hits — "the corpus is empty" is not
+  established), and `filter_excluded` is only reported when the user's
+  filter/contested tri-state actually dropped a candidate (quarantine and
+  namespace drops are not filter decisions).
+- Abstention wording matches its reason code on every surface (CLI, MCP,
+  UserPromptSubmit injection): `degraded_backend` is phrased as a retrieval
+  outage, never as a "trust gate" finding about stored memories; JSON
+  rendering goes through `serde_json`.
+- A failed/timed-out git cleanliness probe now makes the repo snapshot
+  unresolvable (staleness off for the connection) instead of marking every
+  commit-anchored memory stale.
+- Review merge refuses a quarantined member (no laundering untrusted-origin
+  content into a clean row) and keeps the WEAKEST member's trust class.
+- `measured_local` evidence from hook folds lists the same
+  instruction-filtered commands as the summary text; the hook reports the
+  agent-declared session cwd so the staleness snapshot matches namespace
+  detection.
+- Corpus snapshot generation derives from `MAX(memory_oplog.seq)`, so
+  ranking-input writes that leave `updated_at` unchanged (feedback,
+  recalibration, vector updates) can no longer pin two differently-ranking
+  corpora to one fingerprint.
+- Channel-tag docs corrected everywhere: the UDS credential proves the
+  peer's UID, not its binary — the tag is same-user honest-path separation,
+  not executable verification (also fixes the `013_write_channel.sql`
+  citation). The flatten/`deny_unknown_fields` fail-closed parse is now
+  pinned by a regression test, and a no-op self-comparison assertion in the
+  write-gate config test was replaced with a real default check.
+
+### Added — Write-path validation gate, channel trust tags, compaction source filtering (#69)
+
+- Pre-insert write gate at the engine's compose seam: per-namespace
+  `[write_gate]` policy (permitted channels, allowed types, content/context
+  size ceilings, minimum anchors) validated before any enrichment, embedding,
+  or store write; violations fail closed with structured
+  `[write-gate:<code>]` rejections. The built-in default policy keeps today's
+  traffic flowing — the gate is on even when unconfigured.
+- Daemon-stamped write-channel trust tags (`hook`/`mcp`/`cli` over UDS,
+  `http` for the loopback listener) stored in a dedicated `origin_channel`
+  column outside any client-writable payload; untrusted-origin rows are
+  quarantined out of recall and the session digest but stay listed with a
+  visible `[quarantined]` marker (CLI and MCP surfaces).
+- Compaction source filtering for hook folds (MPBench V-P2/V-S3):
+  instruction-shaped entries — standing directives aimed at a future agent —
+  are dropped from session summaries and pre-compact decision snapshots
+  before they become durable; the fold trigger remains lifecycle-structural,
+  never content length. Capability tests prove a planted payload never lands.
+- `docs/THREAT_MODEL.md` documents the three-layer write-path defense.
+
+
+### Added — Memory trust-class ladder with state-bound staleness (#63)
+
+- `trust_class` ladder (`measured_ci > measured_local > human_confirmed >
+  agent_attested > inferred_activity`) on every memory (migration 012;
+  legacy rows backfill to `agent_attested`), with a documented ranking
+  multiplier and a recall filter dimension on the wire.
+- No self-promotion: callers may state only `CaptureEvidence` on the wire —
+  never a class. The daemon derives the class per channel: `hook` can claim
+  `measured_local` only for commands it observed (the session fold does
+  exactly that); `cli` (the human's typed surface) can claim `measured_ci`
+  (requires a `--commit` anchor) or `human_confirmed` via
+  `rb remember --evidence-ci/--evidence-confirmed`. Everything else is a
+  hard rejection.
+- State-bound staleness: clients declare their working directory; the
+  daemon snapshots its git state once per connection (bounded, fail-open).
+  Commit-anchored memories whose state moved past them return `stale: true`
+  and inject with an explicit `[stale]` marker — never silently reused as
+  current.
+- Every injected memory line carries its class (`· trust=<class>`) inside
+  the single provenance bracket; the CLI/MCP surfaces expose `trust_class`.
+- `docs/THREAT_MODEL.md` documents the ladder and its scope.
+
+
+### Added — Recall abstention with reason codes (#62)
+
+- Calibrated abstention gate over the final Linear blend
+  (`rb_search::ABSTAIN_THRESHOLD` = 0.22, derived from the recorded score
+  distributions behind the W1.3 floor): when the best surviving candidate
+  falls below the bar, recall withholds everything and returns a
+  machine-readable reason (`no_candidates`, `below_threshold`,
+  `filter_excluded`, `degraded_backend`) — the 5th-best match no longer
+  rides the 1st's framing. Source-aware (session-scoped tops compare against
+  the prior-scaled bar); skipped for `Rrf`; `[search] abstain_threshold`
+  overrides (0.0 disables, out-of-range fails closed at resolve).
+- ABSTAIN is distinct from an empty result set on every surface: CLI JSON
+  (`{"abstained":"<code>","results":[]}`) and human text, MCP text +
+  structuredContent, and a read-time corpus snapshot (count, generation,
+  last-write epoch, fingerprint) rides served recalls so preregistered eval
+  runs pin the corpus.
+- The UserPromptSubmit injection emits an explicit no-memory path ("Recall
+  abstained (…) — treat the corpus as not covering this topic") instead of
+  silence or filler; the scorecard records per-query abstention and run-level
+  `abstain_rate`/`abstain_events`.
+- `docs/THREAT_MODEL.md` documents the gate and its calibration.
+
 ### Added — Native OMP extension
 
 - Project-local `rusty-brain-install --agents omp` installation, status, dry-run

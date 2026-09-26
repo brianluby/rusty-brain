@@ -11,6 +11,7 @@ mod capture;
 mod cli;
 mod dispatch;
 mod io;
+mod poison;
 mod scratch;
 mod transcript;
 
@@ -141,6 +142,13 @@ fn run() -> serde_json::Value {
         agent: Some(cli.id().as_str().to_string()),
         session_id: ctx.session_id.clone(),
         source: Some("hook".to_string()),
+        // Vikunja #63: use the AGENT-REPORTED session cwd, not the hook
+        // process's cwd (PR #89 review) — the agent can spawn the hook from
+        // a directory that differs from the session's, which would snapshot
+        // the wrong repo (or none) for staleness while the namespace is
+        // detected from ctx.cwd. Keeping both on ctx.cwd makes the
+        // namespace and the snapshot agree.
+        cwd: Some(ctx.cwd.to_string_lossy().into_owned()),
         ..Default::default()
     };
 

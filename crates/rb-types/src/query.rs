@@ -1,6 +1,7 @@
 use crate::memory::MemoryNote;
 use crate::memory_type::MemoryType;
 use crate::namespace::Namespace;
+use crate::trust_class::TrustClass;
 use serde::{Deserialize, Serialize};
 
 /// A hybrid-search request. `Default` yields an empty, unscoped, unlimited query.
@@ -37,10 +38,16 @@ pub struct ChannelHits {
 pub struct SearchResult {
     pub memory: MemoryNote,
     pub score: f32,
-    /// Per-channel hit attribution (W1.0). `#[serde(default)]` (all-`false`)
-    /// keeps old frames decodable — the `contested` additive-field precedent.
     #[serde(default)]
     pub channels: ChannelHits,
+    /// State-bound staleness (Vikunja #63): `true` when this memory is
+    /// commit-bound and the repository state at query time has moved past
+    /// the anchored commit (HEAD differs, or the worktree is dirty). A
+    /// read-side annotation computed at recall time against the repo-state
+    /// provider — never stored. `#[serde(default)]` (the `channels`
+    /// precedent) keeps old frames decodable.
+    #[serde(default)]
+    pub stale: bool,
 }
 
 /// Archived-state scope for recall/list filtering (PRD 2026-07-02
@@ -174,6 +181,10 @@ pub struct RecallFilter {
     /// Archived-state scope (default: active-only, the pre-filter behavior).
     #[serde(default, skip_serializing_if = "MemoryState::is_active")]
     pub state: MemoryState,
+    /// Restrict to any of these trust classes (Vikunja #63 trust ladder;
+    /// empty = no constraint). Any-of, like `types`/`sources`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub trust_classes: Vec<TrustClass>,
     /// Code-anchor constraints (see [`AnchorFilter`]; all-of, like `tags`):
     /// wire plumbing shipped with search-filter parity; evaluation shipped
     /// with typed code anchors (PRD 2026-07-02).
@@ -236,10 +247,11 @@ impl RecallFilter {
 
     /// Whether `note` satisfies every note-decidable dimension of this filter:
     /// types (any-of), tags (all-of), importance/confidence ranges
-    /// (inclusive), created-at window (inclusive), sources (any-of), archived
-    /// state, and anchors (all-of over `note.anchors`, normalized on both
-    /// sides — kept in lockstep with the store's SQL by the
-    /// `anchor_filter_agrees_with_recall_filter_matches` drift test).
+    /// (inclusive), created-at window (inclusive), sources (any-of), trust
+    /// classes (any-of, Vikunja #63), archived state, and anchors (all-of
+    /// over `note.anchors`, normalized on both sides — kept in lockstep with
+    /// the store's SQL by the `anchor_filter_agrees_with_recall_filter_matches`
+    /// drift test).
     /// `contested` is intentionally NOT evaluated here — it requires a link
     /// lookup the note does not carry, so callers handle it where the data
     /// lives.
@@ -275,6 +287,10 @@ impl RecallFilter {
                 .as_ref()
                 .is_some_and(|s| self.sources.contains(s))
         {
+            return false;
+        }
+        // Any-of, like types/sources: an empty list constrains nothing.
+        if !self.trust_classes.is_empty() && !self.trust_classes.contains(&note.trust_class) {
             return false;
         }
         // All-of (like tags): every anchor constraint must be satisfied by
@@ -415,6 +431,7 @@ mod tests {
                 vector: true,
                 graph: false,
             },
+            stale: false,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: SearchResult = serde_json::from_str(&json).unwrap();
@@ -439,6 +456,7 @@ mod tests {
             memory,
             score: 0.5,
             channels: ChannelHits::default(),
+            stale: false,
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("channels").unwrap();
@@ -530,6 +548,7 @@ mod tests {
             sources: vec!["hook".to_string(), "cli".to_string()],
             contested: Some(true),
             state: MemoryState::All,
+            trust_classes: vec![TrustClass::MeasuredCi, TrustClass::AgentAttested],
             anchors: vec![AnchorFilter {
                 kind: AnchorKind::File,
                 value: "src/server.rs".to_string(),
@@ -949,5 +968,64 @@ mod tests {
             json.as_object().unwrap().get("confidence").is_none(),
             "None confidence must not serialize: {json}"
         );
+    }
+
+    #[test]
+    fn recall_filter_matches_by_trust_class_any_of() {
+        let note = |class: TrustClass| {
+            let mut n = MemoryNote::new(
+                Namespace::Global,
+                "content".to_string(),
+                MemoryType::Insight,
+                5,
+            );
+            n.trust_class = class;
+            n
+        };
+        let filter = RecallFilter {
+            trust_classes: vec![TrustClass::MeasuredCi, TrustClass::HumanConfirmed],
+            ..Default::default()
+        };
+        assert!(filter.matches(&note(TrustClass::MeasuredCi)));
+        assert!(filter.matches(&note(TrustClass::HumanConfirmed)));
+        assert!(!filter.matches(&note(TrustClass::MeasuredLocal)));
+        assert!(!filter.matches(&note(TrustClass::AgentAttested)));
+        // Empty list = no constraint (the historical behavior).
+        let unconstrained = RecallFilter::default();
+        for class in TrustClass::all() {
+            assert!(unconstrained.matches(&note(class)), "{class:?}");
+        }
+    }
+
+    #[test]
+    fn recall_filter_wire_carries_trust_classes_snake_case() {
+        let filter = RecallFilter {
+            trust_classes: vec![TrustClass::MeasuredLocal],
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&filter).unwrap();
+        assert_eq!(json, r#"{"trust_classes":["measured_local"]}"#);
+        let back: RecallFilter = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, filter);
+    }
+
+    #[test]
+    fn memory_note_decodes_without_trust_class_to_agent_attested() {
+        // Wire compat: a pre-ladder frame carries no trust_class key and must
+        // decode to the backfill default (migration 012 agreement).
+        let mut value = serde_json::to_value(MemoryNote::new(
+            Namespace::Global,
+            "content".to_string(),
+            MemoryType::Insight,
+            5,
+        ))
+        .unwrap();
+        assert!(value
+            .as_object_mut()
+            .unwrap()
+            .remove("trust_class")
+            .is_some());
+        let back: MemoryNote = serde_json::from_value(value).unwrap();
+        assert_eq!(back.trust_class, TrustClass::AgentAttested);
     }
 }

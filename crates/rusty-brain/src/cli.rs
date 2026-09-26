@@ -370,6 +370,19 @@ pub enum Command {
         /// conflicts declared here).
         #[arg(long, conflicts_with_all = ["supersedes", "content"])]
         batch: bool,
+        /// Substantiating evidence (Vikunja #63): reference the CI run that
+        /// measured this statement (URL, run id, or check name). The CLI is
+        /// the human's typed surface — the only channel that may claim a CI
+        /// measurement — and the claim additionally REQUIRES a `--commit`
+        /// anchor pinning it to history. The daemon rejects the write when
+        /// either condition fails.
+        #[arg(long = "evidence-ci", conflicts_with = "evidence_confirmed")]
+        evidence_ci: Option<String>,
+        /// Substantiating evidence (Vikunja #63): record that the human
+        /// principal confirmed this statement on their own typed surface.
+        /// Optional value records who (defaults to the current user).
+        #[arg(long = "evidence-confirmed", conflicts_with = "evidence_ci", num_args = 0..=1, default_missing_value = None)]
+        evidence_confirmed: Option<Option<String>>,
     },
 
     /// Recall memories matching a query.

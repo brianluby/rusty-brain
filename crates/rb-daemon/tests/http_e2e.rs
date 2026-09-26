@@ -54,6 +54,8 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http,
         };
         let daemon = Daemon::bind(cfg, SharedEmbedder::new(DeterministicProvider::new(DIM)))
@@ -223,6 +225,7 @@ fn remember_request(content: &str) -> Request {
         confidence: None,
         supersedes: None,
         anchors: vec![],
+        evidence: None,
     }
 }
 
@@ -262,6 +265,8 @@ async fn non_loopback_bind_fails_closed_at_daemon_bind() {
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_engine::FusionMode::Linear,
+        abstain_threshold: None,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             bind: "0.0.0.0:0".parse().unwrap(),
             ..Default::default()
@@ -409,8 +414,8 @@ async fn namespace_header_scopes_http_requests() {
         ],
         Some(&body),
     );
-    let (status, body) = raw_round_trip(addr, &req).await;
-    assert_eq!(status, 200, "{body}");
+    let (status, remember_body) = raw_round_trip(addr, &req).await;
+    assert_eq!(status, 200, "{remember_body}");
 
     // Same recall in another namespace: no hits.
     let recall_body = shortcut_body(&recall_request("namespaced memory"));
@@ -429,7 +434,11 @@ async fn namespace_header_scopes_http_requests() {
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
     assert_eq!(parsed["results"].as_array().unwrap().len(), 0);
 
-    // And in the writing namespace: hit.
+    // In the WRITING namespace the row exists — but recall over HTTP no
+    // longer surfaces it (Vikunja #69): every HTTP write carries the `http`
+    // channel tag, and untrusted-origin rows are quarantined out of recall.
+    // Namespace scoping is still proven here by LIST (which keeps
+    // quarantined rows visible, with their stamped channel).
     let req = build_request(
         "POST",
         "/recall",
@@ -443,8 +452,49 @@ async fn namespace_header_scopes_http_requests() {
     let (status, body) = raw_round_trip(addr, &req).await;
     assert_eq!(status, 200, "{body}");
     let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
-    assert!(!parsed["results"].as_array().unwrap().is_empty());
+    assert_eq!(
+        parsed["results"].as_array().unwrap().len(),
+        0,
+        "an http-origin write is quarantined out of recall"
+    );
 
+    // Scoping is proven by GET (recall would prove nothing here: the row is
+    // quarantined out of recall by design). Capture the id from the write.
+    // NOTE: `body` is the recall response here; the write's id was captured
+    // at the remember round-trip above (`remember_body`).
+    let written: serde_json::Value = serde_json::from_str(&remember_body).unwrap();
+    let id = written["id"]
+        .as_str()
+        .expect("remember returns the id")
+        .to_string();
+    let get_in = |id: String, ns: String| {
+        let host = host.clone();
+        async move {
+            let req = build_request(
+                "GET",
+                &format!("/memories/{id}"),
+                Some(&host),
+                &[("x-rusty-brain-namespace", ns.as_str())],
+                None,
+            );
+            raw_round_trip(addr, &req).await
+        }
+    };
+    let (status, body) = get_in(id.clone(), "project:alpha".to_string()).await;
+    assert_eq!(status, 200, "{body}");
+    let got: serde_json::Value = serde_json::from_str(&body).unwrap();
+    let memory = &got["memory"];
+    assert_eq!(
+        memory["origin_channel"], "Http",
+        "the daemon stamped the http channel: {memory}"
+    );
+    let (status, body) = get_in(id, "project:beta".to_string()).await;
+    assert_eq!(status, 200, "{body}");
+    let got: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(
+        got["memory"].is_null(),
+        "the write is invisible from the other namespace: {got}"
+    );
     daemon.stop().await;
 }
 
@@ -1003,4 +1053,152 @@ async fn graceful_shutdown_covers_http_listener() {
             assert_eq!(n, 0, "post-shutdown connection must be closed empty");
         }
     }
+}
+
+/// PR #89 review: a review MERGE must refuse a quarantined member. The
+/// merged row is composed fresh under the resolver's channel, so merging a
+/// quarantined (HTTP-origin) row would move its untrusted-origin content
+/// into a clean row without the user ever seeing a `[quarantined]` marker —
+/// quarantine is demotion, never laundering.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_merge_refuses_a_quarantined_member() {
+    let daemon = RunningDaemon::start(Some(HttpListenerConfig::default())).await;
+    let addr = daemon.http_addr();
+    let ns = Namespace::Project("merge-quarantine".to_string());
+    let host = addr.to_string();
+
+    // HTTP write (stamped Http → quarantined) + identical UDS write (cli).
+    let body = shortcut_body(&remember_request("quarantine merge refusal identical fact"));
+    let req = build_request(
+        "POST",
+        "/remember",
+        Some(&host),
+        &[
+            ("Content-Type", "application/json"),
+            ("x-rusty-brain-namespace", "project:merge-quarantine"),
+        ],
+        Some(&body),
+    );
+    let (status, remember_body) = raw_round_trip(addr, &req).await;
+    assert_eq!(status, 200, "{remember_body}");
+    let http_id: rb_types::MemoryId = serde_json::from_str(&remember_body)
+        .ok()
+        .and_then(|v: serde_json::Value| v["id"].as_str().map(|s| s.parse().unwrap()))
+        .expect("id");
+
+    let mut uds = Client::connect(&daemon.socket, ns).await.unwrap();
+    let cli_id = uds
+        .remember(
+            "quarantine merge refusal identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+
+    // The merge of the near-dup pair is REFUSED, naming the quarantine.
+    let err = uds
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![http_id.clone(), cli_id.clone()],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        err.to_string().contains("quarantined"),
+        "must name the refusal reason: {err}"
+    );
+    // Both members untouched: no supersession, nothing archived.
+    for id in [&http_id, &cli_id] {
+        let m = uds.get((*id).clone()).await.unwrap().unwrap();
+        assert!(m.archived_at.is_none() && m.superseded_by.is_none());
+    }
+
+    daemon.stop().await;
+}
+
+/// PR #89 review: a merged row's trust class is the WEAKEST member's — a
+/// merge must never promote an agent-attested near-duplicate onto a
+/// human-confirmed row's class (the ladder's no-self-promotion rule).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn review_merge_keeps_the_weakest_member_trust_class() {
+    let daemon = RunningDaemon::start(None).await;
+    let ns = Namespace::Project("merge-trust".to_string());
+    // Identify as the cli surface: evidence is only accepted from a
+    // channel that can substantiate it (HumanConfirmed ← cli).
+    let mut client = Client::connect_with_identity(
+        &daemon.socket,
+        ns,
+        Some(rb_proto::ClientIdentity {
+            source: Some("cli".to_string()),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    // Identical contents: one plain (agent_attested — the cli channel's
+    // honest context default), one with human confirmation evidence.
+    let plain = client
+        .remember(
+            "merge trust floor identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+        )
+        .await
+        .unwrap();
+    let confirmed = client
+        .remember_anchored(
+            "merge trust floor identical fact".to_string(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            Some(1.0),
+            vec![],
+            None,
+            Some(rb_types::CaptureEvidence::HumanConfirmed { by: None }),
+        )
+        .await
+        .unwrap();
+    let confirmed_row = client.get(confirmed.clone()).await.unwrap().unwrap();
+    assert_eq!(
+        confirmed_row.trust_class,
+        rb_types::TrustClass::HumanConfirmed,
+        "fixture: the cli channel accepts human-confirmed evidence"
+    );
+
+    let resolution = client
+        .resolve_review_item(
+            rb_types::ReviewReason::NearDuplicate,
+            vec![confirmed.clone(), plain],
+            rb_types::ReviewAction::Merge,
+            None,
+        )
+        .await
+        .unwrap();
+    let merged = resolution.merged_into.expect("merged");
+    let row = client.get(merged).await.unwrap().unwrap();
+    assert_eq!(
+        row.trust_class,
+        rb_types::TrustClass::AgentAttested,
+        "the merged body is only as backed as its weakest member: {:?}",
+        row.trust_class
+    );
+
+    daemon.stop().await;
 }

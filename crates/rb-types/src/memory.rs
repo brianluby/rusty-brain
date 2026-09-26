@@ -3,6 +3,7 @@ use crate::link::MemoryLink;
 use crate::memory_id::MemoryId;
 use crate::memory_type::MemoryType;
 use crate::namespace::Namespace;
+use crate::trust_class::TrustClass;
 use serde::{Deserialize, Serialize};
 
 /// A single unit of memory: content plus enrichment, metadata, and links.
@@ -56,6 +57,19 @@ pub struct MemoryNote {
     /// Producer surface that declared the write: `hook` | `mcp` | `cli` | `job`.
     #[serde(default)]
     pub origin_source: Option<String>,
+    /// Daemon-stamped write channel (Vikunja #69): `hook`/`cli`/`mcp`/`http`.
+    /// Stored in its OWN column (migration 013), OUTSIDE the client-writable
+    /// record body — the daemon derives it from the connection's handshake
+    /// identity (the listener for HTTP), never from a per-REQUEST payload.
+    /// Honesty note (PR #89 review): the UDS kernel credential verifies the
+    /// peer's UID, not its binary — the surface string is the honest
+    /// first-party client's self-report, so the tag separates honest paths
+    /// and degrades unknown/old clients to `None`; it is not a defense
+    /// against a hostile same-user process (inside the threat boundary).
+    /// `None` = pre-migration row, daemon-internal write, or an unrecognized
+    /// surface. See `write_gate` module docs and docs/THREAT_MODEL.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub origin_channel: Option<crate::write_gate::WriteChannel>,
     #[serde(default)]
     pub session_id: Option<String>,
     /// Typed code anchors (PRD 2026-07-02): structured file/commit/symbol
@@ -66,6 +80,14 @@ pub struct MemoryNote {
     /// NO CONTRACT_VERSION bump.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<MemoryAnchor>,
+    /// Evidence-derived trust tier (Vikunja #63 trust ladder): what backs
+    /// this memory, as DERIVED by the daemon from channel-substantiatable
+    /// evidence — never a caller-declared field. `#[serde(default)]` so
+    /// pre-ladder payloads (and rows read by old clients) decode to
+    /// [`TrustClass::AgentAttested`], the same value migration 012 backfills
+    /// legacy rows with, so old payloads and old rows agree.
+    #[serde(default)]
+    pub trust_class: TrustClass,
 }
 
 impl MemoryNote {
@@ -105,8 +127,29 @@ impl MemoryNote {
             origin_host: None,
             origin_agent: None,
             origin_source: None,
+            origin_channel: None,
             session_id: None,
             anchors: Vec::new(),
+            // The conservative pre-evidence default; the daemon's derivation
+            // overwrites it before any durable write.
+            trust_class: TrustClass::default(),
+        }
+    }
+
+    /// Retrieval-side quarantine decision (Vikunja #69), derived exactly like
+    /// `contested` (never persisted): a row is quarantined when its stamped
+    /// channel is the unauthenticated HTTP surface, or — for rows written
+    /// before the channel column existed — when its daemon-stamped
+    /// `origin_source` says `http` (the HTTP listener set that field itself,
+    /// so it is as unforgeable as the column). Quarantined rows are EXCLUDED
+    /// from recall/injection and surfaced with an explicit marker on
+    /// list/get surfaces (never silently hidden).
+    #[must_use]
+    pub fn is_quarantined(&self) -> bool {
+        match self.origin_channel {
+            Some(crate::write_gate::WriteChannel::Http) => true,
+            Some(_) => false,
+            None => self.origin_source.as_deref() == Some("http"),
         }
     }
 }
@@ -254,5 +297,54 @@ mod tests {
         let back: MemoryNote = serde_json::from_value(value).unwrap();
         assert_eq!(back.embedding_input_version, "");
         assert!(!back.contested);
+    }
+
+    #[test]
+    fn quarantine_derives_from_stamped_channel_with_legacy_http_fallback() {
+        use crate::write_gate::WriteChannel;
+
+        // Stamped HTTP channel -> quarantined.
+        let mut m = sample();
+        m.origin_channel = Some(WriteChannel::Http);
+        assert!(m.is_quarantined());
+
+        // Stamped first-party channel -> trusted even if a client also
+        // claimed origin_source "http" (the column wins; claims are advisory).
+        let mut m = sample();
+        m.origin_channel = Some(WriteChannel::Hook);
+        m.origin_source = Some("http".to_string());
+        assert!(!m.is_quarantined());
+
+        // Legacy pre-column row: daemon-stamped origin_source "http" (only
+        // the HTTP listener ever set that value) -> quarantined.
+        let mut m = sample();
+        m.origin_source = Some("http".to_string());
+        assert!(m.is_quarantined());
+
+        // Legacy/NULL rows with any other origin -> trusted (today's behavior).
+        let mut m = sample();
+        m.origin_source = Some("hook".to_string());
+        assert!(!m.is_quarantined());
+        assert!(!sample().is_quarantined());
+    }
+
+    #[test]
+    fn origin_channel_is_additive_and_skipped_when_absent() {
+        // Pre-#69 payloads (no `origin_channel` key) decode to None, and a
+        // None note serializes WITHOUT the key — byte-identical to the
+        // pre-#69 wire shape (the `contested`/`anchors` additive precedent).
+        let m = sample();
+        assert!(m.origin_channel.is_none());
+        let value = serde_json::to_value(&m).unwrap();
+        assert!(
+            value.as_object().unwrap().get("origin_channel").is_none(),
+            "None channel must not serialize: {value}"
+        );
+
+        let mut stamped = sample();
+        stamped.origin_channel = Some(crate::write_gate::WriteChannel::Mcp);
+        let json = serde_json::to_string(&stamped).unwrap();
+        let back: MemoryNote = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.origin_channel, stamped.origin_channel);
     }
 }

@@ -426,6 +426,8 @@ impl RunningDaemon {
             request_idle_timeout: None,
             enrich: None,
             fusion_mode: rb_daemon::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
             http: Some(HttpListenerConfig::default()),
         };
         let daemon = Daemon::bind(config, embedder)
@@ -1461,6 +1463,7 @@ async fn run_mixed_operation(
                     confidence: None,
                     supersedes: None,
                     anchors: vec![],
+                    evidence: None,
                 },
             )
             .await?;
@@ -1993,6 +1996,8 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         request_idle_timeout: None,
         enrich: None,
         fusion_mode: rb_daemon::FusionMode::Linear,
+        abstain_threshold: None,
+        write_gate: rb_types::WriteGateConfig::default(),
         http: Some(HttpListenerConfig {
             request_timeout: Some(Duration::from_millis(20)),
             ..Default::default()
@@ -2025,6 +2030,7 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         confidence: None,
         supersedes: None,
         anchors: vec![],
+        evidence: None,
     };
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/remember"))
@@ -2061,6 +2067,8 @@ mod tests {
                 Request::Recall { .. } => Response::Recalled {
                     results: Vec::new(),
                     degraded: false,
+                    abstained: None,
+                    snapshot: None,
                 },
                 _ => Response::Pong {
                     contract_version: rb_proto::CONTRACT_VERSION,

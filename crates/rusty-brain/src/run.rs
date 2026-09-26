@@ -50,6 +50,7 @@ fn build_recall_filter(
     anchors: Vec<rb_types::AnchorFilter>,
 ) -> rb_types::RecallFilter {
     rb_types::RecallFilter {
+        trust_classes: Vec::new(),
         types: memory_type.into_iter().collect(),
         tags,
         min_importance,
@@ -365,6 +366,8 @@ async fn run_client(
             commit,
             symbol,
             batch,
+            evidence_ci,
+            evidence_confirmed,
         } => {
             // Typed code anchors: parse-validated per flag; one flat list on
             // the wire. Applied uniformly in --batch mode (like --tags).
@@ -397,6 +400,7 @@ async fn run_client(
                             None,
                             anchors.clone(),
                             None,
+                            None,
                         )
                         .await
                         .with_context(|| {
@@ -419,6 +423,19 @@ async fn run_client(
                 let supersedes = supersedes
                     .map(|old| parse_id(&old).context("--supersedes must be a memory UUID"))
                     .transpose()?;
+                // Evidence (Vikunja #63): the CLI is the human's typed
+                // surface — it may claim a CI measurement (requires a
+                // commit anchor, enforced daemon-side) or a human
+                // confirmation. Batch mode plants raw facts and carries no
+                // evidence.
+                let evidence: Option<rb_types::CaptureEvidence> = if let Some(run_ref) = evidence_ci
+                {
+                    Some(rb_types::CaptureEvidence::MeasuredCi { run_ref })
+                } else {
+                    // `Some(None)` = bare flag (human confirmed, no
+                    // attribution); `Some(Some(by))` names who.
+                    evidence_confirmed.map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
+                };
                 let id = client
                     .remember_anchored(
                         content,
@@ -431,6 +448,7 @@ async fn run_client(
                         None,
                         anchors,
                         supersedes,
+                        evidence,
                     )
                     .await
                     .context("remember failed")?;
@@ -469,20 +487,27 @@ async fn run_client(
                 archived,
                 collect_anchor_filters(file, commit, symbol),
             );
-            let (results, degraded) = client
+            let (results, degraded, abstained, _snapshot) = client
                 .recall_filtered_with_status(query, filter, limit)
                 .await
                 .context("recall failed")?;
-            if degraded {
-                // stderr so `--json` stdout stays machine-parseable. Mirrors
-                // the rb-mcp warning: without it a CLI user during an embedder
-                // outage sees ordinary-looking, vector-blind results (W1.6d).
-                eprintln!(
-                    "warning: vector search unavailable (embedding provider \
-                     error); results from keyword and graph channels only"
-                );
+            // ABSTAIN (Vikunja #62) is a distinct outcome from an empty
+            // result set: the gate refused to serve a weak match; render the
+            // refusal and its code in both human and JSON modes.
+            if let Some(reason) = &abstained {
+                println!("{}", output::render_recall_abstained(reason, json));
+            } else {
+                if degraded {
+                    // stderr so `--json` stdout stays machine-parseable. Mirrors
+                    // the rb-mcp warning: without it a CLI user during an embedder
+                    // outage sees ordinary-looking, vector-blind results (W1.6d).
+                    eprintln!(
+                        "warning: vector search unavailable (embedding provider \
+                         error); results from keyword and graph channels only"
+                    );
+                }
+                println!("{}", output::render_recall(&results, json));
             }
-            println!("{}", output::render_recall(&results, json));
         }
         Command::Get { id } => {
             let id = parse_id(&id).context("invalid memory id")?;

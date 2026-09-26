@@ -198,9 +198,12 @@ allows concurrent multi-agent access while keeping writes consistent.
 
 ## Write path (`remember`)
 
-A write resolves the namespace, enriches the note, builds the embedding input,
-generates the vector, persists everything in one transaction, and (best-effort) links
-the new memory to similar existing ones.
+A write resolves the namespace, **validates against the per-namespace write gate,
+enriches the note, builds the embedding input, generates the vector, persists
+everything in one transaction, and (best-effort) links the new memory to similar
+existing ones.** The gate runs before enrichment, embedding, and the store — a
+rejected write never costs an embedding call and never reaches SQLite
+(§Write-path defenses).
 
 ```mermaid
 %%{init: {'theme':'base','themeVariables':{'actorBkg':'#ede7f6','actorBorder':'#7e57c2','actorTextColor':'#311b54','actorLineColor':'#b9a7da','signalColor':'#6b6b7b','signalTextColor':'#33333a','noteBkgColor':'#fff3e0','noteBorderColor':'#ef8e3a','noteTextColor':'#5a3209'}}}%%
@@ -212,13 +215,18 @@ sequenceDiagram
   participant Embed
   participant Store as Store (writer thread)
 
-  Client->>Daemon: Remember { content, type, importance, tags, context }
+  Client->>Daemon: Remember { content, type, importance, tags, context, evidence? }
+  Daemon->>Daemon: stamp origin_channel (hook/mcp/cli from the UDS peer; http on the listener)
   Daemon->>Engine: remember(input)
+  Engine->>Engine: write gate: namespace policy (types, channels, sizes, anchors)
+  alt policy violation
+    Engine-->>Client: structured rejection [write-gate:<code>] — nothing stored
+  end
   Engine->>Enrich: summary / keywords / type (heuristic, or LLM if configured)
   Note over Engine: embedding_input = content + keywords + tags + context
   Engine->>Embed: embed(embedding_input)
   Embed-->>Engine: vector (fixed dim)
-  Engine->>Store: insert note + vector + stamps (one transaction)
+  Engine->>Store: insert note + vector + trust_class + stamps (one transaction)
   Store-->>Engine: ok
   Engine-->>Engine: link to similar memories (best-effort)
   Engine-->>Daemon: MemoryId
@@ -231,6 +239,39 @@ input (content plus enrichment fields) is fully populated. Each row is stamped w
 the embedding model and a composition version; the `reembed` command re-embeds rows
 whose stamp is stale, bounded and idempotently, so the corpus can migrate to a new
 representation without a flag day.
+
+### Write-path defenses
+
+Three layers sit on the write path (see `docs/THREAT_MODEL.md`, "The write
+path", for the threat framing):
+
+- **Validation gate** — the engine composes the per-namespace policy from
+  `[write_gate]` (flattened section defaults plus
+  `[write_gate.namespaces.<ns>]` overrides; on by default, unknown keys fail
+  closed) and checks content type, channel, content/context sizes, and typed
+  anchors **before** enrichment, embedding, or the store. Rejections are
+  structured (`[write-gate:<code>]`) so a client can distinguish *policy*
+  from *failure*. The gate is policy, not a filter: it decides whether a
+  write is permitted at all, never what it says.
+- **Channel trust tags** — the daemon stamps `origin_channel` from the
+  connection's handshake surface (`hook`/`mcp`/`cli` over the UDS) or
+  `http` on the loopback listener; no request payload can set the column.
+  The UDS credential proves the peer's UID, not its binary — the surface is
+  the honest client's self-report (same-user honest-path separation, not
+  executable verification). Rows whose origin is not
+  trusted by the namespace policy are **quarantined** — persisted for audit
+  and admin `forget`, excluded from recall and context, and marked
+  `[quarantined]` in CLI/MCP listings.
+- **Compaction source filtering** — hook folds (session summaries,
+  pre-compact snapshots) drop instruction-shaped entries before they can
+  become durable memories (MPBench V-P2/V-S3), and the fold trigger stays
+  lifecycle-structural, never content length.
+
+Trust classes ride the same seam: the daemon **derives** each write's
+`trust_class` from the channel plus client-declared *evidence* (never a class
+itself — a channel can only claim what it can substantiate, anything else is
+a hard rejection), and recall applies the class as a multiplicative prior
+(§Recall path, trust-class prior).
 
 ## Recall path
 
@@ -248,14 +289,17 @@ flowchart TB
   KW --> MERGE["unique candidate set"]
   VEC --> MERGE
   GRAPH --> MERGE
-  MERGE --> FETCH["one batched fetch<br/>(namespace-scoped, active only)"]
+  MERGE --> FETCH["one batched fetch<br/>(namespace-scoped, active, non-quarantined)"]
   FETCH --> RANK{"ranking mode"}
   RANK -->|Linear default| LIN["weighted blend of<br/>vector · keyword · graph · importance · recency"]
   RANK -->|Rrf opt-in| RRF["two-stage RRF<br/>rank fusion → priors"]
   LIN --> CONF["× confidence dampener (floor)"]
   RRF --> CONF
-  CONF --> CONTEST["annotate contested<br/>(active contradicts links, fail-open)"]
-  CONTEST --> OUT["ranked SearchResults"]
+  CONF --> TRUST["× trust-class prior<br/>(admission floor)"]
+  TRUST --> CONTEST["annotate contested + stale<br/>(fail-open annotations)"]
+  CONTEST --> ABSTAIN{"abstention gate<br/>(Linear only; RRF passes through)"}
+  ABSTAIN -->|top ≥ bar| OUT["ranked SearchResults<br/>+ corpus snapshot"]
+  ABSTAIN -->|below bar| ABST["ABSTAIN: reason code,<br/>no results"]
 
   classDef client fill:#e3f2fd,stroke:#4781c4,color:#0d2b4e;
   classDef proc fill:#ede7f6,stroke:#7e57c2,color:#311b54;
@@ -263,10 +307,9 @@ flowchart TB
   classDef decision fill:#fff8e1,stroke:#d4a72c,color:#5a4708;
   classDef accent fill:#fce4ec,stroke:#c96198,color:#5a1535;
   class Q,OUT client;
-  class KW,SEED,GRAPH,MERGE,FETCH proc;
+  class RANK,LIN,RRF,ABSTAIN decision;
+  class CONF,CONTEST,TRUST accent;
   class EMBED,VEC embed;
-  class RANK,LIN,RRF decision;
-  class CONF,CONTEST accent;
 ```
 
 Ranking lives in `rb-search` as pure, deterministic functions:
@@ -280,10 +323,28 @@ Ranking lives in `rb-search` as pure, deterministic functions:
 - **Confidence dampener:** the final score is multiplied by `floor + (1 - floor) *
   confidence` (default floor 0.5), so a low-confidence memory is suppressed but never
   zeroed. Applies in both modes.
-- **Contradiction surfacing:** a result is flagged `contested` when the memory has an
-  active `contradicts` link (inbound or outbound) within its namespace. This is a
-  read-side annotation computed after ranking and is **fail-open** — a lookup failure
-  returns unflagged results rather than failing recall.
+- **Trust-class prior:** the damped score is multiplied by the memory's trust-class
+  factor (measured CI 1.00 > measured local 0.95 > human-confirmed 0.90 >
+  agent-attested 0.80 > inferred activity 0.70), with an identically-scaled
+  admission floor — a measured result never ranks below an agent-attested one on
+  identical signals, and the class never rescales across the scale in a way the
+  floor would hide. Applies in both modes.
+- **Contradiction and staleness surfacing:** a result is flagged `contested` when the
+  memory has an active `contradicts` link (inbound or outbound), and `stale` when a
+  commit-anchored memory's repo state has moved past its anchor (bounded git snapshot,
+  fail-open). Both are read-side annotations computed after ranking and are
+  **fail-open** — a lookup failure returns unannotated results rather than failing
+  recall.
+- **Abstention gate** (Linear mode only, `ABSTAIN_THRESHOLD` = 0.22, calibrated from
+  the recorded score distributions behind the W1.3 floor; `[search]
+  abstain_threshold` overrides, `0.0` disables): if the best surviving candidate
+  falls below the bar, recall returns **no results** plus a machine-readable reason
+  (`no_candidates`, `below_threshold`, `filter_excluded`, `degraded_backend`) —
+  ABSTAIN is a distinct outcome from an empty result set on every surface.
+  Session-scoped tops compare against the prior-scaled bar; RRF is exempt (uncalibrated
+  scale). Every served recall also carries a read-time **corpus snapshot** (count,
+  oplog-derived generation (every mutating write), last-write epoch, fingerprint) so a preregistered eval run
+  pins the corpus it scored against — observability only, never a gate.
 
 The query itself is embedded raw (only the stored *document* representation is
 composite). Vector search currently uses `sqlite-vec` brute-force KNN, which is

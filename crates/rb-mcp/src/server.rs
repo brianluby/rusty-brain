@@ -262,8 +262,11 @@ mod tests {
                         memory: note(),
                         score: 0.9,
                         channels: rb_types::ChannelHits::default(),
+                        stale: false,
                     }],
                     degraded: false,
+                    abstained: None,
+                    snapshot: None,
                 },
                 Request::Get { .. } => Response::Got {
                     memory: Some(note()),

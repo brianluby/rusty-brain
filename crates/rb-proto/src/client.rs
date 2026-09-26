@@ -234,6 +234,7 @@ where
             confidence,
             Vec::new(),
             None,
+            None,
         )
         .await
     }
@@ -257,6 +258,7 @@ where
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Result<MemoryId> {
         self.ensure_anchor_capable(!anchors.is_empty())?;
         for anchor in &anchors {
@@ -273,6 +275,7 @@ where
             confidence,
             anchors,
             supersedes,
+            evidence,
         )
         .await
     }
@@ -306,6 +309,7 @@ where
             confidence,
             Vec::new(),
             Some(supersedes),
+            None,
         )
         .await
     }
@@ -323,6 +327,7 @@ where
         confidence: Option<f32>,
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
         // with the same error class the daemon would round-trip back. None
@@ -346,6 +351,7 @@ where
                 confidence,
                 supersedes,
                 anchors,
+                evidence,
             })
             .await?;
         match resp {
@@ -382,7 +388,10 @@ where
         limit: usize,
     ) -> Result<(Vec<SearchResult>, bool)> {
         let filter = rb_types::RecallFilter::default().fold_recall_legacy(memory_type, tags);
-        self.recall_filtered_with_status(query, filter, limit).await
+        let (results, degraded, _abstained, _snapshot) = self
+            .recall_filtered_with_status(query, filter, limit)
+            .await?;
+        Ok((results, degraded))
     }
 
     /// Fail-fast anchor-capability gate: anchor payloads may only ride the
@@ -424,7 +433,12 @@ where
         query: String,
         filter: rb_types::RecallFilter,
         limit: usize,
-    ) -> Result<(Vec<SearchResult>, bool)> {
+    ) -> Result<(
+        Vec<SearchResult>,
+        bool,
+        Option<rb_types::AbstainReason>,
+        Option<rb_types::CorpusSnapshot>,
+    )> {
         self.ensure_filter_sendable(&filter)?;
         let (memory_type, tags, filter) = filter.split_recall_legacy();
         let resp = self
@@ -437,7 +451,12 @@ where
             })
             .await?;
         match resp {
-            Resp::Recalled { results, degraded } => Ok((results, degraded)),
+            Resp::Recalled {
+                results,
+                degraded,
+                abstained,
+                snapshot,
+            } => Ok((results, degraded, abstained, snapshot)),
             other => Err(Self::unexpected(other)),
         }
     }
@@ -1088,6 +1107,7 @@ mod wrapper_tests {
                             memory: note(),
                             score: 0.5,
                             channels: rb_types::ChannelHits::default(),
+                            stale: false,
                         }]
                     };
                     // Filter-parity probes: a hit comes back ONLY when the
@@ -1132,6 +1152,9 @@ mod wrapper_tests {
                         // Keyed on the query so the typed-wrapper test can prove
                         // the W1.6d flag rides the wire to `recall_with_status`.
                         degraded: query == "degraded",
+                        // And the #62 abstain/snapshot fields decode as absent.
+                        abstained: None,
+                        snapshot: None,
                     }
                 }
                 Request::Get { .. } => Response::Got {
@@ -1482,6 +1505,7 @@ mod wrapper_tests {
                 None,
                 vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs").unwrap()],
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1505,6 +1529,7 @@ mod wrapper_tests {
                 vec![],
                 None,
                 vec![],
+                None,
                 None,
             )
             .await
@@ -1550,6 +1575,7 @@ mod wrapper_tests {
                     rb_types::MemoryAnchor::new(AnchorKind::Symbol, "Foo::bar").unwrap(),
                 ],
                 None,
+                None,
             )
             .await
             .unwrap();
@@ -1557,7 +1583,7 @@ mod wrapper_tests {
 
         // Anchor filters ride the additive filter field: a hit comes back
         // ONLY when the fake server saw them there.
-        let (results, _) = c
+        let (results, _, _, _) = c
             .recall_filtered_with_status(
                 "probe-anchors".into(),
                 RecallFilter {
@@ -1591,6 +1617,7 @@ mod wrapper_tests {
                     end_line: None,
                 }],
                 None,
+                None,
             )
             .await
             .unwrap_err();
@@ -1612,7 +1639,7 @@ mod wrapper_tests {
         // A single type + tags are expressible pre-filter, so they must ride
         // the LEGACY wire slots (old daemons keep honoring them) and the
         // additive filter must stay off the frame.
-        let (results, _) = c
+        let (results, _, _, _) = c
             .recall_filtered_with_status(
                 "probe-legacy".into(),
                 RecallFilter {
@@ -1627,7 +1654,7 @@ mod wrapper_tests {
         assert_eq!(results.len(), 1, "legacy slots must carry type+tags");
 
         // New dimensions ride the additive filter field.
-        let (results, _) = c
+        let (results, _, _, _) = c
             .recall_filtered_with_status(
                 "probe-filter".into(),
                 RecallFilter {

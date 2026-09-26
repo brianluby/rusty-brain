@@ -175,6 +175,13 @@ Prompt-time recall contract (CA6) parameters:
 3. **Source-aware suppression** — nothing is injected when prior context is still
    present (Claude Code `resume`) or on an empty corpus / zero hits (zero tokens,
    no header).
+4. **Explicit no-memory path** — when the abstention gate withholds every
+   candidate (a below-bar top, not an honest zero-hit), the injection is an explicit
+   refusal carrying the fixed reason code: "Recall abstained (`<code>`) — no memory
+   injected; treat the corpus as not covering this topic." ABSTAIN is neither
+   silence nor a weak hit: the model is told recall ran and declined, so it does not
+   guess at unlisted matches (Vikunja #62; `crates/rb-types/src/abstention.rs`,
+   `crates/rb-hooks/src/capture.rs`).
 
 The Claude Code adapter consumes the contract constants directly
 (`crates/rb-hooks/src/capture.rs`), so the contract and its lead implementation
@@ -189,17 +196,22 @@ full digest, `compact` → constraints only, `resume` → nothing), with a point
 stating the set is a budgeted subset (`crates/rb-hooks/src/capture.rs`, W2.5/W3.3).
 
 ### 3.2 Active recall
-
 `recall` is a first-class operation on every surface — CLI, MCP tool, and the
 opt-in HTTP endpoint — backed by hybrid retrieval: FTS5 keyword search,
 `sqlite-vec` vector similarity, and 1-hop graph expansion, fused by a weighted
 linear blend (opt-in RRF via `[search] fusion`, `crates/rb-config/src/file.rs`)
-with a confidence dampener (`crates/rb-engine/src/engine.rs`; README, "What works
-today"). All list/recall surfaces share ONE filter shape — `rb_types::RecallFilter`
-(`crates/rb-types/src/query.rs`): types, tags, importance/confidence ranges,
-since/until, sources, contested tri-state, archived-state scope, and anchors
-(PRD [search-filter parity](prds/2026-07-02-search-filter-parity.md), PR #58) — so
-the surfaces can never disagree about what is filterable.
+with a confidence dampener, a **trust-class prior** (measured CI > measured
+local > human-confirmed > agent-attested > inferred, so an identically-scored
+measured result outranks an agent-attested one), and a calibrated **abstention
+gate** — when the best surviving candidate falls below the bar, recall withholds
+everything and returns a machine-readable reason code instead (Vikunja #63/#62;
+`crates/rb-search/src/rank.rs`, `crates/rb-types/src/{trust_class,abstention}.rs`).
+Commit-anchored results also carry a `stale` flag when the repo state moved past
+their anchor (state-bound staleness, #63). All list/recall surfaces share ONE
+filter shape — `rb_types::RecallFilter` (`crates/rb-types/src/query.rs`): types,
+tags, importance/confidence ranges, since/until, sources, contested tri-state,
+archived-state scope, anchors, and trust-class scope — so the surfaces can never
+disagree about what is filterable.
 
 ### 3.3 Contextual anchors
 
@@ -207,8 +219,12 @@ Upstream's minimum is who/what/when/why. Every memory carries:
 
 - **Who** — W0.5 provenance: `origin_user`, `origin_host`, `origin_agent`,
   `origin_source` (`hook|mcp|cli|job`), `session_id`
-  (`crates/rb-store/migrations/004_provenance.sql`); injections label each memory
-  with it (§6.1).
+  (`crates/rb-store/migrations/004_provenance.sql`), plus the daemon-stamped
+  `origin_channel` trust tag — `hook`/`mcp`/`cli` from the UDS peer's
+  handshake-declared surface, `http` on the loopback listener, never
+  settable from a request payload
+  (`crates/rb-store/migrations/013_write_channel.sql`, #69); injections label
+  each memory with it (§6.1).
 - **When** — `created_at` / `updated_at` (schema), both filterable.
 - **What** — typed code anchors: structured file (+ optional 1-based line range),
   commit-SHA, and symbol links, multiple per memory
@@ -344,10 +360,16 @@ the memory lifecycle, and poisoning detection on high-trust memories.
 ### 6.1 Write provenance
 
 Every write path declares its provenance: `origin_user`, `origin_host`,
-`origin_agent`, `origin_source` (`hook|mcp|cli|job`), and `session_id`
-(`crates/rb-store/migrations/004_provenance.sql`, W0.5). Rows that predate the
-migration keep honest `NULL`s — provenance was deliberately never backfilled or
-faked. Injected memories carry their provenance label into the prompt (§3.1).
+`origin_agent`, `origin_source` (`hook|mcp|cli|job`), `session_id`
+(`crates/rb-store/migrations/004_provenance.sql`, W0.5), and — stamped by the
+daemon, never from a request payload — `origin_channel` (`hook|mcp|cli`
+from the UDS peer's handshake-declared surface, `http` on the loopback
+listener, `crates/rb-store/migrations/013_write_channel.sql`, #69; the
+credential proves the UID, the surface is the honest client's self-report).
+Rows that predate
+the migrations keep honest `NULL`s — provenance was deliberately never
+backfilled or faked. Injected memories carry their provenance label into the
+prompt (§3.1).
 
 ### 6.2 Trust boundaries and access control
 
@@ -367,9 +389,21 @@ faked. Injected memories carry their provenance label into the prompt (§3.1).
   never differently; Host/Origin gates defend against DNS rebinding and hostile
   browser pages (`crates/rb-daemon/src/http.rs`; `docs/THREAT_MODEL.md`, "The
   opt-in HTTP listener"; PR #62).
-- **Confidence is the single trust axis** (W2.2): producers are hook captures
-  (written below 1.0), explicit adjustment, enrichment, and feedback deltas (§2);
-  ranking dampens low confidence (§4.3).
+- **Confidence is a trust axis** (W2.2): producers are hook captures (written
+  below 1.0), explicit adjustment, enrichment, and feedback deltas (§2); ranking
+  dampens low confidence (§4.3).
+- **Trust class is the evidence axis** (#63): an orthogonal, evidence-derived
+  ladder (measured CI > measured local > human-confirmed > agent-attested >
+  inferred activity) — clients send *evidence*, never a class, and each channel
+  can only claim what it can substantiate; ranking applies it as a
+  multiplicative prior so a measured result outranks an identically-scored
+  agent-attested one.
+- **The write gate is a permit, not a filter** (#69): per-namespace policy
+  (permitted channels/types, content and context ceilings, typed anchors)
+  checked before enrichment, embedding, or store; rejections are structured
+  (`[write-gate:<code>]`). Rows from channels a namespace does not trust are
+  **quarantined** — persisted for audit, excluded from recall and context,
+  marked `[quarantined]` in listings.
 
 ### 6.3 Poisoning resistance (declared best-effort)
 
@@ -385,6 +419,10 @@ have controlled. Enforced mitigations, with residual risk stated:
   drill is deferred to the W3.4 real-session harness and recorded as such — not
   silently declared passed (`docs/plans/2026-06-11-rusty-brain-road-to-tens.md`,
   Phase-2 gate evaluation).
+- **Compaction source filtering** (#69, MPBench V-P2/V-S3) — session folds and
+  pre-compact snapshots drop instruction-shaped entries before they can become
+  durable memories, and the fold trigger stays lifecycle-structural (never
+  content length), so a planted directive mid-session has no write path at all.
 - **Secret redaction** (W2.4) — ONE shared rule set (`crates/rb-redact/`) runs at
   capture time and retroactively via the `rusty-brain scrub` admin op (rewrites
   content, resyncs FTS, re-embeds affected rows). Fail-closed: if the rule set
@@ -412,10 +450,10 @@ For any memory record, the six upstream questions map to:
 |---|---|
 | What kind of memory is it? | `memory_type` + `importance`/`confidence` (§1) |
 | How did it get here / evolve? | supersede chain + oplog + `rusty-brain history` (§2, §5) |
-| How is it retrieved? | CA6 recall contract + `RecallFilter` + anchors (§3) |
+| How is it retrieved? | CA6 recall contract + trust-class prior + abstention gate + `RecallFilter` + anchors (§3) |
 | How does it age out? | `[retention]` policy, supersede, decay, review (§4) |
 | How is it audited? | doctor / stats / review / contract guard (§5) |
-| Who wrote it and who may act on it? | provenance + peer-gated ops + framing (§6) |
+| Who wrote it and who may act on it? | provenance + daemon-stamped channel + peer-gated ops + framing (§6) |
 
 ## Declared gaps and follow-up candidates
 
