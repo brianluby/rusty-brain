@@ -1,0 +1,71 @@
+{
+  "schema_version": 1,
+  "mempalace": {
+    "repository": "https://github.com/MemPalace/mempalace",
+    "commit": "5b1c32eee133b5c480ce3bdd8927ce265a1bb3e6",
+    "license": "MIT",
+    "install": "uv sync --frozen --python 3.12 --extra dev"
+  },
+  "datasets": {
+    "longmemeval_s_cleaned": {
+      "url": "https://huggingface.co/datasets/xiaowu0162/longmemeval-cleaned/resolve/main/longmemeval_s_cleaned.json",
+      "hf_revision": "98d7416c24c778c2fee6e6f3006e7a073259d48f",
+      "sha256": "d6f21ea9d60a0d56f34a05b609c79c88a451d2ae03597821ea3d5a9678c3a442",
+      "license": "MIT",
+      "questions": 500
+    },
+    "locomo10": {
+      "repository": "https://github.com/snap-research/locomo",
+      "commit": "3eb6f2c585f5e1699204e3c3bdf7adc5c28cb376",
+      "path": "data/locomo10.json",
+      "sha256": "79fa87e90f04081343b8c8debecb80a9a6842b76a7aa537dc9fdf651ea698ff4",
+      "license": "CC BY-NC 4.0 (never committed)",
+      "conversations": 10,
+      "qa": 1986
+    },
+    "membench": {
+      "repository": "https://github.com/import-myself/Membench",
+      "commit": "f66d8d1028d3f68627d00f77a967b93fbb8694b6",
+      "path": "MemData/FirstAgent",
+      "license": "MIT (README badge; no LICENSE file)",
+      "files": {
+        "RecMultiSession.json": "c8c97a2fdfa1ac1a68615483c0c6764024d19e97a3fafb03b590e3e15a81e7ec",
+        "aggregative.json": "a05de17960dd41f298a5bf58df47e161526045ca4cc71fe2af6e9a3c5a9be97b",
+        "comparative.json": "aae21a7a0b9a755d3fba7ab212f6ab7f4b8bcad6cbbe94b1a6c70d3ab8099e2a",
+        "conditional.json": "9fa454f02b4f4fda075ef6cdc9199a9ec3e6243dacab5651d440d1b9876ced11",
+        "highlevel.json": "60a93a286c28bce01863f2f79ec4c6f5d0ad10905b030b13227c14d0c6385521",
+        "highlevel_rec.json": "81c19f8913cd905f53cec24e9c658e57afc99428cd0d9b8fd503bed438cf69a0",
+        "knowledge_update.json": "ab4851ff4689777bd620895aa0080ba94f3c499c34be6b90df2c5bfbd006d074",
+        "lowlevel_rec.json": "ff8d4a97021f483223354b57c6f524231906b5202a51068b9f3ded4327165d64",
+        "noisy.json": "64ac646966b165fddad6c2ab3d858a9714a6b6997550338bb2a01200df75f1a2",
+        "post_processing.json": "81070f1fd6bf394d92dc347e888a4b83ed6579e139846d42f0beb054ce371377",
+        "simple.json": "0e3bc668d5fb4f012ac0f7f07013bd87f14fbd309faeaf33f6798a46a799490a"
+      }
+    },
+    "convomem": {
+      "hf_dataset": "Salesforce/ConvoMem",
+      "hf_revision": "e3e9b39115b02346824c70d349350de738f8be41",
+      "license": "CC BY-NC 4.0 (never committed)",
+      "note": "MemPalace downloads from unpinned main; the local cache taken 2026-09-26 is the pinned snapshot, hashed per file in convomem_selection.json"
+    }
+  },
+  "stage_a": {
+    "command": "uv run --frozen python benchmarks/longmemeval_bench.py DATA/longmemeval_s_cleaned.json --out RUNS/stageA-mempalace-raw.jsonl",
+    "published_recall_any_at_5": 0.966,
+    "tolerance_pp": 0.5
+  },
+  "rusty_brain": {
+    "command": "cargo run --release -p rb-eval --features record-local --bin external-bench -- longmemeval --data DATA/longmemeval_s_cleaned.json --profile PROFILE --out RUNS",
+    "embedding_model": "all-MiniLM-L6-v2",
+    "embedding_dim": 384,
+    "top_n": 50,
+    "embed_max_tokens_parity": 256,
+    "embed_max_tokens_production": "512 (fastembed default)",
+    "command_locomo": "cargo run --release -p rb-eval --features record-local --bin external-bench -- locomo --data DATA/locomo/data/locomo10.json --profile PROFILE --top-k 10 --out RUNS [--embed-max-tokens 256]"
+  },
+  "stage_a_locomo": {
+    "command": "uv run --frozen python benchmarks/locomo_bench.py DATA/locomo/data/locomo10.json --granularity session --top-k 10",
+    "published_avg_recall": 0.603,
+    "tolerance_pp": 0.5
+  }
+}

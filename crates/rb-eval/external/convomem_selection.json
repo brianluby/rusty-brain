@@ -1,0 +1,44 @@
+{
+  "abstention_evidence": {
+    "files": {
+      "1_evidence/0050e213-5032-42a0-8041-b5eef2f8ab91_Telemarketer.json": "c411644287287c749c5dda0cb675e9d2b360af430e19d2c54d625515594d7377",
+      "filelist": "caae27467cd55621fe01bd532a9a669b6598a900c6e017446c710cc5e6f3c4c1"
+    },
+    "items": 50
+  },
+  "assistant_facts_evidence": {
+    "files": {
+      "1_evidence/0050e213-5032-42a0-8041-b5eef2f8ab91_Telemarketer.json": "1807c8d15377131efc03961890e2876e829d356fd0e003da1fc7369b26b9522b",
+      "filelist": "caae27467cd55621fe01bd532a9a669b6598a900c6e017446c710cc5e6f3c4c1"
+    },
+    "items": 50
+  },
+  "changing_evidence": {
+    "files": {
+      "skipped": "no 1_evidence file list (MemPalace skips this category)"
+    },
+    "items": 0
+  },
+  "implicit_connection_evidence": {
+    "files": {
+      "1_evidence/0050e213-5032-42a0-8041-b5eef2f8ab91_Telemarketer.json": "2efe52f431bb1b8c71b0235d1d4370268aa512c75989f42218b814720f0e7c48",
+      "1_evidence/03d6ce14-747d-43cb-8b31-d9c73391f58c_Technical_Support_Engineer_Tier_1.json": "5d49529715cb0ec1e860d423965d964e91f52c602e926bba6403cf7c86a997f1",
+      "filelist": "caae27467cd55621fe01bd532a9a669b6598a900c6e017446c710cc5e6f3c4c1"
+    },
+    "items": 50
+  },
+  "preference_evidence": {
+    "files": {
+      "1_evidence/0050e213-5032-42a0-8041-b5eef2f8ab91_Telemarketer.json": "d1cc1965065d69ea85dac687f6595e0d62d37e96eb2fbdfaed96f7067dc7fe62",
+      "filelist": "73102f5d0e574aedc59bff6a02d3e362ffa3ad6e97d3ce9dd3b91a7a0044dd4b"
+    },
+    "items": 50
+  },
+  "user_evidence": {
+    "files": {
+      "1_evidence/0050e213-5032-42a0-8041-b5eef2f8ab91_Telemarketer.json": "3149c825c62e510b25e3acf966886808e1e99aa534882170a7bdc54b46c58ae1",
+      "filelist": "d258fdb45c09c8d3b0e949c489c5e30f5f05c025977f61e3d36b76aaa2236a2d"
+    },
+    "items": 50
+  }
+}

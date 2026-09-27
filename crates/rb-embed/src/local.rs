@@ -66,10 +66,23 @@ impl LocalProvider {
     /// runtime on first use. Maps any fastembed init failure to
     /// `Error::Embedding`.
     pub fn load(model_name: &str) -> rb_types::Result<Self> {
+        Self::load_with_max_tokens(model_name, None)
+    }
+
+    /// Like [`LocalProvider::load`], but truncating inputs at `max_tokens`
+    /// instead of fastembed's default (512). Benchmarks use 256 to match
+    /// sentence-transformers' `max_seq_length` for all-MiniLM-L6-v2.
+    pub fn load_with_max_tokens(
+        model_name: &str,
+        max_tokens: Option<usize>,
+    ) -> rb_types::Result<Self> {
         let canonical = resolve_model_name(model_name).to_string();
         let model_enum = model_for_name(&canonical)?;
         let dim = dim_for_model(&canonical)?;
-        let options = InitOptions::new(model_enum).with_show_download_progress(false);
+        let mut options = InitOptions::new(model_enum).with_show_download_progress(false);
+        if let Some(n) = max_tokens {
+            options = options.with_max_length(n);
+        }
         let model = TextEmbedding::try_new(options)
             .map_err(|e| Error::Embedding(format!("failed to load local model: {e}")))?;
         Ok(Self {
