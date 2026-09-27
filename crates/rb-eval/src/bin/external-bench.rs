@@ -281,7 +281,10 @@ fn merge(mut base: serde_json::Value, extra: serde_json::Value) -> serde_json::V
     base
 }
 
-const CONVOMEM_SELECTION: &str = "crates/rb-eval/external/convomem_selection.json";
+const CONVOMEM_SELECTION: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/external/convomem_selection.json"
+);
 
 #[allow(clippy::too_many_arguments)]
 async fn convomem_cmd(
@@ -381,6 +384,7 @@ async fn convomem_cmd(
                 "n": records.len(),
                 "recall_mempalace": mean(records.iter().map(|r| r.recall)),
                 "items_with_degenerate_gold": records.iter().filter(|r| r.degenerate_gold > 0).count(),
+            "items_with_empty_evidence": records.iter().filter(|r| r.empty_evidence > 0).count(),
                 "items_without_evidence": records.iter().filter(|r| r.evidence_count == 0).count(),
                 "abstained": records.iter().filter(|r| r.abstained.is_some()).count(),
             },

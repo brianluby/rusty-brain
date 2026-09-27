@@ -179,7 +179,7 @@ was $0 (local model).
   the scorecard, not here.
 - **Protocol quirks are inherited and reported, not fixed:** MemPalace's
   NDCG ideal (reported alongside standard NDCG), LoCoMo's empty evidence
-  scoring 1.0, ConvoMem's bidirectional substring gold and skipped category,
+  scoring 1.0, ConvoMem's bidirectional substring gold (an empty evidence text would match any retrieval; none of the 250 pinned items has one, and `items_with_empty_evidence` reports it) and skipped category,
   and MemBench's dual-id hit rule.
 - MemPalace's hybrid-v4 LongMemEval result is contaminated (tuning questions
   d6233ab6, 4dfccbf8 and ceb54acb are in its held-out split). Only raw mode

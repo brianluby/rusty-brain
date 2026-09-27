@@ -143,6 +143,10 @@ pub struct ItemRecord {
     pub recall: f64,
     /// Gold ids that match only because the message is empty.
     pub degenerate_gold: usize,
+    /// Distinct evidence texts that normalize to "". MemPalace's predicate
+    /// counts these as found against any retrieval; kept for comparability,
+    /// reported so an inflated item is visible.
+    pub empty_evidence: usize,
     pub gold: Vec<BTreeSet<String>>,
     pub ranked: Vec<Hit>,
     pub abstained: Option<String>,
@@ -167,6 +171,15 @@ pub async fn run_item<P: EmbeddingProvider>(
         .iter()
         .flatten()
         .filter(|id| empty.contains(id.as_str()))
+        .count();
+    let empty_evidence = selected
+        .item
+        .message_evidences
+        .iter()
+        .map(|e| norm(&e.text))
+        .collect::<BTreeSet<_>>()
+        .iter()
+        .filter(|e| e.is_empty())
         .count();
     let r = retrieve(
         provider,
@@ -195,6 +208,7 @@ pub async fn run_item<P: EmbeddingProvider>(
         found,
         recall,
         degenerate_gold,
+        empty_evidence,
         gold,
         ranked: r.ranked,
         abstained: r.abstained,
