@@ -29,7 +29,7 @@ async fn confidence_poison_low_confidence_wrong_memory_ranks_last() {
                  "confidence": 1.0},
                 {"key": "poison", "content": "the deploy rollback procedure resets the feature flag",
                  "keywords": ["rollback", "deploy"], "memory_type": "Insight", "importance": 5,
-                 "confidence": 0.05}
+                 "confidence": 0.3}
             ],
             "golden_queries": [
                 {"query": "rollback procedure", "expected": ["correct"], "k": 1}

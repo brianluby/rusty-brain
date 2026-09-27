@@ -41,7 +41,7 @@ pub use history::{HistoryEdge, HistoryEntry, MemoryHistory};
 pub use job::JobKind;
 pub use link::{MemoryLink, SIMILARITY_LINK_MAX_COSINE_DISTANCE};
 pub use link_type::LinkType;
-pub use memory::MemoryNote;
+pub use memory::{MemoryNote, RECALL_CONFIDENCE_FLOOR, RECALL_MIN_ELIGIBLE_CONFIDENCE};
 pub use memory_id::MemoryId;
 pub use memory_type::MemoryType;
 pub use namespace::Namespace;
