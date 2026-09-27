@@ -58,6 +58,13 @@ fn text_field(turn: &serde_json::Map<String, Value>, a: &str, b: &str) -> String
     }
 }
 
+/// Python `int(x)` for a JSON number: integers exactly, floats truncated.
+fn json_int(v: &Value) -> Option<i64> {
+    v.as_i64()
+        .or_else(|| v.as_u64().and_then(|u| i64::try_from(u).ok()))
+        .or_else(|| v.as_f64().map(|f| f as i64))
+}
+
 fn turns(message_list: &[Value]) -> Vec<Turn> {
     let sessions: Vec<&[Value]> = match message_list.first() {
         Some(Value::Object(_)) => vec![message_list],
@@ -83,7 +90,7 @@ fn turns(message_list: &[Value]) -> Vec<Turn> {
             } else {
                 turn.get("mid")
             };
-            let sid = raw.and_then(Value::as_f64).map_or(global, |v| v as i64);
+            let sid = raw.and_then(json_int).unwrap_or(global);
             out.push(Turn { sid, global, text });
             global += 1;
         }
@@ -123,8 +130,7 @@ pub fn load(dir: &Path, topic: &str) -> anyhow::Result<Vec<Item>> {
                     .and_then(Value::as_array)
                     .into_iter()
                     .flatten()
-                    .filter_map(|s| s.as_array()?.first()?.as_f64())
-                    .map(|v| v as i64)
+                    .filter_map(|s| json_int(s.as_array()?.first()?))
                     .collect();
                 items.push(Item {
                     category,
@@ -233,5 +239,10 @@ mod tests {
         );
         let flat = vec![json!({"mid": 3, "user": "u", "assistant": "a"})];
         assert_eq!(turns(&flat)[0].sid, 3);
+        assert_eq!(
+            json_int(&json!(9_007_199_254_740_993_i64)),
+            Some(9_007_199_254_740_993)
+        );
+        assert_eq!(json_int(&json!(4.9)), Some(4));
     }
 }

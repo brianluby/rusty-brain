@@ -406,8 +406,13 @@ async fn membench_cmd(
 ) -> Result<()> {
     for (_, file) in membench::CATEGORY_FILES {
         let path = data.join(file);
-        let want = manifest["datasets"]["membench"]["files"][file].as_str();
-        if path.exists() && Some(sha256_file(&path)?.as_str()) != want {
+        let Some(want) = manifest["datasets"]["membench"]["files"][file].as_str() else {
+            bail!("membench {file} has no sha256 pin in the manifest");
+        };
+        if !path.exists() {
+            bail!("membench {file} is missing from {}", data.display());
+        }
+        if sha256_file(&path)? != want {
             bail!("membench {file} sha256 does not match the pinned manifest");
         }
     }

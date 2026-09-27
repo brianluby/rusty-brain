@@ -59,8 +59,8 @@ fn namespace() -> Namespace {
 
 fn fixed_now() -> chrono::DateTime<chrono::Utc> {
     chrono::DateTime::parse_from_rfc3339("2026-01-01T00:00:00Z")
-        .map(|t| t.to_utc())
-        .unwrap_or_default()
+        .expect("fixed benchmark timestamp is valid RFC 3339")
+        .to_utc()
 }
 
 /// Memoizes vectors by (kind, text) so per-question fresh stores over a
