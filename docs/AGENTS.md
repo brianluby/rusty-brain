@@ -55,6 +55,8 @@ succeeding.
   Statement-leading proposal rejection remains unconfirmed; labeled policies such as
   `Constraint: review: reject proposals that include secrets` and
   `Correction: auth: reject anonymous requests` remain confirmed.
+  Statement-leading `propose`/`I propose`/`we propose` indicates planning;
+  proposal terminology inside a labeled fact does not remove its confirmation.
   Bare task imperatives and `must not`/`should not` substrings alone do not confirm
   policy; use labeled facts or explicit decision/preference/confirmation language.
   `Decision: subject: value` and `Correction: subject: value` permit ordered,

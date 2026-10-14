@@ -387,7 +387,6 @@ fn digest_windows(
                     "maybe ",
                     "could ",
                     "should we ",
-                    "propose",
                     "what if ",
                     "not decided",
                     "haven't decided",
@@ -398,6 +397,9 @@ fn digest_windows(
                 ]
                 .iter()
                 .any(|m| lower.contains(m))
+                || ["propose ", "i propose ", "we propose "]
+                    .iter()
+                    .any(|phrase| lower.starts_with(phrase))
                 || [
                     "reject proposal",
                     "reject that proposal",
@@ -751,6 +753,36 @@ mod tests {
             vec!["Adopt proposal: storage\nAdopted proposal: Proposal: storage: use SQLite only in tests"]
         );
         assert_eq!(adopted.evidence[0].status, EvidenceStatus::Proposal);
+    }
+
+    #[test]
+    fn labeled_facts_with_proposal_terminology_keep_confirmation() {
+        for label in [
+            "Decision",
+            "Constraint",
+            "Preference",
+            "Correction",
+            "Reversal",
+        ] {
+            let statement = format!("{label}: deployment: use the proposed blue/green rollout");
+            let digest = digest_from_lines([
+                turn("user", "Decision: deployment: use rolling releases"),
+                turn("user", &statement),
+            ]);
+            assert!(digest.decisions.contains(&statement), "{label}");
+            if matches!(label, "Correction" | "Reversal") {
+                assert_eq!(digest.decisions, vec![statement]);
+            }
+        }
+        for proposal in [
+            "Propose a blue/green rollout",
+            "I propose a blue/green rollout",
+            "We propose a blue/green rollout",
+        ] {
+            let digest = digest_from_lines([turn("user", proposal)]);
+            assert!(digest.decisions.is_empty(), "{proposal}");
+            assert_eq!(digest.evidence[0].status, EvidenceStatus::Proposal);
+        }
     }
 
     #[test]

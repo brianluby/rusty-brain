@@ -10,6 +10,8 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed
   policies such as rejecting anonymous requests; support named `Proposal:` adoption
   without dropping complete test/production qualifications.
+- Match proposal-planning language at the statement start, preserving labeled facts
+  such as a correction adopting the proposed blue/green rollout.
 - Keep unlabeled one-off task instructions in activity context, not critical
   confirmed policy; retain explicit decision/preference language and scoped adoption.
 - Replace stale MCP full-toolset count assertions with required-tool and history

@@ -146,6 +146,15 @@ try {
     entry("review-constraint", "user", "Constraint: review: reject proposals that include secrets"),
   ])).map(note => note.content), ["Constraint: review: reject proposals that include secrets"],
     "labeled rejection policy remains confirmed rather than becoming a rejection of an assistant proposal");
+  const deployment = [
+    entry("deployment-old", "user", "Decision: deployment: use rolling releases"),
+    entry("deployment-correction", "user", "Correction: deployment: use the proposed blue/green rollout"),
+  ];
+  assert.deepEqual((await checkpoint("proposed-policy", deployment.slice(0, 1))).map(note => note.content),
+    ["Decision: deployment: use rolling releases"]);
+  assert.deepEqual((await checkpoint("proposed-policy", deployment)).map(note => note.content),
+    ["Correction: deployment: use the proposed blue/green rollout"],
+    "proposal terminology inside a labeled correction must not suppress the replacement");
   const adopted = await checkpoint("explicit-proposal", [
     entry("storage-proposal", "assistant", "Proposal: storage: use SQLite only in tests; production uses PostgreSQL"),
     entry("storage-adoption", "user", "Adopt proposal: storage"),
