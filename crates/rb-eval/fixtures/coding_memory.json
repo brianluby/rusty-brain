@@ -1,0 +1,74 @@
+{
+  "schema_version": 1,
+  "authorship": "Fictional development cases and exact expected/forbidden IDs authored before execution. Not a holdout or external benchmark.",
+  "clock": "2026-01-01T00:00:00Z",
+  "cases": [
+    {
+      "id": "unanswered-deployment-region", "category": "abstention",
+      "rationale": "No source states a deployment region. Deployment-adjacent facts must not be presented as the missing answer.",
+      "memories": [
+        {"id":"12470000-0000-4000-8000-000000000001", "content":"The deployment health endpoint is /ready and requires a signed release."}
+      ],
+      "queries": [{"query":"Which cloud region hosts our production deployment?", "limit":5, "expected_ids":[], "forbidden_ids":["12470000-0000-4000-8000-000000000001"], "expect_abstention":true}]
+    },
+    {
+      "id": "indexed-decision-and-incident", "category": "direct_multi_fact",
+      "rationale": "Fully indexed decision and incident. Two returned facts are not evidence of multihop retrieval; report direct-channel availability.",
+      "memories": [
+        {"id":"12470000-0000-4000-8000-000000000002", "content":"Dispatch workers use a bounded queue with backpressure instead of dropping pending work."},
+        {"id":"12470000-0000-4000-8000-000000000003", "content":"The dispatch outage exhausted heap memory when pending work accumulated in an unbounded queue."}
+      ],
+      "links":[{"source":"12470000-0000-4000-8000-000000000002", "target":"12470000-0000-4000-8000-000000000003", "kind":"References"}],
+      "queries":[{"query":"What dispatch queue policy was chosen and which outage motivated it?", "limit":5, "expected_ids":["12470000-0000-4000-8000-000000000002","12470000-0000-4000-8000-000000000003"], "forbidden_ids":[]}]
+    },
+    {
+      "id":"controlled-one-hop-incident", "category":"graph_expansion",
+      "rationale":"Controlled unindexed graph evidence: incident document is embedded and recorded, but its vector is deliberately not inserted. This is graph expansion capability, not natural semantic cutoff quality.",
+      "memories":[
+        {"id":"12470000-0000-4000-8000-000000000004", "content":"Dispatchlock selects bounded admission for worker scheduling."},
+        {"id":"12470000-0000-4000-8000-000000000005", "content":"Incident Q17: heap exhaustion killed the process during a burst of pending tasks.", "indexed":false}
+      ],
+      "links":[{"source":"12470000-0000-4000-8000-000000000004", "target":"12470000-0000-4000-8000-000000000005", "kind":"References"}],
+      "queries":[{"query":"Dispatchlock", "limit":5, "expected_ids":["12470000-0000-4000-8000-000000000004","12470000-0000-4000-8000-000000000005"], "forbidden_ids":[], "graph_only":{"seed":"12470000-0000-4000-8000-000000000004","target":"12470000-0000-4000-8000-000000000005","hops":1}}]
+    },
+    {
+      "id":"controlled-two-hop-incident", "category":"unsupported_two_hop",
+      "rationale":"Controlled two-hop-only incident is absent from direct channels and one-hop expansion. Production recall has no two-hop expansion; missing evidence stays a failing assertion, not an expected pass.",
+      "memories":[
+        {"id":"12470000-0000-4000-8000-000000000006", "content":"Admissionlock selects bounded admission for worker scheduling."},
+        {"id":"12470000-0000-4000-8000-000000000007", "content":"Investigation R28 points to the root-cause incident.", "indexed":false},
+        {"id":"12470000-0000-4000-8000-000000000008", "content":"Incident S39: heap exhaustion killed the process during a burst of pending tasks.", "indexed":false}
+      ],
+      "links":[
+        {"source":"12470000-0000-4000-8000-000000000006", "target":"12470000-0000-4000-8000-000000000007", "kind":"References"},
+        {"source":"12470000-0000-4000-8000-000000000007", "target":"12470000-0000-4000-8000-000000000008", "kind":"References"}
+      ],
+      "queries":[{"query":"Admissionlock", "limit":5, "expected_ids":["12470000-0000-4000-8000-000000000006","12470000-0000-4000-8000-000000000007","12470000-0000-4000-8000-000000000008"], "forbidden_ids":[], "graph_only":{"seed":"12470000-0000-4000-8000-000000000006","target":"12470000-0000-4000-8000-000000000008","hops":2}}]
+    },
+    {
+      "id":"current-and-prior-decision", "category":"temporal_history",
+      "rationale":"Active recall must exclude the superseded decision; the explicit production history surface must retain both versions and mark current/prior state. No as-of reconstruction claim.",
+      "memories":[
+        {"id":"12470000-0000-4000-8000-000000000009", "content":"Deploy API timeout policy: 15 seconds."},
+        {"id":"12470000-0000-4000-8000-000000000010", "content":"Deploy API timeout policy: 45 seconds."}
+      ],
+      "supersedes":[["12470000-0000-4000-8000-000000000009","12470000-0000-4000-8000-000000000010"]],
+      "queries":[
+        {"query":"What is the current deploy API timeout policy?", "limit":5, "expected_ids":["12470000-0000-4000-8000-000000000010"], "forbidden_ids":["12470000-0000-4000-8000-000000000009"]},
+        {"query":"What was the prior deploy API timeout policy?", "limit":5, "history_target":"12470000-0000-4000-8000-000000000010", "expected_ids":["12470000-0000-4000-8000-000000000009","12470000-0000-4000-8000-000000000010"], "forbidden_ids":[], "expected_current_ids":["12470000-0000-4000-8000-000000000010"], "expected_archived_ids":["12470000-0000-4000-8000-000000000009"]}
+      ]
+    },
+    {
+      "id":"near-identical-conflicting-instructions", "category":"conflict",
+      "rationale":"Near-identical opposing instructions must both remain visible and contested. The obsolete third instruction is forbidden; retrieval does not resolve which active instruction is true.",
+      "memories":[
+        {"id":"12470000-0000-4000-8000-000000000011", "content":"Production release instructions: enable automatic retries for payment writes."},
+        {"id":"12470000-0000-4000-8000-000000000012", "content":"Production release instructions: do not enable automatic retries for payment writes."},
+        {"id":"12470000-0000-4000-8000-000000000013", "content":"Production release instructions: enable automatic retries for all writes."}
+      ],
+      "archives":["12470000-0000-4000-8000-000000000013"],
+      "links":[{"source":"12470000-0000-4000-8000-000000000011", "target":"12470000-0000-4000-8000-000000000012", "kind":"Contradicts"}],
+      "queries":[{"query":"Production release instructions automatic retries payment writes", "limit":5, "expected_ids":["12470000-0000-4000-8000-000000000011","12470000-0000-4000-8000-000000000012"], "forbidden_ids":["12470000-0000-4000-8000-000000000013"], "expected_contested_ids":["12470000-0000-4000-8000-000000000011","12470000-0000-4000-8000-000000000012"]}]
+    }
+  ]
+}

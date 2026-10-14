@@ -11,6 +11,9 @@ description = "rusty-brain single-writer daemon: dedicated writer thread, read p
 name = "rb_daemon"
 path = "src/lib.rs"
 
+[features]
+local = ["rb-embed/local"]
+
 [dependencies]
 rb-types = { path = "../rb-types" }
 rb-config = { path = "../rb-config" }

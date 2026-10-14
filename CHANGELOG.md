@@ -5,6 +5,65 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Capture review regressions (#73, #74)
+
+- Apply ordered correction filtering before fact admission; retire every known
+  earlier matching-subject fact without evicting source identities. Retry failed
+  retirement for recorded corrections; failed correction writes preserve old facts.
+  Keep stored corrections effective when subsequent windows omit their records.
+- Exclude fenced quotations from confirmation and adoption, and require complete
+  assistant proposals before scoped adoption, independently of window completeness.
+- Count inserted OMP text-block separators when reporting content completeness;
+  partial messages cannot install a clipped, unqualified decision.
+- Preserve newline-aligned recent transcript records while bounding all reads,
+  including tail-boundary inspection, to 1 MiB.
+- Enforce the 1 MiB committed namespace-configuration cap during Git stdout
+  collection for both CLI and hooks; reject oversized blobs instead of parsing prefixes.
+
+### Fixed — Strict Clippy compatibility
+
+- Upgrade `async-trait` to 0.1.92 with its required `syn` 3 parser to remove
+  redundant generated `must_use` attributes without weakening lint policy.
+  Preserve unrelated target-platform dependency versions in the lockfile.
+- Remove Copy/Clone and exact-default-value tautologies from ranking-weight
+  tests; retain the weight-sum invariant and existing ranking behavior coverage.
+
+### Added — Coding-memory evidence baseline (#85)
+
+- Add six predeclared development cases, exact expected/forbidden IDs, explicit
+  decision history and independently checked graph topology using existing rb-eval.
+- Record isolated real local vectors and publish categorized retrieval results,
+  separately from answer quality. Preserve deployment-region abstention failure
+  and unsupported two-hop retrieval as visible gaps, without gate/holdout tuning.
+
+### Fixed — Capture lifecycle, attribution and fact preservation (#73, #74, #87)
+
+- Bound stdin and regular namespace/transcript inputs; offload transcript parsing
+  and scratch pruning and avoid joining abandoned blocking workers. Narrow the
+  contract to fail-open handling, not a whole-process latency deadline.
+- Retain initial and recent evidence with explicit completeness/source metadata;
+  distinguish confirmed user facts, proposals, corrections and observed outcomes.
+  Persist separate durable facts with repeated-fold identities through existing types.
+- Require conservative full-fact equivalence for eager hook collapse and scheduled
+  consolidation, rechecked atomically. Similarity hints do not authorize replacing
+  distinct retry counts, negation, dependency versions or exception qualifiers.
+- Preserve native OMP entry identities and report its bounded, incomplete branch
+  view; exercise the actual asset through disposable hook/daemon/recall self-checks.
+
+### Fixed — Eligible-before-cutoff filtered recall (#76)
+
+- Share complete SQL filter predicates across list and keyword/vector retrieval;
+  sqlite-vec native ID prefiltering precedes top-k rather than filtering its output.
+- Keep default retrieval fast paths, graph-seed eligibility and truthful abstention
+  reasons; reuse query preparation to avoid measured per-candidate parsing overhead.
+
+### Fixed — Namespace and MCP inventory documentation (#77)
+
+- Narrow namespace isolation to row access: shared FTS corpus statistics can
+  influence local BM25 ranking without disclosing foreign-namespace rows.
+- Correct the historical review's full MCP inventory to twelve tools (six by
+  default); remove the incidental README wording assertion.
+
 ### Fixed — PR #89 review remediations (Copilot + CodeRabbit)
 
 - Abstention bar now scales by the top result's trust-class multiplier: the

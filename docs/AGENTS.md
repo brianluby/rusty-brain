@@ -21,6 +21,56 @@ Statuses are honest by design: `partial`/`unsupported`/`unknown` mean exactly
 that, and unsupported paths fail with actionable messages rather than silently
 succeeding.
 
+## Shared capture contract
+
+- Hooks continue on handled errors/panics and exit zero. The five-second
+  connect/capture timer is cooperative (connection timeout: two seconds), **not
+  a whole-process deadline**. Waiting for stdin EOF, synchronous preprocessing,
+  filesystem operations, or stdout can stall. Transcript parsing and scratch
+  pruning run on blocking workers; shutdown does not join abandoned workers.
+- Hook envelopes are capped at 1 MiB plus an oversize sentinel. Namespace
+  pins/config/frontmatter files must be regular, whole-file inputs at most 1 MiB;
+  oversized/special files are ignored, not prefix-interpreted. Committed `HEAD`
+  configuration is capped while collecting Git stdout, including an overflow
+  sentinel, and rejected whole if oversized. An invalid nearest `CLAUDE.md`
+  does not expose an ancestor override.
+- Regular transcript files retain an initial-goal window plus recent evidence:
+  at most 1 MiB read including tail-boundary inspection (up to 256 KiB initial
+  and 768 KiB tail for larger files), and 4000 selected records. Complete aligned
+  tail records survive; only a fragmented first tail record is discarded.
+  Omitted, partial, malformed or truncated evidence marks the digest incomplete.
+  Skipped-byte counts are explicit; skipped-line counts cover known records only,
+  not an unseen middle window.
+- PreCompact, SessionCheckpoint and SessionEnd share one fold: a superseding
+  activity summary plus independently recallable user-confirmed decisions,
+  preferences and constraints. Each digest retains at most 30 confirmed and
+  30 other evidence entries. Assistant proposals, bare “yes”, quoted/planning/
+  rejected statements and assistant success claims do not become confirmed policy.
+  Fenced contents are excluded from confirmation and adoption. Scoped adoption
+  requires one complete retained named assistant proposal (`Adopt proposal: subject`
+  or `yes, use that for subject`), even when the wider window is incomplete.
+  `Decision: subject: value` and `Correction: subject: value` permit ordered,
+  explicit same-session correction: obsolete retained evidence is not admitted,
+  and every known earlier matching-subject fact is retired after the correction
+  is durable. Failed retirements retry even when the correction is already recorded.
+  Stored corrections still filter obsolete evidence and finish pending retirement
+  when their original transcript records leave the next bounded window.
+  Ambiguous conflicts remain unresolved. Compaction custom instructions alone
+  have no verified conversational role.
+- Source context carries actual message IDs when supplied, record byte offsets
+  or OMP branch positions, text-line order and window/status metadata; missing
+  IDs are not invented. Attribution is not authority: hook-confirmed user facts
+  retain daemon-derived `agent_attested` trust. Mixed activity summaries do not
+  claim measured success merely because a command ran; tool outcomes distinguish
+  observed success, failure and unknown status.
+- A per-session 128-source identity ledger survives end/checkpoint resets.
+  Repeated source facts keep their IDs; exhaustion is reported and stops new
+  fact admission instead of evicting identities. Scratch remains best-effort
+  with overlapping-hook last-writer-wins behavior. Redaction and instruction
+  filtering precede persistence; directive-shaped legitimate constraints can
+  still be dropped by the retained safety filter.
+
+
 ## Claude Code (stable)
 
 The lead adapter; fully supported for capture, retrieval, and configuration.
@@ -33,7 +83,7 @@ rusty-brain-install status
 
 - Events wired: `SessionStart`, `UserPromptSubmit`, `PostToolUse`, `Stop`,
   `SessionEnd`, `PreCompact`.
-- Capture: the per-session scratch folds into one summary at `SessionEnd`.
+- Capture: the shared fold stores an activity summary and confirmed user facts.
 - Retrieval: `SessionStart` injects session context; `UserPromptSubmit`
   performs prompt-time recall with untrusted-context framing and a token
   budget.
@@ -76,11 +126,13 @@ installers and skip OMP.
   (including moves/removals), and shell commands in redacted per-session scratch.
 - Before switching or branching, a checkpoint folds the old session without
   clearing scratch. Cancelled transitions are safe; later folds supersede it.
-- `session_shutdown` drains queued capture and folds text-only user/assistant
-  history into one summary. Recent transcript JSONL is capped at 256 KiB and
-  sent through stdin, never written to a temporary transcript file. Rust
-  redacts before persistence. Latest decisions precede the goal so bounded
-  recall excerpts do not hide them behind a long prompt.
+- `session_shutdown` drains queued capture and folds bounded user/assistant
+  branch text. The adapter retains the initial goal plus recent evidence under
+  a reported 256 KiB JSONL cap, preserving actual entry IDs and branch positions.
+  Partial entries and omitted branch entries are reported; omitted byte count is
+  unknown. Its view is conservatively incomplete, not equivalent to a full
+  transcript. JSONL travels through stdin, not a temporary transcript file.
+  Rust redacts and source-filters before persistence.
 - Sessions/factories have independent state. Hooks have a 6.5-second subprocess
   deadline, bounded I/O, and fail open on missing binaries, errors or malformed
   output. A crash/forced kill can bypass shutdown; this is best-effort capture,
@@ -92,6 +144,13 @@ project discovery, write capture, shutdown storage, subsequent recall after
 archiving the original seed, and placebo isolation passed. See
 [`eval/omp-extension-verification.json`](eval/omp-extension-verification.json).
 This is transport/lifecycle evidence, not model-quality or scorecard efficacy.
+
+The bounded native-callback fixture exercises the installed asset with real hook
+processes, a disposable daemon/store, prompt injection and recall (no live model):
+
+```bash
+bun crates/rb-install/tests/omp_capture.ts target/debug/rusty-brain target/debug/rusty-brain-hooks
+```
 
 **Troubleshooting:** run `rusty-brain-install status --agents omp` and
 `rusty-brain doctor` first. Verify the OMP working directory and binary locations.

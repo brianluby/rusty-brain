@@ -1,7 +1,7 @@
 //! Strictly fail-open best-effort client over `rb_proto::Client`. Every method
 //! wraps the underlying call in a timeout and maps ANY error (connect failure,
 //! contract-version mismatch, timeout, wire error) to `None`. The hook surface
-//! must NEVER block the CLI or surface a failure: degrade silently.
+//! continues on handled failure; this client does not bound whole-process latency.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -164,6 +164,14 @@ impl DaemonClient {
         }
     }
 
+    /// Best-effort reversible archive. Returns `None` on any error/timeout.
+    pub async fn archive(&mut self, id: MemoryId) -> Option<()> {
+        match tokio::time::timeout(self.timeout, self.client.delete(id)).await {
+            Ok(Ok(())) => Some(()),
+            Ok(Err(_)) | Err(_) => None,
+        }
+    }
+
     /// Best-effort context fetch. Returns `(recent, important, total)`, or `None`.
     pub async fn context(&mut self) -> Option<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
         match tokio::time::timeout(self.timeout, self.client.context()).await {
@@ -175,7 +183,7 @@ impl DaemonClient {
     /// Best-effort hybrid recall on `query` (W3.2(a): the user's prompt). Returns
     /// up to `limit` ranked results, or `None` on any error/timeout. Drops the
     /// W1.6d degraded flag like [`Self::context`] — the hook surface degrades
-    /// silently and never blocks the CLI. Issues NO writer ops (W1.8: recall is
+    /// silently on handled failure. Issues NO writer ops (W1.8: recall is
     /// read-only), so a UserPromptSubmit on every turn stays cheap.
     pub async fn recall(&mut self, query: String, limit: usize) -> Option<Vec<SearchResult>> {
         let fut = self.client.recall(query, None, Vec::new(), limit);

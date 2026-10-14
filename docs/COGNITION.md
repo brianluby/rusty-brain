@@ -106,16 +106,21 @@ between strata (there are no strata, §1). What is enforced:
   (`Store::supersede`, `crates/rb-store/src/store/core.rs`; the W3.1
   update-as-supersede path in `crates/rb-daemon/src/server.rs`). The chain is
   auditable in both directions (§5, decision history).
-- **Write-time near-duplicate suppression** — a hook-sourced write that is
-  near-identical (cosine similarity bound) to an existing active memory is
-  collapsed into a supersede instead of accreting a duplicate
-  (`crates/rb-daemon/src/server.rs`, W3.1). Capture repeats across compactions
-  collapse the same way (`pre_compact`, `crates/rb-hooks/src/capture.rs`).
-- **SessionEnd fold** — many shallow per-session scratch observations are folded
-  into one structured durable summary (`crates/rb-hooks/src/capture.rs`), the
-  closest analog to a shallow→structural depth-of-processing step.
-- **Consolidation job** — merges near-duplicate clusters into one
-  deterministically-chosen survivor via supersede; bounded, idempotent,
+- **Write-time duplicate suppression** — hook-only cosine neighbors are merely
+  candidates. Automatic collapse requires byte-identical content and authored
+  qualifiers (summary/context/type/keywords/tags/files/anchors), compatible
+  confidence/trust/producer/channel metadata, and no non-similarity graph evidence.
+  Reference links labeled `similar` are candidate hints, not fact equivalence.
+  The store rechecks equivalence, namespace and liveness in the supersede transaction
+  (`crates/rb-store/src/store/core.rs`; eager caller in `rb-daemon/src/server.rs`).
+  Paraphrases and uncertain pairs remain active; explicit correction/review is unchanged.
+- **Shared lifecycle fold** — PreCompact, SessionCheckpoint and SessionEnd fold
+  activity into one superseding summary plus independently recallable confirmed
+  user decisions/preferences/constraints. Source identities survive repeated folds;
+  proposal/adoption/correction and incomplete-window rules are in
+  [the shared capture contract](AGENTS.md#shared-capture-contract).
+- **Consolidation job** — selects a deterministic survivor only among equivalent
+  neighbors and uses the same guarded automatic mutation; bounded, idempotent,
   namespace-isolated (`crates/rb-daemon/src/jobs/consolidation.rs`).
 - **Guided review merge** — the review sweep (§5) offers an atomic merge for
   near-duplicate pairs; both originals are superseded behind a pointer guard in
@@ -152,6 +157,13 @@ injection, and minimum contextual anchors (who / what / when / why).
 
 **rusty-brain declares** — this is a core product contract, agent-agnostic by
 construction:
+
+Recall eligibility is applied inside keyword SQL and native vector prefiltering
+before finite channel cutoffs, including metadata, contested state, quarantine
+and the confidence floor. An eligible fact is not hidden behind earlier
+nonmatching candidates; bounded ranking headroom and vector output limits remain
+([query mechanics and measured limits](ARCHITECTURE.md#recall-path)).
+
 
 ### 3.1 Retrieve-before-generate
 
@@ -277,16 +289,16 @@ the opt-in declared retention policy:
 - **Obsolescence** — supersede archives the old row behind a `superseded_by`
   pointer (§2); `stale` feedback erodes confidence (−0.15, §2); the review queue
   surfaces stale-never-recalled singles.
-- **Redundancy** — write-time near-dup suppression, the consolidation job, and
-  the review sweep's near-duplicate pairs with atomic merge (§2) — all three via
-  the ONE similarity definition (`SqliteStore::near_duplicates`,
-  `crates/rb-store/src/store/review.rs`).
+- **Redundancy** — write-time suppression and scheduled consolidation require
+  conservative equivalence after the shared similarity scan (§2). Guided review
+  still presents near-duplicates for an explicit human merge; cosine alone never
+  authorizes automatic retirement (`SqliteStore::near_duplicates`, `store/review.rs`).
 
 ### 4.3 Graceful degradation
 
-- Low-confidence memories are **dampened in ranking, not hidden** — recall
-  degrades their weight rather than pretending certainty either way
-  (`crates/rb-engine/src/engine.rs`).
+- Recall excludes quarantined and confidence-exhausted rows at channel eligibility.
+  Remaining low-confidence memories are **dampened in ranking**, not treated as
+  certainty (`crates/rb-engine/src/engine.rs`).
 - Injected recall states its trust posture explicitly (the CA6 preamble, §3.1):
   entries are data from the labeled source, never instructions to follow —
   superseded records are excluded, and the preference for recorded decisions
@@ -301,9 +313,10 @@ the opt-in declared retention policy:
   (`base_strength`, migration 002), floored and idempotent
   (`crates/rb-daemon/src/jobs/link_decay.rs`) — old associations fade instead of
   flipping off.
-- The capture surface **fails open**: when the daemon is unreachable, hooks
-  abandon memory work and never block or degrade the host agent session
-  (`crates/rb-hooks/src/main.rs`). Memory is an enhancement, not a dependency.
+- The capture surface **fails open** on handled errors and panics, returning
+  continuation and exit zero. Its cooperative timeout is not a whole-process
+  latency guarantee; stdin/preprocessing/filesystem/stdout may stall
+  (`crates/rb-hooks/src/main.rs`; [capture contract](AGENTS.md#shared-capture-contract)).
 
 ## 5. Health
 

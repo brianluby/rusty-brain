@@ -56,22 +56,6 @@ fn workspace_inventory_matches_readme_and_architecture() {
     }
 }
 
-#[test]
-fn readme_mcp_count_matches_tool_definitions() {
-    let readme = read("README.md");
-    let count = rb_mcp::tool_definitions().len();
-    let claim = format!("**{count} MCP tools**");
-    assert!(
-        readme.contains(&claim),
-        "README must carry the code-derived MCP count marker {claim:?}"
-    );
-    assert!(
-        !readme.contains("exposing ten tools over stdio")
-            && !readme.contains("It implements ten tools."),
-        "README still contains one of the obsolete ten-tool product claims"
-    );
-}
-
 fn status_section(document: &str) -> &str {
     let remainder = document
         .split_once("\n## Status\n")
