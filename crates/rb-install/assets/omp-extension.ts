@@ -94,7 +94,7 @@ function transcript(context: ExtensionContext): string {
     }
     for (let index = branch.length - 1; index >= 0 && remaining > 256; index -= 1) {
       if (selected.has(index)) continue;
-      const line = lineFor(index, remaining);
+      const line = lineFor(index, Math.min(remaining, MAX_TRANSCRIPT_BYTES / 4));
       if (!line) continue;
       selected.set(index, line);
       remaining -= Buffer.byteLength(line);

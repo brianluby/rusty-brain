@@ -10,8 +10,9 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed
   policies such as rejecting anonymous requests; support named `Proposal:` adoption
   without dropping complete test/production qualifications.
-- Match proposal-planning language at the statement start, preserving labeled facts
-  such as a correction adopting the proposed blue/green rollout.
+- Match proposal-planning language at the statement start and apply generic planning
+  markers only to unlabeled prose, preserving labeled rollout corrections and literal
+  diagnostic text such as `"could not connect"`.
 - Keep unlabeled one-off task instructions in activity context, not critical
   confirmed policy; retain explicit decision/preference language and scoped adoption.
 - Replace stale MCP full-toolset count assertions with required-tool and history
@@ -19,6 +20,8 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Replace stale native OMP serialization assertions with lifecycle, source identity,
   initial/recent-window, completeness and byte-bound behavior checks; cover unavailable
   branches without fabricating messages.
+- Bound each recent native OMP entry to 64 KiB so a long final assistant response
+  cannot crowd out the immediately preceding user correction.
 - Patch `quinn-proto` to 0.11.18 and `rustls` to 0.23.46, clearing nine security
   advisories without advisory ignores or unrelated dependency refreshes.
 - Match persisted correction subjects and sources in their redacted form, preserving

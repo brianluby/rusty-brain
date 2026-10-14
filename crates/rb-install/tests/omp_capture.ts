@@ -66,6 +66,7 @@ try {
       { type: "image", text: "Decision: storage: use MySQL." },
       { type: "text", text: "Constraint: logging: Payment card numbers are excluded from logs." },
     ]),
+    entry("long-final-response", "assistant", "Analysis and implementation detail. ".repeat(20_000)),
   ];
   const context = { cwd: root, sessionManager: { getSessionId: () => "omp-bounded-source", getBranch: () => branch } };
   type Handler = (event: unknown, context: unknown) => Promise<unknown>;
@@ -155,6 +156,15 @@ try {
   assert.deepEqual((await checkpoint("proposed-policy", deployment)).map(note => note.content),
     ["Correction: deployment: use the proposed blue/green rollout"],
     "proposal terminology inside a labeled correction must not suppress the replacement");
+  const diagnostics = [
+    entry("diagnostics-old", "user", "Decision: diagnostics: omit connection errors"),
+    entry("diagnostics-correction", "user", "Correction: diagnostics: preserve the \"could not connect\" error text"),
+  ];
+  assert.deepEqual((await checkpoint("literal-diagnostics", diagnostics.slice(0, 1))).map(note => note.content),
+    ["Decision: diagnostics: omit connection errors"]);
+  assert.deepEqual((await checkpoint("literal-diagnostics", diagnostics)).map(note => note.content),
+    ["Correction: diagnostics: preserve the \"could not connect\" error text"],
+    "generic planning words inside a labeled literal must not suppress the correction");
   const adopted = await checkpoint("explicit-proposal", [
     entry("storage-proposal", "assistant", "Proposal: storage: use SQLite only in tests; production uses PostgreSQL"),
     entry("storage-adoption", "user", "Adopt proposal: storage"),

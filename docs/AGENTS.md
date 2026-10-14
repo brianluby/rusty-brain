@@ -56,7 +56,8 @@ succeeding.
   `Constraint: review: reject proposals that include secrets` and
   `Correction: auth: reject anonymous requests` remain confirmed.
   Statement-leading `propose`/`I propose`/`we propose` indicates planning;
-  proposal terminology inside a labeled fact does not remove its confirmation.
+  proposal terminology and generic planning words inside a labeled fact do not
+  remove its confirmation (for example, preserving a `"could not connect"` error).
   Bare task imperatives and `must not`/`should not` substrings alone do not confirm
   policy; use labeled facts or explicit decision/preference/confirmation language.
   `Decision: subject: value` and `Correction: subject: value` permit ordered,
@@ -140,6 +141,8 @@ installers and skip OMP.
 - `session_shutdown` drains queued capture and folds bounded user/assistant
   branch text. The adapter retains the initial goal plus recent evidence under
   a reported 256 KiB JSONL cap, preserving actual entry IDs and branch positions.
+  Each entry is capped at 64 KiB so a long final assistant response cannot consume
+  the entire recent window before the preceding user turn is considered.
   Partial entries and omitted branch entries are reported; omitted byte count is
   unknown. Its view is conservatively incomplete, not equivalent to a full
   transcript. JSONL travels through stdin, not a temporary transcript file.

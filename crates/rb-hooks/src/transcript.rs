@@ -377,26 +377,37 @@ fn digest_windows(
                 }
             }
             let correction = lower.starts_with("correction:") || lower.starts_with("reversal:");
+            let labeled = [
+                "decision:",
+                "decided:",
+                "constraint:",
+                "preference:",
+                "correction:",
+                "reversal:",
+            ]
+            .iter()
+            .any(|prefix| lower.starts_with(prefix));
             let planning = raw.ends_with('?')
                 || raw.starts_with('>')
                 || raw.starts_with('"')
                 || raw.starts_with('\'')
                 || adopted_subject.is_some()
-                || [
-                    "might ",
-                    "maybe ",
-                    "could ",
-                    "should we ",
-                    "what if ",
-                    "not decided",
-                    "haven't decided",
-                    "do not adopt",
-                    "don't adopt",
-                    "assistant said",
-                    "assistant decided",
-                ]
-                .iter()
-                .any(|m| lower.contains(m))
+                || (!labeled
+                    && [
+                        "might ",
+                        "maybe ",
+                        "could ",
+                        "should we ",
+                        "what if ",
+                        "not decided",
+                        "haven't decided",
+                        "do not adopt",
+                        "don't adopt",
+                        "assistant said",
+                        "assistant decided",
+                    ]
+                    .iter()
+                    .any(|m| lower.contains(m)))
                 || ["propose ", "i propose ", "we propose "]
                     .iter()
                     .any(|phrase| lower.starts_with(phrase))
@@ -412,19 +423,10 @@ fn digest_windows(
                         .unwrap_or(&lower)
                         .starts_with(phrase)
                 });
-            let explicit = correction
-                || [
-                    "decision:",
-                    "decided:",
-                    "constraint:",
-                    "preference:",
-                    "we decided ",
-                    "i decided ",
-                    "i prefer ",
-                    "i confirm ",
-                ]
-                .iter()
-                .any(|p| lower.starts_with(p));
+            let explicit = labeled
+                || ["we decided ", "i decided ", "i prefer ", "i confirm "]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix));
             let status = if role == "user" && explicit && !planning {
                 if correction {
                     EvidenceStatus::Correction
@@ -782,6 +784,26 @@ mod tests {
             let digest = digest_from_lines([turn("user", proposal)]);
             assert!(digest.decisions.is_empty(), "{proposal}");
             assert_eq!(digest.evidence[0].status, EvidenceStatus::Proposal);
+        }
+    }
+
+    #[test]
+    fn labeled_error_text_is_not_generic_planning() {
+        for value in [
+            "preserve the \"could not connect\" error text",
+            "display \"not decided\" for an unset status",
+            "keep \"assistant said\" as quoted diagnostic output",
+        ] {
+            let statement = format!("Correction: diagnostics: {value}");
+            let digest = digest_from_lines([
+                turn("user", "Decision: diagnostics: omit connection errors"),
+                turn("user", &statement),
+            ]);
+            assert_eq!(digest.decisions, vec![statement]);
+            assert_eq!(
+                digest.confirmed_evidence().next().unwrap().status,
+                EvidenceStatus::Correction
+            );
         }
     }
 

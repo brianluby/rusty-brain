@@ -340,6 +340,21 @@ test("transcript cap preserves initial goal and recent text within escaped UTF-8
   expect(latest.content_complete).toBe(true);
 });
 
+test("a long final assistant response cannot crowd out the preceding user correction", async () => {
+  const correction = "Correction: storage: use SQLite instead of PostgreSQL";
+  const instance = host("adjacent-correction", [
+    { type: "message", id: "old-policy", message: { role: "user", content: "Decision: storage: use PostgreSQL" } },
+    { type: "message", id: "user-correction", message: { role: "user", content: correction } },
+    { type: "message", id: "long-response", message: { role: "assistant", content: "Implementation detail. ".repeat(20_000) } },
+  ]);
+  await instance.emit("session_shutdown");
+  const transcript = capturedTranscript((await fixtureRecords())[0].envelope?.transcript_jsonl);
+  expect(transcript.messages.find((record) => record.id === "user-correction")).toMatchObject({
+    content_complete: true, message: { role: "user", content: correction },
+  });
+  expect(transcript.messages.find((record) => record.id === "long-response")?.content_complete).toBe(false);
+});
+
 test("real stdin envelopes retain session identities and unavailable IDs never collide", async () => {
   const first = host(undefined);
   const second = host(null);
