@@ -110,6 +110,8 @@ between strata (there are no strata, §1). What is enforced:
   candidates. Automatic collapse requires byte-identical content and authored
   qualifiers (summary/context/type/keywords/tags/files/anchors), compatible
   confidence/trust/producer/channel metadata, and no non-similarity graph evidence.
+  Durable (`session_id` absent) and session-scoped facts are not equivalent because
+  recall scores them differently; different nonempty session IDs may still deduplicate.
   Reference links labeled `similar` are candidate hints, not fact equivalence.
   The store rechecks equivalence, namespace and liveness in the supersede transaction
   (`crates/rb-store/src/store/core.rs`; eager caller in `rb-daemon/src/server.rs`).

@@ -86,6 +86,10 @@ try {
   assert.ok(facts.some(note => note.content.includes("ORCHID-OMP-7311") && note.context.includes("message=confirmed-storage")));
   assert.ok(facts.some(note => note.context.includes("message=confirmed-logging")));
   assert.ok(facts.every(note => note.context.includes("branch_entry") && note.context.includes("incomplete=true")));
+  assert.ok(facts.every(note => note.context.includes("skipped_bytes=unknown") && note.context.includes("skipped_lines=unknown")),
+    "adapter omissions cannot be reported as zero bytes or zero records");
+  const boundedSummary = first.find(note => note.tags.includes("session-summary"));
+  assert.ok(boundedSummary?.content.includes("skipped_bytes=unknown") && boundedSummary.content.includes("skipped_lines=unknown"));
   assert.ok(!facts.some(note => note.content.includes("ORCHID-PROPOSAL")));
   assert.ok(!facts.some(note => note.context.includes("message=initial-goal")),
     "the 200-block clipped SQLite statement must not become a confirmed policy");
@@ -138,6 +142,10 @@ try {
   assert.deepEqual((await checkpoint("rejection-policy", auth)).map(note => note.content),
     ["Correction: auth: reject anonymous requests"],
     "a rejection action must retire the earlier policy, not become an unconfirmed proposal");
+  assert.deepEqual((await checkpoint("labeled-rejection-policy", [
+    entry("review-constraint", "user", "Constraint: review: reject proposals that include secrets"),
+  ])).map(note => note.content), ["Constraint: review: reject proposals that include secrets"],
+    "labeled rejection policy remains confirmed rather than becoming a rejection of an assistant proposal");
   const adopted = await checkpoint("explicit-proposal", [
     entry("storage-proposal", "assistant", "Proposal: storage: use SQLite only in tests; production uses PostgreSQL"),
     entry("storage-adoption", "user", "Adopt proposal: storage"),
@@ -168,6 +176,22 @@ try {
   assert.deepEqual(oldFacts.map(note => note.content).sort(), ledger.slice(0, 2).map(value => value.message.content).sort());
   const db = new Database(`${root}/rb.db`);
   try {
+    const redacted = [
+      entry("redacted-old", "user", "Decision: password=hunter2: use PostgreSQL"),
+      entry("redacted-new", "user", "Correction: password=hunter2: use SQLite"),
+    ];
+    const beforeRedaction = await checkpoint("redacted-subject", redacted.slice(0, 1));
+    assert.equal(beforeRedaction.length, 1);
+    const afterRedaction = await checkpoint("redacted-subject", redacted);
+    assert.equal(afterRedaction.length, 1);
+    assert.ok(afterRedaction[0].content.includes("use SQLite") && !afterRedaction[0].content.includes("hunter2"));
+    const lineage: unknown = db.query("SELECT superseded_by, content FROM memories WHERE memory_id = ?").get(beforeRedaction[0].id);
+    assert.ok(object(lineage) && lineage.superseded_by === afterRedaction[0].id,
+      "redacted-subject correction must retain supersedes lineage, not merely archive old policy");
+    assert.ok(object(lineage) && typeof lineage.content === "string" && !lineage.content.includes("hunter2"));
+    assert.deepEqual((await checkpoint("redacted-subject", redacted.slice(0, 1))).map(note => note.id),
+      afterRedaction.map(note => note.id),
+      "redacted identity must also prevent old head evidence from returning after correction omission");
     // Real SQLite write failures prove old policy survives until its correction is durable.
     db.exec(`CREATE TRIGGER reject_correction BEFORE INSERT ON memories
       WHEN NEW.content = 'Correction: storage: use SQLite CORRECTION-LEDGER'

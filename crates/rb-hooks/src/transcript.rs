@@ -45,7 +45,7 @@ pub struct TranscriptEvidence {
     pub text: String,
     pub role: String,
     pub status: EvidenceStatus,
-    /// Only an explicit `Decision: subject: ...` / `Correction: subject: ...`.
+    /// Subject named by an explicit labeled statement or assistant proposal.
     pub subject: Option<String>,
     pub message_id: Option<String>,
     pub source: String,
@@ -62,6 +62,8 @@ pub struct TranscriptDigest {
     pub decisions: Vec<String>,
     pub evidence: Vec<TranscriptEvidence>,
     pub incomplete: bool,
+    /// Adapter-side omissions cannot be measured from the retained envelope.
+    pub adapter_window: bool,
     pub skipped_bytes: usize,
     pub skipped_lines: usize,
     pub window: String,
@@ -223,6 +225,7 @@ fn digest_windows(
             continue;
         };
         if let Some(window) = entry.get("capture_window") {
+            digest.adapter_window = true;
             digest.incomplete |= window
                 .get("incomplete")
                 .and_then(serde_json::Value::as_bool)
@@ -390,14 +393,23 @@ fn digest_windows(
                     "haven't decided",
                     "do not adopt",
                     "don't adopt",
-                    "reject proposal",
-                    "reject that proposal",
-                    "reject the proposal",
                     "assistant said",
                     "assistant decided",
                 ]
                 .iter()
-                .any(|m| lower.contains(m));
+                .any(|m| lower.contains(m))
+                || [
+                    "reject proposal",
+                    "reject that proposal",
+                    "reject the proposal",
+                ]
+                .iter()
+                .any(|phrase| {
+                    lower
+                        .strip_prefix("no, ")
+                        .unwrap_or(&lower)
+                        .starts_with(phrase)
+                });
             let explicit = correction
                 || [
                     "decision:",
@@ -714,14 +726,22 @@ mod tests {
             EvidenceStatus::Correction
         );
         for rejection in [
-            "Decision: auth: reject proposal: anonymous access",
-            "Correction: auth: reject that proposal",
-            "Constraint: auth: reject the proposal",
+            "Reject proposal: anonymous access",
+            "No, reject that proposal",
+            "Reject the proposal",
         ] {
             assert!(digest_from_lines([turn("user", rejection)])
                 .decisions
                 .is_empty());
         }
+        let policy = digest_from_lines([turn(
+            "user",
+            "Constraint: review: reject proposals that include secrets",
+        )]);
+        assert_eq!(
+            policy.decisions,
+            vec!["Constraint: review: reject proposals that include secrets"]
+        );
         let adopted = digest_from_lines([
             turn("assistant", "Proposal: storage: use SQLite only in tests"),
             turn("user", "Adopt proposal: storage"),

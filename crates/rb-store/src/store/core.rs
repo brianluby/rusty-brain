@@ -321,6 +321,7 @@ impl SqliteStore {
             || a.origin_user != b.origin_user
             || a.origin_host != b.origin_host
             || a.origin_agent != b.origin_agent
+            || a.session_id.is_some() != b.session_id.is_some()
         {
             return Ok(false);
         }
@@ -5015,7 +5016,7 @@ mod near_duplicates_tests {
     fn automatic_duplicates_preserve_distinct_metadata_without_mutation() {
         let ns = Namespace::Project("qualified-facts".into());
         let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
-        for case in 0..11 {
+        for case in 0..12 {
             let store = SqliteStore::open_in_memory(8).unwrap();
             let a = MemoryNote::new(
                 ns.clone(),
@@ -5040,6 +5041,7 @@ mod near_duplicates_tests {
                 8 => b.origin_channel = Some(rb_types::WriteChannel::Http),
                 9 => b.trust_class = rb_types::TrustClass::HumanConfirmed,
                 10 => b.confidence = 0.0,
+                11 => b.session_id = Some("session-scoped".into()),
                 _ => unreachable!(),
             }
             store.insert_memory(&a, Some(&vector)).unwrap();

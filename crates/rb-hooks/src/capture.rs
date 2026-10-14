@@ -6,6 +6,7 @@
 //! scratch). Every flow returns `continue_execution: true`; filesystem work
 //! still has no hard latency bound.
 
+use std::fmt::Write as _;
 use std::path::Path;
 use std::str::FromStr;
 
@@ -902,8 +903,8 @@ async fn store_confirmed_facts(
         let prior_facts = data.facts.iter().filter(|fact| {
             evidence.status == EvidenceStatus::Correction
                 && !fact.retired
-                && evidence.subject.is_some()
-                && fact.subject == evidence.subject
+                && subject.is_some()
+                && fact.subject == subject
                 && (fact.offset, fact.text_line) < (evidence.offset, evidence.text_line)
         });
         let prior = prior_facts
@@ -928,10 +929,21 @@ async fn store_confirmed_facts(
             } else {
                 MemoryType::ArchitectureDecision
             };
-            let context = redact(&format!(
-            "Confirmed user transcript evidence; status={:?}; source={source}; position={}; subject={:?}; window={}; incomplete={}; skipped_bytes={}; skipped_lines={}. Other conflicting statements remain unresolved unless explicitly corrected for this subject.",
-            evidence.status, evidence.offset, evidence.subject, transcript.window, transcript.incomplete, transcript.skipped_bytes, transcript.skipped_lines
-        ));
+            let mut context = format!(
+                "Confirmed user transcript evidence; status={:?}; source={source}; position={}; subject={:?}; window={}; incomplete={}",
+                evidence.status, evidence.offset, evidence.subject, transcript.window, transcript.incomplete
+            );
+            if transcript.adapter_window {
+                context.push_str("; skipped_bytes=unknown; skipped_lines=unknown.");
+            } else {
+                let _ = write!(
+                    context,
+                    "; skipped_bytes={}; skipped_lines={}.",
+                    transcript.skipped_bytes, transcript.skipped_lines
+                );
+            }
+            context.push_str(" Other conflicting statements remain unresolved unless explicitly corrected for this subject.");
+            let context = redact(&context);
             let Some(id) = client
                 .remember_anchored(
                     text.clone(),
@@ -1028,12 +1040,11 @@ async fn fold_session_summary(
     // The initial window may still contain evidence corrected in an omitted middle.
     let before = transcript.evidence.len();
     transcript.evidence.retain(|evidence| {
+        let subject = evidence.subject.as_ref().map(|subject| redact(subject));
+        let source = redact(&evidence.source);
         !data.facts.iter().any(|correction| {
-            correction.source.starts_with(&evidence.source)
-                && correction.corrects(
-                    evidence.subject.as_deref(),
-                    (evidence.offset, evidence.text_line),
-                )
+            correction.source.starts_with(&source)
+                && correction.corrects(subject.as_deref(), (evidence.offset, evidence.text_line))
         })
     });
     if transcript.evidence.len() != before {
@@ -1235,9 +1246,25 @@ fn build_session_summary(
         "Unconfirmed proposals, claims, and observed results",
         &other_evidence,
     );
-    out.push_str(&format!("\nTranscript window: {}; incomplete={}; skipped_bytes={}; skipped_lines={} (middle line count unknown when bytes omitted).\n",
-        if transcript.window.is_empty() { "not available" } else { &transcript.window },
-        transcript.incomplete || transcript.window.is_empty(), transcript.skipped_bytes, transcript.skipped_lines));
+    let _ = write!(
+        out,
+        "\nTranscript window: {}; incomplete={}",
+        if transcript.window.is_empty() {
+            "not available"
+        } else {
+            &transcript.window
+        },
+        transcript.incomplete || transcript.window.is_empty()
+    );
+    if transcript.adapter_window {
+        out.push_str("; skipped_bytes=unknown; skipped_lines=unknown.\n");
+    } else {
+        let _ = writeln!(
+            out,
+            "; skipped_bytes={}; skipped_lines={} (middle line count unknown when bytes omitted).",
+            transcript.skipped_bytes, transcript.skipped_lines
+        );
+    }
     if data.facts.len() >= 128 {
         out.push_str("Durable fact identity budget exhausted (128 per session); additional facts omitted, not evicted or duplicated.\n");
     }

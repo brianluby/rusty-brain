@@ -41,6 +41,8 @@ succeeding.
   Omitted, partial, malformed or truncated evidence marks the digest incomplete.
   Skipped-byte counts are explicit; skipped-line counts cover known records only,
   not an unseen middle window.
+  Adapter-side omitted bytes/records are unknown from the retained envelope;
+  confirmed-fact context and summaries report them as unknown, never as local zeroes.
 - PreCompact, SessionCheckpoint and SessionEnd share one fold: a superseding
   activity summary plus independently recallable user-confirmed decisions,
   preferences and constraints. Each digest retains at most 30 confirmed and
@@ -50,8 +52,9 @@ succeeding.
   requires one complete retained named assistant proposal (`Adopt proposal: subject`
   or `yes, use that for subject`), even when the wider window is incomplete.
   Assistant `Proposal: subject: value` supplies a named proposal, not confirmation.
-  Proposal-rejection phrases remain unconfirmed; a policy action such as
-  `Correction: auth: reject anonymous requests` is still a confirmed correction.
+  Statement-leading proposal rejection remains unconfirmed; labeled policies such as
+  `Constraint: review: reject proposals that include secrets` and
+  `Correction: auth: reject anonymous requests` remain confirmed.
   Bare task imperatives and `must not`/`should not` substrings alone do not confirm
   policy; use labeled facts or explicit decision/preference/confirmation language.
   `Decision: subject: value` and `Correction: subject: value` permit ordered,
@@ -60,6 +63,7 @@ succeeding.
   is durable. Failed retirements retry even when the correction is already recorded.
   Stored corrections still filter obsolete evidence and finish pending retirement
   when their original transcript records leave the next bounded window.
+  Matching uses persisted redacted subject/source identities, including replacement lineage.
   Ambiguous conflicts remain unresolved. Compaction custom instructions alone
   have no verified conversational role.
 - Source context carries actual message IDs when supplied, record byte offsets

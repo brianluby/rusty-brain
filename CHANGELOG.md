@@ -7,7 +7,7 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ### Fixed — PR #98 review remediations
 
-- Restrict proposal-rejection detection to rejection phrases, preserving confirmed
+- Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed
   policies such as rejecting anonymous requests; support named `Proposal:` adoption
   without dropping complete test/production qualifications.
 - Keep unlabeled one-off task instructions in activity context, not critical
@@ -19,8 +19,14 @@ All notable changes to rusty-brain are documented here. The format is based on
   branches without fabricating messages.
 - Patch `quinn-proto` to 0.11.18 and `rustls` to 0.23.46, clearing nine security
   advisories without advisory ignores or unrelated dependency refreshes.
+- Match persisted correction subjects and sources in their redacted form, preserving
+  replacement lineage and preventing obsolete evidence from returning after window shifts.
+- Keep durable facts distinct from session-scoped duplicates during automatic collapse;
+  equivalent facts from different nonempty sessions may still consolidate.
+- Report adapter-side skipped-byte/record counts as unknown, not local zero counts;
+  qualify kanban references so they cannot link to unrelated GitHub issues.
 
-### Fixed — Capture review regressions (#73, #74)
+### Fixed — Capture review regressions (kanban 73, 74)
 
 - Apply ordered correction filtering before fact admission; retire every known
   earlier matching-subject fact without evicting source identities. Retry failed
@@ -43,7 +49,7 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Remove Copy/Clone and exact-default-value tautologies from ranking-weight
   tests; retain the weight-sum invariant and existing ranking behavior coverage.
 
-### Added — Coding-memory evidence baseline (#85)
+### Added — Coding-memory evidence baseline (kanban 85)
 
 - Add six predeclared development cases, exact expected/forbidden IDs, explicit
   decision history and independently checked graph topology using existing rb-eval.
@@ -51,7 +57,7 @@ All notable changes to rusty-brain are documented here. The format is based on
   separately from answer quality. Preserve deployment-region abstention failure
   and unsupported two-hop retrieval as visible gaps, without gate/holdout tuning.
 
-### Fixed — Capture lifecycle, attribution and fact preservation (#73, #74, #87)
+### Fixed — Capture lifecycle, attribution and fact preservation (kanban 73, 74, 87)
 
 - Bound stdin and regular namespace/transcript inputs; offload transcript parsing
   and scratch pruning and avoid joining abandoned blocking workers. Narrow the
@@ -65,14 +71,14 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Preserve native OMP entry identities and report its bounded, incomplete branch
   view; exercise the actual asset through disposable hook/daemon/recall self-checks.
 
-### Fixed — Eligible-before-cutoff filtered recall (#76)
+### Fixed — Eligible-before-cutoff filtered recall (kanban 76)
 
 - Share complete SQL filter predicates across list and keyword/vector retrieval;
   sqlite-vec native ID prefiltering precedes top-k rather than filtering its output.
 - Keep default retrieval fast paths, graph-seed eligibility and truthful abstention
   reasons; reuse query preparation to avoid measured per-candidate parsing overhead.
 
-### Fixed — Namespace and MCP inventory documentation (#77)
+### Fixed — Namespace and MCP inventory documentation (kanban 77)
 
 - Narrow namespace isolation to row access: shared FTS corpus statistics can
   influence local BM25 ranking without disclosing foreign-namespace rows.
