@@ -8,6 +8,20 @@ import rustyBrainOmpExtension from "../scorecard-omp-extension.ts";
 type JsonObject = Record<string, unknown>;
 type Handler = (event: JsonObject, context: ExtensionContext) => unknown;
 type FixtureRecord = { phase: string; envelope?: JsonObject; session_id?: string };
+type CaptureWindow = {
+  incomplete: boolean;
+  byte_cap: number;
+  branch_entries?: number;
+  selected_entries?: number;
+  skipped_entries?: number;
+  error?: string;
+};
+type CapturedMessage = {
+  id?: string;
+  capture_order: number;
+  content_complete: boolean;
+  message: { role: string; content: string };
+};
 const environmentKeys = [
   "RB_OMP_HOOKS_BIN", "RB_SCORECARD_INJECTION_DIR", "RB_SCORECARD_PLACEBO_SOURCE",
   "RB_SCORECARD_FORBIDDEN", "RB_OMP_FIXTURE_LOG",
@@ -72,6 +86,16 @@ function returnedMessage(result: unknown): string | undefined {
 async function fixtureRecords(): Promise<FixtureRecord[]> {
   if (!await Bun.file(log).exists()) return [];
   return (await readFile(log, "utf8")).trim().split("\n").map((line) => JSON.parse(line) as FixtureRecord);
+}
+
+function capturedTranscript(value: unknown): { window: CaptureWindow; messages: CapturedMessage[] } {
+  if (typeof value !== "string") throw new Error("Missing inline transcript");
+  const [header, ...lines] = value.trim().split("\n");
+  const record: { capture_window: CaptureWindow } = JSON.parse(header);
+  return {
+    window: record.capture_window,
+    messages: lines.map((line) => JSON.parse(line) as CapturedMessage),
+  };
 }
 
 async function receiptMessages(path = receipts): Promise<string[]> {
@@ -235,7 +259,8 @@ test("shutdown waits for actual capture, preserves hashline input and sends text
   const branch = [
     { type: "message", message: { role: "user", content: "Choose option B" } },
     { type: "message", message: { role: "assistant", content: [
-      { type: "thinking", thinking: "private reasoning" }, { type: "text", text: "Option B selected" },
+      { type: "thinking", thinking: "private reasoning" }, { type: "text", text: "Option B" },
+      { type: "text", text: "selected" },
       { type: "toolCall", name: "write", arguments: { content: "tool secret" } },
       { type: "image", data: "image secret" },
     ] } },
@@ -254,13 +279,16 @@ test("shutdown waits for actual capture, preserves hashline input and sends text
   const records = await fixtureRecords();
   expect(records.map((record) => record.phase)).toEqual(["received", "captured", "received"]);
   expect(records[0].envelope?.tool_input).toEqual({ input: patch });
-  expect(records[2].envelope).toEqual({
+  expect(records[2].envelope).toMatchObject({
     type: "session_shutdown", reason: "shutdown", cwd: directory, session_id: "session-capture",
-    transcript_jsonl: [
-      JSON.stringify({ message: { role: "user", content: "Choose option B" } }),
-      JSON.stringify({ message: { role: "assistant", content: "Option B selected" } }), "",
-    ].join("\n"),
   });
+  const transcript = capturedTranscript(records[2].envelope?.transcript_jsonl);
+  expect(transcript.window).toMatchObject({ incomplete: true, branch_entries: branch.length, selected_entries: 2 });
+  expect(transcript.messages.map((record) => record.message)).toEqual([
+    { role: "user", content: "Choose option B" },
+    { role: "assistant", content: "Option B\nselected" },
+  ]);
+  expect(transcript.messages.every((record) => record.content_complete)).toBe(true);
   expect((await readdir(directory)).sort()).toEqual(["fixture-hook.ts", "hook-events.jsonl"]);
   await instance.emit("tool_result", successfulTool);
   await instance.emit("session_shutdown");
@@ -284,24 +312,32 @@ test("large writes retain mutation paths and error captures retain bounded error
   expect(envelopes[1]?.tool_response).toEqual({ is_error: true, content: "missing import" });
 });
 
-test("transcript cap counts escaped UTF-8 bytes and retains newest conversation as valid JSONL", async () => {
+test("transcript cap preserves initial goal and recent text within escaped UTF-8 byte bounds", async () => {
   const instance = host("bounded", [
-    { type: "message", message: { role: "user", content: "old".repeat(200_000) } },
-    { type: "message", message: { role: "assistant", content: "é𐐀\u0000\"".repeat(80_000) } },
-    { type: "message", message: { role: "user", content: "Newest question" } },
+    { type: "message", id: "initial-goal", message: { role: "user", content: "old".repeat(200_000) } },
+    { type: "message", id: "recent-evidence", message: { role: "assistant", content: "é𐐀\u0000\"".repeat(80_000) } },
+    { type: "message", id: "latest-question", message: { role: "user", content: "Newest question" } },
   ]);
   await instance.emit("session_shutdown");
   const inline = (await fixtureRecords())[0].envelope?.transcript_jsonl;
-  expect(typeof inline).toBe("string");
-  const text = inline as string;
-  expect(Buffer.byteLength(text)).toBeLessThanOrEqual(256 * 1024);
-  const messages = text.trim().split("\n").map((line) => {
-    const record: { message: { role: string; content: string } } = JSON.parse(line);
-    return record.message;
-  });
-  expect(messages.map((message) => message.role)).toEqual(["assistant", "user"]);
-  expect(messages[0].content).not.toContain("\ufffd");
-  expect(messages[1].content).toBe("Newest question");
+  if (typeof inline !== "string") throw new Error("Missing bounded transcript");
+  expect(Buffer.byteLength(inline)).toBeLessThanOrEqual(256 * 1024);
+  const transcript = capturedTranscript(inline);
+  expect(transcript.window).toMatchObject({ incomplete: true, byte_cap: 256 * 1024 });
+  expect(transcript.messages.map((record) => record.id)).toEqual([
+    "initial-goal", "recent-evidence", "latest-question",
+  ]);
+  expect(transcript.messages.map((record) => record.capture_order)).toEqual([0, 1, 2]);
+  const [goal, evidence, latest] = transcript.messages;
+  expect(goal.message.content.length).toBeGreaterThan(0);
+  expect("old".repeat(200_000).startsWith(goal.message.content)).toBe(true);
+  expect(goal.content_complete).toBe(false);
+  expect(evidence.message.content.length).toBeGreaterThan(0);
+  expect("é𐐀\u0000\"".repeat(80_000).startsWith(evidence.message.content)).toBe(true);
+  expect(evidence.message.content).not.toContain("\ufffd");
+  expect(evidence.content_complete).toBe(false);
+  expect(latest.message).toEqual({ role: "user", content: "Newest question" });
+  expect(latest.content_complete).toBe(true);
 });
 
 test("real stdin envelopes retain session identities and unavailable IDs never collide", async () => {
@@ -345,9 +381,28 @@ test("cancel-safe transition checkpoints use the old session and drain prior cap
     "session_start", "session_shutdown",
   ]);
   expect(records[2].envelope?.session_id).toBe("old-session");
-  expect(records[2].envelope?.transcript_jsonl).toBe(`${JSON.stringify({ message: { role: "user", content: "Old conversation" } })}\n`);
+  expect(capturedTranscript(records[2].envelope?.transcript_jsonl).messages.map((record) => record.message))
+    .toEqual([{ role: "user", content: "Old conversation" }]);
   expect(records[7].envelope?.session_id).toBe("new-session");
-  expect(records[7].envelope?.transcript_jsonl).toBe(`${JSON.stringify({ message: { role: "user", content: "New conversation" } })}\n`);
+  expect(capturedTranscript(records[7].envelope?.transcript_jsonl).messages.map((record) => record.message))
+    .toEqual([{ role: "user", content: "New conversation" }]);
+});
+
+test("unavailable branch reports an incomplete window without losing shutdown identity", async () => {
+  const instance = host("branch-unavailable");
+  Object.defineProperty(instance.context.sessionManager, "getBranch", {
+    value: () => { throw new Error("disposed branch"); },
+  });
+  await instance.emit("session_shutdown");
+  const records = await fixtureRecords();
+  expect(records).toHaveLength(1);
+  expect(records[0].envelope).toMatchObject({
+    type: "session_shutdown", session_id: "branch-unavailable",
+  });
+  const transcript = capturedTranscript(records[0].envelope?.transcript_jsonl);
+  expect(transcript.window.incomplete).toBe(true);
+  expect(transcript.window.error).toBeDefined();
+  expect(transcript.messages).toEqual([]);
 });
 
 test("malformed tool inputs and throwing host getters do not poison later captures", async () => {

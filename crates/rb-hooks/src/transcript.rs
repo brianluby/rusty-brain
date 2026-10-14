@@ -392,7 +392,9 @@ fn digest_windows(
                     "haven't decided",
                     "do not adopt",
                     "don't adopt",
-                    "reject",
+                    "reject proposal",
+                    "reject that proposal",
+                    "reject the proposal",
                     "assistant said",
                     "assistant decided",
                 ]
@@ -443,6 +445,7 @@ fn digest_windows(
                 "preference:",
                 "correction:",
                 "reversal:",
+                "proposal:",
             ]
             .iter()
             .any(|p| lower.starts_with(p))
@@ -704,6 +707,40 @@ mod tests {
             turn("user", "Adopt proposal: storage"),
         ]);
         assert!(ambiguous.decisions.is_empty());
+    }
+
+    #[test]
+    fn rejection_actions_remain_confirmed_and_explicit_proposals_can_be_adopted() {
+        let correction = digest_from_lines([
+            turn("user", "Decision: auth: allow anonymous requests"),
+            turn("user", "Correction: auth: reject anonymous requests"),
+        ]);
+        assert_eq!(
+            correction.decisions,
+            vec!["Correction: auth: reject anonymous requests"]
+        );
+        assert_eq!(
+            correction.confirmed_evidence().next().unwrap().status,
+            EvidenceStatus::Correction
+        );
+        for rejection in [
+            "Decision: auth: reject proposal: anonymous access",
+            "Correction: auth: reject that proposal",
+            "Constraint: auth: reject the proposal",
+        ] {
+            assert!(digest_from_lines([turn("user", rejection)])
+                .decisions
+                .is_empty());
+        }
+        let adopted = digest_from_lines([
+            turn("assistant", "Proposal: storage: use SQLite only in tests"),
+            turn("user", "Adopt proposal: storage"),
+        ]);
+        assert_eq!(
+            adopted.decisions,
+            vec!["Adopt proposal: storage\nAdopted proposal: Proposal: storage: use SQLite only in tests"]
+        );
+        assert_eq!(adopted.evidence[0].status, EvidenceStatus::Proposal);
     }
 
     #[test]

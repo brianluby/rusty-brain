@@ -5,6 +5,17 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — PR #98 review remediations
+
+- Restrict proposal-rejection detection to rejection phrases, preserving confirmed
+  policies such as rejecting anonymous requests; support named `Proposal:` adoption
+  without dropping complete test/production qualifications.
+- Replace stale native OMP serialization assertions with lifecycle, source identity,
+  initial/recent-window, completeness and byte-bound behavior checks; cover unavailable
+  branches without fabricating messages.
+- Patch `quinn-proto` to 0.11.18 and `rustls` to 0.23.46, clearing nine security
+  advisories without advisory ignores or unrelated dependency refreshes.
+
 ### Fixed — Capture review regressions (#73, #74)
 
 - Apply ordered correction filtering before fact admission; retire every known

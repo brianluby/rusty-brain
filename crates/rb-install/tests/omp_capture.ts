@@ -129,6 +129,23 @@ try {
   assert.deepEqual((await checkpoint("correction-window", window.slice(0, 2))).map(note => note.id), windowFacts.map(note => note.id),
     "old head evidence must not return when its stored correction leaves the next window");
 
+  const auth = [
+    entry("auth-old", "user", "Decision: auth: allow anonymous requests"),
+    entry("auth-correction", "user", "Correction: auth: reject anonymous requests"),
+  ];
+  assert.deepEqual((await checkpoint("rejection-policy", auth.slice(0, 1))).map(note => note.content),
+    ["Decision: auth: allow anonymous requests"]);
+  assert.deepEqual((await checkpoint("rejection-policy", auth)).map(note => note.content),
+    ["Correction: auth: reject anonymous requests"],
+    "a rejection action must retire the earlier policy, not become an unconfirmed proposal");
+  const adopted = await checkpoint("explicit-proposal", [
+    entry("storage-proposal", "assistant", "Proposal: storage: use SQLite only in tests; production uses PostgreSQL"),
+    entry("storage-adoption", "user", "Adopt proposal: storage"),
+  ]);
+  assert.deepEqual(adopted.map(note => note.content),
+    ["Adopt proposal: storage\nAdopted proposal: Proposal: storage: use SQLite only in tests; production uses PostgreSQL"],
+    "explicit proposal adoption must retain the complete qualification");
+
   const ledger = [
     entry("ledger-pg", "user", "Decision: storage: use PostgreSQL CORRECTION-LEDGER"),
     entry("ledger-mysql", "user", "Decision: storage: use MySQL CORRECTION-LEDGER"),
@@ -162,7 +179,7 @@ try {
   } finally {
     db.close();
   }
-  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", correction_filtering_and_failure_recovery: "passed" }));
+  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", correction_filtering_and_failure_recovery: "passed", rejection_policy_and_explicit_proposal_adoption: "passed" }));
 } finally {
   daemon.kill();
   await daemon.exited;

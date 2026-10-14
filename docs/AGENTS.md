@@ -49,6 +49,9 @@ succeeding.
   Fenced contents are excluded from confirmation and adoption. Scoped adoption
   requires one complete retained named assistant proposal (`Adopt proposal: subject`
   or `yes, use that for subject`), even when the wider window is incomplete.
+  Assistant `Proposal: subject: value` supplies a named proposal, not confirmation.
+  Proposal-rejection phrases remain unconfirmed; a policy action such as
+  `Correction: auth: reject anonymous requests` is still a confirmed correction.
   `Decision: subject: value` and `Correction: subject: value` permit ordered,
   explicit same-session correction: obsolete retained evidence is not admitted,
   and every known earlier matching-subject fact is retired after the correction
