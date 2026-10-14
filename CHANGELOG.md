@@ -10,6 +10,10 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Restrict proposal-rejection detection to rejection phrases, preserving confirmed
   policies such as rejecting anonymous requests; support named `Proposal:` adoption
   without dropping complete test/production qualifications.
+- Keep unlabeled one-off task instructions in activity context, not critical
+  confirmed policy; retain explicit decision/preference language and scoped adoption.
+- Replace stale MCP full-toolset count assertions with required-tool and history
+  discoverability checks; verify both default and full transport modes.
 - Replace stale native OMP serialization assertions with lifecycle, source identity,
   initial/recent-window, completeness and byte-bound behavior checks; cover unavailable
   branches without fabricating messages.

@@ -145,6 +145,19 @@ try {
   assert.deepEqual(adopted.map(note => note.content),
     ["Adopt proposal: storage\nAdopted proposal: Proposal: storage: use SQLite only in tests; production uses PostgreSQL"],
     "explicit proposal adoption must retain the complete qualification");
+  const taskInstructions = [
+    "Use ripgrep to find the failing call",
+    "Use cargo test to verify it",
+    "Adopt the patch for this task",
+    "Fix the parser; it must not panic on empty input",
+    "Actually, use MySQL for another component",
+  ].map((text, index) => entry(`task-${index}`, "user", text));
+  assert.deepEqual(await checkpoint("one-off-task", taskInstructions), [],
+    "one-off user task instructions must not install critical standing policy");
+  const taskSummary = memories(await run("export", "--format", "json"))
+    .find(note => note.session_id === "one-off-task" && note.tags.includes("session-summary"));
+  assert.ok(taskSummary?.content.includes("Use ripgrep to find the failing call"),
+    "task prompts remain activity context, not confirmed policy");
 
   const ledger = [
     entry("ledger-pg", "user", "Decision: storage: use PostgreSQL CORRECTION-LEDGER"),
@@ -179,7 +192,7 @@ try {
   } finally {
     db.close();
   }
-  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", correction_filtering_and_failure_recovery: "passed", rejection_policy_and_explicit_proposal_adoption: "passed" }));
+  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", correction_filtering_and_failure_recovery: "passed", rejection_policy_and_explicit_proposal_adoption: "passed", one_off_task_policy_exclusion: "passed" }));
 } finally {
   daemon.kill();
   await daemon.exited;

@@ -373,9 +373,7 @@ fn digest_windows(
                     }
                 }
             }
-            let correction = lower.starts_with("correction:")
-                || lower.starts_with("reversal:")
-                || lower.starts_with("actually,");
+            let correction = lower.starts_with("correction:") || lower.starts_with("reversal:");
             let planning = raw.ends_with('?')
                 || raw.starts_with('>')
                 || raw.starts_with('"')
@@ -408,19 +406,11 @@ fn digest_windows(
                     "preference:",
                     "we decided ",
                     "i decided ",
-                    "we will use ",
-                    "let's use ",
-                    "going with ",
-                    "use ",
-                    "yes, use ",
                     "i prefer ",
                     "i confirm ",
-                    "adopt ",
                 ]
                 .iter()
-                .any(|p| lower.starts_with(p))
-                || lower.contains(" must not ")
-                || lower.contains(" should not ");
+                .any(|p| lower.starts_with(p));
             let status = if role == "user" && explicit && !planning {
                 if correction {
                     EvidenceStatus::Correction
@@ -741,6 +731,32 @@ mod tests {
             vec!["Adopt proposal: storage\nAdopted proposal: Proposal: storage: use SQLite only in tests"]
         );
         assert_eq!(adopted.evidence[0].status, EvidenceStatus::Proposal);
+    }
+
+    #[test]
+    fn one_off_task_instructions_do_not_become_confirmed_policy() {
+        let digest = digest_from_lines([
+            turn("user", "Use ripgrep to find the failing call"),
+            turn("user", "Use cargo test to verify it"),
+            turn("user", "Adopt the patch for this task"),
+            turn("user", "Fix the parser; it must not panic on empty input"),
+            turn("user", "This patch should not add a dependency"),
+            turn("user", "Actually, use MySQL for another component"),
+            turn("user", "Decision: storage: use SQLite"),
+            turn("user", "Constraint: parser: must not panic on empty input"),
+        ]);
+        assert_eq!(
+            digest.decisions,
+            vec![
+                "Decision: storage: use SQLite",
+                "Constraint: parser: must not panic on empty input"
+            ]
+        );
+        assert!(digest
+            .evidence
+            .iter()
+            .filter(|e| e.text.contains("patch") || e.text.starts_with("Fix the parser"))
+            .all(|e| e.status == EvidenceStatus::Proposal));
     }
 
     #[test]

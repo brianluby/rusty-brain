@@ -52,6 +52,8 @@ succeeding.
   Assistant `Proposal: subject: value` supplies a named proposal, not confirmation.
   Proposal-rejection phrases remain unconfirmed; a policy action such as
   `Correction: auth: reject anonymous requests` is still a confirmed correction.
+  Bare task imperatives and `must not`/`should not` substrings alone do not confirm
+  policy; use labeled facts or explicit decision/preference/confirmation language.
   `Decision: subject: value` and `Correction: subject: value` permit ordered,
   explicit same-session correction: obsolete retained evidence is not admitted,
   and every known earlier matching-subject fact is retired after the correction

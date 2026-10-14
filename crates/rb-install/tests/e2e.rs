@@ -893,9 +893,10 @@ async fn role_aware_native_folds_preserve_sources_facts_corrections_and_repeat_i
     assert!(corrected.iter().any(
         |m| m.content.starts_with("Correction: storage:") && m.content.contains("ORCHID-9282")
     ));
-    assert!(corrected
+    assert!(!corrected
         .iter()
-        .any(|m| m.content.starts_with("Actually, use MySQL") && m.context.contains("unresolved")));
+        .any(|m| m.tags.iter().any(|t| t == "confirmed-decision")
+            && m.content.starts_with("Actually, use MySQL")));
     let results = client
         .recall("SQLite WAL ORCHID-9282".into(), None, vec![], 10)
         .await
