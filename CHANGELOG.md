@@ -76,6 +76,12 @@ All notable changes to rusty-brain are documented here. The format is based on
   `mcp::ClientProxy::new` now require a `startup_timeout: Duration` argument
   (five seconds normally, 120 for local models). CLI/MCP resolve this from the
   existing embedding configuration; all workspace callers are migrated.
+- Preserve a healthy MCP connection when client-side capability validation refuses
+  a request, including after a reconnect; do not classify it as transport failure.
+- Share one absolute startup deadline across MCP reconnect attempts and backoff,
+  rather than granting each attempt a fresh five- or 120-second allowance.
+  Replace compile-only proxy wiring assertions with socket-level rejection and
+  deadline regressions.
 
 ### Fixed — PR #98 review remediations
 

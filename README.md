@@ -266,9 +266,11 @@ eligibility/ranking boost. Upgrade and restart the daemon to enforce it.
 
 Initial CLI/MCP daemon connection attempts share one socket/handshake deadline:
 five seconds normally, or 120 seconds when resolved configuration requests a local
-backend/model. Slow first-time model downloads can exceed that bound; run `serve`
-explicitly to prewarm them. Startup failures report the observed phase, child
-status when available, a redacted stderr tail and the attempt's log path.
+backend/model. All attempts and backoff within one MCP reconnect share that budget;
+client-side capability rejection leaves healthy connections intact. Slow first-time
+model downloads can exceed the startup bound; run `serve` explicitly to prewarm
+them. Startup failures report the observed phase, child status when available,
+a redacted stderr tail and the attempt's log path.
 Failed-attempt logs live under the cache directory's `rusty-brain/logs` (`0700`,
 files `0600`), retain at most 64 KiB per attempt, and prune completed logs toward
 an eight-file retention target without removing active attempts. The surfaced

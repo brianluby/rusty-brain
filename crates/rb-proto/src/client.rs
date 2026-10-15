@@ -142,6 +142,8 @@ where
     /// retry on a fresh connection is safe for any op; a RECV failure after a
     /// successful send means the daemon may have executed the request and only
     /// the response was lost, so only idempotent ops may be retried.
+    /// Local capability rejection returns `InvalidArgument` before writing and
+    /// leaves the connection healthy; callers must not treat it as transport loss.
     pub async fn send_request(&mut self, req: &Request) -> Result<()> {
         if request_uses_human_curation(req) && !self.supports_human_curation {
             return Err(Error::InvalidArgument(

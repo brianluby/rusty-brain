@@ -71,7 +71,7 @@ pub async fn connect_or_start(
 }
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
-const LOCAL_STARTUP_DEADLINE: Duration = Duration::from_secs(120);
+pub(crate) const LOCAL_STARTUP_DEADLINE: Duration = Duration::from_secs(120);
 const STARTUP_BACKOFF: Duration = Duration::from_millis(100);
 const STARTUP_LOG_LIMIT: u64 = 64 * 1024;
 const STARTUP_ERROR_LIMIT: usize = 8 * 1024;
