@@ -133,9 +133,10 @@ between strata (there are no strata, §1). What is enforced:
   PRD [contradiction/dedup review](prds/2026-07-02-contradiction-dedup-review.md), PR #63).
 - **Human-curation protection** — `remember --curated` and
   `update --curated` / `--uncurate` (or MCP `update.human_curated`) persist a
-  default-false maintenance marker. Automatic collapse, policy review, retention,
-  importance recalibration and unattended confidence decay recheck protection in
-  their mutation transaction. Explicit delete, supersede and review resolution
+  default-false maintenance marker. Automatic collapse, hook correction retirement,
+  policy review, retention, importance recalibration and unattended confidence
+  decay recheck protection in their mutation transaction. Explicit delete,
+  supersede and review resolution
   remain available; feedback, secret scrubbing and derived re-embedding still work.
   Protection is not authorization, trust, a rank boost or an eligibility bypass.
   JSON restore carries it onto new rows without overwriting existing duplicates.
@@ -364,6 +365,11 @@ zero writer ops):
   supersession. Inspection never writes access/confidence counters. Source pointers
   are `recorded_unverified` (or unavailable), not fetched content or freshness proof
   (`crates/rb-types/src/history.rs`; `crates/rb-store/src/store/history.rs`).
+  Human output escapes terminal controls; JSON preserves stored evidence. The
+  encoded response must fit the 1 MiB wire limit: optional edges, then non-target
+  chain rows are omitted with `truncated=true` when needed. Target evidence is
+  never clipped; oversized target detail returns an actionable size error rather
+  than closing the connection.
 - **Contract health** — declared here as part of Health by judgment call: the
   wire surface and on-disk migrations are digested and compared against a
   checked-in snapshot on every CI run; ANY drift fails until the author records a

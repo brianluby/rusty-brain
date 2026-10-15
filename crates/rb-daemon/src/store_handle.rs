@@ -3427,6 +3427,66 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purged_remember_target_retains_new_memory_and_publishes_only_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("purged-remember.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("purged-remember".into());
+        let mut old = note(&ns, "previous session summary");
+        old.created_at = chrono::Utc::now() - chrono::Duration::days(60);
+        old.updated_at = old.created_at;
+        let old_id = old.id.clone();
+        handle.write(old, Some(vec![1.0; DIM])).await.unwrap();
+        let outcome = handle
+            .retention_sweep(
+                ns.clone(),
+                rb_types::RetentionPolicy {
+                    enabled: true,
+                    max_age_days: Some(30),
+                    ..Default::default()
+                },
+                rb_types::ForgetMode::Hard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.purged, 1);
+        assert!(outcome.failure.is_none());
+        assert!(handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut events = handle.subscribe();
+        let replacement = note(&ns, "resumed session summary after hard forget");
+        let replacement_id = replacement.id.clone();
+        handle
+            .write_superseding(replacement, Some(vec![1.0; DIM]), old_id.clone(), false)
+            .await
+            .unwrap();
+        let retained = handle
+            .get(ns.clone(), replacement_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.archived_at.is_none() && retained.superseded_by.is_none());
+        assert!(handle.get(ns.clone(), old_id).await.unwrap().is_none());
+        let expected_seq = handle
+            .with_read({
+                let replacement_id = replacement_id.clone();
+                move |store| store.latest_oplog_seq_for(&replacement_id)
+            })
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        let changes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, replacement_id);
+        assert_eq!(changes[0].namespace, ns);
+        assert_eq!(changes[0].kind, rb_types::ChangeKind::Created);
+        assert_eq!(changes[0].seq, expected_seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn store_handle_supersede_archives_old_and_sets_pointer() {
         let dir = tempfile::tempdir().unwrap();
         let db = dir.path().join("rb.db");

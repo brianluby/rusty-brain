@@ -47,7 +47,7 @@ pub struct MemoryHistory {
     /// `true` when the bounded result contains a supersede cycle.
     #[serde(default)]
     pub cycle_detected: bool,
-    /// `true` when a depth, chain-member, or edge bound omitted rows.
+    /// `true` when a depth, chain-member, edge, or wire-byte bound omitted rows.
     #[serde(default)]
     pub truncated: bool,
 }

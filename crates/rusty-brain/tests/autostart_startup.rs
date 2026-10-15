@@ -7,6 +7,7 @@ use rb_types::{MemoryNote, MemoryType, Namespace};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Output, Stdio};
+use std::sync::Barrier;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -63,11 +64,8 @@ fn cli(executable: &Path, socket: &Path, database: &Path, config: &Path, cache: 
     command
 }
 
-#[test]
-fn cli_and_mcp_report_real_model_conflict_before_the_startup_deadline() {
-    let directory = tempfile::tempdir().unwrap();
-    let database = directory.path().join("memory.db");
-    let store = SqliteStore::open_with_model(&database, 512, "fixture-other-model").unwrap();
+fn model_conflict_database(database: &Path) {
+    let store = SqliteStore::open_with_model(database, 512, "fixture-other-model").unwrap();
     let mut note = MemoryNote::new(
         Namespace::Global,
         "A populated model-conflict startup fixture.".into(),
@@ -78,6 +76,13 @@ fn cli_and_mcp_report_real_model_conflict_before_the_startup_deadline() {
     note.embedding_input_version = "v2-composite".into();
     store.insert_memory(&note, Some(&vec![0.125; 512])).unwrap();
     drop(store);
+}
+
+#[test]
+fn cli_and_mcp_report_real_model_conflict_before_the_startup_deadline() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("memory.db");
+    model_conflict_database(&database);
 
     let executable = cargo_bin("rusty-brain");
     let config = directory.path().join("config");
@@ -114,6 +119,60 @@ fn cli_and_mcp_report_real_model_conflict_before_the_startup_deadline() {
             "{surface} emitted stdout on startup failure"
         );
     }
+}
+
+#[test]
+fn nine_overlapping_cli_starts_preserve_each_attempts_model_conflict() {
+    let directory = tempfile::tempdir().unwrap();
+    let executable = cargo_bin("rusty-brain");
+    let config = directory.path().join("config");
+    let cache = directory.path().join("cache");
+    let mut cleanups = Vec::new();
+    let commands: Vec<_> = (0..9)
+        .map(|index| {
+            let database = directory.path().join(format!("memory-{index}.db"));
+            model_conflict_database(&database);
+            let socket = directory
+                .path()
+                .join("runtime")
+                .join(format!("daemon-{index}.sock"));
+            cleanups.push(DaemonCleanup(socket.clone()));
+            let mut command = cli(&executable, &socket, &database, &config, &cache);
+            command.arg("status");
+            command
+        })
+        .collect();
+    let barrier = Barrier::new(commands.len());
+    thread::scope(|scope| {
+        let attempts: Vec<_> = commands
+            .into_iter()
+            .map(|command| {
+                let barrier = &barrier;
+                scope.spawn(move || {
+                    barrier.wait();
+                    run_before_deadline(command, Duration::from_secs(7))
+                })
+            })
+            .collect();
+        for (index, attempt) in attempts.into_iter().enumerate() {
+            let (output, elapsed) = attempt.join().unwrap();
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            assert!(
+                !output.status.success(),
+                "attempt {index} unexpectedly succeeded"
+            );
+            assert!(
+                elapsed < Duration::from_secs(6),
+                "attempt {index} took {elapsed:?}"
+            );
+            assert!(
+                stderr.contains("fixture-other-model"),
+                "attempt {index} lost its actual startup cause: {stderr}"
+            );
+            assert!(stderr.contains("redacted stderr tail"), "{stderr}");
+            assert!(output.stdout.is_empty(), "attempt {index} emitted stdout");
+        }
+    });
 }
 
 #[test]
@@ -186,6 +245,7 @@ fn internal_collector_keeps_the_bounded_true_tail_in_a_private_file() {
     let mut input = collector.stdin.take().unwrap();
     let mut bytes = vec![b'x'; LIMIT + 16];
     bytes[..5].copy_from_slice(b"FIRST");
+    bytes[15] = b'\n';
     let marker = b"LAST-END";
     let end = bytes.len();
     bytes[end - marker.len()..].copy_from_slice(marker);

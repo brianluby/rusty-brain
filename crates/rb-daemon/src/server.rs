@@ -1742,6 +1742,57 @@ where
     .await
 }
 
+fn history_frame_fits(response: &Response) -> Result<bool> {
+    struct ByteBudget(usize);
+    impl Write for ByteBudget {
+        fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+            self.0 = self.0.checked_sub(bytes.len()).ok_or_else(|| {
+                std::io::Error::other("history response exceeds the wire byte budget")
+            })?;
+            Ok(bytes.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    match serde_json::to_writer(ByteBudget(rb_proto::MAX_FRAME_BYTES), response) {
+        Ok(()) => Ok(true),
+        Err(error) if error.is_io() => Ok(false),
+        Err(error) => Err(Error::Serialization(error.to_string())),
+    }
+}
+
+fn bounded_history_response(history: rb_types::MemoryHistory) -> Result<Response> {
+    let mut response = Response::History { history };
+    if history_frame_fits(&response)? {
+        return Ok(response);
+    }
+    // Drop optional rows, never qualifications from the target's stored evidence.
+    if let Response::History { history } = &mut response {
+        history.edges.clear();
+        history.truncated = true;
+    }
+    if history_frame_fits(&response)? {
+        return Ok(response);
+    }
+    if let Response::History { history } = &mut response {
+        history.chain.retain(|entry| entry.is_target);
+        for entry in &mut history.chain {
+            entry.predecessors.clear();
+        }
+    }
+    if history_frame_fits(&response)? {
+        Ok(response)
+    } else {
+        Err(Error::InvalidArgument(
+            "history target detail exceeds the 1 MiB wire limit; reduce oversized \
+             summary, context, or other metadata before retrying; target evidence \
+             was not truncated"
+                .to_string(),
+        ))
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn dispatch<P>(
     engine: &MemoryEngine<StoreHandle, P>,
@@ -1913,6 +1964,16 @@ where
             Ok(()) => Response::Updated,
             Err(e) => error_to_response(e),
         },
+        Request::Delete { id } if provenance.origin_source.as_deref() == Some("hook") => {
+            match job_store.archive_unattended(namespace.clone(), id).await {
+                Ok(true) => Response::Deleted,
+                Ok(false) => error_to_response(Error::StalePlan(
+                    "automatic archive refused: target is missing, resolved, or human-curated"
+                        .into(),
+                )),
+                Err(e) => error_to_response(e),
+            }
+        }
         Request::Delete { id } => match engine.delete(id).await {
             Ok(()) => Response::Deleted,
             Err(e) => error_to_response(e),
@@ -2060,7 +2121,7 @@ where
                 )
                 .await
             {
-                Ok(history) => Response::History { history },
+                Ok(history) => bounded_history_response(history).unwrap_or_else(error_to_response),
                 Err(e) => error_to_response(e),
             }
         }
@@ -3111,6 +3172,75 @@ mod tests {
             .await
             .unwrap_err();
         assert!(err.to_string().contains("not found"), "{err:?}");
+
+        // Separately valid updates can make the combined history exceed one frame.
+        client
+            .update(
+                a.clone(),
+                rb_types::MemoryUpdates {
+                    summary: Some("a".repeat(600 * 1024)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        client
+            .update(
+                rival.clone(),
+                rb_types::MemoryUpdates {
+                    summary: Some("r".repeat(600 * 1024)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let bounded = client.history(c.clone(), None).await.unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(bounded.chain.len(), 3);
+        assert!(bounded.edges.is_empty());
+        client
+            .update(
+                c.clone(),
+                rb_types::MemoryUpdates {
+                    context: Some("c".repeat(600 * 1024)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let ops_before = store.writer_ops_count();
+        let bounded = client.history(c.clone(), None).await.unwrap();
+        assert!(bounded.truncated);
+        assert_eq!(bounded.chain.len(), 1);
+        assert_eq!(bounded.chain[0].id, c);
+        assert!(bounded.chain[0].predecessors.is_empty());
+        assert!(bounded.edges.is_empty());
+        assert_eq!(
+            bounded.chain[0].evidence.as_ref().unwrap().context,
+            "c".repeat(600 * 1024)
+        );
+        assert_eq!(store.writer_ops_count(), ops_before);
+
+        // Escaping makes 900 KiB of raw metadata exceed the 1 MiB wire budget.
+        client
+            .update(
+                c.clone(),
+                rb_types::MemoryUpdates {
+                    summary: Some("\"".repeat(600 * 1024 / 2)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let err = client.history(c.clone(), Some(1)).await.unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("history target detail exceeds the 1 MiB wire limit"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("not truncated"), "{err}");
+        // A bounded error must leave the connection usable.
+        client.ping().await.unwrap();
 
         drop(client);
         let _ = shutdown_tx.send(());

@@ -311,7 +311,10 @@ fn startup_failure(
     if let Some(path) = &daemon.log_path {
         let pointer = rb_redact::redact(&path.display().to_string());
         message.push_str(&format!("; startup stderr log: {pointer}"));
-        if let Some(excerpt) = read_startup_log(path) {
+        let capture_complete = daemon
+            .collector_status
+            .is_some_and(|status| status.success());
+        if let Some(excerpt) = read_startup_log(path, capture_complete) {
             if !excerpt.is_empty() {
                 message.push_str("; redacted stderr tail:\n");
                 message.push_str(&excerpt);
@@ -351,6 +354,7 @@ struct ManagedDaemon {
     collector: Option<Child>,
     collector_status: Option<ExitStatus>,
     log_path: Option<PathBuf>,
+    log_guard: Option<File>,
 }
 
 impl ManagedDaemon {
@@ -371,6 +375,10 @@ impl ManagedDaemon {
                 let _ = fs::remove_file(path);
             }
         }
+        drop(self.log_guard);
+        if let Some(directory) = self.log_path.as_deref().and_then(Path::parent) {
+            let _ = prune_startup_logs(directory);
+        }
         let mut child = self.child;
         let mut collector = self.collector;
         let _ = thread::Builder::new()
@@ -384,23 +392,26 @@ impl ManagedDaemon {
     }
 }
 
-fn read_startup_log(path: &Path) -> Option<String> {
+fn read_startup_log(path: &Path, capture_complete: bool) -> Option<String> {
     let file = File::open(path).ok()?;
     let mut bytes = Vec::with_capacity(STARTUP_LOG_LIMIT as usize);
     file.take(STARTUP_LOG_LIMIT).read_to_end(&mut bytes).ok()?;
-    let start = bytes.len().saturating_sub(STARTUP_ERROR_LIMIT);
-    let decoded = String::from_utf8_lossy(&bytes[start..]);
-    let redacted = rb_redact::redact(&decoded);
-    let mut safe = String::with_capacity(redacted.len().min(STARTUP_ERROR_LIMIT));
-    for character in redacted.chars() {
-        if !character.is_control() || matches!(character, '\n' | '\t') {
-            if safe.len().saturating_add(character.len_utf8()) > STARTUP_ERROR_LIMIT {
-                break;
-            }
-            safe.push(character);
-        }
+    if !capture_complete {
+        let complete_end = bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |position| position + 1);
+        bytes.truncate(complete_end);
     }
-    Some(safe)
+    let decoded = String::from_utf8_lossy(&bytes);
+    let mut redacted = rb_redact::redact(&decoded);
+    redacted.retain(|character| !character.is_control() || matches!(character, '\n' | '\t'));
+    let mut start = redacted.len().saturating_sub(STARTUP_ERROR_LIMIT);
+    while !redacted.is_char_boundary(start) {
+        start += 1;
+    }
+    redacted.drain(..start);
+    Some(redacted)
 }
 
 /// Run the hidden, standalone stderr drainer before normal CLI initialization.
@@ -429,14 +440,21 @@ pub fn run_internal_startup_log_collector() -> Option<std::process::ExitCode> {
 fn collect_startup_stderr(path: &Path, capture_for: Duration) -> std::process::ExitCode {
     let mut log = open_collector_log(path);
     let mut failed = log.is_none();
-    let mut tail = VecDeque::with_capacity(STARTUP_LOG_LIMIT as usize);
+    let mut tail = StartupTail::new();
     let capture_until = std::time::Instant::now() + capture_for;
     let stdin = io::stdin();
     let mut input = stdin.lock();
     let mut buffer = [0; 8192];
     loop {
         let count = match input.read(&mut buffer) {
-            Ok(0) => break,
+            Ok(0) => {
+                if std::time::Instant::now() < capture_until {
+                    if let Some(file) = &mut log {
+                        failed |= write_startup_tail(file, &tail, true).is_err();
+                    }
+                }
+                break;
+            }
             Ok(count) => count,
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
             Err(_) => {
@@ -450,7 +468,7 @@ fn collect_startup_stderr(path: &Path, capture_for: Duration) -> std::process::E
         extend_startup_tail(&mut tail, &buffer[..count]);
         let write_failed = log
             .as_mut()
-            .is_some_and(|file| write_startup_tail(file, &tail).is_err());
+            .is_some_and(|file| write_startup_tail(file, &tail, false).is_err());
         if write_failed {
             failed = true;
             log = None;
@@ -508,24 +526,73 @@ fn open_collector_log(path: &Path) -> Option<File> {
     OpenOptions::new().read(true).write(true).open(path).ok()
 }
 
-fn extend_startup_tail(tail: &mut VecDeque<u8>, bytes: &[u8]) {
-    let limit = STARTUP_LOG_LIMIT as usize;
-    if bytes.len() >= limit {
-        tail.clear();
-        tail.extend(bytes[bytes.len() - limit..].iter().copied());
-        return;
-    }
-    let remove = tail.len().saturating_add(bytes.len()).saturating_sub(limit);
-    drop(tail.drain(..remove));
-    tail.extend(bytes.iter().copied());
+struct StartupTail {
+    bytes: VecDeque<u8>,
+    starts_mid_record: bool,
 }
 
-fn write_startup_tail(file: &mut File, tail: &VecDeque<u8>) -> io::Result<()> {
+impl StartupTail {
+    fn new() -> Self {
+        Self {
+            bytes: VecDeque::with_capacity(STARTUP_LOG_LIMIT as usize),
+            starts_mid_record: false,
+        }
+    }
+}
+
+fn extend_startup_tail(tail: &mut StartupTail, bytes: &[u8]) {
+    let limit = STARTUP_LOG_LIMIT as usize;
+    if bytes.len() >= limit {
+        let start = bytes.len() - limit;
+        let previous = if start == 0 {
+            tail.bytes.back().copied()
+        } else {
+            Some(bytes[start - 1])
+        };
+        tail.starts_mid_record = previous.is_some_and(|byte| byte != b'\n');
+        tail.bytes.clear();
+        tail.bytes.extend(bytes[start..].iter().copied());
+        return;
+    }
+    let remove = tail
+        .bytes
+        .len()
+        .saturating_add(bytes.len())
+        .saturating_sub(limit);
+    if remove > 0 {
+        tail.starts_mid_record = tail.bytes[remove - 1] != b'\n';
+        drop(tail.bytes.drain(..remove));
+    }
+    tail.bytes.extend(bytes.iter().copied());
+}
+
+fn write_startup_tail(file: &mut File, tail: &StartupTail, end_of_stream: bool) -> io::Result<()> {
+    let start = if tail.starts_mid_record {
+        tail.bytes
+            .iter()
+            .position(|&byte| byte == b'\n')
+            .map_or(tail.bytes.len(), |position| position + 1)
+    } else {
+        0
+    };
+    // A live snapshot must not expose a credential cut off before its closing quote.
+    let end = if end_of_stream {
+        tail.bytes.len()
+    } else {
+        tail.bytes
+            .iter()
+            .rposition(|&byte| byte == b'\n')
+            .map_or(0, |position| position + 1)
+    };
     file.set_len(0)?;
     file.seek(SeekFrom::Start(0))?;
-    let (first, second) = tail.as_slices();
-    file.write_all(first)?;
-    file.write_all(second)?;
+    if start < end {
+        let (first, second) = tail.bytes.as_slices();
+        file.write_all(&first[start.min(first.len())..end.min(first.len())])?;
+        file.write_all(
+            &second[start.saturating_sub(first.len())..end.saturating_sub(first.len())],
+        )?;
+    }
     file.flush()
 }
 
@@ -558,15 +625,15 @@ fn spawn_observed_with_log_directory(
     directory: Option<&Path>,
     capture_for: Duration,
 ) -> Result<ManagedDaemon> {
-    let (log_path, collector) =
+    let (log_path, log_guard, collector) =
         match directory.and_then(|directory| diagnostic_stderr(directory, self_exe, capture_for)) {
-            Some((stderr, path, collector)) => {
+            Some((stderr, path, guard, collector)) => {
                 command.stderr(stderr);
-                (Some(path), Some(collector))
+                (Some(path), Some(guard), Some(collector))
             }
             None => {
                 command.stderr(Stdio::null());
-                (None, None)
+                (None, None, None)
             }
         };
     match command.spawn() {
@@ -575,6 +642,7 @@ fn spawn_observed_with_log_directory(
             collector,
             collector_status: None,
             log_path,
+            log_guard,
         }),
         Err(error) => {
             if let Some(path) = log_path {
@@ -596,9 +664,8 @@ fn diagnostic_stderr(
     directory: &Path,
     self_exe: &Path,
     capture_for: Duration,
-) -> Option<(Stdio, PathBuf, Child)> {
-    let (path, file) = create_startup_log(directory).ok()?;
-    drop(file);
+) -> Option<(Stdio, PathBuf, File, Child)> {
+    let (path, guard) = create_startup_log(directory).ok()?;
     let mut collector = Command::new(self_exe);
     collector
         .arg(STARTUP_COLLECTOR_ARG)
@@ -621,7 +688,7 @@ fn diagnostic_stderr(
         }
     };
     match child.stdin.take() {
-        Some(stdin) => Some((Stdio::from(stdin), path, child)),
+        Some(stdin) => Some((Stdio::from(stdin), path, guard, child)),
         None => {
             let _ = thread::Builder::new()
                 .name("rusty-brain-startup-log-reaper".into())
@@ -648,7 +715,6 @@ fn startup_log_directory() -> io::Result<PathBuf> {
     ensure_log_directory(&root, false)?;
     let logs = root.join("logs");
     ensure_log_directory(&logs, true)?;
-    prune_startup_logs(&logs)?;
     Ok(logs)
 }
 
@@ -702,8 +768,33 @@ fn create_startup_log(directory: &Path) -> io::Result<(PathBuf, File)> {
             "startup-{}-{timestamp}-{sequence}.log",
             std::process::id()
         ));
-        match open_private_startup_log(&path) {
-            Ok(file) => return Ok((path, file)),
+        let pending = path.with_extension("pending");
+        match open_private_startup_log(&pending) {
+            Ok(file) => {
+                // Publish only after locking, without replacing an existing file or symlink.
+                let published = file
+                    .try_lock()
+                    .map_err(io::Error::from)
+                    .and_then(|()| fs::hard_link(&pending, &path));
+                let _ = fs::remove_file(&pending);
+                match published {
+                    Ok(()) => {
+                        let _ = prune_startup_logs(directory);
+                        return Ok((path, file));
+                    }
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            io::ErrorKind::AlreadyExists
+                                | io::ErrorKind::WouldBlock
+                                | io::ErrorKind::NotFound
+                        ) =>
+                    {
+                        continue
+                    }
+                    Err(error) => return Err(error),
+                }
+            }
             Err(error) if error.kind() == io::ErrorKind::AlreadyExists => continue,
             Err(error) => return Err(error),
         }
@@ -714,7 +805,7 @@ fn create_startup_log(directory: &Path) -> io::Result<(PathBuf, File)> {
     ))
 }
 
-// shortcut: concurrent launchers can exceed retention; serialize creation if a strict file cap is needed.
+// shortcut: active attempts can exceed retention; never evict unconsumed diagnostics.
 fn prune_startup_logs(directory: &Path) -> io::Result<()> {
     let mut logs = Vec::new();
     for entry in fs::read_dir(directory)? {
@@ -724,17 +815,30 @@ fn prune_startup_logs(directory: &Path) -> io::Result<()> {
         {
             continue;
         }
-        let modified = entry
+        let path = entry.path();
+        let pending = path.extension() == Some(std::ffi::OsStr::new("pending"));
+        if !pending && path.extension() != Some(std::ffi::OsStr::new("log")) {
+            continue;
+        }
+        let Ok(file) = OpenOptions::new().read(true).write(true).open(&path) else {
+            continue;
+        };
+        if file.try_lock().is_err() {
+            continue;
+        }
+        if pending {
+            let _ = fs::remove_file(path);
+            continue;
+        }
+        let modified = file
             .metadata()
             .and_then(|metadata| metadata.modified())
             .unwrap_or(UNIX_EPOCH);
-        logs.push((modified, entry.path()));
+        logs.push((modified, path, file));
     }
     logs.sort_by_key(|entry| entry.0);
-    let remove_count = logs
-        .len()
-        .saturating_sub(RETAINED_STARTUP_LOGS.saturating_sub(1));
-    for (_, path) in logs.into_iter().take(remove_count) {
+    let remove_count = logs.len().saturating_sub(RETAINED_STARTUP_LOGS);
+    for (_, path, _guard) in logs.into_iter().take(remove_count) {
         let _ = fs::remove_file(path);
     }
     Ok(())
@@ -966,6 +1070,7 @@ mod tests {
                     collector: None,
                     collector_status: None,
                     log_path: None,
+                    log_guard: None,
                 })
             },
             Instant::now() + Duration::from_millis(60),
@@ -1008,6 +1113,7 @@ mod tests {
                     collector: Some(collector),
                     collector_status: None,
                     log_path: Some(log_path),
+                    log_guard: None,
                 })
             },
             deadline,
@@ -1052,6 +1158,7 @@ mod tests {
                     collector: None,
                     collector_status: None,
                     log_path: None,
+                    log_guard: None,
                 })
             },
             Instant::now() + Duration::from_secs(1),
@@ -1076,6 +1183,7 @@ mod tests {
             collector: None,
             collector_status: None,
             log_path: None,
+            log_guard: None,
         }
         .detach(false);
 
@@ -1091,12 +1199,16 @@ mod tests {
         let mut child_for_wait = child;
         let status = child_for_wait.wait().unwrap();
         let (root, path) = test_log();
-        fs::write(&path, log).unwrap();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        file.write_all(log).unwrap();
+        file.write_all(b"\n").unwrap();
+        drop(file);
         let daemon = ManagedDaemon {
             child: child_for_wait,
             collector: None,
             collector_status: None,
             log_path: Some(path),
+            log_guard: None,
         };
         let error = startup_failure(
             &daemon,
@@ -1142,13 +1254,14 @@ mod tests {
         let (root, path) = test_log();
         let mut bytes = vec![b'x'; STARTUP_LOG_LIMIT as usize + 16];
         bytes[..5].copy_from_slice(b"FIRST");
+        bytes[15] = b'\n';
         let marker = b"LAST-END";
         let end = bytes.len();
         bytes[end - marker.len()..].copy_from_slice(marker);
-        let mut tail = VecDeque::with_capacity(STARTUP_LOG_LIMIT as usize);
+        let mut tail = StartupTail::new();
         extend_startup_tail(&mut tail, &bytes);
         let mut file = OpenOptions::new().write(true).open(&path).unwrap();
-        write_startup_tail(&mut file, &tail).unwrap();
+        write_startup_tail(&mut file, &tail, true).unwrap();
         drop(file);
 
         let stored = fs::read(&path).unwrap();
@@ -1160,6 +1273,157 @@ mod tests {
             0o600
         );
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_log_redacts_before_selecting_the_display_tail() {
+        let log = format!(
+            "model mismatch: fixture-other-model; password={}\nprovider configuration rejected\n",
+            "lowentropy".repeat(STARTUP_ERROR_LIMIT / 5)
+        );
+        assert!(log.len() > STARTUP_ERROR_LIMIT);
+        assert!(log.len() < STARTUP_LOG_LIMIT as usize);
+        let error = startup_error_for_child("exit 7", log.as_bytes());
+        assert!(error.contains("fixture-other-model"));
+        assert!(error.contains("provider configuration rejected"));
+        assert!(error.contains("[REDACTED:credential]"));
+        assert!(!error.contains("lowentropy"));
+    }
+
+    #[test]
+    fn startup_log_display_tail_is_utf8_safe_and_control_free() {
+        let (root, path) = test_log();
+        let mut log = "界".repeat(STARTUP_ERROR_LIMIT).into_bytes();
+        log.extend_from_slice(b"\xff\x1b\nmodel conflict\n");
+        fs::write(&path, &log).unwrap();
+        let excerpt = read_startup_log(&path, true).unwrap();
+        assert!(excerpt.len() <= STARTUP_ERROR_LIMIT);
+        assert!(excerpt.starts_with('界'));
+        assert!(excerpt.contains('\u{fffd}'));
+        assert!(!excerpt.contains('\u{1b}'));
+        assert!(excerpt.ends_with("model conflict\n"));
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_tail_drops_the_secret_record_when_the_ring_loses_its_key() {
+        let (root, path) = test_log();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        let secret = format!("password={}", "lowentropy".repeat(STARTUP_ERROR_LIMIT));
+        for chunk_size in [8192, secret.len()] {
+            let mut tail = StartupTail::new();
+            for chunk in secret.as_bytes().chunks(chunk_size) {
+                extend_startup_tail(&mut tail, chunk);
+                assert!(tail.bytes.len() <= STARTUP_LOG_LIMIT as usize);
+            }
+            assert!(tail.starts_mid_record);
+            write_startup_tail(&mut file, &tail, true).unwrap();
+            assert!(fs::read(&path).unwrap().is_empty());
+            extend_startup_tail(
+                &mut tail,
+                b"continued-secret\nmodel conflict: genuine cause\n",
+            );
+            write_startup_tail(&mut file, &tail, true).unwrap();
+            assert_eq!(
+                read_startup_log(&path, true).unwrap(),
+                "model conflict: genuine cause\n"
+            );
+            assert_eq!(fs::read(&path).unwrap(), b"model conflict: genuine cause\n");
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_tail_withholds_partial_records_until_eof() {
+        let (root, path) = test_log();
+        let mut file = OpenOptions::new().write(true).open(&path).unwrap();
+        let mut tail = StartupTail::new();
+        extend_startup_tail(
+            &mut tail,
+            b"provider rejected configuration\npassword=\"lowentropy",
+        );
+        write_startup_tail(&mut file, &tail, false).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"provider rejected configuration\n"
+        );
+        extend_startup_tail(&mut tail, b"secret\"");
+        write_startup_tail(&mut file, &tail, false).unwrap();
+        assert_eq!(
+            fs::read(&path).unwrap(),
+            b"provider rejected configuration\n"
+        );
+        write_startup_tail(&mut file, &tail, true).unwrap();
+        assert_eq!(
+            read_startup_log(&path, false).unwrap(),
+            "provider rejected configuration\n"
+        );
+        let excerpt = read_startup_log(&path, true).unwrap();
+        assert!(excerpt.contains("[REDACTED:credential]"));
+        assert!(!excerpt.contains("lowentropy"));
+        fs::write(
+            &path,
+            b"provider rejected configuration\npassword=\"partial",
+        )
+        .unwrap();
+        assert_eq!(
+            read_startup_log(&path, false).unwrap(),
+            "provider rejected configuration\n"
+        );
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn startup_pruning_protects_nine_active_attempts_then_reclaims_completed_logs() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut attempts: Vec<_> = (0..9)
+            .map(|_| create_startup_log(directory.path()).unwrap())
+            .collect();
+        for (path, _) in &attempts {
+            fs::write(path, b"model conflict: genuine cause\n").unwrap();
+        }
+        prune_startup_logs(directory.path()).unwrap();
+        assert!(attempts.iter().all(|(path, _)| path.exists()));
+        let (completed, guard) = attempts.remove(0);
+        let mut collector = OpenOptions::new().write(true).open(&completed).unwrap();
+        drop(guard);
+        prune_startup_logs(directory.path()).unwrap();
+        assert!(
+            completed.exists(),
+            "active attempts do not consume completed-log retention"
+        );
+        for (path, _) in &attempts {
+            assert_eq!(
+                read_startup_log(path, false).unwrap(),
+                "model conflict: genuine cause\n"
+            );
+        }
+        collector.set_modified(UNIX_EPOCH).unwrap();
+        drop(attempts);
+        prune_startup_logs(directory.path()).unwrap();
+        assert!(!completed.exists());
+        assert_eq!(
+            fs::read_dir(directory.path()).unwrap().count(),
+            RETAINED_STARTUP_LOGS
+        );
+        // An open stderr drainer neither pins retention nor fails after unlink.
+        collector.write_all(b"still draining").unwrap();
+    }
+
+    #[test]
+    fn startup_pruning_reclaims_abandoned_publication_files() {
+        let directory = tempfile::tempdir().unwrap();
+        let abandoned = directory.path().join("startup-abandoned.pending");
+        drop(open_private_startup_log(&abandoned).unwrap());
+        let active = directory.path().join("startup-active.pending");
+        let guard = open_private_startup_log(&active).unwrap();
+        guard.try_lock().unwrap();
+        prune_startup_logs(directory.path()).unwrap();
+        assert!(!abandoned.exists());
+        assert!(active.exists());
+        drop(guard);
+        prune_startup_logs(directory.path()).unwrap();
+        assert!(!active.exists());
     }
 
     #[cfg(unix)]

@@ -1295,7 +1295,7 @@ mod tests {
     use super::*;
     use crate::transcript;
 
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
     use std::time::Duration;
 
     use rb_proto::{
@@ -1303,6 +1303,7 @@ mod tests {
     };
     use rb_types::Namespace;
     use tokio::net::UnixListener;
+    use tokio::sync::Mutex;
     use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
     fn scratch_at(tmp: &std::path::Path) -> Scratch {
@@ -1316,6 +1317,8 @@ mod tests {
         remembers: Vec<(String, Option<MemoryId>, Vec<rb_types::MemoryAnchor>)>,
         evidence: Vec<Option<rb_types::CaptureEvidence>>,
         issued: Vec<MemoryId>,
+        archives: Vec<MemoryId>,
+        refused_archives: Vec<MemoryId>,
     }
 
     /// Accept ONE connection, handshake-ack, then answer every Remember on it with
@@ -1353,11 +1356,23 @@ mod tests {
                     ..
                 } => {
                     let id = MemoryId::new();
-                    let mut s = state.lock().unwrap();
+                    let mut s = state.lock().await;
                     s.remembers.push((content, supersedes, anchors));
                     s.evidence.push(evidence);
                     s.issued.push(id.clone());
                     Response::Remembered { id }
+                }
+                Request::Delete { id } => {
+                    let mut s = state.lock().await;
+                    s.archives.push(id.clone());
+                    if s.refused_archives.contains(&id) {
+                        Response::Error {
+                            kind: "stale_plan".into(),
+                            message: "automatic archive refused: human-curated".into(),
+                        }
+                    } else {
+                        Response::Deleted
+                    }
                 }
                 _ => Response::Pong {
                     contract_version: CONTRACT_VERSION,
@@ -2910,6 +2925,68 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn refused_older_fact_retirement_is_not_marked_retired_and_retries() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket = tmp.path().join("daemon.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        let protected = MemoryId::new();
+        let newer = MemoryId::new();
+        let correction = MemoryId::new();
+        let state = Arc::new(Mutex::new(MockObserved {
+            refused_archives: vec![protected.clone()],
+            ..Default::default()
+        }));
+        let server = tokio::spawn(serve_remembers(listener, Arc::clone(&state)));
+        let mut client = DaemonClient::connect(
+            &socket,
+            Namespace::Project("protected-older-fact".into()),
+            Duration::from_secs(5),
+            None,
+            Some(rb_proto::ClientIdentity {
+                source: Some("hook".into()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let scratch = scratch_at(tmp.path());
+        for (offset, (id, text)) in [
+            (&protected, "Decision: database: PostgreSQL"),
+            (&newer, "Decision: database: MySQL"),
+            (&correction, "Correction: database: SQLite"),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            scratch.record_fact(scratch::CapturedFact {
+                source: format!("transcript; message={offset}"),
+                text: text.into(),
+                subject: Some("database".into()),
+                memory_id: id.to_string(),
+                offset,
+                text_line: 0,
+                retired: false,
+            });
+        }
+
+        store_confirmed_facts(&mut client, &scratch, &TranscriptDigest::default()).await;
+        let facts = scratch.read().facts;
+        assert!(
+            !facts[0].retired,
+            "refusal must preserve the older fact's retry state"
+        );
+        assert!(facts[1].retired, "successful retirement is still recorded");
+        assert!(!facts[2].retired);
+        assert_eq!(state.lock().await.archives, vec![protected.clone(), newer]);
+
+        store_confirmed_facts(&mut client, &scratch, &TranscriptDigest::default()).await;
+        assert!(!scratch.read().facts[0].retired);
+        assert_eq!(state.lock().await.archives.last(), Some(&protected));
+        assert_eq!(state.lock().await.archives.len(), 3);
+        server.abort();
+    }
+
+    #[tokio::test]
     async fn session_checkpoint_stored_path_retains_scratch_and_supersedes() {
         // The novel semantic of this PR, exercised through a LIVE store (not the
         // degraded `client = None` path): a stored checkpoint must call
@@ -2961,7 +3038,7 @@ mod tests {
             "a second stored checkpoint still retains the buffer"
         );
 
-        let observed = state.lock().unwrap();
+        let observed = state.lock().await;
         assert_eq!(
             observed.remembers.len(),
             2,
@@ -3026,7 +3103,7 @@ mod tests {
         let result = session_end(Some(&mut client), Some(&scratch), tmp.path(), None).await;
         assert!(result.continue_execution);
 
-        let observed = state.lock().unwrap();
+        let observed = state.lock().await;
         assert_eq!(observed.remembers.len(), 1, "one summary Remember");
         let anchors = &observed.remembers[0].2;
         let values: Vec<&str> = anchors.iter().map(|a| a.value.as_str()).collect();
@@ -3103,7 +3180,7 @@ mod tests {
         .await;
         assert!(result.continue_execution);
 
-        let observed = state.lock().unwrap();
+        let observed = state.lock().await;
         assert_eq!(observed.remembers.len(), 1, "one folded summary");
         let stored = &observed.remembers[0].0;
         for poison in [
@@ -3166,7 +3243,7 @@ mod tests {
         .await;
         assert!(result.continue_execution);
         assert!(
-            state.lock().unwrap().remembers.is_empty(),
+            state.lock().await.remembers.is_empty(),
             "a planted standing directive must never become a durable decision"
         );
 
@@ -3179,7 +3256,7 @@ mod tests {
             Some("Decided: quarantine HTTP-origin rows at recall (write gate #69)"),
         )
         .await;
-        assert!(state.lock().unwrap().remembers.is_empty());
+        assert!(state.lock().await.remembers.is_empty());
 
         server.abort();
     }
@@ -3213,7 +3290,7 @@ mod tests {
         scratch2.append(scratch::Kind::File, "src/lib.rs");
         session_end(Some(&mut client), Some(&scratch2), tmp.path(), None).await;
 
-        let observed = state.lock().unwrap();
+        let observed = state.lock().await;
         assert_eq!(observed.evidence.len(), 2);
         assert!(observed.evidence[0].is_none());
         assert!(

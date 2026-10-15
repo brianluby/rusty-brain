@@ -33,6 +33,27 @@ All notable changes to rusty-brain are documented here. The format is based on
   resolved, without rewriting established lineage or publishing a false archive;
   curation refusals still roll back the entire replacement transaction.
 
+### Fixed — Trusted-memory adversarial review
+
+- Redact complete retained startup records before selecting the displayed tail;
+  omit capture-ring fragments and incomplete live records instead of exposing
+  credential values after their identifying prefixes or closing quotes are lost.
+- Protect active startup logs with process-held file locks until readiness or
+  failure diagnostics are consumed. Retain up to eight completed logs separately
+  from active attempts; reclaim abandoned publication files without following links.
+- Route hook correction retirement through namespace-scoped transactional curation
+  checks. Refused facts remain unretired in the capture ledger; deliberate user
+  deletion still overrides protection.
+- Preserve new lifecycle summaries after their previous summary was hard-purged,
+  advancing session scratch without a false archive event. Existing foreign-
+  namespace and curated-target refusals remain atomic.
+- Escape terminal controls in human history claims, context, provenance, anchors
+  and related timeline text while leaving JSON evidence unchanged.
+- Enforce the history response's encoded 1 MiB wire budget, omitting optional
+  linked/chain rows with an explicit truncation marker. Oversized target detail
+  returns an actionable error without truncating qualifications or closing the
+  connection.
+
 ### Fixed — PR #98 review remediations
 
 - Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed

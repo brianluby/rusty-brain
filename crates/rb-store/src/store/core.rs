@@ -354,8 +354,8 @@ impl SqliteStore {
             .map_err(|e| Error::Storage(e.to_string()))
     }
     /// Insert a replacement and retire an active target atomically. A curation
-    /// refusal rolls back the replacement; an already-resolved target keeps its
-    /// established lineage while the new memory is retained.
+    /// refusal rolls back the replacement; missing or already-resolved targets
+    /// retain the new memory without changing existing lineage.
     pub fn insert_superseding_memory(
         &self,
         note: &MemoryNote,
@@ -374,22 +374,22 @@ impl SqliteStore {
             anchor.validate()?;
         }
         immediate_tx(&self.conn, || {
-            let old_note = self
-                .get_memory(old)?
-                .ok_or_else(|| Error::NotFound(old.clone()))?;
-            if old_note.namespace != note.namespace {
-                return Err(Error::NotFound(old.clone()));
-            }
-            if old_note.human_curated && !allow_curated_supersede {
-                return Err(Error::StalePlan(format!(
-                    "{old} is human-curated; an explicit user supersede is required"
-                )));
+            let old_note = self.get_memory(old)?;
+            if let Some(old_note) = &old_note {
+                if old_note.namespace != note.namespace {
+                    return Err(Error::NotFound(old.clone()));
+                }
+                if old_note.human_curated && !allow_curated_supersede {
+                    return Err(Error::StalePlan(format!(
+                        "{old} is human-curated; an explicit user supersede is required"
+                    )));
+                }
             }
             self.insert_memory_tx_body(note, embedding)?;
             let created_seq = self
                 .latest_oplog_seq_for(&note.id)?
                 .ok_or_else(|| Error::Storage("insert oplog row is missing".to_string()))?;
-            if old_note.archived_at.is_some() || old_note.superseded_by.is_some() {
+            if old_note.is_none_or(|old| old.archived_at.is_some() || old.superseded_by.is_some()) {
                 return Ok((created_seq, None));
             }
             self.supersede_in_tx(old, &note.id)?;
@@ -5364,6 +5364,80 @@ mod near_duplicates_tests {
         let resolved = store.get_memory(&old.id).unwrap().unwrap();
         assert!(resolved.human_curated && resolved.archived_at.is_some());
         assert_eq!(resolved.superseded_by, Some(replacement.id));
+    }
+
+    #[test]
+    fn purged_supersede_target_retains_replacement_without_archive_receipt() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("purged-summary".into());
+        let old = MemoryNote::new(
+            ns.clone(),
+            "previous session summary".into(),
+            MemoryType::Insight,
+            4,
+        );
+        store.insert_memory(&old, None).unwrap();
+        assert!(store.purge_memory_for_retention(&old.id, "").unwrap());
+        let before = store.last_oplog_seq().unwrap();
+        let replacement = MemoryNote::new(
+            ns.clone(),
+            "resumed session summary".into(),
+            MemoryType::Insight,
+            4,
+        );
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let (created_seq, archived_seq) = store
+            .insert_superseding_memory(&replacement, Some(&vector), &old.id, false)
+            .unwrap();
+        assert!(archived_seq.is_none());
+        assert_eq!(created_seq, before + 1);
+        assert_eq!(store.last_oplog_seq().unwrap(), created_seq);
+        let retained = store.get_memory(&replacement.id).unwrap().unwrap();
+        assert_eq!(retained.content, replacement.content);
+        assert_eq!(retained.namespace, ns);
+        assert!(retained.archived_at.is_none() && retained.superseded_by.is_none());
+        assert!(store.get_memory(&old.id).unwrap().is_none());
+        let changes = store.oplog_changes_since(&ns, before, 10).unwrap().changes;
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, replacement.id);
+        assert_eq!(changes[0].kind, rb_types::ChangeKind::Created);
+        assert_eq!(changes[0].seq, Some(created_seq));
+        let vector_count: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM memory_vectors WHERE memory_id = ?1",
+                [replacement.id.to_string()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(vector_count, 1);
+    }
+
+    #[test]
+    fn present_foreign_supersede_target_refuses_replacement_atomically() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let old = MemoryNote::new(
+            Namespace::Project("foreign-summary".into()),
+            "another project's summary".into(),
+            MemoryType::Insight,
+            4,
+        );
+        store.insert_memory(&old, None).unwrap();
+        let unchanged = store.get_memory(&old.id).unwrap().unwrap();
+        let replacement = MemoryNote::new(
+            Namespace::Project("local-summary".into()),
+            "resumed local summary".into(),
+            MemoryType::Insight,
+            4,
+        );
+        let before = store.last_oplog_seq().unwrap();
+        assert!(matches!(
+            store.insert_superseding_memory(&replacement, Some(&[1.0; 8]), &old.id, true),
+            Err(Error::NotFound(id)) if id == old.id
+        ));
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        assert!(store.get_memory(&replacement.id).unwrap().is_none());
+        assert_eq!(store.get_memory(&old.id).unwrap(), Some(unchanged));
     }
 
     #[test]

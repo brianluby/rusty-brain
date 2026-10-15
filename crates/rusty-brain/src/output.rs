@@ -592,6 +592,21 @@ fn edge_verb(link_type: rb_types::LinkType, outbound: bool) -> &'static str {
     }
 }
 
+fn terminal_text(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.chars().any(char::is_control) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut safe = String::with_capacity(text.len());
+    for character in text.chars() {
+        if character.is_control() {
+            safe.extend(character.escape_debug());
+        } else {
+            safe.push(character);
+        }
+    }
+    std::borrow::Cow::Owned(safe)
+}
+
 /// Render the `history` payload: the decision timeline for one memory.
 /// JSON: the raw `MemoryHistory`. Human: one line per chain version (oldest
 /// first) with age and `current`/`superseded`/`contested` markers (the W3.3
@@ -615,7 +630,7 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
     };
     let mut out = format!(
         "Decision history in {} ({} version{}; {})\n",
-        history.namespace,
+        terminal_text(&history.namespace),
         versions,
         if versions == 1 { "" } else { "s" },
         bounds
@@ -633,9 +648,11 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
             flags.push_str(" [contested]");
         }
         let origin = match (&entry.origin_user, &entry.origin_source) {
-            (Some(user), Some(source)) => format!(", by {user} via {source}"),
-            (Some(user), None) => format!(", by {user}"),
-            (None, Some(source)) => format!(", via {source}"),
+            (Some(user), Some(source)) => {
+                format!(", by {} via {}", terminal_text(user), terminal_text(source))
+            }
+            (Some(user), None) => format!(", by {}", terminal_text(user)),
+            (None, Some(source)) => format!(", via {}", terminal_text(source)),
             (None, None) => String::new(),
         };
         out.push_str(&format!(
@@ -647,7 +664,7 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
             relative_age(entry.created_at),
             origin,
             flags,
-            entry.summary,
+            terminal_text(&entry.summary),
         ));
         let predecessors = if entry.predecessors.is_empty() {
             "none in bounded result".to_string()
@@ -676,7 +693,7 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                 let anchors = evidence
                     .anchors
                     .iter()
-                    .map(ToString::to_string)
+                    .map(|anchor| terminal_text(&anchor.to_string()).into_owned())
                     .collect::<Vec<_>>()
                     .join(", ");
                 let anchors = if anchors.is_empty() {
@@ -702,8 +719,14 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                 out.push_str(
                     "       target detail (stored reference data; claim and sources are unverified):\n",
                 );
-                out.push_str(&format!("         full claim: {}\n", evidence.content));
-                out.push_str(&format!("         context: {}\n", evidence.context));
+                out.push_str(&format!(
+                    "         full claim: {}\n",
+                    terminal_text(&evidence.content)
+                ));
+                out.push_str(&format!(
+                    "         context: {}\n",
+                    terminal_text(&evidence.context)
+                ));
                 out.push_str(&format!(
                     "         type: {}; keywords: {:?}; tags: {:?}\n",
                     evidence
@@ -716,10 +739,10 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                 ));
                 out.push_str(&format!(
                     "         producer: user={}, host={}, agent={}, source={}, channel={}\n",
-                    entry.origin_user.as_deref().unwrap_or("unavailable"),
-                    entry.origin_host.as_deref().unwrap_or("unavailable"),
-                    entry.origin_agent.as_deref().unwrap_or("unavailable"),
-                    entry.origin_source.as_deref().unwrap_or("unavailable"),
+                    terminal_text(entry.origin_user.as_deref().unwrap_or("unavailable")),
+                    terminal_text(entry.origin_host.as_deref().unwrap_or("unavailable")),
+                    terminal_text(entry.origin_agent.as_deref().unwrap_or("unavailable")),
+                    terminal_text(entry.origin_source.as_deref().unwrap_or("unavailable")),
                     channel
                 ));
                 out.push_str(&format!(
@@ -735,7 +758,7 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                 ));
                 out.push_str(&format!(
                     "         session: {}; related files: {:?}; anchors: {}\n",
-                    evidence.session_id.as_deref().unwrap_or("unavailable"),
+                    terminal_text(evidence.session_id.as_deref().unwrap_or("unavailable")),
                     evidence.related_files,
                     anchors
                 ));
@@ -755,7 +778,7 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
             let reason = if edge.reason.is_empty() {
                 String::new()
             } else {
-                format!(" — {}", edge.reason)
+                format!(" — {}", terminal_text(&edge.reason))
             };
             out.push_str(&format!(
                 "       {} {} (conf {:.2}){} {}{}\n",
@@ -763,20 +786,20 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                 edge.other,
                 edge.other_confidence,
                 contested,
-                edge.other_summary,
+                terminal_text(&edge.other_summary),
                 reason,
             ));
         }
     }
     if !history.chain.iter().any(|e| e.current) {
-        out.push_str("(no current version: every chain member is archived)\n");
+        out.push_str("(no current version in this bounded result)\n");
     }
     if history.cycle_detected {
         out.push_str("(cycle detected within the bounded supersede chain)\n");
     }
     if history.truncated {
         out.push_str(
-            "(truncated: the depth, chain-member, or active-edge bound omitted rows; \
+            "(truncated: the depth, chain-member, active-edge, or wire-byte bound omitted rows; \
              use another chain ID to continue the bounded inspection)\n",
         );
     }
@@ -1966,6 +1989,39 @@ mod tests {
             cycle_detected: false,
             truncated: false,
         }
+    }
+
+    #[test]
+    fn human_history_escapes_controls_without_changing_json_evidence() {
+        let mut history = sample_history();
+        let payload = "\u{1b}[2J\u{1b}[HFORGED\rpolicy\n\u{7}";
+        history.namespace = payload.to_string();
+        for entry in &mut history.chain {
+            entry.summary = payload.to_string();
+            entry.origin_user = Some(payload.to_string());
+            entry.origin_host = Some(payload.to_string());
+            entry.origin_agent = Some(payload.to_string());
+            entry.origin_source = Some(payload.to_string());
+        }
+        let evidence = history.chain[1].evidence.as_mut().unwrap();
+        evidence.content = format!("{}{}", "a".repeat(160), payload);
+        evidence.context = payload.to_string();
+        evidence.session_id = Some(payload.to_string());
+        evidence.anchors[0].value = payload.to_string();
+        evidence.related_files = vec![payload.to_string()];
+        evidence.keywords = vec![payload.to_string()];
+        evidence.tags = vec![payload.to_string()];
+        history.edges[0].reason = payload.to_string();
+        history.edges[0].other_summary = payload.to_string();
+
+        let human = render_history(&history, false);
+        assert!(!human.chars().any(|c| c.is_control() && c != '\n'));
+        assert!(!human.contains("policy\n"));
+        assert!(human.contains("\\u{1b}[2J\\u{1b}[HFORGED\\rpolicy\\n\\u{7}"));
+        let json = render_history(&history, true);
+        assert!(!json.contains('\u{1b}'));
+        let decoded: rb_types::MemoryHistory = serde_json::from_str(&json).unwrap();
+        assert_eq!(decoded, history);
     }
 
     #[test]
