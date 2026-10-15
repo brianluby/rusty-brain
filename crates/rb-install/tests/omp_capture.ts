@@ -193,7 +193,7 @@ try {
     "task prompts remain activity context, not confirmed policy");
 
   const ledger = [
-    entry("ledger-pg", "user", "Decision: storage: use PostgreSQL CORRECTION-LEDGER"),
+    entry("ledger-pg", "user", "Decided: storage: use PostgreSQL CORRECTION-LEDGER"),
     entry("ledger-mysql", "user", "Decision: storage: use MySQL CORRECTION-LEDGER"),
     entry("ledger-sqlite", "user", "Correction: storage: use SQLite CORRECTION-LEDGER"),
   ];
@@ -224,12 +224,12 @@ try {
     assert.deepEqual((await checkpoint("correction-ledger", ledger)).map(note => note.id).sort(), oldFacts.map(note => note.id).sort());
     db.exec("DROP TRIGGER reject_correction");
     db.exec(`CREATE TRIGGER reject_retirement BEFORE UPDATE OF archived_at ON memories
-      WHEN OLD.content = 'Decision: storage: use PostgreSQL CORRECTION-LEDGER'
+      WHEN OLD.content = 'Decided: storage: use PostgreSQL CORRECTION-LEDGER'
         AND OLD.archived_at IS NULL AND NEW.archived_at IS NOT NULL
       BEGIN SELECT RAISE(FAIL, 'injected archive failure'); END;`);
     const partial = await checkpoint("correction-ledger", ledger);
     assert.deepEqual(partial.map(note => note.content).sort(), [
-      "Correction: storage: use SQLite CORRECTION-LEDGER", "Decision: storage: use PostgreSQL CORRECTION-LEDGER",
+      "Correction: storage: use SQLite CORRECTION-LEDGER", "Decided: storage: use PostgreSQL CORRECTION-LEDGER",
     ]);
     const correction = partial.find(note => note.content.startsWith("Correction:"));
     assert.ok(correction);

@@ -60,8 +60,9 @@ succeeding.
   remove its confirmation (for example, preserving a `"could not connect"` error).
   Bare task imperatives and `must not`/`should not` substrings alone do not confirm
   policy; use labeled facts or explicit decision/preference/confirmation language.
-  `Decision: subject: value` and `Correction: subject: value` permit ordered,
-  explicit same-session correction: obsolete retained evidence is not admitted,
+  `Decision: subject: value` (or `Decided: subject: value`) and
+  `Correction: subject: value` permit ordered, explicit same-session correction:
+  obsolete retained evidence is not admitted,
   and every known earlier matching-subject fact is retired after the correction
   is durable. Failed retirements retry even when the correction is already recorded.
   Stored corrections still filter obsolete evidence and finish pending retirement

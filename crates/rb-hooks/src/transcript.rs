@@ -445,17 +445,7 @@ fn digest_windows(
             } else {
                 continue;
             };
-            let subject = if [
-                "decision:",
-                "constraint:",
-                "preference:",
-                "correction:",
-                "reversal:",
-                "proposal:",
-            ]
-            .iter()
-            .any(|p| lower.starts_with(p))
-            {
+            let subject = if labeled || lower.starts_with("proposal:") {
                 raw.split_once(':')
                     .and_then(|(_, rest)| rest.split_once(':'))
                     .map(|(s, _)| s.trim().to_lowercase())
@@ -718,7 +708,7 @@ mod tests {
     #[test]
     fn rejection_actions_remain_confirmed_and_explicit_proposals_can_be_adopted() {
         let correction = digest_from_lines([
-            turn("user", "Decision: auth: allow anonymous requests"),
+            turn("user", "Decided: auth: allow anonymous requests"),
             turn("user", "Correction: auth: reject anonymous requests"),
         ]);
         assert_eq!(

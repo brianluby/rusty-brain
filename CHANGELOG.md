@@ -32,6 +32,8 @@ All notable changes to rusty-brain are documented here. The format is based on
   qualify kanban references so they cannot link to unrelated GitHub issues.
 - Skip blank tool error fields before choosing a later message; preserve a generic
   failure observation when an explicitly failed tool supplies no nonblank text.
+- Reuse the fact-label predicate for subject extraction, including `Decided:` facts
+  in ordered correction filtering, persisted retirement and failed-retirement recovery.
 
 ### Fixed — Capture review regressions (kanban 73, 74)
 
