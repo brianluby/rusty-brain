@@ -34,6 +34,8 @@ All notable changes to rusty-brain are documented here. The format is based on
   failure observation when an explicitly failed tool supplies no nonblank text.
 - Reuse the fact-label predicate for subject extraction, including `Decided:` facts
   in ordered correction filtering, persisted retirement and failed-retirement recovery.
+- Preserve explicit confirmations with quoted planning words, and honor preference
+  labels before constraint phrases in their values; verify type-filtered recall and abstention.
 
 ### Fixed — Capture review regressions (kanban 73, 74)
 

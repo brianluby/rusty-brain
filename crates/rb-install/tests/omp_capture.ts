@@ -6,12 +6,13 @@ import { resolve } from "node:path";
 import { Database } from "bun:sqlite";
 import extension from "../assets/omp-extension.ts";
 
-type Note = { id: string; content: string; context: string; tags: string[]; trust_class: string; session_id: string | null };
+type Note = { id: string; content: string; context: string; tags: string[]; trust_class: string; session_id: string | null; memory_type: string };
 const object = (value: unknown): value is Record<string, unknown> => typeof value === "object" && value !== null;
 const note = (value: unknown): value is Note => object(value)
   && typeof value.id === "string" && typeof value.content === "string"
   && typeof value.context === "string" && typeof value.trust_class === "string"
   && (value.session_id === null || typeof value.session_id === "string")
+  && typeof value.memory_type === "string"
   && Array.isArray(value.tags) && value.tags.every((tag: unknown) => typeof tag === "string");
 function memories(value: unknown): Note[] {
   assert.ok(object(value) && Array.isArray(value.memories) && value.memories.every(note), "valid export schema");
@@ -129,6 +130,26 @@ try {
     return memories(await run("export", "--format", "json"))
       .filter(note => note.tags.includes("confirmed-decision") && note.session_id === session);
   };
+  const confirmation = "I confirm the error text is \"could not connect\"";
+  assert.deepEqual((await checkpoint("explicit-error-confirmation", [
+    entry("confirmed-error-text", "user", confirmation),
+  ])).map(note => note.content), [confirmation],
+    "explicit confirmation must survive planning words inside its quoted value");
+  const preference = "Preference: wording: use \"must not\" in errors";
+  const preferenceFacts = await checkpoint("wording-preference", [
+    entry("wording-preference", "user", preference),
+  ]);
+  assert.deepEqual(preferenceFacts.map(note => note.memory_type), ["Preference"],
+    "quoted constraint terminology must not change an explicitly labeled preference's type");
+  const preferenceRecall = await run("--json", "recall", preference, "--type", "preference");
+  assert.ok(Array.isArray(preferenceRecall) && preferenceRecall.some((hit: unknown) =>
+    object(hit) && note(hit.memory) && hit.memory.id === preferenceFacts[0].id));
+  const constraintRecall = await run("--json", "recall", preference, "--type", "constraint");
+  assert.ok(Array.isArray(constraintRecall)
+    ? !constraintRecall.some((hit: unknown) => object(hit) && note(hit.memory) && hit.memory.id === preferenceFacts[0].id)
+    : object(constraintRecall) && typeof constraintRecall.abstained === "string"
+      && Array.isArray(constraintRecall.results) && constraintRecall.results.length === 0,
+    "the preference must not leak into constraints-only retrieval, including truthful abstention");
   const window = [
     entry("window-pg", "user", "Decision: storage: use PostgreSQL CORRECTION-WINDOW"),
     entry("window-mysql", "user", "Decision: storage: use MySQL CORRECTION-WINDOW"),

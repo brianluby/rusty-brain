@@ -387,12 +387,16 @@ fn digest_windows(
             ]
             .iter()
             .any(|prefix| lower.starts_with(prefix));
+            let explicit = labeled
+                || ["we decided ", "i decided ", "i prefer ", "i confirm "]
+                    .iter()
+                    .any(|prefix| lower.starts_with(prefix));
             let planning = raw.ends_with('?')
                 || raw.starts_with('>')
                 || raw.starts_with('"')
                 || raw.starts_with('\'')
                 || adopted_subject.is_some()
-                || (!labeled
+                || (!explicit
                     && [
                         "might ",
                         "maybe ",
@@ -423,10 +427,6 @@ fn digest_windows(
                         .unwrap_or(&lower)
                         .starts_with(phrase)
                 });
-            let explicit = labeled
-                || ["we decided ", "i decided ", "i prefer ", "i confirm "]
-                    .iter()
-                    .any(|prefix| lower.starts_with(prefix));
             let status = if role == "user" && explicit && !planning {
                 if correction {
                     EvidenceStatus::Correction
@@ -795,6 +795,14 @@ mod tests {
                 EvidenceStatus::Correction
             );
         }
+    }
+
+    #[test]
+    fn explicit_confirmation_preserves_quoted_planning_words() {
+        let statement = "I confirm the error text is \"could not connect\"";
+        let digest = digest_from_lines([turn("user", statement)]);
+        assert_eq!(digest.decisions, vec![statement]);
+        assert_eq!(digest.evidence[0].status, EvidenceStatus::Confirmed);
     }
 
     #[test]

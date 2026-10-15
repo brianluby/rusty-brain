@@ -924,13 +924,14 @@ async fn store_confirmed_facts(
                 continue;
             }
             let lower = text.to_lowercase();
-            let memory_type = if lower.starts_with("constraint:")
+            let memory_type = if lower.starts_with("preference:") || lower.starts_with("i prefer ")
+            {
+                MemoryType::Preference
+            } else if lower.starts_with("constraint:")
                 || lower.contains("must not")
                 || lower.contains("should not")
             {
                 MemoryType::Constraint
-            } else if lower.starts_with("preference:") || lower.starts_with("i prefer ") {
-                MemoryType::Preference
             } else {
                 MemoryType::ArchitectureDecision
             };

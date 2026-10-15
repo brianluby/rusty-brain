@@ -56,10 +56,12 @@ succeeding.
   `Constraint: review: reject proposals that include secrets` and
   `Correction: auth: reject anonymous requests` remain confirmed.
   Statement-leading `propose`/`I propose`/`we propose` indicates planning;
-  proposal terminology and generic planning words inside a labeled fact do not
-  remove its confirmation (for example, preserving a `"could not connect"` error).
+  proposal terminology and generic planning words inside explicitly confirmed facts
+  do not remove confirmation (for example, `I confirm` a `"could not connect"` error).
   Bare task imperatives and `must not`/`should not` substrings alone do not confirm
   policy; use labeled facts or explicit decision/preference/confirmation language.
+  Explicit `Preference:` and `I prefer` statements retain the preference type even
+  when their values contain `must not`/`should not`; they are not constraint-only recall.
   `Decision: subject: value` (or `Decided: subject: value`) and
   `Correction: subject: value` permit ordered, explicit same-session correction:
   obsolete retained evidence is not admitted,
