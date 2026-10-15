@@ -29,6 +29,7 @@
 
 pub mod assertion_precision;
 pub mod backend;
+pub mod coding_memory;
 pub mod controlled;
 pub mod corpus;
 pub mod external;

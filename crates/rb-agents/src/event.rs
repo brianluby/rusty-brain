@@ -41,8 +41,8 @@ pub enum HookEvent {
     /// un-superseded live memories — they store nothing at all.
     SessionCheckpoint { reason: Option<String> },
     /// The agent SESSION is ending (distinct from a per-turn [`Stop`]). This is
-    /// W3.1's single capture point: the runtime folds the per-session scratch
-    /// file + transcript into ONE summary memory here. `reason` is the CLI's
+    /// A shared fold stores an activity summary plus confirmed transcript facts.
+    /// `reason` is the CLI's
     /// termination label when reported (Claude Code: `clear` | `logout` |
     /// `prompt_input_exit` | `other`). CLIs without a session-end event never
     /// produce this variant.
@@ -87,7 +87,7 @@ impl InjectionEvent {
 }
 
 /// The result of handling a hook event. In P4 `continue_execution` is ALWAYS
-/// `true`: capture hooks are strictly fail-open and never block the CLI.
+/// `true`: handled capture failures never veto continuation (not a latency bound).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HookResult {
     /// Text to surface to the agent (e.g. injected context). `None` = nothing.
@@ -101,7 +101,7 @@ pub struct HookResult {
     pub injection_event: InjectionEvent,
 }
 
-/// Fail-open default: a defaulted `HookResult` must NEVER block the CLI, so
+/// Fail-open default: a defaulted `HookResult` must not veto continuation, so
 /// `continue_execution` defaults to `true` (the derived `Default` would have made
 /// it `false`, contradicting the P4 fail-open contract). `injection_event` is
 /// irrelevant while `system_message` is `None`.
