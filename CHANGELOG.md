@@ -82,6 +82,9 @@ All notable changes to rusty-brain are documented here. The format is based on
   rather than granting each attempt a fresh five- or 120-second allowance.
   Replace compile-only proxy wiring assertions with socket-level rejection and
   deadline regressions.
+- Return the actual surviving memory ID after automatic hook deduplication,
+  including when an older curated row wins, so capture ledgers do not retain
+  the newly inserted row that suppression just archived.
 
 ### Fixed — PR #98 review remediations
 

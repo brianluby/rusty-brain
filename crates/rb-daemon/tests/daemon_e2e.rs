@@ -2100,7 +2100,7 @@ async fn hook_writes_collapse_near_duplicates_at_write_time() {
         .unwrap();
     let second = client
         .remember(
-            content,
+            content.clone(),
             None,
             MemoryType::Reference,
             4,
@@ -2122,15 +2122,39 @@ async fn hook_writes_collapse_near_duplicates_at_write_time() {
     );
     assert!(archived.archived_at.is_some());
 
-    // Only the newest capture remains live.
-    let live: Vec<_> = client
-        .list(None, 50)
+    let mut curator = Client::connect(&daemon.socket, ns).await.unwrap();
+    curator
+        .update(
+            second.clone(),
+            MemoryUpdates {
+                human_curated: Some(true),
+                ..Default::default()
+            },
+        )
         .await
-        .unwrap()
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
-    assert_eq!(live, vec![second], "only the newest hook capture is live");
+        .unwrap();
+    let reported = client
+        .remember(
+            content,
+            None,
+            MemoryType::Reference,
+            4,
+            vec![],
+            vec!["hook".to_string()],
+            vec![],
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reported, second,
+        "hook receipts must name the curated survivor"
+    );
+    let survivor = client.get(reported).await.unwrap().unwrap();
+    assert!(survivor.human_curated && survivor.archived_at.is_none());
+    let live = client.list(None, 50).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, second);
 
     daemon.stop().await;
 }

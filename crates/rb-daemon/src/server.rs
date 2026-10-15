@@ -1359,12 +1359,14 @@ pub(crate) fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_ty
 /// Semantic neighbors alone never authorize supersede; the store rechecks exact
 /// authored fields, namespace and safety metadata in the mutation transaction.
 /// Only hook-sourced candidates are eligible, so user/cli/mcp/job rows stay live.
+/// Return the final survivor so capture ledgers never record a row we just archived.
 async fn suppress_hook_near_duplicates<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
     namespace: &rb_types::Namespace,
-    new_id: &rb_types::MemoryId,
-) where
+    new_id: rb_types::MemoryId,
+) -> rb_types::MemoryId
+where
     P: EmbeddingProvider,
 {
     let dups = match job_store
@@ -1379,10 +1381,10 @@ async fn suppress_hook_near_duplicates<P>(
         Ok(dups) => dups,
         Err(e) => {
             warn!(error = %e, "near-dup scan failed; skipping write-time suppression");
-            return;
+            return new_id;
         }
     };
-    let mut survivor = new_id.clone();
+    let mut survivor = new_id;
     for (dup_id, _similarity) in dups {
         if dup_id == survivor {
             continue;
@@ -1410,6 +1412,7 @@ async fn suppress_hook_near_duplicates<P>(
             }
         }
     }
+    survivor
 }
 
 /// Apply ONE review resolution (PRD 2026-07-02 REV-2). Fail-closed order:
@@ -1959,11 +1962,11 @@ where
                 None => engine.remember(input).await,
             };
             match remembered {
-                Ok(id) => {
+                Ok(mut id) => {
                     // Automatic hook dedup remains separately guarded in the
                     // transactional store seam.
                     if provenance.origin_source.as_deref() == Some("hook") {
-                        suppress_hook_near_duplicates(engine, job_store, namespace, &id).await;
+                        id = suppress_hook_near_duplicates(engine, job_store, namespace, id).await;
                     }
                     Response::Remembered { id }
                 }
@@ -2457,7 +2460,7 @@ mod tests {
                     let is_local = note.namespace == ns;
                     store.write(note, Some(vector.clone())).await.unwrap();
                     if eager && is_local {
-                        suppress_hook_near_duplicates(&engine, &store, &ns, &id).await;
+                        suppress_hook_near_duplicates(&engine, &store, &ns, id).await;
                     }
                 }
                 let neighbors = store
@@ -2482,7 +2485,7 @@ mod tests {
                     .await
                     .unwrap();
                 if eager {
-                    suppress_hook_near_duplicates(&engine, &store, &ns, &duplicate_id).await;
+                    suppress_hook_near_duplicates(&engine, &store, &ns, duplicate_id.clone()).await;
                 }
                 let config = crate::jobs::ConsolidationConfig {
                     enabled: true,
@@ -2537,7 +2540,7 @@ mod tests {
                 assert!(recalled.iter().all(|r| r.memory.id != *retired_id));
                 assert!(recalled.iter().all(|r| r.memory.namespace == ns));
                 if eager {
-                    suppress_hook_near_duplicates(&engine, &store, &ns, survivor_id).await;
+                    suppress_hook_near_duplicates(&engine, &store, &ns, survivor_id.clone()).await;
                 }
                 assert_eq!(
                     crate::jobs::consolidation::run(&store, &config)

@@ -92,6 +92,8 @@ succeeding.
   with overlapping-hook last-writer-wins behavior. Redaction and instruction
   filtering precede persistence; directive-shaped legitimate constraints can
   still be dropped by the retained safety filter.
+  Hook remember receipts name the final survivor after write-time deduplication,
+  including an older curated row, so the ledger does not record a suppressed row.
 
 
 ## Claude Code (stable)
