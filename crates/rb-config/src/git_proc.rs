@@ -28,6 +28,16 @@ const POLL_INTERVAL: Duration = Duration::from_millis(10);
 /// input or pollute the hook channel. NEVER panics.
 #[must_use]
 pub fn run_git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Option<Vec<u8>> {
+    run_git_bounded_with_output_limit(dir, args, timeout, None)
+}
+
+/// Share the subprocess lifecycle, optionally rejecting stdout beyond a byte cap.
+pub(crate) fn run_git_bounded_with_output_limit(
+    dir: &Path,
+    args: &[&str],
+    timeout: Duration,
+    max_stdout_bytes: Option<u64>,
+) -> Option<Vec<u8>> {
     let mut child = match Command::new("git")
         .arg("-C")
         .arg(dir)
@@ -50,21 +60,28 @@ pub fn run_git_bounded(dir: &Path, args: &[&str], timeout: Duration) -> Option<V
         std::thread::spawn(move || {
             use std::io::Read as _;
             let mut buf = Vec::new();
-            // On read error, return whatever we have; the caller decides via the
-            // exit status whether to trust it.
-            let _ = out.read_to_end(&mut buf);
-            buf
+            if let Some(limit) = max_stdout_bytes {
+                // Read one overflow byte, never an unbounded blob or a usable prefix.
+                out.take(limit + 1).read_to_end(&mut buf).ok()?;
+                if buf.len() as u64 > limit {
+                    return None;
+                }
+            } else {
+                // Preserve existing callers' partial-output behavior on read errors.
+                let _ = out.read_to_end(&mut buf);
+            }
+            Some(buf)
         })
     });
 
-    // Join the reader thread, returning its captured bytes. A panicked reader
-    // thread (it never panics by construction) degrades to `None`.
-    let join_reader = |reader: Option<std::thread::JoinHandle<Vec<u8>>>| -> Option<Vec<u8>> {
-        match reader {
-            Some(handle) => handle.join().ok(),
-            None => Some(Vec::new()),
-        }
-    };
+    // Read errors/overflow in the bounded path and reader panics reject output.
+    let join_reader =
+        |reader: Option<std::thread::JoinHandle<Option<Vec<u8>>>>| -> Option<Vec<u8>> {
+            match reader {
+                Some(handle) => handle.join().ok().flatten(),
+                None => Some(Vec::new()),
+            }
+        };
 
     let deadline = Instant::now() + timeout;
     loop {

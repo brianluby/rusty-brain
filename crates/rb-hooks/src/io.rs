@@ -6,18 +6,24 @@
 
 use std::io::{Read, Write};
 
-/// Read all of stdin and parse it as one JSON value. Fail-open: any read or
-/// parse failure (including empty/whitespace input) degrades to `Value::Null`.
+/// Read a byte-bounded stdin event. This limits allocation, not time waiting for EOF.
+/// Any read, size, or parse failure degrades to `Value::Null`.
 pub fn read_stdin_json() -> serde_json::Value {
     let stdin = std::io::stdin();
     read_json_from(stdin.lock())
 }
 
-/// Pure core: read everything from `reader` and parse one JSON value. Any error
-/// (I/O, empty, invalid) degrades to `Value::Null`.
-fn read_json_from<R: Read>(mut reader: R) -> serde_json::Value {
+const MAX_STDIN_BYTES: u64 = 1024 * 1024;
+
+/// Read at most the envelope cap plus one sentinel byte; reject oversized input.
+fn read_json_from<R: Read>(reader: R) -> serde_json::Value {
     let mut buf = String::new();
-    if reader.read_to_string(&mut buf).is_err() {
+    if reader
+        .take(MAX_STDIN_BYTES + 1)
+        .read_to_string(&mut buf)
+        .is_err()
+        || buf.len() as u64 > MAX_STDIN_BYTES
+    {
         return serde_json::Value::Null;
     }
     if buf.trim().is_empty() {
@@ -78,6 +84,15 @@ mod tests {
         let raw: &[u8] = b"   \n\t  ";
         let value = read_json_from(raw);
         assert_eq!(value, serde_json::Value::Null);
+    }
+
+    #[test]
+    fn byte_boundary_rejects_without_unbounded_read() {
+        let at_cap = format!("\"{}\"", "a".repeat(MAX_STDIN_BYTES as usize - 2));
+        assert!(read_json_from(at_cap.as_bytes()).is_string());
+        let oversized = format!("\"{}\"", "a".repeat(MAX_STDIN_BYTES as usize - 1));
+        assert!(read_json_from(oversized.as_bytes()).is_null());
+        assert!(read_json_from(std::io::repeat(b'a')).is_null());
     }
 
     #[test]

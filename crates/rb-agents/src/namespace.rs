@@ -16,8 +16,8 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rb_config::namespace::{
-    explicit_namespace_from_env, resolve_namespace_in, NamespacePins, RepoConfigDivergenceKind,
-    REPO_CONFIG_FILE,
+    explicit_namespace_from_env, head_repo_config, resolve_namespace_in, NamespacePins,
+    RepoConfigDivergenceKind, REPO_CONFIG_FILE,
 };
 use rb_types::Namespace;
 
@@ -27,9 +27,12 @@ use crate::proc::run_git_bounded;
 /// `.rusty-brain.toml` blob at `HEAD`, and `CLAUDE.md`; invokes git under a 1s
 /// bound. Synchronous: call this OFF the tokio runtime.
 pub fn detect_namespace(cwd: &Path) -> Namespace {
+    if let Some(explicit) = explicit_namespace_from_env() {
+        return Namespace::Project(explicit);
+    }
     let res = resolve_namespace_in(
         cwd,
-        explicit_namespace_from_env(),
+        None,
         &NamespacePins::load(),
         git_toplevel,
         head_repo_config,
@@ -75,14 +78,6 @@ fn git_toplevel(dir: &Path) -> Option<PathBuf> {
     } else {
         Some(PathBuf::from(trimmed))
     }
-}
-
-/// The committed `.rusty-brain.toml` blob at `HEAD`, via git under a 1s bound;
-/// `None` when not committed, HEAD is unborn, or git hung/failed (fail-open).
-fn head_repo_config(toplevel: &Path) -> Option<String> {
-    let spec = format!("HEAD:{REPO_CONFIG_FILE}");
-    let bytes = run_git_bounded(toplevel, &["show", &spec], Duration::from_secs(1))?;
-    String::from_utf8(bytes).ok()
 }
 
 #[cfg(test)]
@@ -181,6 +176,38 @@ mod tests {
         }
         assert_eq!(seen[0], seen[1]);
         assert_eq!(seen[0], Namespace::Project("one-id".to_string()));
+    }
+
+    #[test]
+    fn hook_namespace_accepts_at_cap_head_and_rejects_oversized_namespace_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("host-repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git_init(&repo) {
+            return; // git unavailable; skip
+        }
+        let mut text = String::from("namespace = \"canonical\"\n#");
+        text.push_str(&"x".repeat(1024 * 1024 - text.len()));
+        fs::write(repo.join(REPO_CONFIG_FILE), &text).unwrap();
+        assert!(git_commit_all(&repo));
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(
+            detect_namespace(&repo),
+            Namespace::Project("canonical".to_string())
+        );
+
+        text.push('x');
+        fs::write(repo.join(REPO_CONFIG_FILE), &text).unwrap();
+        assert!(git_commit_all(&repo));
+        assert_eq!(
+            detect_namespace(&repo),
+            Namespace::Project("host-repo".to_string())
+        );
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(
+            detect_namespace(&repo),
+            Namespace::Project("host-repo".to_string())
+        );
     }
 
     #[test]

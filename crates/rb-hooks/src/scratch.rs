@@ -3,11 +3,11 @@
 //! PostToolUse writes ZERO memories; it appends a compact observation (a file
 //! touched, a command run, a failure seen) to a small per-session JSON file
 //! keyed by `session_id`. SessionEnd folds that scratch (plus the transcript)
-//! into ONE summary memory and resets it. Like the dedup cache, the file lives
+//! into a summary plus confirmed facts and resets activity while retaining identities. The file lives
 //! under the shared XDG cache dir, namespaced per project AND per session, with
 //! atomic writes and strict fail-open semantics: every error (unreadable /
-//! corrupt / unwritable) degrades to an empty/absent scratch so capture never
-//! blocks the CLI and never loses the agent's turn.
+//! corrupt / unwritable) degrades to an empty/absent scratch. Filesystem I/O
+//! has no hard latency guarantee.
 //!
 //! SECURITY: callers MUST redact before appending — the scratch persists raw
 //! observation text to disk (unlike the dedup cache, which stores only hashes),
@@ -39,6 +39,32 @@ const MAX_ENTRY_CHARS: usize = 500;
 /// abandoned/crashed session whose SessionEnd never fired; pruned opportunistically.
 const STALE_TTL_SECONDS: u64 = 24 * 60 * 60;
 
+/// Per-session exact source dedup; never inferred from embedding similarity.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CapturedFact {
+    pub source: String,
+    pub text: String,
+    pub subject: Option<String>,
+    pub memory_id: String,
+    pub offset: usize,
+    #[serde(default)]
+    pub text_line: usize,
+    #[serde(default)]
+    pub retired: bool,
+}
+
+impl CapturedFact {
+    /// Only explicit stored correction/reversal markers cover earlier subject evidence.
+    pub fn corrects(&self, subject: Option<&str>, position: (usize, usize)) -> bool {
+        subject.is_some()
+            && self.subject.as_deref() == subject
+            && position < (self.offset, self.text_line)
+            && self.text.split_once(':').is_some_and(|(marker, _)| {
+                marker.eq_ignore_ascii_case("correction") || marker.eq_ignore_ascii_case("reversal")
+            })
+    }
+}
+
 /// The fold-once-per-session capture buffer, persisted as JSON.
 #[derive(Debug, Default, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ScratchData {
@@ -56,13 +82,20 @@ pub struct ScratchData {
     /// so a resumed-then-re-ended session keeps ONE live summary, not two.
     #[serde(default)]
     pub prior_summary_id: Option<String>,
+    #[serde(default)]
+    pub facts: Vec<CapturedFact>,
+    #[serde(default)]
+    pub outcomes: Vec<String>,
 }
 
 impl ScratchData {
     /// True when nothing worth folding has been recorded (no files, commands,
     /// or failures). A scratch carrying only a `prior_summary_id` is empty.
     pub fn is_empty(&self) -> bool {
-        self.files.is_empty() && self.commands.is_empty() && self.failures.is_empty()
+        self.files.is_empty()
+            && self.commands.is_empty()
+            && self.failures.is_empty()
+            && self.outcomes.is_empty()
     }
 }
 
@@ -72,6 +105,7 @@ pub enum Kind {
     File,
     Command,
     Failure,
+    Outcome,
 }
 
 /// A file-backed, per-(namespace, session) capture scratch.
@@ -131,6 +165,7 @@ impl Scratch {
                 Kind::File => (&mut data.files, MAX_FILES),
                 Kind::Command => (&mut data.commands, MAX_COMMANDS),
                 Kind::Failure => (&mut data.failures, MAX_FAILURES),
+                Kind::Outcome => (&mut data.outcomes, MAX_COMMANDS),
             };
             if list.len() < cap && !list.iter().any(|e| e == &value) {
                 list.push(value);
@@ -144,7 +179,21 @@ impl Scratch {
 
     /// Read the scratch (empty on any error — fail-open).
     pub fn read(&self) -> ScratchData {
-        match std::fs::read_to_string(&self.path) {
+        if !std::fs::metadata(&self.path).is_ok_and(|metadata| metadata.is_file()) {
+            return ScratchData::default();
+        }
+        use std::io::Read as _;
+        match std::fs::File::open(&self.path).and_then(|file| {
+            let mut text = String::new();
+            file.take(4 * 1024 * 1024 + 1).read_to_string(&mut text)?;
+            if text.len() > 4 * 1024 * 1024 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "scratch too large",
+                ));
+            }
+            Ok(text)
+        }) {
             Ok(text) => serde_json::from_str(&text).unwrap_or_default(),
             Err(_) => ScratchData::default(),
         }
@@ -157,6 +206,7 @@ impl Scratch {
     pub fn mark_folded(&self, summary_id: Option<&str>) {
         let data = ScratchData {
             prior_summary_id: summary_id.map(str::to_string),
+            facts: self.read().facts,
             ..Default::default()
         };
         self.write(&data);
@@ -177,6 +227,29 @@ impl Scratch {
         let mut data = self.read();
         data.prior_summary_id = Some(summary_id.to_string());
         self.write(&data);
+    }
+
+    /// Record only after a successful durable write. Stop at the cap rather than
+    /// evicting identities and duplicating old facts on every lifecycle fold.
+    pub fn record_fact(&self, fact: CapturedFact) {
+        let mut data = self.read();
+        if data.facts.len() < 128 {
+            data.facts.push(fact);
+            self.write(&data);
+        }
+    }
+
+    /// Keep source identities, and retry retirement until its durable archive succeeds.
+    pub fn mark_fact_retired(&self, memory_id: &str) {
+        let mut data = self.read();
+        if let Some(fact) = data
+            .facts
+            .iter_mut()
+            .find(|fact| fact.memory_id == memory_id)
+        {
+            fact.retired = true;
+            self.write(&data);
+        }
     }
 
     /// Atomically write (temp file 0600 + rename), creating the parent 0700.
@@ -563,5 +636,28 @@ mod tests {
         let other_ns = Namespace::Project("other".into());
         let c = Scratch::for_session(&other_ns, "session-1").path;
         assert_ne!(a, c, "same session in distinct namespaces stays separate");
+    }
+    #[test]
+    fn durable_fact_sources_survive_end_and_identity_budget_does_not_evict() {
+        let (_dir, scratch) = scratch();
+        for index in 0..129 {
+            scratch.record_fact(CapturedFact {
+                source: format!("actual-transcript; message=source-{index}"),
+                text: format!("Decision: component-{index}: SQLite"),
+                subject: Some(format!("component-{index}")),
+                memory_id: format!("stored-{index}"),
+                offset: index,
+                text_line: 0,
+                retired: false,
+            });
+        }
+        let before = scratch.read().facts;
+        assert_eq!(before.len(), 128);
+        assert_eq!(before[0].source, "actual-transcript; message=source-0");
+        scratch.mark_checkpointed("summary-1");
+        assert_eq!(scratch.read().facts, before);
+        scratch.mark_folded(Some("summary-2"));
+        assert_eq!(scratch.read().facts, before);
+        assert!(scratch.read().is_empty());
     }
 }

@@ -43,13 +43,16 @@ async fn write_then_read_round_trips_through_pool() {
             ns.clone(),
             "memory".to_string(),
             50,
-            rb_types::MemoryState::Active,
+            rb_types::RecallFilter::default(),
         )
         .await
         .unwrap();
     assert_eq!(kw, vec![id.clone()], "keyword search finds it by keyword");
 
-    let vec_hits = handle.vector(ns, vec![0.1f32; DIM], 5).await.unwrap();
+    let vec_hits = handle
+        .vector(ns, vec![0.1f32; DIM], 5, rb_types::RecallFilter::default())
+        .await
+        .unwrap();
     assert_eq!(
         vec_hits.len(),
         1,

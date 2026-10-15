@@ -16,6 +16,17 @@ Run it:
 cargo test -p rb-eval
 ```
 
+## Coding-memory development evidence (#85)
+
+`coding-memory` replays six predeclared cases with real local recorded vectors,
+exact expected/forbidden IDs, controlled graph-only topology and explicit decision
+history. It reports capability failures separately from execution failure and
+does not score generated answers or change frozen gates. The observed baseline
+passes direct evidence, one-hop expansion, history and conflict cases; deployment
+region abstention and two-hop retrieval remain failed capabilities.
+See [the categorized baseline and reproduction commands](../../docs/eval/2026-10-13-coding-memory-baseline.md).
+
+
 ## Local session-replay dataset pipeline
 
 `session_replay` adds local-only Claude Code JSONL and OpenCode SQLite adapters

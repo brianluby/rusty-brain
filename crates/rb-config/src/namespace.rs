@@ -33,6 +33,30 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const MAX_NAMESPACE_FILE_BYTES: u64 = 1024 * 1024;
+
+/// Parse whole bounded regular files only; a prefix can change namespace meaning.
+fn read_namespace_file(path: &Path) -> std::io::Result<String> {
+    use std::io::Read as _;
+    if !std::fs::metadata(path)?.is_file() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "namespace input is not a regular file",
+        ));
+    }
+    let mut text = String::new();
+    std::fs::File::open(path)?
+        .take(MAX_NAMESPACE_FILE_BYTES + 1)
+        .read_to_string(&mut text)?;
+    if text.len() as u64 > MAX_NAMESPACE_FILE_BYTES {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "namespace input exceeds 1 MiB",
+        ));
+    }
+    Ok(text)
+}
+
 use rb_types::{Error, Namespace, Result};
 use serde::{Deserialize, Serialize};
 
@@ -220,22 +244,19 @@ struct RepoConfig {
 
 /// The committed content of [`REPO_CONFIG_FILE`] at `HEAD`, read via
 /// `git -C <toplevel> show HEAD:.rusty-brain.toml` so a worktree-only file can
-/// never redirect the namespace. File not committed at `HEAD`, an unborn
-/// `HEAD` (fresh repo with no commits), and a missing git all degrade to
-/// `None` — "no committed identity". Callers needing a process bound (hooks)
-/// supply their own reader to [`resolve_namespace_in`].
+/// never redirect the namespace. Stdout is limited to 1 MiB while collected;
+/// oversized output is rejected whole, never parsed as a prefix.
+/// Missing/unborn `HEAD`, git failures, read errors, and the 1s deadline all
+/// degrade to `None` — "no committed identity".
 pub fn head_repo_config(toplevel: &Path) -> Option<String> {
     let spec = format!("HEAD:{REPO_CONFIG_FILE}");
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(toplevel)
-        .args(["show", &spec])
-        .output()
-        .ok()?;
-    if !output.status.success() {
-        return None;
-    }
-    String::from_utf8(output.stdout).ok()
+    let bytes = crate::git_proc::run_git_bounded_with_output_limit(
+        toplevel,
+        &["show", &spec],
+        std::time::Duration::from_secs(1),
+        Some(MAX_NAMESPACE_FILE_BYTES),
+    )?;
+    String::from_utf8(bytes).ok()
 }
 
 /// Parse `namespace = "..."` from committed [`REPO_CONFIG_FILE`] content.
@@ -255,7 +276,7 @@ fn repo_config_divergence(
     toplevel: &Path,
     committed: Option<&str>,
 ) -> Option<RepoConfigDivergence> {
-    let worktree = std::fs::read_to_string(toplevel.join(REPO_CONFIG_FILE)).ok()?;
+    let worktree = read_namespace_file(&toplevel.join(REPO_CONFIG_FILE)).ok()?;
     let kind = match committed {
         None => RepoConfigDivergenceKind::Untracked,
         Some(blob) if blob != worktree => RepoConfigDivergenceKind::Modified,
@@ -276,12 +297,15 @@ fn frontmatter_project_within(start: &Path, toplevel: &Path) -> Option<String> {
     if !start.starts_with(toplevel) {
         // Defensive (symlinked cwd vs. git's physical toplevel): the bound
         // cannot be applied to the walk, so consider only the toplevel itself.
-        let text = std::fs::read_to_string(toplevel.join("CLAUDE.md")).ok()?;
+        let text = read_namespace_file(&toplevel.join("CLAUDE.md")).ok()?;
         return project_from_frontmatter(&text);
     }
     for dir in start.ancestors() {
-        if let Ok(text) = std::fs::read_to_string(dir.join("CLAUDE.md")) {
-            return project_from_frontmatter(&text);
+        match read_namespace_file(&dir.join("CLAUDE.md")) {
+            Ok(text) => return project_from_frontmatter(&text),
+            // An oversized/special nearest file must not reveal a parent's override.
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidData => return None,
+            Err(_) => {}
         }
         if dir == toplevel {
             break; // bound: never walk past the git toplevel
@@ -359,7 +383,7 @@ impl NamespacePins {
 
     /// Load from `path`; missing or unparsable degrades to empty.
     pub fn load_from(path: &Path) -> Self {
-        std::fs::read_to_string(path)
+        read_namespace_file(path)
             .ok()
             .and_then(|text| toml::from_str(&text).ok())
             .unwrap_or_default()
@@ -483,6 +507,39 @@ mod tests {
         );
         assert_eq!(res.namespace, Namespace::Project("explicit".to_string()));
         assert_eq!(res.unpinned_override, None);
+    }
+
+    #[test]
+    fn oversized_and_special_namespace_inputs_are_ignored_without_prefix_parsing() {
+        let tmp = TempDir::new().unwrap();
+        let at_cap = tmp.path().join("bounded");
+        fs::write(&at_cap, " ".repeat(MAX_NAMESPACE_FILE_BYTES as usize)).unwrap();
+        assert!(read_namespace_file(&at_cap).is_ok());
+        fs::write(&at_cap, " ".repeat(MAX_NAMESPACE_FILE_BYTES as usize + 1)).unwrap();
+        assert!(read_namespace_file(&at_cap).is_err());
+        assert!(read_namespace_file(tmp.path()).is_err());
+        assert!(NamespacePins::load_from(&at_cap).pins.is_empty());
+        let child = tmp.path().join("child");
+        fs::create_dir(&child).unwrap();
+        fs::write(tmp.path().join("CLAUDE.md"), "---\nproject: parent\n---\n").unwrap();
+        fs::write(
+            child.join("CLAUDE.md"),
+            format!(
+                "---\nproject: unseen\n---\n{}",
+                "x".repeat(MAX_NAMESPACE_FILE_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        assert_eq!(frontmatter_project_within(&child, tmp.path()), None);
+        fs::write(
+            tmp.path().join(REPO_CONFIG_FILE),
+            format!(
+                "namespace = \"unseen\"\n{}",
+                " ".repeat(MAX_NAMESPACE_FILE_BYTES as usize)
+            ),
+        )
+        .unwrap();
+        assert!(repo_config_divergence(tmp.path(), None).is_none());
     }
 
     #[test]
@@ -784,6 +841,44 @@ mod tests {
         assert_eq!(
             head_repo_config(&repo).as_deref(),
             Some("namespace = \"canonical\"\n")
+        );
+    }
+
+    #[test]
+    fn head_repo_config_enforces_cap_during_collection_without_prefix_parsing() {
+        let tmp = TempDir::new().unwrap();
+        let repo = tmp.path().canonicalize().unwrap().join("host-repo");
+        fs::create_dir_all(&repo).unwrap();
+        if !git_init(&repo) {
+            return; // git unavailable; skip
+        }
+        let mut text = String::from("namespace = \"canonical\"\n#");
+        text.push_str(&"x".repeat(MAX_NAMESPACE_FILE_BYTES as usize - text.len()));
+        fs::write(repo.join(REPO_CONFIG_FILE), &text).unwrap();
+        assert!(git_commit_all(&repo));
+        assert_eq!(head_repo_config(&repo).as_deref(), Some(text.as_str()));
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(
+            resolve_namespace_in(&repo, None, &no_pins(), git_toplevel, head_repo_config).namespace,
+            Namespace::Project("canonical".to_string())
+        );
+
+        text.push('x');
+        fs::write(repo.join(REPO_CONFIG_FILE), &text).unwrap();
+        assert!(git_commit_all(&repo));
+        assert_eq!(head_repo_config(&repo), None);
+        // Even a small worktree override cannot replace the rejected HEAD blob.
+        fs::write(repo.join(REPO_CONFIG_FILE), "namespace = \"hijacked\"\n").unwrap();
+        assert_eq!(
+            resolve_namespace_in(&repo, None, &no_pins(), git_toplevel, head_repo_config).namespace,
+            Namespace::Project("host-repo".to_string())
+        );
+        // The shared lifecycle must not cap unrelated git output.
+        let spec = format!("HEAD:{REPO_CONFIG_FILE}");
+        assert_eq!(
+            crate::run_git_bounded(&repo, &["show", &spec], std::time::Duration::from_secs(2),)
+                .as_deref(),
+            Some(text.as_bytes())
         );
     }
 

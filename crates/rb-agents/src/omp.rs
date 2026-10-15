@@ -69,12 +69,19 @@ impl AgentCli for OmpCli {
         // carry inline prose. The runtime applies the same byte cap.
         let transcript_jsonl = if matches!(
             &event,
-            HookEvent::SessionEnd { .. } | HookEvent::SessionCheckpoint { .. }
+            HookEvent::SessionEnd { .. }
+                | HookEvent::SessionCheckpoint { .. }
+                | HookEvent::PreCompact { .. }
         ) {
             raw.get("transcript_jsonl")
                 .and_then(Value::as_str)
-                .filter(|text| text.len() <= MAX_TRANSCRIPT_BYTES)
-                .map(ToString::to_string)
+                .map(|text| {
+                    if text.len() <= MAX_TRANSCRIPT_BYTES { text.to_string() }
+                    else { json!({"capture_window": {
+                        "incomplete": true, "adapter": "omp", "byte_cap": MAX_TRANSCRIPT_BYTES,
+                        "rejected_bytes": text.len(), "window": "oversized inline transcript rejected"
+                    }}).to_string() }
+                })
         } else {
             None
         };
@@ -185,7 +192,11 @@ mod tests {
             "type": "session_shutdown",
             "transcript_jsonl": format!("{at_limit}\n"),
         }));
-        assert!(oversized.transcript_jsonl.is_none());
+        assert!(oversized
+            .transcript_jsonl
+            .as_deref()
+            .unwrap()
+            .contains("oversized inline transcript rejected"));
         assert!(matches!(oversized.event, HookEvent::SessionEnd { .. }));
 
         let prompt = OmpCli.parse_input(&json!({
