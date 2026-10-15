@@ -95,6 +95,10 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     }
     let socket_path = effective.socket_path.clone();
     let db_path = effective.db_path.clone();
+    let startup_timeout = client::startup_timeout(
+        effective.embed_backend.as_deref(),
+        effective.local_model.as_deref(),
+    );
 
     match cli.command {
         Command::Serve {
@@ -124,7 +128,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
             .context("daemon failed")?;
             Ok(())
         }
-        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)
+        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace, startup_timeout)
             .await
             .context("mcp adapter failed"),
         // Doctor diagnoses the system AS IT IS: it must not auto-start the
@@ -149,6 +153,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 &socket_path,
                 &db_path,
                 effective.retention.clone(),
+                startup_timeout,
             )
             .await
         }
@@ -173,6 +178,7 @@ async fn run_client(
     socket_path: &std::path::Path,
     db_path: &std::path::Path,
     retention: Option<rb_types::RetentionPolicy>,
+    startup_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
     let ns_str = namespace.as_db_string();
@@ -182,6 +188,7 @@ async fn run_client(
         namespace,
         self_exe,
         Some(client::client_identity("cli")),
+        startup_timeout,
     )
     .await
     .context("connecting to daemon")?;
@@ -1630,7 +1637,15 @@ mod tests {
 
         let ns = Namespace::Project("injected".to_string());
         let started = Instant::now();
-        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe, None).await;
+        let result = crate::client::connect_or_start(
+            &sock,
+            &db,
+            ns,
+            self_exe,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         let elapsed = started.elapsed();
 
         // Returns an Err quickly (no 50-retry backoff, no daemon spawn).

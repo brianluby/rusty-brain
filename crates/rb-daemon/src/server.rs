@@ -654,28 +654,95 @@ impl DatabaseGuard {
     }
 }
 
-/// Use effective UID under fixed /tmp instead of HOME/XDG/socket paths so
-/// cooperating same-user daemons derive the same admission directory.
+/// Use the OS account's persistent home, never HOME/XDG/socket paths or a
+/// temporary directory whose cleanup could unlink a still-locked sidecar.
 fn database_admission_directory() -> Result<PathBuf> {
+    let directory =
+        account_home_directory().and_then(|home| prepare_database_admission_directory(&home));
+    directory.map_err(|e| {
+        Error::Io(format!(
+            "{e}; restore a persistent, writable home for the effective OS user; \
+             HOME/XDG overrides cannot relocate database admission, and admission \
+             files must not be removed while any daemon is running"
+        ))
+    })
+}
+
+#[allow(unsafe_code)]
+fn account_home_directory() -> Result<PathBuf> {
+    use std::ffi::{CStr, OsStr};
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut buffer = vec![0u8; 1024];
+    loop {
+        let mut account = std::mem::MaybeUninit::<libc::passwd>::uninit();
+        let mut found = std::ptr::null_mut();
+        // SAFETY: getpwuid_r initializes account and found, borrowing the
+        // writable buffer only for this call; returned strings live in buffer.
+        let rc = unsafe {
+            libc::getpwuid_r(
+                process_euid(),
+                account.as_mut_ptr(),
+                buffer.as_mut_ptr().cast(),
+                buffer.len(),
+                &mut found,
+            )
+        };
+        if rc == libc::ERANGE {
+            let size = buffer
+                .len()
+                .checked_mul(2)
+                .ok_or_else(|| Error::Io("OS account record is too large".to_string()))?;
+            buffer.resize(size, 0);
+            continue;
+        }
+        if rc != 0 {
+            return Err(Error::Io(format!(
+                "resolve effective OS user's home: {}",
+                std::io::Error::from_raw_os_error(rc)
+            )));
+        }
+        if found.is_null() {
+            return Err(Error::Io(
+                "effective OS user has no account record".to_string(),
+            ));
+        }
+        // SAFETY: a successful getpwuid_r with nonnull found initialized account.
+        let account = unsafe { account.assume_init() };
+        if account.pw_dir.is_null() {
+            return Err(Error::Io(
+                "effective OS user has no home directory".to_string(),
+            ));
+        }
+        // SAFETY: pw_dir is a NUL-terminated string owned by the live buffer.
+        let home = unsafe { CStr::from_ptr(account.pw_dir) };
+        return Ok(PathBuf::from(OsStr::from_bytes(home.to_bytes())));
+    }
+}
+
+fn prepare_database_admission_directory(home: &Path) -> Result<PathBuf> {
     use std::os::unix::fs::{DirBuilderExt, MetadataExt};
 
-    let temp_root = fs::canonicalize("/tmp")
-        .map_err(|e| Error::Io(format!("resolve stable lock root /tmp: {e}")))?;
-    let temp_metadata = fs::metadata(&temp_root).map_err(|e| {
-        Error::Io(format!(
-            "stat stable lock root {}: {e}",
-            temp_root.display()
-        ))
-    })?;
-    let temp_mode = temp_metadata.permissions().mode();
-    if !temp_metadata.is_dir() || temp_metadata.uid() != 0 || temp_mode & 0o1000 == 0 {
+    if !home.is_absolute() {
+        return Err(Error::Io(
+            "OS account home must be an absolute path".to_string(),
+        ));
+    }
+    let home = fs::canonicalize(home)
+        .map_err(|e| Error::Io(format!("resolve OS account home {}: {e}", home.display())))?;
+    let home_metadata = fs::metadata(&home)
+        .map_err(|e| Error::Io(format!("stat OS account home {}: {e}", home.display())))?;
+    if !home_metadata.is_dir()
+        || home_metadata.uid() != process_euid()
+        || home_metadata.permissions().mode() & 0o022 != 0
+    {
         return Err(Error::Io(format!(
-            "stable lock root {} must be a root-owned sticky directory",
-            temp_root.display()
+            "OS account home {} must be owner-owned and not writable by other users",
+            home.display()
         )));
     }
 
-    let directory = temp_root.join(format!("rusty-brain-db-admission-{}", process_euid()));
+    let directory = home.join(".rusty-brain-db-admission");
     let mut builder = fs::DirBuilder::new();
     builder.mode(0o700);
     match builder.create(&directory) {
@@ -1960,6 +2027,14 @@ where
             Ok(memories) => Response::GraphResult { memories },
             Err(e) => error_to_response(e),
         },
+        Request::Update { updates, .. }
+            if provenance.origin_source.as_deref() == Some("hook")
+                && updates.human_curated.is_some() =>
+        {
+            error_to_response(Error::InvalidArgument(
+                "automatic hook writes cannot set human-curation intent".into(),
+            ))
+        }
         Request::Update { id, updates } => match engine.update(id, updates).await {
             Ok(()) => Response::Updated,
             Err(e) => error_to_response(e),
@@ -2523,6 +2598,111 @@ mod tests {
     }
 
     #[test]
+    fn database_admission_directory_refuses_missing_or_unsafe_account_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing-home");
+        assert!(prepare_database_admission_directory(&missing).is_err());
+        assert!(
+            !missing.exists(),
+            "an unavailable account home must not be invented"
+        );
+        assert!(prepare_database_admission_directory(Path::new("relative-home")).is_err());
+
+        let file = dir.path().join("not-a-home");
+        fs::write(&file, b"").unwrap();
+        assert!(prepare_database_admission_directory(&file).is_err());
+
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o770)).unwrap();
+        let err = prepare_database_admission_directory(dir.path()).unwrap_err();
+        assert!(err.to_string().contains("not writable by other users"));
+        assert!(!dir.path().join(".rusty-brain-db-admission").exists());
+    }
+
+    #[test]
+    fn database_admission_directory_refuses_unsafe_entries() {
+        use std::os::unix::fs::symlink;
+
+        for kind in ["file", "symlink", "unwritable"] {
+            let home = tempfile::tempdir().unwrap();
+            let admission = home.path().join(".rusty-brain-db-admission");
+            match kind {
+                "file" => fs::write(&admission, b"").unwrap(),
+                "symlink" => symlink(home.path(), &admission).unwrap(),
+                _ => {
+                    fs::create_dir(&admission).unwrap();
+                    fs::set_permissions(&admission, fs::Permissions::from_mode(0o500)).unwrap();
+                }
+            }
+            let err = prepare_database_admission_directory(home.path()).unwrap_err();
+            assert!(
+                err.to_string().contains("must be owner-owned and private"),
+                "{kind} admission directory must be refused: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn database_admission_environment_does_not_split_live_alias_lock() {
+        use std::os::unix::fs::symlink;
+
+        const CHILD_DATABASE: &str = "RB_ADMISSION_TEST_DATABASE";
+        const CHILD_DIRECTORY: &str = "RB_ADMISSION_TEST_DIRECTORY";
+        if let Some(database) = std::env::var_os(CHILD_DATABASE) {
+            let expected = PathBuf::from(std::env::var_os(CHILD_DIRECTORY).unwrap());
+            assert_eq!(database_admission_directory().unwrap(), expected);
+            let err = DatabaseGuard::acquire(Path::new(&database))
+                .err()
+                .expect("the parent process holds admission for this inode");
+            assert!(err.to_string().contains("already admitted"), "{err}");
+            return;
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.db");
+        let guard = DatabaseGuard::acquire(&database).unwrap();
+        let expected = database_admission_directory().unwrap();
+        let other_directory = dir.path().join("other-database-directory");
+        fs::create_dir(&other_directory).unwrap();
+        let hardlink = other_directory.join("hardlink.db");
+        let symlink_path = other_directory.join("symlink.db");
+        fs::hard_link(&database, &hardlink).unwrap();
+        symlink(&database, &symlink_path).unwrap();
+
+        for alias in [hardlink, symlink_path] {
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap());
+            child
+                .args([
+                    "--exact",
+                    "server::tests::database_admission_environment_does_not_split_live_alias_lock",
+                    "--nocapture",
+                ])
+                .env(CHILD_DATABASE, alias)
+                .env(CHILD_DIRECTORY, &expected);
+            for variable in [
+                "HOME",
+                "USERPROFILE",
+                "XDG_DATA_HOME",
+                "XDG_STATE_HOME",
+                "XDG_RUNTIME_DIR",
+                "TMPDIR",
+                "TMP",
+                "TEMP",
+                "RUSTY_BRAIN_SOCKET",
+            ] {
+                child.env(variable, dir.path().join(variable));
+            }
+            let output = child.output().unwrap();
+            assert!(
+                output.status.success(),
+                "environment-altered launcher bypassed admission:\n{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+        drop(guard);
+    }
+
+    #[test]
     fn database_admission_sidecar_uses_inode_aliases_and_is_not_replaced() {
         use std::os::unix::fs::{symlink, MetadataExt};
 
@@ -2537,9 +2717,9 @@ mod tests {
         let lock_directory = database_admission_directory().unwrap();
         assert_eq!(
             lock_directory,
-            fs::canonicalize("/tmp")
+            fs::canonicalize(account_home_directory().unwrap())
                 .unwrap()
-                .join(format!("rusty-brain-db-admission-{}", process_euid()))
+                .join(".rusty-brain-db-admission")
         );
         assert_eq!(
             fs::metadata(&lock_directory).unwrap().permissions().mode() & 0o777,

@@ -22,6 +22,15 @@ impl Drop for DaemonCleanup {
     }
 }
 
+struct ServeCleanup(Child);
+
+impl Drop for ServeCleanup {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
 fn run_before_deadline(mut command: Command, timeout: Duration) -> (Output, Duration) {
     command
         .stdin(Stdio::null())
@@ -64,10 +73,10 @@ fn cli(executable: &Path, socket: &Path, database: &Path, config: &Path, cache: 
     command
 }
 
-fn model_conflict_database(database: &Path) {
+fn model_conflict_database(database: &Path) -> rb_types::MemoryId {
     let store = SqliteStore::open_with_model(database, 512, "fixture-other-model").unwrap();
     let mut note = MemoryNote::new(
-        Namespace::Global,
+        Namespace::Project("startup-fixture".into()),
         "A populated model-conflict startup fixture.".into(),
         MemoryType::Insight,
         6,
@@ -76,6 +85,7 @@ fn model_conflict_database(database: &Path) {
     note.embedding_input_version = "v2-composite".into();
     store.insert_memory(&note, Some(&vec![0.125; 512])).unwrap();
     drop(store);
+    note.id
 }
 
 #[test]
@@ -119,6 +129,61 @@ fn cli_and_mcp_report_real_model_conflict_before_the_startup_deadline() {
             "{surface} emitted stdout on startup failure"
         );
     }
+}
+
+#[test]
+fn cli_accept_model_change_preserves_the_corpus_and_reembeds_it() {
+    let directory = tempfile::tempdir().unwrap();
+    let database = directory.path().join("memory.db");
+    let id = model_conflict_database(&database);
+    let socket = directory.path().join("runtime").join("daemon.sock");
+    let executable = cargo_bin("rusty-brain");
+    let config = directory.path().join("config");
+    let cache = directory.path().join("cache");
+    let mut command = cli(&executable, &socket, &database, &config, &cache);
+    command
+        .args(["serve", "--accept-model-change"])
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    let daemon = ServeCleanup(command.spawn().unwrap());
+    let deadline = Instant::now() + Duration::from_secs(7);
+    while !socket.exists() {
+        assert!(Instant::now() < deadline, "accepting daemon did not bind");
+        thread::sleep(Duration::from_millis(10));
+    }
+    let run = |arguments: &[&str]| {
+        let mut command = cli(&executable, &socket, &database, &config, &cache);
+        command
+            .env("RUSTY_BRAIN_NAMESPACE", "startup-fixture")
+            .args(arguments);
+        let (output, _) = run_before_deadline(command, Duration::from_secs(7));
+        assert!(
+            output.status.success(),
+            "{arguments:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+    };
+    let status = run(&["--json", "status"]);
+    assert_eq!(status["provider_model"], "deterministic");
+    assert_eq!(status["db"]["embedding_model"], "deterministic");
+    assert_eq!(status["memories"]["live"], 1);
+    assert_eq!(status["vectors"], 0);
+    let reembedded = run(&["--json", "reembed", "--limit", "10"]);
+    assert_eq!(reembedded["changed"], 1);
+    assert_eq!(reembedded["skipped"], 0);
+    assert_eq!(run(&["--json", "status"])["vectors"], 1);
+    drop(daemon);
+
+    let reopened = SqliteStore::open_with_model(&database, 512, "deterministic").unwrap();
+    let memory = reopened.get_memory(&id).unwrap().unwrap();
+    assert_eq!(
+        memory.content,
+        "A populated model-conflict startup fixture."
+    );
+    assert_eq!(memory.embedding_model, "deterministic");
+    assert_eq!(memory.embedding_input_version, "v2-composite");
 }
 
 #[test]
@@ -235,7 +300,7 @@ fn internal_collector_keeps_the_bounded_true_tail_in_a_private_file() {
     let mut collector = Command::new(executable)
         .arg("--internal-startup-stderr-collector")
         .arg(&log)
-        .arg("5000")
+        .arg("120000")
         .env_clear()
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
@@ -243,6 +308,7 @@ fn internal_collector_keeps_the_bounded_true_tail_in_a_private_file() {
         .spawn()
         .unwrap();
     let mut input = collector.stdin.take().unwrap();
+    thread::sleep(Duration::from_secs(6));
     let mut bytes = vec![b'x'; LIMIT + 16];
     bytes[..5].copy_from_slice(b"FIRST");
     bytes[15] = b'\n';

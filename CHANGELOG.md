@@ -15,8 +15,9 @@ All notable changes to rusty-brain are documented here. The format is based on
   and aliases, retaining admission through writer/read-pool shutdown. Use private
   sidecars rather than SQLite-file flocking, which conflicts with macOS WAL locks.
   Legacy binaries and unmanaged SQLite clients must still be stopped explicitly.
-- Surface real daemon startup causes in CLI/MCP errors under one five-second
-  socket/handshake deadline, with child status and a redacted bounded stderr tail.
+- Surface real daemon startup causes in CLI/MCP errors under one bounded
+  socket/handshake deadline (five seconds normally, 120 for resolved local models),
+  with child status and a redacted bounded stderr tail.
   Capture private bounded per-attempt logs without blocking on inherited stderr
   pipes or terminating a healthy detached daemon when its launcher exits.
 - Extend bounded CLI/MCP history with the target's full stored claim, context,
@@ -53,6 +54,21 @@ All notable changes to rusty-brain are documented here. The format is based on
   linked/chain rows with an explicit truncation marker. Oversized target detail
   returns an actionable error without truncating qualifications or closing the
   connection.
+
+### Fixed — PR #99 review remediations
+
+- Move database-inode admission to a persistent, validated OS-account-home
+  directory so temporary cleanup and environment overrides cannot split live
+  locks. Fail closed without a safe home; stop pre-upgrade daemons before switching
+  from the former `/tmp` lock location.
+- Reject hook-origin curation mark/unmark metadata updates before any fields are
+  changed, while preserving ordinary hook updates and deliberate CLI/MCP overrides.
+- Allow resolved local embedding startup up to 120 seconds across CLI/MCP and its
+  stderr collector, retaining the ordinary five-second deadline and one bounded
+  attempt budget.
+- Exercise actual CLI model acceptance and re-embedding, curated importance-job
+  refusal accounting, and legacy-daemon curation capability checks. Correct the
+  symlink log fixture so it reaches the no-follow check rather than a path guard.
 
 ### Fixed — PR #98 review remediations
 

@@ -470,15 +470,19 @@ A legacy database with no global model marker is reconciled from
 may seed the marker; conflicting or mixed corpora require explicit acceptance.
 
 Daemon serving and standalone acceptance acquire the same nonblocking admission
-guard before opening SQLite connections. Private `0600` sidecars in an owner-owned
-`0700` `/tmp/rusty-brain-db-admission-<euid>` directory are keyed by the open
-database's device/inode, so aliases and different socket paths coordinate.
-The guard outlives daemon, writer-thread and borrowed read-pool connections,
-including cancelled asynchronous callers; sidecars are never unlinked.
+guard before opening SQLite connections. Private `0600` sidecars live in the
+owner-owned `0700` directory `<OS-account-home>/.rusty-brain-db-admission`, keyed
+by the open database's device/inode so aliases and separate sockets coordinate.
+The canonical home is resolved for the effective UID, independently of `HOME`,
+XDG and temporary-directory overrides. Unsafe or unavailable homes fail closed,
+without a fallback lock root. The guard outlives daemon, writer-thread and borrowed
+read-pool connections, including cancelled asynchronous callers. Sidecars are
+never unlinked; do not remove them while a daemon is running.
 SQLite's own file is not flocked (that conflicts with WAL locking on macOS).
-This is cooperative exclusion only: stop legacy binaries and unmanaged SQLite
-clients before migration. Database replacement by an unrelated process is not an
-enforced boundary.
+This is cooperative exclusion only: stop all pre-upgrade daemons before switching
+from the former `/tmp` admission directory, and stop legacy binaries and unmanaged
+SQLite clients before migration. Database replacement by an unrelated process is
+not an enforced boundary.
 
 The database file holds captured memory text, so it gets the same posture as the
 daemon socket: the file is created `0600` and tightened fail-closed on every open

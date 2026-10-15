@@ -1527,6 +1527,73 @@ mod wrapper_tests {
     }
 
     #[tokio::test]
+    async fn curation_intent_requires_capability_without_breaking_legacy_operations() {
+        for advertised in [false, true] {
+            let (_directory, path) = socket_path();
+            let listener = UnixListener::bind(&path).unwrap();
+            let id = MemoryId::new();
+            let capabilities = if advertised {
+                vec![crate::CAP_HUMAN_CURATION.into()]
+            } else {
+                vec![]
+            };
+            let server = tokio::spawn(serve_with_capabilities(listener, id.clone(), capabilities));
+            let mut client = connect(&path).await;
+            for human_curated in [false, true] {
+                let result = client
+                    .update(
+                        id.clone(),
+                        MemoryUpdates {
+                            human_curated: Some(human_curated),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if advertised {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(Error::InvalidArgument(_))));
+                }
+            }
+            let result = client
+                .remember_anchored_with_intent(
+                    "curated decision".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
+            if advertised {
+                assert_eq!(result.unwrap(), id);
+            } else {
+                assert!(matches!(result, Err(Error::InvalidArgument(_))));
+            }
+            client
+                .update(
+                    id,
+                    MemoryUpdates {
+                        importance: Some(7),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.ping().await.unwrap(), CONTRACT_VERSION);
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn anchor_payloads_are_rejected_against_a_daemon_without_the_capability() {
         // Old-daemon compatibility: a pre-anchor daemon advertises no
         // `anchors` capability. It would silently IGNORE anchor filters on

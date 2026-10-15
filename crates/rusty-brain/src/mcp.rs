@@ -42,6 +42,7 @@ pub struct ClientProxy {
     db_path: PathBuf,
     namespace: rb_types::Namespace,
     self_exe: PathBuf,
+    startup_timeout: Duration,
 }
 
 /// Which phase of a request round-trip failed. See the retry rule on
@@ -95,6 +96,7 @@ impl ClientProxy {
         db_path: PathBuf,
         namespace: rb_types::Namespace,
         self_exe: PathBuf,
+        startup_timeout: Duration,
     ) -> Self {
         Self {
             client: Some(client),
@@ -102,6 +104,7 @@ impl ClientProxy {
             db_path,
             namespace,
             self_exe,
+            startup_timeout,
         }
     }
 
@@ -123,6 +126,7 @@ impl ClientProxy {
                 self.namespace.clone(),
                 self.self_exe.clone(),
                 Some(crate::client::client_identity("mcp")),
+                self.startup_timeout,
             )
             .await
             {
@@ -228,6 +232,7 @@ pub async fn run_mcp(
     socket_path: &Path,
     db_path: &Path,
     namespace: rb_types::Namespace,
+    startup_timeout: Duration,
 ) -> anyhow::Result<()> {
     let self_exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("locating own executable: {e}"))?;
@@ -237,6 +242,7 @@ pub async fn run_mcp(
         namespace.clone(),
         self_exe.clone(),
         Some(crate::client::client_identity("mcp")),
+        startup_timeout,
     )
     .await
     .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
@@ -254,7 +260,15 @@ pub async fn run_mcp(
     let sub_ns = namespace.clone();
     let sub_exe = self_exe.clone();
     tokio::spawn(async move {
-        run_subscriber(&sub_socket, &sub_db, sub_ns, sub_exe, sub_buffer).await;
+        run_subscriber(
+            &sub_socket,
+            &sub_db,
+            sub_ns,
+            sub_exe,
+            sub_buffer,
+            startup_timeout,
+        )
+        .await;
     });
 
     let proxy = ClientProxy::new(
@@ -263,6 +277,7 @@ pub async fn run_mcp(
         db_path.to_path_buf(),
         namespace,
         self_exe,
+        startup_timeout,
     );
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
@@ -283,6 +298,7 @@ async fn run_subscriber(
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
     buffer: Arc<Mutex<ChangeBuffer>>,
+    startup_timeout: Duration,
 ) {
     let mut backoff = SUBSCRIBE_BACKOFF_INITIAL;
     // W2.7 replay cursor: the highest oplog seq this subscriber has pushed
@@ -299,6 +315,7 @@ async fn run_subscriber(
             namespace.clone(),
             self_exe.clone(),
             cursor,
+            startup_timeout,
         )
         .await
         {
@@ -330,6 +347,7 @@ async fn connect_and_subscribe(
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
     since: Option<u64>,
+    startup_timeout: Duration,
 ) -> rb_types::Result<Client> {
     let mut client = connect_or_start(
         socket_path,
@@ -337,6 +355,7 @@ async fn connect_and_subscribe(
         namespace,
         self_exe,
         Some(crate::client::client_identity("mcp")),
+        startup_timeout,
     )
     .await?;
     client.subscribe_since(since).await?;
@@ -460,7 +479,7 @@ mod tests {
             db: &'a std::path::Path,
             ns: rb_types::Namespace,
         ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-            Box::pin(run_mcp(sock, db, ns))
+            Box::pin(run_mcp(sock, db, ns, Duration::from_secs(5)))
         }
         let _ = _assert_callable as fn(_, _, _) -> _;
     }

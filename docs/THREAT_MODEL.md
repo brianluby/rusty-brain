@@ -77,9 +77,13 @@ do not attach them unreviewed to public reports.
 Database migration admission is advisory coordination, not authorization. New
 daemons and migrations retain a per-user device/inode sidecar lock until all their
 SQLite connections close; aliases and separate sockets cannot bypass that guard.
-Older binaries and raw SQLite clients do not participate, so stop them before
-explicit model/dimension cutover. Concurrent database replacement and hostile
-same-user lock-file manipulation are outside this cooperative guarantee.
+Sidecars persist in the effective OS account home's `.rusty-brain-db-admission`,
+independently of `HOME`, XDG or temporary-directory overrides. Unsafe or unavailable
+homes fail closed. Stop all pre-upgrade daemons before switching from the old
+`/tmp` location, and never remove live admission files. Older binaries and raw
+SQLite clients do not participate, so stop them before explicit model/dimension
+cutover. Concurrent database replacement and hostile same-user lock-file
+manipulation are outside this cooperative guarantee.
 
 History/source inspection returns only namespace-visible stored reference data in
 one read snapshot. It never fetches cited paths/URLs/transcripts or upgrades their

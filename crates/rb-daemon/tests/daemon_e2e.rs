@@ -1961,6 +1961,30 @@ async fn hook_correction_retirement_protects_curated_older_facts_and_preserves_d
     .await
     .unwrap();
     let protected = cli.get(postgres.clone()).await.unwrap().unwrap();
+    for human_curated in [false, true] {
+        let error = hook
+            .update(
+                postgres.clone(),
+                MemoryUpdates {
+                    human_curated: Some(human_curated),
+                    summary: Some("must not partially apply a rejected update".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, rb_types::Error::InvalidArgument(_)),
+            "{error}"
+        );
+        assert!(error
+            .to_string()
+            .contains("automatic hook writes cannot set human-curation intent"));
+        assert_eq!(
+            cli.get(postgres.clone()).await.unwrap(),
+            Some(protected.clone())
+        );
+    }
     let sqlite = hook
         .remember_superseding(
             "Correction: database: SQLite".into(),
@@ -1985,6 +2009,19 @@ async fn hook_correction_retirement_protects_curated_older_facts_and_preserves_d
     assert_eq!(cli.get(postgres.clone()).await.unwrap(), Some(protected));
     assert_eq!(cli.get(mysql).await.unwrap(), Some(resolved_mysql));
 
+    hook.update(
+        sqlite.clone(),
+        MemoryUpdates {
+            context: Some("Ordinary hook metadata updates remain supported.".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cli.get(sqlite.clone()).await.unwrap().unwrap().context,
+        "Ordinary hook metadata updates remain supported."
+    );
     hook.delete(sqlite.clone()).await.unwrap();
     assert!(cli
         .get(sqlite)

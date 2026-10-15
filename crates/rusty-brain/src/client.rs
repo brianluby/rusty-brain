@@ -41,16 +41,18 @@ pub fn client_identity(source: &str) -> ClientIdentity {
 /// Connect to the daemon at `socket_path` for `namespace`, auto-starting a
 /// detached `rusty-brain serve` child if the socket is not yet accepting.
 /// `identity` (see [`client_identity`]) is stamped as provenance on every
-/// memory the connection writes. The startup deadline covers both socket
-/// connection and the existing protocol handshake.
+/// memory the connection writes. The caller selects five seconds normally or
+/// 120 seconds for local model initialization; one absolute deadline covers
+/// both socket connection and the existing protocol handshake.
 pub async fn connect_or_start(
     socket_path: &Path,
     db_path: &Path,
     namespace: Namespace,
     self_exe: PathBuf,
     identity: Option<ClientIdentity>,
+    startup_timeout: Duration,
 ) -> Result<Client> {
-    let deadline = Instant::now() + STARTUP_DEADLINE;
+    let deadline = Instant::now() + startup_timeout.min(LOCAL_STARTUP_DEADLINE);
     let socket = socket_path.to_path_buf();
     let spawn_socket = socket.clone();
     let spawn_db = db_path.to_path_buf();
@@ -69,12 +71,22 @@ pub async fn connect_or_start(
 }
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
+const LOCAL_STARTUP_DEADLINE: Duration = Duration::from_secs(120);
 const STARTUP_BACKOFF: Duration = Duration::from_millis(100);
 const STARTUP_LOG_LIMIT: u64 = 64 * 1024;
 const STARTUP_ERROR_LIMIT: usize = 8 * 1024;
 const RETAINED_STARTUP_LOGS: usize = 8;
 const STARTUP_COLLECTOR_ARG: &str = "--internal-startup-stderr-collector";
 static STARTUP_LOG_SEQUENCE: AtomicU64 = AtomicU64::new(0);
+
+pub(crate) fn startup_timeout(backend: Option<&str>, local_model: Option<&str>) -> Duration {
+    if crate::serve::local_requested(backend, local_model) {
+        // Cold local startup may download weights before binding the socket.
+        LOCAL_STARTUP_DEADLINE
+    } else {
+        STARTUP_DEADLINE
+    }
+}
 
 enum ConnectAttempt<T> {
     Ready(T),
@@ -433,7 +445,7 @@ pub fn run_internal_startup_log_collector() -> Option<std::process::ExitCode> {
     let (Some(path), Some(capture_millis)) = (path, capture_millis) else {
         return Some(collect_startup_stderr(Path::new(""), Duration::ZERO));
     };
-    let capture_for = Duration::from_millis(capture_millis).min(STARTUP_DEADLINE);
+    let capture_for = Duration::from_millis(capture_millis).min(LOCAL_STARTUP_DEADLINE);
     Some(collect_startup_stderr(&path, capture_for))
 }
 
@@ -936,6 +948,101 @@ mod tests {
             .unwrap()
     }
 
+    #[test]
+    fn only_resolved_local_configuration_extends_the_startup_budget() {
+        for (backend, model) in [(None, None), (Some("voyage"), None)] {
+            assert_eq!(startup_timeout(backend, model), Duration::from_secs(5));
+        }
+        for (backend, model) in [
+            (Some("local"), None),
+            (Some("LOCAL"), None),
+            (None, Some("all-MiniLM-L6-v2")),
+            (Some("voyage"), Some("all-MiniLM-L6-v2")),
+        ] {
+            assert_eq!(startup_timeout(backend, model), Duration::from_secs(120));
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn local_startup_outlasts_nonlocal_deadline_and_completes_a_real_handshake() {
+        let directory = tempfile::tempdir().unwrap();
+        let socket = directory.path().join("runtime").join("delayed.sock");
+        let database = directory.path().join("memory.db");
+        let daemon_socket = socket.clone();
+        let (stop, stopped) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(6)).await;
+            let daemon = rb_daemon::Daemon::bind(
+                rb_daemon::DaemonConfig {
+                    socket_path: daemon_socket,
+                    db_path: database,
+                    read_pool_size: 1,
+                    jobs_config: rb_daemon::JobsConfig::default(),
+                    retention_policy: None,
+                    request_idle_timeout: None,
+                    enrich: None,
+                    fusion_mode: rb_daemon::FusionMode::Linear,
+                    abstain_threshold: None,
+                    write_gate: rb_types::WriteGateConfig::default(),
+                    http: None,
+                },
+                rb_daemon::SharedEmbedder::new(rb_embed::DeterministicProvider::new(512)),
+            )
+            .await
+            .unwrap();
+            daemon
+                .run(async {
+                    let _ = stopped.await;
+                })
+                .await
+                .unwrap();
+        });
+        let started = Instant::now();
+        let deadline = started + startup_timeout(Some("local"), None);
+        let spawned = AtomicUsize::new(0);
+        let spawn = || {
+            spawned.fetch_add(1, Ordering::SeqCst);
+            Ok(ManagedDaemon {
+                child: shell("exit 0"),
+                collector: None,
+                collector_status: None,
+                log_path: None,
+                log_guard: None,
+            })
+        };
+        let local = connect_or_start_until(
+            |attempt_deadline| {
+                assert_eq!(attempt_deadline, deadline);
+                connect_once(&socket, Namespace::Global, None, attempt_deadline)
+            },
+            spawn,
+            deadline,
+            STARTUP_BACKOFF,
+        );
+        let nonlocal = connect_or_start_until(
+            |deadline| connect_once(&socket, Namespace::Global, None, deadline),
+            spawn,
+            started + startup_timeout(None, None),
+            STARTUP_BACKOFF,
+        );
+        let (local, nonlocal) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(local, nonlocal)
+        })
+        .await
+        .unwrap();
+        assert!(
+            nonlocal.is_err(),
+            "nonlocal startup must retain its five-second bound"
+        );
+        let mut client = local.unwrap();
+        assert!(started.elapsed() > Duration::from_secs(5));
+        assert_eq!(spawned.load(Ordering::SeqCst), 2);
+        client.ping().await.unwrap();
+        drop(client);
+        stop.send(()).unwrap();
+        serving.await.unwrap();
+    }
+
     #[tokio::test]
     async fn ready_on_first_connection_does_not_spawn() {
         let result = connect_or_start_until(
@@ -1431,11 +1538,16 @@ mod tests {
     fn startup_log_creation_does_not_follow_or_overwrite_symlinks() {
         use std::os::unix::fs::symlink;
 
-        let (root, path) = test_log();
-        fs::remove_file(&path).unwrap();
-        let target = root.join("target");
-        fs::write(&target, b"keep").unwrap();
-        let link = path.with_file_name("startup-link.log");
+        let root = tempfile::tempdir().unwrap();
+        let logs = root.path().join("rusty-brain").join("logs");
+        ensure_log_directory(logs.parent().unwrap(), false).unwrap();
+        ensure_log_directory(&logs, true).unwrap();
+        let link = logs.join("startup-link.log");
+        drop(open_private_startup_log(&link).unwrap());
+        assert!(open_collector_log(&link).is_some());
+        fs::remove_file(&link).unwrap();
+        let target = root.path().join("target");
+        drop(open_private_startup_log(&target).unwrap());
         symlink(&target, &link).unwrap();
 
         assert_eq!(
@@ -1443,8 +1555,11 @@ mod tests {
             io::ErrorKind::AlreadyExists
         );
         assert!(open_collector_log(&link).is_none());
-        assert_eq!(fs::read(&target).unwrap(), b"keep");
-        fs::remove_dir_all(root).unwrap();
+        assert!(fs::symlink_metadata(&link)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert_eq!(fs::metadata(&target).unwrap().len(), 0);
     }
 
     #[test]

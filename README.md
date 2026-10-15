@@ -264,12 +264,15 @@ the marker for new rows; restoring duplicate content never overwrites an existin
 row's curation choice. Protection is not authorization, verified truth or a recall
 eligibility/ranking boost. Upgrade and restart the daemon to enforce it.
 
-Initial CLI/MCP daemon connection attempts share a five-second socket/handshake
-deadline. Startup failures report the observed phase, child status when available,
-a redacted stderr tail and the attempt's log path. Failed-attempt logs live under
-the cache directory's `rusty-brain/logs` (`0700`, files `0600`), retain at most
-64 KiB per attempt, and prune older logs toward an eight-file retention target.
-The surfaced excerpt is capped at 8 KiB; the private raw files can contain secrets.
+Initial CLI/MCP daemon connection attempts share one socket/handshake deadline:
+five seconds normally, or 120 seconds when resolved configuration requests a local
+backend/model. Slow first-time model downloads can exceed that bound; run `serve`
+explicitly to prewarm them. Startup failures report the observed phase, child
+status when available, a redacted stderr tail and the attempt's log path.
+Failed-attempt logs live under the cache directory's `rusty-brain/logs` (`0700`,
+files `0600`), retain at most 64 KiB per attempt, and prune completed logs toward
+an eight-file retention target without removing active attempts. The surfaced
+excerpt is capped at 8 KiB; the private raw files can contain secrets.
 
 You can also run the daemon explicitly in the foreground:
 
@@ -306,9 +309,13 @@ Repeating acceptance for the same model/dimension preserves re-embedding progres
 
 Serving and explicit migration hold a cooperative database-inode admission lock
 across writer/read-pool lifetimes, including through hardlink/symlink aliases.
-It uses a private per-user sidecar under `/tmp`, not a lock on SQLite's own file.
-It does not exclude older rusty-brain binaries or raw SQLite clients: the offline
-stop requirement still applies. A legacy database with no global model marker
+It uses private sidecars in `<OS-account-home>/.rusty-brain-db-admission`, not a lock
+on SQLite's own file. The home comes from the effective OS account, not `HOME`,
+XDG or temporary-directory overrides; an unavailable or unsafe home fails closed.
+Never remove admission files while a daemon is running. Stop every pre-upgrade
+daemon before switching from the old `/tmp` lock location. Older binaries and raw
+SQLite clients do not participate: the offline stop requirement still applies.
+A legacy database with no global model marker
 adopts the configured model only when its corpus is empty or all rows name it;
 conflicting or mixed-model corpora require the explicit recovery path above.
 

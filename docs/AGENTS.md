@@ -69,6 +69,8 @@ succeeding.
   is durable, except human-curated facts. Retirement rechecks protection in its
   transaction; refusals remain unretired in scratch. Failed retirements retry
   even when the correction is already recorded.
+  Hook-origin writes cannot mark memories curated, and hook metadata updates
+  cannot carry mark/unmark intent; deliberate CLI/MCP edits remain available.
   Stored corrections still filter obsolete evidence and finish pending retirement
   when their original transcript records leave the next bounded window.
   Matching uses persisted redacted subject/source identities, including replacement lineage.

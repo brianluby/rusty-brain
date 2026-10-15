@@ -62,7 +62,7 @@ fn env_truthy(value: Option<String>) -> bool {
 /// `backend` equals `local` (case-insensitive) or a local model is named.
 /// Values arrive pre-trimmed/non-empty from [`rb_config::EffectiveConfig`]
 /// (env > config file).
-fn local_requested(backend: Option<&str>, local_model: Option<&str>) -> bool {
+pub(crate) fn local_requested(backend: Option<&str>, local_model: Option<&str>) -> bool {
     backend.is_some_and(|b| b.eq_ignore_ascii_case("local")) || local_model.is_some()
 }
 
