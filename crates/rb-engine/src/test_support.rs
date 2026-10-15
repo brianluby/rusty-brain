@@ -2,7 +2,7 @@
 
 use crate::backend::MemoryBackend;
 use crate::enricher::{Enricher, Enrichment};
-use rb_types::{MemoryId, MemoryNote, MemoryState, MemoryUpdates, Namespace, RecallFilter};
+use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace, RecallFilter};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -130,23 +130,31 @@ impl MemoryBackend for MockBackend {
         ns: Namespace,
         _query: String,
         limit: usize,
-        state: MemoryState,
+        filter: RecallFilter,
     ) -> rb_types::Result<Vec<MemoryId>> {
+        let eligible = self.list(ns, filter, usize::MAX).await?;
+        let eligible: std::collections::HashSet<_> = eligible
+            .into_iter()
+            .filter(|n| !n.is_quarantined() && !n.below_recall_confidence_floor())
+            .map(|n| n.id)
+            .collect();
         if let Some(ids) = self.keyword_results.lock().unwrap().clone() {
-            return Ok(ids.into_iter().take(limit).collect());
+            return Ok(ids
+                .into_iter()
+                .filter(|id| eligible.contains(id))
+                .take(limit)
+                .collect());
         }
-        let mut v: Vec<MemoryNote> = self
+        let mut notes: Vec<_> = self
             .notes
             .lock()
             .unwrap()
             .values()
-            .filter(|n| n.namespace == ns)
-            // Mirror the store: the FTS channel scopes on archived state.
-            .filter(|n| state.admits_archived(n.archived_at.is_some()))
+            .filter(|n| eligible.contains(&n.id))
             .cloned()
             .collect();
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().take(limit).map(|n| n.id).collect())
+        notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        Ok(notes.into_iter().take(limit).map(|n| n.id).collect())
     }
 
     async fn vector(
@@ -154,20 +162,33 @@ impl MemoryBackend for MockBackend {
         ns: Namespace,
         _embedding: Vec<f32>,
         limit: usize,
+        filter: RecallFilter,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
+        let eligible = self.list(ns, filter, usize::MAX).await?;
+        let eligible: std::collections::HashSet<_> = eligible
+            .into_iter()
+            .filter(|n| {
+                n.archived_at.is_none() && !n.is_quarantined() && !n.below_recall_confidence_floor()
+            })
+            .map(|n| n.id)
+            .collect();
         if let Some(ids) = self.vector_results.lock().unwrap().clone() {
-            return Ok(ids.into_iter().take(limit).collect());
+            return Ok(ids
+                .into_iter()
+                .filter(|(id, _)| eligible.contains(id))
+                .take(limit)
+                .collect());
         }
-        let mut v: Vec<MemoryNote> = self
+        let mut notes: Vec<_> = self
             .notes
             .lock()
             .unwrap()
             .values()
-            .filter(|n| n.namespace == ns)
+            .filter(|n| eligible.contains(&n.id))
             .cloned()
             .collect();
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().take(limit).map(|n| (n.id, 0.0)).collect())
+        notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        Ok(notes.into_iter().take(limit).map(|n| (n.id, 0.0)).collect())
     }
 
     async fn graph(

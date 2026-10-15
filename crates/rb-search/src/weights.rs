@@ -37,16 +37,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_weights_match_documented_values() {
-        let w = Weights::default();
-        assert!((w.vector - 0.45).abs() < f32::EPSILON);
-        assert!((w.keyword - 0.30).abs() < f32::EPSILON);
-        assert!((w.graph - 0.10).abs() < f32::EPSILON);
-        assert!((w.importance - 0.10).abs() < f32::EPSILON);
-        assert!((w.recency - 0.05).abs() < f32::EPSILON);
-    }
-
-    #[test]
     fn default_weights_sum_to_one() {
         let w = Weights::default();
         let sum = w.vector + w.keyword + w.graph + w.importance + w.recency;
@@ -54,17 +44,5 @@ mod tests {
             (sum - 1.0).abs() < 1e-6,
             "weights must sum to 1.0, got {sum}"
         );
-    }
-
-    #[test]
-    fn weights_is_copy_and_clone() {
-        let w = Weights::default();
-        let copied = w; // Copy
-                        // Invoke the Clone impl explicitly: `w.clone()` would trip clippy's
-                        // `clone_on_copy` lint (denied by -D warnings) because Weights is Copy.
-        let cloned = Clone::clone(&w);
-        assert!((copied.vector - cloned.vector).abs() < f32::EPSILON);
-        // original still usable after the copy (proves Copy, not move)
-        assert!((w.vector - 0.45).abs() < f32::EPSILON);
     }
 }

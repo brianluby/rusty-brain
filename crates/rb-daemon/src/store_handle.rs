@@ -195,7 +195,8 @@ enum WriteCommand {
         namespace: Namespace,
         old: MemoryId,
         new: MemoryId,
-        reply: oneshot::Sender<Result<()>>,
+        require_equivalence: bool,
+        reply: oneshot::Sender<Result<bool>>,
     },
     /// Replace one memory's stored vector and stamp it to the current
     /// `(model, input_version)` (P5 Feature A re-embed write path). The engine
@@ -829,7 +830,11 @@ impl StoreHandle {
         })
     }
 
-    async fn send_write(&self, cmd: WriteCommand, rx: oneshot::Receiver<Result<()>>) -> Result<()> {
+    async fn send_write<T>(
+        &self,
+        cmd: WriteCommand,
+        rx: oneshot::Receiver<Result<T>>,
+    ) -> Result<T> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(Error::Storage("writer thread unavailable".to_string()));
         }
@@ -1022,6 +1027,18 @@ impl StoreHandle {
             .await
     }
 
+    /// Automatic-collapse candidates; semantic similarity alone is insufficient.
+    pub async fn equivalent_duplicates(
+        &self,
+        ns: Namespace,
+        id: MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        self.with_read(move |store| store.equivalent_duplicates(&ns, &id, threshold, limit))
+            .await
+    }
+
     /// Supersede `old` with `new`: archive `old` and point it at `new`, through
     /// the single writer. The `namespace` is carried only for the published
     /// `Archived` change event; the FK-guarded SQL keys on ids. Fails closed
@@ -1037,6 +1054,26 @@ impl StoreHandle {
             namespace,
             old,
             new,
+            require_equivalence: false,
+            reply,
+        };
+        self.send_write(cmd, rx).await.map(|_| ())
+    }
+
+    /// Collapse only proven duplicates, rechecked in the writer transaction.
+    /// A preserved non-equivalent pair returns `false` and emits no change event.
+    pub async fn supersede_duplicate(
+        &self,
+        namespace: Namespace,
+        old: MemoryId,
+        new: MemoryId,
+    ) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::Supersede {
+            namespace,
+            old,
+            new,
+            require_equivalence: true,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -1787,14 +1824,23 @@ fn writer_loop(
                 namespace,
                 old,
                 new,
+                require_equivalence,
                 reply,
             } => {
+                let mut changed = false;
                 let report = run_store_op(
                     &mut store,
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
                     |s| {
+                        if require_equivalence {
+                            return s.supersede_duplicate(&namespace, &old, &new).map(
+                                |did_change| {
+                                    changed = did_change;
+                                },
+                            );
+                        }
                         // Mirror the Update/Archive arms: verify BOTH memories live in
                         // the caller's namespace before mutating, so the primitive can
                         // never merge across namespaces and the Archived event below is
@@ -1819,12 +1865,12 @@ fn writer_loop(
                         if !new_in_ns {
                             return Err(Error::NotFound(new.clone()));
                         }
-                        s.supersede(&old, &new)
+                        s.supersede(&old, &new).map(|()| changed = true)
                     },
                 );
-                let changed = report.result.is_ok();
+                let changed = report.result.is_ok() && changed;
                 let writer_usable = report.writer_usable;
-                let _ = reply.send(report.result);
+                let _ = reply.send(report.result.map(|()| changed));
                 // supersede archives `old`; mirror the Archive arm so subscribers
                 // observe the consolidation as an Archived event for `old`.
                 if changed {
@@ -2196,9 +2242,9 @@ impl MemoryBackend for StoreHandle {
         ns: Namespace,
         query: String,
         limit: usize,
-        state: rb_types::MemoryState,
+        filter: rb_types::RecallFilter,
     ) -> Result<Vec<MemoryId>> {
-        self.with_read(move |store| store.keyword_search_in_state(&ns, &query, limit, state))
+        self.with_read(move |store| store.keyword_search_filtered(&ns, &query, limit, &filter))
             .await
     }
 
@@ -2207,8 +2253,9 @@ impl MemoryBackend for StoreHandle {
         ns: Namespace,
         embedding: Vec<f32>,
         limit: usize,
+        filter: rb_types::RecallFilter,
     ) -> Result<Vec<(MemoryId, f32)>> {
-        self.with_read(move |store| store.vector_search(&ns, &embedding, limit))
+        self.with_read(move |store| store.vector_search_filtered(&ns, &embedding, limit, &filter))
             .await
     }
 
@@ -2953,6 +3000,67 @@ mod tests {
         assert!(!ids.contains(&foreign_id), "ns-B memory never crosses over");
 
         handle.shutdown().await;
+    }
+
+    /// A refused automatic collapse commits no mutation and publishes no false
+    /// archive; the genuine duplicate still commits and publishes through the writer.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn store_handle_automatic_duplicate_guard_preserves_events_and_namespace() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("duplicates.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("duplicate-events".into());
+        let other = Namespace::Project("foreign-duplicate-events".into());
+        let a = note(&ns, "Retry checkout at most 3 times.");
+        let b = note(&ns, "Retry checkout at most 5 times.");
+        let duplicate = note(&ns, "Retry checkout at most 3 times.");
+        let foreign = note(&other, "Retry checkout at most 3 times.");
+        let (a_id, b_id, duplicate_id, foreign_id) = (
+            a.id.clone(),
+            b.id.clone(),
+            duplicate.id.clone(),
+            foreign.id.clone(),
+        );
+        let mut events = handle.subscribe();
+        for memory in [a, b, duplicate, foreign] {
+            handle.write(memory, Some(vec![1.0; DIM])).await.unwrap();
+        }
+        assert!(!handle
+            .supersede_duplicate(ns.clone(), a_id.clone(), b_id.clone())
+            .await
+            .unwrap());
+        assert!(matches!(
+            handle.supersede_duplicate(ns.clone(), a_id.clone(), foreign_id.clone()).await,
+            Err(Error::NotFound(id)) if id == foreign_id
+        ));
+        assert!(handle
+            .supersede_duplicate(ns.clone(), a_id.clone(), duplicate_id.clone())
+            .await
+            .unwrap());
+        assert!(handle
+            .get(ns.clone(), b_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+        assert!(handle
+            .get(other.clone(), foreign_id.clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+
+        // Shutdown joins the writer, avoiding reply-before-event scheduling races.
+        handle.shutdown().await;
+        let published: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        let archives: Vec<_> = published
+            .iter()
+            .filter(|event| event.kind == rb_types::ChangeKind::Archived)
+            .collect();
+        assert_eq!(archives.len(), 1, "only a genuine collapse emits Archived");
+        assert_eq!(archives[0].id, a_id);
+        assert_eq!(archives[0].namespace, ns);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

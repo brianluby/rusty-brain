@@ -14,31 +14,37 @@ mod scrub;
 mod stats;
 
 use rb_types::{
-    Error, MemoryId, MemoryLink, MemoryNote, MemoryState, MemoryType, MemoryUpdates, Namespace,
-    RecallFilter, Result,
+    Error, MemoryId, MemoryLink, MemoryNote, MemoryType, MemoryUpdates, Namespace, RecallFilter,
+    Result,
 };
 
 pub trait Store {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()>;
     fn get_memory(&self, id: &MemoryId) -> Result<Option<MemoryNote>>;
     fn keyword_search(&self, ns: &Namespace, query: &str, limit: usize) -> Result<Vec<MemoryId>>;
-    /// [`Store::keyword_search`] with an explicit archived-state scope (PRD
-    /// 2026-07-02 search-filter parity). `keyword_search` is the active-only
-    /// convenience; recall with a `state` filter routes here so archived
-    /// memories stay reachable through the FTS channel (their vectors are
-    /// pruned on archive, so keyword+graph are the only archived channels).
-    fn keyword_search_in_state(
+    /// Full recall eligibility, including quarantine/confidence and contested,
+    /// is applied before the FTS cutoff.
+    fn keyword_search_filtered(
         &self,
         ns: &Namespace,
         query: &str,
         limit: usize,
-        state: MemoryState,
+        filter: &RecallFilter,
     ) -> Result<Vec<MemoryId>>;
     fn vector_search(
         &self,
         ns: &Namespace,
         embedding: &[f32],
         limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>>;
+    /// Full eligibility before sqlite-vec's internal top-k, not an outer JOIN
+    /// that merely filters already-truncated neighbors. Archived rows have no vectors.
+    fn vector_search_filtered(
+        &self,
+        ns: &Namespace,
+        embedding: &[f32],
+        limit: usize,
+        filter: &RecallFilter,
     ) -> Result<Vec<(MemoryId, f32)>>;
     /// Walk the link graph out from `id` up to `depth` hops, returning each
     /// reachable node ONCE with its MINIMUM hop distance (1 = direct neighbor;

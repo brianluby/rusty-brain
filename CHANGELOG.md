@@ -5,6 +5,97 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — PR #98 review remediations
+
+- Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed
+  policies such as rejecting anonymous requests; support named `Proposal:` adoption
+  without dropping complete test/production qualifications.
+- Match proposal-planning language at the statement start and apply generic planning
+  markers only to unlabeled prose, preserving labeled rollout corrections and literal
+  diagnostic text such as `"could not connect"`.
+- Keep unlabeled one-off task instructions in activity context, not critical
+  confirmed policy; retain explicit decision/preference language and scoped adoption.
+- Replace stale MCP full-toolset count assertions with required-tool and history
+  discoverability checks; verify both default and full transport modes.
+- Replace stale native OMP serialization assertions with lifecycle, source identity,
+  initial/recent-window, completeness and byte-bound behavior checks; cover unavailable
+  branches without fabricating messages.
+- Bound each recent native OMP entry to 64 KiB so a long final assistant response
+  cannot crowd out the immediately preceding user correction.
+- Patch `quinn-proto` to 0.11.18 and `rustls` to 0.23.46, clearing nine security
+  advisories without advisory ignores or unrelated dependency refreshes.
+- Match persisted correction subjects and sources in their redacted form, preserving
+  replacement lineage and preventing obsolete evidence from returning after window shifts.
+- Keep durable facts distinct from session-scoped duplicates during automatic collapse;
+  equivalent facts from different nonempty sessions may still consolidate.
+- Report adapter-side skipped-byte/record counts as unknown, not local zero counts;
+  qualify kanban references so they cannot link to unrelated GitHub issues.
+- Skip blank tool error fields before choosing a later message; preserve a generic
+  failure observation when an explicitly failed tool supplies no nonblank text.
+- Reuse the fact-label predicate for subject extraction, including `Decided:` facts
+  in ordered correction filtering, persisted retirement and failed-retirement recovery.
+- Preserve explicit confirmations with quoted planning words, and honor preference
+  labels before constraint phrases in their values; verify type-filtered recall and abstention.
+
+### Fixed — Capture review regressions (kanban 73, 74)
+
+- Apply ordered correction filtering before fact admission; retire every known
+  earlier matching-subject fact without evicting source identities. Retry failed
+  retirement for recorded corrections; failed correction writes preserve old facts.
+  Keep stored corrections effective when subsequent windows omit their records.
+- Exclude fenced quotations from confirmation and adoption, and require complete
+  assistant proposals before scoped adoption, independently of window completeness.
+- Count inserted OMP text-block separators when reporting content completeness;
+  partial messages cannot install a clipped, unqualified decision.
+- Preserve newline-aligned recent transcript records while bounding all reads,
+  including tail-boundary inspection, to 1 MiB.
+- Enforce the 1 MiB committed namespace-configuration cap during Git stdout
+  collection for both CLI and hooks; reject oversized blobs instead of parsing prefixes.
+
+### Fixed — Strict Clippy compatibility
+
+- Upgrade `async-trait` to 0.1.92 with its required `syn` 3 parser to remove
+  redundant generated `must_use` attributes without weakening lint policy.
+  Preserve unrelated target-platform dependency versions in the lockfile.
+- Remove Copy/Clone and exact-default-value tautologies from ranking-weight
+  tests; retain the weight-sum invariant and existing ranking behavior coverage.
+
+### Added — Coding-memory evidence baseline (kanban 85)
+
+- Add six predeclared development cases, exact expected/forbidden IDs, explicit
+  decision history and independently checked graph topology using existing rb-eval.
+- Record isolated real local vectors and publish categorized retrieval results,
+  separately from answer quality. Preserve deployment-region abstention failure
+  and unsupported two-hop retrieval as visible gaps, without gate/holdout tuning.
+
+### Fixed — Capture lifecycle, attribution and fact preservation (kanban 73, 74, 87)
+
+- Bound stdin and regular namespace/transcript inputs; offload transcript parsing
+  and scratch pruning and avoid joining abandoned blocking workers. Narrow the
+  contract to fail-open handling, not a whole-process latency deadline.
+- Retain initial and recent evidence with explicit completeness/source metadata;
+  distinguish confirmed user facts, proposals, corrections and observed outcomes.
+  Persist separate durable facts with repeated-fold identities through existing types.
+- Require conservative full-fact equivalence for eager hook collapse and scheduled
+  consolidation, rechecked atomically. Similarity hints do not authorize replacing
+  distinct retry counts, negation, dependency versions or exception qualifiers.
+- Preserve native OMP entry identities and report its bounded, incomplete branch
+  view; exercise the actual asset through disposable hook/daemon/recall self-checks.
+
+### Fixed — Eligible-before-cutoff filtered recall (kanban 76)
+
+- Share complete SQL filter predicates across list and keyword/vector retrieval;
+  sqlite-vec native ID prefiltering precedes top-k rather than filtering its output.
+- Keep default retrieval fast paths, graph-seed eligibility and truthful abstention
+  reasons; reuse query preparation to avoid measured per-candidate parsing overhead.
+
+### Fixed — Namespace and MCP inventory documentation (kanban 77)
+
+- Narrow namespace isolation to row access: shared FTS corpus statistics can
+  influence local BM25 ranking without disclosing foreign-namespace rows.
+- Correct the historical review's full MCP inventory to twelve tools (six by
+  default); remove the incidental README wording assertion.
+
 ### Fixed — PR #89 review remediations (Copilot + CodeRabbit)
 
 - Abstention bar now scales by the top result's trust-class multiplier: the

@@ -288,18 +288,22 @@ mod tests {
         assert_eq!(responses[0]["id"], 1);
         assert_eq!(responses[0]["result"]["serverInfo"]["name"], "rusty-brain");
 
-        // tools/list (id 2) — the DEFAULT advertised set is 6 tools
-        // (remember/recall/get/context/update + memory_feedback, W3.7); the
-        // rest are behind RB_MCP_FULL_TOOLSET.
         assert_eq!(responses[1]["id"], 2);
-        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
-            11
-        } else {
-            6
-        };
+        let tools = responses[1]["result"]["tools"].as_array().unwrap();
+        for name in [
+            "remember",
+            "recall",
+            "get",
+            "context",
+            "update",
+            "memory_feedback",
+        ] {
+            assert!(tools.iter().any(|tool| tool["name"] == name), "{name}");
+        }
         assert_eq!(
-            responses[1]["result"]["tools"].as_array().unwrap().len(),
-            expected_tools
+            tools.iter().any(|tool| tool["name"] == "history"),
+            std::env::var_os("RB_MCP_FULL_TOOLSET").is_some(),
+            "history is discoverable only with the full toolset"
         );
 
         // tools/call (id 3) -> remembered id appears in the tool result text
@@ -413,16 +417,6 @@ mod tests {
             "error for over-long line has null id"
         );
         assert_eq!(responses[1]["id"], 11);
-        // Default advertised toolset is 6 (RB_MCP_FULL_TOOLSET gates the rest).
-        let expected_tools = if std::env::var_os("RB_MCP_FULL_TOOLSET").is_some() {
-            11
-        } else {
-            6
-        };
-        assert_eq!(
-            responses[1]["result"]["tools"].as_array().unwrap().len(),
-            expected_tools
-        );
         server.await.unwrap().unwrap();
     }
 
