@@ -411,9 +411,14 @@ fn tool_failure(tool_response: &serde_json::Value) -> Option<String> {
     Some(
         ["error", "stderr", "message", "content"]
             .iter()
-            .find_map(|key| tool_response.get(*key).and_then(serde_json::Value::as_str))
+            .find_map(|key| {
+                tool_response
+                    .get(*key)
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::trim)
+                    .filter(|text| !text.is_empty())
+            })
             .unwrap_or("tool reported an error")
-            .trim()
             .to_string(),
     )
 }
@@ -1873,6 +1878,18 @@ mod tests {
         // is_error: true without a usable message → a generic description.
         assert_eq!(
             tool_failure(&serde_json::json!({"is_error": true})),
+            Some("tool reported an error".to_string())
+        );
+        assert_eq!(
+            tool_failure(&serde_json::json!({
+                "is_error": true, "error": " \n ", "stderr": "\tpermission denied\n",
+            })),
+            Some("permission denied".to_string())
+        );
+        assert_eq!(
+            tool_failure(&serde_json::json!({
+                "is_error": true, "error": "", "stderr": " ", "message": "\n", "content": "",
+            })),
             Some("tool reported an error".to_string())
         );
         // A successful response (even with a `content` body) is NOT a failure.

@@ -79,6 +79,10 @@ try {
     assert.ok(handler, `native event ${name} must be registered`);
     return handler(payload, context);
   };
+  await event("tool_result", {
+    toolName: "read", input: { path: "missing.txt" }, isError: true,
+    content: [{ type: "text", text: " \n " }],
+  });
   await event("session_before_switch");
   const first = memories(await run("export", "--format", "json"));
   const facts = first.filter(note => note.tags.includes("confirmed-decision"));
@@ -91,6 +95,8 @@ try {
     "adapter omissions cannot be reported as zero bytes or zero records");
   const boundedSummary = first.find(note => note.tags.includes("session-summary"));
   assert.ok(boundedSummary?.content.includes("skipped_bytes=unknown") && boundedSummary.content.includes("skipped_lines=unknown"));
+  assert.ok(boundedSummary?.content.includes("tool reported an error"),
+    "an explicitly failed nonmutation tool with blank output must remain in the session summary");
   assert.ok(!facts.some(note => note.content.includes("ORCHID-PROPOSAL")));
   assert.ok(!facts.some(note => note.context.includes("message=initial-goal")),
     "the 200-block clipped SQLite statement must not become a confirmed policy");

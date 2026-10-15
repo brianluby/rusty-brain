@@ -30,6 +30,8 @@ All notable changes to rusty-brain are documented here. The format is based on
   equivalent facts from different nonempty sessions may still consolidate.
 - Report adapter-side skipped-byte/record counts as unknown, not local zero counts;
   qualify kanban references so they cannot link to unrelated GitHub issues.
+- Skip blank tool error fields before choosing a later message; preserve a generic
+  failure observation when an explicitly failed tool supplies no nonblank text.
 
 ### Fixed — Capture review regressions (kanban 73, 74)
 

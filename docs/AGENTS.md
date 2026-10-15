@@ -75,6 +75,8 @@ succeeding.
   retain daemon-derived `agent_attested` trust. Mixed activity summaries do not
   claim measured success merely because a command ran; tool outcomes distinguish
   observed success, failure and unknown status.
+  Explicit failures retain the first nonblank error/stderr/message/content string;
+  otherwise they record `tool reported an error`, including for nonmutation tools.
 - A per-session 128-source identity ledger survives end/checkpoint resets.
   Repeated source facts keep their IDs; exhaustion is reported and stops new
   fact admission instead of evicting identities. Scratch remains best-effort
