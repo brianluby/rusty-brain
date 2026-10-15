@@ -20,8 +20,8 @@ pub const RETENTION_JOB_INTERVAL_SECS: u64 = 86_400;
 
 /// One retention pass: sweep every namespace, archive-only, each bounded by
 /// the policy's `batch_limit`. `scanned` counts the memories eligible at
-/// sweep time, `changed` the ones actually archived, `skipped` the eligible
-/// overflow left for the next pass.
+/// sweep time, `changed` the ones actually archived, `skipped` guard refusals
+/// plus eligible overflow left for the next pass.
 pub async fn run(
     store: &StoreHandle,
     policy: Option<&RetentionPolicy>,
@@ -149,6 +149,81 @@ mod tests {
         // Idempotent second pass.
         let summary = run(&handle, Some(&policy())).await.unwrap();
         assert_eq!(summary.changed, 0);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_counts_curated_refusals_and_batch_overflow() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let ns = Namespace::Project("job-curation-race".into());
+        let handle = StoreHandle::start(db.clone(), DIM, 1).unwrap();
+        let mut ids = Vec::new();
+        for index in 0..3 {
+            let mut note = MemoryNote::new(
+                ns.clone(),
+                format!("retention candidate {index}"),
+                MemoryType::Insight,
+                2,
+            );
+            note.created_at = chrono::Utc::now() - chrono::Duration::days(90 - index * 10);
+            ids.push(note.id.clone());
+            handle.write(note, Some(vec![0.1; DIM])).await.unwrap();
+        }
+        handle.shutdown().await;
+        {
+            // Curate the next candidate during the first archive, before its own guard runs.
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(&format!(
+                "CREATE TRIGGER curate_next_retention_candidate
+                 AFTER UPDATE OF archived_at ON memories
+                 WHEN OLD.memory_id = '{}' AND NEW.archived_at IS NOT NULL
+                 BEGIN
+                     UPDATE memories SET human_curated = 1 WHERE memory_id = '{}';
+                 END;",
+                ids[0], ids[1]
+            ))
+            .unwrap();
+        }
+        let handle = StoreHandle::start(db, DIM, 1).unwrap();
+        let mut bounded = policy();
+        bounded.batch_limit = 2;
+        let summary = run(&handle, Some(&bounded)).await.unwrap();
+        assert_eq!(summary.scanned, 3);
+        assert_eq!(summary.changed, 1);
+        assert_eq!(summary.skipped, 2);
+        let archived = handle
+            .get(ns.clone(), ids[0].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(archived.archived_at.is_some());
+        let protected = handle
+            .get(ns.clone(), ids[1].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(protected.human_curated);
+        assert!(protected.archived_at.is_none());
+        let pending = handle
+            .get(ns.clone(), ids[2].clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.archived_at.is_none());
+        assert!(!pending.human_curated);
+
+        let next = run(&handle, Some(&bounded)).await.unwrap();
+        assert_eq!(next.scanned, 1);
+        assert_eq!(next.changed, 1);
+        assert_eq!(next.skipped, 0);
+        assert!(handle
+            .get(ns, ids[1].clone())
+            .await
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
         handle.shutdown().await;
     }
 

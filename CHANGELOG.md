@@ -69,6 +69,13 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Exercise actual CLI model acceptance and re-embedding, curated importance-job
   refusal accounting, and legacy-daemon curation capability checks. Correct the
   symlink log fixture so it reaches the no-follow check rather than a path guard.
+- Cover retention-job accounting when curation changes after planning: include
+  both refused candidates and batch overflow, while retaining protection and
+  allowing later passes to finish unprocessed work.
+- Rust API migration: `client::connect_or_start`, `mcp::run_mcp` and
+  `mcp::ClientProxy::new` now require a `startup_timeout: Duration` argument
+  (five seconds normally, 120 for local models). CLI/MCP resolve this from the
+  existing embedding configuration; all workspace callers are migrated.
 
 ### Fixed — PR #98 review remediations
 
