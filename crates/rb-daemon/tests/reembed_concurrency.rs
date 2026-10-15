@@ -130,7 +130,10 @@ async fn assert_interleaved_edit(updates: MemoryUpdates) {
             after.embedding_input_version, "",
             "the edit's stale marker must survive"
         );
-        let hits = handle.vector(ns.clone(), old_vector, 1).await.unwrap();
+        let hits = handle
+            .vector(ns.clone(), old_vector, 1, rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, id);
         assert!(
             hits[0].1.abs() < 1e-6,
@@ -152,7 +155,10 @@ async fn assert_interleaved_edit(updates: MemoryUpdates) {
             .await
             .unwrap()
             .remove(0);
-        let hits = handle.vector(ns, expected, 1).await.unwrap();
+        let hits = handle
+            .vector(ns, expected, 1, rb_types::RecallFilter::default())
+            .await
+            .unwrap();
         assert_eq!(hits[0].0, id);
         assert!(
             hits[0].1.abs() < 1e-6,

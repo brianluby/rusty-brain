@@ -1,4 +1,4 @@
-use rb_types::{MemoryId, MemoryNote, MemoryState, MemoryUpdates, Namespace, RecallFilter};
+use rb_types::{MemoryId, MemoryNote, MemoryUpdates, Namespace, RecallFilter};
 
 /// Async store-access abstraction the engine is generic over. The daemon
 /// implements this on top of the synchronous `rb_store::Store` using a
@@ -8,23 +8,22 @@ use rb_types::{MemoryId, MemoryNote, MemoryState, MemoryUpdates, Namespace, Reca
 pub trait MemoryBackend: Send + Sync {
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()>;
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
-    /// Keyword (FTS) candidates scoped to `state` (PRD 2026-07-02
-    /// search-filter parity): `Active` preserves the historical active-only
-    /// scan; `Archived`/`All` let a state-filtered recall reach archived
-    /// memories through this channel (their vectors are pruned on archive, so
-    /// keyword+graph are the only archived channels).
+    /// Candidates must satisfy the COMPLETE filter (including contested),
+    /// namespace, quarantine and recall-confidence eligibility BEFORE the
+    /// channel cutoff. Archived rows are reachable through keyword only.
     async fn keyword(
         &self,
         ns: Namespace,
         query: String,
         limit: usize,
-        state: MemoryState,
+        filter: RecallFilter,
     ) -> rb_types::Result<Vec<MemoryId>>;
     async fn vector(
         &self,
         ns: Namespace,
         embedding: Vec<f32>,
         limit: usize,
+        filter: RecallFilter,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>>;
     /// Expand the link graph around `id` up to `depth` hops, returning each
     /// reachable id with its MINIMUM hop distance (1 = direct neighbor; the
@@ -186,10 +185,10 @@ mod tests {
         }
         async fn keyword(
             &self,
-            _ns: Namespace,
+            ns: Namespace,
             _query: String,
-            _limit: usize,
-            state: MemoryState,
+            limit: usize,
+            filter: RecallFilter,
         ) -> rb_types::Result<Vec<MemoryId>> {
             // Deterministic order (created_at desc) so keyword_rank is reproducible.
             let mut notes: Vec<MemoryNote> = self
@@ -197,17 +196,24 @@ mod tests {
                 .lock()
                 .unwrap()
                 .values()
-                .filter(|n| state.admits_archived(n.archived_at.is_some()))
+                .filter(|n| n.namespace == ns && filter.matches(n))
+                .filter(|n| !n.is_quarantined() && !n.below_recall_confidence_floor())
                 .cloned()
                 .collect();
             notes.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-            Ok(notes.into_iter().map(|n| n.id).collect())
+            if let Some(want) = filter.contested {
+                let ids = notes.iter().map(|n| n.id.clone()).collect();
+                let contested = self.active_contradicts(ns, ids).await?;
+                notes.retain(|n| contested.contains(&n.id) == want);
+            }
+            Ok(notes.into_iter().take(limit).map(|n| n.id).collect())
         }
         async fn vector(
             &self,
-            _ns: Namespace,
+            ns: Namespace,
             _embedding: Vec<f32>,
-            _limit: usize,
+            limit: usize,
+            filter: RecallFilter,
         ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
             let mut pairs: Vec<(MemoryId, MemoryNote)> = self
                 .embeddings
@@ -223,8 +229,24 @@ mod tests {
                         .map(|n| (id.clone(), n))
                 })
                 .collect();
+            pairs.retain(|(_, n)| {
+                n.namespace == ns
+                    && n.archived_at.is_none()
+                    && filter.matches(n)
+                    && !n.is_quarantined()
+                    && !n.below_recall_confidence_floor()
+            });
+            if let Some(want) = filter.contested {
+                let ids = pairs.iter().map(|(id, _)| id.clone()).collect();
+                let contested = self.active_contradicts(ns, ids).await?;
+                pairs.retain(|(id, _)| contested.contains(id) == want);
+            }
             pairs.sort_by_key(|(_, note)| std::cmp::Reverse(note.created_at));
-            Ok(pairs.into_iter().map(|(id, _)| (id, 0.0)).collect())
+            Ok(pairs
+                .into_iter()
+                .take(limit)
+                .map(|(id, _)| (id, 0.0))
+                .collect())
         }
         async fn graph(
             &self,

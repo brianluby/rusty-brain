@@ -59,6 +59,15 @@ impl SqliteBackend {
         let store = self.lock()?;
         store.supersede(old, new)
     }
+
+    /// Explicit read-only decision history, with the same production store primitive.
+    pub fn history_for_eval(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+    ) -> rb_types::Result<rb_types::MemoryHistory> {
+        self.lock()?.memory_history(ns, id, 10, 20, 20)
+    }
 }
 
 #[async_trait::async_trait]
@@ -78,10 +87,10 @@ impl MemoryBackend for SqliteBackend {
         ns: Namespace,
         query: String,
         limit: usize,
-        state: rb_types::MemoryState,
+        filter: rb_types::RecallFilter,
     ) -> rb_types::Result<Vec<MemoryId>> {
         let store = self.lock()?;
-        store.keyword_search_in_state(&ns, &query, limit, state)
+        store.keyword_search_filtered(&ns, &query, limit, &filter)
     }
 
     async fn vector(
@@ -89,9 +98,10 @@ impl MemoryBackend for SqliteBackend {
         ns: Namespace,
         embedding: Vec<f32>,
         limit: usize,
+        filter: rb_types::RecallFilter,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
         let store = self.lock()?;
-        store.vector_search(&ns, &embedding, limit)
+        store.vector_search_filtered(&ns, &embedding, limit, &filter)
     }
 
     async fn graph(

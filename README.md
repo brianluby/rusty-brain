@@ -48,7 +48,7 @@ focused rebuild. The principles we settled on:
   thread, reads run concurrently over WAL.
 - **Fail-closed where it matters, fail-open where it shouldn't** — namespace
   isolation and the embedding-dimension contract refuse to run on doubt; best-effort
-  capture hooks never block or break an agent session.
+  capture hooks continue on handled errors rather than making memory a prerequisite.
 - **Reproducible from git** — file-discovered, checksummed migrations; CI rebuilds a
   fresh database from committed SQL and exercises every query path.
 
@@ -359,8 +359,9 @@ the non-admin surface while it is enabled.
 
 `rusty-brain-install` wires the `rusty-brain-hooks` binary into a supported agent
 CLI's hook configuration so that file edits, session starts/stops, and similar events
-are captured into memory automatically. The hooks are **fail-open**: any error
-degrades silently and never blocks the agent. The agent surface is
+are captured into memory automatically. The hooks are **fail-open**: handled errors
+and panics continue the session with exit status zero. This is not a whole-process
+latency guarantee; stdin, filesystem work, or stdout can stall. The agent surface is
 **cross-agentic**: OpenCode and Codex are first-priority targets alongside
 Claude Code, with Hermes discovery-gated. Per-agent setup, validation commands, and
 troubleshooting live in [docs/AGENTS.md](docs/AGENTS.md).

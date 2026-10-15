@@ -37,16 +37,10 @@ const MAX_DEPTH: u8 = 8;
 const REEMBED_DEFAULT_LIMIT: usize = 1000;
 /// Hard cap on a single re-embed pass to bound writer-thread work per request.
 const REEMBED_MAX_LIMIT: usize = 10_000;
-/// W3.1 write-time near-dup suppression: cosine-similarity bound at or above
-/// which a freshly stored hook capture absorbs an EXISTING hook capture (via
-/// supersede). Deliberately high (near-identical only): two captures this
-/// similar say the same thing, so collapsing to the newest is the intended
-/// dedup of redundant automatic captures — INCLUDING two session summaries from
-/// near-identical workflows (desired, not a bug; the newest is kept). Genuinely
-/// distinct summaries differ well below 0.97 under real embeddings and stay
-/// separate; looser clustering is the scheduled consolidation job's role. Gated
-/// to `origin_source == "hook"` on BOTH the new write and each candidate, so
-/// user/cli/mcp/job memories are never touched.
+/// Candidate cosine bound for automatic hook deduplication. Similarity is not
+/// equivalence: the store also requires exact authored fields and compatible
+/// safety metadata, rechecked atomically before retiring a row. Only hook-source
+/// writes and candidates enter this path; user/cli/mcp/job rows stay untouched.
 const HOOK_NEAR_DUP_THRESHOLD: f32 = 0.97;
 /// Max existing hook near-dups absorbed per write (bounds the extra reads).
 const HOOK_NEAR_DUP_LIMIT: usize = 8;
@@ -1086,14 +1080,10 @@ pub(crate) fn validate_namespace(namespace: rb_types::Namespace) -> Result<rb_ty
     }
 }
 
-/// W3.1 write-time near-dup suppression. After a hook-sourced memory `new_id`
-/// is stored, absorb every EXISTING active hook capture whose vector is a
-/// near-duplicate (cosine >= [`HOOK_NEAR_DUP_THRESHOLD`]) into it by superseding
-/// the older row through the existing atomic supersede. Strictly best-effort and
-/// bounded ([`HOOK_NEAR_DUP_LIMIT`] candidates): every read/write error is logged
-/// and skipped, and ONLY `origin_source == "hook"` candidates are superseded —
-/// user/cli/mcp/job memories are never collapsed automatically. Namespace
-/// isolation is guaranteed by both `near_duplicates` and the engine read.
+/// Best-effort, bounded deduplication of proven-equivalent hook captures.
+/// Semantic neighbors alone never authorize supersede; the store rechecks exact
+/// authored fields, namespace and safety metadata in the mutation transaction.
+/// Only hook-sourced candidates are eligible, so user/cli/mcp/job rows stay live.
 async fn suppress_hook_near_duplicates<P>(
     engine: &MemoryEngine<StoreHandle, P>,
     job_store: &StoreHandle,
@@ -1103,7 +1093,7 @@ async fn suppress_hook_near_duplicates<P>(
     P: EmbeddingProvider,
 {
     let dups = match job_store
-        .near_duplicates(
+        .equivalent_duplicates(
             namespace.clone(),
             new_id.clone(),
             HOOK_NEAR_DUP_THRESHOLD,
@@ -1129,7 +1119,7 @@ async fn suppress_hook_near_duplicates<P>(
         match engine.peek(dup_id.clone()).await {
             Ok(Some(note)) if note.origin_source.as_deref() == Some("hook") => {
                 if let Err(e) = job_store
-                    .supersede(namespace.clone(), dup_id, new_id.clone())
+                    .supersede_duplicate(namespace.clone(), dup_id, new_id.clone())
                     .await
                 {
                     warn!(error = %e, "near-dup supersede failed; leaving the duplicate live");
@@ -2031,6 +2021,198 @@ mod tests {
         }));
     }
 
+    const DISTINCT_FACT_PAIRS: [(&str, &str); 4] = [
+        (
+            "For checkout requests that time out, use exponential backoff with jitter, preserve the idempotency key, log each failed attempt, and return the last error after exhausting the retry budget. Retry at most 3 times.",
+            "For checkout requests that time out, use exponential backoff with jitter, preserve the idempotency key, log each failed attempt, and return the last error after exhausting the retry budget. Retry at most 5 times.",
+        ),
+        (
+            "For checkout requests that time out, preserve the idempotency key, log the timeout with its request identifier, and return the last error to the caller once the request budget is exhausted. Enable automatic retries.",
+            "For checkout requests that time out, preserve the idempotency key, log the timeout with its request identifier, and return the last error to the caller once the request budget is exhausted. Do not enable automatic retries.",
+        ),
+        (
+            "For checkout requests that time out, preserve the idempotency key, log the timeout with its request identifier, and return the last error to the caller once the request budget is exhausted. With tokio 1.38, use the compatibility retry adapter.",
+            "For checkout requests that time out, preserve the idempotency key, log the timeout with its request identifier, and return the last error to the caller once the request budget is exhausted. With tokio 1.39, use the compatibility retry adapter.",
+        ),
+        (
+            "For checkout requests that time out, use exponential backoff with jitter, preserve the idempotency key, log each failed attempt, and return the last error after exhausting the retry budget. Do not retry HTTP 503 gateway errors.",
+            "For checkout requests that time out, use exponential backoff with jitter, preserve the idempotency key, log each failed attempt, and return the last error after exhausting the retry budget. Do not retry HTTP 504 gateway errors.",
+        ),
+    ];
+
+    /// Drive both automatic mutation paths, then recover each distinct fact
+    /// through ordinary recall rather than relying on archived get/history.
+    async fn assert_automatic_fact_preservation(embedder: SharedEmbedder, vectors: &[Vec<f32>]) {
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace, RecallFilter, WriteChannel};
+
+        let dir = tempfile::tempdir().unwrap();
+        let store =
+            StoreHandle::start(dir.path().join("preservation.db"), embedder.dim(), 2).unwrap();
+        let mut eager_near_pairs = 0;
+        for eager in [false, true] {
+            for (index, (left, right)) in DISTINCT_FACT_PAIRS.iter().enumerate() {
+                let ns = Namespace::Project(format!("preserve-{eager}-{index}"));
+                let foreign_ns = Namespace::Project(format!("foreign-{eager}-{index}"));
+                let engine = MemoryEngine::new(store.clone(), embedder.clone(), ns.clone());
+                let make_note = |namespace: &Namespace, content: &str, importance| {
+                    let mut note = MemoryNote::new(
+                        namespace.clone(),
+                        content.to_string(),
+                        MemoryType::ArchitectureDecision,
+                        importance,
+                    );
+                    note.origin_source = Some("hook".to_string());
+                    note.origin_channel = Some(WriteChannel::Hook);
+                    note.tags = vec!["hook".to_string(), "confirmed-decision".to_string()];
+                    note
+                };
+                let left_note = make_note(&ns, left, 5);
+                let right_note = make_note(&ns, right, 9);
+                let duplicate = make_note(&ns, left, 3);
+                let foreign = make_note(&foreign_ns, left, 10);
+                let (left_id, right_id, duplicate_id, foreign_id) = (
+                    left_note.id.clone(),
+                    right_note.id.clone(),
+                    duplicate.id.clone(),
+                    foreign.id.clone(),
+                );
+                for (note, vector) in [
+                    (left_note, &vectors[index * 2]),
+                    (right_note, &vectors[index * 2 + 1]),
+                    (foreign, &vectors[index * 2]),
+                ] {
+                    let id = note.id.clone();
+                    let is_local = note.namespace == ns;
+                    store.write(note, Some(vector.clone())).await.unwrap();
+                    if eager && is_local {
+                        suppress_hook_near_duplicates(&engine, &store, &ns, &id).await;
+                    }
+                }
+                let neighbors = store
+                    .near_duplicates(ns.clone(), left_id.clone(), 0.0, 10)
+                    .await
+                    .unwrap();
+                let similarity = neighbors
+                    .iter()
+                    .find(|(id, _)| id == &right_id)
+                    .expect("distinct fact must remain indexed")
+                    .1;
+                println!("preservation pair {index}: cosine={similarity:.6}, eager={eager}");
+                assert!(
+                    similarity >= 0.95,
+                    "non-equivalent facts must actually cross the consolidation cosine gate"
+                );
+                if eager && similarity >= HOOK_NEAR_DUP_THRESHOLD {
+                    eager_near_pairs += 1;
+                }
+                store
+                    .write(duplicate, Some(vectors[index * 2].clone()))
+                    .await
+                    .unwrap();
+                if eager {
+                    suppress_hook_near_duplicates(&engine, &store, &ns, &duplicate_id).await;
+                }
+                let config = crate::jobs::ConsolidationConfig {
+                    enabled: true,
+                    interval_secs: 86_400,
+                    similarity_threshold: 0.95,
+                    batch_limit: 200,
+                };
+                let first = crate::jobs::consolidation::run(&store, &config)
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    first.changed,
+                    u64::from(!eager),
+                    "genuine duplicate control"
+                );
+                let second = crate::jobs::consolidation::run(&store, &config)
+                    .await
+                    .unwrap();
+                assert_eq!(second.changed, 0, "repeat pass must be idempotent");
+
+                let (survivor_id, retired_id) = if eager {
+                    (&duplicate_id, &left_id)
+                } else {
+                    (&left_id, &duplicate_id)
+                };
+                let retired = store
+                    .get(ns.clone(), retired_id.clone())
+                    .await
+                    .unwrap()
+                    .unwrap();
+                assert_eq!(retired.superseded_by.as_ref(), Some(survivor_id));
+                assert!(retired.archived_at.is_some());
+                for (namespace, id, content) in [
+                    (&ns, survivor_id, *left),
+                    (&ns, &right_id, *right),
+                    (&foreign_ns, &foreign_id, *left),
+                ] {
+                    let note = store
+                        .get(namespace.clone(), id.clone())
+                        .await
+                        .unwrap()
+                        .unwrap();
+                    assert_eq!(note.content, content);
+                    assert!(note.archived_at.is_none() && note.superseded_by.is_none());
+                }
+                let recalled = engine
+                    .recall(left, 10, &RecallFilter::default())
+                    .await
+                    .unwrap();
+                assert!(recalled.iter().any(|r| r.memory.id == *survivor_id));
+                assert!(recalled.iter().any(|r| r.memory.id == right_id));
+                assert!(recalled.iter().all(|r| r.memory.id != *retired_id));
+                assert!(recalled.iter().all(|r| r.memory.namespace == ns));
+                if eager {
+                    suppress_hook_near_duplicates(&engine, &store, &ns, survivor_id).await;
+                }
+                assert_eq!(
+                    crate::jobs::consolidation::run(&store, &config)
+                        .await
+                        .unwrap()
+                        .changed,
+                    0,
+                    "recall and repeated hook suppression cannot turn neighbors into duplicates"
+                );
+            }
+        }
+        assert!(
+            eager_near_pairs > 0,
+            "exercise non-equivalence above the eager cosine gate"
+        );
+        store.shutdown().await;
+    }
+
+    /// Maximal vector collisions ensure the guard, not low similarity, protects
+    /// retry counts, negation, dependency versions and distinct exceptions.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_collapse_preserves_non_equivalent_facts() {
+        let embedder = SharedEmbedder::new(rb_embed::DeterministicProvider::new(8));
+        let vectors = vec![vec![1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]; 8];
+        assert_automatic_fact_preservation(embedder, &vectors).await;
+    }
+
+    /// Local ONNX acceptance: no paid provider and no frozen gate retuning.
+    /// Run from a disposable working directory/HOME to isolate the model cache.
+    #[cfg(feature = "local")]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    #[ignore = "loads all-MiniLM-L6-v2; run with an isolated local model cache"]
+    async fn semantic_automatic_collapse_preserves_non_equivalent_facts() {
+        let embedder =
+            SharedEmbedder::new(rb_embed::LocalProvider::load("all-MiniLM-L6-v2").unwrap());
+        let texts: Vec<String> = DISTINCT_FACT_PAIRS
+            .iter()
+            .flat_map(|(left, right)| [left.to_string(), right.to_string()])
+            .collect();
+        let vectors = embedder
+            .embed(&texts, rb_embed::EmbedKind::Document)
+            .await
+            .unwrap();
+        assert_automatic_fact_preservation(embedder, &vectors).await;
+    }
+
     // W2.6: the admin decision is the kernel-verified uid equaling the
     // daemon's euid — unreadable peer creds and foreign uids fail closed.
     #[test]
@@ -2509,9 +2691,9 @@ mod tests {
         let store = StoreHandle::start(db, DIM, 2).unwrap();
         let ns = Namespace::Project("a".to_string());
 
-        let mut a = MemoryNote::new(ns.clone(), "twin a".to_string(), MemoryType::Insight, 9);
+        let mut a = MemoryNote::new(ns.clone(), "twin".to_string(), MemoryType::Insight, 9);
         a.id = rb_types::MemoryId::new();
-        let mut b = MemoryNote::new(ns.clone(), "twin b".to_string(), MemoryType::Insight, 3);
+        let mut b = MemoryNote::new(ns.clone(), "twin".to_string(), MemoryType::Insight, 3);
         b.id = rb_types::MemoryId::new();
         store
             .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
