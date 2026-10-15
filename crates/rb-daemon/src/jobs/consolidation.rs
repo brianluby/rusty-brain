@@ -1,5 +1,5 @@
-//! Consolidation job: merge near-duplicate memories by superseding every
-//! duplicate of a cluster into a single deterministically-chosen survivor.
+//! Consolidation job: collapse proven-equivalent near-neighbors into one
+//! deterministically-chosen survivor. Similarity alone never retires a fact.
 //! Bounded, idempotent, and namespace-isolated (see `run`).
 
 use crate::jobs::ConsolidationConfig;
@@ -53,9 +53,9 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
 ///
 /// Algorithm: read up to `batch_limit` active, non-superseded candidates
 /// (deterministic order). For each candidate `m` not already consumed by an
-/// earlier cluster, look up its near-duplicates WITHIN m's own namespace; if it
-/// has none, it is `skipped`. Otherwise form the cluster from `m` plus the
-/// near-duplicates that also appear in this pass's candidate window, pick a
+/// earlier cluster, look up proven-equivalent near-neighbors WITHIN m's own
+/// namespace; if it has none, it is `skipped`. Otherwise form the cluster from
+/// `m` plus equivalent neighbors that also appear in this pass's candidate window, pick a
 /// deterministic survivor, and supersede every OTHER member into the survivor,
 /// marking each consumed so it is never revisited. `scanned` counts candidates
 /// examined; `changed` counts supersede writes; `skipped` counts candidates
@@ -96,11 +96,11 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
             continue;
         }
 
-        // Same-namespace near-duplicates only (namespace isolation guaranteed by
-        // the store read). `limit` is the batch budget — a cluster cannot exceed
-        // the scan size.
+        // The store requires exact authored fields and compatible safety metadata,
+        // not merely cosine similarity. The write rechecks this under its lock.
+        // `limit` is the batch budget — a cluster cannot exceed the scan size.
         let dups = store
-            .near_duplicates(
+            .equivalent_duplicates(
                 cand.namespace.clone(),
                 cand.id.clone(),
                 config.similarity_threshold,
@@ -153,6 +153,9 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
                     summary.changed += 1;
                     consumed.insert(member.id.to_string());
                 }
+                MemberOutcome::Preserved => {
+                    summary.skipped += 1;
+                }
                 // The member was resolved by a concurrent writer: skip it and
                 // keep absorbing the rest — the survivor is still valid.
                 MemberOutcome::LostRace => {
@@ -203,6 +206,8 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
 enum MemberOutcome {
     /// The member was superseded into the survivor.
     Changed,
+    /// Authored fields or safety metadata changed after candidate selection.
+    Preserved,
     /// The member itself was resolved by a concurrent writer; the survivor
     /// is still a valid target for the remaining members.
     LostRace,
@@ -234,10 +239,11 @@ async fn supersede_member(
     survivor: &MemoryId,
 ) -> Result<MemberOutcome> {
     match store
-        .supersede(namespace.clone(), member.clone(), survivor.clone())
+        .supersede_duplicate(namespace.clone(), member.clone(), survivor.clone())
         .await
     {
-        Ok(()) => Ok(MemberOutcome::Changed),
+        Ok(true) => Ok(MemberOutcome::Changed),
+        Ok(false) => Ok(MemberOutcome::Preserved),
         Err(rb_types::Error::StalePlan(reason)) => {
             // Disambiguate WHICH side went stale by re-reading the survivor:
             // still current => the member lost a benign race; otherwise the
@@ -376,7 +382,7 @@ mod tests {
         let ns = Namespace::Project("tolerant".to_string());
 
         let member = vnote(&ns, "member", 3);
-        let survivor = vnote(&ns, "survivor", 9);
+        let survivor = vnote(&ns, "member", 9);
         let (member_id, survivor_id) = (member.id.clone(), survivor.id.clone());
         handle
             .write(
@@ -425,7 +431,7 @@ mod tests {
 
         let member = vnote(&ns, "member", 3);
         let winner = vnote(&ns, "concurrent winner", 5);
-        let survivor = vnote(&ns, "survivor", 9);
+        let survivor = vnote(&ns, "member", 9);
         let (member_id, winner_id, survivor_id) =
             (member.id.clone(), winner.id.clone(), survivor.id.clone());
         for (n, v) in [
@@ -486,7 +492,7 @@ mod tests {
         let ns = Namespace::Project("tolerant".to_string());
 
         let member = vnote(&ns, "member", 3);
-        let survivor = vnote(&ns, "survivor", 9);
+        let survivor = vnote(&ns, "member", 9);
         let replacement = vnote(&ns, "replacement truth", 9);
         let (member_id, survivor_id, replacement_id) = (
             member.id.clone(),
@@ -543,9 +549,9 @@ mod tests {
         let ns_a = Namespace::Project("a".to_string());
         let ns_b = Namespace::Project("b".to_string());
 
-        // Two near-identical memories in A (the survivor has higher importance).
-        let survivor = vnote(&ns_a, "twin survivor", 9);
-        let dup = vnote(&ns_a, "twin dup", 3);
+        // Two genuine duplicates in A (the survivor has higher importance).
+        let survivor = vnote(&ns_a, "twin", 9);
+        let dup = vnote(&ns_a, "twin", 3);
         let (survivor_id, dup_id) = (survivor.id.clone(), dup.id.clone());
         handle
             .write(
@@ -560,7 +566,7 @@ mod tests {
             .unwrap();
 
         // A near-identical memory in B: must NOT be merged with A's cluster.
-        let foreign = vnote(&ns_b, "foreign twin", 9);
+        let foreign = vnote(&ns_b, "twin", 9);
         let foreign_id = foreign.id.clone();
         handle
             .write(
@@ -613,8 +619,8 @@ mod tests {
         let handle = StoreHandle::start(db, DIM, 2).unwrap();
         let ns = Namespace::Project("a".to_string());
 
-        let a = vnote(&ns, "twin a", 9);
-        let b = vnote(&ns, "twin b", 3);
+        let a = vnote(&ns, "twin", 9);
+        let b = vnote(&ns, "twin", 3);
         handle
             .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
             .await
@@ -689,8 +695,8 @@ mod tests {
         let handle = StoreHandle::start(db, DIM, 2).unwrap();
         let ns = Namespace::Project("a".to_string());
 
-        let a = vnote(&ns, "twin a", 9);
-        let b = vnote(&ns, "twin b", 3);
+        let a = vnote(&ns, "twin", 9);
+        let b = vnote(&ns, "twin", 3);
         handle
             .write(a, Some(vec![1.0f32, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]))
             .await

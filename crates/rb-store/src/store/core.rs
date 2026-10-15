@@ -238,6 +238,133 @@ impl SqliteStore {
         out.truncate(limit);
         Ok(out)
     }
+
+    /// Semantic neighbors proven equivalent by the conservative automatic rule.
+    /// Human review still receives all neighbors via `near_duplicates`.
+    pub fn equivalent_duplicates(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+        threshold: f32,
+        limit: usize,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        let Some(anchor) = self.get_memory(id)? else {
+            return Ok(Vec::new());
+        };
+        if anchor.namespace != *ns || anchor.archived_at.is_some() || anchor.superseded_by.is_some()
+        {
+            return Ok(Vec::new());
+        }
+        let mut duplicates = self.near_duplicates(ns, id, threshold, limit)?;
+        let mut kept = 0;
+        for index in 0..duplicates.len() {
+            if let Some(note) = self.get_memory(&duplicates[index].0)? {
+                if note.archived_at.is_none()
+                    && note.superseded_by.is_none()
+                    && self.automatically_equivalent(&anchor, &note)?
+                {
+                    duplicates.swap(kept, index);
+                    kept += 1;
+                }
+            }
+        }
+        duplicates.truncate(kept);
+        Ok(duplicates)
+    }
+
+    /// Automatic deduplication, not an author-requested correction. Recheck
+    /// equivalence and namespace under the same lock as the guarded mutation.
+    /// `false` preserves uncertain pairs without writing an oplog row.
+    pub fn supersede_duplicate(
+        &self,
+        ns: &Namespace,
+        old: &MemoryId,
+        new: &MemoryId,
+    ) -> Result<bool> {
+        immediate_tx(&self.conn, || {
+            let old_note = self
+                .get_memory(old)?
+                .ok_or_else(|| Error::NotFound(old.clone()))?;
+            if old_note.namespace != *ns {
+                return Err(Error::NotFound(old.clone()));
+            }
+            let new_note = self
+                .get_memory(new)?
+                .ok_or_else(|| Error::NotFound(new.clone()))?;
+            if new_note.namespace != *ns {
+                return Err(Error::NotFound(new.clone()));
+            }
+            if !self.automatically_equivalent(&old_note, &new_note)? {
+                return Ok(false);
+            }
+            self.supersede_in_tx(old, new)?;
+            Ok(true)
+        })
+    }
+
+    fn automatically_equivalent(&self, a: &MemoryNote, b: &MemoryNote) -> Result<bool> {
+        // Exact authored fields only: even punctuation/whitespace may matter in
+        // code. Similarity, importance and recency cannot establish equivalence.
+        if a.namespace != b.namespace
+            || a.content != b.content
+            || a.summary != b.summary
+            || a.context != b.context
+            || a.memory_type != b.memory_type
+            || a.keywords != b.keywords
+            || a.tags != b.tags
+            || a.related_files != b.related_files
+            || a.anchors != b.anchors
+            || a.confidence != b.confidence
+            || a.trust_class != b.trust_class
+            || a.origin_source != b.origin_source
+            || a.origin_channel != b.origin_channel
+            || a.origin_user != b.origin_user
+            || a.origin_host != b.origin_host
+            || a.origin_agent != b.origin_agent
+            || a.session_id.is_some() != b.session_id.is_some()
+        {
+            return Ok(false);
+        }
+        // SimilarityLinker edges are candidate hints; authored evidence must survive.
+        self.conn
+            .query_row(
+                "SELECT NOT EXISTS (
+                    SELECT 1 FROM memory_links
+                    WHERE (source_id IN (?1, ?2) OR target_id IN (?1, ?2))
+                      AND NOT (link_type = 'references' AND reason = 'similar')
+                )",
+                rusqlite::params![a.id.to_string(), b.id.to_string()],
+                |row| row.get(0),
+            )
+            .map_err(|e| Error::Storage(e.to_string()))
+    }
+
+    /// General supersede error mapping shared by explicit and automatic writes.
+    /// The caller owns the transaction; the structural guard stays unchanged.
+    fn supersede_in_tx(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
+        match self.supersede_guarded_in_tx(old, new, chrono::Utc::now().timestamp())? {
+            SupersedeGuard::Applied => Ok(()),
+            SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
+                "a memory cannot supersede itself: {old}"
+            ))),
+            SupersedeGuard::MissingOld => Err(Error::NotFound(old.clone())),
+            SupersedeGuard::OldResolved {
+                archived,
+                superseded,
+            } => Err(Error::StalePlan(format!(
+                "{old} was already resolved (archived: {archived}, superseded: \
+                 {superseded}); re-plan against the current row"
+            ))),
+            SupersedeGuard::MissingNew => Err(Error::NotFound(new.clone())),
+            SupersedeGuard::NewNotCurrent {
+                archived,
+                superseded,
+            } => Err(Error::StalePlan(format!(
+                "{new} is no longer current truth (archived: {archived}, superseded: \
+                 {superseded}); a supersede must point at an active replacement"
+            ))),
+        }
+    }
     /// Active (`archived_at IS NULL`), non-superseded (`superseded_by IS NULL`)
     /// memories, oldest first then by id, capped at `limit`. The deterministic
     /// ORDER BY makes a consolidation pass reproducible.
@@ -796,31 +923,15 @@ fn escape_fts5_query(query: &str) -> String {
     }
     expr
 }
-/// Build the filtered-list SELECT — the exact SQL + positional params
-/// `list_filtered` executes — for `ns`, `filter`, `limit`. Split out so
-/// tests can `EXPLAIN QUERY PLAN` the real query (the anchor semi-join
-/// index guarantee). Every fragment is a FIXED literal (no caller data is
-/// ever interpolated); caller values ride numbered parameters exclusively.
-/// Performs the same defense-in-depth `filter.validate()` as the execution
-/// path (this also rejects empty anchor-filter values fail-closed).
+/// Shared, parameterized eligibility predicate for list and retrieval channels.
 #[allow(clippy::vec_box)]
-fn build_list_filtered_query(
+fn build_filter_predicate(
     ns: &Namespace,
     filter: &rb_types::RecallFilter,
-    limit: usize,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     filter.validate()?;
 
-    let mut sql = String::from(
-        "SELECT memory_id, namespace, created_at, updated_at, content, summary,
-                keywords, tags, context, memory_type, importance, confidence,
-                related_files, access_count, last_accessed_at, archived_at,
-                superseded_by, embedding_model, embedding_input_version,
-                origin_user, origin_host, origin_agent, origin_source, session_id,
-                origin_channel, trust_class
-         FROM memories m
-         WHERE m.namespace = ?1",
-    );
+    let mut sql = String::from("m.namespace = ?1");
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ns.as_db_string())];
     fn push(
         sql: &mut String,
@@ -1024,6 +1135,25 @@ fn build_list_filtered_query(
         }
     }
 
+    Ok((sql, params))
+}
+
+#[allow(clippy::vec_box)]
+fn build_list_filtered_query(
+    ns: &Namespace,
+    filter: &rb_types::RecallFilter,
+    limit: usize,
+) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    let (predicate, mut params) = build_filter_predicate(ns, filter)?;
+    let mut sql = format!(
+        "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                keywords, tags, context, memory_type, importance, confidence,
+                related_files, access_count, last_accessed_at, archived_at,
+                superseded_by, embedding_model, embedding_input_version,
+                origin_user, origin_host, origin_agent, origin_source, session_id,
+                origin_channel, trust_class
+         FROM memories m WHERE {predicate}"
+    );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
     sql.push_str(&format!(
         " ORDER BY m.created_at DESC LIMIT ?{}",
@@ -1081,6 +1211,70 @@ fn build_active_contradicts_query(
     (sql, params)
 }
 
+const RECALL_NOT_QUARANTINED_SQL: &str = "m.origin_channel IS NOT 'http' AND
+     (m.origin_channel IS NOT NULL OR m.origin_source IS NOT 'http')";
+
+#[allow(clippy::vec_box)]
+fn build_recall_predicate(
+    ns: &Namespace,
+    filter: &rb_types::RecallFilter,
+) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    let (mut sql, mut params) = build_filter_predicate(ns, filter)?;
+    params.push(Box::new(f64::from(
+        rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE,
+    )));
+    sql.push_str(&format!(
+        " AND ({RECALL_NOT_QUARANTINED_SQL}) AND m.confidence >= ?{}",
+        params.len()
+    ));
+    Ok((sql, params))
+}
+
+impl SqliteStore {
+    /// sqlite-vec 0.1.9 consumes the primary-key IN set in xFilter and masks
+    /// candidates BEFORE distance/top-k. Keep this single-level (no outer LIMIT).
+    /// The inner vector join excludes memories without vectors: sqlite-vec's
+    /// TEXT-PK IN implementation errors on an ID absent from the vector table.
+    fn vector_search_eligible(
+        &self,
+        ns: &Namespace,
+        embedding: &[f32],
+        limit: usize,
+        filter: &rb_types::RecallFilter,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        let (predicate, mut params) = build_recall_predicate(ns, filter)?;
+        params.push(Box::new(
+            serde_json::to_string(embedding).map_err(|e| Error::Serialization(e.to_string()))?,
+        ));
+        let vector_param = params.len();
+        params.push(Box::new(i64::try_from(limit.min(4096)).unwrap_or(4096)));
+        let sql = format!(
+            "SELECT memory_id, distance FROM memory_vectors
+             WHERE embedding MATCH ?{vector_param} AND namespace = ?1
+               AND memory_id IN (
+                 SELECT m.memory_id FROM memories m
+                 JOIN memory_vectors v ON v.memory_id = m.memory_id
+                 WHERE {predicate} AND m.archived_at IS NULL)
+             ORDER BY distance LIMIT ?{}",
+            params.len()
+        );
+        let mut stmt = self
+            .conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, f32>(1)?))
+            })
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        rows.map(|row| {
+            let (id, distance) = row.map_err(|e| Error::Storage(e.to_string()))?;
+            Ok((parse_id(&id)?, distance))
+        })
+        .collect()
+    }
+}
+
 impl Store for SqliteStore {
     fn insert_memory(&self, note: &MemoryNote, embedding: Option<&[f32]>) -> Result<()> {
         // Defense-in-depth validation before touching the DB. The SQL CHECK
@@ -1130,48 +1324,36 @@ impl Store for SqliteStore {
     }
 
     fn keyword_search(&self, ns: &Namespace, query: &str, limit: usize) -> Result<Vec<MemoryId>> {
-        self.keyword_search_in_state(ns, query, limit, rb_types::MemoryState::Active)
+        self.keyword_search_filtered(ns, query, limit, &rb_types::RecallFilter::default())
     }
 
-    fn keyword_search_in_state(
+    fn keyword_search_filtered(
         &self,
         ns: &Namespace,
         query: &str,
         limit: usize,
-        state: rb_types::MemoryState,
+        filter: &rb_types::RecallFilter,
     ) -> Result<Vec<MemoryId>> {
-        let match_expr = escape_fts5_query(query);
-        // The archived predicate is one of three FIXED literals (never caller
-        // data), so the composed SQL stays injection-free.
-        let archived_predicate = match state {
-            rb_types::MemoryState::Active => "AND m.archived_at IS NULL",
-            rb_types::MemoryState::Archived => "AND m.archived_at IS NOT NULL",
-            rb_types::MemoryState::All => "",
-        };
+        let (predicate, mut params) = build_recall_predicate(ns, filter)?;
+        params.push(Box::new(escape_fts5_query(query)));
+        let match_param = params.len();
+        params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
         let sql = format!(
-            "SELECT m.memory_id
-             FROM memories_fts
+            "SELECT m.memory_id FROM memories_fts
              JOIN memories m ON m.rowid = memories_fts.rowid
-             WHERE memories_fts MATCH ?1
-               AND m.namespace = ?2
-               {archived_predicate}
-             ORDER BY rank
-             LIMIT ?3"
+             WHERE memories_fts MATCH ?{match_param} AND {predicate}
+             ORDER BY rank LIMIT ?{}",
+            params.len()
         );
         let mut stmt = self
             .conn
-            .prepare(&sql)
+            .prepare_cached(&sql)
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let rows = stmt
-            .query_map(
-                rusqlite::params![
-                    match_expr,
-                    ns.as_db_string(),
-                    i64::try_from(limit).unwrap_or(i64::MAX)
-                ],
-                |row| row.get::<_, String>(0),
-            )
+            .query_map(rusqlite::params_from_iter(params.iter()), |row| {
+                row.get::<_, String>(0)
+            })
             .map_err(|e| Error::Storage(e.to_string()))?;
 
         let mut ids = Vec::new();
@@ -1199,6 +1381,9 @@ impl Store for SqliteStore {
                 expected: self.embedding_dim,
                 got: embedding.len(),
             });
+        }
+        if limit == 0 {
+            return Ok(Vec::new());
         }
 
         // sqlite-vec accepts the query vector as a JSON array string.
@@ -1248,6 +1433,15 @@ impl Store for SqliteStore {
 
         // Defense-in-depth: re-check namespace + active status per candidate.
         let mut out = Vec::new();
+        let eligibility_sql = "SELECT 1 FROM memories m WHERE m.memory_id = ?1
+             AND m.namespace = ?2 AND m.archived_at IS NULL
+             AND m.origin_channel IS NOT 'http'
+             AND (m.origin_channel IS NOT NULL OR m.origin_source IS NOT 'http')
+             AND m.confidence >= ?3";
+        let mut eligibility = self
+            .conn
+            .prepare(eligibility_sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
         for r in rows {
             let (id_str, dist) = r.map_err(|e| Error::Storage(e.to_string()))?;
 
@@ -1255,9 +1449,12 @@ impl Store for SqliteStore {
             // missing row means "not active" (skip), but ANY other DB error must
             // propagate rather than be silently swallowed (which would drop a
             // candidate as if it were out of scope).
-            let active: bool = match self.conn.query_row(
-                "SELECT 1 FROM memories WHERE memory_id = ?1 AND namespace = ?2 AND archived_at IS NULL",
-                rusqlite::params![id_str, ns_str],
+            let active: bool = match eligibility.query_row(
+                rusqlite::params![
+                    id_str,
+                    ns_str,
+                    f64::from(rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE)
+                ],
                 |_| Ok(true),
             ) {
                 Ok(found) => found,
@@ -1271,9 +1468,43 @@ impl Store for SqliteStore {
                 if out.len() >= limit {
                     break;
                 }
+            } else {
+                // Exceptional path only: rerun with a native prefilter rather
+                // than letting ineligible neighbors consume any finite cutoff.
+                return self.vector_search_eligible(
+                    ns,
+                    embedding,
+                    limit,
+                    &rb_types::RecallFilter::default(),
+                );
             }
         }
         Ok(out)
+    }
+
+    fn vector_search_filtered(
+        &self,
+        ns: &Namespace,
+        embedding: &[f32],
+        limit: usize,
+        filter: &rb_types::RecallFilter,
+    ) -> Result<Vec<(MemoryId, f32)>> {
+        filter.validate()?;
+        if embedding.len() != self.embedding_dim {
+            return Err(Error::DimensionMismatch {
+                expected: self.embedding_dim,
+                got: embedding.len(),
+            });
+        }
+        if limit == 0 || filter.state == rb_types::MemoryState::Archived {
+            return Ok(Vec::new());
+        }
+        if filter.is_empty() {
+            // Keep the usual partitioned KNN query and per-row safety probe;
+            // only exceptional ineligible hits trigger the native IN prefilter.
+            return self.vector_search(ns, embedding, limit);
+        }
+        self.vector_search_eligible(ns, embedding, limit, filter)
     }
 
     /// The recursive CTE `UNION` dedups on (node, depth) pairs, so a cycle can
@@ -1598,31 +1829,7 @@ impl Store for SqliteStore {
         //   established lineage must never be rewritten, and pointing lineage
         //   at a dead end would fabricate a decision-evolution step on the
         //   W2.2 audit surface.
-        let now = chrono::Utc::now().timestamp();
-        immediate_tx(&self.conn, || {
-            match self.supersede_guarded_in_tx(old, new, now)? {
-                SupersedeGuard::Applied => Ok(()),
-                SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
-                    "a memory cannot supersede itself: {old}"
-                ))),
-                SupersedeGuard::MissingOld => Err(Error::NotFound(old.clone())),
-                SupersedeGuard::OldResolved {
-                    archived,
-                    superseded,
-                } => Err(Error::StalePlan(format!(
-                    "{old} was already resolved (archived: {archived}, superseded: \
-                     {superseded}); re-plan against the current row"
-                ))),
-                SupersedeGuard::MissingNew => Err(Error::NotFound(new.clone())),
-                SupersedeGuard::NewNotCurrent {
-                    archived,
-                    superseded,
-                } => Err(Error::StalePlan(format!(
-                    "{new} is no longer current truth (archived: {archived}, superseded: \
-                     {superseded}); a supersede must point at an active replacement"
-                ))),
-            }
-        })
+        immediate_tx(&self.conn, || self.supersede_in_tx(old, new))
     }
 
     fn record_feedback(
@@ -3685,14 +3892,14 @@ mod list_filtered_tests {
     }
 
     #[test]
-    fn keyword_search_in_state_scopes_archived_rows() {
+    fn keyword_search_filtered_scopes_archived_rows() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let active = insert(&store, |m| m.content = "tokio runtime decision".into());
         let archived = insert(&store, |m| m.content = "tokio executor decision".into());
         store.archive_memory(&archived).unwrap();
 
         let default_scope = store
-            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::Active)
+            .keyword_search_filtered(&ns(), "tokio", 10, &RecallFilter::default())
             .unwrap();
         assert_eq!(default_scope, vec![active.clone()]);
         // The legacy method stays active-only.
@@ -3702,12 +3909,28 @@ mod list_filtered_tests {
         );
 
         let archived_scope = store
-            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::Archived)
+            .keyword_search_filtered(
+                &ns(),
+                "tokio",
+                10,
+                &RecallFilter {
+                    state: MemoryState::Archived,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         assert_eq!(archived_scope, vec![archived.clone()]);
 
         let mut all_scope = store
-            .keyword_search_in_state(&ns(), "tokio", 10, MemoryState::All)
+            .keyword_search_filtered(
+                &ns(),
+                "tokio",
+                10,
+                &RecallFilter {
+                    state: MemoryState::All,
+                    ..Default::default()
+                },
+            )
             .unwrap();
         all_scope.sort_by_key(std::string::ToString::to_string);
         let mut expected = vec![active, archived];
@@ -4786,6 +5009,213 @@ mod near_duplicates_tests {
         let id = m.id.clone();
         store.insert_memory(&m, Some(&v)).unwrap();
         id
+    }
+
+    /// Body identity cannot erase qualifiers or cross a safety boundary.
+    #[test]
+    fn automatic_duplicates_preserve_distinct_metadata_without_mutation() {
+        let ns = Namespace::Project("qualified-facts".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        for case in 0..12 {
+            let store = SqliteStore::open_in_memory(8).unwrap();
+            let a = MemoryNote::new(
+                ns.clone(),
+                "Retry checkout requests.".into(),
+                MemoryType::Insight,
+                5,
+            );
+            let mut b = a.clone();
+            b.id = MemoryId::new();
+            match case {
+                0 => b.context = "Only with tokio 1.38; never retry card-declined errors.".into(),
+                1 => b.summary = "Retry checkout requests except expired-token failures.".into(),
+                2 => b.memory_type = MemoryType::Constraint,
+                3 => {
+                    b.anchors =
+                        vec![rb_types::MemoryAnchor::parse_file_spec("src/retry.rs:12-20").unwrap()]
+                }
+                4 => b.tags = vec!["production-only".into()],
+                5 => b.keywords = vec!["tokio-1.38".into()],
+                6 => b.related_files = vec!["src/legacy_retry.rs".into()],
+                7 => b.origin_source = Some("cli".into()),
+                8 => b.origin_channel = Some(rb_types::WriteChannel::Http),
+                9 => b.trust_class = rb_types::TrustClass::HumanConfirmed,
+                10 => b.confidence = 0.0,
+                11 => b.session_id = Some("session-scoped".into()),
+                _ => unreachable!(),
+            }
+            store.insert_memory(&a, Some(&vector)).unwrap();
+            store.insert_memory(&b, Some(&vector)).unwrap();
+            assert_eq!(
+                store.near_duplicates(&ns, &a.id, 0.97, 10).unwrap()[0].0,
+                b.id
+            );
+            assert!(store
+                .equivalent_duplicates(&ns, &a.id, 0.97, 10)
+                .unwrap()
+                .is_empty());
+            let before = store.last_oplog_seq().unwrap();
+            let a_before = store.get_memory(&a.id).unwrap().unwrap();
+            let b_before = store.get_memory(&b.id).unwrap().unwrap();
+            assert!(
+                !store.supersede_duplicate(&ns, &a.id, &b.id).unwrap(),
+                "case {case}"
+            );
+            assert_eq!(
+                store.last_oplog_seq().unwrap(),
+                before,
+                "no false supersede audit"
+            );
+            assert_eq!(store.get_memory(&a.id).unwrap().unwrap(), a_before);
+            assert_eq!(store.get_memory(&b.id).unwrap().unwrap(), b_before);
+            let recovered = store.keyword_search(&ns, "checkout", 10).unwrap();
+            assert!(recovered.contains(&a.id));
+            let vectors = store.vector_search(&ns, &vector, 10).unwrap();
+            assert!(vectors.iter().any(|(id, _)| id == &a.id));
+            if b.is_quarantined() || b.below_recall_confidence_floor() {
+                assert!(
+                    !recovered.contains(&b.id),
+                    "preservation cannot bypass safety eligibility"
+                );
+                assert!(vectors.iter().all(|(id, _)| id != &b.id));
+            } else {
+                assert!(recovered.contains(&b.id));
+                assert!(vectors.iter().any(|(id, _)| id == &b.id));
+            }
+        }
+    }
+
+    /// Candidate reads do not authorize a later write after a fact was edited.
+    #[test]
+    fn automatic_supersede_rechecks_equivalence_after_candidate_selection() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("raced-fact".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let a = insert_vec(
+            &store,
+            ns.clone(),
+            "Retry checkout at most 3 times.",
+            vector,
+        );
+        let b = insert_vec(
+            &store,
+            ns.clone(),
+            "Retry checkout at most 3 times.",
+            vector,
+        );
+        assert_eq!(
+            store.equivalent_duplicates(&ns, &a, 0.95, 10).unwrap()[0].0,
+            b
+        );
+        store
+            .update_memory(
+                &a,
+                &MemoryUpdates {
+                    content: Some("Retry checkout at most 5 times.".into()),
+                    context: Some("Except card-declined failures.".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let before = store.last_oplog_seq().unwrap();
+        assert!(!store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        let note = store.get_memory(&a).unwrap().unwrap();
+        assert_eq!(note.content, "Retry checkout at most 5 times.");
+        assert_eq!(note.context, "Except card-declined failures.");
+        assert!(note.archived_at.is_none() && note.superseded_by.is_none());
+        assert!(store
+            .vector_search(&ns, &vector, 10)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &a));
+    }
+
+    /// Equal text must not strand incoming evidence on a retired fact.
+    #[test]
+    fn automatic_supersede_preserves_linked_facts_and_refuses_foreign_rows() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("linked".into());
+        let foreign_ns = Namespace::Project("foreign".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let a = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        let b = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        let evidence = insert_vec(&store, ns.clone(), "Checkout timeout incident.", vector);
+        let foreign = insert_vec(&store, foreign_ns.clone(), "Retry checkout.", vector);
+        store
+            .add_link(&MemoryLink {
+                source_id: evidence,
+                target_id: a.clone(),
+                link_type: rb_types::LinkType::References,
+                strength: 1.0,
+                reason: "motivating incident".into(),
+                created_at: chrono::Utc::now(),
+            })
+            .unwrap();
+        let before = store.last_oplog_seq().unwrap();
+        assert!(!store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert!(matches!(
+            store.supersede_duplicate(&ns, &b, &foreign),
+            Err(Error::NotFound(id)) if id == foreign
+        ));
+        assert!(matches!(
+            store.supersede_duplicate(&ns, &foreign, &b),
+            Err(Error::NotFound(id)) if id == foreign
+        ));
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        for id in [&a, &b, &foreign] {
+            let note = store.get_memory(id).unwrap().unwrap();
+            assert!(note.archived_at.is_none() && note.superseded_by.is_none());
+        }
+    }
+
+    /// Automatic dedup retains the structural guard and rolls back every part
+    /// of the mutation on a durable-audit failure.
+    #[test]
+    fn automatic_supersede_is_atomic_and_keeps_liveness_guards() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("atomic-duplicate".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let a = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        let b = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        let before = store.last_oplog_seq().unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER refuse_duplicate_audit BEFORE INSERT ON memory_oplog
+             WHEN NEW.op = 'supersede' BEGIN SELECT RAISE(ABORT, 'audit refused'); END;",
+            )
+            .unwrap();
+        assert!(store.supersede_duplicate(&ns, &a, &b).is_err());
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        let note = store.get_memory(&a).unwrap().unwrap();
+        assert!(note.archived_at.is_none() && note.superseded_by.is_none());
+        assert!(store
+            .vector_search(&ns, &vector, 10)
+            .unwrap()
+            .iter()
+            .any(|(id, _)| id == &a));
+        store
+            .conn
+            .execute_batch("DROP TRIGGER refuse_duplicate_audit")
+            .unwrap();
+        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert!(matches!(
+            store.supersede_duplicate(&ns, &a, &b),
+            Err(Error::StalePlan(_))
+        ));
+        assert!(matches!(
+            store.supersede_duplicate(&ns, &b, &a),
+            Err(Error::StalePlan(_))
+        ));
+        assert!(matches!(
+            store.supersede_duplicate(&ns, &b, &b),
+            Err(Error::InvalidArgument(_))
+        ));
+        let page = store.oplog_changes_since(&ns, before, 10).unwrap();
+        assert_eq!(page.changes.len(), 1);
+        assert_eq!(page.changes[0].id, a);
+        assert_eq!(page.changes[0].kind, rb_types::ChangeKind::Archived);
     }
 
     #[test]

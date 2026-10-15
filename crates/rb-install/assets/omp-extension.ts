@@ -54,37 +54,60 @@ function textContent(value: unknown, limit = MAX_TRANSCRIPT_BYTES): string {
 function transcript(context: ExtensionContext): string {
   try {
     const branch = context.sessionManager.getBranch();
-    const lines: string[] = [];
-    let remaining = MAX_TRANSCRIPT_BYTES;
-    // Keep recent conversation, emitting complete JSONL records in branch order.
-    for (let index = branch.length - 1; index >= 0; index -= 1) {
+    const selected = new Map<number, string>();
+    const lineFor = (index: number, budget: number): string | undefined => {
       const entry = objectValue(branch[index]);
-      if (entry?.type !== "message") continue;
-      const message = objectValue(entry.message);
+      const message = objectValue(entry?.message);
       const role = message?.role;
-      if (role !== "user" && role !== "assistant") continue;
+      if (entry?.type !== "message" || (role !== "user" && role !== "assistant")) return;
       const content = textContent(message?.content);
-      if (!content) continue;
-      const lineFor = (text: string) => `${JSON.stringify({ message: { role, content: text } })}\n`;
-      let line = lineFor(content);
-      if (Buffer.byteLength(line) > remaining) {
-        let low = 0;
-        let high = content.length;
-        while (low < high) {
-          const middle = Math.ceil((low + high) / 2);
-          if (Buffer.byteLength(lineFor(prefix(content, middle))) <= remaining) low = middle;
-          else high = middle - 1;
-        }
-        const trimmed = prefix(content, low);
-        if (!trimmed) break;
-        line = lineFor(trimmed);
+      if (!content) return;
+      const originalChars = typeof message?.content === "string" ? message.content.length
+        : Array.isArray(message?.content) ? message.content.reduce((sum: number, block: unknown) => {
+          const value = objectValue(block);
+          return value?.type === "text" && typeof value.text === "string" && value.text
+            ? sum + (sum > 0 ? 1 : 0) + value.text.length : sum;
+        }, 0) : 0;
+      const render = (text: string) => `${JSON.stringify({
+        ...(typeof entry.id === "string" ? { id: entry.id } : {}),
+        capture_order: index, content_complete: text.length >= originalChars,
+        message: { role, content: text },
+      })}\n`;
+      let low = 0;
+      let high = content.length;
+      while (low < high) {
+        const middle = Math.ceil((low + high) / 2);
+        if (Buffer.byteLength(render(prefix(content, middle))) <= budget) low = middle;
+        else high = middle - 1;
       }
-      lines.push(line);
+      const text = prefix(content, low);
+      return text ? render(text) : undefined;
+    };
+    // Initial goal plus recent evidence; never imply this bounded adapter view is complete.
+    let remaining = MAX_TRANSCRIPT_BYTES - 512;
+    for (let index = 0; index < branch.length; index += 1) {
+      const entry = objectValue(branch[index]);
+      if (objectValue(entry?.message)?.role !== "user") continue;
+      const line = lineFor(index, Math.min(remaining, MAX_TRANSCRIPT_BYTES / 4));
+      if (line) { selected.set(index, line); remaining -= Buffer.byteLength(line); }
+      break;
+    }
+    for (let index = branch.length - 1; index >= 0 && remaining > 256; index -= 1) {
+      if (selected.has(index)) continue;
+      const line = lineFor(index, Math.min(remaining, MAX_TRANSCRIPT_BYTES / 4));
+      if (!line) continue;
+      selected.set(index, line);
       remaining -= Buffer.byteLength(line);
     }
-    return lines.reverse().join("");
+    const header = JSON.stringify({ capture_window: {
+      incomplete: true, adapter: "omp", byte_cap: MAX_TRANSCRIPT_BYTES,
+      window: "initial goal + recent branch text", branch_entries: branch.length,
+      selected_entries: selected.size, skipped_entries: branch.length - selected.size,
+      skipped_bytes: "unknown (non-text entries and serialization omitted)",
+    } });
+    return `${header}\n${[...selected].sort(([a], [b]) => a - b).map(([, line]) => line).join("")}`;
   } catch {
-    return "";
+    return `${JSON.stringify({ capture_window: { incomplete: true, adapter: "omp", byte_cap: MAX_TRANSCRIPT_BYTES, error: "branch unavailable" } })}\n`;
   }
 }
 

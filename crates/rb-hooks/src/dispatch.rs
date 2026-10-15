@@ -17,12 +17,32 @@ pub async fn dispatch(
     scratch: Option<&Scratch>,
     ctx: &HookContext,
 ) -> HookResult {
+    let digest = if matches!(
+        &ctx.event,
+        HookEvent::PreCompact { .. }
+            | HookEvent::SessionEnd { .. }
+            | HookEvent::SessionCheckpoint { .. }
+    ) {
+        let inline = ctx.transcript_jsonl.clone();
+        let path = ctx.transcript_path.clone();
+        tokio::task::spawn_blocking(move || {
+            inline
+                .as_deref()
+                .map(|jsonl| transcript::digest_from_lines(jsonl.lines()))
+                .or_else(|| path.as_deref().map(transcript::read_digest))
+        })
+        .await
+        .ok()
+        .flatten()
+    } else {
+        None
+    };
     match &ctx.event {
         HookEvent::SessionStart { source } => {
             // Opportunistic hygiene: reclaim scratch files from abandoned /
             // crashed sessions whose SessionEnd never fired (cheap; once per
             // session, off the daemon path).
-            scratch::prune_stale();
+            let _ = tokio::task::spawn_blocking(scratch::prune_stale).await;
             // W3.3: the injection is source-aware (startup vs resume vs compact).
             capture::session_start(client.take(), source.as_deref()).await
         }
@@ -36,36 +56,20 @@ pub async fn dispatch(
             stop_hook_active, ..
         } => capture::stop(*stop_hook_active),
         HookEvent::SessionCheckpoint { .. } => {
-            capture::session_checkpoint(
-                client.take(),
-                scratch,
-                &ctx.cwd,
-                ctx.transcript_jsonl
-                    .as_deref()
-                    .map(|jsonl| transcript::digest_from_lines(jsonl.lines()))
-                    .or_else(|| ctx.transcript_path.as_deref().map(transcript::read_digest)),
-            )
-            .await
+            capture::session_checkpoint(client.take(), scratch, &ctx.cwd, digest).await
         }
         HookEvent::SessionEnd { .. } => {
-            capture::session_end(
-                client.take(),
-                scratch,
-                &ctx.cwd,
-                ctx.transcript_jsonl
-                    .as_deref()
-                    .map(|jsonl| transcript::digest_from_lines(jsonl.lines()))
-                    .or_else(|| ctx.transcript_path.as_deref().map(transcript::read_digest)),
-            )
-            .await
+            capture::session_end(client.take(), scratch, &ctx.cwd, digest).await
         }
         HookEvent::PreCompact {
             custom_instructions,
         } => {
             capture::pre_compact(
                 client.take(),
+                scratch,
+                &ctx.cwd,
+                digest,
                 custom_instructions.as_deref(),
-                ctx.transcript_path.as_deref(),
             )
             .await
         }
