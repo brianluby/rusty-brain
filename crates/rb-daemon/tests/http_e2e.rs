@@ -226,6 +226,8 @@ fn remember_request(content: &str) -> Request {
         supersedes: None,
         anchors: vec![],
         evidence: None,
+        human_curated: None,
+        allow_curated_supersede: None,
     }
 }
 

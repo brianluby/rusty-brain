@@ -228,13 +228,15 @@ mod oplog_tests {
 
         // Missing-id write: best-effort no-op, no oplog row.
         store
-            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .set_recalibrated_importance(&Namespace::Project("oplog".into()), &MemoryId::new(), 5)
             .unwrap();
         assert_eq!(oplog_rows(&store).len(), 1, "only the insert is logged");
 
         // A real job write logs a `set_importance` row a replay consumer can
         // reproduce (importance is durable ranking state).
-        store.set_recalibrated_importance(&n.id, 7).unwrap();
+        store
+            .set_recalibrated_importance(&n.namespace, &n.id, 7)
+            .unwrap();
         let rows = oplog_rows(&store);
         assert_eq!(rows.len(), 2);
         let (op, mid, _, _, details) = &rows[1];
@@ -462,8 +464,10 @@ mod oplog_tests {
     fn set_confidence_appends_oplog_only_on_real_change() {
         let store = SqliteStore::open_in_memory(8).unwrap();
         let n = node(&store, "to score");
-        store.set_confidence(&MemoryId::new(), 0.5).unwrap(); // missing no-op
-        store.set_confidence(&n.id, 0.4).unwrap();
+        store
+            .set_confidence(&n.namespace, &MemoryId::new(), 0.5)
+            .unwrap(); // missing no-op
+        store.set_confidence(&n.namespace, &n.id, 0.4).unwrap();
         let rows = oplog_rows(&store);
         assert_eq!(rows.len(), 2, "insert + exactly one set_confidence");
         assert_eq!(rows[1].0, "set_confidence");

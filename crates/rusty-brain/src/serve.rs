@@ -62,7 +62,7 @@ fn env_truthy(value: Option<String>) -> bool {
 /// `backend` equals `local` (case-insensitive) or a local model is named.
 /// Values arrive pre-trimmed/non-empty from [`rb_config::EffectiveConfig`]
 /// (env > config file).
-fn local_requested(backend: Option<&str>, local_model: Option<&str>) -> bool {
+pub(crate) fn local_requested(backend: Option<&str>, local_model: Option<&str>) -> bool {
     backend.is_some_and(|b| b.eq_ignore_ascii_case("local")) || local_model.is_some()
 }
 
@@ -73,7 +73,7 @@ fn local_requested(backend: Option<&str>, local_model: Option<&str>) -> bool {
 /// secret selects Voyage. `accept_model_change` (the `--accept-model-change`
 /// flag, OR-ed with `RB_ACCEPT_MODEL_CHANGE` for auto-start — deliberately
 /// NOT a config-file knob: consent must be per-change) opts in to an
-/// embedding-model swap; without it a swap fails closed at bind.
+/// embedding-model/dimension swap; without it a change fails closed at bind.
 pub async fn run_serve(
     effective: rb_config::EffectiveConfig,
     read_pool_size: usize,
@@ -210,20 +210,12 @@ async fn run_with_embedder<P>(
 where
     P: EmbeddingProvider + 'static,
 {
-    // Explicit opt-in to an embedding-model swap, BEFORE bind so the daemon's
-    // model-verified opens then succeed. A no-op when nothing changed.
-    if accept_model_change {
-        let changed =
-            rb_daemon::accept_model_change(&config.db_path, embedder.dim(), embedder.model_id())?;
-        if changed {
-            tracing::info!(
-                model = embedder.model_id(),
-                "accepted embedding model change; corpus marked for re-embed \
-                 (run `rusty-brain reembed` until changed=0)"
-            );
-        }
-    }
-    let daemon = Daemon::bind(config, SharedEmbedder::new(embedder)).await?;
+    let shared_embedder = SharedEmbedder::new(embedder);
+    let daemon = if accept_model_change {
+        Daemon::bind_accepting_model_change(config, shared_embedder).await?
+    } else {
+        Daemon::bind(config, shared_embedder).await?
+    };
     daemon.run(shutdown).await
 }
 

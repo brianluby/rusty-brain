@@ -80,14 +80,23 @@ pub(crate) fn archive_with_details(
     site_id: &str,
     id: &MemoryId,
     details: &str,
+    protect_curated: bool,
+    namespace: Option<&Namespace>,
 ) -> Result<bool> {
     immediate_tx(conn, || {
         let affected = conn
             .execute(
                 "UPDATE memories
                  SET archived_at = ?1, updated_at = ?1
-                 WHERE memory_id = ?2 AND archived_at IS NULL",
-                rusqlite::params![chrono::Utc::now().timestamp(), id.to_string()],
+                 WHERE memory_id = ?2 AND archived_at IS NULL
+                   AND (?3 IS NULL OR namespace = ?3)
+                   AND (?4 = 0 OR human_curated = 0)",
+                rusqlite::params![
+                    chrono::Utc::now().timestamp(),
+                    id.to_string(),
+                    namespace.map(Namespace::as_db_string),
+                    protect_curated,
+                ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
         if affected > 0 {

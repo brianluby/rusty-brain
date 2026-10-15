@@ -5,7 +5,10 @@
 
 use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
-use crate::messages::{Handshake, HandshakeAck, Request, Response, ScrubResult, CONTRACT_VERSION};
+use crate::messages::{
+    request_uses_human_curation, Handshake, HandshakeAck, Request, Response, ScrubResult,
+    CONTRACT_VERSION,
+};
 use crate::{response_error_to_error, Response as Resp};
 use rb_types::{
     Error, FeedbackKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
@@ -28,10 +31,10 @@ pub struct Client<S = UnixStream> {
     framed: Framed<S, LengthDelimitedCodec>,
     /// Whether the daemon advertised [`crate::CAP_ANCHORS`] at handshake —
     /// i.e. it evaluates typed code anchors instead of silently dropping
-    /// (`Remember.anchors`) or ignoring (pre-filter daemons) them. Gates the
-    /// anchor-bearing wrappers so the fail-fast anchor guarantee holds across
-    /// daemon versions.
+    /// (`Remember.anchors`) or ignoring (pre-filter daemons) them.
     supports_anchors: bool,
+    /// Whether the daemon accepts durable curation intent on write requests.
+    supports_human_curation: bool,
 }
 
 /// One item yielded by a live subscribe stream: either a change event or a
@@ -105,12 +108,15 @@ where
             return Err(Error::Storage(format!("handshake rejected: {detail}")));
         }
 
-        // A pre-anchor daemon sends no capabilities (serde default: empty),
-        // so `supports_anchors` correctly degrades to false against it.
         let supports_anchors = ack.capabilities.iter().any(|c| c == crate::CAP_ANCHORS);
+        let supports_human_curation = ack
+            .capabilities
+            .iter()
+            .any(|c| c == crate::CAP_HUMAN_CURATION);
         Ok(Client {
             framed,
             supports_anchors,
+            supports_human_curation,
         })
     }
 
@@ -123,6 +129,12 @@ where
         self.supports_anchors
     }
 
+    /// Whether the daemon advertised support for persistent human curation.
+    #[must_use]
+    pub fn supports_human_curation(&self) -> bool {
+        self.supports_human_curation
+    }
+
     /// Send one request frame WITHOUT reading the response. Split from
     /// [`request`](Self::request) so retrying callers can distinguish the two
     /// failure phases: a SEND failure means the daemon never received the frame
@@ -130,7 +142,14 @@ where
     /// retry on a fresh connection is safe for any op; a RECV failure after a
     /// successful send means the daemon may have executed the request and only
     /// the response was lost, so only idempotent ops may be retried.
+    /// Local capability rejection returns `InvalidArgument` before writing and
+    /// leaves the connection healthy; callers must not treat it as transport loss.
     pub async fn send_request(&mut self, req: &Request) -> Result<()> {
+        if request_uses_human_curation(req) && !self.supports_human_curation {
+            return Err(Error::InvalidArgument(
+                "daemon does not advertise human curation support".to_string(),
+            ));
+        }
         write_frame(&mut self.framed, req).await
     }
 
@@ -235,6 +254,8 @@ where
             Vec::new(),
             None,
             None,
+            false,
+            false,
         )
         .await
     }
@@ -260,6 +281,48 @@ where
         supersedes: Option<MemoryId>,
         evidence: Option<rb_types::CaptureEvidence>,
     ) -> Result<MemoryId> {
+        self.remember_anchored_with_intent(
+            content,
+            context,
+            memory_type,
+            importance,
+            keywords,
+            tags,
+            related_files,
+            confidence,
+            anchors,
+            supersedes,
+            evidence,
+            false,
+            false,
+        )
+        .await
+    }
+
+    /// Remember with deliberate curation and supersede intent. The daemon
+    /// capability is checked before either intent is sent.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn remember_anchored_with_intent(
+        &mut self,
+        content: String,
+        context: Option<String>,
+        memory_type: MemoryType,
+        importance: u8,
+        keywords: Vec<String>,
+        tags: Vec<String>,
+        related_files: Vec<String>,
+        confidence: Option<f32>,
+        anchors: Vec<rb_types::MemoryAnchor>,
+        supersedes: Option<MemoryId>,
+        evidence: Option<rb_types::CaptureEvidence>,
+        human_curated: bool,
+        allow_curated_supersede: bool,
+    ) -> Result<MemoryId> {
+        if allow_curated_supersede && supersedes.is_none() {
+            return Err(Error::InvalidArgument(
+                "curated supersede intent requires a superseded memory id".to_string(),
+            ));
+        }
         self.ensure_anchor_capable(!anchors.is_empty())?;
         for anchor in &anchors {
             anchor.validate()?;
@@ -276,6 +339,8 @@ where
             anchors,
             supersedes,
             evidence,
+            human_curated,
+            allow_curated_supersede,
         )
         .await
     }
@@ -310,6 +375,8 @@ where
             Vec::new(),
             Some(supersedes),
             None,
+            false,
+            false,
         )
         .await
     }
@@ -328,6 +395,8 @@ where
         anchors: Vec<rb_types::MemoryAnchor>,
         supersedes: Option<MemoryId>,
         evidence: Option<rb_types::CaptureEvidence>,
+        human_curated: bool,
+        allow_curated_supersede: bool,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
         // with the same error class the daemon would round-trip back. None
@@ -352,6 +421,8 @@ where
                 supersedes,
                 anchors,
                 evidence,
+                human_curated: human_curated.then_some(true),
+                allow_curated_supersede: allow_curated_supersede.then_some(true),
             })
             .await?;
         match resp {
@@ -642,8 +713,8 @@ where
     }
 
     /// Retroactively redact secrets from every stored memory (W2.4). Returns
-    /// `(scanned, redacted, reembed_pending)`; run `reembed` until `changed=0`
-    /// afterward to recompute vectors for the changed rows. Admin op: a
+    /// `(scanned, redacted, reembed_pending)`; run `reembed` until `scanned=0`
+    /// afterward (skips remain pending). Admin op: a
     /// non-admin peer is rejected with `Error::PermissionDenied`.
     pub async fn scrub(&mut self) -> Result<(u64, u64, u64)> {
         let result = self.scrub_with_checkpoint().await?;
@@ -1274,6 +1345,7 @@ mod wrapper_tests {
                                 mode,
                                 archived: u64::from(mode == rb_types::ForgetMode::Apply),
                                 purged: u64::from(mode == rb_types::ForgetMode::Hard),
+                                skipped: 0,
                                 total_eligible: 1,
                                 remaining: 0,
                                 failure: None,
@@ -1287,6 +1359,8 @@ mod wrapper_tests {
                     history: rb_types::MemoryHistory {
                         namespace: "global".to_string(),
                         depth: depth.unwrap_or(100),
+                        chain_limit: 200,
+                        edge_limit: 200,
                         chain: vec![rb_types::HistoryEntry {
                             id,
                             summary: "canned".to_string(),
@@ -1298,12 +1372,15 @@ mod wrapper_tests {
                             current: true,
                             is_target: true,
                             superseded_by: None,
+                            predecessors: Vec::new(),
+                            evidence: None,
                             origin_user: None,
                             origin_host: None,
                             origin_agent: None,
                             origin_source: None,
                         }],
                         edges: Vec::new(),
+                        cycle_detected: false,
                         truncated: false,
                     },
                 },
@@ -1449,6 +1526,73 @@ mod wrapper_tests {
 
         drop(client);
         server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn curation_intent_requires_capability_without_breaking_legacy_operations() {
+        for advertised in [false, true] {
+            let (_directory, path) = socket_path();
+            let listener = UnixListener::bind(&path).unwrap();
+            let id = MemoryId::new();
+            let capabilities = if advertised {
+                vec![crate::CAP_HUMAN_CURATION.into()]
+            } else {
+                vec![]
+            };
+            let server = tokio::spawn(serve_with_capabilities(listener, id.clone(), capabilities));
+            let mut client = connect(&path).await;
+            for human_curated in [false, true] {
+                let result = client
+                    .update(
+                        id.clone(),
+                        MemoryUpdates {
+                            human_curated: Some(human_curated),
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                if advertised {
+                    result.unwrap();
+                } else {
+                    assert!(matches!(result, Err(Error::InvalidArgument(_))));
+                }
+            }
+            let result = client
+                .remember_anchored_with_intent(
+                    "curated decision".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    true,
+                    false,
+                )
+                .await;
+            if advertised {
+                assert_eq!(result.unwrap(), id);
+            } else {
+                assert!(matches!(result, Err(Error::InvalidArgument(_))));
+            }
+            client
+                .update(
+                    id,
+                    MemoryUpdates {
+                        importance: Some(7),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(client.ping().await.unwrap(), CONTRACT_VERSION);
+            drop(client);
+            server.await.unwrap();
+        }
     }
 
     #[tokio::test]

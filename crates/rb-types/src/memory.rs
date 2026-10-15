@@ -17,6 +17,10 @@ pub struct MemoryNote {
     pub summary: String,
     pub keywords: Vec<String>,
     pub tags: Vec<String>,
+    /// Explicit human decision to protect this memory from unattended
+    /// maintenance. It is independent of provenance, trust, and importance.
+    #[serde(default)]
+    pub human_curated: bool,
     pub context: String,
     pub memory_type: MemoryType,
     /// 1-10 (validated at storage boundary).
@@ -110,6 +114,7 @@ impl MemoryNote {
             summary: String::new(),
             keywords: Vec::new(),
             tags: Vec::new(),
+            human_curated: false,
             context: String::new(),
             memory_type,
             importance,

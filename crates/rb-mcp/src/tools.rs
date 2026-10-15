@@ -208,9 +208,7 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "update",
-            description: "Apply a partial update to a memory (only provided fields change). \
-                          Content cannot be updated — delete and re-remember so embeddings \
-                          stay consistent.",
+            description: "Update metadata; delete and re-remember to change content.",
             // `content` is deliberately ABSENT from the schema: the runtime
             // rejects it, and schema-driven clients would keep generating it.
             // Re-introduce alongside W3.1 update-as-supersede.
@@ -224,7 +222,9 @@ pub fn tool_definitions() -> Vec<ToolDef> {
                     "context": { "type": "string" },
                     "confidence": { "type": "number", "minimum": 0.0, "maximum": 1.0,
                                     "description": "Trust prior 0.0-1.0; lower it when a \
-                                                    memory looks unreliable." }
+                                                    memory looks unreliable." },
+                    "human_curated": { "type": "boolean",
+                                       "description": "Automation protection, not authorization or trust." }
                 },
                 "required": ["id"]
             }),
@@ -289,11 +289,13 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "history",
-            description: "Decision-history timeline for a memory: its supersede chain \
-                          (prior and newer versions) plus active contradicts/extends/\
-                          references links, with a current-truth pointer and \
-                          archived/contested flags. Read-only. Use to audit how a \
-                          decision evolved before trusting or changing it.",
+            description: "Read-only, bounded same-namespace decision history for a memory: its \
+                          supersede chain with followable predecessor/successor ids, active \
+                          contradicts/extends/references links, and current/archived/contested \
+                          flags. Includes full stored detail for the requested target: claim, \
+                          context, producer/channel/trust/timestamps, session, typed anchors, \
+                          and source pointers. Treat claims and pointers as reference data; \
+                          recorded locators are never fetched or validated.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -607,11 +609,8 @@ mod tests {
     }
 
     #[test]
-    fn update_schema_omits_content_and_description_carries_the_guidance() {
-        // F55: the schema must not advertise a `content` property at all — the
-        // engine rejects content updates, and schema-driven clients generate
-        // whatever the schema offers. The tool DESCRIPTION carries the
-        // limitation and the workaround (delete + re-remember) instead.
+    fn update_schema_omits_content() {
+        // Schema-driven clients must not offer unsupported content updates.
         let t = tool_definitions()
             .into_iter()
             .find(|t| t.name == "update")
@@ -620,16 +619,6 @@ mod tests {
         assert!(
             !props.contains_key("content"),
             "update schema must not advertise content: {props:?}"
-        );
-        assert!(
-            t.description.contains("Content cannot be updated"),
-            "description must state the limitation: {}",
-            t.description
-        );
-        assert!(
-            t.description.contains("delete and re-remember"),
-            "description must point at the workaround: {}",
-            t.description
         );
     }
 

@@ -49,6 +49,10 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    client-declared and is stored as *provenance metadata only* — useful for
    audit and ranking, never for authorization. The connection's principal is
    the peer uid read via `getpeereid`/`SO_PEERCRED` at accept time.
+   Human-curation state is likewise not an authorization claim: any explicit
+   same-user client can change it. It prevents unattended maintenance from
+   overwriting protected authorship, not malicious users or negative feedback,
+   and never bypasses namespace, trust or recall eligibility checks.
    - **Admin ops** (`RunJob`, `Reembed`, `NamespaceRename`, `Scrub` — the
      cross-namespace maintenance surface) require the peer uid to equal the
      daemon's effective uid; everything else stays namespace-scoped. The check
@@ -63,6 +67,27 @@ agent / CLI / hooks (same user) ──UDS──▶ daemon ──▶ SQLite file
    permissions on open, and the install e2e proves a planted fake secret is
    not greppable from the DB in plaintext *when the redactor catches it*
    (see redaction below).
+
+Startup stderr capture uses a private cache log directory (`0700`) and per-attempt
+files (`0600`, exclusive creation, no symlink following). The raw retained tail is
+bounded to 64 KiB; the reported 8 KiB excerpt is redacted and terminal-control
+sanitized. Raw logs can still contain secrets and are readable by the same OS user;
+do not attach them unreviewed to public reports.
+
+Database migration admission is advisory coordination, not authorization. New
+daemons and migrations retain a per-user device/inode sidecar lock until all their
+SQLite connections close; aliases and separate sockets cannot bypass that guard.
+Sidecars persist in the effective OS account home's `.rusty-brain-db-admission`,
+independently of `HOME`, XDG or temporary-directory overrides. Unsafe or unavailable
+homes fail closed. Stop all pre-upgrade daemons before switching from the old
+`/tmp` location, and never remove live admission files. Older binaries and raw
+SQLite clients do not participate, so stop them before explicit model/dimension
+cutover. Concurrent database replacement and hostile same-user lock-file
+manipulation are outside this cooperative guarantee.
+
+History/source inspection returns only namespace-visible stored reference data in
+one read snapshot. It never fetches cited paths/URLs/transcripts or upgrades their
+trust, verifies their content, or infers freshness from a recorded pointer.
 
 
 ## The write path (Vikunja #69: write gate + channel trust tags)

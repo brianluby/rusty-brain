@@ -66,12 +66,18 @@ succeeding.
   `Correction: subject: value` permit ordered, explicit same-session correction:
   obsolete retained evidence is not admitted,
   and every known earlier matching-subject fact is retired after the correction
-  is durable. Failed retirements retry even when the correction is already recorded.
+  is durable, except human-curated facts. Retirement rechecks protection in its
+  transaction; refusals remain unretired in scratch. Failed retirements retry
+  even when the correction is already recorded.
+  Hook-origin writes cannot mark memories curated, and hook metadata updates
+  cannot carry mark/unmark intent; deliberate CLI/MCP edits remain available.
   Stored corrections still filter obsolete evidence and finish pending retirement
   when their original transcript records leave the next bounded window.
   Matching uses persisted redacted subject/source identities, including replacement lineage.
   Ambiguous conflicts remain unresolved. Compaction custom instructions alone
   have no verified conversational role.
+  If retention hard-purges a session's prior summary, the next fold still saves
+  its replacement and advances scratch without emitting an archive for the missing row.
 - Source context carries actual message IDs when supplied, record byte offsets
   or OMP branch positions, text-line order and window/status metadata; missing
   IDs are not invented. Attribution is not authority: hook-confirmed user facts
@@ -86,6 +92,8 @@ succeeding.
   with overlapping-hook last-writer-wins behavior. Redaction and instruction
   filtering precede persistence; directive-shaped legitimate constraints can
   still be dropped by the retained safety filter.
+  Hook remember receipts name the final survivor after write-time deduplication,
+  including an older curated row, so the ledger does not record a suppressed row.
 
 
 ## Claude Code (stable)

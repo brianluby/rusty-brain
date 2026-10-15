@@ -519,4 +519,38 @@ mod tests {
         );
         assert!(bad.is_err(), "CHECK constraint rejects unknown trust_class");
     }
+
+    #[test]
+    fn human_curation_migration_preserves_existing_rows_as_uncurated() {
+        let c = conn();
+        run_migrations_up_to(&c, 13).unwrap();
+        c.execute(
+            "INSERT INTO memories (
+                 memory_id, namespace, created_at, updated_at, content, summary,
+                 keywords, tags, memory_type, importance, confidence, embedding_model
+             ) VALUES ('legacy', 'global', 1, 1, 'old fact', '', '[]', '[]',
+                       'insight', 5, 1.0, '')",
+            [],
+        )
+        .unwrap();
+
+        run_migrations(&c).unwrap();
+
+        let curated: i64 = c
+            .query_row(
+                "SELECT human_curated FROM memories WHERE memory_id = 'legacy'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(curated, 0, "legacy memories must remain uncurated");
+        assert!(
+            c.execute(
+                "UPDATE memories SET human_curated = 2 WHERE memory_id = 'legacy'",
+                [],
+            )
+            .is_err(),
+            "the SQL CHECK must reject non-boolean marker values"
+        );
+    }
 }

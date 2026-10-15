@@ -433,7 +433,8 @@ A single SQLite file holds everything, opened in WAL mode:
   timestamps, archive/supersede state, the embedding model + composition-version
   stamps, and provenance: `origin_user`, `origin_host`, `origin_agent`,
   `origin_source`, `session_id` — nullable, never backfilled, so pre-provenance rows
-  keep `NULL`).
+  keep `NULL`). `human_curated` is a dedicated, default-false maintenance-protection
+  bit, not a tag, trust classification or authorization principal.
 - **`memory_vectors`** — a `sqlite-vec` virtual table of embeddings, one per memory.
 - **`memory_links`** — directed edges between memories (e.g. `references`,
   `contradicts`) with a decaying strength.
@@ -457,11 +458,31 @@ length-checked: a provider whose dimension disagrees with the stored value makes
 daemon refuse to start rather than write mismatched vectors. The embedding model
 identity (`meta.embedding_model`) is the second: a same-dimension provider swap also
 refuses to start — mixed vector spaces must be impossible — unless explicitly accepted
-via `serve --accept-model-change` (or `RB_ACCEPT_MODEL_CHANGE=1` for auto-started
-daemons) followed by a corpus `reembed`. A legacy database with no global model marker
-is reconciled from `SELECT DISTINCT memories.embedding_model`: an empty corpus or one
-model matching the configured provider may seed the marker; a conflicting or mixed
-corpus fails closed and requires that explicit accept-and-re-embed flow.
+via `serve --accept-model-change` (or `RB_ACCEPT_MODEL_CHANGE=1` for auto-start).
+Acceptance opens without loading the old vector layout and, in one immediate
+transaction, replaces the derived vec0 index, updates the model/dimension/layout
+markers and invalidates embedding-input stamps. Authoritative rows, anchors, graph,
+oplog and site identity stay unchanged. Bounded `reembed` batches process active rows;
+skips remain retryable and completion is `scanned=0`, not merely `changed=0`.
+An identical model/dimension acceptance is a no-op, preserving partial progress.
+A legacy database with no global model marker is reconciled from
+`SELECT DISTINCT memories.embedding_model`: an empty corpus or one matching model
+may seed the marker; conflicting or mixed corpora require explicit acceptance.
+
+Daemon serving and standalone acceptance acquire the same nonblocking admission
+guard before opening SQLite connections. Private `0600` sidecars live in the
+owner-owned `0700` directory `<OS-account-home>/.rusty-brain-db-admission`, keyed
+by the open database's device/inode so aliases and separate sockets coordinate.
+The canonical home is resolved for the effective UID, independently of `HOME`,
+XDG and temporary-directory overrides. Unsafe or unavailable homes fail closed,
+without a fallback lock root. The guard outlives daemon, writer-thread and borrowed
+read-pool connections, including cancelled asynchronous callers. Sidecars are
+never unlinked; do not remove them while a daemon is running.
+SQLite's own file is not flocked (that conflicts with WAL locking on macOS).
+This is cooperative exclusion only: stop all pre-upgrade daemons before switching
+from the former `/tmp` admission directory, and stop legacy binaries and unmanaged
+SQLite clients before migration. Database replacement by an unrelated process is
+not an enforced boundary.
 
 The database file holds captured memory text, so it gets the same posture as the
 daemon socket: the file is created `0600` and tightened fail-closed on every open

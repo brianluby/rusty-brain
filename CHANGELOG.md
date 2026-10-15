@@ -5,6 +5,87 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Trusted-memory tranche (kanban 78, 79, 94, 95)
+
+- Accept deliberate embedding-model and dimension changes atomically, rebuilding
+  only the derived vector index while preserving authored rows, anchors, links,
+  history and site identity. Preserve partial re-embedding progress on retry and
+  exclude archived rows; skipped work remains pending until a scan returns zero.
+- Coordinate serving and offline migration by database inode across socket paths
+  and aliases, retaining admission through writer/read-pool shutdown. Use private
+  sidecars rather than SQLite-file flocking, which conflicts with macOS WAL locks.
+  Legacy binaries and unmanaged SQLite clients must still be stopped explicitly.
+- Surface real daemon startup causes in CLI/MCP errors under one bounded
+  socket/handshake deadline (five seconds normally, 120 for resolved local models),
+  with child status and a redacted bounded stderr tail.
+  Capture private bounded per-attempt logs without blocking on inherited stderr
+  pipes or terminating a healthy detached daemon when its launcher exits.
+- Extend bounded CLI/MCP history with the target's full stored claim, context,
+  source anchors and provenance under one consistent, counter-free read snapshot.
+  Recorded source references remain unverified; no content is fetched.
+- Persist default-false human-curation protection across CLI/MCP metadata edits,
+  JSON export/restore and daemon restarts. Guard unattended collapse, policy review,
+  retention and importance/confidence maintenance transactionally without turning
+  protection into trust, authorization or a recall eligibility/ranking bypass.
+  Keep explicit overrides, negative feedback, scrubbing and re-embedding available.
+- Carry actual duplicate-survivor/archive receipts through events, hook suppression
+  and remaining consolidation work when curation changes after candidate planning.
+- Preserve new lifecycle summaries when their supersession target is already
+  resolved, without rewriting established lineage or publishing a false archive;
+  curation refusals still roll back the entire replacement transaction.
+
+### Fixed — Trusted-memory adversarial review
+
+- Redact complete retained startup records before selecting the displayed tail;
+  omit capture-ring fragments and incomplete live records instead of exposing
+  credential values after their identifying prefixes or closing quotes are lost.
+- Protect active startup logs with process-held file locks until readiness or
+  failure diagnostics are consumed. Retain up to eight completed logs separately
+  from active attempts; reclaim abandoned publication files without following links.
+- Route hook correction retirement through namespace-scoped transactional curation
+  checks. Refused facts remain unretired in the capture ledger; deliberate user
+  deletion still overrides protection.
+- Preserve new lifecycle summaries after their previous summary was hard-purged,
+  advancing session scratch without a false archive event. Existing foreign-
+  namespace and curated-target refusals remain atomic.
+- Escape terminal controls in human history claims, context, provenance, anchors
+  and related timeline text while leaving JSON evidence unchanged.
+- Enforce the history response's encoded 1 MiB wire budget, omitting optional
+  linked/chain rows with an explicit truncation marker. Oversized target detail
+  returns an actionable error without truncating qualifications or closing the
+  connection.
+
+### Fixed — PR #99 review remediations
+
+- Move database-inode admission to a persistent, validated OS-account-home
+  directory so temporary cleanup and environment overrides cannot split live
+  locks. Fail closed without a safe home; stop pre-upgrade daemons before switching
+  from the former `/tmp` lock location.
+- Reject hook-origin curation mark/unmark metadata updates before any fields are
+  changed, while preserving ordinary hook updates and deliberate CLI/MCP overrides.
+- Allow resolved local embedding startup up to 120 seconds across CLI/MCP and its
+  stderr collector, retaining the ordinary five-second deadline and one bounded
+  attempt budget.
+- Exercise actual CLI model acceptance and re-embedding, curated importance-job
+  refusal accounting, and legacy-daemon curation capability checks. Correct the
+  symlink log fixture so it reaches the no-follow check rather than a path guard.
+- Cover retention-job accounting when curation changes after planning: include
+  both refused candidates and batch overflow, while retaining protection and
+  allowing later passes to finish unprocessed work.
+- Rust API migration: `client::connect_or_start`, `mcp::run_mcp` and
+  `mcp::ClientProxy::new` now require a `startup_timeout: Duration` argument
+  (five seconds normally, 120 for local models). CLI/MCP resolve this from the
+  existing embedding configuration; all workspace callers are migrated.
+- Preserve a healthy MCP connection when client-side capability validation refuses
+  a request, including after a reconnect; do not classify it as transport failure.
+- Share one absolute startup deadline across MCP reconnect attempts and backoff,
+  rather than granting each attempt a fresh five- or 120-second allowance.
+  Replace compile-only proxy wiring assertions with socket-level rejection and
+  deadline regressions.
+- Return the actual surviving memory ID after automatic hook deduplication,
+  including when an older curated row wins, so capture ledgers do not retain
+  the newly inserted row that suppression just archived.
+
 ### Fixed — PR #98 review remediations
 
 - Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed

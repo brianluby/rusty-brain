@@ -9,7 +9,7 @@
 //! the background change subscriber reconnect instead of dying with the first
 //! broken connection.
 
-use crate::client::connect_or_start;
+use crate::client::{connect_or_start, LOCAL_STARTUP_DEADLINE};
 use async_trait::async_trait;
 use rb_mcp::{serve_stdio_with_buffer, ChangeBuffer, DaemonProxy};
 use rb_proto::{Client, Request, Response, SubscribeItem};
@@ -18,6 +18,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::BufReader;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 /// Sleeps between successive proxy reconnect attempts: one immediate attempt,
 /// then one retry per entry. `connect_or_start` already retries auto-start
@@ -42,6 +43,7 @@ pub struct ClientProxy {
     db_path: PathBuf,
     namespace: rb_types::Namespace,
     self_exe: PathBuf,
+    startup_timeout: Duration,
 }
 
 /// Which phase of a request round-trip failed. See the retry rule on
@@ -56,6 +58,10 @@ impl CallFailure {
         match self {
             CallFailure::Send(e) | CallFailure::Recv(e) => e,
         }
+    }
+
+    fn is_local_rejection(&self) -> bool {
+        matches!(self, Self::Send(rb_types::Error::InvalidArgument(_)))
     }
 }
 
@@ -95,6 +101,7 @@ impl ClientProxy {
         db_path: PathBuf,
         namespace: rb_types::Namespace,
         self_exe: PathBuf,
+        startup_timeout: Duration,
     ) -> Self {
         Self {
             client: Some(client),
@@ -102,6 +109,7 @@ impl ClientProxy {
             db_path,
             namespace,
             self_exe,
+            startup_timeout,
         }
     }
 
@@ -109,13 +117,18 @@ impl ClientProxy {
     /// daemon if needed), backing off per [`RECONNECT_BACKOFF`].
     async fn reconnect(&mut self) -> rb_types::Result<()> {
         self.client = None;
+        let deadline = Instant::now() + self.startup_timeout.min(LOCAL_STARTUP_DEADLINE);
         let mut last_err: Option<rb_types::Error> = None;
         for (attempt, backoff) in std::iter::once(None)
             .chain(RECONNECT_BACKOFF.iter().map(Some))
             .enumerate()
         {
             if let Some(backoff) = backoff {
-                tokio::time::sleep(*backoff).await;
+                tokio::time::sleep_until((Instant::now() + *backoff).min(deadline)).await;
+            }
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
             }
             match connect_or_start(
                 &self.socket_path,
@@ -123,6 +136,7 @@ impl ClientProxy {
                 self.namespace.clone(),
                 self.self_exe.clone(),
                 Some(crate::client::client_identity("mcp")),
+                remaining,
             )
             .await
             {
@@ -156,10 +170,11 @@ impl DaemonProxy for ClientProxy {
     // The adapter already built a well-formed Request; forward it verbatim via
     // the raw send/recv methods (not the typed wrappers) so the daemon's
     // Response::Error stays a Response (surfaced as an isError tool result),
-    // and only transport failures become Err.
+    // and local rejections or transport failures become Err.
     //
-    // RETRY RULE (see rb_proto::Client::send_request / recv_response): a SEND
-    // failure means the daemon never received the frame — Unix-socket writes
+    // Local argument rejection writes no frame and leaves the connection reusable.
+    // RETRY RULE (see rb_proto::Client::send_request / recv_response): a transport
+    // SEND failure means the daemon never received the frame — Unix-socket writes
     // fail immediately once the peer has closed, which is exactly the daemon's
     // idle-timeout case — so one reconnect+retry is safe for EVERY op,
     // including Remember. A RECV failure after a successful send is ambiguous
@@ -187,6 +202,10 @@ impl DaemonProxy for ClientProxy {
             }
         };
 
+        if failure.is_local_rejection() {
+            return Err(failure.into_error());
+        }
+
         // The connection is dead either way; never reuse a broken stream.
         self.client = None;
 
@@ -196,10 +215,9 @@ impl DaemonProxy for ClientProxy {
         };
         if !retryable {
             // Surface the ambiguous failure immediately. An eager reconnect
-            // here can block ~20s (backoff attempts x auto-start retries) while
-            // serial stdio dispatch stalls every other tool call — and buys
-            // nothing: `self.client` is None, so the next call reconnects
-            // lazily via `ensure_connected`.
+            // here can consume a whole startup budget while serial stdio dispatch
+            // stalls every other tool call — and buys nothing: the next call
+            // reconnects lazily via `ensure_connected`.
             return Err(failure.into_error());
         }
 
@@ -211,7 +229,9 @@ impl DaemonProxy for ClientProxy {
         match attempt_call(client, &request).await {
             Ok(resp) => Ok(resp),
             Err(f) => {
-                self.client = None;
+                if !f.is_local_rejection() {
+                    self.client = None;
+                }
                 Err(f.into_error())
             }
         }
@@ -228,6 +248,7 @@ pub async fn run_mcp(
     socket_path: &Path,
     db_path: &Path,
     namespace: rb_types::Namespace,
+    startup_timeout: Duration,
 ) -> anyhow::Result<()> {
     let self_exe =
         std::env::current_exe().map_err(|e| anyhow::anyhow!("locating own executable: {e}"))?;
@@ -237,6 +258,7 @@ pub async fn run_mcp(
         namespace.clone(),
         self_exe.clone(),
         Some(crate::client::client_identity("mcp")),
+        startup_timeout,
     )
     .await
     .map_err(|e| anyhow::anyhow!("connecting to daemon: {e}"))?;
@@ -254,7 +276,15 @@ pub async fn run_mcp(
     let sub_ns = namespace.clone();
     let sub_exe = self_exe.clone();
     tokio::spawn(async move {
-        run_subscriber(&sub_socket, &sub_db, sub_ns, sub_exe, sub_buffer).await;
+        run_subscriber(
+            &sub_socket,
+            &sub_db,
+            sub_ns,
+            sub_exe,
+            sub_buffer,
+            startup_timeout,
+        )
+        .await;
     });
 
     let proxy = ClientProxy::new(
@@ -263,6 +293,7 @@ pub async fn run_mcp(
         db_path.to_path_buf(),
         namespace,
         self_exe,
+        startup_timeout,
     );
     let stdin = BufReader::new(tokio::io::stdin());
     let stdout = tokio::io::stdout();
@@ -283,6 +314,7 @@ async fn run_subscriber(
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
     buffer: Arc<Mutex<ChangeBuffer>>,
+    startup_timeout: Duration,
 ) {
     let mut backoff = SUBSCRIBE_BACKOFF_INITIAL;
     // W2.7 replay cursor: the highest oplog seq this subscriber has pushed
@@ -299,6 +331,7 @@ async fn run_subscriber(
             namespace.clone(),
             self_exe.clone(),
             cursor,
+            startup_timeout,
         )
         .await
         {
@@ -330,6 +363,7 @@ async fn connect_and_subscribe(
     namespace: rb_types::Namespace,
     self_exe: std::path::PathBuf,
     since: Option<u64>,
+    startup_timeout: Duration,
 ) -> rb_types::Result<Client> {
     let mut client = connect_or_start(
         socket_path,
@@ -337,6 +371,7 @@ async fn connect_and_subscribe(
         namespace,
         self_exe,
         Some(crate::client::client_identity("mcp")),
+        startup_timeout,
     )
     .await?;
     client.subscribe_since(since).await?;
@@ -375,17 +410,129 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
 
-    // The proxy is a thin wrapper over rb_proto::Client; there is no offline way
-    // to construct a connected Client without a daemon, so reconnect behavior is
-    // proven in the daemon-backed e2e (tests/mcp_e2e.rs). Here we only assert
-    // the type implements the rb_mcp::DaemonProxy trait (a compile-time
-    // guarantee via this fn).
-    fn _assert_impls_daemon_proxy<T: rb_mcp::DaemonProxy>() {}
+    async fn read_json(stream: &mut tokio::net::UnixStream) -> std::io::Result<serde_json::Value> {
+        use tokio::io::AsyncReadExt;
+        let length = stream.read_u32().await?;
+        assert!(length <= 1024 * 1024);
+        let mut bytes = vec![0; length as usize];
+        stream.read_exact(&mut bytes).await?;
+        serde_json::from_slice(&bytes).map_err(std::io::Error::other)
+    }
 
-    #[test]
-    fn client_proxy_implements_daemon_proxy() {
-        // If ClientProxy did not implement DaemonProxy this would not compile.
-        let _ = _assert_impls_daemon_proxy::<ClientProxy>;
+    async fn write_json(stream: &mut tokio::net::UnixStream, value: serde_json::Value) {
+        use tokio::io::AsyncWriteExt;
+        let bytes = serde_json::to_vec(&value).unwrap();
+        stream
+            .write_u32(u32::try_from(bytes.len()).unwrap())
+            .await
+            .unwrap();
+        stream.write_all(&bytes).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn local_curation_rejections_preserve_the_legacy_connection() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("legacy.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            let mut peers = tokio::task::JoinSet::new();
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                peers.spawn(async move {
+                    read_json(&mut stream).await.unwrap();
+                    write_json(
+                        &mut stream,
+                        serde_json::json!({
+                            "contract_version": rb_proto::CONTRACT_VERSION,
+                            "ok": true, "message": null, "capabilities": []
+                        }),
+                    )
+                    .await;
+                    while let Ok(request) = read_json(&mut stream).await {
+                        assert_eq!(request["op"], "Ping", "curation must not reach an old peer");
+                        write_json(
+                            &mut stream,
+                            serde_json::json!({
+                                "result": "Pong",
+                                "contract_version": rb_proto::CONTRACT_VERSION,
+                                "recall_channels": null
+                            }),
+                        )
+                        .await;
+                    }
+                });
+            }
+        });
+        let client = Client::connect(&socket, rb_types::Namespace::Global)
+            .await
+            .unwrap();
+        let mut proxy = ClientProxy::new(
+            client,
+            socket,
+            dir.path().join("unused.db"),
+            rb_types::Namespace::Global,
+            std::env::current_exe().unwrap(),
+            Duration::from_secs(5),
+        );
+        for human_curated in [false, true] {
+            let result = proxy
+                .call(Request::Update {
+                    id: rb_types::MemoryId::new(),
+                    updates: rb_types::MemoryUpdates {
+                        human_curated: Some(human_curated),
+                        ..Default::default()
+                    },
+                })
+                .await;
+            assert!(matches!(result, Err(rb_types::Error::InvalidArgument(_))));
+        }
+        let response = proxy.call(Request::Ping).await;
+        drop(proxy);
+        server.abort();
+        let _ = server.await;
+        assert!(matches!(response, Ok(Response::Pong { .. })));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn reconnect_shares_one_deadline_across_attempts() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("stalled.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let accepted = Arc::clone(&connections);
+        let server = tokio::spawn(async move {
+            let mut streams = Vec::new();
+            loop {
+                let (stream, _) = listener.accept().await.unwrap();
+                accepted.fetch_add(1, Ordering::SeqCst);
+                streams.push(stream);
+            }
+        });
+        let mut proxy = ClientProxy {
+            client: None,
+            socket_path: socket,
+            db_path: dir.path().join("unused.db"),
+            namespace: rb_types::Namespace::Global,
+            self_exe: std::env::current_exe().unwrap(),
+            startup_timeout: Duration::from_millis(100),
+        };
+        let started = std::time::Instant::now();
+        let result = tokio::time::timeout(Duration::from_secs(3), proxy.call(Request::Ping)).await;
+        let elapsed = started.elapsed();
+        server.abort();
+        let _ = server.await;
+        assert!(matches!(result.unwrap(), Err(rb_types::Error::Io(_))));
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(
+            elapsed < Duration::from_secs(1),
+            "reconnect took {elapsed:?}"
+        );
     }
 
     // The retry rule's idempotency split: read-only ops may be retried after a
@@ -427,6 +574,8 @@ mod tests {
                 confidence: None,
                 supersedes: None,
                 evidence: None,
+                human_curated: None,
+                allow_curated_supersede: None,
             },
             Request::Update {
                 id: id(),
@@ -444,38 +593,5 @@ mod tests {
                 "mutating/streaming must not retry: {req:?}"
             );
         }
-    }
-
-    // Compile-time guard: run_mcp must accept a pre-resolved Namespace (threaded
-    // in from main.rs off the runtime) rather than calling detect_namespace()
-    // itself from inside the tokio runtime.
-    #[test]
-    fn run_mcp_signature_takes_preresolved_namespace() {
-        // If run_mcp's signature changed back to not accept a Namespace this
-        // closure would fail to compile.
-        fn _assert_callable<'a>(
-            sock: &'a std::path::Path,
-            db: &'a std::path::Path,
-            ns: rb_types::Namespace,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = anyhow::Result<()>> + 'a>> {
-            Box::pin(run_mcp(sock, db, ns))
-        }
-        let _ = _assert_callable as fn(_, _, _) -> _;
-    }
-
-    // Compile-time guard: the buffer-aware stdio entrypoint must exist and be
-    // importable from rb_mcp. If `serve_stdio_with_buffer` is removed or its
-    // signature changes incompatibly, this fails to compile.
-    #[test]
-    fn buffer_aware_serve_symbol_is_available() {
-        fn _assert_symbol_exists() {
-            // Reference the function path without calling it.
-            let _f = rb_mcp::serve_stdio_with_buffer::<
-                tokio::io::BufReader<tokio::io::Stdin>,
-                tokio::io::Stdout,
-                crate::mcp::ClientProxy,
-            >;
-        }
-        let _ = _assert_symbol_exists;
     }
 }

@@ -43,6 +43,8 @@ fn public_surface_is_reachable_and_stable() {
         supersedes: Some(MemoryId::new()),
         anchors: vec![],
         evidence: None,
+        human_curated: None,
+        allow_curated_supersede: None,
     };
 
     // Error mapping helpers, round-tripping through the wire form.

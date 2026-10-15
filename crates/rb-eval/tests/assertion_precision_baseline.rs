@@ -41,6 +41,7 @@ async fn assert_class(class: &str) {
                     tags: Vec::new(),
                     related_files: Vec::new(),
                     confidence: Some(1.0),
+                    human_curated: false,
                     provenance: Provenance::default(),
                     anchors: Vec::new(),
                     trust_class: None,

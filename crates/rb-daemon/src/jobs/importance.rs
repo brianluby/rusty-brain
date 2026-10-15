@@ -131,10 +131,14 @@ pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSumma
             summary.skipped += 1;
             continue;
         }
-        store
+        if store
             .set_recalibrated_importance(row.namespace.clone(), row.id.clone(), new)
-            .await?;
-        summary.changed += 1;
+            .await?
+        {
+            summary.changed += 1;
+        } else {
+            summary.skipped += 1;
+        }
     }
     Ok(summary)
 }
@@ -456,6 +460,61 @@ mod tests {
             "both rows already at their recalibrated value"
         );
 
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_skips_curated_recalibration_without_reporting_change() {
+        use rb_engine::MemoryBackend;
+        use rb_types::{MemoryNote, MemoryType, Namespace};
+
+        let directory = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(directory.path().join("curated.db"), 8, 2).unwrap();
+        let namespace = Namespace::Project("curated-recalibration".into());
+        let mut note = MemoryNote::new(
+            namespace.clone(),
+            "curated policy".into(),
+            MemoryType::Insight,
+            3,
+        );
+        note.human_curated = true;
+        let id = note.id.clone();
+        handle.write(note, Some(vec![0.1; 8])).await.unwrap();
+        for _ in 0..50 {
+            handle.record_access(id.clone()).await.unwrap();
+        }
+        handle.flush_accesses().await.unwrap();
+        let before = handle
+            .memories_for_recalibration(10)
+            .await
+            .unwrap()
+            .remove(0);
+        let config = cfg();
+        assert_ne!(
+            recalibrate(
+                before.base_importance,
+                before.access_count,
+                before.last_accessed_at,
+                chrono::Utc::now().timestamp(),
+                &config
+            ),
+            before.importance,
+            "fixture must reach the transactional refusal, not the unchanged-target skip"
+        );
+        let summary = run(&handle, &config).await.unwrap();
+        assert_eq!(
+            (summary.scanned, summary.changed, summary.skipped),
+            (1, 0, 1)
+        );
+        let retained = handle.get(namespace, id).await.unwrap().unwrap();
+        assert_eq!(retained.importance, 3);
+        assert!(retained.human_curated && retained.archived_at.is_none());
+        let after = handle
+            .memories_for_recalibration(10)
+            .await
+            .unwrap()
+            .remove(0);
+        assert_eq!(after.base_importance, before.base_importance);
         handle.shutdown().await;
     }
 

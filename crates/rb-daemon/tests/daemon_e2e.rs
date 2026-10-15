@@ -1909,6 +1909,165 @@ async fn superseded_decision_never_reaches_context_or_recall_and_tip_always_does
     daemon.stop().await;
 }
 
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn hook_correction_retirement_protects_curated_older_facts_and_preserves_deliberate_delete() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("curated-older-correction".into());
+    let connect = |source: &str, namespace: Namespace| {
+        Client::connect_with_identity(
+            &daemon.socket,
+            namespace,
+            Some(ClientIdentity {
+                source: Some(source.into()),
+                ..Default::default()
+            }),
+        )
+    };
+    let mut hook = connect("hook", ns.clone()).await.unwrap();
+    let mut cli = connect("cli", ns.clone()).await.unwrap();
+    let mut mcp = connect("mcp", ns.clone()).await.unwrap();
+    let mut foreign_hook = connect("hook", Namespace::Project("other-correction".into()))
+        .await
+        .unwrap();
+    let mut ids = Vec::new();
+    for text in [
+        "Decision: database: PostgreSQL",
+        "Decision: database: MySQL",
+    ] {
+        ids.push(
+            hook.remember(
+                text.into(),
+                None,
+                MemoryType::ArchitectureDecision,
+                5,
+                vec![],
+                vec!["hook".into(), "confirmed-decision".into()],
+                vec![],
+                Some(0.7),
+            )
+            .await
+            .unwrap(),
+        );
+    }
+    let postgres = ids[0].clone();
+    let mysql = ids[1].clone();
+    cli.update(
+        postgres.clone(),
+        MemoryUpdates {
+            human_curated: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let protected = cli.get(postgres.clone()).await.unwrap().unwrap();
+    for human_curated in [false, true] {
+        let error = hook
+            .update(
+                postgres.clone(),
+                MemoryUpdates {
+                    human_curated: Some(human_curated),
+                    summary: Some("must not partially apply a rejected update".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(error, rb_types::Error::InvalidArgument(_)),
+            "{error}"
+        );
+        assert!(error
+            .to_string()
+            .contains("automatic hook writes cannot set human-curation intent"));
+        assert_eq!(
+            cli.get(postgres.clone()).await.unwrap(),
+            Some(protected.clone())
+        );
+    }
+    let sqlite = hook
+        .remember_superseding(
+            "Correction: database: SQLite".into(),
+            None,
+            MemoryType::ArchitectureDecision,
+            5,
+            vec![],
+            vec!["hook".into(), "confirmed-decision".into()],
+            vec![],
+            Some(0.7),
+            mysql.clone(),
+        )
+        .await
+        .unwrap();
+    let resolved_mysql = cli.get(mysql.clone()).await.unwrap().unwrap();
+    assert_eq!(resolved_mysql.superseded_by, Some(sqlite.clone()));
+    assert!(resolved_mysql.archived_at.is_some());
+
+    assert!(hook.delete(postgres.clone()).await.is_err());
+    assert!(foreign_hook.delete(postgres.clone()).await.is_err());
+    assert!(hook.delete(mysql.clone()).await.is_err());
+    assert_eq!(cli.get(postgres.clone()).await.unwrap(), Some(protected));
+    assert_eq!(cli.get(mysql).await.unwrap(), Some(resolved_mysql));
+
+    hook.update(
+        sqlite.clone(),
+        MemoryUpdates {
+            context: Some("Ordinary hook metadata updates remain supported.".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        cli.get(sqlite.clone()).await.unwrap().unwrap().context,
+        "Ordinary hook metadata updates remain supported."
+    );
+    hook.delete(sqlite.clone()).await.unwrap();
+    assert!(cli
+        .get(sqlite)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
+    cli.delete(postgres.clone()).await.unwrap();
+    assert!(cli
+        .get(postgres)
+        .await
+        .unwrap()
+        .unwrap()
+        .archived_at
+        .is_some());
+
+    let curated = cli
+        .remember(
+            "An explicitly curated MCP delete target".into(),
+            None,
+            MemoryType::Insight,
+            5,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    cli.update(
+        curated.clone(),
+        MemoryUpdates {
+            human_curated: Some(true),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    mcp.delete(curated.clone()).await.unwrap();
+    let deleted = cli.get(curated).await.unwrap().unwrap();
+    assert!(deleted.human_curated && deleted.archived_at.is_some());
+    drop((hook, cli, mcp, foreign_hook));
+    daemon.stop().await;
+}
+
 // W3.1 write-time near-dup suppression: two hook captures with identical
 // content embed to the same vector under the DeterministicProvider, so storing
 // the second (a cosine-1.0 near-dup) absorbs the first via supersede — automatic
@@ -1941,7 +2100,7 @@ async fn hook_writes_collapse_near_duplicates_at_write_time() {
         .unwrap();
     let second = client
         .remember(
-            content,
+            content.clone(),
             None,
             MemoryType::Reference,
             4,
@@ -1963,15 +2122,39 @@ async fn hook_writes_collapse_near_duplicates_at_write_time() {
     );
     assert!(archived.archived_at.is_some());
 
-    // Only the newest capture remains live.
-    let live: Vec<_> = client
-        .list(None, 50)
+    let mut curator = Client::connect(&daemon.socket, ns).await.unwrap();
+    curator
+        .update(
+            second.clone(),
+            MemoryUpdates {
+                human_curated: Some(true),
+                ..Default::default()
+            },
+        )
         .await
-        .unwrap()
-        .into_iter()
-        .map(|m| m.id)
-        .collect();
-    assert_eq!(live, vec![second], "only the newest hook capture is live");
+        .unwrap();
+    let reported = client
+        .remember(
+            content,
+            None,
+            MemoryType::Reference,
+            4,
+            vec![],
+            vec!["hook".to_string()],
+            vec![],
+            Some(0.7),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        reported, second,
+        "hook receipts must name the curated survivor"
+    );
+    let survivor = client.get(reported).await.unwrap().unwrap();
+    assert!(survivor.human_curated && survivor.archived_at.is_none());
+    let live = client.list(None, 50).await.unwrap();
+    assert_eq!(live.len(), 1);
+    assert_eq!(live[0].id, second);
 
     daemon.stop().await;
 }

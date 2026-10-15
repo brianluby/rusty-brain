@@ -203,9 +203,8 @@ pub enum Command {
         #[arg(long = "jobs-config", env = "RB_JOBS_CONFIG")]
         jobs_config: Option<String>,
 
-        /// Accept a changed embedding model: adopt the configured model and
-        /// mark the whole corpus for re-embedding (run `rusty-brain reembed`
-        /// until changed=0). Without this, a model swap refuses to start.
+        /// Accept a changed embedding model/dimension pair and mark the corpus
+        /// for re-embedding. Skipped rows remain pending and must be retried.
         /// Env equivalent (for auto-start): `RB_ACCEPT_MODEL_CHANGE`.
         #[arg(long = "accept-model-change")]
         accept_model_change: bool,
@@ -349,6 +348,9 @@ pub enum Command {
         /// is the UUID of the memory being replaced.
         #[arg(long)]
         supersedes: Option<String>,
+        /// Mark this deliberately written memory as protected from unattended maintenance.
+        #[arg(long, conflicts_with = "batch")]
+        curated: bool,
         /// Anchor this memory to a file (repeatable): PATH, PATH:LINE, or
         /// PATH:START-END (1-based, inclusive). Recall can then filter with
         /// `recall --file PATH`.
@@ -366,9 +368,8 @@ pub enum Command {
         /// `--context` flags apply uniformly to every fact; blank lines are
         /// skipped. This avoids one process spawn + handshake per fact when
         /// planting large corpora (e.g. retrieval-at-scale evals). Incompatible
-        /// with a positional content argument and with `--supersedes` (both
-        /// conflicts declared here).
-        #[arg(long, conflicts_with_all = ["supersedes", "content"])]
+        /// with a positional content argument, `--supersedes`, and `--curated`.
+        #[arg(long, conflicts_with_all = ["supersedes", "content", "curated"])]
         batch: bool,
         /// Substantiating evidence (Vikunja #63): reference the CI run that
         /// measured this statement (URL, run id, or check name). The CLI is
@@ -511,10 +512,10 @@ pub enum Command {
         depth: u8,
     },
 
-    /// Show a memory's decision history: the supersede chain in both
-    /// directions (prior and newer versions) plus active contradicts/extends/
-    /// references links, with current/superseded/contested markers. Read-only
-    /// — issues zero writer ops.
+    /// Inspect a memory's full stored claim, context, provenance and typed source
+    /// anchors alongside its bounded supersede chain and active contradiction/
+    /// extension/reference links. Source pointers remain unverified. Read-only:
+    /// no access/confidence writes.
     History {
         /// Memory id (UUID).
         id: String,
@@ -546,6 +547,12 @@ pub enum Command {
         /// fully trust).
         #[arg(long, value_parser = parse_confidence)]
         confidence: Option<f32>,
+        /// Mark this memory as protected from unattended maintenance.
+        #[arg(long, conflicts_with = "uncurate")]
+        curated: bool,
+        /// Remove the human-curated protection from this memory.
+        #[arg(long, conflicts_with = "curated")]
+        uncurate: bool,
     },
 
     /// Link two memories (e.g. mark one as contradicting another). Both sides
@@ -617,9 +624,9 @@ pub enum Command {
         job: String,
     },
 
-    /// Re-embed active memories whose vector is built from a stale composition
-    /// (P5 Feature A). Bounded and idempotent: a second run over unchanged data
-    /// reports `changed=0`. Re-run until `changed=0` to converge a large corpus.
+    /// Re-embed active memories whose vector is stale for the configured
+    /// embedding space/composition. Bounded and idempotent; skipped rows
+    /// remain pending, so a pass with skips is not convergence.
     Reembed {
         /// Maximum memories to scan/re-embed in this pass (else the daemon
         /// batch default).
@@ -708,7 +715,7 @@ pub enum Command {
 
     /// Retroactively redact secrets from every stored memory (W2.4). Rewrites
     /// content/summary/context in place and marks affected rows for
-    /// re-embedding; follow with `rusty-brain reembed` until changed=0. Admin
+    /// re-embedding; rerun until no rows remain (skips stay pending). Admin
     /// op: only a client running as the daemon's own user may invoke it.
     Scrub,
 
@@ -1340,6 +1347,43 @@ mod tests {
     }
 
     #[test]
+    fn curation_flags_are_explicit_and_conflict_with_batch_or_each_other() {
+        let remember = Cli::parse_from(["rusty-brain", "remember", "a fact", "--curated"]);
+        assert!(matches!(
+            remember.command,
+            Command::Remember { curated: true, .. }
+        ));
+        assert!(Cli::try_parse_from(["rusty-brain", "remember", "--batch", "--curated"]).is_err());
+
+        let mark = Cli::parse_from(["rusty-brain", "update", "memory-id", "--curated"]);
+        assert!(matches!(
+            mark.command,
+            Command::Update {
+                curated: true,
+                uncurate: false,
+                ..
+            }
+        ));
+        let unmark = Cli::parse_from(["rusty-brain", "update", "memory-id", "--uncurate"]);
+        assert!(matches!(
+            unmark.command,
+            Command::Update {
+                curated: false,
+                uncurate: true,
+                ..
+            }
+        ));
+        assert!(Cli::try_parse_from([
+            "rusty-brain",
+            "update",
+            "memory-id",
+            "--curated",
+            "--uncurate",
+        ])
+        .is_err());
+    }
+
+    #[test]
     fn remember_parses_anchor_capture_flags() {
         let cli = Cli::parse_from([
             "rusty-brain",
@@ -1552,6 +1596,8 @@ mod tests {
                 tags,
                 context,
                 confidence,
+                curated,
+                uncurate,
             } => {
                 assert_eq!(id, "0c8e7f76-3a4f-4f7e-9d3a-111111111111");
                 assert_eq!(summary, None);
@@ -1559,6 +1605,8 @@ mod tests {
                 assert!(tags.is_empty());
                 assert_eq!(context, None);
                 assert_eq!(confidence, Some(0.3));
+                assert!(!curated);
+                assert!(!uncurate);
             }
             other => panic!("expected Update, got {other:?}"),
         }

@@ -11,7 +11,7 @@ mod store;
 
 pub use migrations::run_migrations;
 pub use store::{
-    read_meta_embedding_model, AccessBump, ConsolidationCandidate, LinkRow, NamespaceRenameOutcome,
-    OplogReplayPage, RecalRow, RetentionSweepEffects, ReviewQueueParams, ScrubOutcome, SqliteStore,
-    Store, WalCheckpointOutcome,
+    read_meta_embedding_model, AccessBump, ConsolidationCandidate, DuplicateSupersede, LinkRow,
+    NamespaceRenameOutcome, OplogReplayPage, RecalRow, RetentionSweepEffects, ReviewQueueParams,
+    ScrubOutcome, SqliteStore, Store, WalCheckpointOutcome,
 };

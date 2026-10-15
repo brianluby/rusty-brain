@@ -13,6 +13,7 @@ use rb_types::{Error, MemoryId, MemoryNote, MemoryUpdates, Namespace, Result};
 use tokio::sync::{broadcast, mpsc, oneshot, watch, Mutex, Semaphore};
 
 use crate::change::{ChangeKind, MemoryChanged};
+use crate::server::DatabaseGuard;
 
 const BROADCAST_CAPACITY: usize = 256;
 const WRITE_QUEUE_CAPACITY: usize = 256;
@@ -135,6 +136,13 @@ enum WriteCommand {
         embedding: Option<Vec<f32>>,
         reply: oneshot::Sender<Result<()>>,
     },
+    InsertSuperseding {
+        note: Box<MemoryNote>,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+        reply: oneshot::Sender<Result<()>>,
+    },
     Update {
         namespace: Namespace,
         id: MemoryId,
@@ -145,6 +153,11 @@ enum WriteCommand {
         namespace: Namespace,
         id: MemoryId,
         reply: oneshot::Sender<Result<()>>,
+    },
+    ArchiveUnattended {
+        namespace: Namespace,
+        id: MemoryId,
+        reply: oneshot::Sender<Result<bool>>,
     },
     AddLink {
         link: Box<rb_types::MemoryLink>,
@@ -183,7 +196,15 @@ enum WriteCommand {
         namespace: Namespace,
         id: MemoryId,
         importance: u8,
-        reply: oneshot::Sender<Result<()>>,
+        reply: oneshot::Sender<Result<bool>>,
+    },
+    /// Set confidence from an unattended review policy, preserving explicit
+    /// negative-feedback mutations and refusing concurrently curated rows.
+    SetConfidence {
+        namespace: Namespace,
+        id: MemoryId,
+        confidence: f32,
+        reply: oneshot::Sender<Result<bool>>,
     },
     DeleteLink {
         source: MemoryId,
@@ -196,7 +217,7 @@ enum WriteCommand {
         old: MemoryId,
         new: MemoryId,
         require_equivalence: bool,
-        reply: oneshot::Sender<Result<bool>>,
+        reply: oneshot::Sender<Result<Option<rb_store::DuplicateSupersede>>>,
     },
     /// Replace one memory's stored vector and stamp it to the current
     /// `(model, input_version)` (P5 Feature A re-embed write path). The engine
@@ -267,6 +288,7 @@ enum WriteCommand {
         note: Box<MemoryNote>,
         embedding: Option<Vec<f32>>,
         details: String,
+        allow_curated_supersede: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     /// Stamp `reviewed_at` + append the `review_resolve` oplog row (REV-4)
@@ -370,18 +392,33 @@ async fn drain_access_buffer(buf: &AccessBuffer) -> Vec<rb_store::AccessBump> {
 
 struct ReadPool {
     permits: Arc<Semaphore>,
-    stores: Arc<Mutex<Vec<SqliteStore>>>,
+    stores: Arc<ReadPoolStores>,
+}
+
+struct ReadPoolStores {
+    stores: Mutex<Vec<SqliteStore>>,
+    // Declared after the stores so they close before this lock releases.
+    _database_guard: Option<Arc<DatabaseGuard>>,
 }
 
 impl ReadPool {
-    fn open(db_path: &Path, dim: usize, model: Option<&str>, size: usize) -> Result<Self> {
+    fn open(
+        db_path: &Path,
+        dim: usize,
+        model: Option<&str>,
+        size: usize,
+        database_guard: Option<Arc<DatabaseGuard>>,
+    ) -> Result<Self> {
         let mut stores = Vec::with_capacity(size);
         for _ in 0..size {
             stores.push(open_store(db_path, dim, model)?);
         }
         Ok(Self {
             permits: Arc::new(Semaphore::new(size)),
-            stores: Arc::new(Mutex::new(stores)),
+            stores: Arc::new(ReadPoolStores {
+                stores: Mutex::new(stores),
+                _database_guard: database_guard,
+            }),
         })
     }
 }
@@ -395,30 +432,37 @@ fn open_store(db_path: &Path, dim: usize, model: Option<&str>) -> Result<SqliteS
     }
 }
 
-/// Explicit opt-in for an embedding-model swap (`--accept-model-change` /
-/// `RB_ACCEPT_MODEL_CHANGE`): atomically adopt `new_model` and stale every
-/// row's embedding stamp so the reembed machinery converges the corpus. Runs
-/// BEFORE the daemon's model-verified opens; a missing DB is a no-op (a fresh
-/// DB seeds the model at first open). Returns `true` when a swap occurred.
+/// Explicit opt-in for an embedding-model/dimension change. The database
+/// admission lock excludes every serving daemon while the derived index is cut
+/// over; missing databases remain a no-op.
 pub fn accept_model_change(db_path: &Path, embedding_dim: usize, new_model: &str) -> Result<bool> {
     if !db_path.exists() {
         return Ok(false);
     }
-    let store = SqliteStore::open(db_path, embedding_dim)?;
-    store.accept_model_change(new_model)
+    let admission = DatabaseGuard::acquire(db_path)?;
+    if !admission.database_existed() {
+        return Ok(false);
+    }
+    accept_model_change_while_admitted(db_path, embedding_dim, new_model)
 }
 
-/// RAII guard that holds a popped `SqliteStore` and pushes it back to the pool
-/// in `Drop`, ensuring the connection is returned even if the closure panics.
+pub(crate) fn accept_model_change_while_admitted(
+    db_path: &Path,
+    embedding_dim: usize,
+    new_model: &str,
+) -> Result<bool> {
+    SqliteStore::accept_embedding_space_change(db_path, embedding_dim, new_model)
+}
+
 struct PoolGuard {
     store: Option<SqliteStore>,
-    pool: Arc<Mutex<Vec<SqliteStore>>>,
+    pool: Arc<ReadPoolStores>,
 }
 
 impl Drop for PoolGuard {
     fn drop(&mut self) {
         if let Some(store) = self.store.take() {
-            self.pool.blocking_lock().push(store);
+            self.pool.stores.blocking_lock().push(store);
         }
     }
 }
@@ -427,11 +471,29 @@ impl StoreHandle {
     /// Start the writer thread and open the read pool without binding an
     /// embedding-model identity (test seam; no model invariant enforced).
     pub fn start(db_path: PathBuf, embedding_dim: usize, read_pool_size: usize) -> Result<Self> {
-        Self::start_inner(db_path, embedding_dim, None, read_pool_size)
+        Self::start_inner(db_path, embedding_dim, None, read_pool_size, None)
+    }
+
+    /// Start a model-bound store while retaining daemon admission through every
+    /// writer and pooled-read connection, even if the `Daemon` is dropped.
+    pub(crate) fn start_with_model_admission(
+        db_path: PathBuf,
+        embedding_dim: usize,
+        embedding_model: String,
+        read_pool_size: usize,
+        database_guard: Arc<DatabaseGuard>,
+    ) -> Result<Self> {
+        Self::start_inner(
+            db_path,
+            embedding_dim,
+            Some(embedding_model),
+            read_pool_size,
+            Some(database_guard),
+        )
     }
 
     /// Start the writer thread and open the read pool, enforcing the
-    /// embedding-model invariant on every connection (the daemon path).
+    /// embedding-model invariant on every connection.
     pub fn start_with_model(
         db_path: PathBuf,
         embedding_dim: usize,
@@ -443,6 +505,7 @@ impl StoreHandle {
             embedding_dim,
             Some(embedding_model),
             read_pool_size,
+            None,
         )
     }
 
@@ -451,6 +514,7 @@ impl StoreHandle {
         embedding_dim: usize,
         embedding_model: Option<String>,
         read_pool_size: usize,
+        database_guard: Option<Arc<DatabaseGuard>>,
     ) -> Result<Self> {
         let (events, _) = broadcast::channel(BROADCAST_CAPACITY);
         let (writer_tx, writer_rx) = mpsc::channel::<WriteCommand>(WRITE_QUEUE_CAPACITY);
@@ -470,6 +534,8 @@ impl StoreHandle {
         let writer_model = embedding_model.clone();
         let writer_ops = Arc::new(std::sync::atomic::AtomicU64::new(0));
         let writer_ops_counter = Arc::clone(&writer_ops);
+        // The worker may outlive a dropped/cancelled Daemon.
+        let writer_database_guard = database_guard.clone();
         let writer_join = std::thread::Builder::new()
             .name("rb-writer".to_string())
             .spawn(move || {
@@ -482,6 +548,7 @@ impl StoreHandle {
                     ready_tx,
                     death_tx,
                     writer_ops_counter,
+                    writer_database_guard,
                 );
             })
             .map_err(|e| Error::Io(format!("spawn writer thread: {e}")))?;
@@ -505,6 +572,7 @@ impl StoreHandle {
             embedding_dim,
             embedding_model.as_deref(),
             read_pool_size.max(1),
+            database_guard,
         ) {
             Ok(pool) => Arc::new(pool),
             Err(e) => {
@@ -891,10 +959,10 @@ impl StoreHandle {
             // because spawn_blocking tasks run to completion.
             let _permit = permit;
 
-            let store = stores
-                .blocking_lock()
-                .pop()
-                .ok_or_else(|| Error::Storage("read pool exhausted despite permit".to_string()))?;
+            let store =
+                stores.stores.blocking_lock().pop().ok_or_else(|| {
+                    Error::Storage("read pool exhausted despite permit".to_string())
+                })?;
 
             // RAII guard: returns `store` to the pool in Drop, even on panic.
             let guard = PoolGuard {
@@ -937,7 +1005,7 @@ impl StoreHandle {
     /// it in production code.
     #[doc(hidden)]
     pub async fn read_pool_len_for_test(&self) -> usize {
-        self.pool.stores.lock().await.len()
+        self.pool.stores.stores.lock().await.len()
     }
 
     /// Test-only helper: how many distinct memory ids currently have buffered
@@ -985,12 +1053,42 @@ impl StoreHandle {
         namespace: Namespace,
         id: MemoryId,
         importance: u8,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let (reply, rx) = oneshot::channel();
         let cmd = WriteCommand::SetRecalibratedImportance {
             namespace,
             id,
             importance,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Guarded confidence update used by unattended review policies.
+    /// Explicit feedback and user updates use their separate mutation paths.
+    pub async fn set_confidence(
+        &self,
+        namespace: Namespace,
+        id: MemoryId,
+        confidence: f32,
+    ) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::SetConfidence {
+            namespace,
+            id,
+            confidence,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    /// Archive an uncurated row from an unattended review policy.
+    /// The store rechecks namespace and curation in the archive transaction.
+    pub async fn archive_unattended(&self, namespace: Namespace, id: MemoryId) -> Result<bool> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::ArchiveUnattended {
+            namespace,
+            id,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -1061,13 +1159,13 @@ impl StoreHandle {
     }
 
     /// Collapse only proven duplicates, rechecked in the writer transaction.
-    /// A preserved non-equivalent pair returns `false` and emits no change event.
+    /// Preserved pairs return `None`; successful receipts name the actual survivor.
     pub async fn supersede_duplicate(
         &self,
         namespace: Namespace,
         old: MemoryId,
         new: MemoryId,
-    ) -> Result<bool> {
+    ) -> Result<Option<rb_store::DuplicateSupersede>> {
         let (reply, rx) = oneshot::channel();
         let cmd = WriteCommand::Supersede {
             namespace,
@@ -1228,6 +1326,7 @@ impl StoreHandle {
         note: MemoryNote,
         embedding: Option<Vec<f32>>,
         details: String,
+        allow_curated_supersede: bool,
     ) -> Result<()> {
         if self.shutting_down.load(Ordering::SeqCst) {
             return Err(Error::Storage("writer thread unavailable".to_string()));
@@ -1242,6 +1341,7 @@ impl StoreHandle {
                 note: Box::new(note),
                 embedding,
                 details,
+                allow_curated_supersede,
                 reply,
             })
             .await
@@ -1525,6 +1625,7 @@ fn writer_loop(
     ready_tx: std::sync::mpsc::Sender<Result<()>>,
     death_tx: watch::Sender<bool>,
     ops: Arc<std::sync::atomic::AtomicU64>,
+    _database_guard: Option<Arc<DatabaseGuard>>,
 ) {
     let mut death = WriterDeathGuard {
         tx: death_tx,
@@ -1590,6 +1691,69 @@ fn writer_loop(
                     break;
                 }
             }
+            WriteCommand::InsertSuperseding {
+                note,
+                embedding,
+                old,
+                allow_curated_supersede,
+                reply,
+            } => {
+                let namespace = note.namespace.clone();
+                let id = note.id.clone();
+                let mut seqs = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        seqs = Some(s.insert_superseding_memory(
+                            &note,
+                            embedding.as_deref(),
+                            &old,
+                            allow_curated_supersede,
+                        )?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    seqs.ok_or_else(|| {
+                        Error::Storage("supersede completed without oplog sequences".to_string())
+                    })
+                });
+                match result {
+                    Ok((created_seq, archived_seq)) => {
+                        publish_change(
+                            &events,
+                            MemoryChanged {
+                                id,
+                                namespace: namespace.clone(),
+                                kind: ChangeKind::Created,
+                                seq: Some(created_seq),
+                            },
+                        );
+                        if let Some(archived_seq) = archived_seq {
+                            publish_change(
+                                &events,
+                                MemoryChanged {
+                                    id: old,
+                                    namespace,
+                                    kind: ChangeKind::Archived,
+                                    seq: Some(archived_seq),
+                                },
+                            );
+                        }
+                        let _ = reply.send(Ok(()));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
             WriteCommand::Update {
                 namespace,
                 id,
@@ -1644,6 +1808,43 @@ fn writer_loop(
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
                 let _ = reply.send(report.result);
+                if changed {
+                    publish_change_stamped(
+                        &events,
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Archived,
+                    );
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::ArchiveUnattended {
+                namespace,
+                id,
+                reply,
+            } => {
+                let mut archived = None;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| {
+                        archived = Some(s.archive_unattended(&namespace, &id)?);
+                        Ok(())
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.and_then(|()| {
+                    archived.ok_or_else(|| {
+                        Error::Storage("guarded archive completed without outcome".to_string())
+                    })
+                });
+                let changed = result.as_ref().is_ok_and(|archived| *archived);
+                let _ = reply.send(result);
                 if changed {
                     publish_change_stamped(
                         &events,
@@ -1769,26 +1970,62 @@ fn writer_loop(
                 importance,
                 reply,
             } => {
+                let mut changed = false;
                 let report = run_store_op(
                     &mut store,
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    // Mirror the Update arm: verify the row lives in the
-                    // caller's namespace before mutating, fail closed
-                    // (NotFound) on a missing or cross-namespace id.
                     |s| match s.get_memory(&id) {
-                        Ok(Some(note)) if note.namespace == namespace => {
-                            s.set_recalibrated_importance(&id, importance)
-                        }
+                        Ok(Some(note)) if note.namespace == namespace => s
+                            .set_recalibrated_importance(&namespace, &id, importance)
+                            .map(|did_change| changed = did_change),
                         Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
                         Err(e) => Err(e),
                     },
                 );
-                let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
-                let _ = reply.send(report.result);
-                if changed {
+                let result = report.result.map(|()| changed);
+                let did_change = result.as_ref().is_ok_and(|changed| *changed);
+                let _ = reply.send(result);
+                if did_change {
+                    publish_change_stamped(
+                        &events,
+                        store.as_ref(),
+                        id,
+                        namespace,
+                        ChangeKind::Updated,
+                    );
+                }
+                if !writer_usable {
+                    break;
+                }
+            }
+            WriteCommand::SetConfidence {
+                namespace,
+                id,
+                confidence,
+                reply,
+            } => {
+                let mut changed = false;
+                let report = run_store_op(
+                    &mut store,
+                    &db_path,
+                    embedding_dim,
+                    embedding_model.as_deref(),
+                    |s| match s.get_memory(&id) {
+                        Ok(Some(note)) if note.namespace == namespace => s
+                            .set_confidence(&namespace, &id, confidence)
+                            .map(|did_change| changed = did_change),
+                        Ok(Some(_)) | Ok(None) => Err(Error::NotFound(id.clone())),
+                        Err(e) => Err(e),
+                    },
+                );
+                let writer_usable = report.writer_usable;
+                let result = report.result.map(|()| changed);
+                let did_change = result.as_ref().is_ok_and(|changed| *changed);
+                let _ = reply.send(result);
+                if did_change {
                     publish_change_stamped(
                         &events,
                         store.as_ref(),
@@ -1827,7 +2064,7 @@ fn writer_loop(
                 require_equivalence,
                 reply,
             } => {
-                let mut changed = false;
+                let mut applied = None;
                 let report = run_store_op(
                     &mut store,
                     &db_path,
@@ -1835,11 +2072,8 @@ fn writer_loop(
                     embedding_model.as_deref(),
                     |s| {
                         if require_equivalence {
-                            return s.supersede_duplicate(&namespace, &old, &new).map(
-                                |did_change| {
-                                    changed = did_change;
-                                },
-                            );
+                            applied = s.supersede_duplicate(&namespace, &old, &new)?;
+                            return Ok(());
                         }
                         // Mirror the Update/Archive arms: verify BOTH memories live in
                         // the caller's namespace before mutating, so the primitive can
@@ -1865,23 +2099,32 @@ fn writer_loop(
                         if !new_in_ns {
                             return Err(Error::NotFound(new.clone()));
                         }
-                        s.supersede(&old, &new).map(|()| changed = true)
+                        s.supersede(&old, &new)?;
+                        let seq = s.latest_oplog_seq_for(&old)?.ok_or_else(|| {
+                            Error::Storage("supersede oplog row is missing".into())
+                        })?;
+                        applied = Some(rb_store::DuplicateSupersede {
+                            archived: old.clone(),
+                            survivor: new.clone(),
+                            seq,
+                        });
+                        Ok(())
                     },
                 );
-                let changed = report.result.is_ok() && changed;
                 let writer_usable = report.writer_usable;
-                let _ = reply.send(report.result.map(|()| changed));
-                // supersede archives `old`; mirror the Archive arm so subscribers
-                // observe the consolidation as an Archived event for `old`.
-                if changed {
-                    publish_change_stamped(
+                let result = report.result.map(|()| applied);
+                if let Ok(Some(receipt)) = &result {
+                    publish_change(
                         &events,
-                        store.as_ref(),
-                        old,
-                        namespace,
-                        ChangeKind::Archived,
+                        MemoryChanged {
+                            id: receipt.archived.clone(),
+                            namespace,
+                            kind: ChangeKind::Archived,
+                            seq: Some(receipt.seq),
+                        },
                     );
                 }
+                let _ = reply.send(result);
                 if !writer_usable {
                     break;
                 }
@@ -2074,6 +2317,7 @@ fn writer_loop(
                 note,
                 embedding,
                 details,
+                allow_curated_supersede,
                 reply,
             } => {
                 let report = run_store_op(
@@ -2090,6 +2334,7 @@ fn writer_loop(
                             &note,
                             embedding.as_deref(),
                             &details,
+                            allow_curated_supersede,
                             chrono::Utc::now(),
                         )
                     },
@@ -2227,6 +2472,24 @@ impl MemoryBackend for StoreHandle {
         let cmd = WriteCommand::Insert {
             note: Box::new(note),
             embedding,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn write_superseding(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::InsertSuperseding {
+            note: Box::new(note),
+            embedding,
+            old,
+            allow_curated_supersede,
             reply,
         };
         self.send_write(cmd, rx).await
@@ -3024,10 +3287,11 @@ mod tests {
         for memory in [a, b, duplicate, foreign] {
             handle.write(memory, Some(vec![1.0; DIM])).await.unwrap();
         }
-        assert!(!handle
+        assert!(handle
             .supersede_duplicate(ns.clone(), a_id.clone(), b_id.clone())
             .await
-            .unwrap());
+            .unwrap()
+            .is_none());
         assert!(matches!(
             handle.supersede_duplicate(ns.clone(), a_id.clone(), foreign_id.clone()).await,
             Err(Error::NotFound(id)) if id == foreign_id
@@ -3035,7 +3299,8 @@ mod tests {
         assert!(handle
             .supersede_duplicate(ns.clone(), a_id.clone(), duplicate_id.clone())
             .await
-            .unwrap());
+            .unwrap()
+            .is_some());
         assert!(handle
             .get(ns.clone(), b_id.clone())
             .await
@@ -3061,6 +3326,164 @@ mod tests {
         assert_eq!(archives.len(), 1, "only a genuine collapse emits Archived");
         assert_eq!(archives[0].id, a_id);
         assert_eq!(archives[0].namespace, ns);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn raced_curation_publishes_the_actual_archived_duplicate() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("curated-events.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("curated-events".into());
+        let a = note(&ns, "Production uses PostgreSQL; SQLite is only for tests.");
+        let b = note(&ns, "Production uses PostgreSQL; SQLite is only for tests.");
+        let (a_id, b_id) = (a.id.clone(), b.id.clone());
+        let mut events = handle.subscribe();
+        for memory in [a, b] {
+            handle.write(memory, Some(vec![1.0; DIM])).await.unwrap();
+        }
+        // The maintenance plan chose B before the user protected A.
+        handle
+            .update(
+                ns.clone(),
+                a_id.clone(),
+                rb_types::MemoryUpdates {
+                    human_curated: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let receipt = handle
+            .supersede_duplicate(ns.clone(), a_id.clone(), b_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(receipt.archived, b_id);
+        assert_eq!(receipt.survivor, a_id);
+        let protected = handle.get(ns.clone(), a_id.clone()).await.unwrap().unwrap();
+        let archived = handle.get(ns.clone(), b_id.clone()).await.unwrap().unwrap();
+        assert!(protected.human_curated && protected.archived_at.is_none());
+        assert_eq!(archived.superseded_by, Some(a_id));
+        let expected_seq = handle
+            .with_read({
+                let b_id = b_id.clone();
+                move |store| store.latest_oplog_seq_for(&b_id)
+            })
+            .await
+            .unwrap();
+        assert_eq!(Some(receipt.seq), expected_seq);
+        handle.shutdown().await;
+        let archived_events: Vec<_> = std::iter::from_fn(|| events.try_recv().ok())
+            .filter(|event| event.kind == rb_types::ChangeKind::Archived)
+            .collect();
+        assert_eq!(archived_events.len(), 1);
+        assert_eq!(archived_events[0].id, b_id);
+        assert_eq!(archived_events[0].seq, expected_seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn stale_remember_retains_new_memory_without_rewriting_lineage_or_archive_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("stale-remember.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("stale-remember".into());
+        let old = note(&ns, "original session summary");
+        let first = note(&ns, "first replacement session summary");
+        let second = note(&ns, "new summary written against a stale view");
+        let old_id = old.id.clone();
+        let second_id = second.id.clone();
+        handle.write(old, Some(vec![1.0; DIM])).await.unwrap();
+        handle
+            .write_superseding(first, Some(vec![1.0; DIM]), old_id.clone(), false)
+            .await
+            .unwrap();
+        let established = handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let mut events = handle.subscribe();
+        handle
+            .write_superseding(second, Some(vec![1.0; DIM]), old_id.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(
+            handle.get(ns.clone(), old_id).await.unwrap().unwrap(),
+            established
+        );
+        let retained = handle.get(ns, second_id.clone()).await.unwrap().unwrap();
+        assert!(retained.archived_at.is_none() && retained.superseded_by.is_none());
+        let expected_seq = handle
+            .with_read({
+                let second_id = second_id.clone();
+                move |store| store.latest_oplog_seq_for(&second_id)
+            })
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        let changes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, second_id);
+        assert_eq!(changes[0].kind, rb_types::ChangeKind::Created);
+        assert_eq!(changes[0].seq, expected_seq);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn purged_remember_target_retains_new_memory_and_publishes_only_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("purged-remember.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("purged-remember".into());
+        let mut old = note(&ns, "previous session summary");
+        old.created_at = chrono::Utc::now() - chrono::Duration::days(60);
+        old.updated_at = old.created_at;
+        let old_id = old.id.clone();
+        handle.write(old, Some(vec![1.0; DIM])).await.unwrap();
+        let outcome = handle
+            .retention_sweep(
+                ns.clone(),
+                rb_types::RetentionPolicy {
+                    enabled: true,
+                    max_age_days: Some(30),
+                    ..Default::default()
+                },
+                rb_types::ForgetMode::Hard,
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.purged, 1);
+        assert!(outcome.failure.is_none());
+        assert!(handle
+            .get(ns.clone(), old_id.clone())
+            .await
+            .unwrap()
+            .is_none());
+
+        let mut events = handle.subscribe();
+        let replacement = note(&ns, "resumed session summary after hard forget");
+        let replacement_id = replacement.id.clone();
+        handle
+            .write_superseding(replacement, Some(vec![1.0; DIM]), old_id.clone(), false)
+            .await
+            .unwrap();
+        let retained = handle
+            .get(ns.clone(), replacement_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(retained.archived_at.is_none() && retained.superseded_by.is_none());
+        assert!(handle.get(ns.clone(), old_id).await.unwrap().is_none());
+        let expected_seq = handle
+            .with_read({
+                let replacement_id = replacement_id.clone();
+                move |store| store.latest_oplog_seq_for(&replacement_id)
+            })
+            .await
+            .unwrap();
+        handle.shutdown().await;
+        let changes: Vec<_> = std::iter::from_fn(|| events.try_recv().ok()).collect();
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].id, replacement_id);
+        assert_eq!(changes[0].namespace, ns);
+        assert_eq!(changes[0].kind, rb_types::ChangeKind::Created);
+        assert_eq!(changes[0].seq, expected_seq);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -3283,7 +3706,8 @@ mod tests {
         let handle = StoreHandle::start(db, DIM, 2).unwrap();
         let ns = Namespace::Project("scan".to_string());
 
-        let keep = note(&ns, "active");
+        let mut keep = note(&ns, "active");
+        keep.human_curated = true;
         let archived = note(&ns, "archived");
         let new = note(&ns, "survivor");
         let (keep_id, archived_id, new_id) = (keep.id.clone(), archived.id.clone(), new.id.clone());
@@ -3305,6 +3729,14 @@ mod tests {
         let ids: Vec<rb_types::MemoryId> = cands.iter().map(|c| c.id.clone()).collect();
         assert!(ids.contains(&keep_id), "active memory present");
         assert!(ids.contains(&new_id), "survivor present");
+        assert!(
+            cands
+                .iter()
+                .find(|c| c.id == keep_id)
+                .unwrap()
+                .human_curated,
+            "curation must be available to survivor planning"
+        );
         assert!(
             !ids.contains(&archived_id),
             "archived/superseded memory must be excluded"
@@ -4031,5 +4463,122 @@ mod tests {
             .unwrap();
 
         handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn writer_keeps_database_admission_after_read_pool_drop() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let admission = Arc::new(DatabaseGuard::acquire(&db).unwrap());
+        let handle = StoreHandle::start_with_model_admission(
+            db.clone(),
+            DIM,
+            "old-model".to_string(),
+            1,
+            Arc::clone(&admission),
+        )
+        .unwrap();
+        drop(admission);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        handle
+            .writer_tx
+            .send(WriteCommand::BlockForTest {
+                entered: entered_tx,
+                release: release_rx,
+            })
+            .await
+            .unwrap();
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let writer_join = Arc::clone(&handle.writer_join);
+        drop(handle);
+        let err = crate::accept_model_change(&db, 4, "new-model").unwrap_err();
+        assert!(
+            err.to_string().contains("already admitted"),
+            "the live writer must retain admission after its read pool drops: {err}"
+        );
+
+        release_tx.send(()).unwrap();
+        let writer_join = writer_join.lock().await.take().unwrap();
+        tokio::task::spawn_blocking(move || writer_join.join())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(crate::accept_model_change(&db, 4, "new-model").unwrap());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn cancelled_read_task_keeps_database_admission_until_connection_closes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("rb.db");
+        let admission = Arc::new(DatabaseGuard::acquire(&db).unwrap());
+        let handle = StoreHandle::start_with_model_admission(
+            db.clone(),
+            DIM,
+            "old-model".to_string(),
+            1,
+            Arc::clone(&admission),
+        )
+        .unwrap();
+        drop(admission);
+
+        let (entered_tx, entered_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let (finished_tx, finished_rx) = std::sync::mpsc::channel();
+        let read_handle = handle.clone();
+        let read = tokio::spawn(async move {
+            read_handle
+                .with_read(move |_| {
+                    entered_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    finished_tx.send(()).unwrap();
+                    Ok(())
+                })
+                .await
+        });
+        tokio::task::spawn_blocking(move || entered_rx.recv().unwrap())
+            .await
+            .unwrap();
+
+        let writer_join = Arc::clone(&handle.writer_join);
+        drop(handle);
+        read.abort();
+        let _ = read.await;
+        let writer_join = writer_join.lock().await.take().unwrap();
+        tokio::task::spawn_blocking(move || writer_join.join())
+            .await
+            .unwrap()
+            .unwrap();
+        let err = crate::accept_model_change(&db, 4, "new-model").unwrap_err();
+        assert!(
+            err.to_string().contains("already admitted"),
+            "the cancelled spawn_blocking read must retain admission: {err}"
+        );
+
+        release_tx.send(()).unwrap();
+        tokio::task::spawn_blocking(move || finished_rx.recv().unwrap())
+            .await
+            .unwrap();
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match crate::accept_model_change(&db, 4, "new-model") {
+                    Ok(changed) => break Ok(changed),
+                    Err(err) if err.to_string().contains("already admitted") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(&accepted, Ok(true)),
+            "acceptance failed after the read closed: {accepted:?}"
+        );
     }
 }

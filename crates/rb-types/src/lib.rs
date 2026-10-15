@@ -37,7 +37,7 @@ pub use change::{ChangeKind, MemoryChanged};
 pub use embedding::EmbeddingInputFingerprint;
 pub use error::{Error, Result};
 pub use feedback_kind::FeedbackKind;
-pub use history::{HistoryEdge, HistoryEntry, MemoryHistory};
+pub use history::{HistoryEdge, HistoryEntry, HistoryEvidence, HistorySourceStatus, MemoryHistory};
 pub use job::JobKind;
 pub use link::{MemoryLink, SIMILARITY_LINK_MAX_COSINE_DISTANCE};
 pub use link_type::LinkType;

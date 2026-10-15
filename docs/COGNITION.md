@@ -115,7 +115,10 @@ between strata (there are no strata, §1). What is enforced:
   Reference links labeled `similar` are candidate hints, not fact equivalence.
   The store rechecks equivalence, namespace and liveness in the supersede transaction
   (`crates/rb-store/src/store/core.rs`; eager caller in `rb-daemon/src/server.rs`).
-  Paraphrases and uncertain pairs remain active; explicit correction/review is unchanged.
+  Paraphrases and uncertain pairs remain active. One curated equivalent wins;
+  two curated equivalents remain separate. The mutation returns the actual
+  archived/surviving IDs, so a raced curation change redirects later cluster work
+  and publishes the correct archive event.
 - **Shared lifecycle fold** — PreCompact, SessionCheckpoint and SessionEnd fold
   activity into one superseding summary plus independently recallable confirmed
   user decisions/preferences/constraints. Source identities survive repeated folds;
@@ -128,6 +131,15 @@ between strata (there are no strata, §1). What is enforced:
   near-duplicate pairs; both originals are superseded behind a pointer guard in
   one transaction (`crates/rb-daemon/src/store_handle.rs`;
   PRD [contradiction/dedup review](prds/2026-07-02-contradiction-dedup-review.md), PR #63).
+- **Human-curation protection** — `remember --curated` and
+  `update --curated` / `--uncurate` (or MCP `update.human_curated`) persist a
+  default-false maintenance marker. Automatic collapse, hook correction retirement,
+  policy review, retention, importance recalibration and unattended confidence
+  decay recheck protection in their mutation transaction. Explicit delete,
+  supersede and review resolution
+  remain available; feedback, secret scrubbing and derived re-embedding still work.
+  Protection is not authorization, trust, a rank boost or an eligibility bypass.
+  JSON restore carries it onto new rows without overwriting existing duplicates.
 - **Usefulness signal** — the `memory_feedback` MCP tool and `rusty-brain feedback`
   CLI record helpful/wrong/stale per memory
   (`crates/rb-store/migrations/008_memory_feedback.sql`, W3.7) and nudge `confidence`
@@ -274,6 +286,9 @@ the opt-in declared retention policy:
   `retention_sweep` share it, so preview and mutation cannot drift), with absolute
   eligibility guards (`crates/rb-store/src/store/retention.rs`; PRD
   [user-facing retention policy](prds/2026-07-02-user-facing-retention-policy.md), PR #60).
+- Human-curated rows are excluded from automatic archive/purge planning, with a
+  final transactional protection check before mutation. Explicit user removal
+  remains available; no TTL or retention configuration is needed for curation.
 - `rusty-brain forget` is guarded: soft archive by default, confirmation gates,
   and hard purge (`--hard`) is a **peer-gated admin op** (§6.2) that permanently
   destroys rows (`Command::Forget`, `crates/rusty-brain/src/cli.rs`;
@@ -342,10 +357,19 @@ zero writer ops):
   oplog audit row per resolution (REV-4)
   (`crates/rb-store/src/store/review.rs`;
   PRD [contradiction/dedup review](prds/2026-07-02-contradiction-dedup-review.md), PR #63).
-- **Decision history** — `rusty-brain history` renders the supersede chain in both
-  directions plus active links with current/superseded/contested markers, so a
-  memory's evolution is auditable (`crates/rb-types/src/history.rs`;
-  PRD [decision history timeline](prds/2026-07-02-decision-history-timeline.md), PR #61).
+- **Decision history** — CLI `history` and MCP `history` share one bounded payload:
+  supersede predecessors/successors, safe contradiction/extension/reference links,
+  applied limits and cycle/truncation markers, plus the target's full stored claim,
+  context, producer/session/trust metadata, curation state and typed source anchors.
+  One SQLite read snapshot keeps evidence and timeline consistent across concurrent
+  supersession. Inspection never writes access/confidence counters. Source pointers
+  are `recorded_unverified` (or unavailable), not fetched content or freshness proof
+  (`crates/rb-types/src/history.rs`; `crates/rb-store/src/store/history.rs`).
+  Human output escapes terminal controls; JSON preserves stored evidence. The
+  encoded response must fit the 1 MiB wire limit: optional edges, then non-target
+  chain rows are omitted with `truncated=true` when needed. Target evidence is
+  never clipped; oversized target detail returns an actionable size error rather
+  than closing the connection.
 - **Contract health** — declared here as part of Health by judgment call: the
   wire surface and on-disk migrations are digested and compared against a
   checked-in snapshot on every CI run; ANY drift fails until the author records a

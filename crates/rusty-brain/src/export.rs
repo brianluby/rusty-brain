@@ -336,6 +336,7 @@ pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
             // Anchors survive export/restore (ANC-4): carried verbatim into
             // the re-remember.
             anchors: m.anchors,
+            human_curated: m.human_curated,
         });
     }
     Ok(items)
@@ -398,6 +399,7 @@ mod tests {
             origin_channel: None,
             trust_class: rb_types::TrustClass::AgentAttested,
             anchors: Vec::new(),
+            human_curated: false,
         }
     }
 
@@ -418,7 +420,7 @@ mod tests {
 
     #[test]
     fn json_export_round_trips_through_parse_restore() {
-        let notes = vec![
+        let mut notes = vec![
             sample_note("Decision A", "Content A", MemoryType::Insight, 5),
             sample_note(
                 "Decision B",
@@ -427,11 +429,22 @@ mod tests {
                 9,
             ),
         ];
+        notes[1].human_curated = true;
         let json = format_json(&notes, "project:test").unwrap();
         let items = parse_restore(&json).unwrap();
         assert_eq!(items.len(), 2);
         assert_eq!(items[0].summary, "Decision A");
         assert_eq!(items[1].memory_type, MemoryType::ArchitectureDecision);
+        assert!(!items[0].human_curated);
+        assert!(items[1].human_curated);
+
+        let mut legacy: serde_json::Value = serde_json::from_str(&json).unwrap();
+        legacy["memories"][1]
+            .as_object_mut()
+            .unwrap()
+            .remove("human_curated");
+        let restored = parse_restore(&serde_json::to_string(&legacy).unwrap()).unwrap();
+        assert!(!restored[1].human_curated);
     }
 
     #[test]

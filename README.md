@@ -197,9 +197,9 @@ so you can go straight to storing and recalling:
 # CHANGELOG.md, docs/**/*.md, and recent decision-ish git commits)
 rusty-brain init --yes
 
-# store a memory (namespace is detected from the current project / git root)
+# store a deliberate decision and protect it from unattended maintenance
 rusty-brain remember "We use a single-writer daemon over SQLite WAL" \
-  --type architecture_decision --importance 8 --tags storage --tags concurrency
+  --type architecture_decision --importance 8 --tags storage --tags concurrency --curated
 
 # back a claim with verifiable evidence — the daemon derives the trust class
 # from the evidence kind + channel (a CI claim additionally needs --commit)
@@ -219,11 +219,13 @@ rusty-brain context
 # adjust a memory you no longer fully trust, or mark two memories as
 # contradicting (both then surface `contested: true` on reads)
 rusty-brain update <id> --confidence 0.3
+rusty-brain update <id> --curated    # enable unattended-maintenance protection
+rusty-brain update <id> --uncurate   # explicitly remove that protection
 rusty-brain link <from-id> <to-id> --type contradicts --reason "policy reversed"
 
-# audit how a decision evolved: the supersede chain in both directions plus
-# active contradicts/extends/references links, with current/superseded/
-# contested markers (read-only, zero writer ops)
+# inspect a decision's full stored claim, context, provenance and typed source
+# anchors alongside its bounded supersede chain and contradiction links
+# (read-only: no access/confidence writes; source references remain unverified)
 rusty-brain history <id>
 rusty-brain history <id> --depth 3 --json
 
@@ -254,6 +256,26 @@ echo "$JSON" | rusty-brain restore -
 rusty-brain recall "sqlite" --json
 ```
 
+`human_curated` defaults to false. It protects authored state from automatic
+duplicate collapse, policy review, importance/confidence maintenance and retention.
+Explicit deletion, review resolution and `remember --supersedes <id>` still work;
+negative feedback and secret redaction still apply. JSON export/restore preserves
+the marker for new rows; restoring duplicate content never overwrites an existing
+row's curation choice. Protection is not authorization, verified truth or a recall
+eligibility/ranking boost. Upgrade and restart the daemon to enforce it.
+
+Initial CLI/MCP daemon connection attempts share one socket/handshake deadline:
+five seconds normally, or 120 seconds when resolved configuration requests a local
+backend/model. All attempts and backoff within one MCP reconnect share that budget;
+client-side capability rejection leaves healthy connections intact. Slow first-time
+model downloads can exceed the startup bound; run `serve` explicitly to prewarm
+them. Startup failures report the observed phase, child status when available,
+a redacted stderr tail and the attempt's log path.
+Failed-attempt logs live under the cache directory's `rusty-brain/logs` (`0700`,
+files `0600`), retain at most 64 KiB per attempt, and prune completed logs toward
+an eight-file retention target without removing active attempts. The surfaced
+excerpt is capped at 8 KiB; the private raw files can contain secrets.
+
 You can also run the daemon explicitly in the foreground:
 
 ```bash
@@ -276,13 +298,28 @@ good real-world recall. For meaningful semantic recall, configure a real provide
 The embedding dimension AND model identity are fixed at first daemon init and checked
 fail-closed on every startup (vector reads are length-checked too); switching
 providers — or models, even at the same dimension — against an existing database
-refuses to run rather than silently mix vector spaces. To accept a deliberate model
-swap, restart with `rusty-brain serve --accept-model-change` (or set
-`RB_ACCEPT_MODEL_CHANGE=1` for auto-started daemons) and re-embed the corpus with
-`rusty-brain reembed`. For a legacy database whose global model marker is missing,
-startup adopts the configured model only when the corpus is empty or every stored row
-already names that model. A conflicting or mixed-model corpus refuses to start until
-the operator uses the same explicit accept-and-re-embed recovery path.
+refuses to run rather than silently mix vector spaces. For a deliberate model or
+dimension swap, stop all daemons and unmanaged SQLite clients sharing the database
+and take a database backup. Restart with `rusty-brain serve --accept-model-change`
+(or use `RB_ACCEPT_MODEL_CHANGE=1` for auto-start), then unset the environment
+opt-in. Acceptance atomically replaces only the derived vector index and model/
+dimension markers, preserving memory IDs, authored state, anchors, links and history.
+Run `rusty-brain reembed` repeatedly until **scanned=0**; skipped rows remain pending
+and need their underlying error fixed before retrying. Recall can be incomplete
+until all active rows have vectors in the new space; archived rows are not revived.
+Repeating acceptance for the same model/dimension preserves re-embedding progress.
+
+Serving and explicit migration hold a cooperative database-inode admission lock
+across writer/read-pool lifetimes, including through hardlink/symlink aliases.
+It uses private sidecars in `<OS-account-home>/.rusty-brain-db-admission`, not a lock
+on SQLite's own file. The home comes from the effective OS account, not `HOME`,
+XDG or temporary-directory overrides; an unavailable or unsafe home fails closed.
+Never remove admission files while a daemon is running. Stop every pre-upgrade
+daemon before switching from the old `/tmp` lock location. Older binaries and raw
+SQLite clients do not participate: the offline stop requirement still applies.
+A legacy database with no global model marker
+adopts the configured model only when its corpus is empty or all rows name it;
+conflicting or mixed-model corpora require the explicit recovery path above.
 
 ### Wire the MCP server into an agent
 
@@ -302,8 +339,8 @@ token-economy subset the model pays for every turn: `remember`, `recall`,
 `get`, `context`, `update`, and `memory_feedback` (report whether a recalled
 memory was `helpful`/`wrong`/`stale`, nudging its trust prior). The remaining
 six — `list`, `graph`, `link` (e.g. mark one memory as contradicting another),
-`delete`, `history` (a memory's decision-history timeline: supersede chain +
-active contradiction links), and `poll_changes` (drains buffered change
+`delete`, `history` (bounded decision timeline plus the target's full stored
+source/evidence detail, identical to CLI JSON), and `poll_changes` (drains buffered change
 notifications) — are advertised only when `RB_MCP_FULL_TOOLSET` is set, though
 every tool stays routable when called directly.
 
@@ -472,7 +509,7 @@ unpinned overrides are never silently honored.
 | `VOYAGE_API_KEY` | — (secret, env-only) | Selects the Voyage embedding provider when set. |
 | `RB_EMBED_BACKEND` | `embed.backend` | `local` forces the local ONNX provider (requires `--features local`). |
 | `RB_LOCAL_MODEL` | `embed.local_model` | Local model name (implies local backend); defaults to `all-MiniLM-L6-v2`. |
-| `RB_ACCEPT_MODEL_CHANGE` | — (deliberately env/flag-only) | Opt in to an embedding-model swap on an existing DB (flag equivalent: `serve --accept-model-change`); follow with `rusty-brain reembed`. |
+| `RB_ACCEPT_MODEL_CHANGE` | — (deliberately env/flag-only) | Explicit model/dimension cutover after stopping all shared-DB clients (`serve --accept-model-change`); unset afterward and run `reembed` until scanned=0. |
 | `RB_ENRICH_BASE_URL`, `RB_ENRICH_MODEL` | `enrich.base_url`, `enrich.model` | Optional LLM enrichment endpoint (off by default; heuristic enrichment is used otherwise). |
 | `RB_ENRICH_API_KEY` | — (secret, env-only) | API key for the enrichment endpoint (optional, e.g. Ollama needs none). |
 | `RB_JOBS_CONFIG` | `jobs_config` | Path to an evolution-jobs TOML config for `serve` (jobs are disabled if absent). |

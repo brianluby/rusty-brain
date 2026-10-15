@@ -272,6 +272,8 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 // class — the write lands at the channel's context default
                 // (`agent_attested`) like every plain tool write.
                 evidence: None,
+                human_curated: None,
+                allow_curated_supersede: None,
             })
         }
         "recall" => Ok(Request::Recall {
@@ -322,6 +324,7 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
                 tags,
                 context: opt_string(args, "context")?,
                 confidence: opt_confidence(args, "confidence")?,
+                human_curated: opt_bool(args, "human_curated")?,
             };
             Ok(Request::Update { id, updates })
         }
@@ -1142,45 +1145,145 @@ mod tests {
     }
 
     #[test]
-    fn history_response_projects_structured_json() {
+    fn history_response_projects_same_evidence_to_text_and_structured_json() {
         use rb_proto::Response;
+        let prior_id = MemoryId::new();
         let id = MemoryId::new();
+        let rival_id = MemoryId::new();
+        let rival_id_string = rival_id.to_string();
+        let now = Utc::now();
         let content = response_to_content(
             Response::History {
                 history: rb_types::MemoryHistory {
                     namespace: "project:p".to_string(),
                     depth: 100,
-                    chain: vec![rb_types::HistoryEntry {
-                        id: id.clone(),
-                        summary: "we use kafka".to_string(),
-                        importance: 7,
-                        confidence: 0.9,
-                        created_at: Utc::now(),
-                        archived: false,
-                        contested: true,
-                        current: true,
-                        is_target: true,
-                        superseded_by: None,
-                        origin_user: None,
-                        origin_host: None,
-                        origin_agent: None,
-                        origin_source: None,
+                    chain_limit: 200,
+                    edge_limit: 200,
+                    chain: vec![
+                        rb_types::HistoryEntry {
+                            id: prior_id.clone(),
+                            summary: "prior production claim".to_string(),
+                            importance: 7,
+                            confidence: 0.9,
+                            created_at: now - chrono::Duration::days(1),
+                            archived: true,
+                            contested: false,
+                            current: false,
+                            is_target: false,
+                            superseded_by: Some(id.clone()),
+                            predecessors: Vec::new(),
+                            evidence: None,
+                            origin_user: None,
+                            origin_host: None,
+                            origin_agent: None,
+                            origin_source: None,
+                        },
+                        rb_types::HistoryEntry {
+                            id: id.clone(),
+                            summary: "current production claim".to_string(),
+                            importance: 8,
+                            confidence: 0.95,
+                            created_at: now,
+                            archived: false,
+                            contested: true,
+                            current: true,
+                            is_target: true,
+                            superseded_by: None,
+                            predecessors: vec![prior_id.clone()],
+                            evidence: Some(rb_types::HistoryEvidence {
+                                content: "Production uses PostgreSQL; never use SQLite there."
+                                    .to_string(),
+                                context: "This does not apply to test fixtures.".to_string(),
+                                keywords: vec!["postgresql".to_string()],
+                                tags: vec!["decision".to_string()],
+                                memory_type: Some(rb_types::MemoryType::ArchitectureDecision),
+                                updated_at: Some(now),
+                                last_accessed_at: None,
+                                related_files: vec!["src/storage.rs".to_string()],
+                                origin_channel: Some(rb_types::WriteChannel::Cli),
+                                session_id: Some("session-history".to_string()),
+                                anchors: vec![rb_types::MemoryAnchor {
+                                    kind: rb_types::AnchorKind::File,
+                                    value: "src/storage.rs".to_string(),
+                                    start_line: Some(12),
+                                    end_line: Some(14),
+                                }],
+                                trust_class: rb_types::TrustClass::HumanConfirmed,
+                                human_curated: true,
+                                source_status: rb_types::HistorySourceStatus::RecordedUnverified,
+                            }),
+                            origin_user: Some("alice".to_string()),
+                            origin_host: Some("devbox".to_string()),
+                            origin_agent: Some("codex".to_string()),
+                            origin_source: Some("cli".to_string()),
+                        },
+                    ],
+                    edges: vec![rb_types::HistoryEdge {
+                        link_type: rb_types::LinkType::Contradicts,
+                        local: id.clone(),
+                        other: rival_id,
+                        outbound: true,
+                        reason: "competing claim".to_string(),
+                        other_summary: "Production uses SQLite".to_string(),
+                        other_confidence: 0.8,
+                        other_contested: true,
+                        created_at: now,
                     }],
-                    edges: Vec::new(),
+                    cycle_detected: false,
                     truncated: false,
                 },
             },
-            Utc::now(),
+            now,
         );
         assert!(!content.is_error);
         assert_eq!(
-            content.structured["history"]["chain"][0]["id"],
+            content.structured["history"]["chain"][1]["id"],
             id.to_string()
         );
-        assert_eq!(content.structured["history"]["chain"][0]["current"], true);
-        // Like `get`, the model text is the JSON itself (deliberate fetch).
+        assert_eq!(
+            content.structured["history"]["chain"][0]["superseded_by"],
+            id.to_string()
+        );
+        assert_eq!(
+            content.structured["history"]["chain"][1]["predecessors"][0],
+            prior_id.to_string()
+        );
+        assert_eq!(
+            content.structured["history"]["chain"][1]["evidence"]["content"],
+            "Production uses PostgreSQL; never use SQLite there."
+        );
+        assert_eq!(
+            content.structured["history"]["chain"][1]["evidence"]["anchors"][0]["value"],
+            "src/storage.rs"
+        );
+        assert_eq!(
+            content.structured["history"]["chain"][1]["evidence"]["source_status"],
+            "recorded_unverified"
+        );
+        assert_eq!(
+            content.structured["history"]["chain"][1]["evidence"]["human_curated"],
+            true
+        );
+        // Like `get`, the deliberate fetch is full JSON; both views expose
+        // exactly the same history evidence and followable IDs.
         let text: serde_json::Value = serde_json::from_str(&content.text).unwrap();
         assert_eq!(text["history"]["depth"], 100);
+        assert_eq!(
+            text["history"]["chain"],
+            content.structured["history"]["chain"]
+        );
+        assert_eq!(
+            content.structured["history"]["edges"][0]["other"].as_str(),
+            Some(rival_id_string.as_str())
+        );
+        assert_eq!(
+            content.structured["history"]["edges"][0]["other_summary"],
+            "Production uses SQLite"
+        );
+        assert_eq!(
+            text["history"]["edges"],
+            content.structured["history"]["edges"]
+        );
     }
 
     #[test]

@@ -31,9 +31,9 @@ impl SqliteStore {
     /// embedding-feeding text (content/keywords/tags/context) changed. Archived
     /// rows have no
     /// live vector — archival deletes the vec0 row, `reembed` skips
-    /// `archived_at IS NULL` rows, and `update_vector` refuses archived ids —
+    /// `archived_at IS NOT NULL` rows, and `update_vector` refuses archived ids —
     /// so blanking their stamp would inflate `reembed_pending` with work no
-    /// reembed pass could ever clear (the "run reembed until changed=0"
+    /// reembed pass could ever clear (the "run reembed until scanned=0"
     /// guidance would never converge). Their text is still redacted; only the
     /// stamp/count is left alone. `reembed_pending` therefore counts exactly
     /// the rows a follow-up `reembed` will revisit.
@@ -329,7 +329,7 @@ mod scrub_tests {
         );
         // Fix #3: an archived row's text is redacted, but it is NOT counted in
         // reembed_pending — reembed skips archived rows, so counting it would
-        // make "reembed until changed=0" never converge.
+        // make "reembed until scanned=0" never converge.
         assert_eq!(
             out.reembed_pending, 0,
             "archived rows must not be queued for a reembed that can never run"

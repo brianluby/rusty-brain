@@ -108,6 +108,9 @@ pub struct ReviewMember {
     pub origin_source: Option<String>,
     #[serde(default)]
     pub origin_user: Option<String>,
+    /// Non-interactive review policies leave curated members untouched.
+    #[serde(default)]
+    pub human_curated: bool,
 }
 
 /// One queue entry: a contradiction pair, a near-dup pair, or a single
@@ -163,6 +166,10 @@ impl ReviewPolicy {
     /// of the policy's scope. Pure — dry-run and apply both derive their plan
     /// from this one function, so they cannot diverge (REV-3 determinism).
     pub fn plan_action(&self, item: &ReviewItem) -> Option<ReviewAction> {
+        if item.members.iter().any(|member| member.human_curated) {
+            return None;
+        }
+
         match (self, item.reason) {
             (ReviewPolicy::AutoMergeDups, ReviewReason::NearDuplicate)
                 if item.members.len() == 2 =>
@@ -393,6 +400,7 @@ mod tests {
             last_accessed_at: None,
             origin_source: Some("cli".to_string()),
             origin_user: None,
+            human_curated: false,
         }
     }
 
@@ -507,6 +515,9 @@ mod tests {
             ReviewPolicy::AutoMergeDups.plan_action(&dup),
             Some(ReviewAction::Merge)
         );
+        let mut curated_dup = dup.clone();
+        curated_dup.members[1].human_curated = true;
+        assert_eq!(ReviewPolicy::AutoMergeDups.plan_action(&curated_dup), None);
         // A contradiction is a human decision, never auto-merged.
         let contra = pair_item(ReviewReason::Contradiction, &a, &b);
         assert_eq!(ReviewPolicy::AutoMergeDups.plan_action(&contra), None);
@@ -533,6 +544,12 @@ mod tests {
         assert_eq!(
             ReviewPolicy::DemoteLowConfidence.plan_action(&low),
             Some(ReviewAction::Demote { id: a.clone() })
+        );
+        let mut curated_low = low.clone();
+        curated_low.members[0].human_curated = true;
+        assert_eq!(
+            ReviewPolicy::DemoteLowConfidence.plan_action(&curated_low),
+            None
         );
         // Stale-never-recalled has UNKNOWN confidence (possibly high): the
         // low-confidence policy must not touch it.

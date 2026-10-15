@@ -398,7 +398,7 @@ impl SqliteStore {
         self.conn
             .query_row(
                 "SELECT summary, importance, confidence, created_at, last_accessed_at,
-                        origin_source, origin_user
+                        origin_source, origin_user, human_curated
                  FROM memories WHERE memory_id = ?1",
                 rusqlite::params![id.to_string()],
                 |r| {
@@ -413,6 +413,7 @@ impl SqliteStore {
                         last_accessed_at: r.get(4)?,
                         origin_source: r.get(5)?,
                         origin_user: r.get(6)?,
+                        human_curated: r.get(7)?,
                     })
                 },
             )
@@ -523,6 +524,7 @@ impl SqliteStore {
         note: &MemoryNote,
         embedding: Option<&[f32]>,
         details: &str,
+        allow_curated_supersede: bool,
         now: chrono::DateTime<chrono::Utc>,
     ) -> Result<()> {
         if a == b || note.id == *a || note.id == *b {
@@ -541,17 +543,18 @@ impl SqliteStore {
         immediate_tx(&self.conn, || {
             // 1. Both members live in `ns`, active, and unresolved.
             for id in [a, b] {
-                let row: Option<(String, Option<i64>, Option<String>)> = match self.conn.query_row(
-                    "SELECT namespace, archived_at, superseded_by
+                let row: Option<(String, Option<i64>, Option<String>, bool)> =
+                    match self.conn.query_row(
+                        "SELECT namespace, archived_at, superseded_by, human_curated
                      FROM memories WHERE memory_id = ?1",
-                    rusqlite::params![id.to_string()],
-                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-                ) {
-                    Ok(row) => Some(row),
-                    Err(rusqlite::Error::QueryReturnedNoRows) => None,
-                    Err(e) => return Err(storage_err(e)),
-                };
-                let Some((row_ns, archived_at, superseded_by)) = row else {
+                        rusqlite::params![id.to_string()],
+                        |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                    ) {
+                        Ok(row) => Some(row),
+                        Err(rusqlite::Error::QueryReturnedNoRows) => None,
+                        Err(e) => return Err(storage_err(e)),
+                    };
+                let Some((row_ns, archived_at, superseded_by, human_curated)) = row else {
                     return Err(Error::NotFound(id.clone()));
                 };
                 if row_ns != ns.as_db_string() {
@@ -561,6 +564,11 @@ impl SqliteStore {
                     return Err(Error::StalePlan(format!(
                         "{id} was already resolved (archived or superseded), likely by a \
                          concurrent review; re-run review for a fresh queue"
+                    )));
+                }
+                if human_curated && !allow_curated_supersede {
+                    return Err(Error::StalePlan(format!(
+                        "{id} is human-curated; automatic review cannot supersede it"
                     )));
                 }
             }
@@ -1457,6 +1465,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 r#"{"action":"merge"}"#,
+                false,
                 now,
             )
             .unwrap();
@@ -1503,6 +1512,60 @@ mod review_tests {
     }
 
     #[test]
+    fn review_merge_requires_explicit_intent_to_supersede_curated_member() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        store
+            .update_memory(
+                &a,
+                &rb_types::MemoryUpdates {
+                    human_curated: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+        let combined = combined_note(&ns(), "combined twin");
+        let before = store.last_oplog_seq().unwrap();
+        assert!(matches!(
+            store.review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &combined,
+                Some(&v_unit()),
+                "{}",
+                false,
+                chrono::Utc::now(),
+            ),
+            Err(Error::StalePlan(_))
+        ));
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        assert!(store.get_memory(&combined.id).unwrap().is_none());
+        assert!(store.get_memory(&a).unwrap().unwrap().archived_at.is_none());
+        assert!(store.get_memory(&b).unwrap().unwrap().archived_at.is_none());
+
+        store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &combined,
+                Some(&v_unit()),
+                "{}",
+                true,
+                chrono::Utc::now(),
+            )
+            .unwrap();
+        let curated = store.get_memory(&a).unwrap().unwrap();
+        assert!(curated.human_curated);
+        assert_eq!(curated.superseded_by, Some(combined.id));
+    }
+
+    #[test]
     fn review_merge_is_all_or_nothing_when_a_supersede_pointer_is_taken() {
         // Review finding (CRITICAL): the guarded pointer UPDATE
         // (`WHERE superseded_by IS NULL AND archived_at IS NULL`) must fail
@@ -1539,6 +1602,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1582,6 +1646,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1599,6 +1664,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1614,6 +1680,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1644,6 +1711,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1664,6 +1732,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap_err();
@@ -1703,6 +1772,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap();
@@ -1755,6 +1825,7 @@ mod review_tests {
                 &note,
                 Some(&v_unit()),
                 "{}",
+                false,
                 chrono::Utc::now(),
             )
             .unwrap();

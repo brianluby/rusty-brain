@@ -29,6 +29,9 @@ pub struct RememberInput {
     pub keywords: Vec<String>,
     pub tags: Vec<String>,
     pub related_files: Vec<String>,
+    /// Explicit user curation marker; never inferred from provenance or
+    /// enrichment.
+    pub human_curated: bool,
     /// Explicit trust prior in `0.0..=1.0` (validated fail-closed), or `None`
     /// when the caller expressed no prior. `None` keeps the full-trust 1.0
     /// baseline AND lets an enricher fill it; `Some(x)` is an explicit prior an
@@ -293,11 +296,35 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
     /// Store a new memory: heuristic-enrich, embed the content, then write.
     pub async fn remember(&self, input: RememberInput) -> rb_types::Result<MemoryId> {
+        self.remember_inner(input, None).await
+    }
+
+    /// Store a user-authored replacement and supersede its prior row atomically.
+    pub async fn remember_superseding(
+        &self,
+        input: RememberInput,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<MemoryId> {
+        self.remember_inner(input, Some((old, allow_curated_supersede)))
+            .await
+    }
+
+    async fn remember_inner(
+        &self,
+        input: RememberInput,
+        supersedes: Option<(MemoryId, bool)>,
+    ) -> rb_types::Result<MemoryId> {
         let (note, embedding) = self.compose_note(input).await?;
         let id = note.id.clone();
-        // Keep a copy of the embedding for candidate search before the note moves.
         let embedding_for_links = embedding.clone();
-        self.backend.write(note, embedding).await?;
+        if let Some((old, allow_curated_supersede)) = supersedes {
+            self.backend
+                .write_superseding(note, embedding, old, allow_curated_supersede)
+                .await?;
+        } else {
+            self.backend.write(note, embedding).await?;
+        }
 
         // Best-effort link generation: never fails the remember.
         if let Some(emb) = embedding_for_links {
@@ -359,6 +386,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             input.memory_type,
             input.importance,
         );
+        note.human_curated = input.human_curated;
         // Determinism hook: under a pinned clock the write stamps are the
         // pinned instant, keeping recency deltas reproducible (eval only).
         if let Some(now) = self.fixed_now {
@@ -1348,6 +1376,7 @@ mod tests {
             keywords: Vec::new(),
             tags: Vec::new(),
             related_files: Vec::new(),
+            human_curated: false,
             // No explicit prior: the engine applies the 1.0 baseline and an
             // enricher (when present) may fill it.
             confidence: None,

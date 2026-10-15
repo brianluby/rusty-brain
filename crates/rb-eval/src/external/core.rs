@@ -175,6 +175,7 @@ pub async fn retrieve<P: EmbeddingProvider>(
                         keywords: Vec::new(),
                         tags: Vec::new(),
                         related_files: Vec::new(),
+                        human_curated: false,
                         confidence: None,
                         provenance: Provenance {
                             origin_source: Some("cli".into()),

@@ -377,6 +377,10 @@ pub struct MemoryUpdates {
     /// by the engine and again by the store.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub confidence: Option<f32>,
+    /// Explicit curation intent for deliberate user updates; `None` preserves
+    /// the current marker, while `Some(false)` deliberately removes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub human_curated: Option<bool>,
 }
 
 #[cfg(test)]
@@ -485,6 +489,7 @@ mod tests {
             tags: Some(vec!["x".to_string(), "y".to_string()]),
             context: Some("ctx".to_string()),
             confidence: Some(0.4),
+            human_curated: Some(true),
         };
         let json = serde_json::to_string(&u).unwrap();
         let back: MemoryUpdates = serde_json::from_str(&json).unwrap();
@@ -494,6 +499,7 @@ mod tests {
         assert_eq!(back.tags, Some(vec!["x".to_string(), "y".to_string()]));
         assert_eq!(back.context, Some("ctx".to_string()));
         assert_eq!(back.confidence, Some(0.4));
+        assert_eq!(back.human_curated, Some(true));
     }
 
     fn note_with(f: impl FnOnce(&mut MemoryNote)) -> MemoryNote {

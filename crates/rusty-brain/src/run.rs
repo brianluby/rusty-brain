@@ -95,6 +95,10 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
     }
     let socket_path = effective.socket_path.clone();
     let db_path = effective.db_path.clone();
+    let startup_timeout = client::startup_timeout(
+        effective.embed_backend.as_deref(),
+        effective.local_model.as_deref(),
+    );
 
     match cli.command {
         Command::Serve {
@@ -124,7 +128,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
             .context("daemon failed")?;
             Ok(())
         }
-        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace)
+        Command::Mcp => crate::mcp::run_mcp(&socket_path, &db_path, namespace, startup_timeout)
             .await
             .context("mcp adapter failed"),
         // Doctor diagnoses the system AS IT IS: it must not auto-start the
@@ -149,6 +153,7 @@ pub async fn run(cli: Cli, namespace: rb_types::Namespace) -> anyhow::Result<()>
                 &socket_path,
                 &db_path,
                 effective.retention.clone(),
+                startup_timeout,
             )
             .await
         }
@@ -173,6 +178,7 @@ async fn run_client(
     socket_path: &std::path::Path,
     db_path: &std::path::Path,
     retention: Option<rb_types::RetentionPolicy>,
+    startup_timeout: std::time::Duration,
 ) -> anyhow::Result<()> {
     let self_exe = std::env::current_exe().context("locating own executable")?;
     let ns_str = namespace.as_db_string();
@@ -182,6 +188,7 @@ async fn run_client(
         namespace,
         self_exe,
         Some(client::client_identity("cli")),
+        startup_timeout,
     )
     .await
     .context("connecting to daemon")?;
@@ -362,6 +369,7 @@ async fn run_client(
             context,
             tags,
             supersedes,
+            curated,
             file,
             commit,
             symbol,
@@ -423,6 +431,7 @@ async fn run_client(
                 let supersedes = supersedes
                     .map(|old| parse_id(&old).context("--supersedes must be a memory UUID"))
                     .transpose()?;
+                let allow_curated_supersede = supersedes.is_some();
                 // Evidence (Vikunja #63): the CLI is the human's typed
                 // surface — it may claim a CI measurement (requires a
                 // commit anchor, enforced daemon-side) or a human
@@ -437,7 +446,7 @@ async fn run_client(
                     evidence_confirmed.map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
                 };
                 let id = client
-                    .remember_anchored(
+                    .remember_anchored_with_intent(
                         content,
                         context,
                         memory_type,
@@ -449,6 +458,8 @@ async fn run_client(
                         anchors,
                         supersedes,
                         evidence,
+                        curated,
+                        allow_curated_supersede,
                     )
                     .await
                     .context("remember failed")?;
@@ -568,6 +579,8 @@ async fn run_client(
             tags,
             context,
             confidence,
+            curated,
+            uncurate,
         } => {
             let id = parse_id(&id).context("invalid memory id")?;
             let updates = rb_types::MemoryUpdates {
@@ -579,6 +592,13 @@ async fn run_client(
                 tags: if tags.is_empty() { None } else { Some(tags) },
                 context,
                 confidence,
+                human_curated: if curated {
+                    Some(true)
+                } else if uncurate {
+                    Some(false)
+                } else {
+                    None
+                },
             };
             client.update(id, updates).await.context("update failed")?;
             println!("{}", output::render_updated(json));
@@ -963,7 +983,8 @@ async fn run_client(
                 // stderr so `--json` stdout stays machine-parseable.
                 eprintln!(
                     "note: {} memories need re-embedding; run \
-                     `rusty-brain reembed` until changed=0 to recompute their vectors",
+                     `rusty-brain reembed` until no pending rows remain \
+                     (skipped rows remain pending)",
                     outcome.reembed_pending
                 );
             }
@@ -1616,7 +1637,15 @@ mod tests {
 
         let ns = Namespace::Project("injected".to_string());
         let started = Instant::now();
-        let result = crate::client::connect_or_start(&sock, &db, ns, self_exe, None).await;
+        let result = crate::client::connect_or_start(
+            &sock,
+            &db,
+            ns,
+            self_exe,
+            None,
+            std::time::Duration::from_secs(5),
+        )
+        .await;
         let elapsed = started.elapsed();
 
         // Returns an Err quickly (no 50-retry backoff, no daemon spawn).

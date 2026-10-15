@@ -17,6 +17,29 @@ impl MemoryBackend for VecBackend {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
         Ok(())
     }
+    async fn write_superseding(
+        &self,
+        note: MemoryNote,
+        _embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        let mut notes = self.notes.lock().unwrap();
+        let old_note = notes
+            .get_mut(&old)
+            .filter(|old_note| old_note.namespace == note.namespace)
+            .ok_or_else(|| rb_types::Error::NotFound(old.clone()))?;
+        if old_note.human_curated && !allow_curated_supersede {
+            return Err(rb_types::Error::StalePlan(
+                "curated memory requires explicit supersede intent".into(),
+            ));
+        }
+        old_note.archived_at = Some(chrono::Utc::now());
+        old_note.updated_at = chrono::Utc::now();
+        old_note.superseded_by = Some(note.id.clone());
+        notes.insert(note.id.clone(), note);
+        Ok(())
+    }
 
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {
         Ok(self
@@ -260,6 +283,7 @@ async fn full_flow_through_public_api() {
             keywords: Vec::new(),
             tags: vec!["concurrency".to_string()],
             related_files: Vec::new(),
+            human_curated: false,
             confidence: Some(1.0),
             provenance: Default::default(),
             anchors: Vec::new(),
