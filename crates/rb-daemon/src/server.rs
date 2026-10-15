@@ -12,7 +12,7 @@ use rb_engine::{Enricher, MemoryEngine, RememberInput};
 use rb_enrich::OpenAiCompatEnricher;
 use rb_proto::{
     bounded_framed, read_frame, write_frame, Handshake, HandshakeAck, RecallChannelTotals, Request,
-    Response, CONTRACT_VERSION,
+    Response, CAP_HUMAN_CURATION, CONTRACT_VERSION,
 };
 use rb_types::{Error, Result};
 use std::sync::Arc;
@@ -33,7 +33,7 @@ const MAX_LIMIT: usize = 1000;
 /// Maximum graph traversal depth per Graph request.
 const MAX_DEPTH: u8 = 8;
 /// Default re-embed batch size when a `Reembed` request omits a limit. Bounded
-/// so one pass converges a slice of the corpus; rerun until `changed == 0`.
+/// so one pass converges a slice of the corpus; skipped rows stay pending.
 const REEMBED_DEFAULT_LIMIT: usize = 1000;
 /// Hard cap on a single re-embed pass to bound writer-thread work per request.
 const REEMBED_MAX_LIMIT: usize = 10_000;
@@ -181,6 +181,7 @@ pub struct Daemon {
     socket_path: PathBuf,
     pidfile_path: PathBuf,
     bind_guard: BindGuard,
+    _database_guard: Arc<DatabaseGuard>,
     jobs_config: JobsConfig,
     retention_policy: Option<rb_types::RetentionPolicy>,
     request_idle_timeout: std::time::Duration,
@@ -207,6 +208,21 @@ impl std::fmt::Debug for Daemon {
 impl Daemon {
     /// Bind the daemon socket and initialize the backing store.
     pub async fn bind(config: DaemonConfig, embedder: SharedEmbedder) -> Result<Self> {
+        Self::bind_inner(config, embedder, false).await
+    }
+    /// Bind after accepting the configured provider's model/dimension pair.
+    /// The database admission lock is held across cutover and every store open.
+    pub async fn bind_accepting_model_change(
+        config: DaemonConfig,
+        embedder: SharedEmbedder,
+    ) -> Result<Self> {
+        Self::bind_inner(config, embedder, true).await
+    }
+    async fn bind_inner(
+        config: DaemonConfig,
+        embedder: SharedEmbedder,
+        accept_model_change: bool,
+    ) -> Result<Self> {
         let dim = embedder.dim();
 
         // Fail closed on a non-loopback HTTP bind BEFORE any filesystem or
@@ -216,15 +232,28 @@ impl Daemon {
             crate::http::validate_bind(http_config)?;
         }
 
-        if let Some(parent) = config.db_path.parent() {
-            prepare_db_dir(parent)?;
-        }
-
         prepare_socket_dir(&config.socket_path)?;
-
         let pidfile_path = config.socket_path.with_extension("pid");
         let mut bind_guard = BindGuard::acquire(config.socket_path.clone(), pidfile_path.clone())?;
 
+        if let Some(parent) = config.db_path.parent() {
+            prepare_db_dir(parent)?;
+        }
+        let database_guard = Arc::new(DatabaseGuard::acquire(&config.db_path)?);
+        if accept_model_change && database_guard.database_existed() {
+            let changed = crate::store_handle::accept_model_change_while_admitted(
+                &config.db_path,
+                dim,
+                embedder.model_id(),
+            )?;
+            if changed {
+                info!(
+                    model = embedder.model_id(),
+                    "accepted embedding model/dimension change; corpus marked for re-embed \
+                     (run `rusty-brain reembed` until no rows remain)"
+                );
+            }
+        }
         if config.socket_path.exists() {
             if probe_live(&config.socket_path).await {
                 return Err(Error::Io(format!(
@@ -262,13 +291,14 @@ impl Daemon {
             }
         };
 
-        // Bind the embedder's model identity into every store open so a
-        // same-dim provider swap fails closed instead of mixing vector spaces.
-        let store = StoreHandle::start_with_model(
+        // Bind the provider's model and dimension into every store open so
+        // unaccepted embedding-space changes fail closed instead of mixing.
+        let store = StoreHandle::start_with_model_admission(
             config.db_path.clone(),
             dim,
             embedder.model_id().to_string(),
             config.read_pool_size,
+            Arc::clone(&database_guard),
         )?;
 
         // Build the opt-in LLM enricher once (reqwest client is reused across
@@ -299,7 +329,6 @@ impl Daemon {
         let request_idle_timeout = config
             .request_idle_timeout
             .unwrap_or(DEFAULT_REQUEST_IDLE_TIMEOUT);
-
         info!(socket = %config.socket_path.display(), "daemon bound");
         Ok(Self {
             listener,
@@ -309,6 +338,7 @@ impl Daemon {
             socket_path: config.socket_path,
             pidfile_path,
             bind_guard,
+            _database_guard: database_guard,
             jobs_config: config.jobs_config,
             retention_policy: config.retention_policy,
             request_idle_timeout,
@@ -343,6 +373,7 @@ impl Daemon {
     /// Run until `shutdown` resolves, then drain connections and clean up.
     pub async fn run(self, shutdown: impl Future<Output = ()>) -> Result<()> {
         let Daemon {
+            _database_guard,
             listener,
             store,
             embedder,
@@ -539,6 +570,180 @@ fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
         .map_err(|e| Error::Io(format!("create socket dir {}: {e}", socket_dir.display())))?;
     fs::set_permissions(socket_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))
+}
+
+/// Nonblocking database-inode admission lock. Its Arc is retained by daemon and
+/// storage workers so cancellation cannot release it before connections close.
+pub(crate) struct DatabaseGuard {
+    _database_file: File,
+    _admission_file: File,
+    database_existed: bool,
+}
+
+impl DatabaseGuard {
+    pub(crate) fn acquire(path: &Path) -> Result<Self> {
+        use std::os::unix::fs::MetadataExt;
+
+        let database_existed = path.exists();
+        let lock_directory = database_admission_directory()?;
+        let database_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(path)
+            .map_err(|e| Error::Io(format!("open database {}: {e}", path.display())))?;
+        let database_metadata = database_file
+            .metadata()
+            .map_err(|e| Error::Io(format!("stat database {}: {e}", path.display())))?;
+        let admission_path = database_admission_lock_path(&lock_directory, &database_metadata);
+        let admission_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&admission_path)
+            .map_err(|e| {
+                Error::Io(format!(
+                    "open database admission sidecar {}: {e}",
+                    admission_path.display()
+                ))
+            })?;
+        let admission_metadata = admission_file.metadata().map_err(|e| {
+            Error::Io(format!(
+                "stat admission sidecar {}: {e}",
+                admission_path.display()
+            ))
+        })?;
+        let admission_mode = admission_metadata.permissions().mode() & 0o777;
+        if !admission_metadata.is_file()
+            || admission_metadata.uid() != process_euid()
+            || admission_mode & 0o600 != 0o600
+        {
+            return Err(Error::Io(format!(
+                "database admission sidecar {} is not a private owner-owned file",
+                admission_path.display()
+            )));
+        }
+        if admission_mode & 0o077 != 0 {
+            admission_file
+                .set_permissions(fs::Permissions::from_mode(0o600))
+                .map_err(|e| {
+                    Error::Io(format!(
+                        "chmod 0600 admission sidecar {}: {e}",
+                        admission_path.display()
+                    ))
+                })?;
+        }
+        lock_database_sidecar(&admission_file, path)?;
+        database_file
+            .set_permissions(fs::Permissions::from_mode(0o600))
+            .map_err(|e| Error::Io(format!("chmod 0600 {}: {e}", path.display())))?;
+        Ok(Self {
+            _database_file: database_file,
+            _admission_file: admission_file,
+            database_existed,
+        })
+    }
+
+    pub(crate) fn database_existed(&self) -> bool {
+        self.database_existed
+    }
+}
+
+/// Use effective UID under fixed /tmp instead of HOME/XDG/socket paths so
+/// cooperating same-user daemons derive the same admission directory.
+fn database_admission_directory() -> Result<PathBuf> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    let temp_root = fs::canonicalize("/tmp")
+        .map_err(|e| Error::Io(format!("resolve stable lock root /tmp: {e}")))?;
+    let temp_metadata = fs::metadata(&temp_root).map_err(|e| {
+        Error::Io(format!(
+            "stat stable lock root {}: {e}",
+            temp_root.display()
+        ))
+    })?;
+    let temp_mode = temp_metadata.permissions().mode();
+    if !temp_metadata.is_dir() || temp_metadata.uid() != 0 || temp_mode & 0o1000 == 0 {
+        return Err(Error::Io(format!(
+            "stable lock root {} must be a root-owned sticky directory",
+            temp_root.display()
+        )));
+    }
+
+    let directory = temp_root.join(format!("rusty-brain-db-admission-{}", process_euid()));
+    let mut builder = fs::DirBuilder::new();
+    builder.mode(0o700);
+    match builder.create(&directory) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(e) => {
+            return Err(Error::Io(format!(
+                "create private database admission directory {}: {e}",
+                directory.display()
+            )))
+        }
+    }
+    let metadata = fs::symlink_metadata(&directory).map_err(|e| {
+        Error::Io(format!(
+            "stat admission directory {}: {e}",
+            directory.display()
+        ))
+    })?;
+    let mode = metadata.permissions().mode() & 0o777;
+    if !metadata.file_type().is_dir() || metadata.uid() != process_euid() || mode & 0o700 != 0o700 {
+        return Err(Error::Io(format!(
+            "database admission directory {} must be owner-owned and private",
+            directory.display()
+        )));
+    }
+    if mode & 0o077 != 0 {
+        fs::set_permissions(&directory, fs::Permissions::from_mode(0o700)).map_err(|e| {
+            Error::Io(format!(
+                "chmod 0700 database admission directory {}: {e}",
+                directory.display()
+            ))
+        })?;
+    }
+    Ok(directory)
+}
+
+fn database_admission_lock_path(
+    directory: &Path,
+    database_metadata: &std::fs::Metadata,
+) -> PathBuf {
+    use std::os::unix::fs::MetadataExt;
+
+    directory.join(format!(
+        "db-{}-{}.lock",
+        database_metadata.dev(),
+        database_metadata.ino()
+    ))
+}
+
+#[allow(unsafe_code)]
+fn lock_database_sidecar(file: &File, path: &Path) -> Result<()> {
+    // SAFETY: flock reads only this borrowed sidecar descriptor; DatabaseGuard
+    // retains the File until every daemon store connection has been shut down.
+    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = std::io::Error::last_os_error();
+    if err.kind() == std::io::ErrorKind::WouldBlock {
+        return Err(Error::Io(format!(
+            "database {} is already admitted by a rusty-brain daemon or migration",
+            path.display()
+        )));
+    }
+    Err(Error::Io(format!(
+        "lock database admission sidecar for {}: {err}",
+        path.display()
+    )))
 }
 
 struct BindGuard {
@@ -880,7 +1085,10 @@ async fn handle_connection(
         // payloads, so advertise the capability — clients gate anchor-bearing
         // requests on it (pre-anchor daemons never send it). Old clients
         // ignore the additive field.
-        capabilities: vec![rb_proto::CAP_ANCHORS.to_string()],
+        capabilities: vec![
+            rb_proto::CAP_ANCHORS.to_string(),
+            CAP_HUMAN_CURATION.to_string(),
+        ],
     };
     write_frame(&mut framed, &ack).await?;
 
@@ -1107,22 +1315,26 @@ async fn suppress_hook_near_duplicates<P>(
             return;
         }
     };
+    let mut survivor = new_id.clone();
     for (dup_id, _similarity) in dups {
-        if &dup_id == new_id {
+        if dup_id == survivor {
             continue;
         }
-        // Only collapse OTHER automatic hook captures into the new memory; a
-        // non-hook (or already-archived/absent) candidate is left untouched.
+        // Only collapse hook captures; concurrent curation can select an older survivor.
         // `peek` (not `get`) so inspecting a candidate's provenance never
         // records an access — a maintenance scan must not pollute the W3.7
         // usefulness signal on memories it deliberately leaves alone.
         match engine.peek(dup_id.clone()).await {
             Ok(Some(note)) if note.origin_source.as_deref() == Some("hook") => {
-                if let Err(e) = job_store
-                    .supersede_duplicate(namespace.clone(), dup_id, new_id.clone())
+                match job_store
+                    .supersede_duplicate(namespace.clone(), dup_id, survivor.clone())
                     .await
                 {
-                    warn!(error = %e, "near-dup supersede failed; leaving the duplicate live");
+                    Ok(Some(receipt)) => survivor = receipt.survivor,
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!(error = %e, "near-dup supersede failed; leaving the duplicate live");
+                    }
                 }
             }
             Ok(_) => {}
@@ -1163,6 +1375,7 @@ async fn apply_review_action<P>(
     ids: &[rb_types::MemoryId],
     action: &rb_types::ReviewAction,
     threshold: f32,
+    explicit: bool,
 ) -> Result<rb_types::ReviewResolution>
 where
     P: EmbeddingProvider,
@@ -1294,6 +1507,7 @@ where
                     keywords,
                     tags,
                     related_files,
+                    human_curated: false,
                     confidence: Some(a.confidence.max(b.confidence)),
                     provenance: provenance.clone(),
                     // Daemon-internal continuity (Vikunja #63), conservative
@@ -1322,6 +1536,7 @@ where
                     note,
                     embedding,
                     details,
+                    explicit,
                 )
                 .await?;
             resolution.merged_into = Some(new_id);
@@ -1329,21 +1544,39 @@ where
             return Ok(resolution);
         }
         ReviewAction::Archive { id } => {
-            engine.delete(id.clone()).await?;
+            if explicit {
+                engine.delete(id.clone()).await?;
+            } else if !job_store
+                .archive_unattended(namespace.clone(), id.clone())
+                .await?
+            {
+                return Err(Error::StalePlan(format!(
+                    "{id} became curated before policy archive"
+                )));
+            }
         }
         ReviewAction::Demote { id } => {
             // `validate` proved membership; the note is in `notes`.
             if let Some(note) = notes.iter().find(|n| &n.id == id) {
                 let confidence = (note.confidence - rb_types::REVIEW_DEMOTE_STEP).clamp(0.0, 1.0);
-                engine
-                    .update(
-                        id.clone(),
-                        rb_types::MemoryUpdates {
-                            confidence: Some(confidence),
-                            ..Default::default()
-                        },
-                    )
-                    .await?;
+                if explicit {
+                    engine
+                        .update(
+                            id.clone(),
+                            rb_types::MemoryUpdates {
+                                confidence: Some(confidence),
+                                ..Default::default()
+                            },
+                        )
+                        .await?;
+                } else if !job_store
+                    .set_confidence(namespace.clone(), id.clone(), confidence)
+                    .await?
+                {
+                    return Err(Error::StalePlan(format!(
+                        "{id} became curated before policy demotion"
+                    )));
+                }
                 resolution.confidence.push(MemberConfidence {
                     id: id.clone(),
                     confidence,
@@ -1427,6 +1660,7 @@ where
             &ids,
             &action,
             threshold,
+            false,
         )
         .await
         {
@@ -1554,6 +1788,8 @@ where
             supersedes,
             anchors,
             evidence,
+            human_curated,
+            allow_curated_supersede,
         } => {
             // Trust-class ladder (Vikunja #63): NO caller states a class on
             // the wire — only evidence. The daemon derives the class
@@ -1577,38 +1813,37 @@ where
                 keywords,
                 tags,
                 related_files,
+                human_curated: human_curated.unwrap_or(false),
                 confidence,
                 provenance: provenance.clone(),
                 anchors,
                 trust_class: Some(trust_class),
             };
-            match engine.remember(input).await {
+            let allow_curated_supersede = allow_curated_supersede.unwrap_or(false);
+            if allow_curated_supersede && supersedes.is_none() {
+                return error_to_response(Error::InvalidArgument(
+                    "curated supersede intent requires a superseded memory id".into(),
+                ));
+            }
+            if provenance.origin_source.as_deref() == Some("hook")
+                && (human_curated.unwrap_or(false) || allow_curated_supersede)
+            {
+                return error_to_response(Error::InvalidArgument(
+                    "automatic hook writes cannot set human-curation intent".into(),
+                ));
+            }
+            let remembered = match supersedes {
+                Some(old) => {
+                    engine
+                        .remember_superseding(input, old, allow_curated_supersede)
+                        .await
+                }
+                None => engine.remember(input).await,
+            };
+            match remembered {
                 Ok(id) => {
-                    // W3.1 update-as-supersede: store the replacement first, then
-                    // archive the prior memory through the existing atomic
-                    // supersede (separate writer tx). Best-effort — a supersede
-                    // failure leaves the new memory stored and `old` un-archived,
-                    // never a partial state. That includes the #501 guard misses
-                    // (StalePlan: `old` was already resolved by an earlier fold or
-                    // another writer) — the established lineage pointer is kept
-                    // and only this warn records the refusal. `old == id` is
-                    // impossible (the id is freshly minted) but guarded for
-                    // clarity.
-                    if let Some(old) = supersedes {
-                        if old != id {
-                            if let Err(e) = job_store
-                                .supersede(namespace.clone(), old, id.clone())
-                                .await
-                            {
-                                warn!(error = %e, "supersede after remember failed (new memory kept)");
-                            }
-                        }
-                    }
-                    // W3.1 write-time near-dup suppression: collapse OTHER active
-                    // hook captures that are near-identical to this one, so
-                    // automatic capture cannot pile up redundant rows between
-                    // scheduled consolidation runs. Gated to hook-source on the
-                    // write AND each candidate; never touches user/cli/mcp/job rows.
+                    // Automatic hook dedup remains separately guarded in the
+                    // transactional store seam.
                     if provenance.origin_source.as_deref() == Some("hook") {
                         suppress_hook_near_duplicates(engine, job_store, namespace, &id).await;
                     }
@@ -1911,7 +2146,7 @@ where
                 _ => rb_types::REVIEW_DEFAULT_THRESHOLD,
             };
             match apply_review_action(
-                engine, job_store, provenance, namespace, reason, &ids, &action, threshold,
+                engine, job_store, provenance, namespace, reason, &ids, &action, threshold, true,
             )
             .await
             {
@@ -2224,6 +2459,216 @@ mod tests {
         }
         .is_admin());
         assert!(!PeerIdentity { uid: None }.is_admin());
+    }
+
+    #[test]
+    fn database_admission_sidecar_uses_inode_aliases_and_is_not_replaced() {
+        use std::os::unix::fs::{symlink, MetadataExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.db");
+        let hardlink = dir.path().join("memory-hardlink.db");
+        let symlink_path = dir.path().join("memory-symlink.db");
+        fs::write(&database, b"").unwrap();
+        fs::hard_link(&database, &hardlink).unwrap();
+        symlink(&database, &symlink_path).unwrap();
+
+        let lock_directory = database_admission_directory().unwrap();
+        assert_eq!(
+            lock_directory,
+            fs::canonicalize("/tmp")
+                .unwrap()
+                .join(format!("rusty-brain-db-admission-{}", process_euid()))
+        );
+        assert_eq!(
+            fs::metadata(&lock_directory).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let database_metadata = fs::metadata(&database).unwrap();
+        let lock_path = database_admission_lock_path(&lock_directory, &database_metadata);
+        let guard = DatabaseGuard::acquire(&database).unwrap();
+        let sidecar_inode = fs::metadata(&lock_path).unwrap().ino();
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+
+        for alias in [&hardlink, &symlink_path] {
+            let err = DatabaseGuard::acquire(alias)
+                .err()
+                .expect("an inode alias must be refused while admission is held");
+            assert!(
+                err.to_string().contains("already admitted"),
+                "inode aliases must share admission: {err}"
+            );
+        }
+
+        drop(guard);
+        assert_eq!(
+            fs::metadata(&lock_path).unwrap().ino(),
+            sidecar_inode,
+            "releasing admission must not unlink/recreate the persistent sidecar"
+        );
+        let reopened = DatabaseGuard::acquire(&symlink_path).unwrap();
+        assert!(reopened.database_existed());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_daemon_blocks_acceptance_from_a_second_socket_on_same_database() {
+        use rb_store::{SqliteStore, Store};
+        use rb_types::{MemoryNote, MemoryType};
+
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.db");
+        let ns = Namespace::Project("database-admission".to_string());
+        let store = SqliteStore::open_with_model(&database, 8, "deterministic").unwrap();
+        let mut note = MemoryNote::new(
+            ns.clone(),
+            "old provider memory".to_string(),
+            MemoryType::Insight,
+            5,
+        );
+        note.embedding_model = "deterministic".to_string();
+        note.embedding_input_version = "v2-composite".to_string();
+        store.insert_memory(&note, Some(&[0.25f32; 8])).unwrap();
+        drop(store);
+
+        let config = |socket_path| DaemonConfig {
+            socket_path,
+            db_path: database.clone(),
+            read_pool_size: 1,
+            jobs_config: JobsConfig::default(),
+            retention_policy: None,
+            request_idle_timeout: None,
+            enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
+            http: None,
+        };
+        let daemon = Daemon::bind(
+            config(dir.path().join("socket-a").join("rb.sock")),
+            SharedEmbedder::new(rb_embed::DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap();
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel();
+        let serving = tokio::spawn(daemon.run(async {
+            let _ = shutdown_rx.await;
+        }));
+        let same_socket = Daemon::bind_accepting_model_change(
+            config(dir.path().join("socket-a").join("rb.sock")),
+            SharedEmbedder::new(rb_embed::DeterministicProvider::new(4)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            same_socket.to_string().contains("already listening"),
+            "the existing socket singleton must refuse before cutover: {same_socket}"
+        );
+        let helper_error = crate::accept_model_change(&database, 4, "deterministic").unwrap_err();
+        assert!(
+            helper_error.to_string().contains("already admitted"),
+            "standalone acceptance must use the same database lock: {helper_error}"
+        );
+
+        let err = Daemon::bind_accepting_model_change(
+            config(dir.path().join("socket-b").join("rb.sock")),
+            SharedEmbedder::new(rb_embed::DeterministicProvider::new(4)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("already admitted"),
+            "the second socket must be refused by database admission: {err}"
+        );
+
+        let unchanged = SqliteStore::open_with_model(&database, 8, "deterministic").unwrap();
+        assert_eq!(
+            unchanged.get_memory(&note.id).unwrap().unwrap().content,
+            "old provider memory"
+        );
+        assert_eq!(
+            unchanged
+                .vector_search(&ns, &[0.25f32; 8], 10)
+                .unwrap()
+                .len(),
+            1,
+            "the active daemon's old-provider vector remains intact"
+        );
+        assert!(matches!(
+            SqliteStore::open_with_model(&database, 4, "deterministic"),
+            Err(Error::DimensionMismatch { .. })
+        ));
+        drop(unchanged);
+
+        shutdown_tx.send(()).unwrap();
+        serving.await.unwrap().unwrap();
+        assert!(crate::accept_model_change(&database, 4, "deterministic").unwrap());
+        let accepted = SqliteStore::open_with_model(&database, 4, "deterministic").unwrap();
+        assert!(
+            accepted
+                .vector_search(&ns, &[0.25f32; 4], 10)
+                .unwrap()
+                .is_empty(),
+            "acceptance becomes available after the serving pool shuts down"
+        );
+        drop(accepted);
+        let stale_provider = Daemon::bind(
+            config(dir.path().join("socket-c").join("rb.sock")),
+            SharedEmbedder::new(rb_embed::DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(&stale_provider, Error::DimensionMismatch { .. }),
+            "a stale old-provider starter must fail after cutover: {stale_provider}"
+        );
+        let current = SqliteStore::open_with_model(&database, 4, "deterministic").unwrap();
+        assert!(
+            current
+                .vector_search(&ns, &[0.25f32; 4], 10)
+                .unwrap()
+                .is_empty(),
+            "a refused stale starter must not change the new vector index"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn dropped_daemon_keeps_database_admission_until_writer_shutdown() {
+        let dir = tempfile::tempdir().unwrap();
+        let database = dir.path().join("memory.db");
+        let config = DaemonConfig {
+            socket_path: dir.path().join("socket").join("rb.sock"),
+            db_path: database.clone(),
+            read_pool_size: 1,
+            jobs_config: JobsConfig::default(),
+            retention_policy: None,
+            request_idle_timeout: None,
+            enrich: None,
+            fusion_mode: rb_engine::FusionMode::Linear,
+            abstain_threshold: None,
+            write_gate: rb_types::WriteGateConfig::default(),
+            http: None,
+        };
+        let daemon = Daemon::bind(
+            config,
+            SharedEmbedder::new(rb_embed::DeterministicProvider::new(8)),
+        )
+        .await
+        .unwrap();
+        let retained_store = daemon.store.clone();
+        drop(daemon);
+
+        let err = crate::accept_model_change(&database, 4, "new-model").unwrap_err();
+        assert!(
+            err.to_string().contains("already admitted"),
+            "a writer connection outliving Daemon must retain admission: {err}"
+        );
+        retained_store.shutdown().await;
+        assert!(
+            crate::accept_model_change(&database, 4, "new-model").unwrap(),
+            "acceptance becomes available after the writer connection closes"
+        );
     }
 
     #[test]
@@ -2767,6 +3212,7 @@ mod tests {
                     keywords: vec![],
                     tags: vec![],
                     related_files: vec![],
+                    human_curated: false,
                     confidence: Some(1.0),
                     provenance: provenance.clone(),
                     anchors: vec![],

@@ -45,7 +45,11 @@ impl SqliteBackend {
     /// used by the offline harness; never on the shipped path.
     pub fn set_confidence(&self, id: &MemoryId, confidence: f32) -> rb_types::Result<()> {
         let store = self.lock()?;
-        store.set_confidence(id, confidence)
+        let namespace = store
+            .get_memory(id)?
+            .map(|note| note.namespace)
+            .unwrap_or(Namespace::Global);
+        store.set_confidence(&namespace, id, confidence).map(|_| ())
     }
 
     /// Prepare an archived fixture row through the store primitive production uses.
@@ -75,6 +79,22 @@ impl MemoryBackend for SqliteBackend {
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()> {
         let store = self.lock()?;
         store.insert_memory(&note, embedding.as_deref())
+    }
+
+    async fn write_superseding(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        self.lock()?.insert_superseding_memory(
+            &note,
+            embedding.as_deref(),
+            &old,
+            allow_curated_supersede,
+        )?;
+        Ok(())
     }
 
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>> {

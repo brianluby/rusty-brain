@@ -53,6 +53,17 @@ impl SqliteStore {
     where
         F: FnOnce(),
     {
+        let conn = Self::open_database(path)?;
+        #[cfg(test)]
+        wait_for_public_open_test_barrier(path);
+        Self::init_with_schema_hook(
+            conn,
+            embedding_dim,
+            embedding_model,
+            after_vector_schema_read,
+        )
+    }
+    fn open_database(path: &Path) -> Result<rusqlite::Connection> {
         register_vec()?;
         // The DB file holds captured memory text: owner-only (0600), parity with
         // the daemon socket. Pre-create a missing file at 0600 so it is never
@@ -96,20 +107,36 @@ impl SqliteStore {
                 }
             }
         }
-        let conn = rusqlite::Connection::open(path).map_err(|e| {
+        rusqlite::Connection::open(path).map_err(|e| {
             io_err(std::io::Error::other(format!(
                 "open {}: {e}",
                 path.display()
             )))
-        })?;
-        #[cfg(test)]
-        wait_for_public_open_test_barrier(path);
-        Self::init_with_schema_hook(
-            conn,
-            embedding_dim,
-            embedding_model,
-            after_vector_schema_read,
-        )
+        })
+    }
+    /// Open and migrate a connection for the explicit model/dimension acceptance
+    /// transaction without enforcing the old dimension or creating its vec0 table.
+    pub(super) fn open_for_model_acceptance(path: &Path) -> Result<rusqlite::Connection> {
+        let conn = Self::open_database(path)?;
+        conn.busy_timeout(OPEN_BUSY_TIMEOUT).map_err(storage_err)?;
+        enable_wal(&conn)?;
+        conn.pragma_update(None, "foreign_keys", "ON")
+            .map_err(storage_err)?;
+        run_migrations(&conn)?;
+        Ok(conn)
+    }
+    /// Replace only the derived vector index during an explicit embedding-space
+    /// cutover. Caller runs this in the same transaction as target meta markers.
+    pub(super) fn replace_vector_index_for_model_acceptance(
+        conn: &rusqlite::Connection,
+        embedding_dim: usize,
+    ) -> Result<()> {
+        conn.execute_batch("DROP TABLE IF EXISTS memory_vectors;")
+            .map_err(storage_err)?;
+        conn.execute_batch(&vector_table_ddl(embedding_dim))
+            .map_err(storage_err)?;
+        upsert_meta(conn, "vector_schema_version", VECTOR_SCHEMA_VERSION)?;
+        upsert_meta(conn, "vector_metric", "cosine")
     }
     /// Open an ephemeral in-memory store with the given embedding dimension.
     pub fn open_in_memory(embedding_dim: usize) -> Result<Self> {
@@ -613,14 +640,14 @@ fn seed_or_verify_model(conn: &rusqlite::Connection, embedding_model: &str) -> R
                     "embedding model changed (meta.embedding_model is missing, stored rows use: \
                      {stored:?}, configured: {embedding_model:?}); run with \
                      --accept-model-change to mark the corpus, then run \
-                     `rusty-brain reembed` until changed=0"
+                     `rusty-brain reembed` until scanned=0; skipped rows remain pending"
                 )))
             }
             models => {
                 return Err(Error::Storage(format!(
                     "meta.embedding_model is missing and stored rows contain mixed embedding \
                      models {models:?}; run with --accept-model-change to adopt \
-                     {embedding_model:?}; then run `rusty-brain reembed` until changed=0"
+                     {embedding_model:?}; then run `rusty-brain reembed` until scanned=0; skipped rows remain pending"
                 )))
             }
         }
@@ -639,7 +666,7 @@ fn verify_configured_model(stored: &str, embedding_model: &str) -> Result<()> {
         return Err(Error::Storage(format!(
             "embedding model changed (stored: {stored:?}, configured: {embedding_model:?}); \
              run with --accept-model-change to mark the corpus, then run \
-             `rusty-brain reembed` until changed=0"
+             `rusty-brain reembed` until scanned=0; skipped rows remain pending"
         )));
     }
     Ok(())
@@ -748,6 +775,27 @@ mod open_tests {
             )
             .unwrap();
         assert_eq!(dim, "768");
+    }
+
+    #[test]
+    fn human_curated_marker_persists_across_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("curation.db");
+        let id;
+        {
+            let store = SqliteStore::open(&path, 8).unwrap();
+            let mut note = MemoryNote::new(
+                Namespace::Project("persisted-curation".into()),
+                "reviewed decision".into(),
+                MemoryType::Insight,
+                5,
+            );
+            note.human_curated = true;
+            id = note.id.clone();
+            store.insert_memory(&note, None).unwrap();
+        }
+        let store = SqliteStore::open(&path, 8).unwrap();
+        assert!(store.get_memory(&id).unwrap().unwrap().human_curated);
     }
 
     #[test]
@@ -925,7 +973,7 @@ mod open_tests {
         assert!(SqliteStore::open_with_model(&path, 8, "model-b").is_err());
 
         let legacy = SqliteStore::open(&path, 8).unwrap();
-        assert!(!legacy.accept_model_change("model-b").unwrap());
+        assert!(legacy.accept_model_change("model-b").unwrap());
         assert_eq!(
             legacy
                 .memories_for_reembed("model-b", "v2-composite", 10)
@@ -1353,7 +1401,9 @@ mod base_importance_migration_tests {
         // ...and a job write on a MIGRATED row moves only the effective value,
         // leaving the backfilled prior anchored.
         let legacy_id: MemoryId = "00000000-0000-4000-8000-000000000003".parse().unwrap();
-        store.set_recalibrated_importance(&legacy_id, 8).unwrap();
+        store
+            .set_recalibrated_importance(&Namespace::Project("legacy".into()), &legacy_id, 8)
+            .unwrap();
         let legacy = store
             .memories_for_recalibration(10)
             .unwrap()

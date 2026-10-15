@@ -196,6 +196,14 @@ pub struct AccessBump {
     pub last_accessed_at: i64,
 }
 
+/// Committed automatic collapse, including the direction selected under the lock.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DuplicateSupersede {
+    pub archived: MemoryId,
+    pub survivor: MemoryId,
+    pub seq: u64,
+}
+
 /// A minimal projection of a memory row for the consolidation scan: only the
 /// fields the job and its survivor policy need. Avoids loading full notes/links.
 #[derive(Clone, Debug)]
@@ -204,6 +212,7 @@ pub struct ConsolidationCandidate {
     pub namespace: Namespace,
     pub importance: u8,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub human_curated: bool,
 }
 
 pub use core::RecalRow;

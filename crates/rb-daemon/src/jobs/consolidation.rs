@@ -22,14 +22,16 @@ pub struct MemoryMeta {
     pub id: MemoryId,
     pub importance: u8,
     pub created_at: chrono::DateTime<chrono::Utc>,
+    pub human_curated: bool,
 }
 
 /// Choose the survivor of a duplicate cluster deterministically.
 ///
 /// Order of preference (each later key only breaks ties of all earlier keys):
-/// 1. highest `importance`,
-/// 2. newest `created_at`,
-/// 3. lexicographically-smallest id string (total, stable final tiebreak).
+/// 1. human-curated rows,
+/// 2. highest `importance`,
+/// 3. newest `created_at`,
+/// 4. lexicographically-smallest id string (total, stable final tiebreak).
 ///
 /// Returns the chosen id. `candidates` must be non-empty; an empty slice is a
 /// caller bug and yields `None` so the caller can skip the cluster rather than
@@ -38,8 +40,9 @@ pub fn pick_survivor(candidates: &[MemoryMeta]) -> Option<MemoryId> {
     candidates
         .iter()
         .max_by(|a, b| {
-            a.importance
-                .cmp(&b.importance)
+            a.human_curated
+                .cmp(&b.human_curated)
+                .then_with(|| a.importance.cmp(&b.importance))
                 .then_with(|| a.created_at.cmp(&b.created_at))
                 // For the FINAL tiebreak we want the SMALLEST id to win. `max_by`
                 // returns the greatest element, so invert the id comparison:
@@ -84,7 +87,14 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
     let candidates = store
         .candidates_for_consolidation(config.batch_limit)
         .await?;
+    consolidate_candidates(store, config, candidates).await
+}
 
+async fn consolidate_candidates(
+    store: &StoreHandle,
+    config: &ConsolidationConfig,
+    candidates: Vec<Candidate>,
+) -> Result<JobSummary> {
     let mut summary = JobSummary::default();
     let mut consumed: HashSet<String> = HashSet::new();
 
@@ -127,15 +137,17 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
             id: cand.id.clone(),
             importance: cand.importance,
             created_at: cand.created_at,
+            human_curated: cand.human_curated,
         });
         for d in &live_dups {
             cluster.push(MemoryMeta {
                 id: d.id.clone(),
                 importance: d.importance,
                 created_at: d.created_at,
+                human_curated: d.human_curated,
             });
         }
-        let Some(survivor_id) = pick_survivor(&cluster) else {
+        let Some(mut survivor_id) = pick_survivor(&cluster) else {
             // Cluster is non-empty here, so this is unreachable in practice; skip
             // defensively rather than panic.
             summary.skipped += 1;
@@ -149,9 +161,10 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
                 continue;
             }
             match supersede_member(store, &cand.namespace, &member.id, &survivor_id).await? {
-                MemberOutcome::Changed => {
+                MemberOutcome::Changed(receipt) => {
                     summary.changed += 1;
-                    consumed.insert(member.id.to_string());
+                    consumed.insert(receipt.archived.to_string());
+                    survivor_id = receipt.survivor;
                 }
                 MemberOutcome::Preserved => {
                     summary.skipped += 1;
@@ -202,10 +215,10 @@ pub async fn run(store: &StoreHandle, config: &ConsolidationConfig) -> Result<Jo
 /// How one member's guarded supersede ended (#501): the job discriminates a
 /// benign member-side race loss from a dead GROUP target so `run` can skip
 /// one member vs abandon the whole cluster.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum MemberOutcome {
-    /// The member was superseded into the survivor.
-    Changed,
+    /// The actual direction selected after transactional curation revalidation.
+    Changed(rb_store::DuplicateSupersede),
     /// Authored fields or safety metadata changed after candidate selection.
     Preserved,
     /// The member itself was resolved by a concurrent writer; the survivor
@@ -242,8 +255,8 @@ async fn supersede_member(
         .supersede_duplicate(namespace.clone(), member.clone(), survivor.clone())
         .await
     {
-        Ok(true) => Ok(MemberOutcome::Changed),
-        Ok(false) => Ok(MemberOutcome::Preserved),
+        Ok(Some(receipt)) => Ok(MemberOutcome::Changed(receipt)),
+        Ok(None) => Ok(MemberOutcome::Preserved),
         Err(rb_types::Error::StalePlan(reason)) => {
             // Disambiguate WHICH side went stale by re-reading the survivor:
             // still current => the member lost a benign race; otherwise the
@@ -286,6 +299,7 @@ mod tests {
             importance,
             created_at: chrono::DateTime::<chrono::Utc>::from_timestamp(created_secs, 0)
                 .expect("valid timestamp"),
+            human_curated: false,
         }
     }
 
@@ -312,6 +326,17 @@ mod tests {
             pick_survivor(&[a, b.clone()]),
             Some(b.id),
             "highest importance must win regardless of recency"
+        );
+    }
+
+    #[test]
+    fn curated_row_beats_higher_priority_and_newer_distractor() {
+        let mut curated = meta(3, 100);
+        curated.human_curated = true;
+        let distractor = meta(10, 500);
+        assert_eq!(
+            pick_survivor(&[curated.clone(), distractor]),
+            Some(curated.id)
         );
     }
 
@@ -403,7 +428,7 @@ mod tests {
             .await
             .unwrap();
         assert!(
-            matches!(outcome, MemberOutcome::Changed),
+            matches!(outcome, MemberOutcome::Changed(_)),
             "an unresolved member is superseded"
         );
         let got = handle
@@ -413,6 +438,66 @@ mod tests {
             .unwrap();
         assert_eq!(got.superseded_by.as_ref(), Some(&survivor_id));
 
+        handle.shutdown().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn curation_after_candidate_scan_redirects_the_remaining_cluster() {
+        let dir = tempfile::tempdir().unwrap();
+        let handle = StoreHandle::start(dir.path().join("curated-cluster.db"), DIM, 2).unwrap();
+        let ns = Namespace::Project("curated-cluster".into());
+        let mut protected = vnote(
+            &ns,
+            "Production uses PostgreSQL; SQLite is only for tests.",
+            4,
+        );
+        protected.created_at -= chrono::Duration::seconds(2);
+        let mut planned = vnote(&ns, &protected.content, 9);
+        planned.created_at -= chrono::Duration::seconds(1);
+        let remaining = vnote(&ns, &protected.content, 6);
+        let (protected_id, planned_id, remaining_id) = (
+            protected.id.clone(),
+            planned.id.clone(),
+            remaining.id.clone(),
+        );
+        for memory in [protected, planned, remaining] {
+            handle.write(memory, Some(vec![1.0; DIM])).await.unwrap();
+        }
+        let candidates = handle.candidates_for_consolidation(10).await.unwrap();
+        handle
+            .update(
+                ns.clone(),
+                protected_id.clone(),
+                rb_types::MemoryUpdates {
+                    human_curated: Some(true),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        let expected = handle
+            .get(ns.clone(), protected_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        let summary = consolidate_candidates(&handle, &cfg(0.95, 10), candidates)
+            .await
+            .unwrap();
+        assert_eq!(summary.changed, 2);
+        let current = handle
+            .get(ns.clone(), protected_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            current, expected,
+            "the curated authored row must stay unchanged"
+        );
+        for id in [planned_id, remaining_id] {
+            let archived = handle.get(ns.clone(), id).await.unwrap().unwrap();
+            assert_eq!(archived.superseded_by.as_ref(), Some(&protected_id));
+            assert!(archived.archived_at.is_some());
+        }
         handle.shutdown().await;
     }
 

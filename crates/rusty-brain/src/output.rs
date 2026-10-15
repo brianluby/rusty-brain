@@ -605,11 +605,20 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
     }
 
     let versions = history.chain.len();
+    let bounds = if history.chain_limit == 0 && history.edge_limit == 0 {
+        "applied row limits unavailable".to_string()
+    } else {
+        format!(
+            "applied bounds: depth={}, chain={}, edges={}",
+            history.depth, history.chain_limit, history.edge_limit
+        )
+    };
     let mut out = format!(
-        "Decision history in {} ({} version{})\n",
+        "Decision history in {} ({} version{}; {})\n",
         history.namespace,
         versions,
-        if versions == 1 { "" } else { "s" }
+        if versions == 1 { "" } else { "s" },
+        bounds
     );
     for (i, entry) in history.chain.iter().enumerate() {
         let marker = if entry.is_target { "->" } else { "  " };
@@ -640,6 +649,103 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
             flags,
             entry.summary,
         ));
+        let predecessors = if entry.predecessors.is_empty() {
+            "none in bounded result".to_string()
+        } else {
+            entry
+                .predecessors
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
+        out.push_str(&format!("       predecessors (visible): {predecessors}\n"));
+        if let Some(successor) = &entry.superseded_by {
+            out.push_str(&format!("       successor: {successor}\n"));
+        }
+        if entry.is_target {
+            if let Some(evidence) = &entry.evidence {
+                let source_status = match evidence.source_status {
+                    rb_types::HistorySourceStatus::Unavailable => {
+                        "unavailable (no stored source locator)"
+                    }
+                    rb_types::HistorySourceStatus::RecordedUnverified => {
+                        "recorded_unverified (not fetched or validated)"
+                    }
+                };
+                let anchors = evidence
+                    .anchors
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let anchors = if anchors.is_empty() {
+                    "none".to_string()
+                } else {
+                    anchors
+                };
+                let channel = evidence
+                    .origin_channel
+                    .as_ref()
+                    .map(|channel| channel.as_str().to_string())
+                    .unwrap_or_else(|| "unavailable".to_string());
+                let updated_at = evidence
+                    .updated_at
+                    .as_ref()
+                    .map(|time| time.to_rfc3339())
+                    .unwrap_or_else(|| "unavailable".to_string());
+                let last_accessed_at = evidence
+                    .last_accessed_at
+                    .as_ref()
+                    .map(|time| time.to_rfc3339())
+                    .unwrap_or_else(|| "unavailable".to_string());
+                out.push_str(
+                    "       target detail (stored reference data; claim and sources are unverified):\n",
+                );
+                out.push_str(&format!("         full claim: {}\n", evidence.content));
+                out.push_str(&format!("         context: {}\n", evidence.context));
+                out.push_str(&format!(
+                    "         type: {}; keywords: {:?}; tags: {:?}\n",
+                    evidence
+                        .memory_type
+                        .as_ref()
+                        .map(rb_types::MemoryType::as_str)
+                        .unwrap_or("unavailable"),
+                    evidence.keywords,
+                    evidence.tags
+                ));
+                out.push_str(&format!(
+                    "         producer: user={}, host={}, agent={}, source={}, channel={}\n",
+                    entry.origin_user.as_deref().unwrap_or("unavailable"),
+                    entry.origin_host.as_deref().unwrap_or("unavailable"),
+                    entry.origin_agent.as_deref().unwrap_or("unavailable"),
+                    entry.origin_source.as_deref().unwrap_or("unavailable"),
+                    channel
+                ));
+                out.push_str(&format!(
+                    "         trust: {}; human-curated: {} (unattended-maintenance protection only; not trust/eligibility)\n",
+                    evidence.trust_class.as_str(),
+                    if evidence.human_curated { "yes" } else { "no" }
+                ));
+                out.push_str(&format!(
+                    "         created: {}; updated: {}; last accessed: {}\n",
+                    entry.created_at.to_rfc3339(),
+                    updated_at,
+                    last_accessed_at
+                ));
+                out.push_str(&format!(
+                    "         session: {}; related files: {:?}; anchors: {}\n",
+                    evidence.session_id.as_deref().unwrap_or("unavailable"),
+                    evidence.related_files,
+                    anchors
+                ));
+                out.push_str(&format!("         source status: {source_status}\n"));
+            } else {
+                out.push_str(
+                    "       target detail/provenance unavailable (the responding daemon/payload does not supply full evidence; source status unavailable)\n",
+                );
+            }
+        }
         for edge in history.edges.iter().filter(|e| e.local == entry.id) {
             let contested = if edge.other_contested {
                 " [contested]"
@@ -665,10 +771,13 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
     if !history.chain.iter().any(|e| e.current) {
         out.push_str("(no current version: every chain member is archived)\n");
     }
+    if history.cycle_detected {
+        out.push_str("(cycle detected within the bounded supersede chain)\n");
+    }
     if history.truncated {
         out.push_str(
-            "(truncated: the depth or edge bound was reached — raise --depth, or \
-             anchor `history` on an end-of-chain id to continue)\n",
+            "(truncated: the depth, chain-member, or active-edge bound omitted rows; \
+             use another chain ID to continue the bounded inspection)\n",
         );
     }
     out.trim_end().to_string()
@@ -873,10 +982,11 @@ pub fn render_forget_outcome(outcome: &rb_types::ForgetOutcome, json: bool) -> S
         });
     }
     let mut out = format!(
-        "forget ({}): archived={} purged={} eligible={} remaining={}",
+        "forget ({}): archived={} purged={} skipped={} eligible={} remaining={}",
         outcome.mode.as_str(),
         outcome.archived,
         outcome.purged,
+        outcome.skipped,
         outcome.total_eligible,
         outcome.remaining
     );
@@ -1255,6 +1365,7 @@ mod tests {
             source: "docs/adr.md".to_string(),
             tags: Vec::new(),
             anchors: Vec::new(),
+            human_curated: false,
         }];
 
         let human = render_import_plan(&items, false);
@@ -1280,6 +1391,7 @@ mod tests {
             source: format!("docs/{token}.md"),
             tags: Vec::new(),
             anchors: Vec::new(),
+            human_curated: false,
         }];
 
         let human = render_import_plan(&items, false);
@@ -1447,6 +1559,7 @@ mod tests {
             last_accessed_at: None,
             origin_source: Some("cli".to_string()),
             origin_user: None,
+            human_curated: false,
         };
         let b = rb_types::ReviewMember {
             id: rb_types::MemoryId::new(),
@@ -1458,6 +1571,7 @@ mod tests {
             last_accessed_at: Some(1_710_000_000),
             origin_source: Some("hook".to_string()),
             origin_user: None,
+            human_curated: false,
         };
         let key = rb_types::review_item_key(
             rb_types::ReviewReason::NearDuplicate,
@@ -1682,12 +1796,14 @@ mod tests {
             mode: rb_types::ForgetMode::Hard,
             archived: 0,
             purged: 2,
+            skipped: 1,
             total_eligible: 5,
             remaining: 3,
             failure: Some("purge of abc failed: injected".to_string()),
         };
         let human = render_forget_outcome(&outcome, false);
         assert!(human.contains("purged=2"), "{human}");
+        assert!(human.contains("skipped=1"), "{human}");
         assert!(
             human.contains("FAILED") && human.contains("injected"),
             "partial failure must be loud: {human}"
@@ -1706,6 +1822,7 @@ mod tests {
             mode: rb_types::ForgetMode::Hard,
             archived: 0,
             purged: 2,
+            skipped: 0,
             total_eligible: 3,
             remaining: 1,
             failure: None,
@@ -1713,6 +1830,7 @@ mod tests {
         let out = render_forget_outcome(&outcome, false);
         assert!(out.contains("hard"), "{out}");
         assert!(out.contains("purged=2"), "{out}");
+        assert!(out.contains("skipped=0"), "{out}");
         assert!(out.contains("remaining=1"), "{out}");
         let parsed: rb_types::ForgetOutcome =
             serde_json::from_str(&render_forget_outcome(&outcome, true)).unwrap();
@@ -1774,9 +1892,11 @@ mod tests {
         rb_types::MemoryHistory {
             namespace: "project:rusty-brain".to_string(),
             depth: 100,
+            chain_limit: 200,
+            edge_limit: 200,
             chain: vec![
                 rb_types::HistoryEntry {
-                    id: old_id,
+                    id: old_id.clone(),
                     summary: "we use rabbitmq".to_string(),
                     importance: 7,
                     confidence: 1.0,
@@ -1786,6 +1906,8 @@ mod tests {
                     current: false,
                     is_target: false,
                     superseded_by: Some(new_id.clone()),
+                    predecessors: Vec::new(),
+                    evidence: None,
                     origin_user: Some("alice".to_string()),
                     origin_host: None,
                     origin_agent: None,
@@ -1802,10 +1924,32 @@ mod tests {
                     current: true,
                     is_target: true,
                     superseded_by: None,
-                    origin_user: None,
-                    origin_host: None,
-                    origin_agent: None,
-                    origin_source: None,
+                    predecessors: vec![old_id],
+                    evidence: Some(rb_types::HistoryEvidence {
+                        content: "Use Kafka for new services, except the legacy bridge remains on RabbitMQ.".to_string(),
+                        context: "The bridge migration is not complete; do not change its broker yet.".to_string(),
+                        keywords: vec!["kafka".to_string()],
+                        tags: vec!["decision".to_string()],
+                        memory_type: Some(rb_types::MemoryType::ArchitectureDecision),
+                        updated_at: Some(now),
+                        last_accessed_at: Some(now),
+                        related_files: vec!["src/events.rs".to_string()],
+                        origin_channel: Some(rb_types::WriteChannel::Cli),
+                        session_id: Some("session-42".to_string()),
+                        anchors: vec![rb_types::MemoryAnchor {
+                            kind: rb_types::AnchorKind::File,
+                            value: "src/events.rs".to_string(),
+                            start_line: Some(12),
+                            end_line: Some(18),
+                        }],
+                        trust_class: rb_types::TrustClass::HumanConfirmed,
+                        human_curated: true,
+                        source_status: rb_types::HistorySourceStatus::RecordedUnverified,
+                    }),
+                    origin_user: Some("bob".to_string()),
+                    origin_host: Some("devbox".to_string()),
+                    origin_agent: Some("codex".to_string()),
+                    origin_source: Some("cli".to_string()),
                 },
             ],
             edges: vec![rb_types::HistoryEdge {
@@ -1819,6 +1963,7 @@ mod tests {
                 other_contested: true,
                 created_at: now,
             }],
+            cycle_detected: false,
             truncated: false,
         }
     }
@@ -1846,6 +1991,64 @@ mod tests {
     }
 
     #[test]
+    fn human_history_exposes_target_evidence_and_followable_chain_ids() {
+        let history = sample_history();
+        let old_id = history.chain[0].id.to_string();
+        let new_id = history.chain[1].id.to_string();
+        let out = render_history(&history, false);
+        assert!(out
+            .contains("Use Kafka for new services, except the legacy bridge remains on RabbitMQ."));
+        assert!(out.contains("The bridge migration is not complete; do not change its broker yet."));
+        assert!(out.contains(&format!("successor: {new_id}")));
+        assert!(out.contains(&format!("predecessors (visible): {old_id}")));
+        assert!(out.contains("channel=cli"));
+        assert!(out.contains("producer: user=bob"));
+        assert!(out.contains("host=devbox"));
+        assert!(out.contains("agent=codex"));
+        assert!(out.contains("source=cli"));
+        assert!(out.contains("trust: human_confirmed"));
+        assert!(out.contains("human-curated: yes"));
+        assert!(out.contains("not fetched or validated"));
+        assert!(out.contains("src/events.rs"));
+        assert!(out.contains("session-42"));
+        assert!(out.contains("created:"));
+        assert!(out.contains("updated:"));
+        assert!(out.contains("last accessed:"));
+    }
+
+    #[test]
+    fn human_history_marks_legacy_source_unavailable() {
+        let mut history = sample_history();
+        let target = &mut history.chain[1];
+        target.origin_user = None;
+        target.origin_host = None;
+        target.origin_agent = None;
+        target.origin_source = None;
+        let evidence = target.evidence.as_mut().unwrap();
+        evidence.anchors.clear();
+        evidence.related_files.clear();
+        evidence.session_id = None;
+        evidence.origin_channel = None;
+        evidence.source_status = rb_types::HistorySourceStatus::Unavailable;
+
+        let out = render_history(&history, false);
+        assert!(out.contains("source status: unavailable (no stored source locator)"));
+        assert!(out.contains(
+            "producer: user=unavailable, host=unavailable, agent=unavailable, source=unavailable, channel=unavailable"
+        ));
+        assert!(out.contains("related files: []; anchors: none"));
+    }
+
+    #[test]
+    fn human_history_marks_missing_legacy_evidence_unavailable() {
+        let mut history = sample_history();
+        history.chain[1].evidence = None;
+        let out = render_history(&history, false);
+        assert!(out.contains("target detail/provenance unavailable"));
+        assert!(out.contains("source status unavailable"));
+    }
+
+    #[test]
     fn human_history_orders_oldest_first_with_indices() {
         let history = sample_history();
         let out = render_history(&history, false);
@@ -1860,10 +2063,15 @@ mod tests {
     fn human_history_notes_truncation_and_a_fully_archived_chain() {
         let mut history = sample_history();
         history.truncated = true;
+        history.chain_limit = 7;
+        history.edge_limit = 8;
+        history.cycle_detected = true;
         history.chain[1].archived = true;
         history.chain[1].current = false;
         let out = render_history(&history, false);
         assert!(out.contains("truncated"), "truncation note: {out}");
+        assert!(out.contains("applied bounds: depth=100, chain=7, edges=8"));
+        assert!(out.contains("cycle detected within the bounded supersede chain"));
         assert!(
             out.contains("no current version"),
             "all-archived note: {out}"
@@ -1875,11 +2083,33 @@ mod tests {
         let history = sample_history();
         let out = render_history(&history, true);
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
+        let successor_id = history.chain[1].id.to_string();
         assert_eq!(parsed["namespace"].as_str(), Some("project:rusty-brain"));
         assert_eq!(parsed["chain"].as_array().map(Vec::len), Some(2));
         assert_eq!(parsed["chain"][1]["current"].as_bool(), Some(true));
         assert_eq!(parsed["chain"][1]["is_target"].as_bool(), Some(true));
         assert_eq!(parsed["chain"][0]["archived"].as_bool(), Some(true));
+        assert_eq!(
+            parsed["chain"][0]["superseded_by"].as_str(),
+            Some(successor_id.as_str())
+        );
+        assert_eq!(parsed["chain_limit"].as_u64(), Some(200));
+        assert_eq!(
+            parsed["chain"][1]["evidence"]["content"].as_str(),
+            Some("Use Kafka for new services, except the legacy bridge remains on RabbitMQ.")
+        );
+        assert_eq!(
+            parsed["chain"][1]["evidence"]["source_status"].as_str(),
+            Some("recorded_unverified")
+        );
+        assert_eq!(
+            parsed["chain"][1]["evidence"]["anchors"][0]["value"].as_str(),
+            Some("src/events.rs")
+        );
+        assert_eq!(
+            parsed["chain"][1]["evidence"]["human_curated"].as_bool(),
+            Some(true)
+        );
         assert_eq!(
             parsed["edges"][0]["link_type"].as_str(),
             Some("Contradicts")

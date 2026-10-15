@@ -210,10 +210,10 @@ pub fn check_model_identity(provider: Option<&str>, meta: Option<&str>) -> Docto
             status: CheckStatus::Fail,
             detail: format!("provider '{p}' does not match DB meta '{m}'"),
             hint: Some(
-                "the daemon fails closed on a model swap; either restore the \
+                "the daemon fails closed on an embedding-space change; either restore the \
                  original provider or opt in with `rusty-brain serve \
-                 --accept-model-change` and run `rusty-brain reembed` until \
-                 changed=0"
+                 --accept-model-change` and run `rusty-brain reembed` until no \
+                 pending rows remain; skipped rows are still pending"
                     .to_string(),
             ),
         },

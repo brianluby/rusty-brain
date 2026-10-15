@@ -362,6 +362,7 @@ async fn run_client(
             context,
             tags,
             supersedes,
+            curated,
             file,
             commit,
             symbol,
@@ -423,6 +424,7 @@ async fn run_client(
                 let supersedes = supersedes
                     .map(|old| parse_id(&old).context("--supersedes must be a memory UUID"))
                     .transpose()?;
+                let allow_curated_supersede = supersedes.is_some();
                 // Evidence (Vikunja #63): the CLI is the human's typed
                 // surface — it may claim a CI measurement (requires a
                 // commit anchor, enforced daemon-side) or a human
@@ -437,7 +439,7 @@ async fn run_client(
                     evidence_confirmed.map(|by| rb_types::CaptureEvidence::HumanConfirmed { by })
                 };
                 let id = client
-                    .remember_anchored(
+                    .remember_anchored_with_intent(
                         content,
                         context,
                         memory_type,
@@ -449,6 +451,8 @@ async fn run_client(
                         anchors,
                         supersedes,
                         evidence,
+                        curated,
+                        allow_curated_supersede,
                     )
                     .await
                     .context("remember failed")?;
@@ -568,6 +572,8 @@ async fn run_client(
             tags,
             context,
             confidence,
+            curated,
+            uncurate,
         } => {
             let id = parse_id(&id).context("invalid memory id")?;
             let updates = rb_types::MemoryUpdates {
@@ -579,6 +585,13 @@ async fn run_client(
                 tags: if tags.is_empty() { None } else { Some(tags) },
                 context,
                 confidence,
+                human_curated: if curated {
+                    Some(true)
+                } else if uncurate {
+                    Some(false)
+                } else {
+                    None
+                },
             };
             client.update(id, updates).await.context("update failed")?;
             println!("{}", output::render_updated(json));
@@ -963,7 +976,8 @@ async fn run_client(
                 // stderr so `--json` stdout stays machine-parseable.
                 eprintln!(
                     "note: {} memories need re-embedding; run \
-                     `rusty-brain reembed` until changed=0 to recompute their vectors",
+                     `rusty-brain reembed` until no pending rows remain \
+                     (skipped rows remain pending)",
                     outcome.reembed_pending
                 );
             }

@@ -47,7 +47,7 @@ pub async fn run(
             Ok(outcome) => {
                 summary.scanned += outcome.total_eligible;
                 summary.changed += outcome.archived;
-                summary.skipped += outcome.remaining;
+                summary.skipped += outcome.skipped + outcome.remaining;
                 if let Some(failure) = outcome.failure {
                     failures.push(format!("{ns_label}: {failure}"));
                 }

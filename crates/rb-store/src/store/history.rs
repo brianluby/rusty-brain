@@ -3,15 +3,14 @@
 //! — these run on the daemon's READ pool, never through the writer, so the
 //! history path issues zero writer ops (W1.8) by construction.
 //!
-//! Everything is derived from EXISTING rows (HIST-2): the
-//! `memories.superseded_by` pointer (the atomic supersede's artifact), the
-//! `archived_at`/`confidence`/`origin_*` columns, and `memory_links`. No new
-//! persistence, no schema change.
+//! The projection uses existing `memories`, `memory_links`, and
+//! `memory_anchors` rows. It adds no history evidence store and never resolves
+//! source pointers.
 
 use super::internal::{from_ts, parse_id};
 use super::*;
-use rb_types::{HistoryEdge, HistoryEntry, MemoryHistory};
-use std::collections::HashSet;
+use rb_types::{HistoryEdge, HistoryEntry, MemoryHistory, MemoryType};
+use std::collections::{HashMap, HashSet};
 
 /// The link types HIST-1 surfaces on the timeline. `supersedes` rides the
 /// chain itself and `implements` is out of the PRD's edge scope.
@@ -47,9 +46,9 @@ impl SqliteStore {
     /// chain in BOTH directions (each direction bounded by `depth` hops, the
     /// whole chain by `chain_limit` members) plus the active
     /// `contradicts`/`extends`/`references` edges touching chain members
-    /// (bounded by `edge_limit`). Pure reads — safe on a read-pool
-    /// connection: one recursive-CTE query per direction (the
-    /// `graph_neighbors` shape), one edge query, one contested batch.
+    /// (bounded by `edge_limit`). In autocommit, a deferred read transaction
+    /// pins one SQLite snapshot across these queries; an enclosing transaction
+    /// is reused rather than nested.
     ///
     /// Semantics guarantees:
     /// - Namespace purity: every chain member and BOTH endpoints of every edge
@@ -75,10 +74,38 @@ impl SqliteStore {
         chain_limit: usize,
         edge_limit: usize,
     ) -> Result<MemoryHistory> {
+        self.memory_history_snapshot(ns, id, depth, chain_limit, edge_limit, || {})
+    }
+
+    fn memory_history_snapshot<F>(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+        depth: u32,
+        chain_limit: usize,
+        edge_limit: usize,
+        after_target: F,
+    ) -> Result<MemoryHistory>
+    where
+        F: FnOnce(),
+    {
+        let tx = if self.conn.is_autocommit() {
+            Some(
+                rusqlite::Transaction::new_unchecked(
+                    &self.conn,
+                    rusqlite::TransactionBehavior::Deferred,
+                )
+                .map_err(storage)?,
+            )
+        } else {
+            None
+        };
         let ns_str = ns.as_db_string();
         let target = self
             .history_row(&ns_str, id)?
             .ok_or_else(|| Error::NotFound(id.clone()))?;
+        // Test seam: interleave a second-connection write before the walks.
+        after_target();
 
         // Per-direction budget: the target always holds one chain slot.
         let budget = chain_limit.saturating_sub(1);
@@ -166,6 +193,25 @@ impl SqliteStore {
             .chain(std::iter::once(target.entry))
             .chain(fwd.rows.into_iter().map(|(_, r)| r.entry))
             .collect();
+        // Publish only predecessor ids represented in this namespace-scoped,
+        // bounded chain. The direct successor pointer is filtered in SQL.
+        let supersedes: Vec<(MemoryId, MemoryId)> = chain
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .superseded_by
+                    .as_ref()
+                    .map(|next| (entry.id.clone(), next.clone()))
+            })
+            .collect();
+        for entry in &mut chain {
+            entry.predecessors = supersedes
+                .iter()
+                .filter(|(_, next)| next == &entry.id)
+                .map(|(previous, _)| previous.clone())
+                .collect();
+        }
+        let cycle_detected = has_supersede_cycle(&chain);
 
         // Edges: active links touching any chain member, both endpoints
         // scoped to `ns` and non-archived (the `active_contradicts` rigor).
@@ -192,34 +238,66 @@ impl SqliteStore {
             current.current = true;
         }
 
-        Ok(MemoryHistory {
+        let history = MemoryHistory {
             namespace: ns_str,
             depth,
+            chain_limit,
+            edge_limit,
             chain,
             edges,
+            cycle_detected,
             truncated,
-        })
+        };
+        if let Some(tx) = tx {
+            tx.commit().map_err(storage)?;
+        }
+        Ok(history)
     }
 
     /// Fetch one chain-member row scoped to `ns`; `Ok(None)` when the id is
     /// missing OR lives in another namespace (indistinguishable on purpose).
     fn history_row(&self, ns_str: &str, id: &MemoryId) -> Result<Option<ChainRow>> {
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT memory_id, summary, content, importance, confidence, created_at,
-                        archived_at, superseded_by, origin_user, origin_host, origin_agent,
-                        origin_source
-                 FROM memories WHERE memory_id = ?1 AND namespace = ?2",
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt
-            .query(rusqlite::params![id.to_string(), ns_str])
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        match rows.next().map_err(|e| Error::Storage(e.to_string()))? {
-            Some(row) => Ok(Some(decode_chain_row(row)?)),
-            None => Ok(None),
+        let mut target = {
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT m.memory_id, m.summary, m.content, m.importance, m.confidence,
+                            m.created_at, m.archived_at,
+                            CASE WHEN EXISTS (
+                                SELECT 1 FROM memories nxt
+                                 WHERE nxt.memory_id = m.superseded_by
+                                   AND nxt.namespace = m.namespace
+                            ) THEN m.superseded_by END,
+                            m.origin_user, m.origin_host, m.origin_agent, m.origin_source,
+                            m.context, m.keywords, m.tags, m.memory_type, m.updated_at,
+                            m.last_accessed_at, m.related_files, m.origin_channel,
+                            m.session_id, m.trust_class, m.human_curated
+                     FROM memories m WHERE m.memory_id = ?1 AND m.namespace = ?2",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query(rusqlite::params![id.to_string(), ns_str])
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            match rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+                Some(row) => Some(decode_target_row(row)?),
+                None => None,
+            }
+        };
+        if let Some(target) = &mut target {
+            let anchors = load_history_anchors(&self.conn, &target.entry.id, ns_str)?;
+            if let Some(evidence) = &mut target.entry.evidence {
+                evidence.anchors = anchors;
+                evidence.source_status = if evidence.anchors.is_empty()
+                    && evidence.related_files.is_empty()
+                    && evidence.session_id.is_none()
+                {
+                    rb_types::HistorySourceStatus::Unavailable
+                } else {
+                    rb_types::HistorySourceStatus::RecordedUnverified
+                };
+            }
         }
+        Ok(target)
     }
 
     /// Walk one supersede direction with a single bounded recursive CTE (the
@@ -277,8 +355,13 @@ impl SqliteStore {
         let sql = format!(
             "WITH RECURSIVE {cte}
              SELECT m.memory_id, m.summary, m.content, m.importance, m.confidence,
-                    m.created_at, m.archived_at, m.superseded_by, m.origin_user,
-                    m.origin_host, m.origin_agent, m.origin_source, x.hops
+                    m.created_at, m.archived_at,
+                    CASE WHEN EXISTS (
+                        SELECT 1 FROM memories nxt
+                         WHERE nxt.memory_id = m.superseded_by
+                           AND nxt.namespace = m.namespace
+                    ) THEN m.superseded_by END,
+                    m.origin_user, m.origin_host, m.origin_agent, m.origin_source, x.hops
                FROM (SELECT id, MIN(hop) AS hops FROM walk WHERE id <> ?1 GROUP BY id) x
                JOIN memories m ON m.memory_id = x.id
               ORDER BY x.hops ASC, m.created_at ASC, m.memory_id ASC
@@ -335,7 +418,7 @@ impl SqliteStore {
         chain_ids: &[MemoryId],
         edge_limit: usize,
     ) -> Result<(Vec<HistoryEdge>, bool)> {
-        if chain_ids.is_empty() || edge_limit == 0 {
+        if chain_ids.is_empty() {
             return Ok((Vec::new(), false));
         }
         // ?1 = namespace; ?2..: chain ids; trailing param = LIMIT probe.
@@ -475,6 +558,8 @@ fn decode_chain_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
             current: false,
             is_target: false,
             superseded_by,
+            predecessors: Vec::new(),
+            evidence: None,
             origin_user: row.get(8).map_err(storage)?,
             origin_host: row.get(9).map_err(storage)?,
             origin_agent: row.get(10).map_err(storage)?,
@@ -483,12 +568,126 @@ fn decode_chain_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
     })
 }
 
+fn decode_target_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
+    let mut target = decode_chain_row(row)?;
+    let related_files = parse_history_array(&row.get::<_, String>(18).map_err(storage)?)?;
+    let session_id = row.get::<_, Option<String>>(20).map_err(storage)?;
+    let evidence = rb_types::HistoryEvidence {
+        content: row.get(2).map_err(storage)?,
+        context: row.get(12).map_err(storage)?,
+        keywords: parse_history_array(&row.get::<_, String>(13).map_err(storage)?)?,
+        tags: parse_history_array(&row.get::<_, String>(14).map_err(storage)?)?,
+        memory_type: Some(MemoryType::parse(
+            &row.get::<_, String>(15).map_err(storage)?,
+        )?),
+        updated_at: Some(from_ts(row.get::<_, i64>(16).map_err(storage)?)?),
+        last_accessed_at: row
+            .get::<_, Option<i64>>(17)
+            .map_err(storage)?
+            .map(from_ts)
+            .transpose()?,
+        related_files,
+        origin_channel: row
+            .get::<_, Option<String>>(19)
+            .map_err(storage)?
+            .map(|value| rb_types::WriteChannel::parse(&value))
+            .transpose()?,
+        session_id,
+        anchors: Vec::new(),
+        trust_class: rb_types::TrustClass::parse(&row.get::<_, String>(21).map_err(storage)?)?,
+        human_curated: row.get(22).map_err(storage)?,
+        source_status: rb_types::HistorySourceStatus::Unavailable,
+    };
+    target.entry.evidence = Some(evidence);
+    Ok(target)
+}
+
+fn parse_history_array(value: &str) -> Result<Vec<String>> {
+    serde_json::from_str(value).map_err(|e| Error::Storage(e.to_string()))
+}
+
+fn load_history_anchors(
+    conn: &rusqlite::Connection,
+    id: &MemoryId,
+    ns_str: &str,
+) -> Result<Vec<rb_types::MemoryAnchor>> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT kind, path, start_line, end_line, ref
+             FROM memory_anchors WHERE memory_id = ?1 AND namespace = ?2 ORDER BY id",
+        )
+        .map_err(storage)?;
+    let mut rows = stmt
+        .query(rusqlite::params![id.to_string(), ns_str])
+        .map_err(storage)?;
+    let mut anchors = Vec::new();
+    while let Some(row) = rows.next().map_err(storage)? {
+        let kind = rb_types::parse_anchor_kind(&row.get::<_, String>(0).map_err(storage)?)?;
+        let value = row
+            .get::<_, Option<String>>(1)
+            .map_err(storage)?
+            .or(row.get::<_, Option<String>>(4).map_err(storage)?)
+            .ok_or_else(|| {
+                Error::Storage("memory_anchors row carries neither path nor ref".into())
+            })?;
+        let line = |index| -> Result<Option<u32>> {
+            row.get::<_, Option<i64>>(index)
+                .map_err(storage)?
+                .map(|value| {
+                    u32::try_from(value)
+                        .map_err(|_| Error::Storage("anchor line out of range in DB".into()))
+                })
+                .transpose()
+        };
+        anchors.push(rb_types::MemoryAnchor {
+            kind,
+            value,
+            start_line: line(2)?,
+            end_line: line(3)?,
+        });
+    }
+    Ok(anchors)
+}
+
+fn has_supersede_cycle(chain: &[HistoryEntry]) -> bool {
+    let members: HashSet<MemoryId> = chain.iter().map(|entry| entry.id.clone()).collect();
+    let next: HashMap<MemoryId, MemoryId> = chain
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .superseded_by
+                .as_ref()
+                .filter(|id| members.contains(*id))
+                .map(|next| (entry.id.clone(), next.clone()))
+        })
+        .collect();
+    let mut complete = HashSet::new();
+    for start in next.keys() {
+        let mut path = HashSet::new();
+        let mut current = start.clone();
+        while let Some(following) = next.get(&current) {
+            if !path.insert(current.clone()) {
+                return true;
+            }
+            if complete.contains(following) {
+                break;
+            }
+            current = following.clone();
+        }
+        complete.extend(path);
+    }
+    false
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used, clippy::panic)]
     use crate::store::Store as _;
     use crate::SqliteStore;
-    use rb_types::{LinkType, MemoryId, MemoryLink, MemoryNote, MemoryType, Namespace};
+    use rb_types::{
+        AnchorKind, LinkType, MemoryAnchor, MemoryId, MemoryLink, MemoryNote, MemoryType,
+        Namespace, TrustClass, WriteChannel,
+    };
 
     const DIM: usize = 8;
 
@@ -589,6 +788,280 @@ mod tests {
         assert_eq!(ea.origin_source.as_deref(), Some("cli"));
     }
 
+    #[test]
+    fn history_inspection_exposes_full_unverified_target_and_is_read_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let store = open(&path);
+        let ns = Namespace::Project("hist-evidence".to_string());
+
+        let prior = seed(&store, &ns, "Production database was previously undecided");
+        let mut target = MemoryNote::new(
+            ns.clone(),
+            "Production continues to use PostgreSQL; never use SQLite there.".to_string(),
+            MemoryType::ArchitectureDecision,
+            9,
+        );
+        target.summary = "Use PostgreSQL in production".to_string();
+        target.context =
+            "This excludes test fixtures; production persistence remains PostgreSQL.".to_string();
+        target.keywords = vec!["database".to_string(), "postgresql".to_string()];
+        target.tags = vec!["decision".to_string()];
+        target.related_files = vec!["src/storage.rs".to_string()];
+        target.anchors = vec![MemoryAnchor {
+            kind: AnchorKind::File,
+            value: "src/storage.rs".to_string(),
+            start_line: Some(12),
+            end_line: Some(14),
+        }];
+        target.origin_user = Some("alice".to_string());
+        target.origin_host = Some("devbox".to_string());
+        target.origin_agent = Some("claude-code".to_string());
+        target.origin_source = Some("cli".to_string());
+        target.origin_channel = Some(WriteChannel::Cli);
+        target.session_id = Some("session-94".to_string());
+        target.trust_class = TrustClass::HumanConfirmed;
+        target.human_curated = true;
+        target.access_count = 7;
+        target.last_accessed_at = Some(chrono::Utc::now() - chrono::Duration::hours(1));
+        let updated_at = target.updated_at.timestamp();
+        let last_accessed_at = target.last_accessed_at.as_ref().unwrap().timestamp();
+        let target_id = target.id.clone();
+        store.insert_memory(&target, Some(&[0.2f32; DIM])).unwrap();
+        // A malformed namespace mirror cannot attach a foreign locator to
+        // this target's evidence even though its memory id is valid.
+        let foreign_ns = Namespace::Project("hist-evidence-foreign".to_string());
+        store
+            .conn
+            .execute(
+                "INSERT INTO memory_anchors
+                     (memory_id, namespace, kind, path, start_line, end_line, ref)
+                 VALUES (?1, ?2, 'file', 'foreign/anchor.rs', NULL, NULL, NULL)",
+                rusqlite::params![target_id.to_string(), foreign_ns.as_db_string()],
+            )
+            .unwrap();
+        store.supersede(&prior, &target_id).unwrap();
+
+        let rival = seed(&store, &ns, "Production uses SQLite");
+        link(
+            &store,
+            &target_id,
+            &rival,
+            LinkType::Contradicts,
+            "the competing production claim",
+        );
+
+        let mut legacy = MemoryNote::new(
+            ns.clone(),
+            "Legacy claim without a source locator".to_string(),
+            MemoryType::ArchitectureDecision,
+            5,
+        );
+        legacy.summary = "Legacy claim".to_string();
+        let legacy_id = legacy.id.clone();
+        store.insert_memory(&legacy, Some(&[0.3f32; DIM])).unwrap();
+
+        let snapshot = |store: &SqliteStore| {
+            let mut stmt = store
+                .conn
+                .prepare(
+                    "SELECT memory_id, access_count, last_accessed_at
+                     FROM memories ORDER BY memory_id",
+                )
+                .unwrap();
+            let counters: Vec<(String, i64, Option<i64>)> = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap();
+            let rows = store
+                .conn
+                .query_row(
+                    "SELECT (SELECT COUNT(*) FROM memories),
+                            (SELECT COUNT(*) FROM memory_links),
+                            (SELECT COUNT(*) FROM memory_anchors)",
+                    [],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, i64>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    },
+                )
+                .unwrap();
+            let changes: i64 = store
+                .conn
+                .query_row("SELECT total_changes()", [], |row| row.get(0))
+                .unwrap();
+            (counters, rows, changes)
+        };
+        let before = snapshot(&store);
+        let history = store
+            .memory_history(&ns, &target_id, 100, 200, 200)
+            .unwrap();
+        let legacy_history = store
+            .memory_history(&ns, &legacy_id, 100, 200, 200)
+            .unwrap();
+        let after = snapshot(&store);
+        assert_eq!(after, before, "history must not change rows or counters");
+
+        let old = history
+            .chain
+            .iter()
+            .find(|entry| entry.id == prior)
+            .unwrap();
+        let current = history
+            .chain
+            .iter()
+            .find(|entry| entry.id == target_id)
+            .unwrap();
+        assert_eq!(old.superseded_by.as_ref(), Some(&target_id));
+        assert_eq!(current.predecessors, vec![prior.clone()]);
+        assert_eq!(current.origin_user.as_deref(), Some("alice"));
+        assert_eq!(current.origin_host.as_deref(), Some("devbox"));
+        assert_eq!(current.origin_agent.as_deref(), Some("claude-code"));
+        assert_eq!(current.origin_source.as_deref(), Some("cli"));
+        assert!(current.is_target && current.current && current.contested);
+        let evidence = current.evidence.as_ref().expect("target evidence");
+        assert_eq!(
+            evidence.content,
+            "Production continues to use PostgreSQL; never use SQLite there."
+        );
+        assert_eq!(
+            evidence.context,
+            "This excludes test fixtures; production persistence remains PostgreSQL."
+        );
+        assert_eq!(
+            evidence.keywords,
+            vec!["database".to_string(), "postgresql".to_string()]
+        );
+        assert_eq!(evidence.tags, vec!["decision".to_string()]);
+        assert_eq!(evidence.memory_type, Some(MemoryType::ArchitectureDecision));
+        assert_eq!(
+            evidence.updated_at.as_ref().map(|t| t.timestamp()),
+            Some(updated_at)
+        );
+        assert_eq!(
+            evidence.last_accessed_at.as_ref().map(|t| t.timestamp()),
+            Some(last_accessed_at)
+        );
+        assert_eq!(evidence.related_files, vec!["src/storage.rs".to_string()]);
+        assert_eq!(evidence.origin_channel, Some(WriteChannel::Cli));
+        assert_eq!(evidence.session_id.as_deref(), Some("session-94"));
+        assert_eq!(evidence.trust_class, TrustClass::HumanConfirmed);
+        assert!(evidence.human_curated);
+        assert_eq!(
+            evidence.source_status,
+            rb_types::HistorySourceStatus::RecordedUnverified
+        );
+        assert_eq!(
+            evidence.anchors,
+            vec![MemoryAnchor {
+                kind: AnchorKind::File,
+                value: "src/storage.rs".to_string(),
+                start_line: Some(12),
+                end_line: Some(14),
+            }]
+        );
+        let contradiction = history
+            .edges
+            .iter()
+            .find(|edge| edge.link_type == LinkType::Contradicts)
+            .expect("active contradiction");
+        assert_eq!(contradiction.other, rival);
+        assert_eq!(contradiction.other_summary, "Production uses SQLite");
+
+        let legacy_evidence = legacy_history.chain[0]
+            .evidence
+            .as_ref()
+            .expect("target projection exists for legacy row");
+        assert!(legacy_evidence.anchors.is_empty());
+        assert!(legacy_evidence.related_files.is_empty());
+        assert!(legacy_evidence.session_id.is_none());
+        assert_eq!(
+            legacy_evidence.source_status,
+            rb_types::HistorySourceStatus::Unavailable
+        );
+        assert!(legacy_history.chain[0].origin_user.is_none());
+        assert!(legacy_history.chain[0].origin_source.is_none());
+
+        drop(store);
+        let store = open(&path);
+        let persisted = store
+            .memory_history(&ns, &target_id, 100, 200, 200)
+            .unwrap();
+        assert_eq!(
+            persisted
+                .chain
+                .iter()
+                .find(|entry| entry.id == target_id)
+                .unwrap(),
+            current
+        );
+        let persisted_legacy = store
+            .memory_history(&ns, &legacy_id, 100, 200, 200)
+            .unwrap();
+        assert_eq!(
+            persisted_legacy.chain[0]
+                .evidence
+                .as_ref()
+                .unwrap()
+                .source_status,
+            rb_types::HistorySourceStatus::Unavailable
+        );
+    }
+
+    #[test]
+    fn history_keeps_one_snapshot_across_a_concurrent_supersede() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rb.db");
+        let reader = open(&path);
+        let ns = Namespace::Project("hist-snapshot".to_string());
+        let target = seed(&reader, &ns, "current before concurrent write");
+        let successor = seed(&reader, &ns, "successor written concurrently");
+        let writer = open(&path);
+
+        let inspected = reader
+            .memory_history_snapshot(&ns, &target, 100, 200, 200, || {
+                writer.supersede(&target, &successor).unwrap();
+            })
+            .unwrap();
+        assert!(reader.is_autocommit(), "read snapshot commits on success");
+        assert_eq!(inspected.chain.len(), 1);
+        assert_eq!(inspected.chain[0].id, target);
+        assert!(inspected.chain[0].current);
+        assert!(!inspected.chain[0].archived);
+        assert!(inspected.chain[0].superseded_by.is_none());
+
+        let after = reader.memory_history(&ns, &target, 100, 200, 200).unwrap();
+        assert_eq!(after.chain.len(), 2);
+        let old = after.chain.iter().find(|entry| entry.id == target).unwrap();
+        let new = after
+            .chain
+            .iter()
+            .find(|entry| entry.id == successor)
+            .unwrap();
+        assert!(old.archived);
+        assert_eq!(old.superseded_by.as_ref(), Some(&successor));
+        assert!(new.current && !new.archived);
+    }
+
+    #[test]
+    fn history_reuses_an_enclosing_transaction() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-enclosing-tx".to_string());
+        let target = seed(&store, &ns, "transactional target");
+        store.conn.execute_batch("BEGIN DEFERRED").unwrap();
+
+        let history = store.memory_history(&ns, &target, 100, 200, 200).unwrap();
+        assert_eq!(history.chain.len(), 1);
+        assert!(!store.is_autocommit());
+        store.conn.execute_batch("COMMIT").unwrap();
+        assert!(store.is_autocommit());
+    }
+
     /// `history C` (the chain head) still lists the full ancestry (the
     /// acceptance-criteria direction).
     #[test]
@@ -633,6 +1106,11 @@ mod tests {
         assert_eq!(history.chain.len(), 3);
         assert!(ids.contains(&a1.to_string()) && ids.contains(&a2.to_string()));
         assert!(history.chain[2].is_target);
+        assert_eq!(history.chain[2].predecessors.len(), 2);
+        assert!(
+            history.chain[2].predecessors.contains(&a1)
+                && history.chain[2].predecessors.contains(&a2)
+        );
     }
 
     /// A supersede cycle (user-influencable data) must not hang the walk: the
@@ -650,6 +1128,7 @@ mod tests {
 
         for anchor in [&a, &b] {
             let history = store.memory_history(&ns, anchor, 100, 200, 200).unwrap();
+            assert!(history.cycle_detected, "the cycle is explicit");
             let mut ids: Vec<String> = history.chain.iter().map(|e| e.id.to_string()).collect();
             let len_before = ids.len();
             ids.sort();
@@ -747,13 +1226,12 @@ mod tests {
         force_supersede(&store, &a, &a); // raw SQL: the write path rejects self-supersede (#501)
 
         let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
-        assert_eq!(history.chain.len(), 1, "the self-loop adds no members");
-        assert_eq!(history.chain[0].id, a);
         assert!(history.chain[0].archived, "supersede archived it");
         assert!(
             !history.chain[0].current,
             "an archived row is never current"
         );
+        assert!(history.cycle_detected, "a self-loop is a cycle");
         assert!(!history.truncated);
     }
 
@@ -774,6 +1252,8 @@ mod tests {
 
         let history = store.memory_history(&ns, &hub, 100, 3, 200).unwrap();
         assert_eq!(history.chain.len(), 3, "total chain members are capped");
+        assert_eq!(history.chain_limit, 3);
+        assert_eq!(history.edge_limit, 200);
         assert!(
             history.chain.iter().any(|e| e.id == hub),
             "the target always survives the cap"
@@ -900,6 +1380,11 @@ mod tests {
         let history = store.memory_history(&ns, &a, 100, 200, 200).unwrap();
         assert_eq!(history.chain.len(), 1, "the cross-ns successor never leaks");
         assert_eq!(history.chain[0].id, a);
+        assert!(
+            history.chain[0].superseded_by.is_none(),
+            "foreign successor ids are filtered, not just traversal"
+        );
+        assert!(history.chain[0].predecessors.is_empty());
         // The backward direction is scoped too: history of the foreign row in
         // ITS namespace must not pull in the `ns` ancestor.
         let foreign_history = store
@@ -1020,6 +1505,22 @@ mod tests {
         let full = store.memory_history(&ns, &hub, 100, 200, 200).unwrap();
         assert_eq!(full.edges.len(), 4);
         assert!(!full.truncated);
+    }
+
+    /// A zero edge cap still probes one row so omitted edges are explicit.
+    #[test]
+    fn history_zero_edge_cap_reports_truncation() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = open(&dir.path().join("rb.db"));
+        let ns = Namespace::Project("hist-edge-zero".to_string());
+        let hub = seed(&store, &ns, "hub");
+        let spoke = seed(&store, &ns, "spoke");
+        link(&store, &spoke, &hub, LinkType::References, "linked");
+
+        let history = store.memory_history(&ns, &hub, 100, 200, 0).unwrap();
+        assert!(history.edges.is_empty(), "the zero-row cap is honored");
+        assert_eq!(history.edge_limit, 0);
+        assert!(history.truncated, "the probe reports the omitted edge");
     }
 
     /// A single memory with no supersede history and no links is a one-entry

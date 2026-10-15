@@ -427,6 +427,8 @@ mod tests {
                 confidence: None,
                 supersedes: None,
                 evidence: None,
+                human_curated: None,
+                allow_curated_supersede: None,
             },
             Request::Update {
                 id: id(),

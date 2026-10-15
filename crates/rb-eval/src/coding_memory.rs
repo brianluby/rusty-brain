@@ -245,6 +245,7 @@ fn input(belief: &Belief) -> RememberInput {
         keywords: Vec::new(),
         tags: Vec::new(),
         related_files: Vec::new(),
+        human_curated: false,
         confidence: Some(1.0),
         provenance: Provenance::default(),
         anchors: Vec::new(),

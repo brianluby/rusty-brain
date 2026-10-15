@@ -46,6 +46,8 @@ pub struct ImportItem {
     /// by restore from the original memory's anchors so they survive the
     /// export/restore round-trip (ANC-4).
     pub anchors: Vec<rb_types::MemoryAnchor>,
+    /// Explicit protection restored from an export; extracted imports leave it false.
+    pub human_curated: bool,
 }
 
 /// Counts for an import run.
@@ -186,6 +188,7 @@ pub fn extract_text(
         source: label.to_string(),
         tags: Vec::new(),
         anchors: Vec::new(),
+        human_curated: false,
     }
 }
 
@@ -394,6 +397,7 @@ fn recent_decision_commits(root: &Path, limit: usize) -> Vec<ImportItem> {
             source: format!("git log {hash}"),
             tags: Vec::new(),
             anchors: Vec::new(),
+            human_curated: false,
         });
     }
     items
@@ -441,7 +445,7 @@ pub async fn store_items(
         tags.extend(item.tags.iter().cloned());
         tags.extend(extra_tags.iter().cloned());
         match client
-            .remember_anchored(
+            .remember_anchored_with_intent(
                 content,
                 Some(context),
                 item.memory_type,
@@ -453,6 +457,8 @@ pub async fn store_items(
                 item.anchors.clone(),
                 None,
                 None,
+                item.human_curated,
+                false,
             )
             .await
         {

@@ -39,6 +39,7 @@ async fn remember(
                 .collect(),
             tags: Vec::new(),
             related_files: Vec::new(),
+            human_curated: false,
             confidence: Some(confidence),
             provenance: Provenance::default(),
             anchors: Vec::new(),

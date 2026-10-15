@@ -58,6 +58,8 @@ pub struct ClientIdentity {
 /// evaluates anchors" from "this daemon would silently drop/ignore them"
 /// WITHOUT a CONTRACT_VERSION bump.
 pub const CAP_ANCHORS: &str = "anchors";
+/// Capability required before a client may request persistent human curation.
+pub const CAP_HUMAN_CURATION: &str = "human_curation";
 
 /// Daemon reply to a `Handshake`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -135,6 +137,14 @@ pub enum Request {
         /// precedent).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         evidence: Option<rb_types::CaptureEvidence>,
+        /// Explicit curation requested by a human caller. `None` preserves
+        /// the pre-field wire shape and decodes as uncurated.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        human_curated: Option<bool>,
+        /// Explicit authorization to supersede a curated target. Defaults to
+        /// false; producer provenance never grants this intent.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        allow_curated_supersede: Option<bool>,
     },
     Recall {
         query: String,
@@ -368,6 +378,21 @@ pub fn request_uses_anchors(req: &Request) -> bool {
     match req {
         Request::Remember { anchors, .. } => !anchors.is_empty(),
         Request::Recall { filter, .. } | Request::List { filter, .. } => !filter.anchors.is_empty(),
+        _ => false,
+    }
+}
+
+/// True when `req` asks to mark/unmark curation or override a curation guard.
+/// Typed clients gate these requests on the daemon's advertised capability.
+#[must_use]
+pub fn request_uses_human_curation(req: &Request) -> bool {
+    match req {
+        Request::Remember {
+            human_curated,
+            allow_curated_supersede,
+            ..
+        } => human_curated.is_some() || allow_curated_supersede.is_some(),
+        Request::Update { updates, .. } => updates.human_curated.is_some(),
         _ => false,
     }
 }
@@ -702,6 +727,8 @@ mod tests {
             supersedes: None,
             anchors: vec![],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         // Some(x) serializes the key and round-trips back to Some(x).
         let json = serde_json::to_value(&explicit).unwrap();
@@ -740,6 +767,8 @@ mod tests {
             supersedes: None,
             anchors: vec![],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -766,6 +795,8 @@ mod tests {
             supersedes: Some(old.clone()),
             anchors: vec![],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         // Some(id) serializes the key and round-trips back to the same id.
         let json = serde_json::to_value(&explicit).unwrap();
@@ -801,6 +832,8 @@ mod tests {
             supersedes: None,
             anchors: vec![],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -887,6 +920,8 @@ mod tests {
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/a.rs:2-4").unwrap()],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         let json = serde_json::to_value(&explicit).unwrap();
         assert!(
@@ -923,6 +958,8 @@ mod tests {
             supersedes: None,
             anchors: vec![],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         };
         let json = serde_json::to_value(&none).unwrap();
         assert!(
@@ -964,6 +1001,8 @@ mod tests {
             supersedes: None,
             anchors: vec![rb_types::MemoryAnchor::parse_file_spec("a.rs").unwrap()],
             evidence: None,
+            human_curated: None,
+            allow_curated_supersede: None,
         }));
         // Anchor-free frames are never flagged.
         assert!(!request_uses_anchors(&Request::Recall {
@@ -991,6 +1030,8 @@ mod tests {
                 supersedes: Some(id.clone()),
                 anchors: vec![rb_types::MemoryAnchor::parse_file_spec("src/lib.rs:3-9").unwrap()],
                 evidence: None,
+                human_curated: None,
+                allow_curated_supersede: None,
             },
             Request::Recall {
                 query: "q".into(),
@@ -1204,6 +1245,8 @@ mod tests {
                 history: rb_types::MemoryHistory {
                     namespace: "global".to_string(),
                     depth: 100,
+                    chain_limit: 200,
+                    edge_limit: 200,
                     chain: vec![rb_types::HistoryEntry {
                         id: MemoryId::new(),
                         summary: "we use kafka".to_string(),
@@ -1215,6 +1258,8 @@ mod tests {
                         current: true,
                         is_target: true,
                         superseded_by: None,
+                        predecessors: Vec::new(),
+                        evidence: None,
                         origin_user: Some("alice".to_string()),
                         origin_host: None,
                         origin_agent: None,
@@ -1231,6 +1276,7 @@ mod tests {
                         other_contested: true,
                         created_at: chrono::Utc::now(),
                     }],
+                    cycle_detected: false,
                     truncated: false,
                 },
             },
@@ -1638,6 +1684,7 @@ mod tests {
                 mode: rb_types::ForgetMode::Hard,
                 archived: 0,
                 purged: 2,
+                skipped: 0,
                 total_eligible: 2,
                 remaining: 0,
                 failure: None,
@@ -1775,26 +1822,53 @@ mod tests {
     #[test]
     fn history_response_round_trips_with_result_tag() {
         let id = MemoryId::new();
+        let now = chrono::Utc::now();
         let resp = Response::History {
             history: rb_types::MemoryHistory {
                 namespace: "project:rusty-brain".to_string(),
                 depth: 100,
+                chain_limit: 200,
+                edge_limit: 200,
                 chain: vec![rb_types::HistoryEntry {
                     id: id.clone(),
                     summary: "we use kafka".to_string(),
                     importance: 7,
                     confidence: 0.9,
-                    created_at: chrono::Utc::now(),
+                    created_at: now,
                     archived: false,
                     contested: true,
                     current: true,
                     is_target: true,
                     superseded_by: None,
+                    predecessors: Vec::new(),
+                    evidence: Some(rb_types::HistoryEvidence {
+                        content: "Use Kafka outside the legacy event bridge.".to_string(),
+                        context: "The bridge stays on RabbitMQ until migration completes."
+                            .to_string(),
+                        keywords: vec!["kafka".to_string()],
+                        tags: vec!["decision".to_string()],
+                        memory_type: Some(rb_types::MemoryType::ArchitectureDecision),
+                        updated_at: Some(now),
+                        last_accessed_at: None,
+                        related_files: vec!["src/events.rs".to_string()],
+                        origin_channel: Some(rb_types::WriteChannel::Cli),
+                        session_id: Some("session-wire".to_string()),
+                        anchors: vec![rb_types::MemoryAnchor {
+                            kind: rb_types::AnchorKind::File,
+                            value: "src/events.rs".to_string(),
+                            start_line: Some(12),
+                            end_line: Some(18),
+                        }],
+                        trust_class: rb_types::TrustClass::HumanConfirmed,
+                        human_curated: true,
+                        source_status: rb_types::HistorySourceStatus::RecordedUnverified,
+                    }),
                     origin_user: None,
                     origin_host: None,
                     origin_agent: None,
                     origin_source: None,
                 }],
+                cycle_detected: false,
                 edges: Vec::new(),
                 truncated: true,
             },
@@ -1809,6 +1883,14 @@ mod tests {
                 assert_eq!(history.chain[0].id, id);
                 assert!(history.chain[0].current);
                 assert!(history.truncated);
+                assert_eq!(
+                    history.chain[0].evidence.as_ref().unwrap().source_status,
+                    rb_types::HistorySourceStatus::RecordedUnverified
+                );
+                assert_eq!(
+                    history.chain[0].evidence.as_ref().unwrap().content,
+                    "Use Kafka outside the legacy event bridge."
+                );
             }
             other => panic!("expected History, got {other:?}"),
         }

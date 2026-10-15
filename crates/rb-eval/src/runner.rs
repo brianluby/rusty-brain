@@ -178,6 +178,7 @@ async fn ingest<P: EmbeddingProvider>(
                 keywords: m.keywords.clone(),
                 tags: m.tags.clone(),
                 related_files: Vec::new(),
+                human_curated: false,
                 confidence: None,
                 provenance: Default::default(),
                 anchors: Vec::new(),

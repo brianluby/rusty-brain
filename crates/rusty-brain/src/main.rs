@@ -9,6 +9,9 @@ use rusty_brain::run::run;
 use std::process::ExitCode;
 
 fn main() -> ExitCode {
+    if let Some(exit_code) = rusty_brain::client::run_internal_startup_log_collector() {
+        return exit_code;
+    }
     init_logging();
     let cli = Cli::parse();
 

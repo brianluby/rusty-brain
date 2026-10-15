@@ -61,7 +61,7 @@ fn retention_where(
     now: chrono::DateTime<chrono::Utc>,
 ) -> Result<Option<WhereClause>> {
     let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(ns.as_db_string())];
-    let mut sql = String::from("m.namespace = ?1");
+    let mut sql = String::from("m.namespace = ?1 AND m.human_curated = 0");
 
     // Horizon cutoffs. `days as i64 * 86_400 <= u32::MAX * 86_400 ≈ 3.7e14`
     // and `now.timestamp() ≈ 1.8e9`, so the subtraction cannot overflow i64
@@ -157,6 +157,11 @@ fn retention_where(
 }
 
 impl SqliteStore {
+    /// Archive only an uncurated row from an unattended review policy.
+    /// Namespace and curation are rechecked by the UPDATE in the transaction.
+    pub fn archive_unattended(&self, ns: &Namespace, id: &MemoryId) -> Result<bool> {
+        archive_with_details(&self.conn, &self.site_id, id, "", true, Some(ns))
+    }
     /// The forget plan: exactly the candidate set one sweep pass in `mode`
     /// would touch (bounded by `batch_limit`, oldest first) plus the total
     /// eligible count. Read-only — this IS the dry-run (RET-2), and
@@ -278,6 +283,7 @@ impl SqliteStore {
         // actually happened, and events for completed items still fire.
         let mut effects = RetentionSweepEffects::default();
         let mut failure: Option<String> = None;
+        let mut skipped = 0_u64;
         for cand in &plan.candidates {
             let details = serde_json::json!({
                 "cause": "retention",
@@ -286,20 +292,28 @@ impl SqliteStore {
             })
             .to_string();
             let step = match mode {
-                ForgetMode::Apply => {
-                    archive_with_details(&self.conn, &self.site_id, &cand.id, &details).map(
-                        |changed| {
-                            if changed {
-                                effects.archived_ids.push(cand.id.clone());
-                            }
-                        },
-                    )
-                }
+                ForgetMode::Apply => archive_with_details(
+                    &self.conn,
+                    &self.site_id,
+                    &cand.id,
+                    &details,
+                    true,
+                    Some(ns),
+                )
+                .map(|changed| {
+                    if changed {
+                        effects.archived_ids.push(cand.id.clone());
+                    } else {
+                        skipped += 1;
+                    }
+                }),
                 ForgetMode::Hard => {
                     self.purge_memory_for_retention(&cand.id, &details)
                         .map(|changed| {
                             if changed {
                                 effects.purged_ids.push(cand.id.clone());
+                            } else {
+                                skipped += 1;
                             }
                         })
                 }
@@ -328,6 +342,7 @@ impl SqliteStore {
             "archived": archived,
             "purged": purged,
             "eligible": plan.total_eligible,
+            "skipped": skipped,
             "failure": failure,
         })
         .to_string();
@@ -355,12 +370,13 @@ impl SqliteStore {
                 mode,
                 archived,
                 purged,
+                skipped,
                 total_eligible: plan.total_eligible,
-                // The sweep runs on the single-writer connection, so nothing
-                // interleaves between plan and execute: unprocessed = the
-                // overflow past batch_limit (plus anything a mid-pass failure
-                // left behind).
-                remaining: plan.total_eligible.saturating_sub(archived + purged),
+                // Guard refusals are counted separately; remaining covers
+                // eligible work left unprocessed by the pass.
+                remaining: plan
+                    .total_eligible
+                    .saturating_sub(archived + purged + skipped),
                 failure,
             },
             effects,
@@ -439,21 +455,24 @@ impl SqliteStore {
     /// `Ok(false)` no-op that logs nothing.
     pub(crate) fn purge_memory_for_retention(&self, id: &MemoryId, details: &str) -> Result<bool> {
         immediate_tx(&self.conn, || {
-            let ns: Option<String> = self
+            let row: Option<(String, i64)> = self
                 .conn
                 .query_row(
-                    "SELECT namespace FROM memories WHERE memory_id = ?1",
+                    "SELECT namespace, human_curated FROM memories WHERE memory_id = ?1",
                     rusqlite::params![id.to_string()],
-                    |r| r.get(0),
+                    |r| Ok((r.get(0)?, r.get(1)?)),
                 )
                 .map(Some)
                 .or_else(|e| match e {
                     rusqlite::Error::QueryReturnedNoRows => Ok(None),
                     other => Err(storage_err(other)),
                 })?;
-            let Some(ns) = ns else {
+            let Some((ns, human_curated)) = row else {
                 return Ok(false);
             };
+            if human_curated != 0 {
+                return Ok(false);
+            }
             let id_str = id.to_string();
             self.conn
                 .execute(
@@ -608,6 +627,30 @@ mod retention_tests {
         );
     }
 
+    #[test]
+    fn retention_excludes_curated_rows_and_hard_purge_rechecks_curation() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let curated = insert_aged(&store, 60, 3, |note| note.human_curated = true);
+        let ordinary = insert_aged(&store, 60, 3, |_| {});
+
+        let preview = store
+            .retention_candidates(&ns(), &policy(), ForgetMode::Apply, chrono::Utc::now())
+            .unwrap();
+        assert!(!preview.candidates.iter().any(|item| item.id == curated));
+        assert!(preview.candidates.iter().any(|item| item.id == ordinary));
+
+        let (outcome, _) = store
+            .retention_sweep(&ns(), &policy(), ForgetMode::Apply, chrono::Utc::now())
+            .unwrap();
+        assert_eq!(outcome.archived, 1);
+        assert!(!is_archived(&store, &curated));
+        assert!(is_archived(&store, &ordinary));
+        assert!(!store
+            .purge_memory_for_retention(&curated, "retention test")
+            .unwrap());
+        assert!(store.get_memory(&curated).unwrap().is_some());
+    }
+
     // W1.9 author-intent clamp productized: eligibility gates on the AUTHOR
     // prior as well as the effective importance, so a signal-degraded
     // effective value can never defeat author intent.
@@ -617,7 +660,9 @@ mod retention_tests {
         // Author said 10; recalibration (clamped to prior-2 by W1.9) dragged
         // the effective importance to 8.
         let authored_ten = insert_aged(&store, 400, 10, |_| {});
-        store.set_recalibrated_importance(&authored_ten, 8).unwrap();
+        store
+            .set_recalibrated_importance(&ns(), &authored_ten, 8)
+            .unwrap();
         // Control: authored low, effective low — eligible.
         let authored_low = insert_aged(&store, 400, 3, |_| {});
 

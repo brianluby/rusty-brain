@@ -5,6 +5,34 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Trusted-memory tranche (kanban 78, 79, 94, 95)
+
+- Accept deliberate embedding-model and dimension changes atomically, rebuilding
+  only the derived vector index while preserving authored rows, anchors, links,
+  history and site identity. Preserve partial re-embedding progress on retry and
+  exclude archived rows; skipped work remains pending until a scan returns zero.
+- Coordinate serving and offline migration by database inode across socket paths
+  and aliases, retaining admission through writer/read-pool shutdown. Use private
+  sidecars rather than SQLite-file flocking, which conflicts with macOS WAL locks.
+  Legacy binaries and unmanaged SQLite clients must still be stopped explicitly.
+- Surface real daemon startup causes in CLI/MCP errors under one five-second
+  socket/handshake deadline, with child status and a redacted bounded stderr tail.
+  Capture private bounded per-attempt logs without blocking on inherited stderr
+  pipes or terminating a healthy detached daemon when its launcher exits.
+- Extend bounded CLI/MCP history with the target's full stored claim, context,
+  source anchors and provenance under one consistent, counter-free read snapshot.
+  Recorded source references remain unverified; no content is fetched.
+- Persist default-false human-curation protection across CLI/MCP metadata edits,
+  JSON export/restore and daemon restarts. Guard unattended collapse, policy review,
+  retention and importance/confidence maintenance transactionally without turning
+  protection into trust, authorization or a recall eligibility/ranking bypass.
+  Keep explicit overrides, negative feedback, scrubbing and re-embedding available.
+- Carry actual duplicate-survivor/archive receipts through events, hook suppression
+  and remaining consolidation work when curation changes after candidate planning.
+- Preserve new lifecycle summaries when their supersession target is already
+  resolved, without rewriting established lineage or publishing a false archive;
+  curation refusals still roll back the entire replacement transaction.
+
 ### Fixed — PR #98 review remediations
 
 - Restrict proposal-rejection detection to statement-leading rejection phrases, preserving confirmed

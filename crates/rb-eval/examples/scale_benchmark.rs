@@ -1464,6 +1464,8 @@ async fn run_mixed_operation(
                     supersedes: None,
                     anchors: vec![],
                     evidence: None,
+                    human_curated: None,
+                    allow_curated_supersede: None,
                 },
             )
             .await?;
@@ -2031,6 +2033,8 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
         supersedes: None,
         anchors: vec![],
         evidence: None,
+        human_curated: None,
+        allow_curated_supersede: None,
     };
     let response = reqwest::Client::new()
         .post(format!("http://{addr}/remember"))

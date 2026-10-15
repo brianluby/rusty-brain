@@ -38,8 +38,8 @@ impl SqliteStore {
     /// `base_importance` author prior (W1.9). This is the importance
     /// recalibration job's only write path; the user-facing `update_memory`
     /// path is the only writer of `base_importance`. Validates the `1..=10`
-    /// range fail-closed (matching the insert path). A missing id is a no-op
-    /// (0 rows), mirroring `set_confidence`/`set_link_strength`.
+    /// range fail-closed (matching the insert path). A missing or curated id is
+    /// a no-op, mirroring `set_confidence`/`set_link_strength`.
     ///
     /// `updated_at` is intentionally NOT bumped: recalibration is a background
     /// maintenance write, not an authorial edit — the same rule `update_vector`
@@ -47,7 +47,12 @@ impl SqliteStore {
     /// look freshly user-modified to list/context, recency ranking, and any
     /// updated_at-based sync each time the job runs. The oplog row below
     /// records the change durably for replay.
-    pub fn set_recalibrated_importance(&self, id: &MemoryId, importance: u8) -> Result<()> {
+    pub fn set_recalibrated_importance(
+        &self,
+        ns: &Namespace,
+        id: &MemoryId,
+        importance: u8,
+    ) -> Result<bool> {
         rb_types::validate_importance(importance)?;
         // Transaction: the UPDATE and its oplog row commit (or roll back)
         // together — importance is durable ranking state replay must reproduce.
@@ -55,38 +60,34 @@ impl SqliteStore {
             let affected = self
                 .conn
                 .execute(
-                    "UPDATE memories SET importance = ?1 WHERE memory_id = ?2",
-                    rusqlite::params![importance as i64, id.to_string()],
+                    "UPDATE memories SET importance = ?1 WHERE memory_id = ?2 AND namespace = ?3 AND human_curated = 0",
+                    rusqlite::params![importance as i64, id.to_string(), ns.as_db_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if affected > 0 {
                 let details = serde_json::json!({ "importance": importance }).to_string();
                 append_oplog(&self.conn, &self.site_id, "set_importance", id, &details)?;
             }
-            Ok(())
+            Ok(affected > 0)
         })
     }
-    /// Set the `confidence` of a single memory. Validates the `0.0..=1.0` range
-    /// fail-closed (matching the insert path). A missing id is a no-op (0 rows).
-    /// Used by maintenance/test paths; the engine never mutates confidence on the
-    /// shipped recall/remember flow.
-    pub fn set_confidence(&self, id: &MemoryId, confidence: f32) -> Result<()> {
+    /// Set the `confidence` of one uncurated memory from a maintenance path.
+    /// Explicit negative feedback uses `record_feedback` and remains allowed.
+    pub fn set_confidence(&self, ns: &Namespace, id: &MemoryId, confidence: f32) -> Result<bool> {
         rb_types::validate_confidence(confidence)?;
-        // Transaction: the UPDATE and its oplog row commit (or roll back)
-        // together — confidence is durable ranking state replay must reproduce.
         immediate_tx(&self.conn, || {
             let affected = self
                 .conn
                 .execute(
-                    "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2",
-                    rusqlite::params![confidence as f64, id.to_string()],
+                    "UPDATE memories SET confidence = ?1 WHERE memory_id = ?2 AND namespace = ?3 AND human_curated = 0",
+                    rusqlite::params![confidence as f64, id.to_string(), ns.as_db_string()],
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
             if affected > 0 {
                 let details = serde_json::json!({ "confidence": confidence }).to_string();
                 append_oplog(&self.conn, &self.site_id, "set_confidence", id, &details)?;
             }
-            Ok(())
+            Ok(affected > 0)
         })
     }
     /// Delete a single link edge identified by its full PK. A missing edge is a
@@ -274,13 +275,13 @@ impl SqliteStore {
 
     /// Automatic deduplication, not an author-requested correction. Recheck
     /// equivalence and namespace under the same lock as the guarded mutation.
-    /// `false` preserves uncertain pairs without writing an oplog row.
+    /// `None` preserves uncertain pairs without writing an oplog row.
     pub fn supersede_duplicate(
         &self,
         ns: &Namespace,
         old: &MemoryId,
         new: &MemoryId,
-    ) -> Result<bool> {
+    ) -> Result<Option<DuplicateSupersede>> {
         immediate_tx(&self.conn, || {
             let old_note = self
                 .get_memory(old)?
@@ -294,11 +295,25 @@ impl SqliteStore {
             if new_note.namespace != *ns {
                 return Err(Error::NotFound(new.clone()));
             }
-            if !self.automatically_equivalent(&old_note, &new_note)? {
-                return Ok(false);
+            if !self.automatically_equivalent(&old_note, &new_note)?
+                || (old_note.human_curated && new_note.human_curated)
+            {
+                return Ok(None);
             }
-            self.supersede_in_tx(old, new)?;
-            Ok(true)
+            let (archived, survivor) = if old_note.human_curated {
+                (new, old)
+            } else {
+                (old, new)
+            };
+            self.supersede_in_tx(archived, survivor)?;
+            let seq = self
+                .latest_oplog_seq_for(archived)?
+                .ok_or_else(|| Error::Storage("supersede oplog row is missing".into()))?;
+            Ok(Some(DuplicateSupersede {
+                archived: archived.clone(),
+                survivor: survivor.clone(),
+                seq,
+            }))
         })
     }
 
@@ -338,6 +353,52 @@ impl SqliteStore {
             )
             .map_err(|e| Error::Storage(e.to_string()))
     }
+    /// Insert a replacement and retire an active target atomically. A curation
+    /// refusal rolls back the replacement; an already-resolved target keeps its
+    /// established lineage while the new memory is retained.
+    pub fn insert_superseding_memory(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        old: &MemoryId,
+        allow_curated_supersede: bool,
+    ) -> Result<(u64, Option<u64>)> {
+        if note.id == *old {
+            return Err(Error::InvalidArgument(
+                "a memory cannot supersede itself".to_string(),
+            ));
+        }
+        rb_types::validate_importance(note.importance)?;
+        rb_types::validate_confidence(note.confidence)?;
+        for anchor in &note.anchors {
+            anchor.validate()?;
+        }
+        immediate_tx(&self.conn, || {
+            let old_note = self
+                .get_memory(old)?
+                .ok_or_else(|| Error::NotFound(old.clone()))?;
+            if old_note.namespace != note.namespace {
+                return Err(Error::NotFound(old.clone()));
+            }
+            if old_note.human_curated && !allow_curated_supersede {
+                return Err(Error::StalePlan(format!(
+                    "{old} is human-curated; an explicit user supersede is required"
+                )));
+            }
+            self.insert_memory_tx_body(note, embedding)?;
+            let created_seq = self
+                .latest_oplog_seq_for(&note.id)?
+                .ok_or_else(|| Error::Storage("insert oplog row is missing".to_string()))?;
+            if old_note.archived_at.is_some() || old_note.superseded_by.is_some() {
+                return Ok((created_seq, None));
+            }
+            self.supersede_in_tx(old, &note.id)?;
+            let archived_seq = self
+                .latest_oplog_seq_for(old)?
+                .ok_or_else(|| Error::Storage("supersede oplog row is missing".to_string()))?;
+            Ok((created_seq, Some(archived_seq)))
+        })
+    }
 
     /// General supersede error mapping shared by explicit and automatic writes.
     /// The caller owns the transaction; the structural guard stays unchanged.
@@ -375,7 +436,7 @@ impl SqliteStore {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT memory_id, namespace, importance, created_at
+                "SELECT memory_id, namespace, importance, created_at, human_curated
                  FROM memories
                  WHERE archived_at IS NULL AND superseded_by IS NULL
                  ORDER BY created_at ASC, memory_id ASC
@@ -392,6 +453,7 @@ impl SqliteStore {
                         row.get::<_, String>(1)?,
                         row.get::<_, i64>(2)?,
                         row.get::<_, i64>(3)?,
+                        row.get::<_, bool>(4)?,
                     ))
                 },
             )
@@ -399,7 +461,7 @@ impl SqliteStore {
 
         let mut out = Vec::new();
         for r in rows {
-            let (id_str, ns_str, importance, created) =
+            let (id_str, ns_str, importance, created, human_curated) =
                 r.map_err(|e| Error::Storage(e.to_string()))?;
             out.push(ConsolidationCandidate {
                 id: parse_id(&id_str)?,
@@ -408,6 +470,7 @@ impl SqliteStore {
                     Error::Storage(format!("importance {importance} out of u8 range"))
                 })?,
                 created_at: from_ts(created)?,
+                human_curated,
             });
         }
         Ok(out)
@@ -487,11 +550,11 @@ impl SqliteStore {
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, origin_channel,
                         session_id,
-                        base_importance, trust_class
+                        base_importance, trust_class, human_curated
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                        ?26, ?27
+                        ?26, ?27, ?28
                      )",
                 rusqlite::params![
                     note.id.to_string(),
@@ -529,6 +592,7 @@ impl SqliteStore {
                     // Trust-class ladder (Vikunja #63): the daemon-derived
                     // tier; the SQL CHECK is the storage backstop.
                     note.trust_class.as_str(),
+                    i64::from(u8::from(note.human_curated)),
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -816,6 +880,7 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         summary: g("summary")?,
         keywords: parse_json_array(&g("keywords")?)?,
         tags: parse_json_array(&g("tags")?)?,
+        human_curated: gi("human_curated")? != 0,
         context: g("context")?,
         memory_type,
         importance: gi("importance")? as u8,
@@ -1151,7 +1216,7 @@ fn build_list_filtered_query(
                 related_files, access_count, last_accessed_at, archived_at,
                 superseded_by, embedding_model, embedding_input_version,
                 origin_user, origin_host, origin_agent, origin_source, session_id,
-                origin_channel, trust_class
+                origin_channel, trust_class, human_curated
          FROM memories m WHERE {predicate}"
     );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
@@ -1308,7 +1373,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel, trust_class
+                        origin_channel, trust_class, human_curated
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1633,6 +1698,10 @@ impl Store for SqliteStore {
             sets.push(format!("confidence = ?{}", params.len() + 1));
             params.push(Box::new(confidence as f64));
         }
+        if let Some(human_curated) = updates.human_curated {
+            sets.push(format!("human_curated = ?{}", params.len() + 1));
+            params.push(Box::new(i64::from(u8::from(human_curated))));
+        }
 
         // If a field that feeds `embedding_input` (content / tags / context — the
         // composite document text) changed, stale this row's embedding stamp so the
@@ -1689,7 +1758,7 @@ impl Store for SqliteStore {
         // row all live in the shared `archive_with_details` body (also used by
         // the retention sweep, which stamps a cause into `details`). Missing
         // or already-archived ids are Ok no-ops and log nothing.
-        archive_with_details(&self.conn, &self.site_id, id, "").map(|_| ())
+        archive_with_details(&self.conn, &self.site_id, id, "", false, None).map(|_| ())
     }
 
     fn add_link(&self, link: &MemoryLink) -> Result<()> {
@@ -1900,7 +1969,7 @@ impl Store for SqliteStore {
                     related_files, access_count, last_accessed_at, archived_at,
                     superseded_by, embedding_model, embedding_input_version,
                     origin_user, origin_host, origin_agent, origin_source, session_id,
-                    origin_channel, trust_class
+                    origin_channel, trust_class, human_curated
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -1995,7 +2064,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel, trust_class
+                        origin_channel, trust_class, human_curated
                  FROM memories
                  WHERE archived_at IS NULL
                    AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
@@ -3958,6 +4027,7 @@ mod update_tests {
             tags: Some(vec!["alpha".into(), "beta".into()]),
             context: Some("new context".into()),
             confidence: Some(0.4),
+            human_curated: None,
         };
         store.update_memory(&m.id, &updates).unwrap();
 
@@ -4157,7 +4227,7 @@ mod update_tests {
         store.insert_memory(&m, None).unwrap();
 
         // A valid value lands on the row.
-        store.set_confidence(&m.id, 0.75).unwrap();
+        store.set_confidence(&m.namespace, &m.id, 0.75).unwrap();
         let got = store.get_memory(&m.id).unwrap().unwrap();
         assert!((got.confidence - 0.75).abs() < 1e-6);
 
@@ -4165,7 +4235,7 @@ mod update_tests {
         // and leave the stored value untouched.
         for bad in [-0.1f32, 1.1, f32::NAN] {
             assert!(matches!(
-                store.set_confidence(&m.id, bad),
+                store.set_confidence(&m.namespace, &m.id, bad),
                 Err(Error::InvalidArgument(_))
             ));
         }
@@ -4173,9 +4243,39 @@ mod update_tests {
         assert!((unchanged.confidence - 0.75).abs() < 1e-6);
 
         // A missing id is a no-op Ok (0 rows) that touches no existing row.
-        store.set_confidence(&MemoryId::new(), 0.2).unwrap();
+        store
+            .set_confidence(&Namespace::Global, &MemoryId::new(), 0.2)
+            .unwrap();
         let still = store.get_memory(&m.id).unwrap().unwrap();
         assert!((still.confidence - 0.75).abs() < 1e-6);
+    }
+    #[test]
+    fn curated_rows_skip_automatic_recalibration_but_accept_negative_feedback() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let namespace = Namespace::Project("curation".into());
+        let mut note = MemoryNote::new(
+            namespace.clone(),
+            "curated decision".into(),
+            MemoryType::Insight,
+            5,
+        );
+        note.human_curated = true;
+        note.confidence = 0.6;
+        store.insert_memory(&note, None).unwrap();
+
+        assert!(!store
+            .set_recalibrated_importance(&namespace, &note.id, 8)
+            .unwrap());
+        assert!(!store.set_confidence(&namespace, &note.id, 0.1).unwrap());
+        let after_policy = store.get_memory(&note.id).unwrap().unwrap();
+        assert_eq!(after_policy.importance, 5);
+        assert!((after_policy.confidence - 0.6).abs() < 1e-6);
+
+        let after_feedback = store
+            .record_feedback(&note.id, rb_types::FeedbackKind::Wrong, None)
+            .unwrap();
+        assert!(after_feedback < after_policy.confidence);
+        assert!(store.get_memory(&note.id).unwrap().unwrap().human_curated);
     }
 
     #[test]
@@ -5058,7 +5158,10 @@ mod near_duplicates_tests {
             let a_before = store.get_memory(&a.id).unwrap().unwrap();
             let b_before = store.get_memory(&b.id).unwrap().unwrap();
             assert!(
-                !store.supersede_duplicate(&ns, &a.id, &b.id).unwrap(),
+                store
+                    .supersede_duplicate(&ns, &a.id, &b.id)
+                    .unwrap()
+                    .is_none(),
                 "case {case}"
             );
             assert_eq!(
@@ -5118,7 +5221,7 @@ mod near_duplicates_tests {
             )
             .unwrap();
         let before = store.last_oplog_seq().unwrap();
-        assert!(!store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap().is_none());
         assert_eq!(store.last_oplog_seq().unwrap(), before);
         let note = store.get_memory(&a).unwrap().unwrap();
         assert_eq!(note.content, "Retry checkout at most 5 times.");
@@ -5129,6 +5232,161 @@ mod near_duplicates_tests {
             .unwrap()
             .iter()
             .any(|(id, _)| id == &a));
+    }
+
+    #[test]
+    fn automatic_supersede_rechecks_curation_after_candidate_selection() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("raced-curation".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let a = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        let b = insert_vec(&store, ns.clone(), "Retry checkout.", vector);
+        assert_eq!(
+            store.equivalent_duplicates(&ns, &a, 0.95, 10).unwrap()[0].0,
+            b
+        );
+
+        store
+            .update_memory(
+                &b,
+                &MemoryUpdates {
+                    human_curated: Some(true),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap().is_some());
+
+        let kept = store.get_memory(&b).unwrap().unwrap();
+        assert!(kept.human_curated && kept.archived_at.is_none());
+        let old = store.get_memory(&a).unwrap().unwrap();
+        assert_eq!(old.superseded_by, Some(b));
+        assert!(old.archived_at.is_some());
+    }
+
+    #[test]
+    fn automatic_supersede_keeps_the_curated_exact_duplicate_and_refuses_two() {
+        let ns = Namespace::Project("curated-duplicates".into());
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut curated = MemoryNote::new(
+            ns.clone(),
+            "Keep the established rollout order.".into(),
+            MemoryType::Insight,
+            3,
+        );
+        curated.created_at = chrono::Utc::now() - chrono::Duration::days(1);
+        curated.updated_at = curated.created_at;
+        curated.human_curated = true;
+        store.insert_memory(&curated, None).unwrap();
+
+        let mut distractor = curated.clone();
+        distractor.id = MemoryId::new();
+        distractor.importance = 9;
+        distractor.created_at = chrono::Utc::now();
+        distractor.updated_at = distractor.created_at;
+        distractor.human_curated = false;
+        store.insert_memory(&distractor, None).unwrap();
+        assert!(store
+            .supersede_duplicate(&ns, &curated.id, &distractor.id)
+            .unwrap()
+            .is_some());
+        let survivor = store.get_memory(&curated.id).unwrap().unwrap();
+        assert!(survivor.human_curated && survivor.archived_at.is_none());
+        assert_eq!(
+            store
+                .get_memory(&distractor.id)
+                .unwrap()
+                .unwrap()
+                .superseded_by,
+            Some(curated.id.clone())
+        );
+
+        let mut another_curated = curated.clone();
+        another_curated.id = MemoryId::new();
+        another_curated.created_at = chrono::Utc::now();
+        another_curated.updated_at = another_curated.created_at;
+        store.insert_memory(&another_curated, None).unwrap();
+        let before = store.last_oplog_seq().unwrap();
+        assert!(store
+            .supersede_duplicate(&ns, &curated.id, &another_curated.id)
+            .unwrap()
+            .is_none());
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        assert!(
+            store
+                .get_memory(&another_curated.id)
+                .unwrap()
+                .unwrap()
+                .human_curated
+        );
+        assert!(store
+            .get_memory(&another_curated.id)
+            .unwrap()
+            .unwrap()
+            .archived_at
+            .is_none());
+    }
+
+    #[test]
+    fn explicit_supersede_overrides_curated_guard_atomically() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("explicit-curation".into());
+        let vector = [1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0];
+        let mut old = MemoryNote::new(
+            ns.clone(),
+            "approved current plan".into(),
+            MemoryType::Insight,
+            6,
+        );
+        old.human_curated = true;
+        store.insert_memory(&old, None).unwrap();
+        let replacement = MemoryNote::new(
+            ns,
+            "explicitly superseding plan".into(),
+            MemoryType::Insight,
+            7,
+        );
+        let before = store.last_oplog_seq().unwrap();
+
+        assert!(matches!(
+            store.insert_superseding_memory(&replacement, Some(&vector), &old.id, false),
+            Err(Error::StalePlan(_))
+        ));
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        assert!(store.get_memory(&replacement.id).unwrap().is_none());
+        let unchanged = store.get_memory(&old.id).unwrap().unwrap();
+        assert!(unchanged.human_curated);
+        assert!(unchanged.archived_at.is_none() && unchanged.superseded_by.is_none());
+
+        store
+            .insert_superseding_memory(&replacement, Some(&vector), &old.id, true)
+            .unwrap();
+        let resolved = store.get_memory(&old.id).unwrap().unwrap();
+        assert!(resolved.human_curated && resolved.archived_at.is_some());
+        assert_eq!(resolved.superseded_by, Some(replacement.id));
+    }
+
+    #[test]
+    fn user_can_explicitly_unmark_curated_memory() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let mut note = MemoryNote::new(
+            Namespace::Project("explicit-unmark".into()),
+            "retired preference".into(),
+            MemoryType::Preference,
+            5,
+        );
+        note.human_curated = true;
+        store.insert_memory(&note, None).unwrap();
+        store
+            .update_memory(
+                &note.id,
+                &MemoryUpdates {
+                    human_curated: Some(false),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert!(!store.get_memory(&note.id).unwrap().unwrap().human_curated);
     }
 
     /// Equal text must not strand incoming evidence on a retired fact.
@@ -5153,7 +5411,7 @@ mod near_duplicates_tests {
             })
             .unwrap();
         let before = store.last_oplog_seq().unwrap();
-        assert!(!store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap().is_none());
         assert!(matches!(
             store.supersede_duplicate(&ns, &b, &foreign),
             Err(Error::NotFound(id)) if id == foreign
@@ -5199,7 +5457,7 @@ mod near_duplicates_tests {
             .conn
             .execute_batch("DROP TRIGGER refuse_duplicate_audit")
             .unwrap();
-        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap());
+        assert!(store.supersede_duplicate(&ns, &a, &b).unwrap().is_some());
         assert!(matches!(
             store.supersede_duplicate(&ns, &a, &b),
             Err(Error::StalePlan(_))
@@ -5387,7 +5645,9 @@ mod near_duplicates_tests {
         store.insert_memory(&m, None).unwrap();
         let stored_before = store.get_memory(&m.id).unwrap().expect("note present");
 
-        store.set_recalibrated_importance(&m.id, 6).unwrap();
+        store
+            .set_recalibrated_importance(&m.namespace, &m.id, 6)
+            .unwrap();
 
         let row = store
             .memories_for_recalibration(10)
@@ -5416,7 +5676,7 @@ mod near_duplicates_tests {
         let store = SqliteStore::open_in_memory(8).unwrap();
         // Out-of-range importance fails closed (matching the insert path).
         let err = store
-            .set_recalibrated_importance(&MemoryId::new(), 11)
+            .set_recalibrated_importance(&Namespace::Global, &MemoryId::new(), 11)
             .unwrap_err();
         assert!(
             matches!(err, Error::InvalidArgument(_)),
@@ -5424,7 +5684,7 @@ mod near_duplicates_tests {
         );
         // Missing id with a valid value is a best-effort no-op.
         store
-            .set_recalibrated_importance(&MemoryId::new(), 5)
+            .set_recalibrated_importance(&Namespace::Global, &MemoryId::new(), 5)
             .unwrap();
     }
 
@@ -5440,7 +5700,9 @@ mod near_duplicates_tests {
         store.insert_memory(&m, None).unwrap();
 
         // Simulate a prior recalibration: effective drifts, prior anchored.
-        store.set_recalibrated_importance(&m.id, 5).unwrap();
+        store
+            .set_recalibrated_importance(&m.namespace, &m.id, 5)
+            .unwrap();
 
         // The USER explicitly sets importance: both effective AND prior move —
         // an explicit update is the author re-declaring intent.

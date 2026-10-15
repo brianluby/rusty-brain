@@ -131,10 +131,14 @@ pub async fn run(store: &StoreHandle, cfg: &ImportanceConfig) -> Result<JobSumma
             summary.skipped += 1;
             continue;
         }
-        store
+        if store
             .set_recalibrated_importance(row.namespace.clone(), row.id.clone(), new)
-            .await?;
-        summary.changed += 1;
+            .await?
+        {
+            summary.changed += 1;
+        } else {
+            summary.skipped += 1;
+        }
     }
     Ok(summary)
 }

@@ -226,6 +226,9 @@ pub struct ForgetOutcome {
     /// Memories hard-purged by this pass (always 0 for apply).
     #[serde(default)]
     pub purged: u64,
+    /// Curated or concurrently resolved candidates skipped by the mutation guard.
+    #[serde(default)]
+    pub skipped: u64,
     /// Total eligible when the sweep started.
     #[serde(default)]
     pub total_eligible: u64,
@@ -401,8 +404,9 @@ mod tests {
             mode: ForgetMode::Apply,
             archived: 5,
             purged: 0,
+            skipped: 1,
             total_eligible: 9,
-            remaining: 4,
+            remaining: 3,
             failure: Some("purge of x failed: injected".to_string()),
         };
         let json = serde_json::to_string(&outcome).unwrap();
