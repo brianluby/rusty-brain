@@ -2,9 +2,7 @@
 
 use rb_embed::DeterministicProvider;
 use rb_engine::{MemoryBackend, MemoryEngine, RememberInput};
-use rb_types::{
-    MemoryId, MemoryNote, MemoryState, MemoryType, MemoryUpdates, Namespace, RecallFilter,
-};
+use rb_types::{MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace, RecallFilter};
 use std::collections::HashMap;
 use std::sync::Mutex;
 
@@ -35,19 +33,16 @@ impl MemoryBackend for VecBackend {
         ns: Namespace,
         _query: String,
         limit: usize,
-        state: MemoryState,
+        filter: RecallFilter,
     ) -> rb_types::Result<Vec<MemoryId>> {
-        let mut v: Vec<MemoryNote> = self
-            .notes
-            .lock()
-            .unwrap()
-            .values()
-            .filter(|n| n.namespace == ns)
-            .filter(|n| state.admits_archived(n.archived_at.is_some()))
-            .cloned()
-            .collect();
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
-        Ok(v.into_iter().take(limit).map(|n| n.id).collect())
+        Ok(self
+            .list(ns, filter, usize::MAX)
+            .await?
+            .into_iter()
+            .filter(|n| !n.is_quarantined() && !n.below_recall_confidence_floor())
+            .take(limit)
+            .map(|n| n.id)
+            .collect())
     }
 
     async fn vector(
@@ -55,6 +50,7 @@ impl MemoryBackend for VecBackend {
         _ns: Namespace,
         _embedding: Vec<f32>,
         _limit: usize,
+        _filter: RecallFilter,
     ) -> rb_types::Result<Vec<(MemoryId, f32)>> {
         Ok(Vec::new())
     }

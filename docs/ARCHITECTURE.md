@@ -27,7 +27,7 @@ left as guidelines.
 | Focused crates, never a monolith | **18 workspace crates** with a compiler-enforced dependency DAG; heavy/optional pieces (ONNX) behind a feature flag; evaluation and contract guards stay outside the shipped runtime; supply-chain policy is checked in CI. |
 | One database, one transaction, one truth | Memories, FTS, and vectors in a single SQLite file; all writes serialize through one thread; reads run concurrently over WAL. |
 | Fail-closed boundaries | Namespace isolation and the embedding-dimension contract refuse to run on doubt. |
-| Fail-open capture | Best-effort capture hooks degrade silently and never block an agent session. |
+| Fail-open capture | Best-effort hooks continue on handled failures; this is not a whole-process wall-clock latency guarantee. |
 | Reproducible from git | File-discovered, checksummed migrations; a CI gate rebuilds a fresh DB from committed SQL and exercises every query path. |
 | Substrate, not orchestrator | Stores and retrieves memory; has no agent lifecycle and no LLM-driven evolution. The in-process job scheduler (consolidation, link-decay) is in-scope maintenance on the substrate itself, not agent orchestration. |
 
@@ -278,6 +278,32 @@ a hard rejection), and recall applies the class as a multiplicative prior
 Recall gathers candidates from three independent paths, fetches their notes in one
 batch, ranks them with pure functions, and annotates contradictions before returning.
 
+Keyword SQL and native sqlite-vec primary-key prefiltering apply the complete
+recall filter plus quarantine/confidence eligibility **before** channel cutoffs.
+`limit * 4` buys ranking headroom among eligible candidates; it is not a
+post-filter completeness promise. Explicit vector filters materialize eligible
+indexed IDs before distance/top-k; the default KNN fast path reruns that prefilter
+if its safety probe encounters an ineligible row. The 4096-neighbor cap remains,
+but applies to eligible vectors on these paths. Filtered work is corpus-dependent.
+Archived recall has no vector channel. Graph expansion spends its one hop only
+from an eligible seed and rechecks fetched neighbors for races.
+
+An otherwise-eligible one-candidate probe on empty explicit-filter results
+preserves `filter_excluded`; degraded-backend precedence is unchanged. The
+common unfiltered path does not pay for this probe. Its vector eligibility SQL is
+prepared once per search, and keyword statement preparation is reused.
+
+Bounded latency verification uses identical 512-note offline CLI corpora and
+five interleaved, feature-matched baseline/current pairs, plus 512/4096-note
+SQL-channel probes. The paired CLI median shift was +0.6%, with both positive
+and negative pair deltas and overlapping run ranges: no clear regression in
+this check, not a zero-cost or production-scale guarantee. Reproduce the
+channel probe with:
+
+```bash
+cargo test -p rb-store --release --test recall_fast_path_latency -- --ignored --nocapture --test-threads=1
+```
+
 ```mermaid
 flowchart TB
   Q["query"] --> EMBED["embed query (raw)"]
@@ -353,11 +379,12 @@ not a hidden assumption.
 
 ## Namespace model
 
-Every memory belongs to exactly one namespace, and all reads and writes are scoped to
-it. Namespaces are isolated by the daemon (fail-closed): a query in one namespace
-cannot see or be influenced by memories in another — including, for example, the
-`contested` flag, which requires both ends of a `contradicts` link to be active and in
-the same namespace.
+Every memory belongs to exactly one namespace, and reads and writes are scoped to
+it. The daemon fails closed on row access: a query cannot return memories from
+another namespace. The `contested` flag requires both ends of a `contradicts` link
+to be active and in the same namespace. Keyword ranking is not namespace-independent:
+the shared FTS index uses corpus-global BM25 statistics, so foreign-namespace rows
+can influence the ordering and cutoff of local results without being disclosed.
 
 ```mermaid
 flowchart TD

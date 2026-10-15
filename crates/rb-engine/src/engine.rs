@@ -463,7 +463,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         const CANDIDATE_LIMIT: usize = 8;
         let pairs = self
             .backend
-            .vector(self.namespace.clone(), embedding, CANDIDATE_LIMIT)
+            .vector(
+                self.namespace.clone(),
+                embedding,
+                CANDIDATE_LIMIT,
+                rb_types::RecallFilter::default(),
+            )
             .await?;
         // Candidate ids exclude the new note itself.
         let candidate_ids: Vec<MemoryId> = pairs
@@ -526,13 +531,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
     /// warning. The vector channel is skipped entirely in that case; ranking
     /// proceeds on the surviving signals.
     ///
-    /// Filter semantics: metadata dimensions apply per candidate BEFORE
-    /// ranking ([`rb_types::RecallFilter::matches`]); `contested` is resolved
-    /// through one batched `active_contradicts` lookup and FAILS CLOSED (a
-    /// filter must never silently return unfiltered results — unlike the
-    /// best-effort contested ANNOTATION, which stays fail-open); a non-default
-    /// `state` widens the keyword channel to archived rows (their vectors are
-    /// pruned on archive, so archived recall rides keyword+graph only).
+    /// Full eligibility is applied by each direct channel BEFORE its cutoff.
+    /// Metadata and contested checks below remain defense-in-depth for graph
+    /// candidates and concurrent mutations. Archived-only recall has no vectors.
     pub async fn recall_with_status(
         &self,
         query: &str,
@@ -543,7 +544,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
 
         Self::ensure_filter_supported(filter)?;
 
-        // Over-fetch candidates so post-filtering still has enough to fill `limit`.
+        // Retain ranking headroom among eligible candidates, not post-filter headroom.
         let candidate_limit = limit.saturating_mul(4).max(limit);
 
         // Recall path => EmbedKind::Query (W1.4): asymmetric providers (Voyage
@@ -569,22 +570,73 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 self.namespace.clone(),
                 query.to_string(),
                 candidate_limit,
-                filter.state,
+                filter.clone(),
             )
             .await?;
+        // Only explicit filters may need the empty-result reason probe below;
+        // never copy an embedding or issue an extra query on the default path.
+        let probe_embedding = if !filter.is_empty()
+            && keyword.is_empty()
+            && !degraded
+            && filter.state != rb_types::MemoryState::Archived
+        {
+            Some(embedding.clone())
+        } else {
+            None
+        };
         // Archived rows have no vector (pruned on archive: the live-only vec0
         // partition invariant), so an archived-only recall skips the channel.
         let vector = if degraded || filter.state == rb_types::MemoryState::Archived {
             Vec::new()
         } else {
             self.backend
-                .vector(self.namespace.clone(), embedding, candidate_limit)
+                .vector(
+                    self.namespace.clone(),
+                    embedding,
+                    candidate_limit,
+                    filter.clone(),
+                )
                 .await?
         };
+        let mut filter_excluded_direct = false;
+        if limit > 0 && !filter.is_empty() && keyword.is_empty() && vector.is_empty() && !degraded {
+            let scope_only = rb_types::RecallFilter {
+                state: filter.state,
+                ..Default::default()
+            };
+            filter_excluded_direct = !self
+                .backend
+                .keyword(
+                    self.namespace.clone(),
+                    query.to_string(),
+                    1,
+                    scope_only.clone(),
+                )
+                .await?
+                .is_empty();
+            if !filter_excluded_direct {
+                if let Some(embedding) = probe_embedding {
+                    filter_excluded_direct = !self
+                        .backend
+                        .vector(self.namespace.clone(), embedding, 1, scope_only)
+                        .await?
+                        .is_empty();
+                }
+            }
+        }
 
         // Bounded 1-hop graph expansion of the top recall-eligible keyword hit
         // only: a quarantined or confidence-exhausted hit is dropped below, so
         // it must not spend the single seed either.
+        let seed_contested = if filter.contested.is_some() {
+            Some(
+                self.backend
+                    .active_contradicts(self.namespace.clone(), keyword.clone())
+                    .await?,
+            )
+        } else {
+            None
+        };
         let mut graph_seed = None;
         for id in &keyword {
             if self
@@ -593,6 +645,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 .as_ref()
                 .is_some_and(|note| {
                     filter.matches(note)
+                        && filter.contested.is_none_or(|want| {
+                            seed_contested.as_ref().is_some_and(|ids| ids.contains(id)) == want
+                        })
                         && !note.is_quarantined()
                         && !note.below_recall_confidence_floor()
                 })
@@ -631,7 +686,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // Distinguish "the user's filter excluded every candidate"
         // (`FilterExcluded`) from quarantine/namespace drops, which are not
         // filter decisions (PR #89 review).
-        let mut filter_dropped_any = false;
+        let mut filter_dropped_any = filter_excluded_direct;
         for note in fetched {
             // `get_many` is already namespace-scoped; `filter.matches` covers
             // every metadata dimension including the archived-state scope
@@ -838,20 +893,16 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // set. Precedence (PR #89 review, most conservative first): the
         // backend was DEGRADED → warn/retry before concluding anything about
         // the corpus (a down channel hid hits; "no candidates" is not
-        // established); no channel surfaced anything at all → the corpus
-        // simply has no candidate; the user's FILTER (or contested tri-state)
-        // excluded every candidate → the query may be answerable unfiltered;
-        // candidates existed but none survived → the calibrated gate or the
-        // W1.3 floor dropped them. Quarantine/namespace drops are not filter
-        // decisions and fall through to the honest "no candidate" reading.
+        // established); observed filter exclusion → query may be answerable
+        // without the metadata filter; no eligible candidates → no_candidates;
+        // otherwise the calibrated gate or score floor withheld the evidence.
+        // Quarantine/namespace/confidence drops are never filter decisions.
         if results.is_empty() && abstained.is_none() {
             abstained = Some(if degraded {
                 rb_types::AbstainReason::DegradedBackend
-            } else if order.is_empty() {
-                rb_types::AbstainReason::NoCandidates
             } else if filter_dropped_any {
                 rb_types::AbstainReason::FilterExcluded
-            } else if notes.is_empty() {
+            } else if order.is_empty() || notes.is_empty() {
                 rb_types::AbstainReason::NoCandidates
             } else {
                 rb_types::AbstainReason::BelowThreshold

@@ -1,0 +1,525 @@
+{
+  "schema_version": 1,
+  "fixture_sha256": "42320615cbd5f781d0a7ffb531526b88813c89332a143928890414d910c7de80",
+  "vectors_sha256": "489511cb2abf0a3ee9d8107a805efb86209340b765be6e7ea40fedebc2f73e79",
+  "model_id": "all-MiniLM-L6-v2",
+  "answer_quality": "not_evaluated: no generated answer or model judge",
+  "limits": [
+    "Six authored development cases; no held-out tuning, external benchmark or production-scale claim.",
+    "Controlled graph-only cases deliberately omit stored vectors; not natural semantic cutoff evidence.",
+    "Two-hop evidence remains unsupported by production recall and its missing-ID assertion is not weakened.",
+    "History is the retained supersede timeline, not point-in-time reconstruction.",
+    "No hooks, daemon transport, answer generation, or background consolidation is exercised."
+  ],
+  "categories": {
+    "abstention": {
+      "total_cases": 1,
+      "passed_cases": 0
+    },
+    "conflict": {
+      "total_cases": 1,
+      "passed_cases": 1
+    },
+    "direct_multi_fact": {
+      "total_cases": 1,
+      "passed_cases": 1
+    },
+    "graph_expansion": {
+      "total_cases": 1,
+      "passed_cases": 1
+    },
+    "temporal_history": {
+      "total_cases": 1,
+      "passed_cases": 1
+    },
+    "unsupported_two_hop": {
+      "total_cases": 1,
+      "passed_cases": 0
+    }
+  },
+  "cases": [
+    {
+      "id": "unanswered-deployment-region",
+      "category": "abstention",
+      "rationale": "No source states a deployment region. Deployment-adjacent facts must not be presented as the missing answer.",
+      "queries": [
+        {
+          "query": "Which cloud region hosts our production deployment?",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000001"
+            ],
+            "missing_ids": [],
+            "extra_ids": [
+              "12470000-0000-4000-8000-000000000001"
+            ],
+            "duplicate_ids": [],
+            "passed": false
+          },
+          "forbidden_ids": [
+            "12470000-0000-4000-8000-000000000001"
+          ],
+          "forbidden_returned_ids": [
+            "12470000-0000-4000-8000-000000000001"
+          ],
+          "expect_abstention": true,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000001"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000001"
+            ],
+            "graph_only_target": null,
+            "authored_hops": null,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000001",
+              "score": 0.455442,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [
+            "abstention_contract",
+            "extra_evidence",
+            "forbidden_evidence"
+          ],
+          "passed": false
+        }
+      ],
+      "passed": false
+    },
+    {
+      "id": "indexed-decision-and-incident",
+      "category": "direct_multi_fact",
+      "rationale": "Fully indexed decision and incident. Two returned facts are not evidence of multihop retrieval; report direct-channel availability.",
+      "queries": [
+        {
+          "query": "What dispatch queue policy was chosen and which outage motivated it?",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000002",
+              "12470000-0000-4000-8000-000000000003"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000003",
+              "12470000-0000-4000-8000-000000000002"
+            ],
+            "missing_ids": [],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": true
+          },
+          "forbidden_ids": [],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000003",
+              "12470000-0000-4000-8000-000000000002"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000002",
+              "12470000-0000-4000-8000-000000000003"
+            ],
+            "graph_only_target": null,
+            "authored_hops": null,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000003",
+              "score": 0.54880315,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12470000-0000-4000-8000-000000000002",
+              "score": 0.44579372,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [],
+          "passed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "controlled-one-hop-incident",
+      "category": "graph_expansion",
+      "rationale": "Controlled unindexed graph evidence: incident document is embedded and recorded, but its vector is deliberately not inserted. This is graph expansion capability, not natural semantic cutoff quality.",
+      "queries": [
+        {
+          "query": "Dispatchlock",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000004",
+              "12470000-0000-4000-8000-000000000005"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000004",
+              "12470000-0000-4000-8000-000000000005"
+            ],
+            "missing_ids": [],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": true
+          },
+          "forbidden_ids": [],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000004"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000004"
+            ],
+            "graph_only_target": "12470000-0000-4000-8000-000000000005",
+            "authored_hops": 1,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000004",
+              "score": 0.577051,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12470000-0000-4000-8000-000000000005",
+              "score": 0.176,
+              "channels": {
+                "fts": false,
+                "vector": false,
+                "graph": true
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [],
+          "passed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "controlled-two-hop-incident",
+      "category": "unsupported_two_hop",
+      "rationale": "Controlled two-hop-only incident is absent from direct channels and one-hop expansion. Production recall has no two-hop expansion; missing evidence stays a failing assertion, not an expected pass.",
+      "queries": [
+        {
+          "query": "Admissionlock",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000006",
+              "12470000-0000-4000-8000-000000000007",
+              "12470000-0000-4000-8000-000000000008"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000006",
+              "12470000-0000-4000-8000-000000000007"
+            ],
+            "missing_ids": [
+              "12470000-0000-4000-8000-000000000008"
+            ],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": false
+          },
+          "forbidden_ids": [],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000006"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000006"
+            ],
+            "graph_only_target": "12470000-0000-4000-8000-000000000008",
+            "authored_hops": 2,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000006",
+              "score": 0.5974129,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12470000-0000-4000-8000-000000000007",
+              "score": 0.176,
+              "channels": {
+                "fts": false,
+                "vector": false,
+                "graph": true
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [
+            "missing_evidence"
+          ],
+          "passed": false
+        }
+      ],
+      "passed": false
+    },
+    {
+      "id": "current-and-prior-decision",
+      "category": "temporal_history",
+      "rationale": "Active recall must exclude the superseded decision; the explicit production history surface must retain both versions and mark current/prior state. No as-of reconstruction claim.",
+      "queries": [
+        {
+          "query": "What is the current deploy API timeout policy?",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "missing_ids": [],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": true
+          },
+          "forbidden_ids": [
+            "12470000-0000-4000-8000-000000000009"
+          ],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "graph_only_target": null,
+            "authored_hops": null,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000010",
+              "score": 0.62847775,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [],
+          "passed": true
+        },
+        {
+          "query": "What was the prior deploy API timeout policy?",
+          "surface": "SqliteStore::memory_history",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000009",
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000009",
+              "12470000-0000-4000-8000-000000000010"
+            ],
+            "missing_ids": [],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": true
+          },
+          "forbidden_ids": [],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [
+            "12470000-0000-4000-8000-000000000010"
+          ],
+          "expected_archived_ids": [
+            "12470000-0000-4000-8000-000000000009"
+          ],
+          "expected_contested_ids": [],
+          "candidates": null,
+          "returned_evidence": [],
+          "history": {
+            "namespace": "project:rb-eval-coding-current-and-prior-decision",
+            "depth": 10,
+            "chain": [
+              {
+                "id": "12470000-0000-4000-8000-000000000009",
+                "summary": "Deploy API timeout policy: 15 seconds.",
+                "importance": 7,
+                "confidence": 1.0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "archived": true,
+                "contested": false,
+                "current": false,
+                "is_target": false,
+                "superseded_by": "12470000-0000-4000-8000-000000000010",
+                "origin_user": null,
+                "origin_host": null,
+                "origin_agent": null,
+                "origin_source": null
+              },
+              {
+                "id": "12470000-0000-4000-8000-000000000010",
+                "summary": "Deploy API timeout policy: 45 seconds.",
+                "importance": 7,
+                "confidence": 1.0,
+                "created_at": "2026-01-01T00:00:00Z",
+                "archived": false,
+                "contested": false,
+                "current": true,
+                "is_target": true,
+                "origin_user": null,
+                "origin_host": null,
+                "origin_agent": null,
+                "origin_source": null
+              }
+            ],
+            "edges": [],
+            "truncated": false
+          },
+          "abstain_reason": null,
+          "failures": [],
+          "passed": true
+        }
+      ],
+      "passed": true
+    },
+    {
+      "id": "near-identical-conflicting-instructions",
+      "category": "conflict",
+      "rationale": "Near-identical opposing instructions must both remain visible and contested. The obsolete third instruction is forbidden; retrieval does not resolve which active instruction is true.",
+      "queries": [
+        {
+          "query": "Production release instructions automatic retries payment writes",
+          "surface": "MemoryEngine::recall_with_status",
+          "limit": 5,
+          "assertion": {
+            "expected_ids": [
+              "12470000-0000-4000-8000-000000000011",
+              "12470000-0000-4000-8000-000000000012"
+            ],
+            "returned_ids": [
+              "12470000-0000-4000-8000-000000000011",
+              "12470000-0000-4000-8000-000000000012"
+            ],
+            "missing_ids": [],
+            "extra_ids": [],
+            "duplicate_ids": [],
+            "passed": true
+          },
+          "forbidden_ids": [
+            "12470000-0000-4000-8000-000000000013"
+          ],
+          "forbidden_returned_ids": [],
+          "expect_abstention": false,
+          "expected_current_ids": [],
+          "expected_archived_ids": [],
+          "expected_contested_ids": [
+            "12470000-0000-4000-8000-000000000011",
+            "12470000-0000-4000-8000-000000000012"
+          ],
+          "candidates": {
+            "keyword_ids": [
+              "12470000-0000-4000-8000-000000000011",
+              "12470000-0000-4000-8000-000000000012"
+            ],
+            "vector_ids": [
+              "12470000-0000-4000-8000-000000000011",
+              "12470000-0000-4000-8000-000000000012"
+            ],
+            "graph_only_target": null,
+            "authored_hops": null,
+            "topology_passed": true
+          },
+          "returned_evidence": [
+            {
+              "id": "12470000-0000-4000-8000-000000000011",
+              "score": 0.6661965,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": false
+              }
+            },
+            {
+              "id": "12470000-0000-4000-8000-000000000012",
+              "score": 0.6104785,
+              "channels": {
+                "fts": true,
+                "vector": true,
+                "graph": true
+              }
+            }
+          ],
+          "history": null,
+          "abstain_reason": null,
+          "failures": [],
+          "passed": true
+        }
+      ],
+      "passed": true
+    }
+  ]
+}

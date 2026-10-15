@@ -144,7 +144,9 @@ pub async fn retrieve<P: EmbeddingProvider>(
                 .await?
                 .pop()
                 .unwrap_or_default();
-            let hits = backend.vector(namespace(), query, top_n).await?;
+            let hits = backend
+                .vector(namespace(), query, top_n, rb_types::RecallFilter::default())
+                .await?;
             let query_us = q.elapsed().as_micros();
             let ranked: Vec<Hit> = hits
                 .into_iter()

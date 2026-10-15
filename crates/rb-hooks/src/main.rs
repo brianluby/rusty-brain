@@ -1,10 +1,9 @@
 //! `rusty-brain-hooks` — the per-event capture hook binary.
 //!
-//! FAIL-OPEN CONTRACT: this binary NEVER blocks, NEVER returns non-zero, and
-//! NEVER lets an error reach the agent. It reads one event JSON on stdin,
-//! captures memories / injects context best-effort, prints the CLI-specific
-//! `{"continue":true,...}` to stdout, and always exits 0. Any panic or error
-//! anywhere degrades to a literal `{"continue":true}`.
+//! FAIL-OPEN CONTRACT: errors and panics degrade to an exit-0 continue response.
+//! This is not a hard wall-clock guarantee: stdin, preprocessing, filesystem
+//! operations and stdout can stall. The async daemon phase has a cooperative
+//! timeout, and runtime shutdown does not join abandoned blocking work.
 
 mod cache;
 mod capture;
@@ -25,9 +24,9 @@ use rb_agents::{HookEvent, HookResult};
 use crate::cli::Args;
 use crate::scratch::Scratch;
 
-/// Overall wall-clock budget for the connect+capture phase. On expiry the
-/// harness abandons the daemon work and still prints a fail-open response.
-const OVERALL_TIMEOUT: Duration = Duration::from_secs(5);
+/// Cooperative connect+capture budget, NOT a whole-process wall-clock deadline.
+/// Blocking filesystem work and preprocessing are outside this guarantee.
+const CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 /// Per-connect budget for reaching the daemon.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -153,9 +152,9 @@ fn run() -> serde_json::Value {
     };
 
     let result = runtime.block_on(async {
-        // Overall timeout guards the whole connect+capture phase.
+        // Cooperative timeout: synchronous operations cannot be preempted.
         match tokio::time::timeout(
-            OVERALL_TIMEOUT,
+            CAPTURE_TIMEOUT,
             capture_phase(
                 &socket,
                 &namespace,
@@ -169,11 +168,13 @@ fn run() -> serde_json::Value {
         {
             Ok(result) => result,
             Err(_) => {
-                tracing::warn!("overall timeout (fail-open)");
+                tracing::warn!("cooperative capture timeout (fail-open)");
                 continue_result()
             }
         }
     });
+    // Do not turn an abandoned spawn_blocking operation into a teardown join.
+    runtime.shutdown_background();
 
     cli.render_output(&result)
 }
@@ -251,7 +252,7 @@ fn db_path() -> rb_types::Result<std::path::PathBuf> {
 /// running hooks executable. If the sibling is missing (or `current_exe` is
 /// unresolvable), fall back to the bare name `rusty-brain`, which the OS resolves
 /// on `PATH`. Fully fail-open: if nothing is resolvable, auto-start simply fails
-/// and `connect` degrades to `None` — never panics, never blocks.
+/// and `connect` degrades to `None` — never panics; resolution may block on I/O.
 fn daemon_bin() -> std::path::PathBuf {
     let sibling = std::env::current_exe()
         .ok()
@@ -557,5 +558,30 @@ mod tests {
                 "{event:?} must NOT need the daemon (local-only, no store access)"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod blocking_shutdown_tests {
+    #![allow(clippy::expect_used)]
+    #[test]
+    fn shutdown_does_not_join_abandoned_blocking_io() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        drop(runtime.spawn_blocking(move || {
+            let _ = started_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        started_rx
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .expect("worker starts");
+        let started = std::time::Instant::now();
+        runtime.shutdown_background();
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+        drop(release_tx);
     }
 }
