@@ -586,7 +586,8 @@ pub enum Command {
         id: String,
     },
 
-    /// Show the project context payload (recent + important).
+    /// Show compact eligible current decisions, constraints and preferences with
+    /// memory IDs; use get/history for full stored detail on demand.
     Context,
 
     /// Stream live change notifications for the current namespace until Ctrl-C.

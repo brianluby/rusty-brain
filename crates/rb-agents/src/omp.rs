@@ -45,8 +45,9 @@ impl AgentCli for OmpCli {
             Some("session_start") => HookEvent::SessionStart {
                 source: opt_str(raw, "source"),
             },
-            Some("prompt") => HookEvent::UserPromptSubmit {
+            Some("before_agent_start") => HookEvent::BeforeAgentStart {
                 prompt: opt_str(raw, "prompt"),
+                startup: raw.get("startup").and_then(Value::as_bool).unwrap_or(false),
             },
             Some("tool_result") => HookEvent::PostToolUse {
                 tool_name: opt_str(raw, "tool_name").unwrap_or_default(),
@@ -99,6 +100,7 @@ impl AgentCli for OmpCli {
 
     fn render_output(&self, result: &HookResult) -> Value {
         let mut out = json!({ "continue": result.continue_execution });
+        out["prepared"] = json!(result.injection_event == crate::InjectionEvent::BeforeAgentStart);
         if let Some(message) = &result.system_message {
             out["message"] = Value::String(message.clone());
         }
@@ -138,13 +140,14 @@ mod tests {
         );
 
         let prompt = cli.parse_input(&serde_json::json!({
-            "type": "prompt",
+            "type": "before_agent_start",
             "prompt": "Use the project convention"
         }));
         assert_eq!(
             prompt.event,
-            HookEvent::UserPromptSubmit {
-                prompt: Some("Use the project convention".to_string())
+            HookEvent::BeforeAgentStart {
+                prompt: Some("Use the project convention".to_string()),
+                startup: false,
             }
         );
 
@@ -200,7 +203,7 @@ mod tests {
         assert!(matches!(oversized.event, HookEvent::SessionEnd { .. }));
 
         let prompt = OmpCli.parse_input(&json!({
-            "type": "prompt",
+            "type": "before_agent_start",
             "transcript_jsonl": line,
         }));
         assert!(prompt.transcript_jsonl.is_none());
@@ -215,6 +218,30 @@ mod tests {
         });
         assert_eq!(output["continue"], serde_json::json!(true));
         assert_eq!(output["message"], serde_json::json!("recalled memory"));
+    }
+
+    #[test]
+    fn supported_preparation_preserves_startup_and_successful_empty_status() {
+        let context = OmpCli.parse_input(&json!({
+            "type": "before_agent_start", "startup": true, "prompt": "matching evidence",
+        }));
+        assert_eq!(
+            context.event,
+            HookEvent::BeforeAgentStart {
+                startup: true,
+                prompt: Some("matching evidence".into()),
+            }
+        );
+        assert_eq!(
+            OmpCli.render_output(&HookResult::default())["prepared"],
+            false
+        );
+        let empty = OmpCli.render_output(&HookResult {
+            injection_event: crate::InjectionEvent::BeforeAgentStart,
+            ..HookResult::default()
+        });
+        assert_eq!(empty["prepared"], true);
+        assert!(empty.get("message").is_none());
     }
 
     #[test]

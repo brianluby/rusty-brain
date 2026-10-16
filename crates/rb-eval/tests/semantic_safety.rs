@@ -267,14 +267,14 @@ async fn exhausted_keyword_hit_does_not_spend_the_graph_seed() {
 }
 
 #[tokio::test]
-async fn exhausted_rows_cannot_crowd_eligible_ones_out_of_the_context_windows() {
+async fn exhausted_rows_cannot_crowd_eligible_ones_out_of_stable_context() {
     use rb_engine::MemoryBackend;
     let engine = engine();
     let at = |s: &str| chrono::DateTime::parse_from_rfc3339(s).unwrap().to_utc();
     let mut older = rb_types::MemoryNote::new(
         rb_eval::backend::eval_namespace(),
         "older eligible fact".into(),
-        MemoryType::Insight,
+        MemoryType::Constraint,
         9,
     );
     older.created_at = at("2025-01-01T00:00:00Z");
@@ -284,7 +284,7 @@ async fn exhausted_rows_cannot_crowd_eligible_ones_out_of_the_context_windows() 
         let mut exhausted = rb_types::MemoryNote::new(
             rb_eval::backend::eval_namespace(),
             format!("exhausted newer row {i}"),
-            MemoryType::Insight,
+            MemoryType::Constraint,
             9,
         );
         exhausted.created_at = at("2026-01-01T00:00:00Z");
@@ -292,11 +292,11 @@ async fn exhausted_rows_cannot_crowd_eligible_ones_out_of_the_context_windows() 
         engine.backend().write(exhausted, None).await.unwrap();
     }
 
-    let (recent, important, _) = engine.context().await.unwrap();
-    assert!(recent.iter().any(|n| n.id == older_id), "recent window");
-    assert!(
-        important.iter().any(|n| n.id == older_id),
-        "important window"
+    let context = engine.context().await.unwrap();
+    assert_eq!(
+        context.stable.len(),
+        1,
+        "exhausted rows must remain excluded"
     );
-    assert!(recent.iter().chain(&important).all(|n| n.confidence > 0.1));
+    assert_eq!(context.stable[0].id, older_id);
 }

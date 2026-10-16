@@ -15,6 +15,7 @@ path = "src/lib.rs"
 rb-types = { path = "../rb-types" }
 rb-config = { path = "../rb-config" }
 rb-proto = { path = "../rb-proto" }
+rb-tokens = { path = "../rb-tokens" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

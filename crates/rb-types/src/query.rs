@@ -50,6 +50,119 @@ pub struct SearchResult {
     pub stale: bool,
 }
 
+/// Current project navigation, validated against corpus and repository changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectContext {
+    pub stable: Vec<ContextEntry>,
+    pub snapshot: Option<crate::CorpusSnapshot>,
+    pub repo_state: Option<crate::RepoSnapshot>,
+}
+
+/// Bounded navigation only. Full evidence and qualifications belong to get/history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextEntry {
+    pub id: crate::MemoryId,
+    pub memory_type: MemoryType,
+    pub subject: String,
+    pub origin_user: Option<String>,
+    pub origin_agent: Option<String>,
+    pub origin_source: Option<String>,
+    pub origin_channel: Option<crate::WriteChannel>,
+    pub trust_class: TrustClass,
+    pub human_curated: bool,
+    pub contested: bool,
+    pub stale: bool,
+    /// Full-evidence currentness key, excluding access metadata and relative age.
+    pub fingerprint: u64,
+}
+
+impl ContextEntry {
+    /// Reserve handle, safety-label and detail-pointer overhead within original budgets.
+    pub const SUBJECT_CHARS: usize = 80;
+    pub const SOURCE_CHARS: usize = 40;
+
+    /// Currentness comparison without copying full evidence into a preview.
+    pub fn fingerprint_for(memory: &MemoryNote, stale: bool) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut hash = std::collections::hash_map::DefaultHasher::new();
+        (
+            &memory.content,
+            &memory.context,
+            &memory.summary,
+            &memory.keywords,
+            &memory.tags,
+            &memory.related_files,
+        )
+            .hash(&mut hash);
+        (
+            memory.memory_type.as_str(),
+            memory.importance,
+            memory.confidence.to_bits(),
+            memory.trust_class.as_str(),
+            memory.human_curated,
+            memory.contested,
+            stale,
+        )
+            .hash(&mut hash);
+        (
+            &memory.origin_user,
+            &memory.origin_host,
+            &memory.origin_agent,
+            &memory.origin_source,
+            memory.origin_channel.map(|channel| channel.as_str()),
+            &memory.session_id,
+        )
+            .hash(&mut hash);
+        for anchor in &memory.anchors {
+            (
+                crate::anchor_kind_str(anchor.kind),
+                &anchor.value,
+                anchor.start_line,
+                anchor.end_line,
+            )
+                .hash(&mut hash);
+        }
+        hash.finish()
+    }
+
+    pub fn from_memory(memory: MemoryNote, stale: bool) -> Self {
+        let fingerprint = Self::fingerprint_for(&memory, stale);
+        let subject = if memory.summary.trim().is_empty() {
+            &memory.content
+        } else {
+            &memory.summary
+        };
+        let subject = subject
+            .trim()
+            .chars()
+            .take(Self::SUBJECT_CHARS)
+            .map(|ch| {
+                if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        let bounded =
+            |text: Option<String>| text.map(|text| text.chars().take(Self::SOURCE_CHARS).collect());
+        Self {
+            id: memory.id,
+            memory_type: memory.memory_type,
+            subject,
+            origin_user: bounded(memory.origin_user),
+            origin_agent: bounded(memory.origin_agent),
+            origin_source: bounded(memory.origin_source),
+            origin_channel: memory.origin_channel,
+            trust_class: memory.trust_class,
+            human_curated: memory.human_curated,
+            contested: memory.contested,
+            stale,
+            fingerprint,
+        }
+    }
+}
+
 /// Archived-state scope for recall/list filtering (PRD 2026-07-02
 /// search-filter parity). `Active` is the default and preserves pre-filter
 /// behavior (archived rows never surface unless explicitly requested).
@@ -190,6 +303,10 @@ pub struct RecallFilter {
     /// with typed code anchors (PRD 2026-07-02).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<AnchorFilter>,
+    /// Internal injection eligibility, never accepted from a wire filter.
+    /// Audit list/get deliberately retain quarantined and exhausted rows.
+    #[serde(skip)]
+    pub recall_eligible: bool,
 }
 
 impl RecallFilter {
@@ -257,6 +374,9 @@ impl RecallFilter {
     /// lives.
     #[must_use]
     pub fn matches(&self, note: &MemoryNote) -> bool {
+        if self.recall_eligible && (note.is_quarantined() || note.below_recall_confidence_floor()) {
+            return false;
+        }
         if !self.types.is_empty() && !self.types.contains(&note.memory_type) {
             return false;
         }
@@ -559,6 +679,7 @@ mod tests {
                 kind: AnchorKind::File,
                 value: "src/server.rs".to_string(),
             }],
+            recall_eligible: false,
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: RecallFilter = serde_json::from_str(&json).unwrap();

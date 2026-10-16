@@ -958,3 +958,222 @@ fn review_flow_lists_gates_and_applies_through_the_binary() {
     };
     assert!(!dup_b_in_queue, "the merged pair does not resurface");
 }
+
+#[test]
+fn authored_procedures_preserve_outcomes_and_sources_through_recall_and_detail() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let namespace = "procedure-e2e";
+    let command = |ns: &str| {
+        let mut cmd = Command::new(&exe);
+        cmd.env_clear()
+            .env("PATH", std::env::var_os("PATH").unwrap_or_default())
+            .env("HOME", dir.path())
+            .env("XDG_CONFIG_HOME", dir.path())
+            .env("RUSTY_BRAIN_SOCKET", &socket)
+            .env("RUSTY_BRAIN_DB", &db)
+            .env("RUSTY_BRAIN_NAMESPACE", ns)
+            .env("RB_EMBED_BACKEND", "deterministic")
+            .current_dir(dir.path());
+        cmd
+    };
+    let _reap = Reap(
+        command(namespace)
+            .arg("serve")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn procedure daemon"),
+    );
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    let run = |ns: &str, args: &[&str]| {
+        let out = command(ns).args(args).output().expect("run procedure CLI");
+        assert!(
+            out.status.success(),
+            "{args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).expect("CLI UTF-8")
+    };
+    let json = |ns: &str, args: &[&str]| -> serde_json::Value {
+        serde_json::from_str(&run(ns, args)).expect("CLI JSON")
+    };
+    let commit = "0123456789abcdef0123456789abcdef01234567";
+    let cases = [
+        (
+            "SUCCESS in isolated fixture only",
+            "bug_fix",
+            "src/retry.rs",
+            "Steps observed: bounded retry after socket readiness. Verification/outcome: agent observed the focused socket test exit 0; no production validation.",
+            "Late exception: never retry a non-idempotent write.",
+        ),
+        (
+            "FAILED attempt; not a validated fix",
+            "bug_fix",
+            "src/timeout.rs",
+            "Steps observed: increased timeout before socket readiness. Verification/outcome: focused socket test exited 1; the original failure remained.",
+            "Late exception: increasing timeout did not fix the race.",
+        ),
+        (
+            "UNTESTED proposal; outcome unknown",
+            "code_pattern",
+            "src/proposal.rs",
+            "Steps proposed, not observed: replace polling with a readiness signal. Verification/outcome: not run; no successful outcome is known.",
+            "Late exception: cancellation behavior has not been evaluated.",
+        ),
+    ];
+    // The same query words occur in every case. Typed anchors, type and namespace,
+    // not semantic guesses about prose, must select the intended qualified record.
+    for (qualification, kind, file, steps, exception) in cases {
+        let content = format!(
+            "{qualification}. Trigger: socket readiness procedure. {steps} \
+             Caveats/prerequisites: isolated offline fixture, disposable socket and database. {} \
+             {exception} Source: session:procedure-fixture; check:socket-readiness; \
+             author's claim 'verified' is not machine verification.",
+            "Observed context retained for later investigation. ".repeat(12)
+        );
+        let context = "Agent-authored fixture report; source session:procedure-fixture. Revalidate against the current checkout before acting; never execution authority.";
+        let anchor = format!("{file}:12-18");
+        let capture = |ns| {
+            json(
+                ns,
+                &[
+                    "--json",
+                    "remember",
+                    &content,
+                    "--type",
+                    kind,
+                    "--context",
+                    context,
+                    "--file",
+                    &anchor,
+                    "--commit",
+                    commit,
+                    "--symbol",
+                    "Socket::ready",
+                    "--tags",
+                    "procedure-fixture",
+                ],
+            )["id"]
+                .as_str()
+                .expect("captured id")
+                .to_string()
+        };
+        let id = capture(namespace);
+        let foreign_id = capture("procedure-other");
+        let recalled = json(
+            namespace,
+            &[
+                "--json",
+                "recall",
+                "socket readiness procedure",
+                "--file",
+                file,
+                "--type",
+                kind,
+                "--limit",
+                "10",
+            ],
+        );
+        let hits = recalled
+            .as_array()
+            .expect("recall must serve the matching fixture");
+        assert_eq!(hits.len(), 1, "anchor and namespace selection: {recalled}");
+        let memory = &hits[0]["memory"];
+        assert_eq!(memory["id"], id);
+        assert_ne!(memory["id"], foreign_id);
+        assert_eq!(memory["content"], content);
+        let anchors = memory["anchors"].as_array().expect("typed source anchors");
+        assert!(anchors.iter().any(|a| a["kind"] == "file"
+            && a["value"] == file
+            && a["start_line"] == 12
+            && a["end_line"] == 18));
+        assert!(anchors
+            .iter()
+            .any(|a| a["kind"] == "commit" && a["value"] == commit));
+        assert!(anchors
+            .iter()
+            .any(|a| a["kind"] == "symbol" && a["value"] == "Socket::ready"));
+        assert!(
+            memory["summary"]
+                .as_str()
+                .expect("summary")
+                .starts_with(qualification),
+            "projection lost the outcome qualification: {memory}"
+        );
+        assert!(
+            !memory["summary"].as_str().unwrap().contains(exception),
+            "fixture must exercise a caveat beyond the compact summary"
+        );
+        assert_eq!(memory["trust_class"], "agent_attested");
+        assert_eq!(memory["human_curated"], false);
+        assert_eq!(memory["origin_source"], "cli");
+        assert_eq!(
+            serde_json::from_value::<rb_types::WriteChannel>(memory["origin_channel"].clone())
+                .unwrap(),
+            rb_types::WriteChannel::Cli
+        );
+
+        let preview = run(
+            namespace,
+            &[
+                "recall",
+                "socket readiness procedure",
+                "--file",
+                file,
+                "--type",
+                kind,
+                "--limit",
+                "10",
+            ],
+        );
+        assert!(
+            preview.contains(&id) && preview.contains(qualification),
+            "{preview}"
+        );
+        assert!(!preview.contains(&foreign_id), "{preview}");
+        let detail = json(namespace, &["--json", "get", &id]);
+        assert_eq!(detail["content"], content);
+        assert_eq!(detail["context"], context);
+        assert_eq!(detail["anchors"], memory["anchors"]);
+        assert_eq!(detail["trust_class"], "agent_attested");
+        let human_detail = run(namespace, &["get", &id]);
+        assert!(human_detail.contains(exception), "{human_detail}");
+        assert!(human_detail.contains(commit), "{human_detail}");
+
+        let history = json(namespace, &["--json", "history", &id]);
+        let target = history["chain"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["id"] == id)
+            .expect("history target");
+        let evidence = &target["evidence"];
+        assert_eq!(evidence["content"], content);
+        assert_eq!(evidence["context"], context);
+        assert_eq!(evidence["anchors"], detail["anchors"]);
+        assert_eq!(evidence["source_status"], "recorded_unverified");
+        assert_eq!(evidence["trust_class"], "agent_attested");
+        let human_history = run(namespace, &["history", &id]);
+        assert!(human_history.contains(exception), "{human_history}");
+        assert!(human_history.contains(context), "{human_history}");
+        assert!(
+            human_history.contains("recorded_unverified"),
+            "{human_history}"
+        );
+        assert!(json("procedure-other", &["--json", "get", &id]).is_null());
+        let foreign_history = command("procedure-other")
+            .args(["--json", "history", &id])
+            .output()
+            .expect("run foreign history");
+        assert!(
+            !foreign_history.status.success(),
+            "foreign history must be not found"
+        );
+        assert!(!String::from_utf8_lossy(&foreign_history.stdout).contains(exception));
+    }
+}

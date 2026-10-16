@@ -143,8 +143,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "get",
-            description: "Fetch one memory's full content + links by id. Use to expand a \
-                          recall/list hit.",
+            description: "Fetch one memory's full content + links by id. Expand a \
+                          context/recall/list preview.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
@@ -262,8 +262,8 @@ pub fn tool_definitions() -> Vec<ToolDef> {
         },
         ToolDef {
             name: "context",
-            description: "Project memory digest: recent + important memories and a total \
-                          count for the current namespace. Use at the start of work.",
+            description: "Compact current project decisions, constraints, preferences. \
+                          Incomplete subjects; get gives full detail. Use at work start.",
             input_schema: json!({
                 "type": "object",
                 "properties": {}

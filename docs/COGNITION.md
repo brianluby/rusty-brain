@@ -78,18 +78,18 @@ Per-memory policy dimensions, all schema-enforced:
   `protected_tags` that exempt memories from forgetting entirely
   (`crates/rb-config/src/file.rs`, `RetentionFileConfig`;
   PRD [user-facing retention policy](prds/2026-07-02-user-facing-retention-policy.md), PR #60).
-- **Type-aware retrieval preference** — the SessionStart digest surfaces standing
-  `constraint` / `architecture_decision` memories at importance ≥ 8 first
-  (`is_preferred`, `crates/rb-hooks/src/capture.rs`, W3.3) — the one place a type
-  currently changes retrieval policy.
+- **Type-aware context selection** — `context` selects current eligible
+  `constraint` / `architecture_decision` / `preference` records before its SQL
+  cutoff, ordered by importance descending, creation time descending, then UUID.
+  Activity summaries do not enter this stable navigation projection.
 
 **Gaps (declared, not implemented here)**:
 
 - No per-type (per-stratum) **retention** policy: `importance_floor`,
   `protected_tags`, and the age horizons apply uniformly across all nine types.
 - No per-type **encoding** policy: enrichment and embedding treat all types the same.
-- No per-type **retrieval** protocol beyond the digest preference above; ranking
-  weights are global (`crates/rb-engine/src/engine.rs`).
+- No per-type **recall** protocol beyond stable context selection above; query
+  ranking weights remain global (`crates/rb-engine/src/engine.rs`).
 
 Concrete follow-up candidates are listed at the end of this file.
 
@@ -216,10 +216,28 @@ HTTP `/recall` endpoint (`crates/rb-daemon/src/http.rs`) or are recorded
 `unsupported` in the capability matrix (`crates/rb-agents/src/capability.rs`) —
 never silent parity.
 
-SessionStart additionally injects a once-per-session digest: at most 10 items
-under a ≤600-token budget, mode decided by the session source (`startup`/`clear` →
-full digest, `compact` → constraints only, `resume` → nothing), with a pointer
-stating the set is a budgeted subset (`crates/rb-hooks/src/capture.rs`, W2.5/W3.3).
+SessionStart prepares stable navigation: at most 10 items under a ≤600-token
+budget, including framing, full UUIDs, trust/contested/stale labels and detail
+pointers. Source decides the mode (`startup`/`clear` → full, `compact` →
+constraints only, `resume` → no redundant startup). Subjects are incomplete,
+not complete policy; follow `get`/`history` for exact caveats and source context.
+The shared projection lives in `rb-tokens::context`; no generated doctrine,
+query router or second memory store is involved.
+
+Selection excludes archived/superseded, quarantined and confidence-exhausted
+records before the bounded cutoff. Corpus generation includes relevant global
+administrative changes such as scrub, while ordinary writes in another namespace
+remain isolated. Before/after corpus and live-repository validation retries
+boundedly, then refuses inconsistent context. Long-lived connections refresh Git
+state instead of holding the handshake snapshot. Read-time staleness still
+requires substantiating repository evidence; unknown state is not proof of
+freshness or staleness.
+
+Stable text excludes volatile access/age data and is not a provider-cache promise.
+Session preparation tracks bounded handles/fingerprints rather than full notes.
+Supported refresh/recall paths disclose changed prior entries; they cannot revoke
+text already held by the host. Dynamic recall remains query-specific and does not
+repeat unchanged stable previews already prepared for that session.
 
 ### 3.2 Active recall
 `recall` is a first-class operation on every surface — CLI, MCP tool, and the

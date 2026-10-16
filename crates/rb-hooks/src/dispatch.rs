@@ -44,7 +44,13 @@ pub async fn dispatch(
             // session, off the daemon path).
             let _ = tokio::task::spawn_blocking(scratch::prune_stale).await;
             // W3.3: the injection is source-aware (startup vs resume vs compact).
-            capture::session_start(client.take(), source.as_deref()).await
+            capture::session_start(client.take(), scratch, source.as_deref()).await
+        }
+        HookEvent::BeforeAgentStart { prompt, startup } => {
+            if *startup {
+                let _ = tokio::task::spawn_blocking(scratch::prune_stale).await;
+            }
+            capture::before_agent_start(client.take(), scratch, prompt.as_deref(), *startup).await
         }
         HookEvent::PostToolUse {
             tool_name,
@@ -76,7 +82,7 @@ pub async fn dispatch(
         // W3.2(a): recall memories relevant to the user's prompt and inject them
         // as additionalContext (read-only; deterministic — no model election).
         HookEvent::UserPromptSubmit { prompt } => {
-            capture::user_prompt_submit(client.take(), prompt.as_deref()).await
+            capture::user_prompt_submit(client.take(), scratch, prompt.as_deref()).await
         }
         HookEvent::Other(_) => HookResult::default(),
     }

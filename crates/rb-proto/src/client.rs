@@ -10,9 +10,10 @@ use crate::messages::{
     CONTRACT_VERSION,
 };
 use crate::{response_error_to_error, Response as Resp};
+use futures::SinkExt;
 use rb_types::{
     Error, FeedbackKind, MemoryChanged, MemoryId, MemoryNote, MemoryType, MemoryUpdates, Namespace,
-    Result, SearchResult,
+    ProjectContext, Result, SearchResult,
 };
 use std::path::Path;
 use tokio::io::{AsyncRead, AsyncWrite};
@@ -29,12 +30,21 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 #[derive(Debug)]
 pub struct Client<S = UnixStream> {
     framed: Framed<S, LengthDelimitedCodec>,
+    state: ConnectionState,
     /// Whether the daemon advertised [`crate::CAP_ANCHORS`] at handshake —
     /// i.e. it evaluates typed code anchors instead of silently dropping
     /// (`Remember.anchors`) or ignoring (pre-filter daemons) them.
     supports_anchors: bool,
     /// Whether the daemon accepts durable curation intent on write requests.
     supports_human_curation: bool,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum ConnectionState {
+    Idle,
+    AwaitingResponse { subscribe: bool },
+    Streaming,
+    Poisoned,
 }
 
 /// One item yielded by a live subscribe stream: either a change event or a
@@ -115,6 +125,7 @@ where
             .any(|c| c == crate::CAP_HUMAN_CURATION);
         Ok(Client {
             framed,
+            state: ConnectionState::Idle,
             supports_anchors,
             supports_human_curation,
         })
@@ -135,28 +146,64 @@ where
         self.supports_human_curation
     }
 
-    /// Send one request frame WITHOUT reading the response. Split from
-    /// [`request`](Self::request) so retrying callers can distinguish the two
-    /// failure phases: a SEND failure means the daemon never received the frame
-    /// (a Unix-socket write fails immediately once the peer has closed), so a
-    /// retry on a fresh connection is safe for any op; a RECV failure after a
-    /// successful send means the daemon may have executed the request and only
-    /// the response was lost, so only idempotent ops may be retried.
-    /// Local capability rejection returns `InvalidArgument` before writing and
-    /// leaves the connection healthy; callers must not treat it as transport loss.
+    /// Send one request frame WITHOUT reading the response. Finish with
+    /// [`recv_response`](Self::recv_response) before sending another request.
+    /// Cancellation or transport failure makes this connection unusable: a
+    /// partial send may have reached the daemon, so failure alone does not make
+    /// a mutation safe to retry.
+    /// Local capability/size rejection returns `InvalidArgument` before writing
+    /// and leaves an idle connection healthy.
     pub async fn send_request(&mut self, req: &Request) -> Result<()> {
+        if !matches!(self.state, ConnectionState::Idle) {
+            return Err(Error::Io(
+                "connection has an unfinished request, is streaming, or is broken".into(),
+            ));
+        }
         if request_uses_human_curation(req) && !self.supports_human_curation {
             return Err(Error::InvalidArgument(
                 "daemon does not advertise human curation support".to_string(),
             ));
         }
-        write_frame(&mut self.framed, req).await
+        let bytes = serde_json::to_vec(req).map_err(|e| Error::Serialization(e.to_string()))?;
+        if bytes.len() > self.framed.codec().max_frame_length() {
+            return Err(Error::InvalidArgument(
+                "request exceeds the maximum frame size".into(),
+            ));
+        }
+        // Only a complete send/read can restore usability after an await.
+        self.state = ConnectionState::Poisoned;
+        self.framed
+            .send(bytes::Bytes::from(bytes))
+            .await
+            .map_err(|e| Error::Io(e.to_string()))?;
+        self.state = ConnectionState::AwaitingResponse {
+            subscribe: matches!(req, Request::Subscribe { .. }),
+        };
+        Ok(())
     }
 
     /// Read one response frame for a request previously sent with
     /// [`send_request`](Self::send_request).
+    /// Cancellation or a malformed/lost response permanently breaks the
+    /// connection rather than letting a later request consume its response.
     pub async fn recv_response(&mut self) -> Result<Response> {
-        read_frame(&mut self.framed).await
+        let ConnectionState::AwaitingResponse { subscribe } = self.state else {
+            return Err(Error::Io(
+                "connection has no readable pending response or is broken".into(),
+            ));
+        };
+        self.state = ConnectionState::Poisoned;
+        let response = read_frame(&mut self.framed).await?;
+        self.state = if subscribe {
+            match &response {
+                Response::SubscribeAck => ConnectionState::Streaming,
+                Response::Error { .. } => ConnectionState::Idle,
+                _ => ConnectionState::Poisoned,
+            }
+        } else {
+            ConnectionState::Idle
+        };
+        Ok(response)
     }
 
     /// Send one request and read one response.
@@ -178,11 +225,11 @@ where
     /// oplog before live streaming begins, so a reconnecting consumer misses
     /// nothing. Track the cursor as `max(seq)` over received changes.
     pub async fn subscribe_since(&mut self, since: Option<u64>) -> Result<()> {
-        write_frame(&mut self.framed, &Request::Subscribe { since }).await?;
+        self.send_request(&Request::Subscribe { since }).await?;
         // Block until the daemon confirms the broadcast receiver is registered.
         // Returning before the ack would let the caller commit a change that
         // races ahead of an active subscription and is silently missed.
-        let resp: Response = read_frame(&mut self.framed).await?;
+        let resp = self.recv_response().await?;
         match resp {
             Resp::SubscribeAck => Ok(()),
             Resp::Error { kind, message } => Err(response_error_to_error(&kind, &message)),
@@ -195,15 +242,30 @@ where
     /// Read the next streamed item from a subscribe stream. Blocks until the
     /// daemon emits the next `Change`/`Lagged` frame; a closed stream surfaces as
     /// `Error::Io`. Any non-streamed response is a protocol violation.
+    /// Cancelling a stream read is safe to resume; requests remain forbidden.
     pub async fn recv_change(&mut self) -> Result<SubscribeItem> {
-        let resp: Response = read_frame(&mut self.framed).await?;
+        if !matches!(self.state, ConnectionState::Streaming) {
+            return Err(Error::Io(
+                "connection is not a readable subscribe stream".into(),
+            ));
+        }
+        let resp: Response = match read_frame(&mut self.framed).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.state = ConnectionState::Poisoned;
+                return Err(error);
+            }
+        };
         match resp {
             Response::Change(evt) => Ok(SubscribeItem::Change(evt)),
             Response::Lagged { dropped } => Ok(SubscribeItem::Lagged(dropped)),
             Resp::Error { kind, message } => Err(response_error_to_error(&kind, &message)),
-            other => Err(Error::Storage(format!(
-                "unexpected frame on subscribe stream: {other:?}"
-            ))),
+            other => {
+                self.state = ConnectionState::Poisoned;
+                Err(Error::Storage(format!(
+                    "unexpected frame on subscribe stream: {other:?}"
+                )))
+            }
         }
     }
 }
@@ -215,10 +277,13 @@ where
     /// Helper: turn an unexpected response (including a wire `Error`) into an
     /// `Err`. The daemon's `Response::Error` is mapped back to a domain error;
     /// any other unexpected variant is a protocol violation -> `Error::Storage`.
-    fn unexpected(resp: Resp) -> Error {
+    fn unexpected(&mut self, resp: Resp) -> Error {
         match resp {
             Resp::Error { kind, message } => response_error_to_error(&kind, &message),
-            other => Error::Storage(format!("unexpected response: {other:?}")),
+            other => {
+                self.state = ConnectionState::Poisoned;
+                Error::Storage(format!("unexpected response: {other:?}"))
+            }
         }
     }
 
@@ -427,7 +492,7 @@ where
             .await?;
         match resp {
             Resp::Remembered { id } => Ok(id),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -528,7 +593,7 @@ where
                 abstained,
                 snapshot,
             } => Ok((results, degraded, abstained, snapshot)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -537,7 +602,7 @@ where
         let resp = self.request(Request::Get { id }).await?;
         match resp {
             Resp::Got { memory } => Ok(memory),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -573,7 +638,7 @@ where
             .await?;
         match resp {
             Resp::Listed { memories } => Ok(memories),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -582,7 +647,7 @@ where
         let resp = self.request(Request::Graph { id, depth }).await?;
         match resp {
             Resp::GraphResult { memories } => Ok(memories),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -591,7 +656,7 @@ where
         let resp = self.request(Request::Update { id, updates }).await?;
         match resp {
             Resp::Updated => Ok(()),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -624,7 +689,7 @@ where
             .await?;
         match resp {
             Resp::Linked => Ok(()),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -634,7 +699,7 @@ where
         let resp = self.request(Request::Feedback { id, kind }).await?;
         match resp {
             Resp::FeedbackRecorded { confidence } => Ok(confidence),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -643,20 +708,16 @@ where
         let resp = self.request(Request::Delete { id }).await?;
         match resp {
             Resp::Deleted => Ok(()),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
-    /// Fetch the project context payload (recent, important, total).
-    pub async fn context(&mut self) -> Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
+    /// Fetch eligible stable project navigation and its snapshot.
+    pub async fn context(&mut self) -> Result<ProjectContext> {
         let resp = self.request(Request::Context).await?;
         match resp {
-            Resp::ContextResult {
-                recent,
-                important,
-                total,
-            } => Ok((recent, important, total)),
-            other => Err(Self::unexpected(other)),
+            Resp::ContextResult { context } => Ok(context),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -677,7 +738,7 @@ where
                 contract_version,
                 recall_channels,
             } => Ok((contract_version, recall_channels)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -692,7 +753,7 @@ where
                 changed,
                 skipped,
             } => Ok((scanned, changed, skipped)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -708,7 +769,7 @@ where
                 changed,
                 skipped,
             } => Ok((scanned, changed, skipped)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -739,7 +800,7 @@ where
                 wal_checkpoint,
                 wal_checkpoint_error,
             }),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -760,7 +821,7 @@ where
                 provider_model,
                 writer_alive,
             } => Ok((stats, provider_model, writer_alive)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -782,7 +843,7 @@ where
             .await?;
         match resp {
             Resp::ForgetPlanned { plan } => Ok(plan),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -804,7 +865,7 @@ where
             .await?;
         match resp {
             Resp::ForgetDone { outcome } => Ok(outcome),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -823,7 +884,7 @@ where
         let resp = self.request(Request::History { id, depth }).await?;
         match resp {
             Resp::History { history } => Ok(history),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -849,7 +910,7 @@ where
             .await?;
         match resp {
             Resp::ReviewPlanned { plan } => Ok(plan),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -876,7 +937,7 @@ where
             .await?;
         match resp {
             Resp::ReviewDone { outcome } => Ok(outcome),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -901,7 +962,7 @@ where
             .await?;
         match resp {
             Resp::Resolved { resolution } => Ok(resolution),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 
@@ -920,7 +981,7 @@ where
             .await?;
         match resp {
             Resp::NamespaceRenamed { moved, vectors } => Ok((moved, vectors)),
-            other => Err(Self::unexpected(other)),
+            other => Err(self.unexpected(other)),
         }
     }
 }
@@ -1261,9 +1322,19 @@ mod wrapper_tests {
                 Request::Feedback { .. } => Response::FeedbackRecorded { confidence: 0.7 },
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
-                    recent: vec![note()],
-                    important: vec![note()],
-                    total: 2,
+                    context: rb_types::ProjectContext {
+                        stable: vec![rb_types::ContextEntry::from_memory(
+                            {
+                                let mut memory = note();
+                                memory.id = fixed_id.clone();
+                                memory.memory_type = MemoryType::Constraint;
+                                memory
+                            },
+                            true,
+                        )],
+                        snapshot: None,
+                        repo_state: None,
+                    },
                 },
                 Request::Ping => Response::Pong {
                     contract_version: CONTRACT_VERSION,
@@ -1886,10 +1957,10 @@ mod wrapper_tests {
             .unwrap();
         c.delete(fixed_id.clone()).await.unwrap();
 
-        let (recent, important, total) = c.context().await.unwrap();
-        assert_eq!(recent.len(), 1);
-        assert_eq!(important.len(), 1);
-        assert_eq!(total, 2);
+        let context = c.context().await.unwrap();
+        assert_eq!(context.stable.len(), 1);
+        assert_eq!(context.stable[0].id, fixed_id);
+        assert!(context.stable[0].stale);
 
         let version = c.ping().await.unwrap();
         assert_eq!(version, CONTRACT_VERSION);

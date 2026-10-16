@@ -66,13 +66,12 @@ impl std::fmt::Display for AbstainReason {
 /// results are pinned to an exact corpus state: any insert, update, or delete
 /// in the namespace changes at least one component.
 ///
-/// Components (all namespace-scoped):
+/// Components (row aggregates namespace-scoped; generation also sees global admin writes):
 /// - `memories` — row count (all states: active + archived),
-/// - `generation` — the namespace's `MAX(memory_oplog.seq)`: every mutating
-///   path (insert, update, delete, AND ranking-input writes like feedback
-///   that deliberately leave `updated_at` alone) logs an oplog row
-///   transactionally, so the generation moves on each (PR #89 review —
-///   `MAX(rowid)` missed no-`updated_at` rewrites),
+/// - `generation` — MAX(memory_oplog.seq) for this namespace OR the empty
+///   global-admin namespace. Scrub can change qualifications without changing
+///   authored timestamps, so its global oplog row invalidates every snapshot.
+///   Ordinary writes to other namespaces remain isolated.
 /// - `last_write_epoch_s` — `MAX(updated_at)`: unix seconds of the newest
 ///   row-timestamped write.
 ///
@@ -84,9 +83,8 @@ impl std::fmt::Display for AbstainReason {
 pub struct CorpusSnapshot {
     /// Rows in the namespace, active and archived.
     pub memories: u64,
-    /// The namespace's `MAX(memory_oplog.seq)`: moves on EVERY mutating
-    /// write, including ranking-input writes (feedback, recalibration,
-    /// vector updates) that leave `updated_at` unchanged.
+    /// MAX(oplog seq) for this namespace plus global admin mutations, including
+    /// qualification/ranking changes that deliberately leave `updated_at` unchanged.
     pub generation: u64,
     /// `MAX(updated_at)` in unix seconds; `0` for an empty namespace.
     pub last_write_epoch_s: i64,

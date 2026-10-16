@@ -6,7 +6,8 @@ use crate::jsonrpc::{JsonRpcError, INVALID_PARAMS, METHOD_NOT_FOUND};
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use rb_proto::{Request, Response};
-use rb_types::{FeedbackKind, MemoryId, MemoryNote, MemoryType, MemoryUpdates};
+use rb_tokens::context::render_preparation;
+use rb_types::{FeedbackKind, MemoryId, MemoryNote, MemoryType, MemoryUpdates, ProjectContext};
 use serde_json::{json, Value};
 use std::str::FromStr;
 
@@ -441,12 +442,9 @@ fn truncate_chars(s: &str, max: usize) -> String {
     }
 }
 
-/// One compact markdown line for a memory (W3.3):
-/// `[type, imp N, Xd ago] summary-or-first-200-chars (id <uuid>)` + ` ⚠ contested`.
-/// Newlines/control chars in the memory text are flattened to spaces so stored
-/// content cannot inject fake markdown structure into the result. The full id is
-/// kept (not a 6-char prefix) so the model can `get`/`update`/`link` the result;
-/// `structuredContent` carries it too.
+/// One compact markdown line with a real detail handle. Even a short summary
+/// is incomplete evidence: late qualifications may live only in full detail.
+/// Newlines/control chars cannot inject fake markdown structure.
 fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
     let raw = if m.summary.trim().is_empty() {
         m.content.trim()
@@ -476,7 +474,7 @@ fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
         ""
     };
     format!(
-        "[{}, imp {}, {}] {} (id {}){}{}",
+        "[{}, imp {}, {}] incomplete subject: {} (id {}; get/history for full detail){}{}",
         m.memory_type.as_str(),
         m.importance,
         relative_age(m.created_at, now),
@@ -520,27 +518,14 @@ fn render_indexed_results(results: &[rb_types::SearchResult], now: DateTime<Utc>
     out
 }
 
-/// Compact markdown for the `context` projection: a total count plus Important
-/// and Recent sections (each a numbered list).
-fn render_context_md(
-    recent: &[MemoryNote],
-    important: &[MemoryNote],
-    total: usize,
-    now: DateTime<Utc>,
-) -> String {
-    if total == 0 && recent.is_empty() && important.is_empty() {
-        return "no stored memories".to_string();
+/// Stable model-facing navigation and the complete current context payload.
+pub(crate) fn context_to_content(context: &ProjectContext, notice: Option<&str>) -> ToolContent {
+    ToolContent {
+        text: render_preparation(Some(context), false, &[], notice)
+            .unwrap_or_else(|| "no stored project context".to_string()),
+        structured: json!(context),
+        is_error: false,
     }
-    let mut out = format!("{total} memories in scope.\n");
-    if !important.is_empty() {
-        out.push_str("\nImportant:\n");
-        out.push_str(&render_indexed(important.iter(), now));
-    }
-    if !recent.is_empty() {
-        out.push_str("\nRecent:\n");
-        out.push_str(&render_indexed(recent.iter(), now));
-    }
-    out
 }
 
 pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
@@ -655,18 +640,7 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
             ToolContent::json(json!({ "ok": true, "confidence": confidence }), false)
         }
         Response::Deleted => ToolContent::json(json!({ "ok": true }), false),
-        Response::ContextResult {
-            recent,
-            important,
-            total,
-        } => {
-            let text = render_context_md(&recent, &important, total, now);
-            ToolContent {
-                text,
-                structured: json!({ "recent": recent, "important": important, "total": total }),
-                is_error: false,
-            }
-        }
+        Response::ContextResult { context } => context_to_content(&context, None),
         Response::Pong {
             contract_version, ..
         } => ToolContent::json(json!({ "contract_version": contract_version }), false),
@@ -1641,15 +1615,17 @@ mod tests {
 
         let ctx = response_to_content(
             Response::ContextResult {
-                recent: vec![note()],
-                important: vec![note()],
-                total: 2,
+                context: ProjectContext {
+                    stable: vec![rb_types::ContextEntry::from_memory(note(), false)],
+                    snapshot: None,
+                    repo_state: None,
+                },
             },
             now,
         );
-        assert_eq!(ctx.structured["total"], 2);
-        assert!(ctx.text.contains("2 memories in scope"));
-        assert!(ctx.text.contains("Important:") && ctx.text.contains("Recent:"));
+        assert_eq!(ctx.structured["stable"].as_array().unwrap().len(), 1);
+        assert!(ctx.text.contains("one db one transaction"));
+        assert!(ctx.structured.get("recent").is_none());
 
         let err = response_to_content(
             Response::Error {

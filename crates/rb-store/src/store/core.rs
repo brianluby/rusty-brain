@@ -1210,6 +1210,17 @@ fn build_list_filtered_query(
     limit: usize,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
     let (predicate, mut params) = build_filter_predicate(ns, filter)?;
+    let predicate = if filter.recall_eligible {
+        params.push(Box::new(f64::from(
+            rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE,
+        )));
+        format!(
+            "{predicate} AND {RECALL_NOT_QUARANTINED_SQL} AND m.confidence >= ?{}",
+            params.len()
+        )
+    } else {
+        predicate
+    };
     let mut sql = format!(
         "SELECT memory_id, namespace, created_at, updated_at, content, summary,
                 keywords, tags, context, memory_type, importance, confidence,
@@ -1220,10 +1231,12 @@ fn build_list_filtered_query(
          FROM memories m WHERE {predicate}"
     );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-    sql.push_str(&format!(
-        " ORDER BY m.created_at DESC LIMIT ?{}",
-        params.len()
-    ));
+    let order = if filter.recall_eligible {
+        "m.importance DESC, m.created_at DESC, m.memory_id ASC"
+    } else {
+        "m.created_at DESC, m.memory_id ASC"
+    };
+    sql.push_str(&format!(" ORDER BY {order} LIMIT ?{}", params.len()));
     Ok((sql, params))
 }
 

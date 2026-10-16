@@ -8,6 +8,10 @@ const log = process.env.RB_OMP_FIXTURE_LOG;
 if (!log) process.exit(42);
 await appendFile(log, `${JSON.stringify({ phase: "received", envelope })}\n`);
 const prompt = envelope.prompt;
+if (prompt === "fixture/empty") {
+  console.log(JSON.stringify({ continue: true, prepared: true }));
+  process.exit(0);
+}
 if (prompt === "fixture/nonzero") {
   console.log(JSON.stringify({ message: "must not inject failed output" }));
   process.exit(7);
@@ -34,10 +38,12 @@ if (envelope.type === "tool_result") {
   await Bun.sleep(40);
   await appendFile(log, `${JSON.stringify({ phase: "captured", session_id: envelope.session_id })}\n`);
 }
-if (envelope.type === "prompt") {
+if (envelope.type === "before_agent_start") {
   if (prompt === "alpha") await Bun.sleep(40);
-  const message = prompt === "alpha" ? "Stored alpha decision" : "Stored β decision 𐐀";
-  console.log(JSON.stringify({ message }));
+  const dynamic = prompt === "alpha" ? "Stored alpha decision" : "Stored β decision 𐐀";
+  const stable = envelope.startup === true && envelope.session_id === "stable-session"
+    ? "Stored stable project decision" : undefined;
+  console.log(JSON.stringify({ continue: true, prepared: true, message: [stable, dynamic].filter(Boolean).join("\n") }));
 } else {
-  console.log("{}");
+  console.log(JSON.stringify({ continue: true }));
 }

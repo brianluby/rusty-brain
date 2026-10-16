@@ -55,6 +55,11 @@ pub enum HookEvent {
     /// call a tool. `prompt` is the raw user text (Claude Code `prompt` field);
     /// CLIs without an equivalent event never produce this variant.
     UserPromptSubmit { prompt: Option<String> },
+    /// OMP's supported preparation combines optional startup and prompt recall.
+    BeforeAgentStart {
+        prompt: Option<String>,
+        startup: bool,
+    },
     /// An event we do not model (or could not parse). Carries the raw event name.
     Other(String),
 }
@@ -73,6 +78,8 @@ pub enum InjectionEvent {
     SessionStart,
     /// Injected on a user prompt (the W3.2(a) deterministic recall).
     UserPromptSubmit,
+    /// A completed OMP preparation, including a successful empty context.
+    BeforeAgentStart,
 }
 
 impl InjectionEvent {
@@ -82,6 +89,7 @@ impl InjectionEvent {
         match self {
             InjectionEvent::SessionStart => "SessionStart",
             InjectionEvent::UserPromptSubmit => "UserPromptSubmit",
+            InjectionEvent::BeforeAgentStart => "before_agent_start",
         }
     }
 }

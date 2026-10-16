@@ -13,7 +13,7 @@ use std::time::Duration;
 // knobs need no forwarding — the spawned daemon re-reads config.toml itself.
 use rb_config::{spawn_forward_env, DB_ENV, SOCKET_ENV};
 use rb_proto::{Client, ClientIdentity};
-use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace, SearchResult};
+use rb_types::{MemoryId, MemoryType, Namespace, ProjectContext, SearchResult};
 
 /// Auto-start parameters. Provided ONLY for `SessionStart`; any other event
 /// passes `None` so non-session hooks never spawn a daemon.
@@ -172,10 +172,10 @@ impl DaemonClient {
         }
     }
 
-    /// Best-effort context fetch. Returns `(recent, important, total)`, or `None`.
-    pub async fn context(&mut self) -> Option<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
+    /// Best-effort stable project context fetch, or `None` on failure.
+    pub async fn context(&mut self) -> Option<ProjectContext> {
         match tokio::time::timeout(self.timeout, self.client.context()).await {
-            Ok(Ok(triple)) => Some(triple),
+            Ok(Ok(context)) => Some(context),
             Ok(Err(_)) | Err(_) => None,
         }
     }
@@ -342,16 +342,17 @@ mod tests {
             .expect("remember must return an id");
         assert_eq!(id.to_string().len(), 36, "id is a uuid");
 
-        let (recent, important, total) = client
+        let context = client
             .context()
             .await
-            .expect("context must return a triple");
-        assert!(total >= 1, "the stored memory must be counted");
-        let note = recent
-            .iter()
-            .chain(important.iter())
-            .find(|m| m.id == id)
-            .expect("stored memory must appear in recent or important");
+            .expect("context must return stable entries");
+        assert!(context.stable.iter().any(|entry| entry.id == id));
+        let note = client
+            .client
+            .get(id)
+            .await
+            .unwrap()
+            .expect("full stored detail");
 
         // W0.5: the handshake identity is stamped onto the write, and the
         // declared confidence (0.7 for hook captures) is persisted.
@@ -371,9 +372,9 @@ mod tests {
         ];
         let anchored_id = client
             .remember_anchored(
-                "anchored session summary".to_string(),
+                "anchored constraint".to_string(),
                 None,
-                MemoryType::Insight,
+                MemoryType::Constraint,
                 6,
                 vec!["hook".to_string()],
                 Some(0.7),
@@ -383,12 +384,14 @@ mod tests {
             )
             .await
             .expect("anchored remember must return an id");
-        let (recent, important, _total) = client.context().await.expect("context");
-        let anchored_note = recent
-            .iter()
-            .chain(important.iter())
-            .find(|m| m.id == anchored_id)
-            .expect("anchored memory must appear");
+        let context = client.context().await.expect("context");
+        assert!(context.stable.iter().any(|entry| entry.id == anchored_id));
+        let anchored_note = client
+            .client
+            .get(anchored_id)
+            .await
+            .unwrap()
+            .expect("full anchored detail");
         assert_eq!(
             anchored_note.anchors, anchors,
             "anchors must persist through the fail-open hook client"
@@ -417,7 +420,7 @@ mod tests {
             .remember(
                 "legacy client write".to_string(),
                 None,
-                MemoryType::Insight,
+                MemoryType::Preference,
                 8,
                 vec![],
                 Some(1.0),
@@ -425,12 +428,14 @@ mod tests {
             .await
             .expect("remember must return an id");
 
-        let (recent, important, _total) = client.context().await.expect("context");
-        let note = recent
-            .iter()
-            .chain(important.iter())
-            .find(|m| m.id == id)
-            .expect("note present");
+        let context = client.context().await.expect("context");
+        assert!(context.stable.iter().any(|entry| entry.id == id));
+        let note = client
+            .client
+            .get(id)
+            .await
+            .unwrap()
+            .expect("full stored provenance");
         assert_eq!(note.origin_user, rb_config::current_user());
         assert_eq!(note.origin_host, rb_config::current_hostname());
         assert!(note.origin_agent.is_none());

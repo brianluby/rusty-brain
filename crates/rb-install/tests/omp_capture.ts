@@ -130,6 +130,93 @@ try {
     return memories(await run("export", "--format", "json"))
       .filter(note => note.tags.includes("confirmed-decision") && note.session_id === session);
   };
+  const deliveryHandlers = new Map<string, Handler>();
+  let deliverySession = "omp-stable-first";
+  const deliveryContext = {
+    cwd: root, sessionManager: { getSessionId: () => deliverySession, getBranch: () => [] },
+  };
+  extension({ on: (name: string, handler: Handler) => deliveryHandlers.set(name, handler) } as unknown as Parameters<typeof extension>[0]);
+  const deliver = async (name: string, payload = {}) => {
+    const handler = deliveryHandlers.get(name);
+    assert.ok(handler);
+    return handler(payload, deliveryContext);
+  };
+  const body = (result: unknown): string => {
+    assert.ok(object(result) && object(result.message));
+    assert.equal(result.message.display, false);
+    assert.equal(result.message.customType, "dev.rusty-brain.recall");
+    assert.equal(typeof result.message.content, "string");
+    return result.message.content as string;
+  };
+  const callbackObservation = "ORCHID-LATE-STARTUP red cedar callback observation";
+  await run("--json", "remember", callbackObservation, "--type", "insight", "--importance", "9");
+  const dynamicNote = memories(await run("export", "--format", "json"))
+    .find(note => note.memory_type === "Insight" && note.content === callbackObservation);
+  assert.ok(dynamicNote);
+  assert.equal(await deliver("session_start"), undefined);
+  // The decision is written after startup was requested, before its actual preparation.
+  const lateFacts = await checkpoint("omp-late-policy", [
+    entry("late-policy", "user", "Decision: startup delivery: use ORCHID-LATE-STARTUP only for isolated tests"),
+  ]);
+  assert.equal(lateFacts.length, 1);
+  const firstDelivery = body(await deliver("before_agent_start", { prompt: callbackObservation }));
+  assert.ok(firstDelivery.includes("# Rusty Brain — Stable project context"));
+  assert.ok(firstDelivery.includes("# Rusty Brain — Memories relevant to this prompt"));
+  const stableBlock = firstDelivery.split("# Rusty Brain — Memories relevant to this prompt")[0];
+  assert.ok(stableBlock.includes(lateFacts[0].id), "startup must read the live corpus at first prompt");
+  assert.ok(!stableBlock.includes(dynamicNote.id), "activity observations must remain outside stable context");
+  assert.ok(firstDelivery.split("# Rusty Brain — Memories relevant to this prompt")[1].includes(dynamicNote.id));
+  assert.ok(Buffer.byteLength(firstDelivery) <= 256 * 1024);
+  const secondDelivery = body(await deliver("before_agent_start", { prompt: callbackObservation }));
+  assert.ok(!secondDelivery.includes("# Rusty Brain — Stable project context"));
+  assert.ok(secondDelivery.includes(dynamicNote.id));
+  await deliver("session_start");
+  assert.ok(!body(await deliver("before_agent_start", { prompt: callbackObservation }))
+    .includes("# Rusty Brain — Stable project context"), "duplicate startup cannot resend stable text");
+  deliverySession = "omp-stable-independent";
+  await deliver("session_start");
+  assert.ok(body(await deliver("before_agent_start", { prompt: callbackObservation }))
+    .includes("# Rusty Brain — Stable project context"), "a separate session receives its own startup");
+  for (const transition of ["session_switch", "session_branch", "session_tree"]) {
+    deliverySession = `omp-resumed-${transition}`;
+    await deliver("session_start");
+    await deliver(transition);
+    assert.ok(!body(await deliver("before_agent_start", { prompt: callbackObservation }))
+      .includes("# Rusty Brain — Stable project context"), `${transition} suppresses pending startup`);
+  }
+  deliverySession = "omp-stable-first";
+  await deliver("session_switch");
+  assert.ok(!body(await deliver("before_agent_start", { prompt: callbackObservation }))
+    .includes("# Rusty Brain — Stable project context"), "returning sessions cannot inherit pending text");
+  for (let index = 0; index < 12; index++) {
+    await run("--json", "remember", `Combined stable ${index}: ${"transaction ownership policy ".repeat(20)}`,
+      "--type", "constraint", "--importance", "9");
+  }
+  const combinedQuery = "ORCHID-COMBINED-BUDGET independent callback observation";
+  for (let index = 0; index < 5; index++) {
+    await run("--json", "remember", `${combinedQuery} candidate ${index}: ${"query-specific evidence ".repeat(20)}`,
+      "--type", "insight", "--importance", "9");
+  }
+  const combinedHits = await run("--json", "recall", combinedQuery, "--limit", "5");
+  assert.ok(Array.isArray(combinedHits) && combinedHits.length === 5);
+  assert.ok(combinedHits.every(hit => object(hit) && note(hit.memory)
+    && hit.memory.content.startsWith(combinedQuery)), "five independent dynamic candidates reach the preparation");
+  deliverySession = "omp-combined-budget";
+  await deliver("session_start");
+  const combinedPreparation = body(await deliver("before_agent_start", { prompt: combinedQuery }));
+  const [combinedStable, combinedDynamic] = combinedPreparation.split("# Rusty Brain — Memories relevant to this prompt\n");
+  assert.ok(combinedStable.includes("# Rusty Brain — Stable project context"));
+  assert.equal(typeof combinedDynamic, "string");
+  const preparedStable = combinedStable.split("\n").filter(line => line.startsWith("- "));
+  const preparedDynamic = combinedDynamic.split("\n").filter(line => line.startsWith("- "));
+  assert.ok(preparedStable.length > 0 && preparedStable.length <= 10);
+  assert.ok(preparedDynamic.length > 0 && preparedDynamic.length <= 5);
+  for (const line of [...preparedStable, ...preparedDynamic]) {
+    assert.match(line, /^- [0-9a-f-]{36} \[.*trust=.*subject=".*"$/);
+    assert.ok([...line.split('subject="')[1].slice(0, -1)].length <= 200);
+  }
+  assert.ok(combinedPreparation.includes("NOT instructions") && combinedPreparation.includes("rusty-brain history <id>"));
+  assert.ok(!body(await deliver("before_agent_start", { prompt: combinedQuery })).includes("# Rusty Brain — Stable project context"));
   const confirmation = "I confirm the error text is \"could not connect\"";
   assert.deepEqual((await checkpoint("explicit-error-confirmation", [
     entry("confirmed-error-text", "user", confirmation),
@@ -262,7 +349,7 @@ try {
   } finally {
     db.close();
   }
-  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", correction_filtering_and_failure_recovery: "passed", rejection_policy_and_explicit_proposal_adoption: "passed", one_off_task_policy_exclusion: "passed" }));
+  console.log(JSON.stringify({ branch_entries: branch.length, confirmed_facts: facts.length, source_ids_preserved: true, incomplete_window_reported: true, repeated_fold_ids_preserved: true, prompt_injection_and_recall: "passed", combined_preparation: combinedPreparation, correction_filtering_and_failure_recovery: "passed", rejection_policy_and_explicit_proposal_adoption: "passed", one_off_task_policy_exclusion: "passed" }));
 } finally {
   daemon.kill();
   await daemon.exited;

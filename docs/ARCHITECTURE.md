@@ -67,6 +67,7 @@ flowchart TD
   RB --> rbredact
   RB --> rbstore
   RB --> rbtypes
+  RB --> rbtokens
   HOOKS --> rbagents
   HOOKS --> rbconfig
   HOOKS --> rbproto
@@ -81,8 +82,10 @@ flowchart TD
   rbdaemon --> rbstore
   rbdaemon --> rbproto
   rbmcp --> rbproto
+  rbmcp --> rbtokens
   rbagents --> rbconfig
   rbagents --> rbproto
+  rbagents --> rbtokens
   rbenrich --> rbengine
   rbengine --> rbembed
   rbengine --> rbsearch
@@ -97,6 +100,7 @@ flowchart TD
   rbsearch --> rbtypes
   rbstore --> rbtypes
   rbmcp --> rbtypes
+  rbtokens --> rbtypes
 
   subgraph dev["Development and CI only"]
     EVAL["rb-eval"]
@@ -376,6 +380,29 @@ The query itself is embedded raw (only the stored *document* representation is
 composite). Vector search currently uses `sqlite-vec` brute-force KNN, which is
 appropriate at small/medium scale; an approximate index is a documented future option,
 not a hidden assumption.
+
+## Stable context and detail navigation
+
+Wire v3 replaces the old activity tuple with
+`ContextResult { context: ProjectContext { stable, snapshot, repo_state } }`.
+`ContextEntry` is bounded navigation: UUID, type, short incomplete subject,
+bounded provenance, trust/curation/dispute/staleness fields and a full-evidence
+change fingerprint. Full content, context and source anchors stay behind
+`get`/`history`; even several large stored constraints cannot overflow a context
+response by eagerly copying their bodies into it.
+
+The engine selects eligible current decisions, constraints and preferences before
+the SQL cutoff. Corpus generation and live Git snapshots bracket constituent
+reads; inconsistency retries boundedly and then fails closed. Global scrub/admin
+mutations invalidate relevant snapshots without changing authorial timestamps.
+This is validated observation, not a lock against later external writes.
+
+`rb-tokens::context` shares lower-trust framing, whole-entry budgeting and bounded
+prepared-handle state across hooks, CLI and MCP without pulling agent/evaluation
+crates into the default CLI runtime. Prepared output is not a host acknowledgement.
+Changed prior context gets a current-state correction on supported refresh/recall;
+old host text cannot be revoked. Exact stored evidence remains unverified advice,
+not permission to execute it.
 
 ## Namespace model
 

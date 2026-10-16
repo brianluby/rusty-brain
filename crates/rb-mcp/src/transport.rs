@@ -7,7 +7,7 @@
 use crate::change_buffer::ChangeBuffer;
 use crate::jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse, PARSE_ERROR};
 use crate::proxy::DaemonProxy;
-use crate::server::{handle_request, handle_request_with_buffer};
+use crate::server::Server;
 use rb_types::{Error, Result};
 use serde_json::Value;
 use std::sync::Arc;
@@ -72,6 +72,7 @@ where
     W: AsyncWrite + Unpin,
     P: DaemonProxy,
 {
+    let mut server = Server::default();
     loop {
         let response = match read_capped_line(&mut reader).await? {
             LineRead::Eof => {
@@ -98,8 +99,12 @@ where
                 }
                 match serde_json::from_str::<JsonRpcRequest>(trimmed) {
                     Ok(request) => match buffer.as_ref() {
-                        Some(buf) => handle_request_with_buffer(request, &mut proxy, buf).await,
-                        None => handle_request(request, &mut proxy).await,
+                        Some(buf) => {
+                            server
+                                .handle_request_with_buffer(request, &mut proxy, buf)
+                                .await
+                        }
+                        None => server.handle_request(request, &mut proxy).await,
                     },
                     Err(e) => {
                         tracing::warn!(error = %e, "malformed JSON-RPC frame");

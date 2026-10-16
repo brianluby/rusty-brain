@@ -737,7 +737,7 @@ async fn omp_recalls_captured_decision_despite_a_long_goal() {
         &shutdown.to_string(),
     );
     let prompt = serde_json::json!({
-        "type":"prompt", "cwd":project.path(), "session_id":"omp-next-session",
+        "type":"before_agent_start", "cwd":project.path(), "session_id":"omp-next-session",
         "prompt":"nebula deployment",
     });
     let output = fire_hook(
@@ -904,7 +904,7 @@ async fn role_aware_native_folds_preserve_sources_facts_corrections_and_repeat_i
     assert!(results
         .iter()
         .any(|r| r.memory.content.starts_with("Correction: storage:")));
-    let prompt = serde_json::json!({"type":"prompt","cwd":project.path(),"session_id":"next-session","prompt":"SQLite WAL ORCHID-9282"});
+    let prompt = serde_json::json!({"type":"before_agent_start","cwd":project.path(),"session_id":"next-session","prompt":"SQLite WAL ORCHID-9282"});
     let out = fire_hook(
         "omp",
         &hooks,

@@ -14,6 +14,8 @@ use std::sync::OnceLock;
 
 use tiktoken_rs::CoreBPE;
 
+pub mod context;
+
 /// Budget (in tokens) for the MCP `tools/list` payload — the largest static
 /// surface the model pays for on every turn (W3.3).
 pub const TOOLS_LIST_BUDGET: usize = 900;

@@ -3,16 +3,16 @@
 #   cargo run -p rb-contract-guard -- update --intent additive --note "..."   # serde-default addition, no bump
 #   cargo run -p rb-contract-guard -- update --intent breaking --note "..."   # after bumping CONTRACT_VERSION
 
-contract_version = 2
+contract_version = 3
 
 [wire]
-"crates/rb-proto/src/messages.rs::CONTRACT_VERSION" = "3f9208b6b23ee097c0f8177f4e0c94696a2c17f0cc02d4f3db93854566d67791"
+"crates/rb-proto/src/messages.rs::CONTRACT_VERSION" = "765cd5f9ec21c075d526ef957f1479ae5befc88782adc8b803c377512d5c4787"
 "crates/rb-proto/src/messages.rs::ClientIdentity" = "df5f6b27a044d45c548a0e3429088261fe240f7cb4277e5b03d73d52427b936d"
 "crates/rb-proto/src/messages.rs::Handshake" = "0e5a28374c8f0a527ab97db51e530b91b6a6cbaa1f9a2cf328a1bcffb9246961"
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
 "crates/rb-proto/src/messages.rs::Request" = "fad676ebc4fbbde093ecc05841d39558c3a4d250a1cb17e0a09ec99ef8c7b8e3"
-"crates/rb-proto/src/messages.rs::Response" = "1fffc25a1e07edc354a958a1185774c1b1112e6dca5f2741b569de36d681fc4d"
+"crates/rb-proto/src/messages.rs::Response" = "7e5db61a04d5318879b0d148ef0f0a0fb1bd4c48f52540a874caa21d7d79a8ff"
 "crates/rb-proto/src/messages.rs::ScrubCheckpoint" = "dfe99a03b49da585b2e26b8825493a07cb95b11c615bf1ed4b48a339ea6976cc"
 "crates/rb-proto/src/messages.rs::ScrubResult" = "89eb31711254dae32468bce07ea31c707f4fa0a6d32dfe9ca33dc4707f922918"
 "crates/rb-types/src/abstention.rs::AbstainReason" = "4bc07498ec9861b37f02e12677cfee436787b3ece8e6817566e036afce48b282"
@@ -37,9 +37,11 @@ contract_version = 2
 "crates/rb-types/src/query.rs::AnchorFilter" = "b481d1e814b74964b64e1f24399d35d8da2cb7d4dfd12bd57f5419fee3de9541"
 "crates/rb-types/src/query.rs::AnchorKind" = "911669d5a3dad2d65e13994be15d6ec594e0c3f78d0326dc0a84982fa5e3bb6b"
 "crates/rb-types/src/query.rs::ChannelHits" = "34168a59378e913813f5c759c87925242ee72ef8a2fb107e4d460a6e87d3b298"
+"crates/rb-types/src/query.rs::ContextEntry" = "23ef3c52a74a895dbe8f92e018722b149b7c24b230a1ec05e4d5a9cfe1433522"
 "crates/rb-types/src/query.rs::MemoryState" = "62ea53a8a4e8ec3040760fb8ccb113b12d3d84c7619f9d3be88354491e544904"
 "crates/rb-types/src/query.rs::MemoryUpdates" = "93e89260e1049ca0a46c5d5474ec005faae8f2d97e527a1eb3d9620644906397"
-"crates/rb-types/src/query.rs::RecallFilter" = "a40a6e31598e2c173707205f9d7f546650e033f961e7ca281a842628ed231302"
+"crates/rb-types/src/query.rs::ProjectContext" = "80ad71f27912d6f5bd1fba80080c87137deb0738ef722c3074775b8d9998c91c"
+"crates/rb-types/src/query.rs::RecallFilter" = "c9974d0b2ab0afad41dc33432f0ca776d7b9c842bfc3fa9a4ea038c3845e55a0"
 "crates/rb-types/src/query.rs::SearchQuery" = "09cf14ba050d24ee74a6757b4b30eb8dd9baa81b6df9e5c1f50340f2b402197b"
 "crates/rb-types/src/query.rs::SearchResult" = "6548eb7adde3d6f30bc1a1fcc729ca39589f847919efd3ee732c30ac1b8cbda5"
 "crates/rb-types/src/retention.rs::ForgetCandidate" = "05a732f57b5fd9a4dbe8b5836f2c21a23b527fc5b94f199cfdb034949263c518"
@@ -59,7 +61,7 @@ contract_version = 2
 "crates/rb-types/src/review.rs::ReviewReason" = "37eb2d83f358bca5209cd609f6aa41404b4e1c572049c77100553b64aba4f306"
 "crates/rb-types/src/review.rs::ReviewResolution" = "86028eeb5d8bff0514cb84c606bb62b63b933d871b80fa5fc5330c430d679b39"
 "crates/rb-types/src/review.rs::ReviewTotals" = "24036939b87eb2632d012eee8db2df6ef41a93511c2bf5c0802e2096461df8f9"
-"crates/rb-types/src/staleness.rs::RepoSnapshot" = "7e81abbfd10e4c2d94f50b99c541bfcf5e17dba14aab8ba25daa45dd32170ecc"
+"crates/rb-types/src/staleness.rs::RepoSnapshot" = "0e04750c920966a962a1989d9aff0c389f282a8c5f92ee5c62db941804943a38"
 "crates/rb-types/src/stats.rs::FeedbackTotals" = "ab6a1ea796d5866a566a9372536caed43217046b16245604cf41225963bbcd23"
 "crates/rb-types/src/stats.rs::GrowthBucket" = "552aa8d7fcb065ccc8275263b55fb0b5e1aad3493bbffa4e1c695bcd14174de6"
 "crates/rb-types/src/stats.rs::MemoryStats" = "ed42bc5a916a5f0ac3f939e516e89d7770cff334c8d06b033200bbcba1bc045d"
@@ -176,3 +178,8 @@ note = "PR #89 review: 013_write_channel.sql comment corrected (channel derives 
 contract_version = 2
 intent = "additive"
 note = "Add bounded source-evidence history, explicit human-curation intent and protection state, and default-false persisted curation migration"
+
+[[log]]
+contract_version = 3
+intent = "breaking"
+note = "Replace activity context tuple with bounded stable navigation"

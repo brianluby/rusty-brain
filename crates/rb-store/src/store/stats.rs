@@ -258,8 +258,8 @@ impl SqliteStore {
 
     /// Read-time corpus snapshot for `ns` (Vikunja #62): ONE aggregate query
     /// deriving the fingerprint a recall outcome was computed against — row
-    /// count (all states), the namespace's `MAX(memory_oplog.seq)` as the
-    /// generation, and `MAX(updated_at)` (unix seconds). Generation uses the
+    /// count (all states), MAX(oplog seq) over this namespace plus global admin
+    /// mutations, and MAX(updated_at) (unix seconds). Generation uses the
     /// OPLOG, not `MAX(rowid)` (PR #89 review): ranking-input writes —
     /// feedback (confidence), importance recalibration, vector updates —
     /// bump the oplog but deliberately leave `updated_at` alone, so a
@@ -273,7 +273,7 @@ impl SqliteStore {
         self.conn
             .query_row(
                 "SELECT COUNT(*),
-                        COALESCE((SELECT MAX(seq) FROM memory_oplog WHERE namespace = ?1), 0),
+                        COALESCE((SELECT MAX(seq) FROM memory_oplog WHERE namespace IN (?1, '')), 0),
                         COALESCE(MAX(updated_at), 0)
                  FROM memories WHERE namespace = ?1",
                 rusqlite::params![ns_str],
@@ -387,6 +387,46 @@ mod tests {
             after.generation
         );
         assert_ne!(before.fingerprint(), after.fingerprint());
+    }
+
+    #[test]
+    fn corpus_generation_tracks_global_scrub_and_namespace_rename_without_age_churn() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let ns = Namespace::Project("current".into());
+        let other = Namespace::Project("unrelated".into());
+        let moved = Namespace::Project("renamed".into());
+        let id = seed(&store, &ns,
+            "Exception: recovery uses credential AKIAABCDEFGHIJKLMNOP only in the isolated legacy bridge.");
+        let before = store.corpus_snapshot(&ns).unwrap();
+        let original = store.get_memory(&id).unwrap().unwrap();
+        seed(&store, &other, "unrelated activity");
+        assert_eq!(
+            store.corpus_snapshot(&ns).unwrap(),
+            before,
+            "ordinary other-namespace writes must not invalidate this corpus"
+        );
+        store.scrub().unwrap();
+        let after = store.corpus_snapshot(&ns).unwrap();
+        let scrubbed = store.get_memory(&id).unwrap().unwrap();
+        assert!(!scrubbed.content.contains("AKIAABCDEFGHIJKLMNOP"));
+        assert_eq!(scrubbed.updated_at, original.updated_at);
+        assert_eq!(after.last_write_epoch_s, before.last_write_epoch_s);
+        assert_eq!(after.memories, before.memories);
+        assert!(
+            after.generation > before.generation,
+            "global scrub must invalidate pre/post consistency without authored age changes"
+        );
+        store.rename_namespace(&ns, &moved, false).unwrap();
+        assert_eq!(store.corpus_snapshot(&ns).unwrap().memories, 0);
+        assert_eq!(store.corpus_snapshot(&moved).unwrap().memories, 1);
+        store.rename_namespace(&moved, &ns, false).unwrap();
+        let restored = store.corpus_snapshot(&ns).unwrap();
+        assert_eq!(restored.memories, after.memories);
+        assert_eq!(restored.last_write_epoch_s, after.last_write_epoch_s);
+        assert!(
+            restored.generation > after.generation,
+            "a round-trip rename cannot masquerade as an unchanged read"
+        );
     }
 
     #[test]

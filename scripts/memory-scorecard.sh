@@ -806,7 +806,7 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
       < "$dir/session-start-input.json" > "$dir/session-start-injection.json"
 
     jq -cn --arg sid "$sid" --arg cwd "$project" --arg prompt "$query" \
-      '{type:"prompt",session_id:$sid,cwd:$cwd,prompt:$prompt}' \
+      '{type:"before_agent_start",session_id:$sid,cwd:$cwd,prompt:$prompt}' \
       > "$dir/prompt-time-input.json"
     rusty-brain-hooks --agent omp \
       < "$dir/prompt-time-input.json" > "$dir/prompt-time-injection.json"

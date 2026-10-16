@@ -39,16 +39,33 @@ case "$(uname -s)-$(uname -m)" in
 esac
 
 # Portable octal-mode and sha256 helpers (macOS vs GNU).
-mode_of() { stat -f '%Lp' "$1" 2>/dev/null || stat -c '%a' "$1"; }
+mode_of() {
+  case "$TARGET" in
+    *-apple-darwin) /usr/bin/stat -f '%Lp' "$1" ;;
+    *) stat -c '%a' "$1" ;;
+  esac
+}
 sha_check() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum --check --ignore-missing SHA256SUMS
   else shasum -a 256 --check --ignore-missing SHA256SUMS; fi
 }
 
+# Resolve local input in the invoking directory, before entering the sandbox.
+if [ -z "$TAG" ] && [ -n "$TARBALL" ]; then
+  [ -f "$TARBALL" ] && [ -r "$TARBALL" ] \
+    || { echo "tarball is not a readable file: $TARBALL" >&2; exit 1; }
+  TARBALL_DIR="$(cd "$(dirname "$TARBALL")" && pwd)" \
+    || { echo "cannot resolve tarball directory: $TARBALL" >&2; exit 1; }
+  TARBALL="$TARBALL_DIR/$(basename "$TARBALL")"
+fi
+
 WORKDIR="$(mktemp -d)"
 DAEMON_PID=""
 cleanup() {
   status=$?
+  if [ -z "$DAEMON_PID" ] && [ -f "$WORKDIR/rb/sock.pid" ]; then
+    DAEMON_PID="$(cat "$WORKDIR/rb/sock.pid" 2>/dev/null)" || DAEMON_PID=""
+  fi
   if [ -n "$DAEMON_PID" ] && kill -0 "$DAEMON_PID" 2>/dev/null; then
     kill "$DAEMON_PID" 2>/dev/null || true
   fi
@@ -69,10 +86,10 @@ if [ -n "$TAG" ]; then
   sha_check
   TARBALL="$(ls rusty-brain-*-"${TARGET}".tar.gz)"
 else
-  TARBALL="$(cd "$(dirname "$TARBALL")" && pwd)/$(basename "$TARBALL")"
   if [ -f "$(dirname "$TARBALL")/SHA256SUMS" ]; then
     cp "$(dirname "$TARBALL")/SHA256SUMS" .
     cp "$TARBALL" .
+    TARBALL="$WORKDIR/$(basename "$TARBALL")"
     sha_check
   else
     echo "note: no SHA256SUMS next to the tarball; checksum skipped (local mode)"
