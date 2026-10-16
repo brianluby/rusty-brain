@@ -1043,47 +1043,48 @@ fn uds_write_channel(source: Option<&str>) -> Option<rb_types::WriteChannel> {
     }
 }
 
-/// Bounded git state read for state-bound staleness (Vikunja #63): HEAD sha
-/// plus whether the worktree is clean of TRACKED modifications. Uses the
-/// shared `run_git_bounded` (hardcoded args, 2s kill bound, no shell);
-/// fail-open to `head: None` ("state unresolvable"), which DISABLES
-/// staleness claims rather than guessing. Untracked files are ignored (see
-/// `rb_types::RepoSnapshot`). Runs once per connection at handshake.
-async fn git_repo_snapshot(cwd: &std::path::Path) -> Option<rb_types::RepoSnapshot> {
-    const GIT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(2);
-    let head = tokio::task::spawn_blocking({
-        let cwd = cwd.to_path_buf();
-        move || rb_config::run_git_bounded(&cwd, &["rev-parse", "HEAD"], GIT_DEADLINE)
-    })
-    .await
-    .ok()??;
-    let head = String::from_utf8(head).ok()?.trim().to_string();
-    if head.is_empty() {
+/// Connection-scoped cwd, not connection-scoped state. The engine offloads
+/// each synchronous snapshot so bounded git probes cannot block its runtime.
+struct GitRepoState(Option<std::path::PathBuf>);
+
+impl rb_engine::RepoStateProvider for GitRepoState {
+    fn snapshot(&self) -> Option<rb_types::RepoSnapshot> {
+        git_repo_snapshot(self.0.as_deref()?)
+    }
+}
+
+/// Read HEAD and tracked changes in one successful, bounded git invocation.
+/// Missing/unborn repositories and failed probes remain unknown, never dirty.
+fn git_repo_snapshot(cwd: &std::path::Path) -> Option<rb_types::RepoSnapshot> {
+    let status = rb_config::run_git_bounded(
+        cwd,
+        &[
+            "status",
+            "--porcelain=v2",
+            "--branch",
+            "--no-ahead-behind",
+            "--untracked-files=no",
+            "--ignore-submodules=untracked",
+        ],
+        std::time::Duration::from_secs(2),
+    )?;
+    let mut head = None;
+    let mut clean_worktree = true;
+    // Only the OID needs UTF-8; tracked paths may contain arbitrary bytes.
+    for line in status.split(|&byte| byte == b'\n') {
+        if let Some(oid) = line.strip_prefix(b"# branch.oid ") {
+            head = std::str::from_utf8(oid).ok();
+        } else if !line.is_empty() && !line.starts_with(b"# ") {
+            clean_worktree = false;
+        }
+    }
+    let head = head?;
+    if head.is_empty() || !head.bytes().all(|byte| byte.is_ascii_hexdigit()) {
         return None;
     }
-    // `git diff-index --quiet HEAD` prints nothing and exits 0 when no
-    // tracked file differs; a non-zero exit means modifications exist.
-    let clean = tokio::task::spawn_blocking({
-        let cwd = cwd.to_path_buf();
-        move || {
-            rb_config::run_git_status_bounded(
-                &cwd,
-                &["diff-index", "--quiet", "HEAD"],
-                GIT_DEADLINE,
-            )
-        }
-    })
-    .await
-    .ok()?;
-    // `None` from the probe (timeout / spawn failure) means "could not
-    // determine," NOT "dirty": propagating it makes the whole snapshot
-    // unresolvable, which DISABLES staleness claims for the connection —
-    // the module contract ("no unsubstantiated staleness claim") and the
-    // fail-open posture of the HEAD probe above (PR #89 review).
-    let clean = clean?;
     Some(rb_types::RepoSnapshot {
-        head: Some(head),
-        clean_worktree: clean,
+        head: Some(head.to_string()),
+        clean_worktree,
     })
 }
 
@@ -1181,20 +1182,19 @@ async fn handle_connection(
         channel: uds_write_channel(identity.source.as_deref()),
     };
 
-    // State-bound staleness (Vikunja #63): snapshot the client-declared
-    // working directory's git state ONCE per connection (bounded, fail-open
-    // to "unresolvable" — which disables staleness claims rather than
-    // guessing). The snapshot is fixed for the connection's lifetime: an
-    // anchored memory is judged against the state the session opened with.
-    let repo_state: std::sync::Arc<dyn rb_engine::RepoStateProvider> = {
-        let snap = match identity.cwd.as_deref().map(std::path::PathBuf::from) {
-            Some(cwd) => git_repo_snapshot(&cwd).await,
-            // No declared cwd (old client, HTTP peer): state unresolvable —
-            // staleness stays off rather than guessed.
-            None => None,
-        };
-        std::sync::Arc::new(rb_engine::FixedRepoState::new(snap))
+    // Resolve only an absolute declared directory; never fall back to the
+    // daemon's cwd. Keep its state live for long-lived MCP/proto connections.
+    let repo_cwd = match identity.cwd.map(std::path::PathBuf::from) {
+        Some(cwd) if cwd.is_absolute() => tokio::task::spawn_blocking(move || {
+            let cwd = cwd.canonicalize().ok()?;
+            cwd.is_dir().then_some(cwd)
+        })
+        .await
+        .ok()
+        .flatten(),
+        _ => None,
     };
+    let repo_state = std::sync::Arc::new(GitRepoState(repo_cwd));
     let store_for_stream = store.clone();
     let job_store = store.clone();
     // Snapshot the provider identity before the embedder moves into the
@@ -2057,11 +2057,7 @@ where
             Err(e) => error_to_response(e),
         },
         Request::Context => match engine.context().await {
-            Ok((recent, important, total)) => Response::ContextResult {
-                recent,
-                important,
-                total,
-            },
+            Ok(context) => Response::ContextResult { context },
             Err(e) => error_to_response(e),
         },
         // Subscribe is handled by the streaming branch in `handle_connection`
@@ -2847,7 +2843,22 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         serving.await.unwrap().unwrap();
-        assert!(crate::accept_model_change(&database, 4, "deterministic").unwrap());
+        // Aborted scheduler tasks may still retain storage until cancellation runs.
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match crate::accept_model_change(&database, 4, "deterministic") {
+                    Ok(changed) => break Ok(changed),
+                    Err(err) if err.to_string().contains("already admitted") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await
+        .expect("storage admission must release after daemon teardown")
+        .unwrap();
+        assert!(accepted);
         let accepted = SqliteStore::open_with_model(&database, 4, "deterministic").unwrap();
         assert!(
             accepted

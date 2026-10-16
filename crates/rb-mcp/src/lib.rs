@@ -16,6 +16,6 @@ pub mod transport;
 pub use change_buffer::{ChangeBuffer, Drained, SubscriberStatus};
 pub use jsonrpc::{JsonRpcError, JsonRpcRequest, JsonRpcResponse};
 pub use proxy::{build_request, response_to_content, DaemonProxy};
-pub use server::handle_request;
+pub use server::Server;
 pub use tools::{tool_definitions, ToolDef};
 pub use transport::{serve_stdio, serve_stdio_with_buffer};

@@ -33,7 +33,7 @@
 //! a mutation of the stored memory.
 
 /// A resolved repository state at recall time.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RepoSnapshot {
     /// The current HEAD commit SHA as printed by `git rev-parse HEAD`, or
     /// `None` when HEAD is unresolvable (not a repository / git failed).

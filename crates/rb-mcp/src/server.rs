@@ -4,8 +4,12 @@ use crate::change_buffer::{ChangeBuffer, SubscriberStatus};
 use crate::jsonrpc::{
     JsonRpcError, JsonRpcRequest, JsonRpcResponse, INTERNAL_ERROR, INVALID_PARAMS, METHOD_NOT_FOUND,
 };
-use crate::proxy::{build_request, response_to_content, DaemonProxy, ToolContent};
+use crate::proxy::{
+    build_request, context_to_content, response_to_content, DaemonProxy, ToolContent,
+};
 use crate::tools::advertised_tool_definitions;
+use rb_proto::{Request, Response};
+use rb_tokens::context::ContextDelivery;
 use serde_json::{json, Value};
 use std::sync::Arc;
 use tokio::sync::Mutex;
@@ -13,25 +17,31 @@ use tokio::sync::Mutex;
 /// The MCP protocol revision this adapter targets when the client omits one.
 pub const DEFAULT_PROTOCOL_VERSION: &str = "2024-11-05";
 
-/// Handle one decoded JSON-RPC request WITHOUT a change buffer. `poll_changes`
-/// in this mode returns an empty result with a note, since no subscriber is
-/// running. Retained for the plain stdio transport that does not poll.
-pub async fn handle_request(
-    request: JsonRpcRequest,
-    proxy: &mut dyn DaemonProxy,
-) -> Option<JsonRpcResponse> {
-    dispatch(request, proxy, None).await
+/// Connection-local delivery state; never shared across independent MCP sessions.
+#[derive(Default)]
+pub struct Server {
+    delivery: Option<ContextDelivery>,
 }
 
-/// Handle one decoded JSON-RPC request with a shared change buffer that
-/// `poll_changes` drains. Used by the daemon-backed MCP server that runs a
-/// background subscriber.
-pub async fn handle_request_with_buffer(
-    request: JsonRpcRequest,
-    proxy: &mut dyn DaemonProxy,
-    buffer: &Arc<Mutex<ChangeBuffer>>,
-) -> Option<JsonRpcResponse> {
-    dispatch(request, proxy, Some(buffer)).await
+impl Server {
+    /// Handle a request without a background change subscriber.
+    pub async fn handle_request(
+        &mut self,
+        request: JsonRpcRequest,
+        proxy: &mut dyn DaemonProxy,
+    ) -> Option<JsonRpcResponse> {
+        dispatch(request, proxy, None, &mut self.delivery).await
+    }
+
+    /// Handle a request with the connection's shared change buffer.
+    pub async fn handle_request_with_buffer(
+        &mut self,
+        request: JsonRpcRequest,
+        proxy: &mut dyn DaemonProxy,
+        buffer: &Arc<Mutex<ChangeBuffer>>,
+    ) -> Option<JsonRpcResponse> {
+        dispatch(request, proxy, Some(buffer), &mut self.delivery).await
+    }
 }
 
 /// Shared dispatch core. `buffer` is `Some` when a background subscriber feeds
@@ -40,6 +50,7 @@ async fn dispatch(
     request: JsonRpcRequest,
     proxy: &mut dyn DaemonProxy,
     buffer: Option<&Arc<Mutex<ChangeBuffer>>>,
+    delivery: &mut Option<ContextDelivery>,
 ) -> Option<JsonRpcResponse> {
     // Notifications (no id) are acknowledged silently with no response frame.
     if request.is_notification() {
@@ -54,7 +65,7 @@ async fn dispatch(
     let response = match request.method.as_str() {
         "initialize" => JsonRpcResponse::success(id, initialize_result(&params)),
         "tools/list" => JsonRpcResponse::success(id, tools_list_result()),
-        "tools/call" => handle_tools_call(id, &params, proxy, buffer).await,
+        "tools/call" => handle_tools_call(id, &params, proxy, buffer, delivery).await,
         other => JsonRpcResponse::error(
             id,
             JsonRpcError::new(METHOD_NOT_FOUND, format!("unknown method '{other}'")),
@@ -105,6 +116,7 @@ async fn handle_tools_call(
     params: &Value,
     proxy: &mut dyn DaemonProxy,
     buffer: Option<&Arc<Mutex<ChangeBuffer>>>,
+    delivery: &mut Option<ContextDelivery>,
 ) -> JsonRpcResponse {
     let Some(name) = params.get("name").and_then(Value::as_str) else {
         return JsonRpcResponse::error(
@@ -126,19 +138,53 @@ async fn handle_tools_call(
         Err(err) => return JsonRpcResponse::error(id, err),
     };
 
-    match proxy.call(request).await {
-        Ok(resp) => {
-            // W3.3: project to compact markdown (the model reads `content[].text`)
-            // + full JSON in `structuredContent`. `now` drives relative-age render.
-            let content = response_to_content(resp, chrono::Utc::now());
-            JsonRpcResponse::success(id, tool_result(content))
+    let response = proxy.call(request).await;
+    let mut correction = None;
+    if name == "recall" && matches!(&response, Ok(Response::Recalled { .. })) {
+        if let Some(delivery) = delivery.as_mut() {
+            correction = match proxy.call(Request::Context).await {
+                Ok(Response::ContextResult { context }) => delivery.correction(&context),
+                _ => Some(CURRENT_STATE_UNAVAILABLE.to_string()),
+            };
         }
-        Err(e) => JsonRpcResponse::error(
-            id,
-            JsonRpcError::new(INTERNAL_ERROR, format!("daemon call failed: {e}")),
-        ),
     }
+
+    let mut content = match response {
+        Ok(Response::ContextResult { context }) => {
+            let delivery = delivery.get_or_insert_with(ContextDelivery::default);
+            let correction = delivery.correction(&context);
+            let content = context_to_content(&context, correction.as_deref());
+            delivery.record(&context, &content.text);
+            return JsonRpcResponse::success(id, tool_result(content));
+        }
+        Ok(resp) => {
+            if name == "context" && delivery.is_some() {
+                correction = Some(CURRENT_STATE_UNAVAILABLE.to_string());
+            }
+            response_to_content(resp, chrono::Utc::now())
+        }
+        Err(e) => {
+            let mut message = format!("daemon call failed: {e}");
+            if matches!(name, "context" | "recall") && delivery.is_some() {
+                correction = Some(CURRENT_STATE_UNAVAILABLE.to_string());
+            }
+            if let Some(correction) = correction {
+                message.push_str("\n\n");
+                message.push_str(&correction);
+            }
+            return JsonRpcResponse::error(id, JsonRpcError::new(INTERNAL_ERROR, message));
+        }
+    };
+    if let Some(correction) = correction {
+        content.text.push_str("\n\n");
+        content.text.push_str(&correction);
+    }
+    JsonRpcResponse::success(id, tool_result(content))
 }
+
+const CURRENT_STATE_UNAVAILABLE: &str = "# Rusty Brain — Current-state correction\n\
+    Current project-context state is unavailable. Do not treat earlier context subjects \
+    as current policy; prior host text cannot be revoked. Retry context before relying on it.";
 
 /// Default and cap for the number of events a single `poll_changes` returns.
 const POLL_DEFAULT_MAX: usize = 100;
@@ -225,12 +271,13 @@ mod tests {
     use rb_proto::{Request, Response};
     use rb_types::{MemoryId, MemoryNote, MemoryType, Namespace, SearchResult};
     use serde_json::json;
+    use std::collections::VecDeque;
 
     fn note() -> MemoryNote {
         MemoryNote::new(
             Namespace::Project("p".into()),
             "remembered body".into(),
-            MemoryType::Insight,
+            MemoryType::Constraint,
             6,
         )
     }
@@ -292,9 +339,11 @@ mod tests {
                 Request::Feedback { .. } => Response::FeedbackRecorded { confidence: 0.7 },
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
-                    recent: vec![note()],
-                    important: vec![note()],
-                    total: 1,
+                    context: rb_types::ProjectContext {
+                        stable: vec![rb_types::ContextEntry::from_memory(note(), false, None)],
+                        snapshot: None,
+                        repo_state: None,
+                    },
                 },
                 Request::Ping => Response::Pong {
                     contract_version: 1,
@@ -403,6 +452,104 @@ mod tests {
         serde_json::from_value(raw).unwrap()
     }
 
+    struct ScriptedProxy {
+        responses: VecDeque<Response>,
+        requests: Vec<Request>,
+    }
+
+    #[async_trait]
+    impl DaemonProxy for ScriptedProxy {
+        async fn call(&mut self, request: Request) -> rb_types::Result<Response> {
+            self.requests.push(request);
+            Ok(self
+                .responses
+                .pop_front()
+                .expect("unexpected daemon request"))
+        }
+    }
+
+    fn scripted(responses: Vec<Response>) -> ScriptedProxy {
+        ScriptedProxy {
+            responses: responses.into(),
+            requests: Vec::new(),
+        }
+    }
+
+    fn project_context(memories: Vec<MemoryNote>) -> rb_types::ProjectContext {
+        rb_types::ProjectContext {
+            stable: memories
+                .into_iter()
+                .map(|memory| rb_types::ContextEntry::from_memory(memory, false, None))
+                .collect(),
+            snapshot: None,
+            repo_state: None,
+        }
+    }
+
+    fn recalled(memories: Vec<MemoryNote>, abstained: Option<rb_types::AbstainReason>) -> Response {
+        Response::Recalled {
+            results: memories
+                .into_iter()
+                .map(|memory| SearchResult {
+                    memory,
+                    score: 0.9,
+                    channels: rb_types::ChannelHits::default(),
+                    stale: false,
+                })
+                .collect(),
+            degraded: false,
+            abstained,
+            snapshot: None,
+        }
+    }
+
+    async fn tool(
+        server: &mut Server,
+        proxy: &mut dyn DaemonProxy,
+        name: &str,
+        arguments: Value,
+    ) -> Value {
+        server
+            .handle_request(
+                req(
+                    "tools/call",
+                    Some(90),
+                    json!({ "name": name, "arguments": arguments }),
+                ),
+                proxy,
+            )
+            .await
+            .unwrap()
+            .result
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn context_refresh_error_retains_error_payload_and_disclaims_prior_policy() {
+        let mut proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![note()]),
+            },
+            Response::Error {
+                kind: "internal".into(),
+                message: "snapshot read failed".into(),
+            },
+        ]);
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let result = tool(&mut server, &mut proxy, "context", json!({})).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(
+            result["structuredContent"]["error"]["message"],
+            "snapshot read failed"
+        );
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("snapshot read failed"));
+        assert!(text.contains("Current project-context state is unavailable"));
+        assert!(!text.contains("Stable project context"));
+        assert!(proxy.responses.is_empty());
+    }
+
     #[tokio::test]
     async fn initialize_returns_server_info_and_capabilities() {
         let mut proxy = fake();
@@ -411,7 +558,10 @@ mod tests {
             Some(1),
             json!({ "protocolVersion": "2024-11-05" }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         assert_eq!(result["serverInfo"]["name"], "rusty-brain");
         assert!(result["serverInfo"]["version"].is_string());
@@ -455,7 +605,7 @@ mod tests {
     async fn initialized_notification_gets_no_response() {
         let mut proxy = fake();
         let r = req("notifications/initialized", None, json!({}));
-        let resp = handle_request(r, &mut proxy).await;
+        let resp = Server::default().handle_request(r, &mut proxy).await;
         assert!(resp.is_none(), "notifications must not be answered");
     }
 
@@ -469,7 +619,10 @@ mod tests {
         }
         let mut proxy = fake();
         let r = req("tools/list", Some(2), json!({}));
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let tools = resp.result.unwrap()["tools"].as_array().unwrap().clone();
         assert_eq!(tools.len(), 6);
         for name in [
@@ -503,7 +656,10 @@ mod tests {
             Some(3),
             json!({ "name": "remember", "arguments": { "content": "hi" } }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         // MCP tool result: content array with a text item, isError false/absent.
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -526,7 +682,10 @@ mod tests {
             Some(7),
             json!({ "name": "recall", "arguments": { "query": "x" } }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         // Compact text: a numbered markdown line, NOT the raw JSON.
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -552,7 +711,10 @@ mod tests {
             Some(4),
             json!({ "name": "frobnicate", "arguments": {} }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let err = resp.error.unwrap();
         assert_eq!(err.code, crate::jsonrpc::METHOD_NOT_FOUND);
     }
@@ -565,7 +727,10 @@ mod tests {
             Some(5),
             json!({ "name": "get", "arguments": { "id": "not-a-uuid" } }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         assert_eq!(resp.error.unwrap().code, crate::jsonrpc::INVALID_PARAMS);
     }
 
@@ -578,7 +743,10 @@ mod tests {
             Some(6),
             json!({ "name": "get", "arguments": { "id": MemoryId::new().to_string() } }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         assert_eq!(
             result["isError"],
@@ -602,7 +770,10 @@ mod tests {
                 "content": "rewritten body"
             } }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let result = resp.result.unwrap();
         assert_eq!(result["isError"], json!(true));
         let text = result["content"][0]["text"].as_str().unwrap();
@@ -622,7 +793,10 @@ mod tests {
     async fn unknown_method_is_method_not_found() {
         let mut proxy = fake();
         let r = req("does/not/exist", Some(7), json!({}));
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         assert_eq!(resp.error.unwrap().code, crate::jsonrpc::METHOD_NOT_FOUND);
     }
 
@@ -651,7 +825,8 @@ mod tests {
             Some(20),
             json!({ "name": "poll_changes", "arguments": { "max": 10 } }),
         );
-        let resp = handle_request_with_buffer(r, &mut proxy, &buffer)
+        let resp = Server::default()
+            .handle_request_with_buffer(r, &mut proxy, &buffer)
             .await
             .unwrap();
         let result = resp.result.unwrap();
@@ -669,7 +844,8 @@ mod tests {
             Some(21),
             json!({ "name": "poll_changes", "arguments": {} }),
         );
-        let resp2 = handle_request_with_buffer(r2, &mut proxy, &buffer)
+        let resp2 = Server::default()
+            .handle_request_with_buffer(r2, &mut proxy, &buffer)
             .await
             .unwrap();
         let text2 = resp2.result.unwrap()["content"][0]["text"]
@@ -709,7 +885,8 @@ mod tests {
 
         // Connected: status alone, no outage duration.
         buffer.lock().await.set_connected();
-        let resp = handle_request_with_buffer(poll(30), &mut proxy, &buffer)
+        let resp = Server::default()
+            .handle_request_with_buffer(poll(30), &mut proxy, &buffer)
             .await
             .unwrap();
         let payload = payload_of(resp);
@@ -718,7 +895,8 @@ mod tests {
 
         // Disconnected: carries how long the subscriber has been down.
         buffer.lock().await.set_disconnected();
-        let resp = handle_request_with_buffer(poll(31), &mut proxy, &buffer)
+        let resp = Server::default()
+            .handle_request_with_buffer(poll(31), &mut proxy, &buffer)
             .await
             .unwrap();
         let payload = payload_of(resp);
@@ -739,7 +917,10 @@ mod tests {
             Some(32),
             json!({ "name": "poll_changes", "arguments": {} }),
         );
-        let resp = handle_request(r, &mut proxy).await.unwrap();
+        let resp = Server::default()
+            .handle_request(r, &mut proxy)
+            .await
+            .unwrap();
         let text = resp.result.unwrap()["content"][0]["text"]
             .as_str()
             .unwrap()
@@ -747,5 +928,531 @@ mod tests {
         let payload: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(payload["subscriber"]["status"], "disconnected");
         assert_eq!(payload["events"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn context_is_byte_stable_across_access_and_time_with_bounded_real_handles() {
+        let mut memories: Vec<_> = (0..12)
+            .map(|index| {
+                let mut memory = note();
+                memory.memory_type = MemoryType::Constraint;
+                memory.summary = format!(
+                    "Constraint {index}: {}",
+                    "qualified project subject ".repeat(8)
+                );
+                memory.content = format!("{} EXCEPT isolated test fixtures.", memory.summary);
+                memory
+            })
+            .collect();
+        let before = project_context(memories.clone());
+        for memory in &mut memories {
+            memory.access_count += 30;
+            memory.last_accessed_at = Some(chrono::Utc::now() + chrono::Duration::days(90));
+        }
+        let after = project_context(memories);
+        let now = chrono::Utc::now();
+        let expected = response_to_content(
+            Response::ContextResult {
+                context: before.clone(),
+            },
+            now,
+        )
+        .text;
+        assert_eq!(
+            expected,
+            response_to_content(
+                Response::ContextResult {
+                    context: after.clone()
+                },
+                now + chrono::Duration::days(90),
+            )
+            .text
+        );
+        let mut proxy = scripted(vec![
+            Response::ContextResult { context: before },
+            Response::ContextResult {
+                context: after.clone(),
+            },
+        ]);
+        let mut server = Server::default();
+        let first = tool(&mut server, &mut proxy, "context", json!({})).await;
+        let second = tool(&mut server, &mut proxy, "context", json!({})).await;
+        let text = first["content"][0]["text"].as_str().unwrap();
+        assert_eq!(text, expected);
+        assert_eq!(first["content"], second["content"]);
+        assert!(rb_tokens::count_tokens(text) <= rb_tokens::INJECTION_BUDGET);
+        let entries: Vec<_> = text.lines().filter(|line| line.starts_with("- ")).collect();
+        assert!(!entries.is_empty() && entries.len() <= 10);
+        for line in entries {
+            let id = line
+                .strip_prefix("- ")
+                .unwrap()
+                .split_whitespace()
+                .next()
+                .unwrap();
+            assert!(after.stable.iter().any(|entry| entry.id.to_string() == id));
+        }
+        assert!(text.contains("Incomplete subjects"));
+        assert!(text.contains("MCP get(id)") && text.contains("history"));
+        assert!(!text.contains("EXCEPT isolated test fixtures."));
+        assert_eq!(second["structuredContent"], json!(after));
+        assert!(second["structuredContent"].get("recent").is_none());
+        assert_eq!(proxy.requests.len(), 2);
+        assert!(proxy
+            .requests
+            .iter()
+            .all(|request| matches!(request, Request::Context)));
+    }
+
+    #[tokio::test]
+    async fn changed_context_budgets_correction_and_records_only_final_previews() {
+        let memories: Vec<_> = (0..12).map(|i| {
+            let mut memory = MemoryNote::new(
+                Namespace::Project("budget".into()),
+                format!("Constraint {i}: retain transaction ownership and explicit migration prerequisites."),
+                MemoryType::Constraint, 9,
+            );
+            memory.id = format!("{i:08x}-0000-4000-8000-000000000001").parse().unwrap();
+            memory
+        }).collect();
+        let before = project_context(memories.clone());
+        let after = project_context(
+            memories
+                .into_iter()
+                .map(|mut memory| {
+                    memory.human_curated = true;
+                    memory
+                })
+                .collect(),
+        );
+        let mut proxy = scripted(vec![
+            Response::ContextResult { context: before },
+            Response::ContextResult { context: after },
+        ]);
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let prior = server.delivery.as_ref().unwrap().entries.clone();
+        let result = tool(&mut server, &mut proxy, "context", json!({})).await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(
+            rb_tokens::count_tokens(text) <= rb_tokens::INJECTION_BUDGET,
+            "{text}"
+        );
+        assert!(text.contains("Current-state correction"));
+        for (id, _) in prior {
+            assert!(
+                text.contains(&id.to_string()),
+                "lost corrected handle: {text}"
+            );
+        }
+        let final_ids: Vec<_> = text
+            .lines()
+            .filter_map(|line| line.strip_prefix("- "))
+            .map(|line| line.split_whitespace().next().unwrap())
+            .collect();
+        let recorded = &server.delivery.as_ref().unwrap().entries;
+        assert_eq!(recorded.len(), final_ids.len());
+        for (id, _) in recorded {
+            assert!(final_ids.contains(&id.to_string().as_str()));
+        }
+    }
+
+    #[tokio::test]
+    async fn next_recall_corrects_changed_and_removed_context_even_when_abstaining() {
+        for abstained in [None, Some(rb_types::AbstainReason::BelowThreshold)] {
+            let mut changed = note();
+            changed.memory_type = MemoryType::Constraint;
+            changed.summary = "Use the production store".into();
+            let mut removed = note();
+            removed.memory_type = MemoryType::Preference;
+            let before = project_context(vec![changed.clone(), removed.clone()]);
+            changed
+                .content
+                .push_str(" Except offline fixtures must use an isolated store.");
+            let current = project_context(vec![changed.clone()]);
+            let results = if abstained.is_some() {
+                Vec::new()
+            } else {
+                vec![changed.clone()]
+            };
+            let mut proxy = scripted(vec![
+                Response::ContextResult { context: before },
+                recalled(results.clone(), abstained),
+                Response::ContextResult {
+                    context: current.clone(),
+                },
+                recalled(vec![changed.clone()], None),
+                Response::ContextResult { context: current },
+            ]);
+            let mut server = Server::default();
+            tool(&mut server, &mut proxy, "context", json!({})).await;
+            let result = tool(
+                &mut server,
+                &mut proxy,
+                "recall",
+                json!({ "query": "store" }),
+            )
+            .await;
+            let text = result["content"][0]["text"].as_str().unwrap();
+            assert!(text.contains("Current-state correction"));
+            assert!(text.contains(&changed.id.to_string()));
+            assert!(text.contains(&removed.id.to_string()));
+            assert!(
+                !text.contains("Stable project context"),
+                "no repeated startup block"
+            );
+            if abstained.is_some() {
+                assert!(text.starts_with("recall abstained (below_threshold)"));
+                assert_eq!(result["structuredContent"]["abstained"], "below_threshold");
+                assert_eq!(result["structuredContent"]["results"], json!([]));
+            } else {
+                assert_eq!(
+                    result["structuredContent"]["results"][0]["memory"]["content"],
+                    changed.content
+                );
+            }
+            let again = tool(
+                &mut server,
+                &mut proxy,
+                "recall",
+                json!({ "query": "store" }),
+            )
+            .await;
+            assert!(!again["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("Current-state correction"));
+            assert_eq!(
+                again["structuredContent"]["results"][0]["memory"]["id"],
+                json!(changed.id)
+            );
+            assert_eq!(
+                again["structuredContent"]["results"][0]["memory"]["content"],
+                changed.content
+            );
+            assert!(matches!(
+                proxy.requests.as_slice(),
+                [
+                    Request::Context,
+                    Request::Recall { .. },
+                    Request::Context,
+                    Request::Recall { .. },
+                    Request::Context,
+                ]
+            ));
+            assert!(proxy.responses.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn context_delivery_is_independent_for_each_server_connection() {
+        let first_memory = note();
+        let second_memory = note();
+        let mut first_proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![first_memory.clone()]),
+            },
+            recalled(Vec::new(), None),
+            Response::ContextResult {
+                context: project_context(Vec::new()),
+            },
+        ]);
+        let mut second_proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![second_memory.clone()]),
+            },
+            recalled(Vec::new(), None),
+            Response::ContextResult {
+                context: project_context(vec![second_memory]),
+            },
+        ]);
+        let mut first = Server::default();
+        let mut second = Server::default();
+        tool(&mut first, &mut first_proxy, "context", json!({})).await;
+        tool(&mut second, &mut second_proxy, "context", json!({})).await;
+        let corrected = tool(
+            &mut first,
+            &mut first_proxy,
+            "recall",
+            json!({ "query": "x" }),
+        )
+        .await;
+        let unchanged = tool(
+            &mut second,
+            &mut second_proxy,
+            "recall",
+            json!({ "query": "x" }),
+        )
+        .await;
+        assert!(corrected["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&first_memory.id.to_string()));
+        assert_eq!(unchanged["content"][0]["text"], "no stored memories match");
+        assert_eq!(first_proxy.requests.len(), 3);
+        assert_eq!(second_proxy.requests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_recall_returns_without_refresh_and_retains_prior_currentness() {
+        struct OutageProxy {
+            context: Option<rb_types::ProjectContext>,
+        }
+
+        #[async_trait]
+        impl DaemonProxy for OutageProxy {
+            async fn call(&mut self, request: Request) -> rb_types::Result<Response> {
+                match request {
+                    Request::Context => match self.context.take() {
+                        Some(context) => Ok(Response::ContextResult { context }),
+                        None => std::future::pending().await,
+                    },
+                    Request::Recall { .. } => {
+                        Err(rb_types::Error::Io("fixture transport disconnected".into()))
+                    }
+                    _ => panic!("unexpected outage fixture operation"),
+                }
+            }
+        }
+
+        let memory = note();
+        let mut proxy = OutageProxy {
+            context: Some(project_context(vec![memory.clone()])),
+        };
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.handle_request(
+                req(
+                    "tools/call",
+                    Some(91),
+                    json!({ "name": "recall", "arguments": { "query": "unknown" } }),
+                ),
+                &mut proxy,
+            ),
+        )
+        .await
+        .expect("a known transport failure must not wait for another daemon operation")
+        .unwrap();
+        let error = response.error.unwrap();
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("fixture transport disconnected"));
+        assert!(error.message.contains(CURRENT_STATE_UNAVAILABLE));
+        assert!(!error.message.contains(&memory.content));
+
+        proxy.context = Some(project_context(Vec::new()));
+        let refreshed = tool(&mut server, &mut proxy, "context", json!({})).await;
+        assert!(
+            refreshed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&memory.id.to_string()),
+            "recovery must still qualify the preview prepared before the outage"
+        );
+    }
+
+    #[tokio::test]
+    async fn daemon_rejected_recall_preserves_error_text_and_prior_currentness() {
+        let memory = note();
+        let error = json!({
+            "error": { "kind": "internal", "message": "recall fixture rejected" }
+        });
+        let mut proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![memory.clone()]),
+            },
+            Response::Error {
+                kind: "internal".into(),
+                message: "recall fixture rejected".into(),
+            },
+            Response::ContextResult {
+                context: project_context(Vec::new()),
+            },
+        ]);
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let result = tool(&mut server, &mut proxy, "recall", json!({ "query": "x" })).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"], error);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            error,
+            "a rejected recall must retain its original JSON error text"
+        );
+        let refreshed = tool(&mut server, &mut proxy, "context", json!({})).await;
+        assert!(refreshed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&memory.id.to_string()));
+    }
+
+    #[tokio::test]
+    async fn failed_context_freshness_is_disclosed_without_erasing_abstention_or_prior_ids() {
+        let memory = note();
+        let mut proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![memory.clone()]),
+            },
+            recalled(Vec::new(), Some(rb_types::AbstainReason::NoCandidates)),
+            Response::Error {
+                kind: "internal".into(),
+                message: "snapshot read failed".into(),
+            },
+            Response::ContextResult {
+                context: project_context(Vec::new()),
+            },
+        ]);
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let result = tool(
+            &mut server,
+            &mut proxy,
+            "recall",
+            json!({ "query": "unknown" }),
+        )
+        .await;
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("recall abstained (no_candidates)"));
+        assert!(text.contains("Current project-context state is unavailable"));
+        assert!(!text.contains(&memory.content));
+        assert_eq!(result["structuredContent"]["abstained"], "no_candidates");
+        assert_eq!(result["isError"], false);
+        let refreshed = tool(&mut server, &mut proxy, "context", json!({})).await;
+        let text = refreshed["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains(&memory.id.to_string()),
+            "failed refresh retains the prior delivery ledger"
+        );
+    }
+
+    #[tokio::test]
+    async fn context_handles_recover_exact_late_caveats_via_default_get_and_routable_history() {
+        let caveat = "EXCEPT offline fixtures must never contact the production database.";
+        let mut memory = note();
+        memory.memory_type = MemoryType::Constraint;
+        memory.summary = "Production uses the shared database".into();
+        memory.content = format!(
+            "{} {} {caveat}",
+            memory.summary,
+            "recorded rationale ".repeat(80)
+        );
+        memory.context = "Only applies to deployed services.".into();
+        let context = project_context(vec![memory.clone()]);
+        let history = rb_types::MemoryHistory {
+            namespace: "project:p".into(),
+            chain: vec![rb_types::HistoryEntry {
+                id: memory.id.clone(),
+                summary: memory.summary.clone(),
+                importance: memory.importance,
+                confidence: memory.confidence,
+                created_at: memory.created_at,
+                archived: false,
+                contested: false,
+                current: true,
+                is_target: true,
+                superseded_by: None,
+                predecessors: Vec::new(),
+                evidence: Some(rb_types::HistoryEvidence {
+                    content: memory.content.clone(),
+                    context: memory.context.clone(),
+                    keywords: memory.keywords.clone(),
+                    tags: memory.tags.clone(),
+                    memory_type: Some(memory.memory_type),
+                    updated_at: Some(memory.updated_at),
+                    last_accessed_at: memory.last_accessed_at,
+                    related_files: memory.related_files.clone(),
+                    origin_channel: memory.origin_channel,
+                    session_id: memory.session_id.clone(),
+                    anchors: memory.anchors.clone(),
+                    trust_class: memory.trust_class,
+                    human_curated: memory.human_curated,
+                    source_status: rb_types::HistorySourceStatus::Unavailable,
+                }),
+                origin_user: memory.origin_user.clone(),
+                origin_host: memory.origin_host.clone(),
+                origin_agent: memory.origin_agent.clone(),
+                origin_source: memory.origin_source.clone(),
+            }],
+            ..rb_types::MemoryHistory::default()
+        };
+        let mut proxy = scripted(vec![
+            Response::ContextResult {
+                context: context.clone(),
+            },
+            recalled(vec![memory.clone()], None),
+            Response::ContextResult { context },
+            Response::Got {
+                memory: Some(memory.clone()),
+            },
+            Response::History {
+                history: history.clone(),
+            },
+        ]);
+        let mut server = Server::default();
+        let listed = server
+            .handle_request(req("tools/list", Some(1), json!({})), &mut proxy)
+            .await
+            .unwrap()
+            .result
+            .unwrap();
+        assert!(listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| tool["name"] == "get"));
+        assert!(!crate::tools::DEFAULT_TOOLS.contains(&"history"));
+        let startup = tool(&mut server, &mut proxy, "context", json!({})).await;
+        let text = startup["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains(&memory.id.to_string()));
+        assert!(!text.contains(caveat));
+        assert!(text.contains("Incomplete subjects") && text.contains("MCP get(id)"));
+        assert_eq!(
+            proxy.requests.len(),
+            1,
+            "startup never eagerly expands source or detail"
+        );
+        let recall = tool(
+            &mut server,
+            &mut proxy,
+            "recall",
+            json!({ "query": "database" }),
+        )
+        .await;
+        assert!(!recall["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(caveat));
+        assert!(recall["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("incomplete subject"));
+        assert_eq!(
+            recall["structuredContent"]["results"][0]["memory"]["content"],
+            memory.content
+        );
+        let got = tool(&mut server, &mut proxy, "get", json!({ "id": memory.id })).await;
+        let got_text: Value =
+            serde_json::from_str(got["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(got_text, got["structuredContent"]);
+        assert_eq!(got_text["memory"]["content"], memory.content);
+        let timeline = tool(
+            &mut server,
+            &mut proxy,
+            "history",
+            json!({ "id": memory.id }),
+        )
+        .await;
+        let history_text: Value =
+            serde_json::from_str(timeline["content"][0]["text"].as_str().unwrap()).unwrap();
+        assert_eq!(history_text, timeline["structuredContent"]);
+        assert_eq!(history_text["history"], json!(history));
+        assert_eq!(
+            history_text["history"]["chain"][0]["evidence"]["content"],
+            memory.content
+        );
+        assert!(matches!(&proxy.requests[3], Request::Get { id } if id == &memory.id));
+        assert!(matches!(&proxy.requests[4], Request::History { id, .. } if id == &memory.id));
+        assert!(proxy.responses.is_empty());
     }
 }

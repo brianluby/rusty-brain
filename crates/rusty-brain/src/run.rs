@@ -67,6 +67,7 @@ fn build_recall_filter(
             rb_types::MemoryState::Active
         },
         anchors,
+        recall_eligible: false,
     }
 }
 
@@ -628,11 +629,8 @@ async fn run_client(
             println!("{}", output::render_deleted(json));
         }
         Command::Context => {
-            let (recent, important, total) = client.context().await.context("context failed")?;
-            println!(
-                "{}",
-                output::render_context(&recent, &important, total, json)
-            );
+            let context = client.context().await.context("context failed")?;
+            println!("{}", output::render_context(&context, json));
         }
         Command::Subscribe { since } => {
             client

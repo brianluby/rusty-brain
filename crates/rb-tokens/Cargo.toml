@@ -13,6 +13,8 @@ path = "src/lib.rs"
 
 [dependencies]
 tiktoken-rs = { workspace = true }
+rb-types = { path = "../rb-types" }
+serde = { workspace = true }
 
 [lints]
 workspace = true

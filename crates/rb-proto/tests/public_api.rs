@@ -8,8 +8,8 @@ use rb_types::{Error, MemoryId, MemoryType, Namespace};
 
 #[test]
 fn public_surface_is_reachable_and_stable() {
-    // Constants and messages. v2 = P5 Feature C (additive `contested`).
-    assert_eq!(CONTRACT_VERSION, 2);
+    // v3 replaces the context tuple with stable project navigation.
+    assert_eq!(CONTRACT_VERSION, 3);
     // W0.5 additions are public surface: the handshake identity struct and the
     // Remember confidence field are constructed literally to lock their shape.
     let identity = ClientIdentity {

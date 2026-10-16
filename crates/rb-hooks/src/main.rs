@@ -96,20 +96,22 @@ fn run() -> serde_json::Value {
         }
     };
 
-    // Only SessionStart may auto-start the daemon. Other events never spawn.
+    // SessionStart and OMP's pending startup preparation may auto-start.
     // An unresolvable db path only disables auto-start; connecting to an
     // already-running daemon at `socket` still works.
     let auto_start = match &ctx.event {
-        HookEvent::SessionStart { .. } => match db_path() {
-            Ok(db) => Some(AutoStart {
-                self_exe: daemon_bin(),
-                db,
-            }),
-            Err(e) => {
-                tracing::warn!("db path unresolvable; auto-start disabled (fail-open): {e}");
-                None
+        HookEvent::SessionStart { .. } | HookEvent::BeforeAgentStart { startup: true, .. } => {
+            match db_path() {
+                Ok(db) => Some(AutoStart {
+                    self_exe: daemon_bin(),
+                    db,
+                }),
+                Err(e) => {
+                    tracing::warn!("db path unresolvable; auto-start disabled (fail-open): {e}");
+                    None
+                }
             }
-        },
+        }
         _ => None,
     };
 
@@ -209,15 +211,15 @@ async fn capture_phase(
 }
 
 /// True for events that read or write the store (and so need a daemon
-/// connection): SessionStart (inject), UserPromptSubmit (recall + inject),
-/// SessionCheckpoint/SessionEnd (fold + store), PreCompact (store). Local-only
-/// events — PostToolUse (scratch append), Stop (no-op), Other — skip the
-/// connect.
+/// connection): SessionStart, BeforeAgentStart, UserPromptSubmit,
+/// SessionCheckpoint/SessionEnd, and PreCompact. Local-only PostToolUse,
+/// Stop, and Other events skip the connection.
 fn event_needs_daemon(event: &HookEvent) -> bool {
     matches!(
         event,
         HookEvent::SessionStart { .. }
             | HookEvent::UserPromptSubmit { .. }
+            | HookEvent::BeforeAgentStart { .. }
             | HookEvent::SessionCheckpoint { .. }
             | HookEvent::SessionEnd { .. }
             | HookEvent::PreCompact { .. }

@@ -218,7 +218,10 @@ fn fake_claude_path(dir: &Path) -> String {
 async fn install_capture_uninstall_round_trip() {
     // --- fixture project -----------------------------------------------------
     let proj_dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
-    let project = proj_dir.path().to_path_buf();
+    let project = proj_dir.path().join(
+        "a deliberately long fixture directory that keeps source basenames outside compact previews",
+    );
+    std::fs::create_dir(&project).unwrap();
     // Pin the namespace explicitly (env on the hook invocation below): the
     // fixture dir is not a git repo, and since W0.3 hooks never honor unpinned
     // CLAUDE.md frontmatter, so the env override is the stable identity here.
@@ -349,7 +352,7 @@ async fn install_capture_uninstall_round_trip() {
     let mut client = Client::connect(&daemon.socket, namespace.clone())
         .await
         .expect("connect to in-process daemon for recall");
-    let mut found = false;
+    let mut found = None;
     for _ in 0..40 {
         let results = client
             .recall(
@@ -360,20 +363,21 @@ async fn install_capture_uninstall_round_trip() {
             )
             .await
             .expect("recall");
-        if results
+        if let Some(result) = results
             .iter()
-            .any(|r| r.memory.content.contains("zztest.rs"))
+            .find(|result| result.memory.content.contains("zztest.rs"))
         {
-            found = true;
+            found = Some(result.memory.id.clone());
             break;
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
     }
     assert!(
-        found,
+        found.is_some(),
         "the SessionEnd summary must fold the PostToolUse file edit and be recallable; stored={:?}",
         client.list(None, 100).await
     );
+    let found_id = found.unwrap();
 
     // --- 2.5) W3.2(a): a UserPromptSubmit deterministically recalls + injects -
     // Fire a UserPromptSubmit whose prompt matches the stored summary through the
@@ -408,8 +412,17 @@ async fn install_capture_uninstall_round_trip() {
         .as_str()
         .unwrap_or_default();
     assert!(
-        injected.contains("zztest.rs"),
-        "W3.2(a): the prompt-relevant memory must be injected as additionalContext; got {injected}"
+        injected.contains(&found_id.to_string()),
+        "prompt-relevant evidence must have a followable handle; got {injected}"
+    );
+    let recovered = client
+        .get(found_id)
+        .await
+        .expect("get the injected handle")
+        .expect("injected evidence remains available");
+    assert!(
+        recovered.content.contains("zztest.rs"),
+        "exact detail must retain the captured source beyond the compact preview"
     );
 
     // --- 3) uninstall removes ONLY the sentinel block ------------------------
@@ -737,7 +750,7 @@ async fn omp_recalls_captured_decision_despite_a_long_goal() {
         &shutdown.to_string(),
     );
     let prompt = serde_json::json!({
-        "type":"prompt", "cwd":project.path(), "session_id":"omp-next-session",
+        "type":"before_agent_start", "cwd":project.path(), "session_id":"omp-next-session",
         "prompt":"nebula deployment",
     });
     let output = fire_hook(
@@ -904,7 +917,7 @@ async fn role_aware_native_folds_preserve_sources_facts_corrections_and_repeat_i
     assert!(results
         .iter()
         .any(|r| r.memory.content.starts_with("Correction: storage:")));
-    let prompt = serde_json::json!({"type":"prompt","cwd":project.path(),"session_id":"next-session","prompt":"SQLite WAL ORCHID-9282"});
+    let prompt = serde_json::json!({"type":"before_agent_start","cwd":project.path(),"session_id":"next-session","prompt":"SQLite WAL ORCHID-9282"});
     let out = fire_hook(
         "omp",
         &hooks,

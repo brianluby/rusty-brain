@@ -102,6 +102,78 @@ impl RunningDaemon {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn large_stable_claims_keep_context_small_and_full_detail_followable() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("large-stable-context".to_string());
+    let mut client = cli_client(&daemon.socket, &ns).await.unwrap();
+    let mut claims = Vec::new();
+    for index in 0..6 {
+        let content = format!(
+            "Constraint {index}: retain the complete recorded claim. {} Late caveat {index}: never apply during recovery.",
+            "recorded supporting detail ".repeat(4200),
+        );
+        assert!(content.len() >= 105 * 1024);
+        let context =
+            format!("Prerequisite {index}: inspect the recovery exception before applying.");
+        let id = client
+            .remember(
+                content.clone(),
+                Some(context.clone()),
+                MemoryType::Constraint,
+                9,
+                vec![],
+                vec![],
+                vec![],
+                Some(1.0),
+            )
+            .await
+            .unwrap();
+        claims.push((id, content, context));
+    }
+
+    let context = client
+        .context()
+        .await
+        .expect("large stored claims must not overflow context");
+    assert_eq!(context.stable.len(), claims.len());
+    for (id, _, _) in &claims {
+        let entry = context
+            .stable
+            .iter()
+            .find(|entry| &entry.id == id)
+            .expect("every eligible claim retains its full navigation handle");
+        assert_eq!(entry.id.to_string().len(), 36);
+        assert!(entry.subject.chars().count() <= 80);
+    }
+    let wire = serde_json::to_vec(&rb_proto::Response::ContextResult { context }).unwrap();
+    assert!(
+        wire.len() < 32 * 1024,
+        "navigation must stay well below the frame cap"
+    );
+
+    for (id, content, context) in claims {
+        let detail = client
+            .get(id.clone())
+            .await
+            .unwrap()
+            .expect("followable full detail");
+        assert_eq!(detail.content, content);
+        assert_eq!(detail.context, context);
+        let history = client.history(id.clone(), None).await.unwrap();
+        let evidence = history
+            .chain
+            .iter()
+            .find(|entry| entry.id == id)
+            .and_then(|entry| entry.evidence.as_ref())
+            .expect("target history preserves complete evidence");
+        assert_eq!(evidence.content, content);
+        assert_eq!(evidence.context, context);
+    }
+    assert_eq!(client.ping().await.unwrap(), rb_proto::CONTRACT_VERSION);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn full_round_trip_through_client() {
     let daemon = RunningDaemon::start(4).await;
     let ns = Namespace::Project("a".to_string());
@@ -170,11 +242,10 @@ async fn full_round_trip_through_client() {
     let after = client.get(id.clone()).await.unwrap().unwrap();
     assert_eq!(after.importance, 10);
 
-    let (recent, important, total) = client.context().await.unwrap();
-    assert!(total >= 1, "context total counts the active memory");
+    let context = client.context().await.unwrap();
     assert!(
-        recent.iter().chain(important.iter()).any(|m| m.id == id),
-        "context surfaces the high-importance memory"
+        context.stable.iter().any(|entry| entry.id == id),
+        "context surfaces the eligible decision"
     );
 
     client.delete(id.clone()).await.unwrap();
@@ -1177,7 +1248,7 @@ async fn recall_degrades_on_embedder_outage_and_flags_the_wire_response() {
             results,
             degraded,
             abstained: None,
-            snapshot: None,
+            ..
         } => {
             assert!(degraded, "embedder outage must flag the wire response");
             assert!(
@@ -1837,13 +1908,12 @@ async fn superseded_decision_never_reaches_context_or_recall_and_tip_always_does
     let ns = Namespace::Project("rb-sc-fresh-test-runner".to_string());
     let mut client = Client::connect(&daemon.socket, ns.clone()).await.unwrap();
 
-    // plant_explicit semantics from scripts/memory-scorecard.sh: two insight
-    // facts at importance 5, the second stored as a superseding update.
+    // Stable decision facts at importance 5, the second superseding the first.
     let old = client
         .remember(
             "Decision: run the test suite with `cargo test`.".to_string(),
             None,
-            MemoryType::Insight,
+            MemoryType::ArchitectureDecision,
             5,
             vec![],
             vec![],
@@ -1859,7 +1929,7 @@ async fn superseded_decision_never_reaches_context_or_recall_and_tip_always_does
              in CI and locally."
                 .to_string(),
             None,
-            MemoryType::Insight,
+            MemoryType::ArchitectureDecision,
             5,
             vec![],
             vec![],
@@ -1870,16 +1940,12 @@ async fn superseded_decision_never_reaches_context_or_recall_and_tip_always_does
         .await
         .unwrap();
 
-    // Context (the SessionStart digest input): the tip is the one recent row;
-    // the archived value appears in NEITHER half.
-    let (recent, important, total) = client.context().await.unwrap();
-    assert_eq!(total, 1, "only the tip is in the recent window");
+    // Context includes only the current eligible supersede-chain tip.
+    let context = client.context().await.unwrap();
+    assert_eq!(context.stable.len(), 1);
+    assert_eq!(context.stable[0].id, tip);
     assert!(
-        recent.iter().any(|m| m.id == tip),
-        "the supersede-chain tip must reach the digest"
-    );
-    assert!(
-        recent.iter().chain(important.iter()).all(|m| m.id != old),
+        context.stable.iter().all(|entry| entry.id != old),
         "the archived superseded row must never reach the digest"
     );
 
@@ -3216,4 +3282,192 @@ async fn resolve_revalidates_the_planned_relationship() {
     }
 
     daemon.stop().await;
+}
+
+mod live_repository_state {
+    use super::*;
+    use rb_types::{AnchorKind, MemoryAnchor, MemoryId, RepoSnapshot};
+    use std::path::Path;
+
+    const DECISION: &str = "Use one bounded repository snapshot for each project context.";
+
+    fn git(cwd: &Path, args: &[&str]) -> String {
+        let output = std::process::Command::new("git")
+            .arg("-C")
+            .arg(cwd)
+            .args([
+                "-c",
+                "user.name=fixture",
+                "-c",
+                "user.email=fixture@example.invalid",
+            ])
+            .args([
+                "-c",
+                "commit.gpgsign=false",
+                "-c",
+                "core.hooksPath=/dev/null",
+            ])
+            .args(args)
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env_remove("GIT_DIR")
+            .env_remove("GIT_WORK_TREE")
+            .env_remove("GIT_INDEX_FILE")
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout).unwrap().trim().to_string()
+    }
+
+    fn committed_repository() -> (tempfile::TempDir, String) {
+        let repo = tempdir();
+        git(repo.path(), &["init"]);
+        std::fs::write(repo.path().join("tracked.txt"), "original\n").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        git(repo.path(), &["commit", "-m", "initial"]);
+        let head = git(repo.path(), &["rev-parse", "HEAD"]);
+        (repo, head)
+    }
+
+    async fn remember(client: &mut Client, head: &str) -> MemoryId {
+        client
+            .remember_anchored(
+                DECISION.to_string(),
+                None,
+                MemoryType::ArchitectureDecision,
+                9,
+                vec![],
+                vec![],
+                vec![],
+                Some(1.0),
+                vec![MemoryAnchor::new(AnchorKind::Commit, head).unwrap()],
+                None,
+                None,
+            )
+            .await
+            .unwrap()
+    }
+
+    async fn assert_projection(
+        client: &mut Client,
+        id: &MemoryId,
+        expected: Option<RepoSnapshot>,
+        stale: bool,
+    ) {
+        let context = client.context().await.unwrap();
+        assert_eq!(context.repo_state, expected);
+        let entry = context
+            .stable
+            .iter()
+            .find(|entry| &entry.id == id)
+            .expect("context retains the anchored decision with its current stale label");
+        assert_eq!(
+            entry.stale, stale,
+            "context must use current repository state"
+        );
+        let results = client
+            .recall(DECISION.to_string(), None, vec![], 10)
+            .await
+            .unwrap();
+        let result = results
+            .iter()
+            .find(|result| &result.memory.id == id)
+            .expect("recall retains the anchored decision with its current stale label");
+        assert_eq!(
+            result.stale, stale,
+            "recall must use current repository state"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn connected_client_observes_head_tracked_changes_and_probe_failure() {
+        let daemon = RunningDaemon::start(2).await;
+        let (repo, head) = committed_repository();
+        let mut client = Client::connect_with_identity(
+            &daemon.socket,
+            Namespace::Project("live-repository-state".to_string()),
+            Some(ClientIdentity {
+                source: Some("mcp".to_string()),
+                cwd: Some(repo.path().to_string_lossy().into_owned()),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+        let id = remember(&mut client, &head).await;
+        assert_projection(&mut client, &id, Some(RepoSnapshot::at(&head)), false).await;
+
+        std::fs::write(repo.path().join("untracked.txt"), "not state-bound\n").unwrap();
+        assert_projection(&mut client, &id, Some(RepoSnapshot::at(&head)), false).await;
+
+        git(repo.path(), &["commit", "--allow-empty", "-m", "next HEAD"]);
+        let moved_head = git(repo.path(), &["rev-parse", "HEAD"]);
+        assert_ne!(moved_head, head);
+        assert_projection(&mut client, &id, Some(RepoSnapshot::at(&moved_head)), true).await;
+
+        git(repo.path(), &["checkout", "--detach", &head]);
+        assert_projection(&mut client, &id, Some(RepoSnapshot::at(&head)), false).await;
+        std::fs::write(repo.path().join("tracked.txt"), "modified\n").unwrap();
+        let dirty = RepoSnapshot {
+            head: Some(head.clone()),
+            clean_worktree: false,
+        };
+        assert_projection(&mut client, &id, Some(dirty.clone()), true).await;
+        git(repo.path(), &["add", "tracked.txt"]);
+        assert_projection(&mut client, &id, Some(dirty), true).await;
+        std::fs::write(repo.path().join("tracked.txt"), "original\n").unwrap();
+        git(repo.path(), &["add", "tracked.txt"]);
+        assert_projection(&mut client, &id, Some(RepoSnapshot::at(&head)), false).await;
+
+        // A fatal probe must not reuse prior state or treat every nonzero exit as dirty.
+        std::fs::write(repo.path().join(".git/index"), "invalid git index\n").unwrap();
+        assert_projection(&mut client, &id, None, false).await;
+        drop(client);
+        daemon.stop().await;
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn absent_invalid_and_unresolvable_cwds_remain_unknown() {
+        let daemon = RunningDaemon::start(2).await;
+        let (_anchored_repo, head) = committed_repository();
+        let nonrepo = tempdir();
+        let unborn = tempdir();
+        git(unborn.path(), &["init"]);
+        let file = nonrepo.path().join("not-a-directory");
+        std::fs::write(&file, "not a repository\n").unwrap();
+        let cases = [
+            None,
+            Some(".".to_string()),
+            Some(
+                nonrepo
+                    .path()
+                    .join("missing")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
+            Some(file.to_string_lossy().into_owned()),
+            Some(nonrepo.path().to_string_lossy().into_owned()),
+            Some(unborn.path().to_string_lossy().into_owned()),
+        ];
+        for (index, cwd) in cases.into_iter().enumerate() {
+            let mut client = Client::connect_with_identity(
+                &daemon.socket,
+                Namespace::Project(format!("unknown-repository-state-{index}")),
+                Some(ClientIdentity {
+                    source: Some("mcp".to_string()),
+                    cwd,
+                    ..Default::default()
+                }),
+            )
+            .await
+            .unwrap();
+            let id = remember(&mut client, &head).await;
+            assert_projection(&mut client, &id, None, false).await;
+        }
+        daemon.stop().await;
+    }
 }

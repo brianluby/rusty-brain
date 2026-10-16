@@ -76,6 +76,7 @@ const CAPABILITIES: &[AgentCapability] = &[
         limitations: &[
             "Project-local native extension installation; global scope is unsupported.",
             "OMP 18.2.4 live Luna/Terra probes verified recall, native write capture, shutdown folding, and placebo isolation; other host versions and crash recovery are not certified.",
+            "Stable project navigation and query-specific recall share one bounded before_agent_start preparation; failed startup remains pending, switch/branch/tree resume suppress startup, and no native compaction callback is registered.",
         ],
     },
     AgentCapability {

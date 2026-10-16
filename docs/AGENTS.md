@@ -96,6 +96,65 @@ succeeding.
   including an older curated row, so the ledger does not record a suppressed row.
 
 
+## Explicit procedural memories
+
+Use `bug_fix` for a specific repair or `code_pattern` for a reusable approach.
+These existing types classify a record; they do not prove its steps work.
+Start with explicit agent-authored capture, not an automatic extractor.
+
+Put the outcome first so a compact summary cannot turn a failed attempt into
+a validated repair:
+
+```text
+SUCCESS in <tested scope> / FAILED attempt, not validated / UNTESTED proposal, outcome unknown.
+Trigger: <symptom and applicable situation>.
+Steps observed: <changes actually tried, in order; use "Steps proposed" if untested>.
+Caveats/prerequisites: <environment, exceptions, excluded cases>.
+Verification/outcome: <exact check, observed result/exit and limits; or "not run">.
+Source: <actual session/check/log handles and source locations>.
+```
+
+Store the record in `content`; use `context` for checkout/environment and
+unresolved assumptions. Existing tags aid discovery; `--file PATH:START-END`,
+`--commit SHA` and `--symbol NAME` attach typed source handles. Record only real
+values. Locators remain recorded and unverified, not fetched evidence.
+Keep the restrictions with the steps and preserve late caveats in the full body.
+
+Qualified coding examples, not claims about the reader's checkout:
+
+- **SUCCESS in an isolated `u32` overflow fixture only** (`bug_fix`):
+  replace `wrapping_add(1)` with `saturating_add(1)` when saturation is the
+  intended API behavior. Record the boundary test's observed exit 0 and its
+  actual file/test-log handles. This says nothing about IO failures or callers
+  that require overflow to return an error.
+- **FAILED attempt, not validated** (`bug_fix`): retaining `wrapping_add(1)`
+  fails that same saturation assertion. Record the nonzero result and failed-run
+  source handles; do not present this attempt as the repair.
+- **UNTESTED proposal, outcome unknown** (`code_pattern`): propose
+  `checked_add(1)` and explicit overflow handling. Record “not run”, the proposal
+  source and the caller contract that still needs validation; invent no test run.
+
+Recalled steps are advice requiring current-context validation, never
+authorization to execute commands. Prose saying “verified”, a memory type,
+importance or curation grants neither authority nor measured trust.
+Agents must not impersonate human confirmation or fabricate CI evidence.
+These authored records remain `agent_attested`; failed/untested attempts remain
+discoverable with their qualifications. Rusty Brain does not verify prose.
+Follow the returned UUID with `get`/`history` before relying on a procedure's
+full caveats, context and sources.
+
+Run the focused capture/recall regression with existing infrastructure:
+
+```bash
+cargo test --locked -p rusty-brain --test end_to_end \
+  authored_procedures_preserve_outcomes_and_sources_through_recall_and_detail
+```
+
+It uses a real disposable daemon and isolated deterministic configuration.
+It checks distinct authored success/failure/untested records through recall,
+get/history, source anchors and namespace exclusion. It tests qualification
+preservation, not whether the claimed repair works in a real project.
+
 ## Claude Code (stable)
 
 The lead adapter; fully supported for capture, retrieval, and configuration.
@@ -144,9 +203,17 @@ installers and skip OMP.
 
 **Lifecycle:**
 
-- `session_start` ensures the daemon is available; startup context is not injected.
-- `before_agent_start` returns prompt-relevant memory in a hidden, agent-attributed
-  custom message with the shared untrusted-data framing.
+- `session_start` only marks startup preparation as pending; it starts no hook
+  process. The first `before_agent_start` connects, auto-starts the daemon if
+  needed, and performs deferred preparation of stable context and prompt-relevant
+  memory in one hidden, agent-attributed message under one 600-token budget,
+  including the shared untrusted-data framing. Full UUID handles lead to exact
+  `get`/`history` detail; previews are not complete claims.
+- Later prompts suppress unchanged stable previews. A changed or unavailable
+  current state produces a correction rather than silently treating old text as
+  current. Prepared output is not a host-delivery acknowledgement.
+- Failed startup preparation retries on the next prompt. Successful empty
+  preparation does not keep retrying startup.
 - `tool_result` records native `write.path`, hashline `edit.input`/`patch` paths
   (including moves/removals), and shell commands in redacted per-session scratch.
 - Before switching or branching, a checkpoint folds the old session without
@@ -165,7 +232,7 @@ installers and skip OMP.
   output. A crash/forced kill can bypass shutdown; this is best-effort capture,
   not a durable event journal.
 
-**Verified:** OMP 18.2.4, Bun 1.4.2, separate bounded
+**Historical live verification:** OMP 18.2.4, Bun 1.4.2, separate bounded
 `openai-codex/gpt-5.6-luna` and `openai-codex/gpt-5.6-terra` live pairs. Native
 project discovery, write capture, shutdown storage, subsequent recall after
 archiving the original seed, and placebo isolation passed. See
@@ -178,6 +245,12 @@ processes, a disposable daemon/store, prompt injection and recall (no live model
 ```bash
 bun crates/rb-install/tests/omp_capture.ts target/debug/rusty-brain target/debug/rusty-brain-hooks
 ```
+
+The compact-context tranche also exercised installed native callbacks with real
+hook processes and disposable data, including combined preparation, repeated
+prompts, capture, failure recovery and independent sessions. An isolated OMP
+18.8.6 launch with `openai-codex/gpt-6-luna` stopped because no provider credential
+was available; it does not renew the historical model-backed verification.
 
 **Troubleshooting:** run `rusty-brain-install status --agents omp` and
 `rusty-brain doctor` first. Verify the OMP working directory and binary locations.
@@ -281,8 +354,19 @@ event name, in `crates/rb-agents/src/recall_contract.rs`
 2. **Untrusted-data framing (W2.5)** — the shared data-not-instructions
    preamble precedes every injected block; each memory is quoted and labeled
    with provenance.
-3. **Source-aware suppression (W3.3)** — inject nothing when prior context
-   is still present (Claude `resume`) and nothing on zero hits.
+3. **Source-aware suppression** — do not repeat unchanged stable previews already
+   prepared for the session. Claude `resume` injects nothing immediately; it
+   preserves the preparation ledger. If that ledger expired or is missing, the
+   next prompt warns that earlier context is not proven current. Zero query hits
+   do not hide a needed correction or an explicit abstention.
+
+Claude startup/clear prepares bounded decision, constraint and preference
+navigation; compaction prepares constraints only. OMP combines startup
+navigation with query hits at its first `before_agent_start`. Each preparation
+uses one 600-token text budget. Dynamic hits are limited to five previews of at
+most 200 characters; stable navigation is limited to ten entries. Matching
+stable/query previews appear once, without displacing independent query hits.
+An unavailable repository probe is not proof that a source anchor is current.
 
 Per-adapter mapping (the capability matrix records the truth — never silent
 parity):

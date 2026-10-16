@@ -142,9 +142,9 @@ pub trait MemoryBackend: Send + Sync {
     /// Read-time corpus snapshot for `ns` (Vikunja #62): a cheap, READ-ONLY
     /// derivation (one aggregate query on real stores) pinning the corpus
     /// state a recall outcome was computed against, so a preregistered eval
-    /// run can record it. `None` on backends without a derivation (the
-    /// in-memory test mocks) — the engine treats the snapshot as
-    /// observability, never a gate, and fails open on errors.
+    /// run can record it. `None` means the backend cannot derive freshness.
+    /// Recall treats this as observability and fails open; stable context
+    /// requires before/after validation and fails closed without it.
     async fn corpus_snapshot(
         &self,
         _ns: Namespace,

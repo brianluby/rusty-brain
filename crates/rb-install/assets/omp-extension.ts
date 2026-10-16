@@ -18,6 +18,7 @@ type SessionState = {
   placeboInvocation: number;
   placeboReceipts?: Promise<string[] | undefined>;
   closed: boolean;
+  startup: "unrequested" | "pending" | "suppressed" | "prepared";
 };
 
 function objectValue(value: unknown): JsonObject | undefined {
@@ -154,7 +155,7 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
     const key = id as string;
     let state = sessions.get(key);
     if (!state) {
-      state = { id: key, tail: Promise.resolve(), placeboInvocation: 0, closed: false };
+      state = { id: key, tail: Promise.resolve(), placeboInvocation: 0, closed: false, startup: "unrequested" };
       sessions.set(key, state);
     }
     return state;
@@ -189,7 +190,7 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
     return receipts;
   }
 
-  async function invokeHook(envelope: JsonObject, cwd: string): Promise<string | undefined> {
+  async function invokeHook(envelope: JsonObject, cwd: string): Promise<{ message?: string; prepared: boolean } | undefined> {
     // Defined-but-empty placebo configuration is still a control arm: never run hooks.
     if (placebo) return undefined;
     let killChild: (() => void) | undefined;
@@ -216,8 +217,10 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
       });
       const result = await Promise.race([output, deadline]);
       if (!result || result[0] !== 0 || !result[1].trim()) return undefined;
-      const message = objectValue(JSON.parse(result[1]))?.message;
-      return typeof message === "string" ? message : undefined;
+      const response = objectValue(JSON.parse(result[1]));
+      if (!response || response.continue !== true
+        || (response.message !== undefined && typeof response.message !== "string")) return undefined;
+      return { message: response.message as string | undefined, prepared: response.prepared === true };
     } catch {
       return undefined;
     } finally {
@@ -266,7 +269,14 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
       const state = stateFor(context, resetAnonymous);
       state.closed = false;
       const cwd = context.cwd;
-      await enqueue(state, () => invokeHook({ type: "session_start", source, cwd, session_id: state.id }, cwd));
+      await enqueue(state, async () => {
+        if (source === "startup") {
+          if (state.startup === "unrequested") state.startup = "pending";
+        } else {
+          state.startup = "suppressed";
+          await invokeHook({ type: "session_start", source, cwd, session_id: state.id }, cwd);
+        }
+      });
     } catch {
       // Hosts can dispose session context while lifecycle events are being delivered.
     }
@@ -307,9 +317,18 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
     if (state.closed) return undefined;
     const cwd = context.cwd;
     return enqueue(state, async () => {
-      const message = placebo
-        ? await placeboMessage(state)
-        : await invokeHook({ type: "prompt", cwd, session_id: state.id, prompt: event.prompt }, cwd);
+      let message: string | undefined;
+      if (placebo) {
+        message = await placeboMessage(state);
+      } else {
+        // One Rust preparation owns whole-entry admission under the shared token budget.
+        const result = await invokeHook({
+          type: "before_agent_start", cwd, session_id: state.id, prompt: event.prompt,
+          startup: state.startup === "pending",
+        }, cwd);
+        if (result?.prepared && state.startup === "pending") state.startup = "prepared";
+        message = result?.message;
+      }
       if (!message) {
         if (placebo) await controlFailure("placebo receipt unavailable or prohibited");
         return undefined;

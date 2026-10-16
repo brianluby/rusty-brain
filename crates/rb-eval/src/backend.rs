@@ -76,6 +76,13 @@ impl SqliteBackend {
 
 #[async_trait::async_trait]
 impl MemoryBackend for SqliteBackend {
+    async fn corpus_snapshot(
+        &self,
+        ns: Namespace,
+    ) -> rb_types::Result<Option<rb_types::CorpusSnapshot>> {
+        self.lock()?.corpus_snapshot(&ns).map(Some)
+    }
+
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> rb_types::Result<()> {
         let store = self.lock()?;
         store.insert_memory(&note, embedding.as_deref())

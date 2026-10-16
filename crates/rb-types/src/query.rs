@@ -50,6 +50,156 @@ pub struct SearchResult {
     pub stale: bool,
 }
 
+/// Current project navigation, validated against corpus and repository changes.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ProjectContext {
+    pub stable: Vec<ContextEntry>,
+    pub snapshot: Option<crate::CorpusSnapshot>,
+    pub repo_state: Option<crate::RepoSnapshot>,
+}
+
+/// Bounded navigation only. Full evidence and qualifications belong to get/history.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ContextEntry {
+    pub id: crate::MemoryId,
+    pub memory_type: MemoryType,
+    pub subject: String,
+    pub origin_user: Option<String>,
+    pub origin_agent: Option<String>,
+    pub origin_source: Option<String>,
+    pub origin_channel: Option<crate::WriteChannel>,
+    pub trust_class: TrustClass,
+    pub human_curated: bool,
+    pub contested: bool,
+    pub stale: bool,
+    /// Full-evidence currentness key, excluding access metadata and relative age.
+    pub fingerprint: u64,
+}
+
+impl ContextEntry {
+    /// Reserve handle, safety-label and detail-pointer overhead within original budgets.
+    pub const SUBJECT_CHARS: usize = 80;
+    pub const SOURCE_CHARS: usize = 40;
+
+    /// Currentness comparison without copying full evidence into a preview.
+    /// SHA-256 over length-framed evidence, truncated to its first eight bytes (LE).
+    /// Use the same repository snapshot as staleness evaluation; unresolved HEAD
+    /// invalidates a commit-bound claim without marking unknown evidence stale.
+    pub fn fingerprint_for(
+        memory: &MemoryNote,
+        stale: bool,
+        repo: Option<&crate::RepoSnapshot>,
+    ) -> u64 {
+        use sha2::{Digest, Sha256};
+        let mut hash = Sha256::new();
+        hash.update(b"rusty-brain-context-fingerprint-v1");
+        // Match embedding fingerprints: u64 LE counts and UTF-8 byte lengths.
+        for fields in [
+            std::slice::from_ref(&memory.content),
+            std::slice::from_ref(&memory.context),
+            std::slice::from_ref(&memory.summary),
+            memory.keywords.as_slice(),
+            memory.tags.as_slice(),
+            memory.related_files.as_slice(),
+        ] {
+            hash.update((fields.len() as u64).to_le_bytes());
+            for field in fields {
+                hash.update((field.len() as u64).to_le_bytes());
+                hash.update(field.as_bytes());
+            }
+        }
+        for field in [memory.memory_type.as_str(), memory.trust_class.as_str()] {
+            hash.update((field.len() as u64).to_le_bytes());
+            hash.update(field.as_bytes());
+        }
+        hash.update([memory.importance]);
+        hash.update(memory.confidence.to_bits().to_le_bytes());
+        hash.update([
+            u8::from(memory.human_curated),
+            u8::from(memory.contested),
+            u8::from(stale),
+        ]);
+        for field in [
+            memory.origin_user.as_deref(),
+            memory.origin_host.as_deref(),
+            memory.origin_agent.as_deref(),
+            memory.origin_source.as_deref(),
+            memory.origin_channel.map(|channel| channel.as_str()),
+            memory.session_id.as_deref(),
+        ] {
+            hash.update([u8::from(field.is_some())]);
+            if let Some(field) = field {
+                hash.update((field.len() as u64).to_le_bytes());
+                hash.update(field.as_bytes());
+            }
+        }
+        hash.update((memory.anchors.len() as u64).to_le_bytes());
+        for anchor in &memory.anchors {
+            for field in [crate::anchor_kind_str(anchor.kind), anchor.value.as_str()] {
+                hash.update((field.len() as u64).to_le_bytes());
+                hash.update(field.as_bytes());
+            }
+            for line in [anchor.start_line, anchor.end_line] {
+                hash.update([u8::from(line.is_some())]);
+                if let Some(line) = line {
+                    hash.update(line.to_le_bytes());
+                }
+            }
+            if anchor.kind == AnchorKind::Commit {
+                // Unknown currentness is not stale, but invalidates earlier clean evidence.
+                hash.update([u8::from(
+                    repo.and_then(|state| state.head.as_ref()).is_some(),
+                )]);
+            }
+        }
+        let digest = hash.finalize();
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        u64::from_le_bytes(bytes)
+    }
+
+    pub fn from_memory(
+        memory: MemoryNote,
+        stale: bool,
+        repo: Option<&crate::RepoSnapshot>,
+    ) -> Self {
+        let fingerprint = Self::fingerprint_for(&memory, stale, repo);
+        let subject = if memory.summary.trim().is_empty() {
+            &memory.content
+        } else {
+            &memory.summary
+        };
+        let subject = subject
+            .trim()
+            .chars()
+            .take(Self::SUBJECT_CHARS)
+            .map(|ch| {
+                if ch.is_control() || matches!(ch, '\u{2028}' | '\u{2029}') {
+                    ' '
+                } else {
+                    ch
+                }
+            })
+            .collect();
+        let bounded =
+            |text: Option<String>| text.map(|text| text.chars().take(Self::SOURCE_CHARS).collect());
+        Self {
+            id: memory.id,
+            memory_type: memory.memory_type,
+            subject,
+            origin_user: bounded(memory.origin_user),
+            origin_agent: bounded(memory.origin_agent),
+            origin_source: bounded(memory.origin_source),
+            origin_channel: memory.origin_channel,
+            trust_class: memory.trust_class,
+            human_curated: memory.human_curated,
+            contested: memory.contested,
+            stale,
+            fingerprint,
+        }
+    }
+}
+
 /// Archived-state scope for recall/list filtering (PRD 2026-07-02
 /// search-filter parity). `Active` is the default and preserves pre-filter
 /// behavior (archived rows never surface unless explicitly requested).
@@ -190,6 +340,10 @@ pub struct RecallFilter {
     /// with typed code anchors (PRD 2026-07-02).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub anchors: Vec<AnchorFilter>,
+    /// Internal injection eligibility, never accepted from a wire filter.
+    /// Audit list/get deliberately retain quarantined and exhausted rows.
+    #[serde(skip)]
+    pub recall_eligible: bool,
 }
 
 impl RecallFilter {
@@ -257,6 +411,9 @@ impl RecallFilter {
     /// lives.
     #[must_use]
     pub fn matches(&self, note: &MemoryNote) -> bool {
+        if self.recall_eligible && (note.is_quarantined() || note.below_recall_confidence_floor()) {
+            return false;
+        }
         if !self.types.is_empty() && !self.types.contains(&note.memory_type) {
             return false;
         }
@@ -390,6 +547,126 @@ mod tests {
     use crate::memory::MemoryNote;
     use crate::memory_type::MemoryType;
     use crate::namespace::Namespace;
+
+    fn context_fingerprint_note() -> MemoryNote {
+        let mut note = MemoryNote::new(
+            Namespace::Global,
+            "Use SQLite.".into(),
+            MemoryType::ArchitectureDecision,
+            8,
+        );
+        note.context = "UNTESTED; revalidate before use.".into();
+        note.summary = "Use SQLite.".into();
+        note.keywords = vec!["sqlite".into(), "storage".into()];
+        note.tags = vec!["decision".into()];
+        note.related_files = vec!["src/db.rs".into()];
+        note.confidence = 0.75;
+        note.trust_class = TrustClass::HumanConfirmed;
+        note.human_curated = true;
+        note.contested = true;
+        note.origin_user = Some("Ada".into());
+        note.origin_agent = Some("omp".into());
+        note.origin_source = Some("cli".into());
+        note.origin_channel = Some(crate::WriteChannel::Cli);
+        note.session_id = Some(String::new());
+        note.anchors = vec![
+            crate::MemoryAnchor::parse_file_spec("src/db.rs:12-18").unwrap(),
+            crate::MemoryAnchor::new(AnchorKind::Symbol, "Db::open").unwrap(),
+        ];
+        note
+    }
+
+    #[test]
+    fn context_fingerprint_has_a_portable_serialized_fixture() {
+        let mut note = context_fingerprint_note();
+        // Independently framed with Python hashlib.sha256: 24f59a62214df278
+        // efc9e46e9a2f1a4e55a721b2f58468aadd0e1639a394e45b; first 8 bytes LE.
+        let expected = 8_715_113_034_698_913_060;
+        let entry = ContextEntry::from_memory(note.clone(), true, None);
+        assert_eq!(entry.fingerprint, expected);
+        let serialized = serde_json::to_string(&entry).unwrap();
+        let restored: ContextEntry = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(restored.fingerprint, expected);
+        note.access_count += 1;
+        note.last_accessed_at = Some(note.created_at);
+        note.created_at -= chrono::Duration::days(30);
+        note.updated_at = note.created_at;
+        assert_eq!(ContextEntry::fingerprint_for(&note, true, None), expected);
+        assert_ne!(ContextEntry::fingerprint_for(&note, false, None), expected);
+    }
+
+    #[test]
+    fn context_fingerprint_retains_full_evidence_and_qualifications() {
+        let note = context_fingerprint_note();
+        let expected = ContextEntry::fingerprint_for(&note, true, None);
+        let mutations: [fn(&mut MemoryNote); 22] = [
+            |n| n.content.push_str(" Exception: read-only."),
+            |n| n.context.push_str(" Outcome unknown."),
+            |n| n.summary.push_str(" (proposal)"),
+            |n| n.keywords.push("caveat".into()),
+            |n| n.tags.push("untested".into()),
+            |n| n.related_files.push("src/legacy.rs".into()),
+            |n| n.memory_type = MemoryType::Constraint,
+            |n| n.importance = 9,
+            |n| n.confidence = 0.5,
+            |n| n.trust_class = TrustClass::AgentAttested,
+            |n| n.human_curated = false,
+            |n| n.contested = false,
+            |n| n.origin_user = Some("Grace".into()),
+            |n| n.origin_host = Some("titan".into()),
+            |n| n.origin_agent = Some("other".into()),
+            |n| n.origin_source = Some("hook".into()),
+            |n| n.origin_channel = Some(crate::WriteChannel::Hook),
+            |n| n.session_id = None,
+            |n| n.anchors[0].kind = AnchorKind::Symbol,
+            |n| n.anchors[0].value.push_str(".old"),
+            |n| n.anchors[0].start_line = Some(13),
+            |n| n.anchors[0].end_line = Some(19),
+        ];
+        for (index, mutate) in mutations.into_iter().enumerate() {
+            let mut changed = note.clone();
+            mutate(&mut changed);
+            assert_ne!(
+                ContextEntry::fingerprint_for(&changed, true, None),
+                expected,
+                "evidence mutation {index}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_fingerprint_frames_lists_options_and_anchor_ranges() {
+        let mut left = context_fingerprint_note();
+        let mut right = left.clone();
+        let distinct = |left: &MemoryNote, right: &MemoryNote| {
+            assert_ne!(
+                ContextEntry::fingerprint_for(left, true, None),
+                ContextEntry::fingerprint_for(right, true, None)
+            );
+        };
+        left.keywords = vec!["ab".into(), "c".into()];
+        right.keywords = vec!["a".into(), "bc".into()];
+        distinct(&left, &right);
+        right.keywords = vec!["ab".into(), "c".into(), String::new()];
+        distinct(&left, &right);
+        right = left.clone();
+        right.origin_host = Some(String::new());
+        distinct(&left, &right);
+        right = left.clone();
+        right.anchors.reverse();
+        distinct(&left, &right);
+        right = left.clone();
+        right.anchors.push(right.anchors[0].clone());
+        distinct(&left, &right);
+        right = left.clone();
+        left.anchors[0].start_line = None;
+        right.anchors[0].start_line = Some(0);
+        distinct(&left, &right);
+        right.anchors[0].start_line = None;
+        left.anchors[0].end_line = None;
+        right.anchors[0].end_line = Some(0);
+        distinct(&left, &right);
+    }
 
     #[test]
     fn search_query_default_is_empty() {
@@ -559,6 +836,7 @@ mod tests {
                 kind: AnchorKind::File,
                 value: "src/server.rs".to_string(),
             }],
+            recall_eligible: false,
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: RecallFilter = serde_json::from_str(&json).unwrap();

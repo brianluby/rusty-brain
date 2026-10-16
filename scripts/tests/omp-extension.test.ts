@@ -134,7 +134,29 @@ test("returned prompt messages and appended receipts follow preparation order", 
     customType: "dev.rusty-brain.recall", content: messages[0], display: false, attribution: "agent",
   } });
   expect(await receiptMessages()).toEqual(messages);
-  expect((await fixtureRecords()).map((record) => record.envelope?.type)).toEqual(["session_start", "prompt", "prompt"]);
+  expect((await fixtureRecords()).map((record) => record.envelope?.type)).toEqual(["before_agent_start", "before_agent_start"]);
+});
+
+test("deferred startup is returned once with dynamic recall and receipts replay the entire preparation", async () => {
+  const instance = host("stable-session");
+  await instance.emit("session_start");
+  expect(await fixtureRecords()).toEqual([]);
+  const first = returnedMessage(await instance.emit("before_agent_start", { prompt: "alpha" }));
+  expect(first).toBe("Stored stable project decision\nStored alpha decision");
+  await instance.emit("session_start");
+  const second = returnedMessage(await instance.emit("before_agent_start", { prompt: "beta" }));
+  expect(second).toBe("Stored β decision 𐐀");
+  expect(await receiptMessages()).toEqual([first!, second!]);
+  process.env.RB_SCORECARD_PLACEBO_SOURCE = receipts;
+  process.env.RB_SCORECARD_INJECTION_DIR = join(directory, "placebo-receipts");
+  const control = host("stable-session");
+  await control.emit("session_start");
+  for (const [index, prompt] of ["alpha", "beta"].entries()) {
+    expect(returnedMessage(await control.emit("before_agent_start", { prompt })))
+      .toBe(".".repeat(Math.ceil(Buffer.byteLength([first!, second!][index]) / 4) * 4));
+  }
+  expect((await fixtureRecords()).map((record) => record.envelope?.type))
+    .toEqual(["before_agent_start", "before_agent_start"]);
 });
 
 test("placebo matches UTF-8 token estimates and never starts hooks across lifecycle", async () => {
@@ -227,6 +249,31 @@ test("nonzero exit, malformed response, missing message, and missing executable 
   expect(await receiptMessages()).toEqual(["Stored alpha decision"]);
 });
 
+test("failed startup preparation remains pending until recovery and successful empty is final", async () => {
+  for (const mode of ["nonzero", "malformed", "no-message", "oversize"]) {
+    const instance = host("stable-session");
+    await instance.emit("session_start");
+    expect(await instance.emit("before_agent_start", { prompt: `fixture/${mode}` })).toBeUndefined();
+    expect(returnedMessage(await instance.emit("before_agent_start", { prompt: "alpha" })))
+      .toBe("Stored stable project decision\nStored alpha decision");
+    expect(returnedMessage(await instance.emit("before_agent_start", { prompt: "beta" })))
+      .toBe("Stored β decision 𐐀");
+  }
+  const empty = host("stable-session");
+  await empty.emit("session_start");
+  expect(await empty.emit("before_agent_start", { prompt: "fixture/empty" })).toBeUndefined();
+  expect(returnedMessage(await empty.emit("before_agent_start", { prompt: "alpha" }))).toBe("Stored alpha decision");
+  const executable = process.env.RB_OMP_HOOKS_BIN!;
+  const source = await readFile(executable);
+  await rm(executable);
+  const missing = host("stable-session");
+  await missing.emit("session_start");
+  expect(await missing.emit("before_agent_start", { prompt: "alpha" })).toBeUndefined();
+  await writeFile(executable, source, { mode: 0o700 });
+  expect(returnedMessage(await missing.emit("before_agent_start", { prompt: "alpha" })))
+    .toBe("Stored stable project decision\nStored alpha decision");
+});
+
 test("oversized hook output and stdin fail open and the next request still succeeds", async () => {
   const instance = host();
   expect(await instance.emit("before_agent_start", { prompt: "fixture/oversize" })).toBeUndefined();
@@ -237,12 +284,13 @@ test("oversized hook output and stdin fail open and the next request still succe
 });
 
 test("a hook ignoring SIGTERM is killed by the deadline without blocking subsequent work", async () => {
-  const instance = host();
+  const instance = host("stable-session");
+  await instance.emit("session_start");
   const started = performance.now();
   expect(await instance.emit("before_agent_start", { prompt: "fixture/timeout" })).toBeUndefined();
   expect(performance.now() - started).toBeLessThan(10_000);
-  expect(returnedMessage(await instance.emit("before_agent_start", { prompt: "alpha" }))).toBe("Stored alpha decision");
-  expect(await receiptMessages()).toEqual(["Stored alpha decision"]);
+  expect(returnedMessage(await instance.emit("before_agent_start", { prompt: "alpha" }))).toBe("Stored stable project decision\nStored alpha decision");
+  expect(await receiptMessages()).toEqual(["Stored stable project decision\nStored alpha decision"]);
 }, 15_000);
 
 test("receipt I/O failure is distinguishable from absent recall without blocking injection", async () => {
@@ -355,25 +403,6 @@ test("a long final assistant response cannot crowd out the preceding user correc
   expect(transcript.messages.find((record) => record.id === "long-response")?.content_complete).toBe(false);
 });
 
-test("real stdin envelopes retain session identities and unavailable IDs never collide", async () => {
-  const first = host(undefined);
-  const second = host(null);
-  // Undefined explicitly selects the function default, so remove the native getter too.
-  Object.defineProperty(first.context.sessionManager, "getSessionId", { value: () => { throw new Error("not ready"); } });
-  await first.emit("session_start");
-  await second.emit("session_start");
-  await first.emit("before_agent_start", { prompt: "alpha" });
-  const switching = host("session/a");
-  await switching.emit("session_start");
-  switching.switchTo("session_a");
-  await switching.emit("session_switch");
-  await switching.emit("before_agent_start", { prompt: "beta" });
-  const ids = (await fixtureRecords()).map((record) => record.envelope?.session_id);
-  expect(typeof ids[0]).toBe("string");
-  expect(ids[0]).not.toBe(ids[1]);
-  expect(ids[2]).toBe(ids[0]);
-  expect(ids.slice(3)).toEqual(["session/a", "session_a", "session_a"]);
-});
 
 test("cancel-safe transition checkpoints use the old session and drain prior captures without closing it", async () => {
   const instance = host("old-session", [

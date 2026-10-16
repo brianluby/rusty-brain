@@ -103,7 +103,7 @@ fn anchors_suffix(n: &MemoryNote) -> String {
     format!(" [anchors: {}]", anchor_labels(n))
 }
 
-/// Render a list of notes (used by `list`, `graph`, and the `context` halves).
+/// Render a list of notes (used by `list` and `graph`).
 pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
     if json {
         return serde_json::to_string_pretty(notes).unwrap_or_else(|e| {
@@ -425,28 +425,14 @@ pub fn render_deleted(json: bool) -> String {
 }
 
 /// Render the `context` payload.
-pub fn render_context(
-    recent: &[MemoryNote],
-    important: &[MemoryNote],
-    total: usize,
-    json: bool,
-) -> String {
+pub fn render_context(context: &rb_types::ProjectContext, json: bool) -> String {
     if json {
-        let value = serde_json::json!({
-            "recent": recent,
-            "important": important,
-            "total": total,
-        });
-        return serde_json::to_string_pretty(&value).unwrap_or_else(|e| {
+        return serde_json::to_string_pretty(context).unwrap_or_else(|e| {
             tracing::warn!(error = %e, "failed to render context JSON");
             "{}".to_string()
         });
     }
-    let mut out = format!("Context ({total} memories total)\n\nRecent:\n");
-    out.push_str(&render_notes(recent, false));
-    out.push_str("\n\nImportant:\n");
-    out.push_str(&render_notes(important, false));
-    out
+    rb_tokens::context::render_project_context(context, false).unwrap_or_default()
 }
 
 /// Threshold below which the feedback ratio gets a low-N caveat instead of
@@ -1196,6 +1182,55 @@ mod tests {
     #![allow(clippy::unwrap_used, clippy::expect_used)]
     use super::*;
     use rb_types::{MemoryNote, MemoryType, Namespace, SearchResult};
+
+    #[test]
+    fn context_json_preserves_bounded_navigation_and_human_uses_shared_renderer() {
+        let mut memory = note(
+            &format!("Use one writer. {}", "full exception detail ".repeat(80)),
+            9,
+        );
+        memory.memory_type = MemoryType::Constraint;
+        let id = memory.id.to_string();
+        let content = memory.content.clone();
+        let context = rb_types::ProjectContext {
+            stable: vec![rb_types::ContextEntry::from_memory(memory, true, None)],
+            snapshot: None,
+            repo_state: None,
+        };
+        let value: serde_json::Value =
+            serde_json::from_str(&render_context(&context, true)).unwrap();
+        assert_eq!(value["stable"][0]["id"], id);
+        assert!(
+            value["stable"][0]["subject"]
+                .as_str()
+                .unwrap()
+                .chars()
+                .count()
+                <= 80
+        );
+        assert!(value["stable"][0].get("content").is_none());
+        assert!(value["stable"][0].get("memory").is_none());
+        assert_eq!(value["stable"][0]["stale"], true);
+        assert!(value.get("recent").is_none());
+        let human = render_context(&context, false);
+        assert_eq!(
+            human,
+            rb_tokens::context::render_project_context(&context, false).unwrap()
+        );
+        assert!(human.contains(&id));
+        assert!(human.contains("[stale]"));
+        assert!(rb_tokens::count_tokens(&human) <= rb_tokens::INJECTION_BUDGET);
+        assert!(!human.contains(&content));
+        assert!(render_context(
+            &rb_types::ProjectContext {
+                stable: vec![],
+                snapshot: None,
+                repo_state: None,
+            },
+            false
+        )
+        .is_empty());
+    }
 
     fn note(content: &str, importance: u8) -> MemoryNote {
         MemoryNote::new(
@@ -2183,7 +2218,7 @@ mod tests {
     fn status_renders_health_payload_in_both_modes() {
         let stats = sample_stats();
         let view = StatusView {
-            contract_version: 2,
+            contract_version: rb_proto::CONTRACT_VERSION,
             recall_channels: Some(rb_proto::RecallChannelTotals {
                 recalls: 4,
                 fts_hits: 9,
@@ -2196,7 +2231,10 @@ mod tests {
             db_file_mode: Some(0o600),
         };
         let human = render_status(&view, false);
-        assert!(human.contains("ok (contract v2)"), "{human}");
+        assert!(
+            human.contains(&format!("ok (contract v{})", rb_proto::CONTRACT_VERSION)),
+            "{human}"
+        );
         assert!(human.contains("writer: alive"), "{human}");
         assert!(human.contains("deterministic"), "{human}");
         assert!(human.contains("/tmp/rb.db"), "{human}");
@@ -2209,7 +2247,10 @@ mod tests {
         let json = render_status(&view, true);
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed["ok"].as_bool(), Some(true));
-        assert_eq!(parsed["contract_version"].as_u64(), Some(2));
+        assert_eq!(
+            parsed["contract_version"].as_u64(),
+            Some(u64::from(rb_proto::CONTRACT_VERSION))
+        );
         assert_eq!(parsed["writer_alive"].as_bool(), Some(true));
         assert_eq!(parsed["provider_model"].as_str(), Some("deterministic"));
         assert_eq!(parsed["db"]["path"].as_str(), Some("/tmp/rb.db"));
@@ -2226,7 +2267,7 @@ mod tests {
     fn status_marks_a_dead_writer() {
         let stats = sample_stats();
         let view = StatusView {
-            contract_version: 2,
+            contract_version: rb_proto::CONTRACT_VERSION,
             recall_channels: None,
             stats: &stats,
             provider_model: "deterministic",

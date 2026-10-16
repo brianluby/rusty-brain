@@ -5,6 +5,61 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Changed — Compact context navigation (kanban 96)
+
+- Replace activity-heavy context digests with bounded current decisions,
+  constraints and preferences, selected for recall eligibility before the
+  candidate cutoff. Keep full UUID handles, qualified source labels and lazy
+  exact `get`/`history` detail instead of eagerly transporting full note bodies.
+- Share stable/dynamic rendering and the 600-token preparation budget across
+  supported native hooks and MCP context text. Suppress unchanged prepared
+  stable previews; retain independent query evidence and explicit abstention.
+  Disclose changed or unavailable current state without claiming that prior
+  host text can be revoked or that prepared output was acknowledged.
+- **Breaking:** context wire contract is version 3. Upgrade matched CLI, daemon,
+  hook and MCP binaries, restart the daemon and reinstall the OMP extension.
+  The former context tuple and OMP prompt envelope have no compatibility shim.
+
+### Added — Qualified procedures and artifact checks (kanban 89, 58)
+
+- Document explicit `bug_fix`/`code_pattern` capture with outcome, trigger,
+  observed steps, caveats, verification and source fields. Keep verified
+  fixture outcomes, failed attempts and untested proposals distinct; recalled
+  procedures remain unverified-source advice, never execution authority.
+- Add a native, real-binary packaged-artifact regression harness covering
+  relative/absolute paths, spaces, unreadable input, bad checksums, source
+  replacement after verification, failure cleanup and GNU `stat` on macOS.
+  This local ARM macOS proof does not replace the release matrix.
+
+### Fixed — Context and release adversarial review
+
+- Bridge actual daemon/evaluation stores to corpus snapshots. Poison cancelled
+  or malformed framed-client exchanges rather than reuse a misaligned stream.
+- Persist native preparation state only after final message assembly, retry
+  failed OMP startup preparation and warn after a resumed ledger expires.
+  Corrections do not mark unseen replacement previews as already prepared.
+- Budget MCP context corrections with their previews and render overlapping
+  stable/query evidence once without losing its current safety labels.
+- Resolve local artifact paths before entering the sandbox; use native Darwin
+  permission inspection, extract the exact checksum-verified private copy and
+  terminate an owned fixture daemon even when verification fails early.
+- Refresh MCP context only after a recalled result, never after a transport error
+  or daemon rejection. Preserve rejected-recall JSON errors unchanged; transport
+  failures qualify prior prepared context as unavailable until recovery.
+- Use explicitly framed SHA-256 evidence fingerprints rather than Rust's
+  release-dependent default hasher. Existing preparation keys may cause one
+  conservative correction after upgrade; the 64-bit key is not authentication.
+- Include repository-state resolvability in commit-bound context fingerprints.
+  Losing or recovering Git evidence now corrects prior native/MCP preparation;
+  unknown currentness is not mislabeled stale and unbound entries are unchanged.
+- Isolate scorecard startup and first-prompt probes, count only dynamic recall as
+  query evidence, and retain empty-recall abstention reasons during history capture.
+  These disposable hook probes do not establish host or provider delivery.
+- Exercise long-path capture through compact UUID handles and exact source
+  drilldown instead of requiring source basenames inside truncated previews.
+- Bound the post-shutdown admission test's wait for asynchronous fixture teardown;
+  keep all live-daemon rejection and old-provider data-preservation assertions.
+
 ### Added — Trusted-memory tranche (kanban 78, 79, 94, 95)
 
 - Accept deliberate embedding-model and dimension changes atomically, rebuilding

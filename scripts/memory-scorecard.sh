@@ -783,11 +783,9 @@ reach_identity_paths() { # memory_on_base -> ha<TAB>pa<TAB>hb<TAB>pb
 }
 
 
-# Capture the exact read-side evidence a scorecard work session is about to see.
-# SessionStart and prompt-time hook outputs are retained separately so Class A
-# can distinguish an answer already present at startup from one surfaced by the
-# query-specific recall path. These probes are read-only and separate from the
-# extension's actual per-session receipt.
+# Capture read-side preparation evidence, not actual host/model injection.
+# SessionStart and a fresh extension-style first prompt are retained separately;
+# the latter can contain both stable context and query-specific recall.
 capture_memory_diagnostics() { # home project query diagnostics_dir planted_jsonl
   local home="$1" project="$2" query="$3" dir="$4" planted="$5"
   mkdir -p "$dir"
@@ -805,8 +803,8 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
     rusty-brain-hooks --agent omp \
       < "$dir/session-start-input.json" > "$dir/session-start-injection.json"
 
-    jq -cn --arg sid "$sid" --arg cwd "$project" --arg prompt "$query" \
-      '{type:"prompt",session_id:$sid,cwd:$cwd,prompt:$prompt}' \
+    jq -cn --arg sid "${sid}-first-prompt" --arg cwd "$project" --arg prompt "$query" \
+      '{type:"before_agent_start",startup:true,session_id:$sid,cwd:$cwd,prompt:$prompt}' \
       > "$dir/prompt-time-input.json"
     rusty-brain-hooks --agent omp \
       < "$dir/prompt-time-input.json" > "$dir/prompt-time-injection.json"
@@ -820,8 +818,8 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
     # durable even if one side did not rank for this exact query.
     {
       jq -r '.id // empty' "$planted"
-      jq -r '.[].memory.id // empty' "$dir/recall-active.json"
-      jq -r '.[].memory.id // empty' "$dir/recall-archived.json"
+      jq -r '(if type == "array" then . else .results end)[] | .memory.id // empty' \
+        "$dir/recall-active.json" "$dir/recall-archived.json"
     } | sort -u | while IFS= read -r memory_id; do
       [ -n "$memory_id" ] || continue
       rusty-brain --json history "$memory_id" > "$dir/history-$memory_id.json"
@@ -829,6 +827,7 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
 
     jq -n --arg query "$query" --arg namespace "${RUSTY_BRAIN_NAMESPACE:-}" \
       '{schema_version:3,query:$query,namespace:$namespace,recall_limit:5,
+        diagnostic_probe_scope:"hook_preparation_only",
         evidence:{context:"context.json",active_candidates:"recall-active.json",
         archived_candidates:"recall-archived.json",planted_chain:"planted.jsonl",
         session_start_input:"session-start-input.json",
@@ -845,15 +844,17 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
 finalize_memory_diagnostics() { # dir success stale_evidence evidence_reason expect stale -> start<TAB>prompt
   local dir="$1" success="$2" stale_evidence="$3" evidence_reason="$4" expect="$5" stale="$6"
   [ -d "$dir" ] || { printf 'na\tna\n'; return 0; }
-  local startup prompt probe_stale=0 probe_current=0 probe_any=0
+  local startup prompt dynamic probe_stale=0 probe_current=0 probe_any=0
   local startup_current_present=0 prompt_current_present=0
   startup="$(jq -r '.message // ""' "$dir/session-start-injection.json" 2>/dev/null || true)"
   prompt="$(jq -r '.message // ""' "$dir/prompt-time-injection.json" 2>/dev/null || true)"
+  # First-prompt preparation also includes stable context: only this section is query evidence.
+  dynamic="$(printf '%s\n' "$prompt" | python3 -c 'import sys; text = sys.stdin.read(); print(text.partition("# Rusty Brain — Memories relevant to this prompt\n")[2], end="")')"
   [ -z "$prompt" ] || probe_any=1
   if [ -n "$stale" ] && grep -qiF -- "$stale" <<<"$prompt"; then probe_stale=1; fi
   if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$prompt"; then probe_current=1; fi
   if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$startup"; then startup_current_present=1; fi
-  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$prompt"; then prompt_current_present=1; fi
+  if [ -n "$expect" ] && grep -qiF -- "$expect" <<<"$dynamic"; then prompt_current_present=1; fi
   jq -n --argjson success "$success" --arg stale_evidence "$stale_evidence" \
     --arg evidence_reason "$evidence_reason" \
     --argjson probe_stale "$probe_stale" --argjson probe_current "$probe_current" \
@@ -866,6 +867,7 @@ finalize_memory_diagnostics() { # dir success stale_evidence evidence_reason exp
         (if $stale_evidence == "1" then true
          elif $stale_evidence == "0" then false else null end),
       injection_evidence_reason:$evidence_reason,
+      diagnostic_probe_scope:"hook_preparation_only",
       diagnostic_probe_stale_present:($probe_stale == 1),
       diagnostic_probe_current_present:($probe_current == 1),
       diagnostic_probe_any_memory:($probe_any == 1),
@@ -1816,7 +1818,7 @@ JSON
   # target surfaced only by the prompt query.
   local source_diag="$tmp/source-diagnostics"; mkdir -p "$source_diag"
   printf '{"continue":true,"message":"startup has another decision"}\n' > "$source_diag/session-start-injection.json"
-  printf '{"continue":true,"message":"prompt recalled use ureq"}\n' > "$source_diag/prompt-time-injection.json"
+  printf '{"continue":true,"message":"# Rusty Brain — Memories relevant to this prompt\\nprompt recalled use ureq"}\n' > "$source_diag/prompt-time-injection.json"
   check "diagnostics report query-only answer evidence" "$(printf '0\t1')" \
     "$(finalize_memory_diagnostics "$source_diag" 1 0 receipt_empty ureq "")"
   if jq -e '.session_start_answer_present == false and .prompt_recall_answer_present == true and .query_only_answer_evidence == true' \
@@ -1824,6 +1826,15 @@ JSON
     echo "ok: diagnostics outcome preserves separate injection sources"
   else
     echo "BUG: diagnostics outcome merged injection sources"; fail=1
+  fi
+  printf '{"continue":true,"message":"# Rusty Brain — Stable project context\\nuse ureq"}\n' > "$source_diag/prompt-time-injection.json"
+  check "combined stable evidence is not query recall" "$(printf '0\t0')" \
+    "$(finalize_memory_diagnostics "$source_diag" 1 na receipt_missing ureq "")"
+  if jq -e '.diagnostic_probe_current_present == true and .prompt_recall_answer_present == false and .query_only_answer_evidence == false and .injected_stale_evidence == null and .diagnostic_probe_scope == "hook_preparation_only"' \
+      "$source_diag/outcome.json" >/dev/null; then
+    echo "ok: stable preparation neither becomes query evidence nor an injection receipt"
+  else
+    echo "BUG: stable preparation misattributed"; fail=1
   fi
   # Session-log retention copies diagnosable OMP JSON logs, judged text, daemon
   # logs, exact extension injections, candidates, states, and histories out of a

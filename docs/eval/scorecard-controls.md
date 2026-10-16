@@ -122,12 +122,21 @@ columns 18-22 retain injection estimates, and columns 23-24 carry answer-source 
 | 21 | Sum of columns 18–20. |
 | 22 | Estimator ID. |
 | 23 | Expected answer present in the diagnostic SessionStart hook context (`0`/`1`; `na` outside memory-on). |
-| 24 | Expected answer present in prompt-time/query recall (`0`/`1`; `na` outside memory-on). |
+| 24 | Expected answer present in the dynamic prompt-recall section only (`0`/`1`; `na` outside memory-on). |
 
 Class A reports SessionStart-present, prompt-recall-present, and query-only rows
 separately. A response-level success supports the retrieval-at-scale claim only
 when column 23 is `0` and column 24 is `1`. Historical rows lacking these fields
 are not valid input to the current gate; analyze them with their original schema.
+
+The standalone startup probe and combined first-prompt probe use separate
+synthetic sessions. The latter requests startup preparation explicitly, so the
+startup probe cannot suppress its stable context. Stable previews in the combined
+message do not count as query recall. Retained diagnostics declare
+`diagnostic_probe_scope: "hook_preparation_only"`; neither probe establishes
+native host delivery, provider consumption, or causal attribution. Those claims
+still require the existing session receipts and paired controls. Empty recall
+artifacts retain their explicit abstention reason codes.
 
 The runner emits columns 25-26 and the causal postprocessor appends columns
 27-28. It can upgrade column 7 to `1`, but never erase an existing failure flag,
@@ -189,6 +198,10 @@ and real fixture subprocesses: actual stdin, message/receipt order, source bound
 timeouts, fail-open paths, strict zero-hook placebo lifecycle, session isolation,
 and capture/checkpoint ordering. Shell/Python checks cover scoring and receipt
 accounting, not native host lifecycle.
+
+Set `RB_SCORECARD_DIAGNOSTIC_BIN_DIR` to a built binary directory to additionally
+exercise the first-prompt diagnostic with disposable real hooks, daemon and CLI.
+Without that variable, this integration check is explicitly skipped.
 
 Separate bounded live evidence is recorded in
 [`omp-extension-verification.json`](omp-extension-verification.json):

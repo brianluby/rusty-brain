@@ -3,14 +3,153 @@ from contextlib import redirect_stderr
 import io
 import json
 from pathlib import Path
+import os
 import runpy
+import shlex
 import subprocess
 import tempfile
+import time
 import unittest
 from unittest import mock
 
 SCRIPTS = Path(__file__).resolve().parents[1]
 CONTROLS = SCRIPTS / "scorecard-controls.py"
+
+@unittest.skipUnless(
+    os.environ.get("RB_SCORECARD_DIAGNOSTIC_BIN_DIR"),
+    "set RB_SCORECARD_DIAGNOSTIC_BIN_DIR to exercise disposable hook/daemon diagnostics",
+)
+class DiagnosticHookTest(unittest.TestCase):
+    def test_first_prompt_preserves_stable_and_distinguishes_query_evidence(self):
+        """Use real binaries, never an OMP host, provider, or production store."""
+        binaries = Path(os.environ["RB_SCORECARD_DIAGNOSTIC_BIN_DIR"]).resolve()
+        for name in ("rusty-brain", "rusty-brain-hooks"):
+            self.assertTrue((binaries / name).is_file(), str(binaries / name))
+        with tempfile.TemporaryDirectory(prefix="rbdiag-", dir="/tmp") as tmp:
+            root = Path(tmp)
+            home, project = root / "home", root / "project"
+            home.mkdir()
+            project.mkdir()
+            environment = {
+                "PATH": f"{binaries}:{os.environ['PATH']}",
+                "HOME": str(home), "USER": "fixture", "TMPDIR": "/tmp",
+                "RUSTY_BRAIN_SOCKET": str(root / "s"),
+                "RUSTY_BRAIN_DB": str(root / "memory.db"),
+                "RUSTY_BRAIN_NAMESPACE": "scorecard-diagnostic-test",
+                "RB_EMBED_BACKEND": "deterministic",
+                "XDG_CONFIG_HOME": str(root / "config"),
+                "XDG_CACHE_HOME": str(root / "cache"),
+                "XDG_DATA_HOME": str(root / "data"),
+                "XDG_STATE_HOME": str(root / "state"),
+                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+            }
+
+            def cli(*args):
+                result = subprocess.run(
+                    [str(binaries / "rusty-brain"), "--json", *args],
+                    env=environment, cwd=project, capture_output=True, text=True,
+                    timeout=60,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)
+
+            with (root / "daemon.log").open("w+") as log:
+                daemon = subprocess.Popen(
+                    [str(binaries / "rusty-brain"), "serve"], env=environment,
+                    cwd=project, stdout=log, stderr=log,
+                )
+                try:
+                    deadline = time.monotonic() + 60
+                    while not (root / "s").exists() and daemon.poll() is None:
+                        if time.monotonic() >= deadline:
+                            break
+                        time.sleep(0.1)
+                    log.flush()
+                    self.assertTrue((root / "s").exists(),
+                                    (root / "daemon.log").read_text())
+                    stable = "Constraint: use serialized migrations with transaction ownership."
+                    cli("remember", stable, "--type", "constraint", "--importance", "8")
+                    prefix = (SCRIPTS / "memory-scorecard.sh").read_text().split(
+                        "# ---- arg parsing", 1
+                    )[0]
+
+                    # Reproduce the old probe on the same disposable daemon.
+                    for event in (
+                        {"type": "session_start", "source": "startup"},
+                        {"type": "before_agent_start", "prompt": stable},
+                    ):
+                        legacy = subprocess.run(
+                            [str(binaries / "rusty-brain-hooks"), "--agent", "omp"],
+                            input=json.dumps(dict(event, session_id="legacy-diagnostic",
+                                                  cwd=str(project))),
+                            env=environment, cwd=project, capture_output=True,
+                            text=True, timeout=60,
+                        )
+                        self.assertEqual(legacy.returncode, 0, legacy.stderr)
+                    self.assertNotIn("serialized migrations",
+                                     json.loads(legacy.stdout).get("message", ""))
+                    def capture(query, expected, destination):
+                        directory = root / destination
+                        script = prefix + "\n" + "\n".join((
+                            f"BIN_DIR={shlex.quote(str(binaries))}",
+                            "capture_memory_diagnostics "
+                            + " ".join(map(shlex.quote, (
+                                str(home), str(project), query, str(directory),
+                                str(directory / "planted.jsonl"),
+                            ))),
+                            "finalize_memory_diagnostics "
+                            + " ".join(map(shlex.quote, (
+                                str(directory), "1", "na", "receipt_missing",
+                                expected, "",
+                            ))),
+                        ))
+                        result = subprocess.run(
+                            ["bash", "-s", str(SCRIPTS / "memory-scorecard.sh")],
+                            input=script, env=environment, cwd=project,
+                            capture_output=True, text=True, timeout=60,
+                        )
+                        self.assertEqual(result.returncode, 0, result.stderr)
+                        outcome = json.loads((directory / "outcome.json").read_text())
+                        self.assertEqual(outcome["diagnostic_probe_scope"],
+                                         "hook_preparation_only")
+                        self.assertIsNone(outcome["injected_stale_evidence"])
+                        self.assertEqual(outcome["injection_evidence_reason"],
+                                         "receipt_missing")
+                        return directory, outcome
+
+                    directory, outcome = capture(stable, "serialized migrations", "stable")
+                    archived = json.loads((directory / "recall-archived.json").read_text())
+                    self.assertEqual(archived, {"abstained": "no_candidates", "results": []})
+                    message = json.loads(
+                        (directory / "prompt-time-injection.json").read_text()
+                    )["message"]
+                    self.assertIn("# Rusty Brain — Stable project context", message)
+                    self.assertNotIn("# Rusty Brain — Memories relevant to this prompt", message)
+                    self.assertIn("serialized migrations", message)
+                    self.assertTrue(outcome["session_start_answer_present"])
+                    self.assertFalse(outcome["prompt_recall_answer_present"])
+                    self.assertFalse(outcome["query_only_answer_evidence"])
+
+                    dynamic = "Observation: cobalt telemetry dashboards show callback latency."
+                    cli("remember", dynamic, "--type", "insight", "--importance", "8")
+                    directory, outcome = capture(dynamic, "cobalt telemetry", "dynamic")
+                    message = json.loads(
+                        (directory / "prompt-time-injection.json").read_text()
+                    )["message"]
+                    self.assertIn("# Rusty Brain — Stable project context", message)
+                    self.assertIn("# Rusty Brain — Memories relevant to this prompt", message)
+                    self.assertFalse(outcome["session_start_answer_present"])
+                    self.assertTrue(outcome["prompt_recall_answer_present"])
+                    self.assertTrue(outcome["query_only_answer_evidence"])
+                finally:
+                    if daemon.poll() is None:
+                        daemon.terminate()
+                    try:
+                        daemon.wait(timeout=10)
+                    except subprocess.TimeoutExpired:
+                        daemon.kill()
+                        daemon.wait()
+
 
 
 class ControlsTest(unittest.TestCase):

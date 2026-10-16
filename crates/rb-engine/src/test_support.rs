@@ -24,6 +24,9 @@ pub(crate) struct MockBackend {
     update_vector_calls: std::sync::atomic::AtomicUsize,
     fail_update_vector: std::sync::atomic::AtomicBool,
     fail_contradicts: std::sync::atomic::AtomicBool,
+    fail_snapshot: std::sync::atomic::AtomicBool,
+    changing_snapshot: std::sync::atomic::AtomicBool,
+    snapshot_reads: std::sync::atomic::AtomicU64,
 }
 
 impl MockBackend {
@@ -88,6 +91,14 @@ impl MockBackend {
     pub fn set_fail_contradicts(&self, fail: bool) {
         self.fail_contradicts
             .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn set_fail_snapshot(&self, fail: bool) {
+        self.fail_snapshot
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+    pub fn set_changing_snapshot(&self, changing: bool) {
+        self.changing_snapshot
+            .store(changing, std::sync::atomic::Ordering::SeqCst);
     }
     /// Record a directed contradicts link on the source note (test helper).
     pub fn link_contradicts(&self, source: &MemoryId, target: &MemoryId) {
@@ -265,7 +276,16 @@ impl MemoryBackend for MockBackend {
             let contested = self.active_contradicts(ns, ids).await?;
             v.retain(|n| contested.contains(&n.id) == want);
         }
-        v.sort_by_key(|n| std::cmp::Reverse(n.created_at));
+        v.sort_by(|a, b| {
+            let importance = if filter.recall_eligible {
+                b.importance.cmp(&a.importance)
+            } else {
+                std::cmp::Ordering::Equal
+            };
+            importance
+                .then_with(|| b.created_at.cmp(&a.created_at))
+                .then_with(|| a.id.as_uuid().cmp(&b.id.as_uuid()))
+        });
         v.truncate(limit);
         Ok(v)
     }
@@ -507,6 +527,18 @@ impl MemoryBackend for MockBackend {
         &self,
         ns: Namespace,
     ) -> rb_types::Result<Option<rb_types::CorpusSnapshot>> {
+        if self.fail_snapshot.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(rb_types::Error::Storage("snapshot unavailable".into()));
+        }
+        let bump = if self
+            .changing_snapshot
+            .load(std::sync::atomic::Ordering::SeqCst)
+        {
+            self.snapshot_reads
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        } else {
+            0
+        };
         // Same derivation shape as the store: row count, a monotonically
         // increasing generation (insert count here — the mock has no rowid),
         // and the newest write timestamp.
@@ -521,7 +553,7 @@ impl MemoryBackend for MockBackend {
         if notes.is_empty() {
             return Ok(Some(rb_types::CorpusSnapshot {
                 memories: 0,
-                generation: 0,
+                generation: bump,
                 last_write_epoch_s: 0,
             }));
         }
@@ -532,7 +564,7 @@ impl MemoryBackend for MockBackend {
             .unwrap_or(0);
         Ok(Some(rb_types::CorpusSnapshot {
             memories: notes.len() as u64,
-            generation: notes.len() as u64,
+            generation: notes.len() as u64 + bump,
             last_write_epoch_s: last_write,
         }))
     }

@@ -1,17 +1,15 @@
 use rb_types::{
     FeedbackKind, JobKind, LinkType, MemoryChanged, MemoryId, MemoryNote, MemoryType,
-    MemoryUpdates, Namespace, RecallFilter, SearchResult,
+    MemoryUpdates, Namespace, ProjectContext, RecallFilter, SearchResult,
 };
 use serde::{Deserialize, Serialize};
 
 /// Wire contract version carried in the handshake. Clients and the daemon must
 /// agree on this exact value; mismatch is rejected at connect time.
 ///
-/// v2 (P5 Feature C): result rows (recall/list/context) and the `get` payload
-/// carry an additive `MemoryNote.contested` boolean. The field is
-/// `#[serde(default)]`, so a v1 payload without it deserializes to `false` — but
-/// the version bump lets clients detect (and rely on) the richer shape.
-pub const CONTRACT_VERSION: u32 = 2;
+/// v3 replaces the recent/important/total context payload with stable navigation
+/// entries and their corpus/repository snapshot.
+pub const CONTRACT_VERSION: u32 = 3;
 
 /// First frame the client sends after connecting.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -490,9 +488,7 @@ pub enum Response {
     Updated,
     Deleted,
     ContextResult {
-        recent: Vec<MemoryNote>,
-        important: Vec<MemoryNote>,
-        total: usize,
+        context: ProjectContext,
     },
     Pong {
         contract_version: u32,
@@ -632,9 +628,32 @@ mod tests {
     }
 
     #[test]
-    fn contract_version_is_two() {
-        // Bumped to 2 for the additive `contested` field (P5 Feature C).
-        assert_eq!(CONTRACT_VERSION, 2);
+    fn contract_version_is_three() {
+        assert_eq!(CONTRACT_VERSION, 3);
+    }
+
+    #[test]
+    fn context_round_trip_preserves_full_handle_and_staleness() {
+        let memory = note();
+        let id = memory.id.to_string();
+        let response = Response::ContextResult {
+            context: ProjectContext {
+                stable: vec![rb_types::ContextEntry::from_memory(memory, true, None)],
+                snapshot: None,
+                repo_state: None,
+            },
+        };
+        let json = serde_json::to_string(&response).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["context"]["stable"][0]["id"], id);
+        assert_eq!(value["context"]["stable"][0]["stale"], true);
+        assert!(value.get("recent").is_none());
+        let back: Response = serde_json::from_str(&json).unwrap();
+        let Response::ContextResult { context } = back else {
+            panic!("expected context")
+        };
+        assert_eq!(context.stable[0].id.to_string(), id);
+        assert!(context.stable[0].stale);
     }
 
     #[test]
@@ -1172,9 +1191,11 @@ mod tests {
             Response::Updated,
             Response::Deleted,
             Response::ContextResult {
-                recent: vec![note()],
-                important: vec![note()],
-                total: 2,
+                context: ProjectContext {
+                    stable: vec![rb_types::ContextEntry::from_memory(note(), true, None)],
+                    snapshot: None,
+                    repo_state: None,
+                },
             },
             Response::Pong {
                 contract_version: CONTRACT_VERSION,
@@ -1355,13 +1376,13 @@ mod tests {
     fn pong_without_recall_channels_field_decodes_to_none() {
         // Wire compat: a pre-W1.0 Pong (no recall_channels key) must decode.
         let back: Response =
-            serde_json::from_str(r#"{"result":"Pong","contract_version":2}"#).unwrap();
+            serde_json::from_str(r#"{"result":"Pong","contract_version":3}"#).unwrap();
         match back {
             Response::Pong {
                 contract_version,
                 recall_channels,
             } => {
-                assert_eq!(contract_version, 2);
+                assert_eq!(contract_version, CONTRACT_VERSION);
                 assert!(recall_channels.is_none());
             }
             other => panic!("expected Pong, got {other:?}"),

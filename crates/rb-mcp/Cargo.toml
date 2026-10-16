@@ -14,17 +14,14 @@ path = "src/lib.rs"
 [dependencies]
 rb-types = { path = "../rb-types" }
 rb-proto = { path = "../rb-proto" }
+rb-tokens = { path = "../rb-tokens" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 tracing = { workspace = true }
-# W3.3: relative-age rendering in the compact recall/list/context projection.
+# W3.3: relative-age rendering in compact recall/list projections.
 chrono = { workspace = true }
-
-[dev-dependencies]
-# W3.3 token-accounting test: faithful BPE counts for tools/list + instructions.
-rb-tokens = { path = "../rb-tokens" }
 
 [lints]
 workspace = true

@@ -13,6 +13,23 @@ struct VecBackend {
 
 #[async_trait::async_trait]
 impl MemoryBackend for VecBackend {
+    async fn corpus_snapshot(
+        &self,
+        ns: Namespace,
+    ) -> rb_types::Result<Option<rb_types::CorpusSnapshot>> {
+        // This static fixture only inserts active rows before context reads.
+        let scoped = self.list(ns, RecallFilter::default(), usize::MAX).await?;
+        Ok(Some(rb_types::CorpusSnapshot {
+            memories: scoped.len() as u64,
+            generation: scoped.len() as u64,
+            last_write_epoch_s: scoped
+                .iter()
+                .map(|note| note.updated_at.timestamp())
+                .max()
+                .unwrap_or(0),
+        }))
+    }
+
     async fn write(&self, note: MemoryNote, _embedding: Option<Vec<f32>>) -> rb_types::Result<()> {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
         Ok(())
@@ -306,9 +323,10 @@ async fn full_flow_through_public_api() {
     assert_eq!(results.len(), 1);
     assert_eq!(results[0].memory.id, id);
 
-    // context surfaces it as both recent and important (importance 9 >= 8).
-    let (recent, important, total) = engine.context().await.unwrap();
-    assert_eq!(total, 1);
-    assert_eq!(recent.len(), 1);
-    assert_eq!(important.len(), 1);
+    // Context exposes the eligible decision once, with its full handle.
+    let context = engine.context().await.unwrap();
+    assert_eq!(context.stable.len(), 1);
+    assert_eq!(context.stable[0].id, id);
+    assert!(!context.stable[0].stale);
+    assert_eq!(context.snapshot.unwrap().memories, 1);
 }

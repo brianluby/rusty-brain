@@ -46,8 +46,8 @@ pub use memory_id::MemoryId;
 pub use memory_type::MemoryType;
 pub use namespace::Namespace;
 pub use query::{
-    AnchorFilter, AnchorKind, ChannelHits, MemoryState, MemoryUpdates, RecallFilter, SearchQuery,
-    SearchResult,
+    AnchorFilter, AnchorKind, ChannelHits, ContextEntry, MemoryState, MemoryUpdates,
+    ProjectContext, RecallFilter, SearchQuery, SearchResult,
 };
 pub use retention::{
     ForgetCandidate, ForgetMode, ForgetOutcome, ForgetPlan, ForgetRule, RetentionPolicy,

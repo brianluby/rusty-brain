@@ -24,6 +24,31 @@ You can run the deterministic checks before tagging:
 scripts/release-preflight.sh --tag vX.Y.Z --commit HEAD --main-ref origin/main
 ```
 
+## Check a local packaged artifact
+
+The tarball must contain one top-level directory with executable
+`rusty-brain`, `rusty-brain-hooks` and `rusty-brain-install` binaries for the
+machine running the check:
+
+```bash
+scripts/verify-fresh-install.sh --tarball dist/rusty-brain-VERSION-TARGET.tar.gz
+bash scripts/verify-fresh-install.test.sh --tarball dist/rusty-brain-VERSION-TARGET.tar.gz
+```
+
+Relative paths resolve against the invoking directory; absolute paths and spaces
+are supported. An adjacent `SHA256SUMS` verifies the private copy that is unpacked,
+not a mutable original. Without that file, local mode explicitly skips checksums;
+this is not release-integrity evidence. Tagged downloads still require checksums.
+
+The regression harness exercises real packaged executables: valid paths,
+missing/unreadable inputs, bad checksums, source replacement after verification,
+and a damaged hook failing after daemon auto-start. A failed checklist stops its
+owned daemon and retains diagnostics; a failed harness also retains its fixtures.
+Successful runs remove disposable HOME/config/store/socket data.
+
+Run on the native target. One ARM macOS pass does not certify Intel macOS or
+Linux; the release workflow still requires all three native jobs before publish.
+
 ## Failure and rollback
 
 The build matrix uses `fail-fast: false`, so a partial failure preserves the

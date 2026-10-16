@@ -31,6 +31,7 @@ rb-tokens = { path = "../rb-tokens" }
 [dev-dependencies]
 # Dev-only: the path-agreement tests pin hooks-resolution == daemon-resolution.
 rb-daemon = { path = "../rb-daemon" }
+rb-embed = { path = "../rb-embed" }
 tokio = { workspace = true }
 tokio-util = { workspace = true }
 tempfile = { workspace = true }

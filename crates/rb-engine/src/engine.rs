@@ -841,7 +841,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let mut results: Vec<rb_types::SearchResult> = Vec::new();
         // One repo-state read per recall (Vikunja #63): implementations may
         // shell out to git; never per-result.
-        let repo_snapshot = self.repo_state.as_ref().and_then(|p| p.snapshot());
+        let repo_snapshot = self.current_repo_snapshot().await;
         let repo_snapshot = repo_snapshot.as_ref();
         for (id, score) in ranked {
             let Some(note) = notes.get(&id) else {
@@ -1302,50 +1302,73 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         self.backend.archive(self.namespace.clone(), id).await
     }
 
-    /// Project context payload: recent memories (by recency) plus important ones
-    /// (importance >= 8), with a total count of the recent window.
-    ///
-    /// Vikunja #69 quarantine: this projection feeds the SessionStart digest
-    /// injection channel, so untrusted-origin rows (stamped HTTP channel) are
-    /// EXCLUDED here too — recall parity, never silently injected. The total
-    /// still counts the pre-filter window; list/get stay visible with the
-    /// marker.
-    pub async fn context(&self) -> rb_types::Result<(Vec<MemoryNote>, Vec<MemoryNote>, usize)> {
-        const CONTEXT_LIMIT: usize = 50;
-        const IMPORTANT_FLOOR: u8 = 8;
-        // The confidence floor goes into the query so exhausted rows cannot
-        // fill a window ahead of eligible older ones.
-        let eligible = Some(rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE);
-        let mut recent = self
-            .backend
-            .list(
-                self.namespace.clone(),
-                rb_types::RecallFilter {
-                    min_confidence: eligible,
-                    ..Default::default()
-                },
-                CONTEXT_LIMIT,
-            )
-            .await?;
-        let mut important = self
-            .backend
-            .list(
-                self.namespace.clone(),
-                rb_types::RecallFilter {
-                    min_importance: Some(IMPORTANT_FLOOR),
-                    min_confidence: eligible,
-                    ..Default::default()
-                },
-                CONTEXT_LIMIT,
-            )
-            .await?;
-        let total = recent.len();
-        recent.retain(|n| !n.is_quarantined());
-        important.retain(|n| !n.is_quarantined());
-        // Annotate contested on both context halves (Feature C, fail-open).
-        self.annotate_contested(&mut recent).await;
-        self.annotate_contested(&mut important).await;
-        Ok((recent, important, total))
+    /// Read bounded repository state off the async runtime; persistent clients
+    /// must not keep the repository state from their initial handshake.
+    async fn current_repo_snapshot(&self) -> Option<rb_types::RepoSnapshot> {
+        let provider = self.repo_state.as_ref()?.clone();
+        tokio::task::spawn_blocking(move || provider.snapshot())
+            .await
+            .ok()
+            .flatten()
+    }
+
+    /// Current eligible decisions, constraints and preferences, never activity.
+    /// Validate both generation and repository state around every constituent
+    /// read; an observed fingerprint after a read alone is not consistency.
+    pub async fn context(&self) -> rb_types::Result<rb_types::ProjectContext> {
+        for _ in 0..3 {
+            let before = self
+                .backend
+                .corpus_snapshot(self.namespace.clone())
+                .await?
+                .ok_or_else(|| rb_types::Error::Storage("context freshness unavailable".into()))?;
+            let repo_before = self.current_repo_snapshot().await;
+            let mut memories = self
+                .backend
+                .list(
+                    self.namespace.clone(),
+                    rb_types::RecallFilter {
+                        types: vec![
+                            rb_types::MemoryType::Constraint,
+                            rb_types::MemoryType::ArchitectureDecision,
+                            rb_types::MemoryType::Preference,
+                        ],
+                        recall_eligible: true,
+                        ..Default::default()
+                    },
+                    50,
+                )
+                .await?;
+            let ids = memories.iter().map(|m| m.id.clone()).collect();
+            // Context must not silently lose a dispute warning on lookup error.
+            let contested = self
+                .backend
+                .active_contradicts(self.namespace.clone(), ids)
+                .await?;
+            for memory in &mut memories {
+                memory.contested = contested.contains(&memory.id);
+            }
+            let repo_after = self.current_repo_snapshot().await;
+            let after = self.backend.corpus_snapshot(self.namespace.clone()).await?;
+            if after != Some(before) || repo_before != repo_after {
+                continue;
+            }
+            return Ok(rb_types::ProjectContext {
+                stable: memories
+                    .into_iter()
+                    .map(|memory| {
+                        let stale =
+                            rb_types::evaluate_staleness(&memory.anchors, repo_after.as_ref());
+                        rb_types::ContextEntry::from_memory(memory, stale, repo_after.as_ref())
+                    })
+                    .collect(),
+                snapshot: Some(before),
+                repo_state: repo_after,
+            });
+        }
+        Err(rb_types::Error::StalePlan(
+            "project context changed while reading; refresh again".into(),
+        ))
     }
 }
 
@@ -3358,11 +3381,11 @@ mod tests {
         let kept = note(
             ns.clone(),
             "floor probe content",
-            MemoryType::Insight,
+            MemoryType::Constraint,
             9,
             &[],
         );
-        let mut exhausted = note(ns, "floor probe content", MemoryType::Insight, 9, &[]);
+        let mut exhausted = note(ns, "floor probe content", MemoryType::Constraint, 9, &[]);
         // Two `wrong` verdicts on a 0.7 hook capture land here (f32 arithmetic).
         exhausted.confidence = 0.7 - 0.3 - 0.3;
         let (kept_id, exhausted_id) = (kept.id.clone(), exhausted.id.clone());
@@ -3383,12 +3406,9 @@ mod tests {
             "floor row must never be recalled"
         );
 
-        let (recent, important, _) = eng.context().await.unwrap();
-        assert!(recent
-            .iter()
-            .chain(&important)
-            .all(|n| n.id != exhausted_id));
-        assert!(recent.iter().any(|n| n.id == kept_id));
+        let context = eng.context().await.unwrap();
+        assert!(context.stable.iter().all(|entry| entry.id != exhausted_id));
+        assert!(context.stable.iter().any(|entry| entry.id == kept_id));
     }
 
     #[tokio::test]
@@ -3956,16 +3976,192 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn context_splits_recent_and_important() {
+    async fn context_selects_stable_types_before_cutoff_with_deterministic_ties() {
+        use std::str::FromStr as _;
         let eng = engine();
-        seed(&eng, "low importance recent", MemoryType::Insight, 2, &[]).await;
-        seed(&eng, "high importance note", MemoryType::Insight, 9, &[]).await;
-        let (recent, important, total) = eng.context().await.unwrap();
-        // recent includes both; important only the >= 8 one.
-        assert_eq!(recent.len(), 2);
-        assert_eq!(important.len(), 1);
-        assert_eq!(important[0].importance, 9);
-        assert_eq!(total, 2);
+        let timestamp = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+            .unwrap()
+            .to_utc();
+        let mut preference = note(
+            Namespace::Project("rb".into()),
+            "old stable preference",
+            MemoryType::Preference,
+            2,
+            &[],
+        );
+        preference.created_at = timestamp - chrono::Duration::days(1);
+        let preference_id = preference.id.clone();
+        eng.backend().insert_note(preference);
+        for i in 0..60 {
+            let mut activity = note(
+                Namespace::Project("rb".into()),
+                "new activity",
+                MemoryType::Insight,
+                9,
+                &[],
+            );
+            activity.created_at = timestamp;
+            eng.backend().insert_note(activity);
+            let mut quarantine = note(
+                Namespace::Project("rb".into()),
+                "quarantined constraint",
+                MemoryType::Constraint,
+                9,
+                &[],
+            );
+            quarantine.origin_channel = Some(rb_types::WriteChannel::Http);
+            quarantine.created_at = timestamp;
+            eng.backend().insert_note(quarantine);
+            let mut stable = note(
+                Namespace::Project("rb".into()),
+                &format!("decision {i}"),
+                MemoryType::ArchitectureDecision,
+                8,
+                &[],
+            );
+            stable.created_at = timestamp;
+            stable.id = MemoryId::from_str(&format!("00000000-0000-4000-8000-{i:012}")).unwrap();
+            eng.backend().insert_note(stable);
+        }
+        let context = eng.context().await.unwrap();
+        assert_eq!(context.stable.len(), 50);
+        let ids: Vec<_> = context
+            .stable
+            .iter()
+            .map(|entry| entry.id.as_uuid())
+            .collect();
+        assert!(ids.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(context
+            .stable
+            .iter()
+            .all(|entry| entry.memory_type == MemoryType::ArchitectureDecision));
+        // Raising the older preference proves eligibility, not recency of activity,
+        // controls membership; an unchanged corpus repeats the identical ordering.
+        let mut preference = eng.backend().note_of(&preference_id).unwrap();
+        preference.importance = 9;
+        eng.backend().insert_note(preference);
+        let next = eng.context().await.unwrap();
+        assert_eq!(next.stable[0].id, preference_id);
+        let again = eng.context().await.unwrap();
+        assert_eq!(next.snapshot, again.snapshot);
+        assert_eq!(
+            next.stable
+                .iter()
+                .map(|entry| &entry.id)
+                .collect::<Vec<_>>(),
+            again
+                .stable
+                .iter()
+                .map(|entry| &entry.id)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[tokio::test]
+    async fn context_invalidates_commit_currentness_when_repository_evidence_is_lost() {
+        struct SwitchableRepo(AtomicUsize);
+        impl crate::RepoStateProvider for SwitchableRepo {
+            fn snapshot(&self) -> Option<rb_types::RepoSnapshot> {
+                match self.0.load(Ordering::SeqCst) {
+                    0 => Some(rb_types::RepoSnapshot::at("aaaaaaaa")),
+                    1 => None,
+                    _ => Some(rb_types::RepoSnapshot {
+                        head: None,
+                        clean_worktree: true,
+                    }),
+                }
+            }
+        }
+        let repo = Arc::new(SwitchableRepo(AtomicUsize::new(0)));
+        let eng = engine().with_repo_state_provider(repo.clone());
+        let mut bound = note(
+            Namespace::Project("rb".into()),
+            "use transactions",
+            MemoryType::Constraint,
+            9,
+            &[],
+        );
+        bound
+            .anchors
+            .push(rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "aaaaaaaa").unwrap());
+        let bound_id = bound.id.clone();
+        eng.backend().insert_note(bound);
+        let unbound = note(
+            Namespace::Project("rb".into()),
+            "prefer concise output",
+            MemoryType::Preference,
+            8,
+            &[],
+        );
+        let unbound_id = unbound.id.clone();
+        eng.backend().insert_note(unbound);
+        let known = eng.context().await.unwrap();
+        repo.0.store(1, Ordering::SeqCst);
+        let unknown = eng.context().await.unwrap();
+        repo.0.store(2, Ordering::SeqCst);
+        let unresolved = eng.context().await.unwrap();
+        repo.0.store(0, Ordering::SeqCst);
+        let recovered = eng.context().await.unwrap();
+        let entry = |context: &rb_types::ProjectContext, id: &MemoryId| {
+            context
+                .stable
+                .iter()
+                .find(|entry| &entry.id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_ne!(
+            entry(&known, &bound_id).fingerprint,
+            entry(&unknown, &bound_id).fingerprint
+        );
+        assert_eq!(entry(&unknown, &bound_id), entry(&unresolved, &bound_id));
+        assert_eq!(entry(&known, &bound_id), entry(&recovered, &bound_id));
+        assert_eq!(entry(&known, &unbound_id), entry(&unknown, &unbound_id));
+        assert!(known
+            .stable
+            .iter()
+            .chain(&unknown.stable)
+            .all(|entry| !entry.stale));
+    }
+
+    #[tokio::test]
+    async fn context_fails_closed_on_lost_dispute_state_and_changing_repository() {
+        struct MovingRepo(std::sync::atomic::AtomicUsize);
+        impl crate::RepoStateProvider for MovingRepo {
+            fn snapshot(&self) -> Option<rb_types::RepoSnapshot> {
+                Some(rb_types::RepoSnapshot::at(&format!(
+                    "{}",
+                    self.0.fetch_add(1, Ordering::SeqCst)
+                )))
+            }
+        }
+        let eng = engine();
+        seed(
+            &eng,
+            "standing decision",
+            MemoryType::ArchitectureDecision,
+            8,
+            &[],
+        )
+        .await;
+        eng.backend().set_fail_contradicts(true);
+        assert!(eng.context().await.is_err());
+        eng.backend().set_fail_contradicts(false);
+        eng.backend().set_fail_snapshot(true);
+        assert!(eng.context().await.is_err());
+        eng.backend().set_fail_snapshot(false);
+        eng.backend().set_changing_snapshot(true);
+        assert!(matches!(
+            eng.context().await,
+            Err(rb_types::Error::StalePlan(_))
+        ));
+        eng.backend().set_changing_snapshot(false);
+        let eng = eng
+            .with_repo_state_provider(Arc::new(MovingRepo(std::sync::atomic::AtomicUsize::new(0))));
+        assert!(matches!(
+            eng.context().await,
+            Err(rb_types::Error::StalePlan(_))
+        ));
     }
 
     use crate::test_support::{FailingEnricher, FixedEnricher};
@@ -4255,12 +4451,9 @@ mod tests {
         assert!(!results.is_empty(), "trusted rows still recall");
 
         // The context projection (SessionStart digest feed) excludes it too.
-        let (recent, important, _total) = eng.context().await.unwrap();
+        let context = eng.context().await.unwrap();
         assert!(
-            recent
-                .iter()
-                .chain(important.iter())
-                .all(|n| n.id != poisoned[0]),
+            context.stable.iter().all(|entry| entry.id != poisoned[0]),
             "quarantined row must never reach the digest feed"
         );
 

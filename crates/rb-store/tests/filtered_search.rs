@@ -70,3 +70,72 @@ fn filtered_vector_empty_sets_and_invalid_dimensions_are_not_silent_fallbacks() 
         .unwrap()
         .is_empty());
 }
+
+#[test]
+fn context_eligibility_and_uuid_ties_resolve_before_the_sql_cutoff() {
+    let store = SqliteStore::open_in_memory(2).unwrap();
+    let ns = Namespace::Project("stable-context".into());
+    let time = chrono::DateTime::parse_from_rfc3339("2025-01-01T00:00:00Z")
+        .unwrap()
+        .to_utc();
+    let mut expected = Vec::new();
+    for i in (0..60).rev() {
+        let mut decision = MemoryNote::new(
+            ns.clone(),
+            format!("decision {i}"),
+            MemoryType::ArchitectureDecision,
+            8,
+        );
+        decision.id = format!("00000000-0000-4000-8000-{i:012}").parse().unwrap();
+        decision.created_at = time;
+        if i == 0 {
+            decision.confidence = rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE;
+        }
+        if i < 50 {
+            expected.push(decision.id.clone());
+        }
+        store.insert_memory(&decision, None).unwrap();
+        let mut activity =
+            MemoryNote::new(ns.clone(), format!("activity {i}"), MemoryType::Insight, 9);
+        activity.created_at = time + chrono::Duration::days(1);
+        store.insert_memory(&activity, None).unwrap();
+        let mut poisoned =
+            MemoryNote::new(ns.clone(), format!("poison {i}"), MemoryType::Constraint, 9);
+        poisoned.origin_channel = Some(WriteChannel::Http);
+        poisoned.created_at = activity.created_at;
+        store.insert_memory(&poisoned, None).unwrap();
+    }
+    let mut exhausted = MemoryNote::new(
+        ns.clone(),
+        "confidence exhausted".into(),
+        MemoryType::Constraint,
+        10,
+    );
+    exhausted.confidence = 0.0;
+    let exhausted_id = exhausted.id.clone();
+    store.insert_memory(&exhausted, None).unwrap();
+    let filter = RecallFilter {
+        types: vec![
+            MemoryType::Constraint,
+            MemoryType::ArchitectureDecision,
+            MemoryType::Preference,
+        ],
+        recall_eligible: true,
+        ..Default::default()
+    };
+    expected.reverse();
+    let selected = store.list_filtered(&ns, &filter, 50).unwrap();
+    assert_eq!(
+        selected
+            .iter()
+            .map(|note| note.id.clone())
+            .collect::<Vec<_>>(),
+        expected
+    );
+    assert_eq!(store.list_filtered(&ns, &filter, 50).unwrap(), selected);
+    let audit = store
+        .list_filtered(&ns, &RecallFilter::default(), 200)
+        .unwrap();
+    assert!(audit.iter().any(MemoryNote::is_quarantined));
+    assert!(audit.iter().any(|note| note.id == exhausted_id));
+}

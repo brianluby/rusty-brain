@@ -264,6 +264,23 @@ the marker for new rows; restoring duplicate content never overwrites an existin
 row's curation choice. Protection is not authorization, verified truth or a recall
 eligibility/ranking boost. Upgrade and restart the daemon to enforce it.
 
+For explicit how-to records, use the existing `bug_fix`/`code_pattern` types and
+the [qualified procedural-memory format](docs/AGENTS.md#explicit-procedural-memories).
+Failed attempts and untested proposals remain qualified advice, not validated
+repairs or authorization to run their steps.
+
+`context` is compact navigation for current eligible decisions, constraints and
+preferences, not a recent-activity feed or complete policy. Previews carry full
+UUIDs and deliberately incomplete subjects; use `get`/`history` in the same
+namespace for exact stored qualifications and source handles. Context text omits
+access counters and relative ages; deterministic bytes do not guarantee provider
+prompt caching. CLI `context --json` and MCP structured context return
+`{ stable, snapshot, repo_state }`, without full memory bodies.
+
+This is a breaking wire **v3** cutover. Upgrade CLI, daemon, MCP and hook binaries
+together, restart the daemon, and reinstall the owned OMP extension. Older wire
+versions are rejected rather than silently translated.
+
 Initial CLI/MCP daemon connection attempts share one socket/handshake deadline:
 five seconds normally, or 120 seconds when resolved configuration requests a local
 backend/model. All attempts and backoff within one MCP reconnect share that budget;

@@ -2467,6 +2467,11 @@ fn writer_loop(
 
 #[async_trait]
 impl MemoryBackend for StoreHandle {
+    async fn corpus_snapshot(&self, ns: Namespace) -> Result<Option<rb_types::CorpusSnapshot>> {
+        self.with_read(move |store| store.corpus_snapshot(&ns).map(Some))
+            .await
+    }
+
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> Result<()> {
         let (reply, rx) = oneshot::channel();
         let cmd = WriteCommand::Insert {

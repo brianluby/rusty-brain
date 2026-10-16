@@ -2610,6 +2610,7 @@ dependencies = [
  "rb-daemon",
  "rb-embed",
  "rb-proto",
+ "rb-tokens",
  "rb-types",
  "serde",
  "serde_json",
@@ -2760,6 +2761,7 @@ dependencies = [
  "rb-agents",
  "rb-config",
  "rb-daemon",
+ "rb-embed",
  "rb-proto",
  "rb-redact",
  "rb-tokens",
@@ -2862,6 +2864,8 @@ dependencies = [
 name = "rb-tokens"
 version = "0.0.1"
 dependencies = [
+ "rb-types",
+ "serde",
  "tiktoken-rs",
 ]
 
@@ -3092,6 +3096,7 @@ dependencies = [
  "rb-proto",
  "rb-redact",
  "rb-store",
+ "rb-tokens",
  "rb-types",
  "serde",
  "serde_json",

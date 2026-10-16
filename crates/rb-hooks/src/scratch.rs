@@ -86,6 +86,13 @@ pub struct ScratchData {
     pub facts: Vec<CapturedFact>,
     #[serde(default)]
     pub outcomes: Vec<String>,
+    /// At most ten prepared context handles/fingerprints; survives capture folds.
+    #[serde(default)]
+    pub context_delivery: rb_tokens::context::ContextDelivery,
+    #[serde(default)]
+    pub context_known: bool,
+    #[serde(default)]
+    pub context_currentness_unknown: bool,
 }
 
 impl ScratchData {
@@ -204,9 +211,13 @@ impl Scratch {
     /// resumed session supersedes this summary instead of duplicating it. A
     /// `None` summary id (the fold produced no memory) still clears the buffer.
     pub fn mark_folded(&self, summary_id: Option<&str>) {
+        let prior = self.read();
         let data = ScratchData {
             prior_summary_id: summary_id.map(str::to_string),
-            facts: self.read().facts,
+            facts: prior.facts,
+            context_delivery: prior.context_delivery,
+            context_known: prior.context_known,
+            context_currentness_unknown: prior.context_currentness_unknown,
             ..Default::default()
         };
         self.write(&data);
@@ -248,6 +259,24 @@ impl Scratch {
             .find(|fact| fact.memory_id == memory_id)
         {
             fact.retired = true;
+            self.write(&data);
+        }
+    }
+
+    /// Preserve capture data while updating the bounded context preparation ledger.
+    pub fn record_context(&self, delivery: rb_tokens::context::ContextDelivery) {
+        let mut data = self.read();
+        data.context_delivery = delivery;
+        data.context_known = true;
+        data.context_currentness_unknown = false;
+        self.write(&data);
+    }
+
+    /// Missing/expired scratch cannot prove the currentness of retained host text.
+    pub fn mark_resumed(&self) {
+        let mut data = self.read();
+        if !data.context_known && data.context_delivery.entries.is_empty() {
+            data.context_currentness_unknown = true;
             self.write(&data);
         }
     }
@@ -335,7 +364,11 @@ fn truncate(value: &str) -> String {
 /// any error (no cache dir, unreadable entry) is ignored. Keyed on file mtime,
 /// so even a corrupt scratch is reclaimed.
 pub fn prune_stale() {
-    let Ok(entries) = std::fs::read_dir(cache::cache_dir()) else {
+    prune_stale_in(&cache::cache_dir());
+}
+
+pub(crate) fn prune_stale_in(directory: &std::path::Path) {
+    let Ok(entries) = std::fs::read_dir(directory) else {
         return;
     };
     let now = SystemTime::now();
@@ -377,6 +410,26 @@ mod tests {
         assert!(data.is_empty());
         assert!(data.files.is_empty() && data.commands.is_empty() && data.failures.is_empty());
         assert_eq!(data.prior_summary_id, None);
+    }
+
+    #[test]
+    fn context_delivery_survives_capture_folds_without_cross_session_state() {
+        let (dir, first) = scratch();
+        let second = Scratch::at(dir.path().join("another-session.json"));
+        let delivery = rb_tokens::context::ContextDelivery {
+            entries: vec![(rb_types::MemoryId::new(), 42)],
+        };
+        first.append(Kind::Command, "cargo check");
+        first.record_context(delivery.clone());
+        assert_eq!(first.read().commands, vec!["cargo check"]);
+        assert!(second.read().context_delivery.entries.is_empty());
+        first.mark_folded(Some("summary-id"));
+        let folded = first.read();
+        assert!(folded.is_empty());
+        assert_eq!(folded.prior_summary_id.as_deref(), Some("summary-id"));
+        assert_eq!(folded.context_delivery, delivery);
+        first.mark_checkpointed("next-summary");
+        assert_eq!(first.read().context_delivery, delivery);
     }
 
     #[test]
