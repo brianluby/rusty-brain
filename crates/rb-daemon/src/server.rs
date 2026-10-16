@@ -2843,7 +2843,22 @@ mod tests {
 
         shutdown_tx.send(()).unwrap();
         serving.await.unwrap().unwrap();
-        assert!(crate::accept_model_change(&database, 4, "deterministic").unwrap());
+        // Aborted scheduler tasks may still retain storage until cancellation runs.
+        let accepted = tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            loop {
+                match crate::accept_model_change(&database, 4, "deterministic") {
+                    Ok(changed) => break Ok(changed),
+                    Err(err) if err.to_string().contains("already admitted") => {
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    Err(err) => break Err(err),
+                }
+            }
+        })
+        .await
+        .expect("storage admission must release after daemon teardown")
+        .unwrap();
+        assert!(accepted);
         let accepted = SqliteStore::open_with_model(&database, 4, "deterministic").unwrap();
         assert!(
             accepted

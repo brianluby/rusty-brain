@@ -54,6 +54,8 @@ All notable changes to rusty-brain are documented here. The format is based on
   These disposable hook probes do not establish host or provider delivery.
 - Exercise long-path capture through compact UUID handles and exact source
   drilldown instead of requiring source basenames inside truncated previews.
+- Bound the post-shutdown admission test's wait for asynchronous fixture teardown;
+  keep all live-daemon rejection and old-provider data-preservation assertions.
 
 ### Added — Trusted-memory tranche (kanban 78, 79, 94, 95)
 
