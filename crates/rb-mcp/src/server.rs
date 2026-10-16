@@ -140,7 +140,7 @@ async fn handle_tools_call(
 
     let response = proxy.call(request).await;
     let mut correction = None;
-    if name == "recall" && response.is_ok() {
+    if name == "recall" && matches!(&response, Ok(Response::Recalled { .. })) {
         if let Some(delivery) = delivery.as_mut() {
             correction = match proxy.call(Request::Context).await {
                 Ok(Response::ContextResult { context }) => delivery.correction(&context),
@@ -1250,6 +1250,41 @@ mod tests {
                 .contains(&memory.id.to_string()),
             "recovery must still qualify the preview prepared before the outage"
         );
+    }
+
+    #[tokio::test]
+    async fn daemon_rejected_recall_preserves_error_text_and_prior_currentness() {
+        let memory = note();
+        let error = json!({
+            "error": { "kind": "internal", "message": "recall fixture rejected" }
+        });
+        let mut proxy = scripted(vec![
+            Response::ContextResult {
+                context: project_context(vec![memory.clone()]),
+            },
+            Response::Error {
+                kind: "internal".into(),
+                message: "recall fixture rejected".into(),
+            },
+            Response::ContextResult {
+                context: project_context(Vec::new()),
+            },
+        ]);
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let result = tool(&mut server, &mut proxy, "recall", json!({ "query": "x" })).await;
+        assert_eq!(result["isError"], true);
+        assert_eq!(result["structuredContent"], error);
+        assert_eq!(
+            serde_json::from_str::<Value>(result["content"][0]["text"].as_str().unwrap()).unwrap(),
+            error,
+            "a rejected recall must retain its original JSON error text"
+        );
+        let refreshed = tool(&mut server, &mut proxy, "context", json!({})).await;
+        assert!(refreshed["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains(&memory.id.to_string()));
     }
 
     #[tokio::test]

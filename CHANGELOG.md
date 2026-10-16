@@ -43,8 +43,9 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Resolve local artifact paths before entering the sandbox; use native Darwin
   permission inspection, extract the exact checksum-verified private copy and
   terminate an owned fixture daemon even when verification fails early.
-- Return failed MCP recalls without starting another context request; preserve the
-  original error and qualify prior prepared context as unavailable until recovery.
+- Refresh MCP context only after a recalled result, never after a transport error
+  or daemon rejection. Preserve rejected-recall JSON errors unchanged; transport
+  failures qualify prior prepared context as unavailable until recovery.
 - Use explicitly framed SHA-256 evidence fingerprints rather than Rust's
   release-dependent default hasher. Existing preparation keys may cause one
   conservative correction after upgrade; the 64-bit key is not authentication.
