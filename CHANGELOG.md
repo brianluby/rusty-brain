@@ -49,6 +49,9 @@ All notable changes to rusty-brain are documented here. The format is based on
 - Use explicitly framed SHA-256 evidence fingerprints rather than Rust's
   release-dependent default hasher. Existing preparation keys may cause one
   conservative correction after upgrade; the 64-bit key is not authentication.
+- Include repository-state resolvability in commit-bound context fingerprints.
+  Losing or recovering Git evidence now corrects prior native/MCP preparation;
+  unknown currentness is not mislabeled stale and unbound entries are unchanged.
 - Isolate scorecard startup and first-prompt probes, count only dynamic recall as
   query evidence, and retain empty-recall abstention reasons during history capture.
   These disposable hook probes do not establish host or provider delivery.

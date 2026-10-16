@@ -340,7 +340,7 @@ mod tests {
                 Request::Delete { .. } => Response::Deleted,
                 Request::Context => Response::ContextResult {
                     context: rb_types::ProjectContext {
-                        stable: vec![rb_types::ContextEntry::from_memory(note(), false)],
+                        stable: vec![rb_types::ContextEntry::from_memory(note(), false, None)],
                         snapshot: None,
                         repo_state: None,
                     },
@@ -479,7 +479,7 @@ mod tests {
         rb_types::ProjectContext {
             stable: memories
                 .into_iter()
-                .map(|memory| rb_types::ContextEntry::from_memory(memory, false))
+                .map(|memory| rb_types::ContextEntry::from_memory(memory, false, None))
                 .collect(),
             snapshot: None,
             repo_state: None,

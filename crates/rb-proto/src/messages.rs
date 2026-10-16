@@ -638,7 +638,7 @@ mod tests {
         let id = memory.id.to_string();
         let response = Response::ContextResult {
             context: ProjectContext {
-                stable: vec![rb_types::ContextEntry::from_memory(memory, true)],
+                stable: vec![rb_types::ContextEntry::from_memory(memory, true, None)],
                 snapshot: None,
                 repo_state: None,
             },
@@ -1192,7 +1192,7 @@ mod tests {
             Response::Deleted,
             Response::ContextResult {
                 context: ProjectContext {
-                    stable: vec![rb_types::ContextEntry::from_memory(note(), true)],
+                    stable: vec![rb_types::ContextEntry::from_memory(note(), true, None)],
                     snapshot: None,
                     repo_state: None,
                 },

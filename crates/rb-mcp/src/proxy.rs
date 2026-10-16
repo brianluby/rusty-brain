@@ -1616,7 +1616,7 @@ mod tests {
         let ctx = response_to_content(
             Response::ContextResult {
                 context: ProjectContext {
-                    stable: vec![rb_types::ContextEntry::from_memory(note(), false)],
+                    stable: vec![rb_types::ContextEntry::from_memory(note(), false, None)],
                     snapshot: None,
                     repo_state: None,
                 },

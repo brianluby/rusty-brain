@@ -1193,7 +1193,7 @@ mod tests {
         let id = memory.id.to_string();
         let content = memory.content.clone();
         let context = rb_types::ProjectContext {
-            stable: vec![rb_types::ContextEntry::from_memory(memory, true)],
+            stable: vec![rb_types::ContextEntry::from_memory(memory, true, None)],
             snapshot: None,
             repo_state: None,
         };

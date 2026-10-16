@@ -1359,7 +1359,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                     .map(|memory| {
                         let stale =
                             rb_types::evaluate_staleness(&memory.anchors, repo_after.as_ref());
-                        rb_types::ContextEntry::from_memory(memory, stale)
+                        rb_types::ContextEntry::from_memory(memory, stale, repo_after.as_ref())
                     })
                     .collect(),
                 snapshot: Some(before),
@@ -4055,6 +4055,73 @@ mod tests {
                 .map(|entry| &entry.id)
                 .collect::<Vec<_>>()
         );
+    }
+
+    #[tokio::test]
+    async fn context_invalidates_commit_currentness_when_repository_evidence_is_lost() {
+        struct SwitchableRepo(AtomicUsize);
+        impl crate::RepoStateProvider for SwitchableRepo {
+            fn snapshot(&self) -> Option<rb_types::RepoSnapshot> {
+                match self.0.load(Ordering::SeqCst) {
+                    0 => Some(rb_types::RepoSnapshot::at("aaaaaaaa")),
+                    1 => None,
+                    _ => Some(rb_types::RepoSnapshot {
+                        head: None,
+                        clean_worktree: true,
+                    }),
+                }
+            }
+        }
+        let repo = Arc::new(SwitchableRepo(AtomicUsize::new(0)));
+        let eng = engine().with_repo_state_provider(repo.clone());
+        let mut bound = note(
+            Namespace::Project("rb".into()),
+            "use transactions",
+            MemoryType::Constraint,
+            9,
+            &[],
+        );
+        bound
+            .anchors
+            .push(rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "aaaaaaaa").unwrap());
+        let bound_id = bound.id.clone();
+        eng.backend().insert_note(bound);
+        let unbound = note(
+            Namespace::Project("rb".into()),
+            "prefer concise output",
+            MemoryType::Preference,
+            8,
+            &[],
+        );
+        let unbound_id = unbound.id.clone();
+        eng.backend().insert_note(unbound);
+        let known = eng.context().await.unwrap();
+        repo.0.store(1, Ordering::SeqCst);
+        let unknown = eng.context().await.unwrap();
+        repo.0.store(2, Ordering::SeqCst);
+        let unresolved = eng.context().await.unwrap();
+        repo.0.store(0, Ordering::SeqCst);
+        let recovered = eng.context().await.unwrap();
+        let entry = |context: &rb_types::ProjectContext, id: &MemoryId| {
+            context
+                .stable
+                .iter()
+                .find(|entry| &entry.id == id)
+                .unwrap()
+                .clone()
+        };
+        assert_ne!(
+            entry(&known, &bound_id).fingerprint,
+            entry(&unknown, &bound_id).fingerprint
+        );
+        assert_eq!(entry(&unknown, &bound_id), entry(&unresolved, &bound_id));
+        assert_eq!(entry(&known, &bound_id), entry(&recovered, &bound_id));
+        assert_eq!(entry(&known, &unbound_id), entry(&unknown, &unbound_id));
+        assert!(known
+            .stable
+            .iter()
+            .chain(&unknown.stable)
+            .all(|entry| !entry.stale));
     }
 
     #[tokio::test]

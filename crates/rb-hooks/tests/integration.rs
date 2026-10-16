@@ -210,7 +210,7 @@ fn record_and_respond(req: Request, observed: &mut Observed, corpus: &MockCorpus
                     .stable
                     .iter()
                     .cloned()
-                    .map(|memory| rb_types::ContextEntry::from_memory(memory, false))
+                    .map(|memory| rb_types::ContextEntry::from_memory(memory, false, None))
                     .collect(),
                 ..Default::default()
             },

@@ -83,7 +83,13 @@ impl ContextEntry {
 
     /// Currentness comparison without copying full evidence into a preview.
     /// SHA-256 over length-framed evidence, truncated to its first eight bytes (LE).
-    pub fn fingerprint_for(memory: &MemoryNote, stale: bool) -> u64 {
+    /// Use the same repository snapshot as staleness evaluation; unresolved HEAD
+    /// invalidates a commit-bound claim without marking unknown evidence stale.
+    pub fn fingerprint_for(
+        memory: &MemoryNote,
+        stale: bool,
+        repo: Option<&crate::RepoSnapshot>,
+    ) -> u64 {
         use sha2::{Digest, Sha256};
         let mut hash = Sha256::new();
         hash.update(b"rusty-brain-context-fingerprint-v1");
@@ -139,6 +145,12 @@ impl ContextEntry {
                     hash.update(line.to_le_bytes());
                 }
             }
+            if anchor.kind == AnchorKind::Commit {
+                // Unknown currentness is not stale, but invalidates earlier clean evidence.
+                hash.update([u8::from(
+                    repo.and_then(|state| state.head.as_ref()).is_some(),
+                )]);
+            }
         }
         let digest = hash.finalize();
         let mut bytes = [0_u8; 8];
@@ -146,8 +158,12 @@ impl ContextEntry {
         u64::from_le_bytes(bytes)
     }
 
-    pub fn from_memory(memory: MemoryNote, stale: bool) -> Self {
-        let fingerprint = Self::fingerprint_for(&memory, stale);
+    pub fn from_memory(
+        memory: MemoryNote,
+        stale: bool,
+        repo: Option<&crate::RepoSnapshot>,
+    ) -> Self {
+        let fingerprint = Self::fingerprint_for(&memory, stale, repo);
         let subject = if memory.summary.trim().is_empty() {
             &memory.content
         } else {
@@ -566,7 +582,7 @@ mod tests {
         // Independently framed with Python hashlib.sha256: 24f59a62214df278
         // efc9e46e9a2f1a4e55a721b2f58468aadd0e1639a394e45b; first 8 bytes LE.
         let expected = 8_715_113_034_698_913_060;
-        let entry = ContextEntry::from_memory(note.clone(), true);
+        let entry = ContextEntry::from_memory(note.clone(), true, None);
         assert_eq!(entry.fingerprint, expected);
         let serialized = serde_json::to_string(&entry).unwrap();
         let restored: ContextEntry = serde_json::from_str(&serialized).unwrap();
@@ -575,14 +591,14 @@ mod tests {
         note.last_accessed_at = Some(note.created_at);
         note.created_at -= chrono::Duration::days(30);
         note.updated_at = note.created_at;
-        assert_eq!(ContextEntry::fingerprint_for(&note, true), expected);
-        assert_ne!(ContextEntry::fingerprint_for(&note, false), expected);
+        assert_eq!(ContextEntry::fingerprint_for(&note, true, None), expected);
+        assert_ne!(ContextEntry::fingerprint_for(&note, false, None), expected);
     }
 
     #[test]
     fn context_fingerprint_retains_full_evidence_and_qualifications() {
         let note = context_fingerprint_note();
-        let expected = ContextEntry::fingerprint_for(&note, true);
+        let expected = ContextEntry::fingerprint_for(&note, true, None);
         let mutations: [fn(&mut MemoryNote); 22] = [
             |n| n.content.push_str(" Exception: read-only."),
             |n| n.context.push_str(" Outcome unknown."),
@@ -611,7 +627,7 @@ mod tests {
             let mut changed = note.clone();
             mutate(&mut changed);
             assert_ne!(
-                ContextEntry::fingerprint_for(&changed, true),
+                ContextEntry::fingerprint_for(&changed, true, None),
                 expected,
                 "evidence mutation {index}"
             );
@@ -624,8 +640,8 @@ mod tests {
         let mut right = left.clone();
         let distinct = |left: &MemoryNote, right: &MemoryNote| {
             assert_ne!(
-                ContextEntry::fingerprint_for(left, true),
-                ContextEntry::fingerprint_for(right, true)
+                ContextEntry::fingerprint_for(left, true, None),
+                ContextEntry::fingerprint_for(right, true, None)
             );
         };
         left.keywords = vec!["ab".into(), "c".into()];

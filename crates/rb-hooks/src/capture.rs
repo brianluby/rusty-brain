@@ -567,11 +567,15 @@ async fn prepare_prompt(
     };
     // Only unchanged previews actually prepared earlier cover query-specific evidence.
     results.retain(|result| {
-        !context.as_ref().is_some_and(|_| {
+        !context.as_ref().is_some_and(|context| {
             delivery.entries.iter().any(|(id, fingerprint)| {
                 id == &result.memory.id
                     && *fingerprint
-                        == rb_types::ContextEntry::fingerprint_for(&result.memory, result.stale)
+                        == rb_types::ContextEntry::fingerprint_for(
+                            &result.memory,
+                            result.stale,
+                            context.repo_state.as_ref(),
+                        )
             })
         })
     });
@@ -1950,7 +1954,7 @@ mod tests {
             stable: notes
                 .iter()
                 .cloned()
-                .map(|memory| rb_types::ContextEntry::from_memory(memory, false))
+                .map(|memory| rb_types::ContextEntry::from_memory(memory, false, None))
                 .collect(),
             ..Default::default()
         }
@@ -2059,7 +2063,7 @@ mod tests {
         delivery.record(&context, &output);
         memory.access_count += 1;
         memory.last_accessed_at = Some(memory.created_at);
-        context.stable[0] = rb_types::ContextEntry::from_memory(memory.clone(), false);
+        context.stable[0] = rb_types::ContextEntry::from_memory(memory.clone(), false, None);
         assert_eq!(
             format_session_start(&context, InjectionMode::Full).unwrap(),
             output
@@ -2068,7 +2072,7 @@ mod tests {
         memory
             .context
             .push_str(" Exception: no approval on replicas.");
-        context.stable[0] = rb_types::ContextEntry::from_memory(memory.clone(), false);
+        context.stable[0] = rb_types::ContextEntry::from_memory(memory.clone(), false, None);
         let correction = delivery.correction(&context).unwrap();
         assert!(correction.contains(&context.stable[0].id.to_string()));
         assert!(correction.contains("cannot be revoked"));
@@ -2081,7 +2085,7 @@ mod tests {
             &context,
             &format_session_start(&context, InjectionMode::Full).unwrap(),
         );
-        context.stable[0] = rb_types::ContextEntry::from_memory(memory, true);
+        context.stable[0] = rb_types::ContextEntry::from_memory(memory, true, None);
         assert!(delivery.correction(&context).is_some());
         delivery.record(
             &context,

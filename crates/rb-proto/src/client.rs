@@ -1331,6 +1331,7 @@ mod wrapper_tests {
                                 memory
                             },
                             true,
+                            None,
                         )],
                         snapshot: None,
                         repo_state: None,

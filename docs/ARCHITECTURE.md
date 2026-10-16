@@ -403,6 +403,10 @@ crates into the default CLI runtime. Prepared output is not a host acknowledgeme
 Changed prior context gets a current-state correction on supported refresh/recall;
 old host text cannot be revoked. Exact stored evidence remains unverified advice,
 not permission to execute it.
+For commit-anchored entries, currentness fingerprints include whether repository
+HEAD is resolvable. Losing or recovering that evidence invalidates earlier
+preparation even when `stale` stays false: unknown state is not proof of staleness.
+Unbound entries do not acquire a repository-state dependency.
 
 ## Namespace model
 

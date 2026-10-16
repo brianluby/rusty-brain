@@ -148,7 +148,11 @@ pub fn render_preparation(
                 entry.id == hit.memory.id
                     && (!constraints_only || entry.memory_type == rb_types::MemoryType::Constraint)
                     && entry.fingerprint
-                        == rb_types::ContextEntry::fingerprint_for(&hit.memory, hit.stale)
+                        == rb_types::ContextEntry::fingerprint_for(
+                            &hit.memory,
+                            hit.stale,
+                            context.repo_state.as_ref(),
+                        )
             })
         });
         let previous = if let Some(entry) = stable_entry {
