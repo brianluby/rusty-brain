@@ -1,30 +1,51 @@
 # Bounded Phase 5 dogfood pilot preregistration
 
-- **Status:** **BLOCKED — protocol only; no treatment has started.**
-- **Admission blockers:** task #56 is currently **NO-GO** after independent
-  reproduction found the low-confidence instruction-shaped poison in the
-  second production recall result; task #57 admission, the confirmed repository
-  subset, exact UTC period, and the frozen paired-scenario plan also remain
-  unresolved.
-- **Candidate repositories:** `rusty-brain`, `threatmitigator`, and
-  `vikunja-rust-mcp`. This list is not a selection.
-- **Operator:** a maintainer running the pilot and an independent reviewer
-  confirming the sanitized evidence.
+- **Status:** **CANDIDATE PREPARED — NOT ADMITTED; no treatment has started.**
+- **User decision (2026-10-16):** prepare only; do not admit the pilot, assign
+  an operator, or start treatment. Passing technical gates does not override it.
+- **Admission blockers:** replacement #57 resource evidence must pass on the
+  clean integrated treatment revision, then #56 must be rechecked on that same
+  revision. The original PR #70 N>=5 rerun must record zero memory-induced
+  errors before treatment; prior semantic diagnostics alone do not replace it.
+  Final freeze and operator/reviewer execution remain separate steps.
+- **Selected candidates:** `rusty-brain` and `threatmitigator`, six balanced
+  pairs each. `vikunja-rust-mcp` was not found locally or by authenticated GitHub
+  repository search and is excluded, rather than assigned an invented revision.
+- **Operator / independent reviewer:** not yet assigned. Execution needs a
+  human to measure active time, adjudicate injections, and attest sanitization;
+  neither a scheduler nor this preparation substitutes for those observations.
 - **Ground truth:** this pilot measures bounded single-user dogfood value. It
   is not the Phase 5c two-user/two-machine team-mode gate.
 
 The manifest is
 [`2026-07-12-phase5-dogfood-pilot-manifest.json`](2026-07-12-phase5-dogfood-pilot-manifest.json).
-It is intentionally invalid for execution while fields are pending. The
-aggregator is `scripts/dogfood-pilot.py`.
+It remains intentionally non-executable (`status=candidate`, resource evidence
+unavailable, no freeze timestamp). `scripts/dogfood-pilot.py validate --candidate`
+checks all prepared fields and actual scenario hashes without admitting a run.
 
-The manifest records `task_56.overall_pilot_go=false` and the poison-exposure
-blocker. It also records `task_57.complete=false`; partial benchmark evidence
-does not supply a pilot envelope. The corrected #56 decision leaves both exact
-evidence and surprise-aware combined admission at **NO-GO**, so no treatment
-arm is production-qualified. Only a separately reviewed production fix plus a
-repeated #56 gate may change `task_56.state` from `no-go` to `go` and
-`task_56.overall_pilot_go` to `true`.
+The manifest records `task_56.state=go` and `overall_pilot_go=true`, pinned to
+`commit:ac4bf4c3cfa951035f7992e027309a6f281ce87e`. On 2026-10-13, all eight
+semantic safety tests, the production Linear gate, the five-seed fusion
+diagnostic, and the controlled-arms diagnostic passed. The qualified arm is
+`linear-with-recall-confidence-floor`; exact-evidence and surprise-aware
+experiments remain **NO-GO** and must not be enabled.
+
+Task #57 is marked Done in the tracker. Maintainer comment 182 approved a
+bounded single-user trial at 25,000 active memories on 2026-07-15, explicitly
+deferring physical filesystem exhaustion rather than claiming a full production
+envelope. Its benchmark code (`be6e0c4faa727df546dd81aa79037cec53482860`),
+simulated SQLITE_FULL regression (`121d3d7d2e660b0be8ad4a85967a7670be9f3660`),
+and pilot handoff (`2c99f13`) were not recovered from local reflogs, unreachable
+Git objects, registered worktrees, or retained scale-artifact locations. The
+previous GitHub commit-API absence is not a new check. The referenced
+`target/scale-benchmark-v4-full.json` remains absent; its recorded SHA-256 is
+`c24756340dfaad111637a415a5f8b434ef6e227088997cc8ba9b8c1405b0ab06`.
+The replacement extends the existing real-local SQLite/store/transport load
+harness with retained actual SQLite page-limit refusal, rollback, recovery and
+reopen evidence. See [the resource reproduction contract](../benchmarks/scale-concurrency-harness.md).
+No replacement benchmark has been run during preparation. `max_active_memories`
+is the **proposed**, not adopted, 25,000 ceiling; `complete=false` continues to
+block admission. Only a passing immutable replacement report can adopt it.
 
 ## 1. What is frozen now
 
@@ -33,6 +54,81 @@ one explicit plan with **at least five paired observations**. The exact run
 count, start/end timestamps, repository subset, commits, scenarios, and arm
 order must be filled in and frozen before the first treatment observation.
 They cannot be selected after outcomes are visible.
+
+### Prepared schedule and task snapshots (2026-10-16)
+
+The proposed interval is **2026-10-19T16:00:00Z through
+2026-11-02T16:00:00Z**, exactly fourteen days, end-exclusive. Each repository
+has six pairs on October 19, 20, 22, 25, 28 and 31: rusty-brain at 16:00 UTC,
+threatmitigator at 17:00 UTC. Each plan has three baseline-first and three
+treatment-first pairs, with two pairs per delivery surface. The first two
+slots permit measuring the unchanged 72-hour activation threshold.
+
+`observed_at_utc` means completion of both arms in a pair, and must fall in
+**[that scenario's scheduled UTC, the next scheduled slot in the same repository)**.
+The final pair's upper bound is the pilot end. The next repository's slot does
+not shorten this window. Both early completions (for example an October 31
+scenario completed on October 19) and late completions are rejected; a missed
+window is an incomplete planned pair, not permission to backdate or reschedule
+after observing outcomes.
+
+The sanitized scenario bundle is private local data at
+`${HOME}/.local/share/rusty-brain-pilots/phase5-20261019/scenario-inputs.json`.
+It contains source paths, exact task wording, synthetic seed notes, review
+rubrics, opportunity counts, surface and UTC slot, but no private transcripts or
+observed outputs. `threatmitigator` is private, so task bodies/source paths are
+not committed. Public metadata uses opaque private-project scenario IDs and
+canonical SHA-256 commitments; the store plan records the whole bundle hash.
+Hashes use UTF-8 JSON with sorted keys, ASCII escaping and separators `,`/`:`.
+Candidate validation recomputes every hash, rejects globally duplicate scenario
+IDs before indexing plans, and requires coverage of the whole pair plan.
+These are controlled source-derived tasks in real repositories,
+not evidence of fourteen days of organic use; the eventual report must retain
+that distinction.
+
+The current task-source commits are rusty-brain
+`a33ea3ba0fef50b94b1d65884118384d7886a24d` and threatmitigator
+`580cfff8d0fca117171b9ac40e05e3fc5486ac78`. Task-source commits and the
+memory-treatment binary's verified revision are distinct: the latter is the
+integrated #56/#57 evidence revision. Before final freeze, the parent may pin
+rusty-brain tasks to that clean integration commit and recompute their hashes;
+no treatment observation may precede that freeze.
+
+The candidate execution route is `litellm/deepseek-v4.1-flash`, with an
+8,000-token common prompt budget, per the user's explicit provider switch.
+The parent catalog confirms this configured route; catalog presence is not
+an observed pilot invocation. The provider has not exposed an
+immutable backend version: `model_version=provider-unexposed` records that
+limitation, not a verified model revision. Both arms must use the same route,
+version metadata, tool permissions and task budget; record any provider version
+that becomes available before freeze. A requirement for an immutable backend
+version would remain blocked on provider support, not operator attestation.
+
+Store/namespace identifiers map to four separate private roots in the
+[prepared store plan](2026-10-16-pilot-store-plan.json). The roots and configuration
+files exist with owner-only permissions; databases are deliberately uninitialized
+and no memories or credentials were copied. Runtime sockets have a short,
+separate disposable root. Recreate that private runtime root before any future
+admission if the OS removes it. Never point the study at installed dogfood data
+or edit existing MCP/OMP configuration. Restore each task working directory from its
+frozen commit and the same sanitized task fixture; retain treatment memories
+within its own repository arm only. A treatment-first human may learn the task:
+balanced order reports that residual crossover risk; separate fresh agent
+sessions prevent machine-context leakage, not human unlearning.
+
+If resource/provenance verification or operator availability misses the first
+slot, stop before treatment, declare a new future fourteen-day interval and
+rehash/re-freeze the scenario schedules. Do not backdate observations. Twelve
+paired sessions, immediate interim aggregation after each, and one reviewed
+backup/retention drill need the operator and independent reviewer during the
+declared interval; no unattended future execution is installed by this change.
+
+```bash
+python3 scripts/dogfood-pilot.py validate --candidate \
+  --manifest docs/eval/2026-07-12-phase5-dogfood-pilot-manifest.json \
+  --snapshots "${HOME}/.local/share/rusty-brain-pilots/phase5-20261019/scenario-inputs.json"
+```
+
 
 The thresholds below are compiled into the aggregator. A manifest with a
 different threshold object is rejected; changing a threshold requires a new
@@ -90,7 +186,8 @@ Do not install or enable a treatment from this protocol. Admission requires:
 
    ```bash
    python3 scripts/dogfood-pilot.py validate \
-     --manifest docs/eval/2026-07-12-phase5-dogfood-pilot-manifest.json
+     --manifest docs/eval/2026-07-12-phase5-dogfood-pilot-manifest.json \
+     --snapshots "${HOME}/.local/share/rusty-brain-pilots/phase5-20261019/scenario-inputs.json"
    ```
 
 The command fails closed on a pending task, missing field, changed threshold,
@@ -128,6 +225,7 @@ STOP exit means no further treatment work may run.
 ```bash
 python3 scripts/dogfood-pilot.py aggregate \
   --manifest docs/eval/2026-07-12-phase5-dogfood-pilot-manifest.json \
+  --snapshots "${HOME}/.local/share/rusty-brain-pilots/phase5-20261019/scenario-inputs.json" \
   --events /path/to/sanitized-pilot-events.jsonl \
   --output /path/to/interim-report.json \
   --interim
@@ -176,6 +274,8 @@ Each pair contains:
 - task success, turns, active seconds, corrections, contested opportunities
   and correct answers, and multi-answer opportunities and correct answers for
   each arm;
+- schema version 2 model ID, reported version (or explicit provider-unexposed
+  marker), and prompt-budget fields in both arms, equal to frozen execution;
 - the treatment arm/surface plus the injection, safety, corpus, backlog,
   retention, backup, and token fields defined above;
 - zero or more sanitized qualitative examples.
@@ -199,10 +299,12 @@ username, or absolute path. The tool rejects unknown fields, common secret/key
 patterns, and home-directory paths. Pattern rejection is only a backstop: the
 operator and reviewer must attest that the example is sanitized.
 
-Do not add raw-content fields. Do not collect database rows, model output,
-prompts, transcripts, diffs, environment variables, API keys, or memory bodies.
-Do not create a separate raw pilot artifact. Ordinary source-system data stays
-under its existing local retention policy and is never copied into this study.
+Do not add raw production-content fields. Do not collect database rows, model
+output, private prompts, transcripts, diffs, environment variables, API keys,
+or production memory bodies. The deliberately synthetic preregistered task
+wording and seed notes above are inputs, not captured private evidence. Do not
+create a separate raw pilot artifact. Ordinary source-system data stays under
+its existing local retention policy and is never copied into this study.
 
 ## 6. Stop, continue, go, and no-go
 

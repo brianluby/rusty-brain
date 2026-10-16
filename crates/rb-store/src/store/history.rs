@@ -271,7 +271,7 @@ impl SqliteStore {
                             m.origin_user, m.origin_host, m.origin_agent, m.origin_source,
                             m.context, m.keywords, m.tags, m.memory_type, m.updated_at,
                             m.last_accessed_at, m.related_files, m.origin_channel,
-                            m.session_id, m.trust_class, m.human_curated
+                            m.session_id, m.trust_class, m.human_curated, m.legacy_unknown
                      FROM memories m WHERE m.memory_id = ?1 AND m.namespace = ?2",
                 )
                 .map_err(|e| Error::Storage(e.to_string()))?;
@@ -596,6 +596,7 @@ fn decode_target_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
         anchors: Vec::new(),
         trust_class: rb_types::TrustClass::parse(&row.get::<_, String>(21).map_err(storage)?)?,
         human_curated: row.get(22).map_err(storage)?,
+        legacy_unknown: row.get(23).map_err(storage)?,
         source_status: rb_types::HistorySourceStatus::Unavailable,
     };
     target.entry.evidence = Some(evidence);

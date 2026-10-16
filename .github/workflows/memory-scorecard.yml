@@ -15,7 +15,7 @@
 # ALLOWED TO FAIL, WITH ALERTING: scheduled weekly (plus manual dispatch); NEVER
 # gates PRs (it is nondeterministic and costs API spend). On failure it opens or
 # comments on a pinned issue titled "weekly memory scorecard failing"; on success
-# it closes that issue if open. Same posture as w35-ab-eval.yml.
+# it closes that issue if open. Manual runs leave issues untouched unless opted in.
 #
 # Uploads a structured TSV whose first 13 fields are stable
 # (dimension/scenario/arm/run/success/turns/mie/cost/tok_in/tok_cc/tok_cr/tok_out/
@@ -28,11 +28,14 @@
 # candidates (ids, states, scores, channel flags), and supersede histories.
 # These diagnostics are synthetic scorecard data and never key material.
 #
-# Required repository secret:
-#   ANTHROPIC_API_KEY — the scorecard's default @slow role is mapped to Haiku.
-#   A run is (scenarios x 5 arms x N) sessions, each with the harness's default
-#   300-second timeout. OMP has no per-session dollar cap in this runner.
+# Required repository secret LITELLM_API_KEY and variable LITELLM_BASE_URL.
+#   The selected model is litellm/deepseek-v4.1-flash. Session costs are OMP's
+#   catalog-priced usage estimates, not authoritative proxy billing.
+#   A run is (scenarios x 5 arms x N) sessions, each bounded to 300 seconds.
 #   Scheduled runs use N=5; dispatch N=1 for a directional plumbing smoke.
+# Credentials currently remain local by user choice: scheduled CI is blocked
+# until the user provisions these values. Never fall back to Anthropic credits;
+# a local N>=5 result does not close the alert issue or establish CI recovery.
 name: memory scorecard
 
 on:
@@ -40,6 +43,10 @@ on:
     - cron: "11 10 * * 1" # weekly (Mondays 10:11 UTC), offset from the nightly evals
   workflow_dispatch:
     inputs:
+      manage_issue:
+        description: "Update the alert issue (scheduled runs always do)"
+        type: boolean
+        default: false
       runs:
         description: "runs per (scenario, arm); N>=5 for a real read, 1 for a smoke"
         required: false
@@ -61,45 +68,50 @@ jobs:
       contents: read
       issues: write # open/update/close the alert issue
     steps:
-      - name: Preflight - require the ANTHROPIC_API_KEY secret
+      - name: Preflight - require the LiteLLM credential and endpoint
         env:
-          HAVE_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAVE_KEY: ${{ secrets.LITELLM_API_KEY != '' }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
         run: |
-          if [ "$HAVE_KEY" != "true" ]; then
-            echo "::error::repository secret ANTHROPIC_API_KEY is not configured; the scorecard cannot run."
+          if [ "$HAVE_KEY" != "true" ] || [ -z "$LITELLM_BASE_URL" ]; then
+            echo "::error::configure repository secret LITELLM_API_KEY and variable LITELLM_BASE_URL."
             exit 1
           fi
 
       - name: Preflight - verify the key authenticates (status code only)
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
         run: |
           # Validate the secret's shape BEFORE it is used anywhere, then print
           # ONLY the HTTP status; the key and response body are never echoed.
           # 200 = key valid; 401 = invalid/revoked or mangled paste.
-          case "$ANTHROPIC_API_KEY" in
+          case "$LITELLM_API_KEY" in
             *[[:space:]]*) echo "::error::secret contains whitespace (bad paste?)"; exit 1 ;;
           esac
           status="$(curl -sS -o /dev/null -w '%{http_code}' \
             --max-time 30 \
-            -H "x-api-key: ${ANTHROPIC_API_KEY}" \
-            -H "anthropic-version: 2023-06-01" \
-            https://api.anthropic.com/v1/models)"
-          echo "anthropic /v1/models HTTP status: ${status}"
+            -H "Authorization: Bearer ${LITELLM_API_KEY}" \
+            "${LITELLM_BASE_URL%/}/models")"
+          echo "LiteLLM /models HTTP status: ${status}"
           if [ "$status" != "200" ]; then
-            echo "::error::ANTHROPIC_API_KEY did not authenticate (HTTP ${status}); fix the repository secret."
+            echo "::error::LITELLM_API_KEY did not authenticate (HTTP ${status}); check proxy endpoint and credential."
             exit 1
           fi
 
       - name: Preflight - bare claude session probe (prints result record, no secrets)
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
+          CLAUDE_CODE_EXTRA_BODY: '{"cache":{"no-cache":true,"no-store":true},"thinking":{"type":"disabled"}}'
         run: |
           # One minimal -p session outside the scorecard harness: isolates
           # key/billing/model-access errors from harness (hooks/daemon) errors.
           # Only the stream-json system/result records are printed; they carry
           # no key material.
           npm install -g @anthropic-ai/claude-code
+          export ANTHROPIC_BASE_URL="${LITELLM_BASE_URL%/}"
+          export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL%/v1}"
           probe_home="$(mktemp -d)"
           printf '{"hasCompletedOnboarding": true}\n' > "${probe_home}/.claude.json"
           probe_proj="$(mktemp -d)"
@@ -111,7 +123,7 @@ jobs:
             cd "$probe_proj"
             perl -e 'alarm 180; exec @ARGV' -- \
               claude -p 'reply with exactly: ok' \
-              --model haiku --max-budget-usd 0.50 \
+              --model deepseek-v4.1-flash --max-budget-usd 0.50 \
               --output-format stream-json --verbose </dev/null || true
           ) | python3 -c '
           import sys, json
@@ -126,12 +138,14 @@ jobs:
               if t == "system" and r.get("subtype") == "init":
                   seen += 1
                   print("apiKeySource:", r.get("apiKeySource"), "| model:", r.get("model"))
+              if t == "assistant":
+                  print("response model:", r.get("message", {}).get("model"))
               if t == "result":
                   seen += 1
                   print("result subtype:", r.get("subtype"),
                         "| is_error:", r.get("is_error"),
                         "| turns:", r.get("num_turns"),
-                        "| cost_usd:", r.get("total_cost_usd"))
+                        "| cli_cost_estimate_usd:", r.get("total_cost_usd"))
                   print("result text:", str(r.get("result"))[:300])
                   if not r.get("is_error"):
                       ok_result = True
@@ -161,7 +175,7 @@ jobs:
           bun-version: "1.4.2"
       - name: Install OMP CLI
         run: |
-          bun install --global @oh-my-pi/pi-coding-agent@18.2.4
+          bun install --global @oh-my-pi/pi-coding-agent@18.8.6
           echo "${HOME}/.bun/bin" >> "$GITHUB_PATH"
           "${HOME}/.bun/bin/omp" --version
 
@@ -170,10 +184,9 @@ jobs:
 
       - name: Run the scorecard
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
-          # Fresh profiles do not inherit local role aliases. Keep the harness's
-          # @slow selector and timeout defaults; bind the role to this provider.
-          PI_SLOW_MODEL: "anthropic/claude-haiku-4-5"
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
+          PI_SLOW_MODEL: "litellm/deepseek-v4.1-flash"
           # Pass the dispatch input via env (never interpolate ${{ }} into the
           # shell) and validate it's a positive integer before use.
           RUNS_INPUT: ${{ github.event.inputs.runs || '5' }}
@@ -216,7 +229,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Open or update the alert issue on failure
-        if: failure()
+        if: failure() && (github.event_name == 'schedule' || inputs.manage_issue)
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -237,7 +250,7 @@ jobs:
           fi
 
       - name: Close the alert issue on success
-        if: success()
+        if: success() && (github.event_name == 'schedule' || inputs.manage_issue)
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

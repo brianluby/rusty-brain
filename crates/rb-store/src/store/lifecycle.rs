@@ -1081,12 +1081,21 @@ mod migration_004_tests {
         assert!(got.origin_source.is_none());
         assert!(got.session_id.is_none());
 
-        // FTS still matches the old row: 004 ran no UPDATE, so the mem_au
-        // trigger never fired and the index is exactly the insert-time one.
-        let hits = store
-            .keyword_search(&got.namespace, "pre-provenance", 10)
+        // Historical quarantine affects eligibility, never the FTS index.
+        assert!(got.legacy_unknown && got.is_quarantined());
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"pre-provenance\"'",
+                [],
+                |row| row.get(0),
+            )
             .unwrap();
-        assert!(hits.contains(&id), "FTS untouched by the migration");
+        assert_eq!(indexed, 1, "FTS untouched by provenance classification");
+        assert!(store
+            .keyword_search(&got.namespace, "pre-provenance", 10)
+            .unwrap()
+            .is_empty());
 
         // The oplog table now exists and new mutations log into it.
         store.archive_memory(&id).unwrap();
@@ -1140,10 +1149,18 @@ mod fts_tokenizer_migration_tests {
         let ns = Namespace::Project("legacy".into());
         let id: MemoryId = "00000000-0000-4000-8000-000000000005".parse().unwrap();
 
-        // The 'rebuild' step re-indexed the OLD row under porter: an inflected
-        // query now matches it.
-        let hits = store.keyword_search(&ns, "retries", 10).unwrap();
-        assert_eq!(hits, vec![id.clone()], "old row re-indexed under porter");
+        // Porter rebuilt the historical row, but quarantine excludes it from recall.
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"retries\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "old row re-indexed under porter");
+        assert!(store.get_memory(&id).unwrap().unwrap().legacy_unknown);
+        assert!(store.keyword_search(&ns, "retries", 10).unwrap().is_empty());
 
         // Exactly the populated rows are indexed (no loss, no duplication).
         let fts_rows: i64 = store
@@ -1274,9 +1291,17 @@ mod mem_au_narrowing_migration_tests {
             assert!(ddl.contains(col), "mem_au OF-list must keep {col}: {ddl:?}");
         }
 
-        // The trigger swap never touched the index: the old row still matches.
-        let hits = store.keyword_search(&ns, "recall", 10).unwrap();
-        assert_eq!(hits, vec![id.clone()], "index survives the migration");
+        // The index survives independently of historical recall quarantine.
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"recall\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 1, "index survives the migration");
+        assert!(store.keyword_search(&ns, "recall", 10).unwrap().is_empty());
 
         // Post-006: access bumps — both the single and the batched (W1.8
         // flush) paths — trigger ZERO FTS writes.
@@ -1309,10 +1334,31 @@ mod mem_au_narrowing_migration_tests {
             .unwrap();
         let after_edit = fts_index_state(&store.conn);
         assert_ne!(after_edit, before, "content edits still write the index");
-        let hits = store.keyword_search(&ns, "serialized", 10).unwrap();
-        assert_eq!(hits, vec![id.clone()], "new content searchable");
-        let stale = store.keyword_search(&ns, "recall", 10).unwrap();
-        assert!(stale.is_empty(), "old content left the index");
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"serialized\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed, 1,
+            "new content indexed without clearing quarantine"
+        );
+        let stale: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"recall\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stale, 0, "old content left the index");
+        assert!(store
+            .keyword_search(&ns, "serialized", 10)
+            .unwrap()
+            .is_empty());
 
         // Archive (archived_at/updated_at only) is churn-free too.
         store.archive_memory(&id).unwrap();
@@ -1384,8 +1430,16 @@ mod base_importance_migration_tests {
         // FTS untouched by the migration (mem_au is column-scoped post-006 and
         // the backfill assigns no indexed column): legacy content still matches.
         let ns = Namespace::Project("legacy".into());
-        let hits = store.keyword_search(&ns, "legacy", 10).unwrap();
-        assert_eq!(hits.len(), 3, "index survives the migration");
+        let indexed: i64 = store
+            .conn
+            .query_row(
+                "SELECT count(*) FROM memories_fts WHERE memories_fts MATCH '\"legacy\"'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexed, 3, "index survives the migration");
+        assert!(store.keyword_search(&ns, "legacy", 10).unwrap().is_empty());
 
         // A post-migration insert stamps the prior...
         let m = MemoryNote::new(ns.clone(), "fresh row".into(), MemoryType::Insight, 8);

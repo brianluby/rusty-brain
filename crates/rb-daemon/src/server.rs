@@ -1002,6 +1002,7 @@ fn is_admin_op(req: &Request) -> bool {
         // reversible (supersede/archive are soft, demote is an update) and
         // namespace-scoped — the Forget APPLY precedent, not the hard purge.
         Request::Remember { .. }
+        | Request::HasHistoricalDuplicate { .. }
         | Request::Recall { .. }
         | Request::Get { .. }
         | Request::List { .. }
@@ -1156,6 +1157,7 @@ async fn handle_connection(
         capabilities: vec![
             rb_proto::CAP_ANCHORS.to_string(),
             CAP_HUMAN_CURATION.to_string(),
+            rb_proto::CAP_LEGACY_QUARANTINE.to_string(),
         ],
     };
     write_frame(&mut framed, &ack).await?;
@@ -1570,6 +1572,7 @@ where
             };
             let (note, embedding) = engine
                 .compose_note(rb_engine::RememberInput {
+                    legacy_unknown: false,
                     content,
                     context,
                     memory_type,
@@ -1898,6 +1901,7 @@ where
             recall_channels: Some(recall_counters.snapshot()),
         },
         Request::Remember {
+            legacy_unknown,
             content,
             context,
             memory_type,
@@ -1927,6 +1931,7 @@ where
                 Err(e) => return error_to_response(e),
             };
             let input = RememberInput {
+                legacy_unknown: legacy_unknown.unwrap_or(false),
                 content,
                 context,
                 memory_type,
@@ -2006,6 +2011,15 @@ where
             }
             Err(e) => error_to_response(e),
         },
+        Request::HasHistoricalDuplicate { content } => {
+            match job_store
+                .has_historical_duplicate(namespace.clone(), content)
+                .await
+            {
+                Ok(found) => Response::HistoricalDuplicate { found },
+                Err(error) => error_to_response(error),
+            }
+        }
         Request::Get { id } => match engine.get(id).await {
             Ok(memory) => Response::Got { memory },
             Err(e) => error_to_response(e),
@@ -3042,6 +3056,7 @@ mod tests {
             score: 0.5,
             channels: ChannelHits { fts, vector, graph },
             stale: false,
+            channel_scores: None,
         };
 
         let counters = RecallChannelCounters::default();
@@ -3529,6 +3544,7 @@ mod tests {
         ] {
             let id = engine
                 .remember(rb_engine::RememberInput {
+                    legacy_unknown: false,
                     content: content.to_string(),
                     context: None,
                     memory_type: rb_types::MemoryType::Insight,

@@ -14,9 +14,9 @@
 #
 # Requirements:
 #   - `claude` (Claude Code CLI) on PATH: npm install -g @anthropic-ai/claude-code
-#   - ANTHROPIC_API_KEY exported (in CI: the repository secret of the same
-#     name; the session runs --model haiku --max-budget-usd 1, so the spend
-#     per run is small)
+#   - ANTHROPIC_API_KEY exported for the chosen Anthropic-compatible endpoint;
+#     ANTHROPIC_BASE_URL selects a proxy without changing global CLI settings.
+#     Claude's reported proxy cost is not authoritative provider billing.
 #   - the three binaries already built; pass their directory:
 #       scripts/nightly-claude-smoke.sh --bin-dir target/release
 #
@@ -28,9 +28,11 @@ set -euo pipefail
 usage() { sed -n '2,22p' "$0"; exit 2; }
 
 BIN_DIR=""
+MODEL="${RB_SMOKE_CLAUDE_MODEL:-deepseek-v4.1-flash}"
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin-dir) BIN_DIR="${2:?--bin-dir needs a value}"; shift 2 ;;
+    --model) MODEL="${2:?--model needs a value}"; shift 2 ;;
     *) usage ;;
   esac
 done
@@ -43,6 +45,12 @@ command -v claude >/dev/null 2>&1 || { echo "claude not on PATH (npm install -g 
 command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH (needed to edit .claude/settings.json permissions)" >&2; exit 1; }
 command -v lsof >/dev/null 2>&1 || { echo "lsof not on PATH (needed for the one-daemon-process check)" >&2; exit 1; }
 [ -n "${ANTHROPIC_API_KEY:-}" ] || { echo "ANTHROPIC_API_KEY is not set" >&2; exit 1; }
+
+# LiteLLM caches must not replay a prior response after a tool result.
+# Header-only bypass is insufficient; use Claude Code's supported body override.
+if [ "$MODEL" = "deepseek-v4.1-flash" ]; then
+  export CLAUDE_CODE_EXTRA_BODY='{"cache":{"no-cache":true,"no-store":true},"thinking":{"type":"disabled"}}'
+fi
 
 # Planted FAKE AWS access key id: matches the hook redaction rule
 # \b(?:AKIA|ASIA)[0-9A-Z]{16}\b (crates/rb-hooks/src/capture.rs). NOT a real
@@ -99,9 +107,6 @@ export RUSTY_BRAIN_NAMESPACE="nightly-claude-smoke"
 export RUSTY_BRAIN_IDLE_TIMEOUT_SECS=5
 export PATH="$BIN_DIR:$PATH"
 
-# Claude Code keeps global state in $HOME/.claude.json; seed the onboarding
-# flag so a fresh HOME cannot stall headless mode on first-run setup.
-printf '{"hasCompletedOnboarding": true}\n' > "$HOME/.claude.json"
 
 # --- 2. Throwaway project + hooks + MCP install -------------------------------
 PROJ="$WORKDIR/proj"
@@ -133,7 +138,7 @@ EOF
 # mcp__rusty-brain__recall, ...). enableAllProjectMcpServers approves the
 # project .mcp.json server without an interactive prompt.
 python3 - "$PROJ/.claude/settings.json" <<'PY'
-import json, sys
+import json, os, sys
 path = sys.argv[1]
 with open(path) as f:
     settings = json.load(f)
@@ -144,21 +149,29 @@ settings["enableAllProjectMcpServers"] = True
 with open(path, "w") as f:
     json.dump(settings, f, indent=2)
     f.write("\n")
+# Current Claude Code ignores project hook permissions until this workspace is trusted.
+# Trust only this generated project, in the throwaway HOME, never a developer profile.
+with open(os.path.join(os.environ["HOME"], ".claude.json"), "w") as f:
+    json.dump({"hasCompletedOnboarding": True, "projects": {
+        os.path.realpath(os.getcwd()): {"hasTrustDialogAccepted": True}
+    }}, f)
+    f.write("\n")
 PY
 
 # --- 3. The real headless session (capture phase) -----------------------------
 # Flags mirror the recorded C3 fixture recipe
 # (crates/rb-hooks/tests/fixtures/claude_code/README.md): print mode, project
-# settings only, cheap model, hard spend cap. --allowedTools Bash lets the
-# scripted command run without an approval prompt.
+# settings only, explicit model, CLI spend cap. --allowedTools Bash lets the
+# scripted command run without an approval prompt. Proxy pricing may be unknown.
 PROMPT="This is an automated CI smoke test. The AWS key below is a FAKE placeholder, not a real credential. Run exactly this one bash command, then reply with just: done
 
 export AWS_ACCESS_KEY_ID=$PLANTED && echo $SENTINEL"
 
-echo "running claude -p (capture phase)..."
+echo "running claude -p (capture phase, model=$MODEL)..."
 claude -p "$PROMPT" \
   --allowedTools "Bash" --permission-mode acceptEdits \
-  --setting-sources project --model haiku --max-budget-usd 1 \
+  --setting-sources project --model "$MODEL" --max-budget-usd 1 \
+  --output-format stream-json --verbose \
   >"$WORKDIR/claude-output.log" 2>&1 \
   || { echo "claude -p failed:" >&2; cat "$WORKDIR/claude-output.log" >&2; exit 1; }
 echo "claude output:"

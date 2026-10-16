@@ -152,6 +152,8 @@ pub struct ItemRecord {
     pub abstained: Option<String>,
     pub ingest_ms: u128,
     pub query_us: u128,
+    pub logical_db_bytes: u64,
+    pub failure: &'static str,
 }
 
 pub async fn run_item<P: EmbeddingProvider>(
@@ -199,6 +201,7 @@ pub async fn run_item<P: EmbeddingProvider>(
     } else {
         found as f64 / gold.len() as f64
     };
+    let failure = super::core::classify_failure(gold.len(), found, r.abstained.is_some());
     Ok(ItemRecord {
         category: selected.category,
         file: selected.file.clone(),
@@ -214,6 +217,8 @@ pub async fn run_item<P: EmbeddingProvider>(
         abstained: r.abstained,
         ingest_ms: r.ingest_ms,
         query_us: r.query_us,
+        logical_db_bytes: r.logical_db_bytes,
+        failure,
     })
 }
 

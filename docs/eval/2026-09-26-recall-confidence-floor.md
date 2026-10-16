@@ -71,7 +71,14 @@ Full workspace: 1911 passed, 14 ignored.
 
 ## Pilot manifest
 
-`docs/eval/2026-07-12-phase5-dogfood-pilot-manifest.json` is **not** flipped
-here. `task_56.state=go` needs an immutable `commit:` reference, which exists
-only after merge. The pilot also stays blocked on #57 (no operating
-envelope).
+At this change's original publication the manifest was not flipped; it needed
+post-merge immutable evidence. PR #90 merged at
+`db80f94e2e35249d93a75b0c4a96275dd5b11c59`.
+
+On 2026-10-13, the four safety/gate/diagnostic commands passed again on `main`
+at `ac4bf4c3cfa951035f7992e027309a6f281ce87e`. The pilot manifest now pins
+that commit, clears the #56 blocker, and qualifies only
+`linear-with-recall-confidence-floor`. The floor still does not cover fresh
+normal-confidence poison; exact-evidence and surprise-aware treatments remain
+unqualified. The pilot remains blocked because #57's tracker closeout references
+unavailable code and artifacts, and the repository plan and period are unfrozen.

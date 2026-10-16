@@ -32,6 +32,7 @@ fn public_surface_is_reachable_and_stable() {
         capabilities: vec![],
     };
     let _req = Request::Remember {
+        legacy_unknown: None,
         content: "c".into(),
         context: None,
         memory_type: MemoryType::Insight,

@@ -155,14 +155,14 @@ evidence.
 
 ## Resources (diagnostic; shared machine)
 
-| Run | Wall | Query p50 / p99 | Peak RSS |
-|---|---:|---:|---:|
-| LongMemEval parity-256 | 246 s | 3.5 / 15.0 ms | 2.3 GB |
-| LongMemEval parity-512 | 470 s | 3.3 / 18.4 ms | 5.2 GB |
-| LongMemEval native | 293 s | 4.3 / 8.3 ms | 0.86 GB |
-| LoCoMo native | 38 s | 3.8 / 6.3 ms | 0.31 GB |
-| ConvoMem native | 49 s | 4.6 / 7.8 ms | 0.22 GB |
-| MemBench native | 5,793 s | 4.1 / 10.0 ms | 0.81 GB |
+| Run | Wall | Ingest total | Query p50 / p95 / p99 | Peak RSS |
+|---|---:|---:|---:|---:|
+| LongMemEval parity-256 | 246.094 s | 242.530 s | 3.499 / 5.980 / 15.031 ms | 2.3 GB |
+| LongMemEval parity-512 | 469.771 s | 466.090 s | 3.265 / 9.569 / 18.381 ms | 5.2 GB |
+| LongMemEval native | 293.313 s | 289.814 s | 4.335 / 6.743 / 8.296 ms | 0.86 GB |
+| LoCoMo native | 38.412 s | 26.184 s | 3.808 / 5.277 / 6.263 ms | 0.31 GB |
+| ConvoMem native | 49.387 s | 47.628 s | 4.558 / 6.741 / 7.810 ms | 0.22 GB |
+| MemBench native | 5,792.838 s | 5,734.835 s | 4.093 / 8.082 / 9.971 ms | 0.81 GB |
 
 Parity's RSS comes from the adapter embedding a whole haystack in one batch
 (padding to the longest document). It is not production behavior. Every
@@ -204,7 +204,11 @@ semantic/safety gate and the zero-memory-induced-error scorecard.
    at up to 256. It helped on long sessions here (LoCoMo +12 pp), but
    chunking long memories may beat truncation either way.
 
-## Reproduce
+## Historical protocol commands
+
+These identify the frozen runs; **do not rerun them into the frozen `runs/`
+directory**. For new instrumentation evidence use the separately labeled
+diagnostic commands below, not another one-shot quality evaluation.
 
 ```bash
 B=~/.cache/rusty-brain-bench   # data/, runs/, mempalace/ (outside git)
@@ -217,7 +221,103 @@ $X membench    --data $B/data/Membench/MemData/FirstAgent              --profile
 # add --profile parity [--embed-max-tokens 256] for the equivalence columns
 ```
 
-Per-question JSONL (gold ids, ranked ids, per-hit channels and scores,
-metrics, failure class) is written next to each summary. It stays outside
-git because the datasets' licenses (CC BY-NC for LoCoMo and ConvoMem) do not
-permit committing derived per-item content.
+Frozen per-question JSONL contains gold ids, ranked ids, final scores and
+channel booleans. Only LongMemEval originally recorded an explicit failure
+class. It does **not** contain native numeric per-channel scores; those
+cannot be recovered uniquely from a fused score and booleans. Artifacts stay
+outside git (including derived per-item records); only aggregate metadata
+and checksums are committed here.
+
+## 2026-10-16 artifact closeout: frozen quality versus new diagnostics
+
+The headline and all category quality figures above remain the **2026-09-26
+frozen results**. No benchmark was rerun, tuned, re-embedded or reranked to
+prepare this addendum. The committed
+[`frozen metadata inventory`](artifacts/2026-10-16-external-bench-frozen-metadata.json)
+copies metadata from all 12 existing summaries and hashes both summaries and
+their per-question JSONL. It includes every LongMemEval R@1/3/5/10,
+recall_any/recall_all, MRR and both NDCG definitions overall and for all six
+categories, plus all other benchmarks' category breakdowns. Original files
+are at `~/.cache/rusty-brain-bench/runs/` with the names in that inventory;
+they are local reproducibility artifacts, not remotely hosted downloads.
+
+The four native summary links are
+[`longmemeval-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/longmemeval-native.summary.json),
+[`locomo-top10-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/locomo-top10-native.summary.json),
+[`convomem-top10-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/convomem-top10-native.summary.json), and
+[`membench-movie-top5-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/membench-movie-top5-native.summary.json).
+The ingest and p95 columns above were already recorded there; they are not
+new performance measurements.
+
+| Requested evidence | Frozen evidence / reconstruction | New diagnostic execution |
+|---|---|---|
+| Protocol, data/order pins, code, provider, granularity, top-k, quality/category metrics | Existing preregistration, manifests and hashed summaries; unchanged | Same pinned inputs, explicitly a different current-code execution |
+| Numeric fusion weights | `Weights::default()` inspected at `0fa0022`, `a17c72c`, `5879f68`: vector 0.45, keyword 0.30, graph 0.10, importance 0.10, recency 0.05; summaries specify default Linear. Parity has no fusion | Captured from current `Weights::default()`, not copied from this table |
+| Explicit failure classification per question | `complete-artifacts` deterministically adds missing outcome classes using existing gold/ranked ids or `found`/`hit`; original LongMemEval classes stay unchanged | Emitted by all four adapters |
+| Numeric channel scores per returned question/hit | Native scores **unrecoverable** from frozen fused scores/booleans; parity cosine distance was recorded | Source-backed FTS reciprocal rank (not BM25), clamped cosine similarity and reciprocal graph hops; absent channels are `null`. These are unweighted Linear scores **before** priors, confidence and source adjustment, not final contributions |
+| DB size | **Unmeasured**: old databases were ephemeral and no snapshots/page counts remain | Per-question `logical_db_bytes` after recall and maximum in summary: SQLite `page_count * page_size`, including free pages/indexes; not physical disk bytes, WAL or RSS |
+| OS/hardware | Only `macos aarch64` recorded. Historical CPU model, RAM and full OS/kernel version are **unavailable**; today's machine cannot establish them | Current timestamp, kernel, CPU model, RAM and available logical CPUs; unsupported/unavailable fields remain `null` |
+| Ingest, query p50/p95/p99, RSS, wall time, API cost | Recorded separately from quality in all 12 summaries; $0 local-model API cost | Captured again, diagnostic only; shared-machine caveat remains |
+
+Reconstruction adds **outcome**, not causal failure analysis: `hit`,
+`partial_hit`, `miss`, `abstained`, or `unscorable_empty_gold`. Empty evidence
+can retain the inherited published metric of 1.0 without being mislabeled a
+successful retrieval. ConvoMem degenerate-gold/empty-evidence flags and
+MemBench's sid-only alternative remain separately visible.
+
+### Commands for integration owner
+
+After the combined build/check, run artifact reconstruction in a **new**
+directory; it reads all 12 frozen outputs and does no inference. Create-new
+output files prevent overwriting the frozen inputs. The resulting manifest
+contains input/output hashes and failure counts; completed per-question
+JSONL stays outside git.
+
+```bash
+B=~/.cache/rusty-brain-bench
+X=./target/release/external-bench
+# Build once after integration, not while sibling implementations are in flight:
+cargo build --release -p rb-eval --features record-local --bin external-bench
+C=$(mktemp -d "$B/artifact-completion-20261016.XXXXXX")
+$X complete-artifacts --runs "$B/runs" --out "$C"
+```
+
+For **full all-four per-question numeric-channel/DB evidence**, the following
+is a separately declared current diagnostic execution, **not** a replacement
+quality run. It includes native-512, parity-512 and parity-256. No frozen
+vector/store cache was found in the benchmark cache (`*.npy`, `*.npz`,
+`*.pkl`, `*.sqlite`, `*.db`; only dependency test data matched), so native
+channels and DB allocation require rebuilding each question's temporary
+store and running the pinned local model. There is no external API charge;
+the old native wall times total about 6,174 seconds (MemBench alone about
+5,793 seconds), not a runtime guarantee for this execution. Do not inspect
+individual failures to change weights, gates, token limits or selection.
+
+```bash
+D=$(mktemp -d "$B/diagnostics-20261016.XXXXXX")
+for mode in native parity parity256; do
+  profile=$mode
+  tokens=()
+  if [ "$mode" = parity256 ]; then
+    profile=parity
+    tokens=(--embed-max-tokens 256)
+  fi
+  $X --diagnostic longmemeval --data "$B/data/longmemeval/longmemeval_s_cleaned.json" --profile "$profile" --out "$D" "${tokens[@]}"
+  $X --diagnostic locomo --data "$B/data/locomo/data/locomo10.json" --profile "$profile" --top-k 10 --out "$D" "${tokens[@]}"
+  $X --diagnostic convomem --cache "$B/data/convomem" --profile "$profile" --per-category 50 --top-k 10 --out "$D" "${tokens[@]}"
+  $X --diagnostic membench --data "$B/data/Membench/MemData/FirstAgent" --profile "$profile" --topic movie --top-k 5 --out "$D" "${tokens[@]}"
+done
+```
+
+All new files are named `diagnostic-*`; summary `artifact_role` is
+`current_diagnostic_not_frozen_quality`. Current code/config SHA and dirty
+state are recorded independently. These numbers explain **current**
+retrieval, not the historical run's missing channel values. A limited smoke
+is instrumentation validation only, never the all-question audit.
+
+**Closeout boundary:** instrumentation and reconstructable frozen metadata
+are supplied here; new runtime diagnostics have not been executed in this
+addendum. Until their full outputs are attached by the integration owner,
+the numeric-channel and DB audit clauses remain pending. Even after that,
+missing historical hardware and native channel values remain explicitly
+unavailable, not implicitly waived or retrospectively invented.

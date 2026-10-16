@@ -30,6 +30,11 @@ impl SqliteBackend {
         })
     }
 
+    /// Logical main-database bytes, not RSS or an on-disk/WAL measurement.
+    pub fn logical_size_bytes(&self) -> rb_types::Result<u64> {
+        self.lock()?.logical_size_bytes()
+    }
+
     fn lock(&self) -> rb_types::Result<std::sync::MutexGuard<'_, SqliteStore>> {
         self.store
             .lock()

@@ -416,7 +416,7 @@ the memory lifecycle, and poisoning detection on high-trust memories.
 
 ### 6.1 Write provenance
 
-Every write path declares its provenance: `origin_user`, `origin_host`,
+First-party write paths declare available provenance: `origin_user`, `origin_host`,
 `origin_agent`, `origin_source` (`hook|mcp|cli|job`), `session_id`
 (`crates/rb-store/migrations/004_provenance.sql`, W0.5), and — stamped by the
 daemon, never from a request payload — `origin_channel` (`hook|mcp|cli`
@@ -427,6 +427,14 @@ Rows that predate
 the migrations keep honest `NULL`s — provenance was deliberately never
 backfilled or faked. Injected memories carry their provenance label into the
 prompt (§3.1).
+
+Migration 015 retains those honest NULLs and marks historical source/channel-NULL
+rows `legacy_unknown`; they remain inspectable but are recall/context-ineligible.
+New identity-less writes remain allowed and explicitly unverified, and sourced
+internal jobs retain their behavior. Curation/editing never upgrades historical
+unknowns; export/restore preserves explicit classification. Recovery is deliberate
+inspection and re-authoring, followed by archiving the old entry, not fabricated
+provenance or an automatic trust promotion.
 
 ### 6.2 Trust boundaries and access control
 

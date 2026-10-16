@@ -63,6 +63,7 @@ pub struct QuestionRecord {
     pub failure: &'static str,
     pub ingest_ms: u128,
     pub query_us: u128,
+    pub logical_db_bytes: u64,
 }
 
 fn classify(m: &QuestionMetrics, abstained: bool) -> &'static str {
@@ -101,6 +102,7 @@ pub async fn run_question<P: EmbeddingProvider>(
         failure,
         ingest_ms,
         query_us,
+        logical_db_bytes: r.logical_db_bytes,
     })
 }
 

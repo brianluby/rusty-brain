@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rb_embed::{EmbeddingProvider, LocalProvider};
+use rb_embed::LocalProvider;
 use rb_eval::external::core::Memo;
 use rb_eval::external::locomo::{run_sample, QaRecord, Sample};
 use rb_eval::external::longmemeval::{aggregate, run_question, Entry, Profile, TOP_N};
@@ -21,12 +21,29 @@ const MANIFEST: &str = include_str!("../../external/manifest.json");
 
 #[derive(Parser)]
 struct Cli {
+    /// Mark a new, separately named diagnostic artifact; never replaces frozen quality.
+    #[arg(long, global = true)]
+    diagnostic: bool,
     #[command(subcommand)]
     command: Command,
 }
 
+struct RunOptions {
+    profile: Profile,
+    out: PathBuf,
+    embed_max_tokens: Option<usize>,
+    diagnostic: bool,
+}
+
 #[derive(Subcommand)]
 enum Command {
+    /// Add reconstructable failure classes and hash-link frozen output, with no retrieval.
+    CompleteArtifacts {
+        #[arg(long)]
+        runs: PathBuf,
+        #[arg(long)]
+        out: PathBuf,
+    },
     Longmemeval {
         #[arg(long)]
         data: PathBuf,
@@ -127,8 +144,19 @@ fn run_meta(
     manifest: &serde_json::Value,
     profile: Profile,
     embed_max_tokens: Option<usize>,
+    diagnostic: bool,
 ) -> serde_json::Value {
+    let w = rb_search::Weights::default();
     json!({
+        "artifact_role": if diagnostic { "current_diagnostic_not_frozen_quality" } else { "retrieval_evaluation" },
+        "captured_at": chrono::Utc::now().to_rfc3339(),
+        "hardware": hardware_meta(),
+        "argv": std::env::args().collect::<Vec<_>>(),
+        "manifest_sha256": format!("{:x}", Sha256::digest(MANIFEST.as_bytes())),
+        "dataset_pins": manifest["datasets"],
+        "linear_gates": {"score_floor": rb_search::SCORE_FLOOR, "abstain_threshold": rb_search::ABSTAIN_THRESHOLD, "confidence_floor": rb_search::CONFIDENCE_FLOOR},
+        "fusion_weights": if profile == Profile::Native { json!({"vector": w.vector, "keyword": w.keyword, "graph": w.graph, "importance": w.importance, "recency": w.recency}) } else { serde_json::Value::Null },
+        "channel_score_semantics": "unweighted: FTS reciprocal zero-based rank (not BM25), clamped cosine similarity, reciprocal graph hops; before priors/confidence/source adjustment, not final contributions",
         "profile": profile,
         "rusty_brain_commit": git(&["rev-parse", "HEAD"]),
         "rusty_brain_dirty": git(&["status", "--porcelain"]).map(|s| !s.is_empty()),
@@ -136,8 +164,28 @@ fn run_meta(
         "embedding": {"model": manifest["rusty_brain"]["embedding_model"], "dim": manifest["rusty_brain"]["embedding_dim"], "input_kind": "document/query (symmetric model; kind ignored)", "max_tokens": max_tokens_json(embed_max_tokens)},
         "fusion": if profile == Profile::Native { "production default (Linear) + heuristic enrichment" } else { "none (vector index only)" },
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        "db": "in-memory per question (size not measured)",
+        "db": "in-memory fresh per question; logical_db_bytes = SQLite main page_count * page_size after recall (includes free pages/indexes; excludes WAL, RSS, physical filesystem bytes)",
         "external_api_cost_usd": 0.0,
+    })
+}
+
+fn command_text(program: &str, args: &[&str]) -> Option<String> {
+    let out = std::process::Command::new(program)
+        .args(args)
+        .output()
+        .ok()?;
+    out.status
+        .success()
+        .then(|| String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+fn hardware_meta() -> serde_json::Value {
+    json!({
+        "kernel": command_text("uname", &["-sr"]),
+        "cpu_model": if cfg!(target_os = "macos") { command_text("sysctl", &["-n", "machdep.cpu.brand_string"]) } else { None },
+        "physical_memory_bytes": if cfg!(target_os = "macos") { command_text("sysctl", &["-n", "hw.memsize"]) } else { None },
+        "logical_cpus": std::thread::available_parallelism().ok().map(usize::from),
+        "note": "captured on this execution only; null means unavailable; no historical hardware inference",
     })
 }
 
@@ -180,14 +228,32 @@ fn percentile(sorted: &[u128], p: f64) -> u128 {
 #[tokio::main]
 async fn main() -> Result<()> {
     let manifest: serde_json::Value = serde_json::from_str(MANIFEST)?;
-    match Cli::parse().command {
+    let cli = Cli::parse();
+    let diagnostic = cli.diagnostic;
+    match cli.command {
+        Command::CompleteArtifacts { runs, out } => {
+            rb_eval::external::artifacts::complete_frozen(&runs, &out)
+        }
         Command::Longmemeval {
             data,
             profile,
             out,
             limit,
             embed_max_tokens,
-        } => longmemeval(&manifest, data, profile, out, limit, embed_max_tokens).await,
+        } => {
+            longmemeval(
+                &manifest,
+                data,
+                limit,
+                RunOptions {
+                    profile,
+                    out,
+                    embed_max_tokens,
+                    diagnostic,
+                },
+            )
+            .await
+        }
         Command::Convomem {
             cache,
             profile,
@@ -200,12 +266,15 @@ async fn main() -> Result<()> {
             convomem_cmd(
                 &manifest,
                 cache,
-                profile,
-                out,
                 per_category,
                 top_k,
-                embed_max_tokens,
                 write_selection,
+                RunOptions {
+                    profile,
+                    out,
+                    embed_max_tokens,
+                    diagnostic,
+                },
             )
             .await
         }
@@ -220,11 +289,14 @@ async fn main() -> Result<()> {
             membench_cmd(
                 &manifest,
                 data,
-                profile,
-                out,
                 topic,
                 top_k,
-                embed_max_tokens,
+                RunOptions {
+                    profile,
+                    out,
+                    embed_max_tokens,
+                    diagnostic,
+                },
             )
             .await
         }
@@ -239,11 +311,14 @@ async fn main() -> Result<()> {
             locomo(
                 &manifest,
                 data,
-                profile,
-                out,
                 top_k,
                 limit,
-                embed_max_tokens,
+                RunOptions {
+                    profile,
+                    out,
+                    embed_max_tokens,
+                    diagnostic,
+                },
             )
             .await
         }
@@ -286,17 +361,20 @@ const CONVOMEM_SELECTION: &str = concat!(
     "/external/convomem_selection.json"
 );
 
-#[allow(clippy::too_many_arguments)]
 async fn convomem_cmd(
     manifest: &serde_json::Value,
     cache: PathBuf,
-    profile: Profile,
-    out: PathBuf,
     per_category: usize,
     top_k: usize,
-    embed_max_tokens: Option<usize>,
     write_selection: bool,
+    options: RunOptions,
 ) -> Result<()> {
+    let RunOptions {
+        profile,
+        out,
+        embed_max_tokens,
+        diagnostic,
+    } = options;
     let mut selected = Vec::new();
     let mut pins = serde_json::Map::new();
     for category in convomem::CATEGORIES {
@@ -368,7 +446,7 @@ async fn convomem_cmd(
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
     let summary = merge(
-        run_meta(manifest, profile, embed_max_tokens),
+        run_meta(manifest, profile, embed_max_tokens, diagnostic),
         json!({
             "benchmark": "convomem",
             "complete": true,
@@ -380,6 +458,7 @@ async fn convomem_cmd(
             "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
             "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
             "max_rss_bytes": max_rss_bytes(),
+            "logical_db_bytes_max": records.iter().map(|r| r.logical_db_bytes).max(),
             "overall": {
                 "n": records.len(),
                 "recall_mempalace": mean(records.iter().map(|r| r.recall)),
@@ -392,7 +471,8 @@ async fn convomem_cmd(
         }),
     );
     let tag = format!(
-        "convomem-top{top_k}-{}{}",
+        "{}convomem-top{top_k}-{}{}",
+        if diagnostic { "diagnostic-" } else { "" },
         profile_name(profile),
         token_suffix(embed_max_tokens)
     );
@@ -402,12 +482,16 @@ async fn convomem_cmd(
 async fn membench_cmd(
     manifest: &serde_json::Value,
     data: PathBuf,
-    profile: Profile,
-    out: PathBuf,
     topic: String,
     top_k: usize,
-    embed_max_tokens: Option<usize>,
+    options: RunOptions,
 ) -> Result<()> {
+    let RunOptions {
+        profile,
+        out,
+        embed_max_tokens,
+        diagnostic,
+    } = options;
     for (_, file) in membench::CATEGORY_FILES {
         let path = data.join(file);
         let Some(want) = manifest["datasets"]["membench"]["files"][file].as_str() else {
@@ -459,7 +543,7 @@ async fn membench_cmd(
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
     let summary = merge(
-        run_meta(manifest, profile, embed_max_tokens),
+        run_meta(manifest, profile, embed_max_tokens, diagnostic),
         json!({
             "benchmark": "membench",
             "complete": true,
@@ -471,6 +555,7 @@ async fn membench_cmd(
             "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
             "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
             "max_rss_bytes": max_rss_bytes(),
+            "logical_db_bytes_max": records.iter().map(|r| r.logical_db_bytes).max(),
             "overall": {
                 "n": records.len(),
                 "hit_at_k_mempalace": rate(&all, |r| r.hit),
@@ -481,7 +566,8 @@ async fn membench_cmd(
         }),
     );
     let tag = format!(
-        "membench-{topic}-top{top_k}-{}{}",
+        "{}membench-{topic}-top{top_k}-{}{}",
+        if diagnostic { "diagnostic-" } else { "" },
         profile_name(profile),
         token_suffix(embed_max_tokens)
     );
@@ -491,12 +577,16 @@ async fn membench_cmd(
 async fn locomo(
     manifest: &serde_json::Value,
     data: PathBuf,
-    profile: Profile,
-    out: PathBuf,
     top_k: usize,
     limit: Option<usize>,
-    embed_max_tokens: Option<usize>,
+    options: RunOptions,
 ) -> Result<()> {
+    let RunOptions {
+        profile,
+        out,
+        embed_max_tokens,
+        diagnostic,
+    } = options;
     let (bytes, sha) = read_pinned(manifest, "locomo10", &data)?;
     let mut samples: Vec<Sample> = serde_json::from_slice(&bytes)?;
     if let Some(n) = limit {
@@ -511,7 +601,8 @@ async fn locomo(
     )?));
     std::fs::create_dir_all(&out)?;
     let tag = format!(
-        "locomo-top{top_k}-{}{}",
+        "{}locomo-top{top_k}-{}{}",
+        if diagnostic { "diagnostic-" } else { "" },
         profile_name(profile),
         token_suffix(embed_max_tokens)
     );
@@ -548,7 +639,7 @@ async fn locomo(
         .collect();
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
-    let mut summary = run_meta(manifest, profile, embed_max_tokens);
+    let mut summary = run_meta(manifest, profile, embed_max_tokens, diagnostic);
     let extra = json!({
         "benchmark": "locomo10",
         "complete": limit.is_none(),
@@ -561,6 +652,7 @@ async fn locomo(
         "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
         "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
         "max_rss_bytes": max_rss_bytes(),
+        "logical_db_bytes_max": records.iter().map(|r| r.logical_db_bytes).max(),
         "overall": {
             "n": records.len(),
             "empty_evidence": records.iter().filter(|r| r.evidence_empty).count(),
@@ -585,11 +677,15 @@ async fn locomo(
 async fn longmemeval(
     manifest: &serde_json::Value,
     data: PathBuf,
-    profile: Profile,
-    out: PathBuf,
     limit: Option<usize>,
-    embed_max_tokens: Option<usize>,
+    options: RunOptions,
 ) -> Result<()> {
+    let RunOptions {
+        profile,
+        out,
+        embed_max_tokens,
+        diagnostic,
+    } = options;
     let pinned = &manifest["datasets"]["longmemeval_s_cleaned"];
 
     let bytes = std::fs::read(&data).with_context(|| format!("reading {}", data.display()))?;
@@ -612,7 +708,8 @@ async fn longmemeval(
     )?);
     std::fs::create_dir_all(&out)?;
     let tag = format!(
-        "longmemeval-{}{}",
+        "{}longmemeval-{}{}",
+        if diagnostic { "diagnostic-" } else { "" },
         profile_name(profile),
         token_suffix(embed_max_tokens)
     );
@@ -652,30 +749,25 @@ async fn longmemeval(
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
 
-    let summary = json!({
-        "benchmark": "longmemeval_s_cleaned",
-        "profile": profile,
-        "complete": limit.is_none(),
-        "rusty_brain_commit": git(&["rev-parse", "HEAD"]),
-        "rusty_brain_dirty": git(&["status", "--porcelain"]).map(|s| !s.is_empty()),
-        "mempalace_commit": manifest["mempalace"]["commit"],
-        "dataset_sha256": sha,
-        "dataset_hf_revision": pinned["hf_revision"],
-        "embedding": {"model": provider.model_id(), "dim": provider.dim(), "input_kind": "document/query (symmetric model; kind ignored)", "max_tokens": max_tokens_json(embed_max_tokens)},
-        "granularity": "session (user turns joined by newline)",
-        "fusion": if profile == Profile::Native { "production default (Linear) + heuristic enrichment" } else { "none (vector index only)" },
-        "top_n": TOP_N,
-        "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
-        "wall_clock_s": wall.elapsed().as_secs_f64(),
-        "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
-        "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
-        "max_rss_bytes": max_rss_bytes(),
-        "db": "in-memory per question (size not measured)",
-        "external_api_cost_usd": 0.0,
-        "overall": aggregate(&records),
-        "per_type": per_type,
-        "failures": failures,
-    });
+    let summary = merge(
+        run_meta(manifest, profile, embed_max_tokens, diagnostic),
+        json!({
+            "benchmark": "longmemeval_s_cleaned",
+            "complete": limit.is_none(),
+            "dataset_sha256": sha,
+            "dataset_hf_revision": pinned["hf_revision"],
+            "granularity": "session (user turns joined by newline)",
+            "top_n": TOP_N,
+            "wall_clock_s": wall.elapsed().as_secs_f64(),
+            "ingest_ms_total": records.iter().map(|r| r.ingest_ms).sum::<u128>(),
+            "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0), "p99": percentile(&query_us, 99.0)},
+            "max_rss_bytes": max_rss_bytes(),
+            "logical_db_bytes_max": records.iter().map(|r| r.logical_db_bytes).max(),
+            "overall": aggregate(&records),
+            "per_type": per_type,
+            "failures": failures,
+        }),
+    );
     let path = out.join(format!("{tag}.summary.json"));
     std::fs::write(&path, serde_json::to_string_pretty(&summary)?)?;
     println!("{}", serde_json::to_string_pretty(&summary["overall"])?);

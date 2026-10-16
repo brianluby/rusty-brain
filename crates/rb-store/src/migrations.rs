@@ -425,6 +425,62 @@ mod tests {
     }
 
     #[test]
+    fn legacy_unknown_classifies_only_historical_unsourced_rows_once() {
+        let c = conn();
+        run_migrations_up_to(&c, 14).unwrap();
+        for (id, source, channel) in [
+            ("unknown", None, None),
+            ("job", Some("job"), None),
+            ("hook", Some("hook"), None),
+            ("channel", None, Some("cli")),
+        ] {
+            c.execute(
+                "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content,
+                 summary, keywords, tags, memory_type, importance, confidence, embedding_model,
+                 origin_source, origin_channel)
+                 VALUES (?1,'global',0,0,'zebra','s','[]','[]','insight',5,1.0,'',?2,?3)",
+                rusqlite::params![id, source, channel],
+            )
+            .unwrap();
+        }
+        run_migrations(&c).unwrap();
+        let unknown = |id: &str| -> bool {
+            c.query_row(
+                "SELECT legacy_unknown FROM memories WHERE memory_id=?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert!(unknown("unknown"));
+        for id in ["job", "hook", "channel"] {
+            assert!(
+                !unknown(id),
+                "recorded provenance must remain unchanged: {id}"
+            );
+        }
+        c.execute(
+            "INSERT INTO memories (memory_id, namespace, created_at, updated_at, content,
+             summary, keywords, tags, memory_type, importance, confidence, embedding_model)
+             VALUES ('new','global',0,0,'zebra','s','[]','[]','insight',5,1.0,'')",
+            [],
+        )
+        .unwrap();
+        run_migrations(&c).unwrap();
+        assert!(
+            !unknown("new"),
+            "restart must not reclassify new identity-less writes"
+        );
+        assert!(unknown("unknown"));
+        assert!(c
+            .execute(
+                "UPDATE memories SET legacy_unknown=2 WHERE memory_id='new'",
+                []
+            )
+            .is_err());
+    }
+
+    #[test]
     fn target_link_index_migrates_a_populated_prior_schema() {
         let c = conn();
         run_migrations_up_to(&c, 10).unwrap();

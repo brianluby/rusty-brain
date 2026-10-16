@@ -10,19 +10,26 @@
 # ALLOWED TO FAIL, WITH ALERTING: this workflow is scheduled-only (plus manual
 # dispatch) and NEVER gates PRs. On failure it opens — or comments on — a
 # pinned issue titled "nightly claude smoke failing"; on success it closes
-# that issue if it is open.
+# that issue if it is open. Manual runs leave issues untouched unless opted in.
 #
-# Required repository secret:
-#   ANTHROPIC_API_KEY — an Anthropic API key with a small spend budget. The
-#   session runs `--model haiku --max-budget-usd 1`, so each run costs cents.
-#   Until the secret is configured, every run fails fast on the preflight step
-#   (and the alert issue says so).
+# Required repository secret LITELLM_API_KEY and variable LITELLM_BASE_URL.
+# Claude Code uses the proxy's native Anthropic Messages endpoint with model
+# deepseek-v4.1-flash. Its $1 CLI budget is not authoritative proxy billing.
+# Missing provider configuration fails before any model session.
+# Credentials currently remain local by user choice: scheduled CI is blocked
+# until the user provisions these values. Never fall back to Anthropic credits;
+# local proof does not close the GitHub alert issue or establish CI recovery.
 name: nightly claude smoke
 
 on:
   schedule:
     - cron: "23 8 * * *" # nightly, off the top of the hour
   workflow_dispatch:
+    inputs:
+      manage_issue:
+        description: "Update the alert issue (scheduled runs always do)"
+        type: boolean
+        default: false
 
 env:
   CARGO_TERM_COLOR: always
@@ -42,12 +49,13 @@ jobs:
       contents: read
       issues: write # open/update/close the alert issue
     steps:
-      - name: Preflight - require the ANTHROPIC_API_KEY secret
+      - name: Preflight - require the LiteLLM credential and endpoint
         env:
-          HAVE_KEY: ${{ secrets.ANTHROPIC_API_KEY != '' }}
+          HAVE_KEY: ${{ secrets.LITELLM_API_KEY != '' }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
         run: |
-          if [ "$HAVE_KEY" != "true" ]; then
-            echo "::error::repository secret ANTHROPIC_API_KEY is not configured; the nightly real-Claude-Code smoke cannot run. See the header comment in .github/workflows/nightly-claude-smoke.yml."
+          if [ "$HAVE_KEY" != "true" ] || [ -z "$LITELLM_BASE_URL" ]; then
+            echo "::error::configure repository secret LITELLM_API_KEY and variable LITELLM_BASE_URL."
             exit 1
           fi
 
@@ -76,9 +84,13 @@ jobs:
 
       - name: Run the smoke (capture -> idle -> recall + planted-secret DB grep)
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LITELLM_BASE_URL: ${{ vars.LITELLM_BASE_URL }}
           SMOKE_WORKDIR: ${{ runner.temp }}/claude-smoke
-        run: scripts/nightly-claude-smoke.sh --bin-dir target/release
+        run: |
+          export ANTHROPIC_BASE_URL="${LITELLM_BASE_URL%/}"
+          export ANTHROPIC_BASE_URL="${ANTHROPIC_BASE_URL%/v1}"
+          scripts/nightly-claude-smoke.sh --bin-dir target/release --model deepseek-v4.1-flash
 
       # GitHub's automatic secret masking covers step logs ONLY — not artifact
       # file contents. The smoke runs a real model session with unrestricted
@@ -88,7 +100,7 @@ jobs:
       - name: Scrub any leaked API key from logs before upload
         if: always()
         env:
-          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEY: ${{ secrets.LITELLM_API_KEY }}
         run: |
           set -euo pipefail
           dir="${RUNNER_TEMP}/claude-smoke"
@@ -114,7 +126,7 @@ jobs:
           if-no-files-found: ignore
 
       - name: Open or update the alert issue on failure
-        if: failure()
+        if: failure() && (github.event_name == 'schedule' || inputs.manage_issue)
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
@@ -137,7 +149,7 @@ jobs:
           fi
 
       - name: Close the alert issue on success
-        if: success()
+        if: success() && (github.event_name == 'schedule' || inputs.manage_issue)
         env:
           GH_TOKEN: ${{ github.token }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}

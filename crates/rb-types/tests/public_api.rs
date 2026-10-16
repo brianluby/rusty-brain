@@ -52,6 +52,7 @@ fn all_public_types_are_reachable_from_crate_root() {
         score: 1.0,
         channels: rb_types::ChannelHits::default(),
         stale: false,
+        channel_scores: None,
     };
     assert!((res.score - 1.0).abs() < f32::EPSILON);
     assert!(!res.channels.fts && !res.channels.vector && !res.channels.graph);

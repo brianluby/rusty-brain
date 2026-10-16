@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft, ready after the remaining W3.5 scorecard evidence is generated or explicitly deferred.
+Delivered as evidence accounting, not an all-dimensions pass. The [closeout artifact](../eval/2026-06-23-w35-scorecard-closeout.md) records the initial measured/deferred states; its July addendum links the [full N=5 read and post-fix safety reread](../eval/2026-07-12-w35-scorecard-n5-run.md). Class B capture and Class R single-machine reach have bounded measured evidence. Historical Class A retrieval-at-scale PASS and ADR-3 ratification remain withdrawn by #75: unequal-importance/off-topic distractors and unattributed startup versus query evidence cannot establish retrieval at scale. Performance, concurrency, resource exhaustion, real-provider semantic quality, and multi-machine adoption are not established by this scorecard.
 
 ## Owner Area
 
@@ -124,12 +124,8 @@ or the equivalent GitHub Actions run URL and artifact path.
 
 ## Implementation Checklist
 
-- [ ] Gather current scorecard artifacts and run links.
-- [ ] Determine final state for C, A, B, R, and safety.
-- [ ] Create closeout artifact.
-- [ ] Update W3.5 redesign doc.
-- [ ] Update road-to-tens plan.
-- [ ] Update changelog.
-- [ ] Update sprint board parent.
-- [ ] Run self-test.
-- [ ] Run workspace tests or document why they were skipped.
+- [x] Gather artifacts and run links in the linked closeout and measured N=5 report.
+- [x] Account for C, A, B, R, and safety, including explicit deferrals, the first safety failure and recovery reread, and withdrawn Class A interpretation.
+- [x] Publish closeout artifact with bounded claims and Phase-5-not-proven caveat.
+
+The historical roadmap/changelog/board synchronization and test-execution items are not newly certified here. This reconciliation updates delivered evidence accounting; it does not claim a fresh self-test, workspace test run, or live scorecard execution. Follow the verification commands above for the current checkout.

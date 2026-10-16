@@ -37,6 +37,7 @@ pub struct Client<S = UnixStream> {
     supports_anchors: bool,
     /// Whether the daemon accepts durable curation intent on write requests.
     supports_human_curation: bool,
+    supports_legacy_quarantine: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -128,6 +129,10 @@ where
             state: ConnectionState::Idle,
             supports_anchors,
             supports_human_curation,
+            supports_legacy_quarantine: ack
+                .capabilities
+                .iter()
+                .any(|c| c == crate::CAP_LEGACY_QUARANTINE),
         })
     }
 
@@ -157,6 +162,18 @@ where
         if !matches!(self.state, ConnectionState::Idle) {
             return Err(Error::Io(
                 "connection has an unfinished request, is streaming, or is broken".into(),
+            ));
+        }
+        if matches!(
+            req,
+            Request::Remember {
+                legacy_unknown: Some(true),
+                ..
+            } | Request::HasHistoricalDuplicate { .. }
+        ) && !self.supports_legacy_quarantine
+        {
+            return Err(Error::InvalidArgument(
+                "daemon does not advertise legacy quarantine support".to_string(),
             ));
         }
         if request_uses_human_curation(req) && !self.supports_human_curation {
@@ -321,6 +338,7 @@ where
             None,
             false,
             false,
+            false,
         )
         .await
     }
@@ -360,6 +378,7 @@ where
             evidence,
             false,
             false,
+            false,
         )
         .await
     }
@@ -382,6 +401,7 @@ where
         evidence: Option<rb_types::CaptureEvidence>,
         human_curated: bool,
         allow_curated_supersede: bool,
+        legacy_unknown: bool,
     ) -> Result<MemoryId> {
         if allow_curated_supersede && supersedes.is_none() {
             return Err(Error::InvalidArgument(
@@ -406,6 +426,7 @@ where
             evidence,
             human_curated,
             allow_curated_supersede,
+            legacy_unknown,
         )
         .await
     }
@@ -442,6 +463,7 @@ where
             None,
             false,
             false,
+            false,
         )
         .await
     }
@@ -462,6 +484,7 @@ where
         evidence: Option<rb_types::CaptureEvidence>,
         human_curated: bool,
         allow_curated_supersede: bool,
+        legacy_unknown: bool,
     ) -> Result<MemoryId> {
         // Mirrors the engine-side check so a bad EXPLICIT value fails fast and
         // with the same error class the daemon would round-trip back. None
@@ -475,6 +498,7 @@ where
         }
         let resp = self
             .request(Request::Remember {
+                legacy_unknown: legacy_unknown.then_some(true),
                 content,
                 context,
                 memory_type,
@@ -593,6 +617,17 @@ where
                 abstained,
                 snapshot,
             } => Ok((results, degraded, abstained, snapshot)),
+            other => Err(self.unexpected(other)),
+        }
+    }
+
+    /// Read-only exact-content restore probe, independent of recall/list limits.
+    pub async fn has_historical_duplicate(&mut self, content: String) -> Result<bool> {
+        let response = self
+            .request(Request::HasHistoricalDuplicate { content })
+            .await?;
+        match response {
+            Resp::HistoricalDuplicate { found } => Ok(found),
             other => Err(self.unexpected(other)),
         }
     }
@@ -1213,6 +1248,9 @@ mod wrapper_tests {
                 Err(_) => break, // client closed
             };
             let resp = match req {
+                Request::HasHistoricalDuplicate { content } => Response::HistoricalDuplicate {
+                    found: content == "old unknown row",
+                },
                 Request::Remember {
                     content, anchors, ..
                 } => {
@@ -1239,6 +1277,7 @@ mod wrapper_tests {
                             memory: note(),
                             score: 0.5,
                             channels: rb_types::ChannelHits::default(),
+                            channel_scores: None,
                             stale: false,
                         }]
                     };
@@ -1601,6 +1640,69 @@ mod wrapper_tests {
     }
 
     #[tokio::test]
+    async fn historical_restore_requires_capability_without_breaking_identityless_writes() {
+        for advertised in [false, true] {
+            let (_directory, path) = socket_path();
+            let listener = UnixListener::bind(&path).unwrap();
+            let id = MemoryId::new();
+            let capabilities = if advertised {
+                vec![crate::CAP_LEGACY_QUARANTINE.into()]
+            } else {
+                vec![]
+            };
+            let server = tokio::spawn(serve_with_capabilities(listener, id.clone(), capabilities));
+            let mut client = connect(&path).await;
+            let probe = client
+                .has_historical_duplicate("old unknown row".into())
+                .await;
+            if advertised {
+                assert!(probe.unwrap());
+            } else {
+                assert!(matches!(probe, Err(Error::InvalidArgument(_))));
+            }
+            let restored = client
+                .remember_anchored_with_intent(
+                    "old unknown row".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                )
+                .await;
+            if advertised {
+                assert_eq!(restored.unwrap(), id);
+            } else {
+                assert!(matches!(restored, Err(Error::InvalidArgument(_))));
+            }
+            let fresh = client
+                .remember(
+                    "new unverified row".into(),
+                    None,
+                    MemoryType::Insight,
+                    5,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                )
+                .await
+                .unwrap();
+            assert_eq!(fresh, id);
+            drop(client);
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn curation_intent_requires_capability_without_breaking_legacy_operations() {
         for advertised in [false, true] {
             let (_directory, path) = socket_path();
@@ -1643,6 +1745,7 @@ mod wrapper_tests {
                     None,
                     None,
                     true,
+                    false,
                     false,
                 )
                 .await;

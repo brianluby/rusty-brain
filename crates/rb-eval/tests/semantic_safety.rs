@@ -27,6 +27,7 @@ async fn remember(
 ) -> MemoryId {
     engine
         .remember(RememberInput {
+            legacy_unknown: false,
             content: content.to_string(),
             context: None,
             memory_type: MemoryType::Insight,

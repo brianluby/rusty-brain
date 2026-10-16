@@ -301,6 +301,9 @@ mod tests {
                 });
             }
             Ok(match request {
+                Request::HasHistoricalDuplicate { .. } => {
+                    Response::HistoricalDuplicate { found: false }
+                }
                 Request::Remember { .. } => Response::Remembered {
                     id: self.id.clone(),
                 },
@@ -309,6 +312,7 @@ mod tests {
                         memory: note(),
                         score: 0.9,
                         channels: rb_types::ChannelHits::default(),
+                        channel_scores: None,
                         stale: false,
                     }],
                     degraded: false,
@@ -495,6 +499,7 @@ mod tests {
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
                     stale: false,
+                    channel_scores: None,
                 })
                 .collect(),
             degraded: false,
@@ -1367,6 +1372,7 @@ mod tests {
                     anchors: memory.anchors.clone(),
                     trust_class: memory.trust_class,
                     human_curated: memory.human_curated,
+                    legacy_unknown: memory.legacy_unknown,
                     source_status: rb_types::HistorySourceStatus::Unavailable,
                 }),
                 origin_user: memory.origin_user.clone(),

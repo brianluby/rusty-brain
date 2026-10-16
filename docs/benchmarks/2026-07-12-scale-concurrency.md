@@ -8,6 +8,30 @@ needs at least 100 successful samples per latency path at 1k, 10k, and a practic
 upper bound, using the real 384-dimensional local model in an unattended
 environment without this task runner's execution ceiling.
 
+### Replacement preparation — 2026-10-16 (not a benchmark result)
+
+The previously cited benchmark `be6e0c4faa727df546dd81aa79037cec53482860`,
+SQLite-full regression `121d3d7d2e660b0be8ad4a85967a7670be9f3660`, handoff
+`2c99f13`, and artifact SHA-256
+`c24756340dfaad111637a415a5f8b434ef6e227088997cc8ba9b8c1405b0ab06`
+were not recovered from the additional local reflog/unreachable-object,
+worktree and retained-artifact searches. No GitHub refetch was used to repeat
+the previously reported absence. Their recorded 25k approval remains a tracker
+decision, not recovered measurements.
+
+The replacement `rusty-brain-scale-v4` harness keeps the real-local matrix and
+all existing latency/durability gates. It adds retained evidence for an actual
+SQLite `max_page_count` refusal on a disposable store, complete rollback,
+successful subsequent insert and durable reopen. A separate bounded-pilot
+eligibility field requires representative load and all nonphysical faults;
+the full production field still requires physical exhaustion. This is limited
+to the existing maintainer comment 182 bounded-trial decision, not a new waiver.
+The [harness guide](scale-concurrency-harness.md#bounded-pilot-replacement-evidence)
+contains runnable matrix commands with in-harness fault execution/output capture. They have not
+been run during implementation. No replacement artifact/hash, passing gate,
+resource ceiling or pilot admission is claimed here.
+
+
 ## Corrected harness contract
 
 The committed command defaults to the real local `all-MiniLM-L6-v2` provider
@@ -162,8 +186,7 @@ mount is never fully production-eligible.
 # Real local model (default; compiles rb-eval's record-local feature):
 scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
   --operations 100 --burst 100 --operation-timeout-ms 30000 \
-  --interrupted-writes-artifact target/interrupted-writes-test.json \
-  --writer-death-artifact target/writer-death-test.json \
+  --fault-evidence-dir target/scale-fault-evidence \
   --output target/scale-local-384.json
 
 # Explicit smoke-only deterministic fixture:

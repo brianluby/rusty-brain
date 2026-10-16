@@ -165,6 +165,8 @@ pub struct ItemRecord {
     pub abstained: Option<String>,
     pub ingest_ms: u128,
     pub query_us: u128,
+    pub logical_db_bytes: u64,
+    pub failure: &'static str,
 }
 
 pub async fn run_item<P: EmbeddingProvider>(
@@ -201,6 +203,11 @@ pub async fn run_item<P: EmbeddingProvider>(
         .collect();
     let hit_sid_only = retrieved.iter().any(|t| item.targets.contains(&t.sid));
     let hit = hit_sid_only || retrieved.iter().any(|t| item.targets.contains(&t.global));
+    let failure = super::core::classify_failure(
+        usize::from(!item.targets.is_empty()),
+        usize::from(hit),
+        r.abstained.is_some(),
+    );
     Ok(Some(ItemRecord {
         category: item.category,
         topic: item.topic.clone(),
@@ -214,6 +221,8 @@ pub async fn run_item<P: EmbeddingProvider>(
         abstained: r.abstained,
         ingest_ms: r.ingest_ms,
         query_us: r.query_us,
+        logical_db_bytes: r.logical_db_bytes,
+        failure,
     }))
 }
 

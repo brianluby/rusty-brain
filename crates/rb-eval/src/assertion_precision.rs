@@ -165,6 +165,7 @@ pub async fn run_committed() -> anyhow::Result<PrecisionReport> {
         for belief in case.memories {
             let (mut note, vector) = engine
                 .compose_note(RememberInput {
+                    legacy_unknown: false,
                     content: belief.content,
                     context: None,
                     memory_type: MemoryType::Insight,

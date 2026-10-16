@@ -466,6 +466,13 @@ A single SQLite file holds everything, opened in WAL mode:
   `origin_source`, `session_id` — nullable, never backfilled, so pre-provenance rows
   keep `NULL`). `human_curated` is a dedicated, default-false maintenance-protection
   bit, not a tag, trust classification or authorization principal.
+  `legacy_unknown` is a separate persisted historical classification: migration
+  015 marks preexisting NULL-source/NULL-channel rows, while new identity-less
+  writes default false and remain explicitly unverified. Historical rows stay
+  available for audit but are filtered before recall/context limits, including
+  after curation or restore. A capability-gated, namespace-scoped exact-content
+  probe deduplicates historical restores with a boolean response rather than
+  materializing the corpus or depending on the ordinary list cutoff.
 - **`memory_vectors`** — a `sqlite-vec` virtual table of embeddings, one per memory.
 - **`memory_links`** — directed edges between memories (e.g. `references`,
   `contradicts`) with a decaying strength.
