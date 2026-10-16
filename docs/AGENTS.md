@@ -203,8 +203,9 @@ installers and skip OMP.
 
 **Lifecycle:**
 
-- `session_start` ensures the daemon is available and defers preparation.
-- The first `before_agent_start` prepares stable context and prompt-relevant
+- `session_start` only marks startup preparation as pending; it starts no hook
+  process. The first `before_agent_start` connects, auto-starts the daemon if
+  needed, and performs deferred preparation of stable context and prompt-relevant
   memory in one hidden, agent-attributed message under one 600-token budget,
   including the shared untrusted-data framing. Full UUID handles lead to exact
   `get`/`history` detail; previews are not complete claims.

@@ -140,7 +140,7 @@ async fn handle_tools_call(
 
     let response = proxy.call(request).await;
     let mut correction = None;
-    if name == "recall" {
+    if name == "recall" && response.is_ok() {
         if let Some(delivery) = delivery.as_mut() {
             correction = match proxy.call(Request::Context).await {
                 Ok(Response::ContextResult { context }) => delivery.correction(&context),
@@ -165,7 +165,7 @@ async fn handle_tools_call(
         }
         Err(e) => {
             let mut message = format!("daemon call failed: {e}");
-            if name == "context" && delivery.is_some() {
+            if matches!(name, "context" | "recall") && delivery.is_some() {
                 correction = Some(CURRENT_STATE_UNAVAILABLE.to_string());
             }
             if let Some(correction) = correction {
@@ -1191,6 +1191,65 @@ mod tests {
         assert_eq!(unchanged["content"][0]["text"], "no stored memories match");
         assert_eq!(first_proxy.requests.len(), 3);
         assert_eq!(second_proxy.requests.len(), 3);
+    }
+
+    #[tokio::test]
+    async fn failed_recall_returns_without_refresh_and_retains_prior_currentness() {
+        struct OutageProxy {
+            context: Option<rb_types::ProjectContext>,
+        }
+
+        #[async_trait]
+        impl DaemonProxy for OutageProxy {
+            async fn call(&mut self, request: Request) -> rb_types::Result<Response> {
+                match request {
+                    Request::Context => match self.context.take() {
+                        Some(context) => Ok(Response::ContextResult { context }),
+                        None => std::future::pending().await,
+                    },
+                    Request::Recall { .. } => {
+                        Err(rb_types::Error::Io("fixture transport disconnected".into()))
+                    }
+                    _ => panic!("unexpected outage fixture operation"),
+                }
+            }
+        }
+
+        let memory = note();
+        let mut proxy = OutageProxy {
+            context: Some(project_context(vec![memory.clone()])),
+        };
+        let mut server = Server::default();
+        tool(&mut server, &mut proxy, "context", json!({})).await;
+        let response = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            server.handle_request(
+                req(
+                    "tools/call",
+                    Some(91),
+                    json!({ "name": "recall", "arguments": { "query": "unknown" } }),
+                ),
+                &mut proxy,
+            ),
+        )
+        .await
+        .expect("a known transport failure must not wait for another daemon operation")
+        .unwrap();
+        let error = response.error.unwrap();
+        assert_eq!(error.code, INTERNAL_ERROR);
+        assert!(error.message.contains("fixture transport disconnected"));
+        assert!(error.message.contains(CURRENT_STATE_UNAVAILABLE));
+        assert!(!error.message.contains(&memory.content));
+
+        proxy.context = Some(project_context(Vec::new()));
+        let refreshed = tool(&mut server, &mut proxy, "context", json!({})).await;
+        assert!(
+            refreshed["content"][0]["text"]
+                .as_str()
+                .unwrap()
+                .contains(&memory.id.to_string()),
+            "recovery must still qualify the preview prepared before the outage"
+        );
     }
 
     #[tokio::test]
