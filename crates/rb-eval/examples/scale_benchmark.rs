@@ -18,7 +18,7 @@ use rb_mcp::DaemonProxy;
 use rb_proto::{Client, Request, Response};
 use rb_store::{SqliteStore, Store};
 use rb_types::{MemoryNote, MemoryType, Namespace};
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::oneshot;
@@ -64,12 +64,9 @@ struct Options {
     /// Refuse disk exhaustion when the dedicated mount has more free space.
     #[arg(long, default_value_t = 512)]
     disk_exhaustion_max_mib: u64,
-    /// Retained interrupted-write test evidence; the harness hashes this file.
-    #[arg(long)]
-    interrupted_writes_artifact: Option<PathBuf>,
-    /// Retained writer-death/reopen test evidence; the harness hashes this file.
-    #[arg(long)]
-    writer_death_artifact: Option<PathBuf>,
+    /// Output directory for fault proofs executed by this harness (never read as input).
+    #[arg(long, default_value = "target/scale-fault-evidence")]
+    fault_evidence_dir: PathBuf,
     /// JSON report path.
     #[arg(long, default_value = "target/scale-benchmark.json")]
     output: PathBuf,
@@ -102,6 +99,8 @@ struct Report {
     embedding_fixture: &'static str,
     representative_load_eligible: bool,
     production_envelope_eligible: bool,
+    bounded_pilot_eligible: bool,
+    bounded_pilot_max_active_memories: Option<usize>,
     minimum_p99_samples: usize,
     operation_timeout_ms: u64,
     seed_batch_timeout_ms: u64,
@@ -255,7 +254,7 @@ struct FaultEvidence {
     detail: String,
 }
 
-#[derive(Deserialize)]
+#[derive(Serialize)]
 struct FaultArtifactRecord {
     schema: String,
     git_sha: String,
@@ -513,8 +512,7 @@ async fn main() -> anyhow::Result<()> {
         &shape,
         options.disk_exhaustion_dir.as_deref(),
         options.disk_exhaustion_max_mib,
-        options.interrupted_writes_artifact.as_deref(),
-        options.writer_death_artifact.as_deref(),
+        &options.fault_evidence_dir,
         &git_sha,
     )
     .await?;
@@ -535,9 +533,12 @@ async fn main() -> anyhow::Result<()> {
         });
     let production_envelope_eligible =
         representative_load_eligible && mandatory_fault_evidence_complete(&fault_matrix);
+    // Maintainer #57 comment 182 defers physical exhaustion only for this bounded trial.
+    let bounded_pilot_eligible =
+        bounded_pilot_evidence_complete(representative_load_eligible, &fault_matrix);
 
     let report = Report {
-        schema: "rusty-brain-scale-v3",
+        schema: "rusty-brain-scale-v4",
         generated_at: chrono::Utc::now().to_rfc3339(),
         git_sha,
         worktree_clean,
@@ -547,6 +548,8 @@ async fn main() -> anyhow::Result<()> {
         embedding_fixture: options.provider.description(),
         representative_load_eligible,
         production_envelope_eligible,
+        bounded_pilot_eligible,
+        bounded_pilot_max_active_memories: bounded_pilot_eligible.then_some(25_000),
         minimum_p99_samples: MINIMUM_P99_SAMPLES,
         operation_timeout_ms: options.operation_timeout_ms,
         seed_batch_timeout_ms: options.seed_batch_timeout_ms,
@@ -1453,6 +1456,7 @@ async fn run_mixed_operation(
                 http_addr,
                 "/remember",
                 Request::Remember {
+                    legacy_unknown: None,
                     content: format!("mixed HTTP write {index}"),
                     context: None,
                     memory_type: MemoryType::Insight,
@@ -1652,37 +1656,53 @@ async fn fault_evidence(
     shape: &EmbeddingShape,
     disk_dir: Option<&Path>,
     disk_max_mib: u64,
-    interrupted_writes_artifact: Option<&Path>,
-    writer_death_artifact: Option<&Path>,
+    evidence_dir: &Path,
     git_sha: &str,
 ) -> anyhow::Result<Vec<FaultEvidence>> {
     let provider_status = exercise_provider_timeout(shape).await?;
     let disk_evidence = disk_exhaustion_evidence(shape, disk_dir, disk_max_mib).await?;
-    Ok(vec![
-        FaultEvidence {
-            case: "long_lived_reader",
-            status: "executed_per_corpus",
-            complete_for_full_eligibility: true,
-            detail: "Reader transaction pins WAL during writes and graceful shutdown; report records WAL growth, blocked checkpoint duration, and explicit retry/truncate.".into(),
-        },
-        artifact_fault_evidence(
-            "interrupted_writes",
-            interrupted_writes_artifact,
-            &["caught_writer_panic_isolates_and_does_not_lose_later_writes"],
-            git_sha,
-        ),
-        provider_timeout_evidence(provider_status),
-        artifact_fault_evidence(
-            "writer_death_recovery",
-            writer_death_artifact,
-            &[
-                "writer_alive_reports_liveness_and_flips_on_death",
-                "writer_death_exits_the_accept_loop",
-            ],
-            git_sha,
-        ),
-        disk_evidence,
-    ])
+    let evidence_dir = evidence_dir.to_path_buf();
+    let git_sha = git_sha.to_owned();
+    let mut evidence =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<FaultEvidence>> {
+            Ok(vec![
+                execute_fault_tests(
+                    "interrupted_writes",
+                    "rb-daemon",
+                    &["caught_writer_panic_isolates_and_does_not_lose_later_writes"],
+                    &evidence_dir,
+                    &git_sha,
+                )?,
+                execute_fault_tests(
+                    "writer_death_recovery",
+                    "rb-daemon",
+                    &[
+                        "writer_alive_reports_liveness_and_flips_on_death",
+                        "writer_death_exits_the_accept_loop",
+                    ],
+                    &evidence_dir,
+                    &git_sha,
+                )?,
+                execute_fault_tests(
+                    "sqlite_full_recovery",
+                    "rb-store",
+                    &["sqlite_full_rolls_back_and_recovers_after_reopen"],
+                    &evidence_dir,
+                    &git_sha,
+                )?,
+            ])
+        })
+        .await
+        .context("fault-test executor panicked")??;
+    evidence.push(FaultEvidence {
+        case: "long_lived_reader",
+        status: "executed_per_corpus",
+        complete_for_full_eligibility: true,
+        detail: "Reader transaction pins WAL during writes and graceful shutdown; report records WAL growth, blocked checkpoint duration, and explicit retry/truncate.".into(),
+    });
+    evidence.push(provider_timeout_evidence(provider_status));
+    evidence.push(disk_evidence);
+    Ok(evidence)
 }
 
 fn provider_timeout_evidence(provider_status: reqwest::StatusCode) -> FaultEvidence {
@@ -1705,82 +1725,104 @@ fn open_pinned_reader(db: &Path) -> rusqlite::Result<rusqlite::Connection> {
     rusqlite::Connection::open_with_flags(db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)
 }
 
-fn artifact_fault_evidence(
+fn execute_fault_tests(
     case: &'static str,
-    artifact: Option<&Path>,
+    package: &str,
     required_tests: &[&str],
-    expected_git_sha: &str,
-) -> FaultEvidence {
-    let tests = required_tests.join(", ");
-    let Some(path) = artifact else {
-        return FaultEvidence {
-            case,
-            status: "missing_immutable_artifact_reference",
-            complete_for_full_eligibility: false,
-            detail: format!(
-                "Retain output for {tests} and pass its artifact path; a test name alone is not immutable evidence."
-            ),
+    evidence_dir: &Path,
+    git_sha: &str,
+) -> anyhow::Result<FaultEvidence> {
+    std::fs::create_dir_all(evidence_dir)?;
+    let mut complete = git_sha != "unavailable" && !required_tests.is_empty();
+    let mut artifacts = Vec::with_capacity(required_tests.len());
+    for test in required_tests {
+        let arguments = [
+            "test",
+            "--release",
+            "--locked",
+            "-p",
+            package,
+            "--lib",
+            test,
+            "--",
+            "--test-threads=1",
+        ];
+        let result = std::process::Command::new("cargo")
+            .args(arguments)
+            .output()
+            .with_context(|| format!("execute required fault test {test}"))?;
+        let stdout = String::from_utf8(result.stdout).context("fault-test stdout is not UTF-8")?;
+        complete &= result.status.success() && fault_test_output_passed(&stdout, test);
+        let record = FaultArtifactRecord {
+            schema: "rusty-brain-scale-fault-evidence-v2".into(),
+            git_sha: git_sha.into(),
+            command: format!("cargo {}", arguments.join(" ")),
+            exit_code: result.status.code().unwrap_or(-1),
+            tests: vec![(*test).into()],
+            output: format!("{stdout}\n{}", String::from_utf8_lossy(&result.stderr)),
         };
-    };
-    match validate_and_hash_fault_artifact(path, expected_git_sha, required_tests) {
-        Ok(digest) => FaultEvidence {
-            case,
-            status: "validated_hashed_artifact",
-            complete_for_full_eligibility: true,
-            detail: format!(
-                "Retained test evidence for {tests}; artifact={}; sha256={digest}",
-                path.display()
-            ),
-        },
-        Err(error) => FaultEvidence {
-            case,
-            status: "unreadable_artifact_reference",
-            complete_for_full_eligibility: false,
-            detail: format!(
-                "Could not validate retained test evidence for {tests} at {}: {error}",
-                path.display()
-            ),
-        },
+        let raw = serde_json::to_vec_pretty(&record)?;
+        let path = evidence_dir.join(format!("{test}.json"));
+        std::fs::write(&path, &raw)
+            .with_context(|| format!("retain fault proof {}", path.display()))?;
+        artifacts.push(format!(
+            "{} sha256={:x}",
+            path.display(),
+            Sha256::digest(&raw)
+        ));
     }
+    Ok(FaultEvidence {
+        case,
+        status: if complete {
+            "executed_and_hashed"
+        } else {
+            "execution_failed_or_test_not_passed"
+        },
+        complete_for_full_eligibility: complete,
+        detail: artifacts.join("; "),
+    })
 }
 
-fn validate_and_hash_fault_artifact(
-    path: &Path,
-    expected_git_sha: &str,
-    required_tests: &[&str],
-) -> anyhow::Result<String> {
-    let raw = std::fs::read(path)
-        .with_context(|| format!("read evidence artifact {}", path.display()))?;
-    let record: FaultArtifactRecord = serde_json::from_slice(&raw)
-        .with_context(|| format!("parse evidence artifact {}", path.display()))?;
-    if record.schema != "rusty-brain-scale-fault-evidence-v1" {
-        bail!("unsupported fault-evidence schema");
-    }
-    if record.git_sha != expected_git_sha || expected_git_sha == "unavailable" {
-        bail!("fault evidence git SHA does not match the benchmark revision");
-    }
-    if record.exit_code != 0 {
-        bail!("fault evidence command did not exit successfully");
-    }
-    if !record.command.contains("cargo test") {
-        bail!("fault evidence command is not a cargo test invocation");
-    }
-    for test in required_tests {
-        if !record.tests.iter().any(|recorded| recorded == test) || !record.output.contains(test) {
-            bail!("fault evidence is missing required test {test}");
-        }
-    }
-    if !record.output.contains("test result: ok") {
-        bail!("fault evidence output does not record a passing test result");
-    }
-    Ok(format!("{:x}", Sha256::digest(&raw)))
+fn fault_test_output_passed(output: &str, required_test: &str) -> bool {
+    let individual_pass = output.lines().any(|line| {
+        line.strip_prefix("test ")
+            .and_then(|line| line.split_once(" ... "))
+            .is_some_and(|(name, status)| {
+                name.rsplit("::").next() == Some(required_test) && status == "ok"
+            })
+    });
+    let nonempty_pass = output.lines().any(|line| {
+        line.strip_prefix("test result: ok. ")
+            .and_then(|line| line.split_once(" passed; "))
+            .is_some_and(|(count, rest)| {
+                count.parse::<usize>().is_ok_and(|count| count > 0)
+                    && rest.starts_with("0 failed; 0 ignored;")
+            })
+    });
+    individual_pass && nonempty_pass
 }
 
 fn mandatory_fault_evidence_complete(evidence: &[FaultEvidence]) -> bool {
-    evidence.len() == 5
+    evidence.len() == 6
         && evidence
             .iter()
             .all(|item| item.complete_for_full_eligibility)
+}
+
+fn bounded_pilot_evidence_complete(representative: bool, evidence: &[FaultEvidence]) -> bool {
+    let required = [
+        "long_lived_reader",
+        "interrupted_writes",
+        "provider_timeout",
+        "writer_death_recovery",
+        "sqlite_full_recovery",
+    ];
+    representative
+        && required.iter().all(|case| {
+            evidence
+                .iter()
+                .any(|item| item.case == *case && item.complete_for_full_eligibility)
+        })
 }
 
 async fn disk_exhaustion_evidence(
@@ -2022,6 +2064,7 @@ async fn exercise_provider_timeout(shape: &EmbeddingShape) -> anyhow::Result<req
             .await
     });
     let request = Request::Remember {
+        legacy_unknown: None,
         content: "provider timeout probe".into(),
         context: None,
         memory_type: MemoryType::Insight,
@@ -2215,7 +2258,7 @@ mod tests {
 
     #[test]
     fn full_eligibility_rejects_missing_disk_fault_evidence() {
-        let mut evidence: Vec<_> = (0..5)
+        let mut evidence: Vec<_> = (0..6)
             .map(|_| FaultEvidence {
                 case: "test",
                 status: "executed",
@@ -2225,6 +2268,29 @@ mod tests {
             .collect();
         evidence[4].complete_for_full_eligibility = false;
         assert!(!mandatory_fault_evidence_complete(&evidence));
+    }
+
+    #[test]
+    fn bounded_pilot_requires_real_load_and_every_nonphysical_fault() {
+        let mut evidence: Vec<_> = [
+            "long_lived_reader",
+            "interrupted_writes",
+            "provider_timeout",
+            "writer_death_recovery",
+            "sqlite_full_recovery",
+        ]
+        .into_iter()
+        .map(|case| FaultEvidence {
+            case,
+            status: "executed",
+            complete_for_full_eligibility: true,
+            detail: String::new(),
+        })
+        .collect();
+        assert!(bounded_pilot_evidence_complete(true, &evidence));
+        assert!(!bounded_pilot_evidence_complete(false, &evidence));
+        evidence[4].complete_for_full_eligibility = false;
+        assert!(!bounded_pilot_evidence_complete(true, &evidence));
     }
 
     #[test]
@@ -2251,37 +2317,25 @@ mod tests {
     }
 
     #[test]
-    fn fault_artifact_is_read_and_hashed_by_the_harness() {
-        let dir = tempfile::tempdir().unwrap();
-        let artifact = dir.path().join("writer-test.json");
-        let test_name = "writer test";
-        let git_sha = "0123456789abcdef0123456789abcdef01234567";
-        let raw = serde_json::to_vec(&serde_json::json!({
-            "schema": "rusty-brain-scale-fault-evidence-v1",
-            "git_sha": git_sha,
-            "command": "cargo test writer_test",
-            "exit_code": 0,
-            "tests": [test_name],
-            "output": "test writer test ... ok\ntest result: ok",
-        }))
-        .unwrap();
-        std::fs::write(&artifact, &raw).unwrap();
-
-        let evidence = artifact_fault_evidence("writer", Some(&artifact), &[test_name], git_sha);
-
-        assert!(evidence.complete_for_full_eligibility);
-        assert_eq!(evidence.status, "validated_hashed_artifact");
-        assert!(evidence
-            .detail
-            .contains(&format!("sha256={:x}", Sha256::digest(&raw))));
-
-        let wrong_revision = artifact_fault_evidence(
-            "writer",
-            Some(&artifact),
-            &[test_name],
-            "ffffffffffffffffffffffffffffffffffffffff",
-        );
-        assert!(!wrong_revision.complete_for_full_eligibility);
+    fn fault_output_requires_individual_execution_and_nonzero_passing_count() {
+        let test = "required_fault";
+        for flag in [
+            "--interrupted-writes-artifact",
+            "--writer-death-artifact",
+            "--sqlite-full-artifact",
+        ] {
+            assert!(Options::try_parse_from(["scale_benchmark", flag, "fabricated.json"]).is_err());
+        }
+        assert!(fault_test_output_passed("test module::required_fault ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored; 0 measured;", test));
+        for output in [
+            "required_fault\ntest result: ok",
+            "test module::required_fault ... ignored\ntest result: ok. 0 passed; 0 failed; 1 ignored;",
+            "test result: ok. 0 passed; 0 failed; 0 ignored;",
+            "test module::required_fault ... ok\ntest result: ok. 0 passed; 0 failed; 0 ignored;",
+            "test module::different_fault ... ok\ntest result: ok. 1 passed; 0 failed; 0 ignored;",
+        ] {
+            assert!(!fault_test_output_passed(output, test), "accepted {output}");
+        }
     }
 
     #[test]

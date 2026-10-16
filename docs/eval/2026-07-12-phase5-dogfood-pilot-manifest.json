@@ -1,28 +1,33 @@
 {
-  "schema_version": 1,
-  "pilot_id": null,
-  "status": "blocked",
+  "schema_version": 2,
+  "pilot_id": "phase5-20261019",
+  "status": "candidate",
   "period": {
     "duration_days": 14,
-    "start_utc": null,
-    "end_utc": null
+    "start_utc": "2026-10-19T16:00:00Z",
+    "end_utc": "2026-11-02T16:00:00Z"
   },
-  "paired_runs_per_repository": null,
+  "paired_runs_per_repository": 6,
+  "execution": {
+    "model_id": "litellm/deepseek-v4.1-flash",
+    "model_version": "provider-unexposed",
+    "prompt_budget_tokens": 8000
+  },
   "admission": {
     "frozen_at_utc": null,
     "task_56": {
-      "state": "no-go",
-      "evidence": "independent-review-local-reproduction-2026-07-12",
-      "overall_pilot_go": false,
-      "blocker": "instruction-shaped-poison-is-second-production-recall-result",
-      "qualified_treatment_arm": null,
+      "state": "go",
+      "evidence": "commit:ac4bf4c3cfa951035f7992e027309a6f281ce87e",
+      "overall_pilot_go": true,
+      "blocker": null,
+      "qualified_treatment_arm": "linear-with-recall-confidence-floor",
       "unqualified_behavior_allowed": false
     },
     "task_57": {
-      "state": "not-complete",
+      "state": "evidence-unavailable",
       "complete": false,
-      "evidence": "task-57-results-not-reviewed-complete-2026-07-12",
-      "max_active_memories": null
+      "evidence": "task-57-closeout-code-and-artifact-unavailable-2026-10-13",
+      "max_active_memories": 25000
     }
   },
   "thresholds": {
@@ -48,5 +53,98 @@
     "retention_actions_min": 1,
     "retention_failures_max": 0
   },
-  "repositories": []
+  "repositories": [
+    {
+      "name": "rusty-brain",
+      "commit_sha": "a33ea3ba0fef50b94b1d65884118384d7886a24d",
+      "baseline_store_id": "phase5-20261019-rusty-brain-baseline",
+      "treatment_store_id": "phase5-20261019-rusty-brain-treatment",
+      "baseline_namespace": "phase5-20261019-rusty-brain-baseline",
+      "treatment_namespace": "phase5-20261019-rusty-brain-treatment",
+      "pair_plan": [
+        {
+          "pair_id": "rusty-brain-pair-01",
+          "scenario_id": "rusty-brain-atomic-vector-insert",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "9dc20ed836d0a37e88a375914fff5910f1d5fe6da418dbf0c890ea4ab59818be"
+        },
+        {
+          "pair_id": "rusty-brain-pair-02",
+          "scenario_id": "rusty-brain-curated-duplicate",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "939dd14683c733c81527b1b4e2301a8ded15fff15d7c36835c7dc7629e7bc2b3"
+        },
+        {
+          "pair_id": "rusty-brain-pair-03",
+          "scenario_id": "rusty-brain-namespace-disputes",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "e3447b920a4cfa1719fb7fb6714cc17072ba8bc815af550186a172312067b4aa"
+        },
+        {
+          "pair_id": "rusty-brain-pair-04",
+          "scenario_id": "rusty-brain-archive-vector",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "c62c9cbca5efa0785cf4596acce15213ca9338da0a9f4ebdf9f32dcfef35de72"
+        },
+        {
+          "pair_id": "rusty-brain-pair-05",
+          "scenario_id": "rusty-brain-readonly-history",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "de63810553da796b3a90cc47b907e0784d6f18a386f30f0252f21c3de156417e"
+        },
+        {
+          "pair_id": "rusty-brain-pair-06",
+          "scenario_id": "rusty-brain-retention-backup",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "61952e213826ead192cd5df8652b3c337f7126a7c93e631375f05df33395e467"
+        }
+      ]
+    },
+    {
+      "name": "threatmitigator",
+      "commit_sha": "580cfff8d0fca117171b9ac40e05e3fc5486ac78",
+      "baseline_store_id": "phase5-20261019-threatmitigator-baseline",
+      "treatment_store_id": "phase5-20261019-threatmitigator-treatment",
+      "baseline_namespace": "phase5-20261019-threatmitigator-baseline",
+      "treatment_namespace": "phase5-20261019-threatmitigator-treatment",
+      "pair_plan": [
+        {
+          "pair_id": "threatmitigator-pair-01",
+          "scenario_id": "threatmitigator-scenario-01",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "ebc05186eb92b219bb2c440b8254966eb40dfd6f30cc4b613ba6a049880386f4"
+        },
+        {
+          "pair_id": "threatmitigator-pair-02",
+          "scenario_id": "threatmitigator-scenario-02",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "18d80ba2fcefc04fbd06eaeb55a208f0d57d8a6b81eec70fe815eb51f6b36912"
+        },
+        {
+          "pair_id": "threatmitigator-pair-03",
+          "scenario_id": "threatmitigator-scenario-03",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "5063aa36edb6931c3f2c770f190f472fb8f3e845ee986ac1eeffd78214feb72b"
+        },
+        {
+          "pair_id": "threatmitigator-pair-04",
+          "scenario_id": "threatmitigator-scenario-04",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "498cdc0fdedffba174f709d77f0d2fb204837cc205c6ce6a9a5ec7d62f29b6d7"
+        },
+        {
+          "pair_id": "threatmitigator-pair-05",
+          "scenario_id": "threatmitigator-scenario-05",
+          "arm_order": "baseline_first",
+          "snapshot_sha256": "ae2d2f5cc2b11240aedcc0beac224943b07bd3f6fe612f37ef5f337976cfd173"
+        },
+        {
+          "pair_id": "threatmitigator-pair-06",
+          "scenario_id": "threatmitigator-scenario-06",
+          "arm_order": "treatment_first",
+          "snapshot_sha256": "d5ee8e1ebca9df2defa6e9c78113071269e314070c656638253fdc54b4f5fab3"
+        }
+      ]
+    }
+  ]
 }

@@ -293,6 +293,7 @@ async fn full_flow_through_public_api() {
 
     let id = engine
         .remember(RememberInput {
+            legacy_unknown: false,
             content: "single writer over sqlite wal with concurrent readers".to_string(),
             context: Some("architecture".to_string()),
             memory_type: MemoryType::ArchitectureDecision,

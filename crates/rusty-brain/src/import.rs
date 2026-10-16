@@ -48,6 +48,8 @@ pub struct ImportItem {
     pub anchors: Vec<rb_types::MemoryAnchor>,
     /// Explicit protection restored from an export; extracted imports leave it false.
     pub human_curated: bool,
+    /// Historical quarantine preserved by restore; ordinary imports use false.
+    pub legacy_unknown: bool,
 }
 
 /// Counts for an import run.
@@ -181,6 +183,7 @@ pub fn extract_text(
 ) -> ImportItem {
     let summary = derive_summary(text, label);
     ImportItem {
+        legacy_unknown: false,
         summary,
         content: text.to_string(),
         memory_type,
@@ -390,6 +393,7 @@ fn recent_decision_commits(root: &Path, limit: usize) -> Vec<ImportItem> {
             content.push_str(body);
         }
         items.push(ImportItem {
+            legacy_unknown: false,
             summary: truncate_summary(subject),
             content,
             memory_type: MemoryType::Insight,
@@ -434,7 +438,12 @@ pub async fn store_items(
             continue;
         }
 
-        if is_duplicate(client, &content).await? {
+        let duplicate = if item.legacy_unknown {
+            client.has_historical_duplicate(content.clone()).await?
+        } else {
+            is_duplicate(client, &content).await?
+        };
+        if duplicate {
             counts.skipped_duplicate += 1;
             ids.push(None);
             continue;
@@ -459,6 +468,7 @@ pub async fn store_items(
                 None,
                 item.human_curated,
                 false,
+                item.legacy_unknown,
             )
             .await
         {

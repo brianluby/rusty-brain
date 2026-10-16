@@ -6,6 +6,7 @@
 
 use super::internal::*;
 use super::*;
+use crate::error::storage_err;
 use rb_types::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 
 /// Read `meta.embedding_model` from `db_path` over a plain READ-ONLY SQLite
@@ -41,6 +42,18 @@ fn count_query(
 }
 
 impl SqliteStore {
+    /// Logical SQLite main-database allocation, including free pages and indexes.
+    /// Works in memory; excludes WAL, process RSS and physical filesystem usage.
+    pub fn logical_size_bytes(&self) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_err)
+    }
+
     /// Compute the namespace-scoped value/health aggregate for `ns`
     /// (doctor/stats PRD). Pure reads — safe on a read-pool connection; the
     /// caller supplies the bounded `window_days`, the CURRENT

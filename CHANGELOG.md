@@ -5,6 +5,45 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Provenance and verification closeout (kanban 55, 58, 59, 60, 93)
+
+- Classify historical NULL-source/NULL-channel rows once in migration 015 as
+  `legacy_unknown`, without inventing provenance or changing new identity-less
+  write compatibility. Preserve job-source behavior, audit visibility and
+  explicit false/true portable classification; edits and curation cannot silently
+  promote historical unknowns into recall/context.
+- Deduplicate historical restore through a capability-gated, namespace-scoped
+  exact-content lookup with a boolean response. Avoid ordinary list cutoffs and
+  oversized corpus transfers; show historical quarantine in human history.
+- Add normalized numeric channel diagnostics, logical SQLite allocation and
+  deterministic outcome classes to external benchmark audits. Keep new diagnostic
+  runs distinct from the frozen September quality results; historical missing
+  measurements are not reconstructed from current hardware or invented.
+- Add a nonpublishing manual Release matrix. ARM macOS, Intel macOS and Linux
+  packaged build/attestation/checksum/smoke jobs passed in run `38924475235`;
+  tag publication still requires version/changelog/main-ancestry preflight.
+- Reconcile delivered PRD statuses and use runtime MCP contract checks plus manual
+  overview review instead of brittle documentation-wording assertions.
+- Prepare a two-repository, six-balanced-pairs-per-repository pilot candidate for
+  2026-10-19 through 2026-11-02. Replacement resource admission executes actual
+  fault regressions rather than accepting caller-authored pass claims; scenario
+  IDs, snapshot hashes and half-open completion windows are validated. Planning
+  is not resource admission or observed pilot value.
+
+### Fixed — Local real-host verification provider
+
+- Seed trust only for the disposable Claude project and support the requested
+  `deepseek-v4.1-flash` route through the existing LiteLLM transports. Disable
+  whole-response cache reuse per request and replay real DeepSeek reasoning
+  content for tool continuation; do not substitute a model or weaken the gates.
+- Keep credentials local. Manual workflow runs do not mutate alert issues by
+  default; scheduled jobs require separately provisioned LiteLLM credentials.
+  Catalog-priced usage estimates are not authoritative provider bills.
+- Distinguish a cold OMP persisted-session resume from a fresh startup using
+  retained branch entries. Actual authenticated DeepSeek startup/prompt/detail/
+  supersession/resume verification caught and fixed duplicate stable injection;
+  real hook regression coverage preserves dynamic recall on resumed sessions.
+
 ### Changed — Compact context navigation (kanban 96)
 
 - Replace activity-heavy context digests with bounded current decisions,

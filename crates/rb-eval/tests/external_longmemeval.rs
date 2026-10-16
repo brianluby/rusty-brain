@@ -40,6 +40,19 @@ async fn both_profiles_round_trip_gold_session_ids() {
             let known: std::collections::HashSet<_> = entry.haystack_session_ids.iter().collect();
             assert!(r.ranked.iter().all(|h| known.contains(&h.session_id)));
             assert_eq!(r.corpus_size, session_documents(&entry).len());
+            assert!(r.logical_db_bytes > 0);
+            for hit in &r.ranked {
+                let scores = hit
+                    .channel_scores
+                    .expect("numeric Linear/parity channel scores");
+                assert_eq!(scores.fts.is_some(), hit.fts);
+                assert_eq!(scores.vector.is_some(), hit.vector);
+                assert_eq!(scores.graph.is_some(), hit.graph);
+                assert!([scores.fts, scores.vector, scores.graph]
+                    .into_iter()
+                    .flatten()
+                    .all(|s| s.is_finite() && (0.0..=1.0).contains(&s)));
+            }
             if entry.answer_session_ids.is_empty() {
                 assert_eq!(r.metrics.mrr, 0.0);
             }

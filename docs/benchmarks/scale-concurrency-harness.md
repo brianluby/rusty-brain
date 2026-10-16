@@ -15,8 +15,7 @@ scripts/run-scale-benchmark.sh \
   --burst 100 \
   --operation-timeout-ms 30000 \
   --seed-batch-timeout-ms 120000 \
-  --interrupted-writes-artifact target/interrupted-writes-test.json \
-  --writer-death-artifact target/writer-death-test.json \
+  --fault-evidence-dir target/scale-fault-evidence \
   --output target/scale-benchmark.json
 ```
 
@@ -45,7 +44,7 @@ The default upper bound is 25,000 memories because sqlite-vec search is exact
 today. Change `--corpora` to probe a larger local envelope; do not silently
 replace the committed default or compare results from different corpus lists.
 For fast wiring checks only, pass `--provider fixture`; such reports are marked
-ineligible for a production envelope. V3 preregisters at least 100 actual,
+ineligible for a production envelope. V4 retains at least 100 actual,
 error-free successes per measured path for p99; configured counts alone do not
 qualify. The report records `worktree_clean`, and machine eligibility requires
 a clean tracked and untracked worktree so a modified harness cannot claim only
@@ -53,16 +52,57 @@ the clean `git_sha`. `representative_load_eligible` also requires the complete
 committed 1k/10k/25k matrix and acknowledged-write/namespace/checkpoint invariants.
 `production_envelope_eligible` additionally requires every mandatory fault,
 including actual disk exhaustion, plus SHA-256 references for retained
-interrupted-write and writer-death/reopen evidence. The harness reads and
-hashes the supplied artifact paths itself; caller-supplied digest strings are
-not accepted as proof. Each artifact is JSON with schema
-`rusty-brain-scale-fault-evidence-v1`, the current full `git_sha`, the exact
-`cargo test` command, `exit_code: 0`, the required test names, and captured
-output containing those names plus `test result: ok`. Empty, failing, stale-
-revision, malformed, or unrelated files remain incomplete. Only
-`rusty-brain-scale-v3` reports with an explicit `worktree_clean: true` carry
-this contract; older or incomplete artifacts cannot support a production-
+interrupted-write, writer-death/reopen and SQLite page-limit recovery evidence.
+The harness executes the four required `cargo test --release --locked --lib`
+selectors itself. Eligibility uses actual subprocess exit status, a matching
+individual `test ...::name ... ok` outcome, and a nonzero passing count with
+zero failures/ignored tests. It writes and hashes its own captured records
+(`rusty-brain-scale-fault-evidence-v2`) under `--fault-evidence-dir`; those files
+are outputs, never caller-authored input authority. Fabricated records cannot
+be supplied through the removed `--*-artifact` flags. Empty, ignored, zero-test
+or failing executions remain incomplete. Only
+`rusty-brain-scale-v4` reports with an explicit `worktree_clean: true` carry
+this contract; older or incomplete artifacts cannot support a new production-
 envelope claim.
+
+## Bounded pilot replacement evidence
+
+The original #57 benchmark/regression commits and v4 artifact were not recovered.
+This replacement does not inherit their claimed results. `bounded_pilot_eligible`
+requires the unchanged clean-revision, real-local 384-dimensional 1k/10k/25k
+matrix, 100 error-free successes per latency path, acknowledged-ID durability,
+namespace isolation and checkpoint invariants. It additionally requires every
+nonphysical fault: pinned reader, interrupted writes, provider timeout,
+writer death/reopen and actual SQLite `SQLITE_FULL` rollback/recovery.
+Only then is `bounded_pilot_max_active_memories=25000`; otherwise it is null.
+
+Maintainer #57 comment 182 explicitly allowed this bounded single-user trial
+to defer physical filesystem exhaustion. The new field expresses that existing
+decision only. `production_envelope_eligible` still requires the guarded physical
+disk probe and every fault; no physical-full or broader resource gate is waived.
+SQLite `max_page_count` forces the real store connection to refuse page growth
+on a disposable on-disk database, not a mocked exception. The regression checks
+the refused note/vector/FTS/oplog leave no partial state, autocommit is restored,
+a subsequent insert succeeds after lifting the cap, acknowledged IDs and vectors
+survive reopen, and `integrity_check` returns `ok`. It does not simulate a full
+filesystem, failed WAL sync, process-kill crash or kernel I/O failure.
+
+On the clean integrated revision, run the matrix; the harness executes and
+retains the fault regressions itself (no prior output-capture command):
+
+```bash
+scripts/run-scale-benchmark.sh --corpora 1000,10000,25000 \
+  --operations 100 --burst 100 --operation-timeout-ms 30000 \
+  --fault-evidence-dir target/scale-fault-evidence \
+  --output target/scale-benchmark-v4-replacement.json
+```
+
+Preserve the generated JSON fault records, report and SHA-256 values with the
+dated report. A fixture provider, small smoke, dirty worktree, unexecuted fault,
+failed sample, or timed-out path is not admission proof. Run on the same clean
+integration revision used by #56; preserve failed distributions rather than
+changing counts, timeouts or the practical bound after observing results.
+
 
 ## Disk exhaustion
 

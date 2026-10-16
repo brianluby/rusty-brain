@@ -238,6 +238,7 @@ fn fixture() -> anyhow::Result<Fixture> {
 
 fn input(belief: &Belief) -> RememberInput {
     RememberInput {
+        legacy_unknown: false,
         content: belief.content.clone(),
         context: None,
         memory_type: MemoryType::Insight,

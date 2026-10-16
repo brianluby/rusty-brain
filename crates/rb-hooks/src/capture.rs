@@ -2002,6 +2002,7 @@ mod tests {
             score: 0.9,
             channels: rb_types::ChannelHits::default(),
             stale: true,
+            channel_scores: None,
         }])
         .unwrap();
         for output in [stable, dynamic] {
@@ -2102,6 +2103,7 @@ mod tests {
             score: 0.9,
             channels: rb_types::ChannelHits::default(),
             stale: false,
+            channel_scores: None,
         }
     }
 
@@ -2170,6 +2172,7 @@ mod tests {
                 score: 1.0,
                 channels: Default::default(),
                 stale: false,
+                channel_scores: None,
             }],
             None,
         )
@@ -2192,6 +2195,7 @@ mod tests {
                 score: 1.0,
                 channels: Default::default(),
                 stale: false,
+                channel_scores: None,
             },
             independent.clone(),
         ];

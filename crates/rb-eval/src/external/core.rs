@@ -28,6 +28,8 @@ pub struct Hit {
     pub fts: bool,
     pub vector: bool,
     pub graph: bool,
+    /// Parity records cosine similarity; native records pre-prior Linear scores.
+    pub channel_scores: Option<rb_types::ChannelScores>,
 }
 
 pub struct Retrieval {
@@ -35,6 +37,35 @@ pub struct Retrieval {
     pub abstained: Option<String>,
     pub ingest_ms: u128,
     pub query_us: u128,
+    pub logical_db_bytes: u64,
+}
+
+/// Metric outcome, not a causal ranking diagnosis. Empty gold is not a hit.
+pub fn classify_failure(gold: usize, found: usize, abstained: bool) -> &'static str {
+    if gold == 0 {
+        "unscorable_empty_gold"
+    } else if abstained {
+        "abstained"
+    } else if found == gold {
+        "hit"
+    } else if found > 0 {
+        "partial_hit"
+    } else {
+        "miss"
+    }
+}
+
+fn validate_vectors(expected: usize, dim: usize, vectors: &[Vec<f32>]) -> rb_types::Result<()> {
+    if vectors.len() != expected
+        || vectors
+            .iter()
+            .any(|v| v.len() != dim || v.iter().any(|x| !x.is_finite()))
+    {
+        return Err(rb_types::Error::Embedding(
+            "external benchmark requires complete finite vectors of the declared dimension".into(),
+        ));
+    }
+    Ok(())
 }
 
 /// Lets one loaded model serve every per-question engine.
@@ -49,7 +80,9 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Shared<P> {
         self.0.dim()
     }
     async fn embed(&self, texts: &[String], kind: EmbedKind) -> rb_types::Result<Vec<Vec<f32>>> {
-        self.0.embed(texts, kind).await
+        let vectors = self.0.embed(texts, kind).await?;
+        validate_vectors(texts.len(), self.dim(), &vectors)?;
+        Ok(vectors)
     }
 }
 
@@ -99,6 +132,7 @@ impl<P: EmbeddingProvider> EmbeddingProvider for Memo<P> {
         };
         if !missing.is_empty() {
             let vectors = self.inner.embed(&missing, kind).await?;
+            validate_vectors(missing.len(), self.dim(), &vectors)?;
             let mut cache = self.cache.lock().map_err(|_| poisoned())?;
             for (text, vector) in missing.into_iter().zip(vectors) {
                 cache.insert((kind, text), vector);
@@ -127,10 +161,11 @@ pub async fn retrieve<P: EmbeddingProvider>(
     let backend = SqliteBackend::in_memory(provider.dim())?;
     let started = Instant::now();
     let mut id_to_source: HashMap<MemoryId, String> = HashMap::new();
-    let (ingest_ms, query_us, ranked, abstained) = match profile {
+    let (ingest_ms, query_us, ranked, abstained, logical_db_bytes) = match profile {
         Profile::Parity => {
             let texts: Vec<String> = docs.iter().map(|(_, d)| d.clone()).collect();
             let vectors = provider.embed(&texts, EmbedKind::Document).await?;
+            validate_vectors(texts.len(), provider.dim(), &vectors)?;
             for ((source, doc), vector) in docs.iter().zip(vectors) {
                 let mut note = MemoryNote::new(namespace(), doc.clone(), MemoryType::Insight, 5);
                 note.embedding_model = provider.model_id().to_string();
@@ -139,11 +174,13 @@ pub async fn retrieve<P: EmbeddingProvider>(
             }
             let ingest_ms = started.elapsed().as_millis();
             let q = Instant::now();
-            let query = provider
+            let mut queries = provider
                 .embed(std::slice::from_ref(&query_owned), EmbedKind::Query)
-                .await?
-                .pop()
-                .unwrap_or_default();
+                .await?;
+            validate_vectors(1, provider.dim(), &queries)?;
+            let query = queries.pop().ok_or_else(|| {
+                rb_types::Error::Embedding("missing benchmark query vector".into())
+            })?;
             let hits = backend
                 .vector(namespace(), query, top_n, rb_types::RecallFilter::default())
                 .await?;
@@ -157,10 +194,20 @@ pub async fn retrieve<P: EmbeddingProvider>(
                         fts: false,
                         vector: true,
                         graph: false,
+                        channel_scores: Some(rb_types::ChannelScores {
+                            vector: Some((1.0 - distance).clamp(0.0, 1.0)),
+                            ..Default::default()
+                        }),
                     })
                 })
                 .collect();
-            (ingest_ms, query_us, ranked, None)
+            (
+                ingest_ms,
+                query_us,
+                ranked,
+                None,
+                backend.logical_size_bytes()?,
+            )
         }
         Profile::Native => {
             let engine = MemoryEngine::new(backend, Shared(provider.clone()), namespace())
@@ -168,6 +215,7 @@ pub async fn retrieve<P: EmbeddingProvider>(
             for (source, doc) in docs {
                 let id = engine
                     .remember(RememberInput {
+                        legacy_unknown: false,
                         content: doc.clone(),
                         context: None,
                         memory_type: MemoryType::Insight,
@@ -193,6 +241,11 @@ pub async fn retrieve<P: EmbeddingProvider>(
             let outcome = engine
                 .recall_with_status(&query_owned, top_n, &RecallFilter::default())
                 .await?;
+            if outcome.degraded {
+                return Err(rb_types::Error::Embedding(
+                    "native benchmark recall degraded; no result artifact is admissible".into(),
+                ));
+            }
             let query_us = q.elapsed().as_micros();
             let ranked: Vec<Hit> = outcome
                 .results
@@ -204,11 +257,18 @@ pub async fn retrieve<P: EmbeddingProvider>(
                         fts: r.channels.fts,
                         vector: r.channels.vector,
                         graph: r.channels.graph,
+                        channel_scores: r.channel_scores,
                     })
                 })
                 .collect();
             let abstained = outcome.abstained.map(|a| format!("{a:?}"));
-            (ingest_ms, query_us, ranked, abstained)
+            (
+                ingest_ms,
+                query_us,
+                ranked,
+                abstained,
+                engine.backend().logical_size_bytes()?,
+            )
         }
     };
     Ok(Retrieval {
@@ -216,5 +276,28 @@ pub async fn retrieve<P: EmbeddingProvider>(
         abstained,
         ingest_ms,
         query_us,
+        logical_db_bytes,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{classify_failure, validate_vectors};
+
+    #[test]
+    fn vector_audit_rejects_missing_malformed_or_nonfinite_vectors() {
+        assert!(validate_vectors(1, 2, &[vec![0.0, 1.0]]).is_ok());
+        assert!(validate_vectors(1, 2, &[]).is_err());
+        assert!(validate_vectors(1, 2, &[vec![0.0]]).is_err());
+        assert!(validate_vectors(1, 2, &[vec![f32::NAN, 0.0]]).is_err());
+    }
+
+    #[test]
+    fn failure_classes_distinguish_empty_partial_and_abstention() {
+        assert_eq!(classify_failure(0, 0, false), "unscorable_empty_gold");
+        assert_eq!(classify_failure(2, 0, true), "abstained");
+        assert_eq!(classify_failure(2, 0, false), "miss");
+        assert_eq!(classify_failure(2, 1, false), "partial_hit");
+        assert_eq!(classify_failure(2, 2, false), "hit");
+    }
 }

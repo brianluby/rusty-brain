@@ -461,6 +461,7 @@ async fn run_client(
                         evidence,
                         curated,
                         allow_curated_supersede,
+                        false,
                     )
                     .await
                     .context("remember failed")?;

@@ -133,6 +133,8 @@ pub struct HistoryEvidence {
     pub trust_class: crate::TrustClass,
     #[serde(default)]
     pub human_curated: bool,
+    #[serde(default)]
+    pub legacy_unknown: bool,
     /// Source pointers are stored locators only and are never resolved by
     /// this read; legacy rows with no pointers are explicitly unavailable.
     #[serde(default)]
@@ -237,6 +239,7 @@ mod tests {
             }],
             trust_class: TrustClass::HumanConfirmed,
             human_curated: true,
+            legacy_unknown: false,
             source_status: HistorySourceStatus::RecordedUnverified,
         });
         let history = MemoryHistory {

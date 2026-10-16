@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft, implementation-ready.
+Delivered (Vikunja #382). The [N=5 measured artifact](../eval/2026-07-12-w35-scorecard-n5-run.md#class-b--capture-fidelity-vikunja-382) records direct hook-origin fidelity of 15/15 (100%, interval 79.6–100.0%). This is bounded Claude Code capture evidence, not general semantic-quality or adoption proof; capture remains report-only except for the zero memory-induced-errors safety gate. Historical Class A retrieval-at-scale and ADR-3 claims in that run remain withdrawn.
 
 ## Owner Area
 
@@ -191,15 +191,9 @@ Then run a manual `memory-scorecard.yml` dispatch with `runs=1`. Promote to `run
 
 ## Implementation Checklist
 
-- [ ] Add capture scenarios.
-- [ ] Parse `plant_session`, `capture_expect`, and `capture_forbid`.
-- [ ] Implement `run_auto_capture_plant`.
-- [ ] Implement direct hook-origin fidelity filtering.
-- [ ] Record fidelity before `score_session`.
-- [ ] Append or companion-write capture fields.
-- [ ] Extend scorecard aggregation.
-- [ ] Extend `--self-test`.
-- [ ] Update workflow comments/artifact schema.
-- [ ] Run live `runs=1`.
-- [ ] Run measured `runs>=5`.
-- [ ] Publish measured Class B artifact.
+- [x] Capture scenarios and `plant_session`/`capture_expect`/`capture_forbid` parsing landed in the scorecard runner.
+- [x] Auto-capture plant sessions and direct hook-origin fidelity filtering landed; fidelity is measured before work-session scoring.
+- [x] Capture fields, aggregation, self-test coverage, and scenario contracts landed.
+- [x] Publish measured `runs>=5` Class B artifact (linked above, with raw TSV and live run URL).
+
+The original staged `runs=1` smoke and workflow-update checklist is superseded by the retained complete N=5 artifact; no separate smoke execution is asserted by this reconciliation.

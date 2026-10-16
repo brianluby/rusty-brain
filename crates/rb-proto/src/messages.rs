@@ -58,6 +58,8 @@ pub struct ClientIdentity {
 pub const CAP_ANCHORS: &str = "anchors";
 /// Capability required before a client may request persistent human curation.
 pub const CAP_HUMAN_CURATION: &str = "human_curation";
+/// Capability required to preserve historical quarantine during portable restore.
+pub const CAP_LEGACY_QUARANTINE: &str = "legacy_quarantine";
 
 /// Daemon reply to a `Handshake`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -80,6 +82,11 @@ pub struct HandshakeAck {
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(tag = "op")]
 pub enum Request {
+    /// Read-only restore probe, scoped by the connection namespace. The tiny
+    /// boolean reply cannot overflow the frame with unrelated stored content.
+    HasHistoricalDuplicate {
+        content: String,
+    },
     Remember {
         content: String,
         context: Option<String>,
@@ -143,6 +150,9 @@ pub enum Request {
         /// false; producer provenance never grants this intent.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         allow_curated_supersede: Option<bool>,
+        /// Restore historical quarantine. This can restrict recall, never grant trust.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        legacy_unknown: Option<bool>,
     },
     Recall {
         query: String,
@@ -452,6 +462,9 @@ pub enum Response {
     Remembered {
         id: MemoryId,
     },
+    HistoricalDuplicate {
+        found: bool,
+    },
     Recalled {
         results: Vec<SearchResult>,
         /// `true` when recall DEGRADED to keyword+graph because the embedder
@@ -735,6 +748,7 @@ mod tests {
         // None (the engine applies the 1.0 baseline), and a None serializes
         // WITHOUT the key — byte-identical to the pre-field frame.
         let explicit = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -775,6 +789,7 @@ mod tests {
 
         // A None confidence serializes to nothing (no key) — pre-field shape.
         let none = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -803,6 +818,7 @@ mod tests {
         // byte-identical to the pre-field frame, so no CONTRACT_VERSION bump.
         let old = MemoryId::new();
         let explicit = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -840,6 +856,7 @@ mod tests {
 
         // A None supersedes serializes to nothing (no key) — pre-field shape.
         let none = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -928,6 +945,7 @@ mod tests {
         // key — byte-identical to the pre-anchor frame, so no
         // CONTRACT_VERSION bump (the `confidence`/`supersedes` precedent).
         let explicit = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -966,6 +984,7 @@ mod tests {
 
         // Empty anchors serialize to nothing (no key) — pre-anchor shape.
         let none = Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -1009,6 +1028,7 @@ mod tests {
             filter: anchored_filter,
         }));
         assert!(request_uses_anchors(&Request::Remember {
+            legacy_unknown: None,
             content: "c".into(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -1037,7 +1057,11 @@ mod tests {
     fn all_requests() -> Vec<Request> {
         let id = MemoryId::new();
         vec![
+            Request::HasHistoricalDuplicate {
+                content: "historical exact claim".into(),
+            },
             Request::Remember {
+                legacy_unknown: None,
                 content: "c".into(),
                 context: Some("ctx".into()),
                 memory_type: MemoryType::Insight,
@@ -1158,6 +1182,8 @@ mod tests {
 
     fn all_responses() -> Vec<Response> {
         vec![
+            Response::HistoricalDuplicate { found: true },
+            Response::HistoricalDuplicate { found: false },
             Response::Remembered {
                 id: MemoryId::new(),
             },
@@ -1166,6 +1192,7 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    channel_scores: None,
                     stale: false,
                 }],
                 degraded: false,
@@ -1882,6 +1909,7 @@ mod tests {
                         }],
                         trust_class: rb_types::TrustClass::HumanConfirmed,
                         human_curated: true,
+                        legacy_unknown: false,
                         source_status: rb_types::HistorySourceStatus::RecordedUnverified,
                     }),
                     origin_user: None,

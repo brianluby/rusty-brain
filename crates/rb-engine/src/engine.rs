@@ -32,6 +32,8 @@ pub struct RememberInput {
     /// Explicit user curation marker; never inferred from provenance or
     /// enrichment.
     pub human_curated: bool,
+    /// Restore-only historical classification; true can only restrict recall.
+    pub legacy_unknown: bool,
     /// Explicit trust prior in `0.0..=1.0` (validated fail-closed), or `None`
     /// when the caller expressed no prior. `None` keeps the full-trust 1.0
     /// baseline AND lets an enricher fill it; `Some(x)` is an explicit prior an
@@ -407,6 +409,7 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // compose starts from `MemoryNote::new`, so a client-supplied note
         // field can never reach this assignment.
         note.origin_channel = input.provenance.channel;
+        note.legacy_unknown = input.legacy_unknown;
         note.session_id = input.provenance.session_id;
         // Enrichment: opt-in LLM, else heuristic. The enricher only fills fields
         // the caller left empty; an enricher error degrades to the heuristic.
@@ -787,16 +790,12 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         // candidate, read off the merged signals BEFORE ranking consumes them.
         // A `Some` signal field means that channel's candidate set contained
         // the id, so the flags record contribution, not rank.
-        let channel_map: HashMap<MemoryId, rb_types::ChannelHits> = signals
+        let channel_map: HashMap<_, _> = signals
             .iter()
             .map(|s| {
                 (
                     s.id.clone(),
-                    rb_types::ChannelHits {
-                        fts: s.keyword_rank.is_some(),
-                        vector: s.vector_distance.is_some(),
-                        graph: s.graph_hops.is_some(),
-                    },
+                    (s.keyword_rank, s.vector_distance, s.graph_hops),
                 )
             })
             .collect();
@@ -848,7 +847,9 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
                 continue;
             };
             let durable_keyword = note.session_id.is_none()
-                && channel_map.get(&id).is_some_and(|channels| channels.fts);
+                && channel_map
+                    .get(&id)
+                    .is_some_and(|channels| channels.0.is_some());
             let candidate_floor = if note.session_id.is_some() {
                 // The source prior changes ordering, not retrieval relevance.
                 // Applying it only to scores would silently raise the admission
@@ -869,10 +870,29 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
             // on the result — never silently injected as current. With no
             // provider (direct engine callers) staleness stays `false`.
             let stale = rb_types::evaluate_staleness(&note.anchors, repo_snapshot);
+            let (keyword_rank, vector_distance, graph_hops) =
+                channel_map.get(&id).copied().unwrap_or_default();
             results.push(rb_types::SearchResult {
                 memory: note.clone(),
                 score,
-                channels: channel_map.get(&id).copied().unwrap_or_default(),
+                channels: rb_types::ChannelHits {
+                    fts: keyword_rank.is_some(),
+                    vector: vector_distance.is_some(),
+                    graph: graph_hops.is_some(),
+                },
+                channel_scores: (self.fusion_mode == FusionMode::Linear).then(|| {
+                    rb_types::ChannelScores {
+                        fts: keyword_rank.map(|r| 1.0 / (1.0 + r as f32)),
+                        vector: vector_distance.map(|d| {
+                            if d.is_finite() {
+                                (1.0 - d).clamp(0.0, 1.0)
+                            } else {
+                                0.0
+                            }
+                        }),
+                        graph: graph_hops.map(|h| 1.0 / h.max(1) as f32),
+                    }
+                }),
                 stale,
             });
             if results.len() == limit {
@@ -1392,6 +1412,7 @@ mod tests {
 
     fn input(content: &str, importance: u8) -> RememberInput {
         RememberInput {
+            legacy_unknown: false,
             content: content.to_string(),
             context: None,
             memory_type: MemoryType::Insight,
@@ -2566,6 +2587,38 @@ mod tests {
             "graph-expanded hit must be graph-attributed"
         );
         assert!(!graph_channels.fts && !graph_channels.vector);
+        let scores_of = |id: &rb_types::MemoryId| {
+            results
+                .iter()
+                .find(|r| &r.memory.id == id)
+                .unwrap()
+                .channel_scores
+                .unwrap()
+        };
+        assert_eq!(
+            scores_of(&kw),
+            rb_types::ChannelScores {
+                fts: Some(1.0),
+                vector: None,
+                graph: None
+            }
+        );
+        assert_eq!(
+            scores_of(&vec_only),
+            rb_types::ChannelScores {
+                fts: None,
+                vector: Some(0.9),
+                graph: None
+            }
+        );
+        assert_eq!(
+            scores_of(&graph_only),
+            rb_types::ChannelScores {
+                fts: None,
+                vector: None,
+                graph: Some(1.0)
+            }
+        );
     }
 
     #[tokio::test]

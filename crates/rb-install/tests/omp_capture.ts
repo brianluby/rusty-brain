@@ -132,8 +132,9 @@ try {
   };
   const deliveryHandlers = new Map<string, Handler>();
   let deliverySession = "omp-stable-first";
+  let deliveryBranch: unknown[] = [];
   const deliveryContext = {
-    cwd: root, sessionManager: { getSessionId: () => deliverySession, getBranch: () => [] },
+    cwd: root, sessionManager: { getSessionId: () => deliverySession, getBranch: () => deliveryBranch },
   };
   extension({ on: (name: string, handler: Handler) => deliveryHandlers.set(name, handler) } as unknown as Parameters<typeof extension>[0]);
   const deliver = async (name: string, payload = {}) => {
@@ -177,6 +178,13 @@ try {
   await deliver("session_start");
   assert.ok(body(await deliver("before_agent_start", { prompt: callbackObservation }))
     .includes("# Rusty Brain — Stable project context"), "a separate session receives its own startup");
+  deliverySession = "omp-cold-persisted-resume";
+  deliveryBranch = [{ type: "custom_message", customType: "dev.rusty-brain.recall", content: firstDelivery }];
+  await deliver("session_start");
+  const resumedDelivery = body(await deliver("before_agent_start", { prompt: callbackObservation }));
+  assert.ok(!resumedDelivery.includes("# Rusty Brain — Stable project context"), "cold resume with retained context cannot re-inject startup text");
+  assert.ok(resumedDelivery.includes(dynamicNote.id), "cold resume keeps current query recall available");
+  deliveryBranch = [];
   for (const transition of ["session_switch", "session_branch", "session_tree"]) {
     deliverySession = `omp-resumed-${transition}`;
     await deliver("session_start");

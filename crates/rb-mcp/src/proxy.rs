@@ -254,6 +254,7 @@ pub fn build_request(name: &str, args: &Value) -> Result<Request, ToolError> {
             let memory_type = parse_type(args, "type")?.unwrap_or(MemoryType::Insight);
             let importance = opt_importance(args, "importance")?.unwrap_or(5);
             Ok(Request::Remember {
+                legacy_unknown: None,
                 content,
                 context: opt_string(args, "context")?,
                 memory_type,
@@ -468,8 +469,12 @@ fn memory_md_line(m: &MemoryNote, now: DateTime<Utc>) -> String {
     // Vikunja #69: quarantined rows stay visible in listings (quarantine is
     // demotion from recall/injection, never silent deletion) — and the model
     // must SEE why before it reaches for one by id.
-    let quarantined = if m.is_quarantined() {
+    let quarantined = if m.legacy_unknown {
+        " ⛔ quarantined (legacy unknown origin)"
+    } else if m.is_quarantined() {
         " ⛔ quarantined (untrusted origin)"
+    } else if m.origin_channel.is_none() && m.origin_source.is_none() {
+        " ⚠ unverified origin"
     } else {
         ""
     };
@@ -531,6 +536,9 @@ pub(crate) fn context_to_content(context: &ProjectContext, notice: Option<&str>)
 pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
     match resp {
         Response::Remembered { id } => ToolContent::json(json!({ "id": id.to_string() }), false),
+        Response::HistoricalDuplicate { found } => {
+            ToolContent::json(json!({ "found": found }), false)
+        }
         // W3.3: recall renders as compact markdown (one line per hit) for the
         // model; the full results ride structuredContent. W1.3 empty state +
         // W1.6d degraded warning, and the Vikunja #62 ABSTAIN distinction
@@ -764,6 +772,13 @@ mod tests {
             !clean.contains("quarantined"),
             "trusted rows unmarked: {clean}"
         );
+        m.origin_channel = None;
+        m.legacy_unknown = true;
+        let historical = memory_md_line(&m, chrono::Utc::now());
+        assert!(historical.contains("quarantined (legacy unknown origin)"));
+        m.legacy_unknown = false;
+        let unverified = memory_md_line(&m, chrono::Utc::now());
+        assert!(unverified.contains("unverified origin") && !unverified.contains("quarantined"));
     }
 
     #[test]
@@ -779,12 +794,14 @@ mod tests {
                 memory: note(),
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: false,
             },
             rb_types::SearchResult {
                 memory: stale,
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: true,
             },
         ];
@@ -1184,6 +1201,7 @@ mod tests {
                                 }],
                                 trust_class: rb_types::TrustClass::HumanConfirmed,
                                 human_curated: true,
+                                legacy_unknown: false,
                                 source_status: rb_types::HistorySourceStatus::RecordedUnverified,
                             }),
                             origin_user: Some("alice".to_string()),
@@ -1573,6 +1591,7 @@ mod tests {
                     memory: note(),
                     score: 0.5,
                     channels: rb_types::ChannelHits::default(),
+                    channel_scores: None,
                     stale: false,
                 }],
                 degraded: false,
@@ -1662,6 +1681,7 @@ mod tests {
                     memory: contested,
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    channel_scores: None,
                     stale: false,
                 }],
                 degraded: false,
@@ -1715,6 +1735,7 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    channel_scores: None,
                     stale: false,
                 }],
                 degraded: false,
@@ -1740,6 +1761,7 @@ mod tests {
                     memory: note(),
                     score: 0.9,
                     channels: rb_types::ChannelHits::default(),
+                    channel_scores: None,
                     stale: false,
                 }],
                 degraded: true,

@@ -49,5 +49,5 @@ bash "$SCORECARD_SH" --bin-dir "$EMPTY_BIN_DIR" --agent omp --model @slow >/dev/
 [ "$omp_exit" = 1 ] || fail "OMP path must fail the missing-binary prerequisite, got $omp_exit"
 pass "--agent omp selects the live path without starting a model"
 
-python3 -m unittest discover -s "$HERE/tests" -p test_scorecard_controls.py -v
-printf '\nTEST PASS: OMP scorecard routing and receipt controls behave correctly\n'
+python3 -m unittest discover -s "$HERE/tests" -p 'test_*.py' -v
+printf '\nTEST PASS: OMP scorecard and isolated Claude profile controls behave correctly\n'

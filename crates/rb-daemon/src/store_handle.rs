@@ -1111,6 +1111,12 @@ impl StoreHandle {
         self.send_write(cmd, rx).await
     }
 
+    /// Constant-memory exact-content probe for historical portable restore.
+    pub async fn has_historical_duplicate(&self, ns: Namespace, content: String) -> Result<bool> {
+        self.with_read(move |store| store.has_historical_duplicate(&ns, &content))
+            .await
+    }
+
     /// Read near-duplicate candidates for `id` within `ns` via the read pool.
     /// Namespace-isolated (see `SqliteStore::near_duplicates`); used by the
     /// consolidation job to find merge candidates without crossing namespaces.
