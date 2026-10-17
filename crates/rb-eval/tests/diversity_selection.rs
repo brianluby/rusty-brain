@@ -2,6 +2,7 @@
 //! `docs/eval/2026-10-17-diversity-selection-preregistration.md`.
 #![allow(clippy::unwrap_used, clippy::expect_used)]
 
+use rb_eval::metrics;
 use rb_eval::{
     build_engine_with_at, detailed_rankings, document_vectors, evaluate_retrieval_arm,
     load_semantic_gate, mmr_rankings, run_corpus_with, silent_losses, Corpus, DetailedRun,
@@ -41,12 +42,6 @@ async fn vectors(corpus: &Corpus) -> HashMap<String, Vec<f32>> {
         .expect("strict replay has every stored document vector")
 }
 
-fn percentile(values: &mut [u64], quantile: f64) -> u64 {
-    values.sort_unstable();
-    let index = ((values.len() as f64 - 1.0) * quantile).round() as usize;
-    values[index]
-}
-
 struct SeedResult {
     linear: RetrievalArmReport,
     mmr: RetrievalArmReport,
@@ -78,8 +73,16 @@ async fn run_seed(
         step_us.push(started.elapsed().as_micros() as u64);
         mmr.push(ranked.pop().unwrap());
     }
-    let step_p50_us = percentile(&mut step_us.clone(), 0.5);
-    let step_p99_us = percentile(&mut step_us, 0.99);
+    // Pair each query's recall time with its own MMR step before taking
+    // percentiles; summing independent percentiles is not a valid bound.
+    let combined_us: Vec<u64> = run
+        .per_query
+        .iter()
+        .zip(&step_us)
+        .map(|(detail, step)| detail.recall_latency_us + step)
+        .collect();
+    let step_p50_us = metrics::p50(&step_us);
+    let step_p99_us = metrics::p99(&step_us);
 
     let mut linear = evaluate_retrieval_arm(
         corpus,
@@ -94,9 +97,8 @@ async fn run_seed(
     linear.metrics.p99_latency_us = run.report.p99_latency_us;
     let mut mmr_report =
         evaluate_retrieval_arm(corpus, &mmr, RetrievalArm::Mmr, set, seed, &latencies).unwrap();
-    // Recall latency plus the MMR step at the same percentile: an upper bound.
-    mmr_report.metrics.p50_latency_us = run.report.p50_latency_us + step_p50_us;
-    mmr_report.metrics.p99_latency_us = run.report.p99_latency_us + step_p99_us;
+    mmr_report.metrics.p50_latency_us = metrics::p50(&combined_us);
+    mmr_report.metrics.p99_latency_us = metrics::p99(&combined_us);
 
     for (detail, shadow) in run.per_query.iter().zip(&mmr) {
         assert!(shadow.len() <= 5, "MMR rows stay within the row budget");
@@ -203,7 +205,7 @@ async fn bounded_mmr_diversity_against_linear_on_the_same_candidates() {
         "relevance": "(n - rank) / n over Linear order",
         "similarity": "cosine over stored composite document vectors (strict replay)",
         "budget": "5 rows / 800 tokens, whole rows",
-        "latency_note": "in-process, shared machine; MMR arm latency = recall + step at the same percentile (upper bound)",
+        "latency_note": "in-process, shared machine; MMR arm latency = percentiles of per-query (recall + MMR step)",
         "sets": sets,
         "decision_rule_set": "holdout",
         "decision": holdout_decision,

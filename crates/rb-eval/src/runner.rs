@@ -306,6 +306,11 @@ pub struct QueryDetail {
     /// answer" from "answered and missed".
     #[serde(default)]
     pub abstained: Option<rb_types::AbstainReason>,
+    /// This query's recall wall time. Kept out of serialized artifacts so the
+    /// frozen per-query shape is unchanged; shadow arms (#86) pair it with
+    /// their own per-query step time before taking percentiles.
+    #[serde(skip)]
+    pub recall_latency_us: u64,
 }
 
 /// Full run output: the aggregate report plus per-query detail.
@@ -369,7 +374,8 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
         let outcome = engine
             .recall_with_status(&q.query, RECALL_LIMIT, &rb_types::RecallFilter::default())
             .await?;
-        latencies_us.push(started.elapsed().as_micros() as u64);
+        let recall_latency_us = started.elapsed().as_micros() as u64;
+        latencies_us.push(recall_latency_us);
         let results = outcome.results;
         let abstained = outcome.abstained;
 
@@ -409,6 +415,7 @@ pub async fn run_corpus_with<P: EmbeddingProvider>(
             ndcg,
             channels,
             abstained,
+            recall_latency_us,
         });
     }
 

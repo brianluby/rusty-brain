@@ -326,10 +326,16 @@ fn mmr_order(vectors: &[&[f32]], lambda: f64) -> Vec<usize> {
             .enumerate()
             .map(|(position, &rank)| {
                 let relevance = (n - rank as f64) / n;
-                let redundancy = selected
-                    .iter()
-                    .map(|&chosen| cosine(vectors[rank], vectors[chosen]))
-                    .fold(0.0_f64, f64::max);
+                // Preregistered: the max over an empty selection is 0;
+                // otherwise it is the true max, which may be negative.
+                let redundancy = if selected.is_empty() {
+                    0.0
+                } else {
+                    selected
+                        .iter()
+                        .map(|&chosen| cosine(vectors[rank], vectors[chosen]))
+                        .fold(f64::NEG_INFINITY, f64::max)
+                };
                 (position, lambda * relevance - (1.0 - lambda) * redundancy)
             })
             // `remaining` stays in rank order, so keeping the first maximum
@@ -926,6 +932,20 @@ mod tests {
         let distinct = [0.0_f32, 1.0, 0.0];
         let order = mmr_order(&[&a, &a_copy, &distinct], MMR_LAMBDA);
         assert_eq!(order, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn mmr_keeps_negative_redundancy_instead_of_clamping_to_zero() {
+        // After `first`, both remaining rows have negative similarity to it.
+        // The true max rewards `opposite` (cos = -1) over `slightly` (cos ~ -0.1);
+        // clamping both to 0 would keep rank order and pick `slightly` first.
+        let first = [1.0_f32, 0.0];
+        let slightly = [-0.1_f32, 1.0];
+        let opposite = [-1.0_f32, 0.0];
+        assert_eq!(
+            mmr_order(&[&first, &slightly, &opposite], 0.5),
+            vec![0, 2, 1]
+        );
     }
 
     #[test]
