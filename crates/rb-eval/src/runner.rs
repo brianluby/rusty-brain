@@ -8,8 +8,8 @@
 use crate::backend::{eval_namespace, SqliteBackend, EVAL_DIM};
 use crate::corpus::Corpus;
 use crate::metrics;
-use rb_embed::{DeterministicProvider, EmbeddingProvider};
-use rb_engine::{MemoryEngine, RememberInput};
+use rb_embed::{DeterministicProvider, EmbedKind, EmbeddingProvider};
+use rb_engine::{embedding_input, MemoryEngine, RememberInput};
 use rb_search::FusionMode;
 use rb_types::MemoryId;
 use serde::{Deserialize, Serialize};
@@ -193,6 +193,34 @@ async fn ingest<P: EmbeddingProvider>(
         key_to_id.insert(m.key.clone(), id);
     }
     Ok(key_to_id)
+}
+
+/// Ingest the corpus into `engine` (use a fresh one) and return each fixture
+/// key's stored composite document vector: `embedding_input` of the note the
+/// engine actually stored, embedded as a document by the engine's provider.
+/// With a strict replay provider every vector is the recorded one; a miss is
+/// an error rather than a fallback. Shadow arms (#86 MMR) use this to compare
+/// candidates without touching the measured recall run.
+pub async fn document_vectors<P: EmbeddingProvider>(
+    engine: &MemoryEngine<SqliteBackend, P>,
+    corpus: &Corpus,
+) -> rb_types::Result<HashMap<String, Vec<f32>>> {
+    let key_to_id = ingest(engine, corpus).await?;
+    let mut vectors = HashMap::with_capacity(key_to_id.len());
+    for (key, id) in key_to_id {
+        let note = engine
+            .get(id)
+            .await?
+            .ok_or_else(|| rb_types::Error::Storage(format!("stored fixture {key} missing")))?;
+        let vector = engine
+            .embedder()
+            .embed(&[embedding_input(&note)], EmbedKind::Document)
+            .await?
+            .pop()
+            .ok_or_else(|| rb_types::Error::Storage(format!("no vector for fixture {key}")))?;
+        vectors.insert(key, vector);
+    }
+    Ok(vectors)
 }
 
 /// Run the full fixture suite and produce an aggregate report.
