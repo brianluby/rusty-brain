@@ -107,35 +107,50 @@ pub fn complete_frozen(runs: &Path, out: &Path) -> Result<()> {
     write_all_new(out, &outputs)
 }
 
-/// Refuse up front if any output already exists, then create each with
-/// `create_new`; on a write failure, remove the files this call created.
+/// Publish through a staging directory with the manifest written last, so it
+/// marks a complete set. Every file is made durable in `out/.staging-*` first,
+/// then renamed into place. If the process dies partway, `out` holds no
+/// manifest and only byte-identical record files (they are deterministic from
+/// the frozen inputs), so a rerun can finish the set. A rerun refuses an
+/// existing manifest or any record whose bytes differ.
 fn write_all_new(out: &Path, outputs: &[(String, Vec<u8>)]) -> Result<()> {
+    let (manifest, records) = outputs.split_last().context("no outputs to publish")?;
     std::fs::create_dir_all(out)?;
-    if let Some((name, _)) = outputs.iter().find(|(name, _)| out.join(name).exists()) {
+    if out.join(&manifest.0).exists() {
         bail!(
             "{} already exists; refusing to overwrite frozen evidence",
-            out.join(name).display()
+            out.join(&manifest.0).display()
         );
     }
-    let mut created = Vec::with_capacity(outputs.len());
-    let result = outputs.iter().try_for_each(|(name, bytes)| -> Result<()> {
+    for (name, bytes) in records {
         let path = out.join(name);
+        if path.exists() && std::fs::read(&path)? != *bytes {
+            bail!(
+                "{} exists from an interrupted run but differs; refusing to overwrite",
+                path.display()
+            );
+        }
+    }
+    let staging = tempfile::Builder::new()
+        .prefix(".staging-")
+        .tempdir_in(out)
+        .context("create staging directory")?;
+    for (name, bytes) in outputs {
+        let path = staging.path().join(name);
         let mut file = std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&path)
             .with_context(|| format!("create {}", path.display()))?;
-        created.push(path);
         file.write_all(bytes)?;
         file.sync_all()?;
-        Ok(())
-    });
-    if result.is_err() {
-        for path in &created {
-            let _ = std::fs::remove_file(path);
-        }
     }
-    result
+    for (name, _) in records.iter().chain(std::iter::once(manifest)) {
+        std::fs::rename(staging.path().join(name), out.join(name))
+            .with_context(|| format!("publish {name}"))?;
+    }
+    std::fs::File::open(out)?.sync_all()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -199,11 +214,16 @@ mod tests {
         let out = tempfile::tempdir().unwrap();
         write_frozen_runs(runs.path(), "not json\n");
         assert!(complete_frozen(runs.path(), out.path()).is_err());
-        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+        assert_eq!(published(out.path()), 0);
 
         write_frozen_runs(runs.path(), "{\"targets\": [], \"hit\": false}\n");
         complete_frozen(runs.path(), out.path()).unwrap();
-        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 13);
+        assert_eq!(published(out.path()), 13);
+        assert_eq!(
+            std::fs::read_dir(out.path()).unwrap().count(),
+            13,
+            "staging removed"
+        );
         let completed =
             std::fs::read_to_string(out.path().join("membench-movie-top5-parity-tok256.jsonl"))
                 .unwrap();
@@ -216,6 +236,42 @@ mod tests {
         assert_eq!(std::fs::read(&manifest).unwrap(), before);
     }
 
+    fn published(out: &Path) -> usize {
+        std::fs::read_dir(out)
+            .unwrap()
+            .filter(|entry| {
+                !entry
+                    .as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .starts_with('.')
+            })
+            .count()
+    }
+
+    #[test]
+    fn interrupted_publish_is_recoverable_but_divergent_leftovers_are_refused() {
+        let runs = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write_frozen_runs(runs.path(), "{\"targets\": [\"t\"], \"hit\": true}\n");
+        complete_frozen(runs.path(), out.path()).unwrap();
+
+        // Simulate a kill mid-publish: manifest and one record never landed,
+        // and an abandoned staging directory remains.
+        std::fs::remove_file(out.path().join("frozen-artifact-completion.json")).unwrap();
+        std::fs::remove_file(out.path().join("convomem-top10-parity.jsonl")).unwrap();
+        std::fs::create_dir(out.path().join(".staging-abandoned")).unwrap();
+        complete_frozen(runs.path(), out.path()).unwrap();
+        assert_eq!(published(out.path()), 13);
+
+        std::fs::remove_file(out.path().join("frozen-artifact-completion.json")).unwrap();
+        std::fs::write(out.path().join("locomo-top10-native.jsonl"), "tampered\n").unwrap();
+        let error = complete_frozen(runs.path(), out.path()).unwrap_err();
+        assert!(error.to_string().contains("differs"), "{error:#}");
+        assert!(!out.path().join("frozen-artifact-completion.json").exists());
+    }
+
     #[test]
     fn summary_count_mismatch_creates_no_outputs() {
         let runs = tempfile::tempdir().unwrap();
@@ -226,6 +282,6 @@ mod tests {
         );
         let error = complete_frozen(runs.path(), out.path()).unwrap_err();
         assert!(error.to_string().contains("count differs"), "{error:#}");
-        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+        assert_eq!(published(out.path()), 0);
     }
 }
