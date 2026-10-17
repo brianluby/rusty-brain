@@ -340,6 +340,37 @@ mod tests {
     }
 
     #[test]
+    fn logical_size_bytes_counts_whole_pages_and_grows_with_writes() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let page_size: u64 = store
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let empty = store.logical_size_bytes().unwrap();
+        assert!(empty > 0, "schema pages are allocated even in memory");
+        assert_eq!(
+            empty % page_size,
+            0,
+            "allocation is reported in whole pages"
+        );
+
+        let ns = Namespace::Project("size".to_string());
+        for index in 0..200 {
+            seed(
+                &store,
+                &ns,
+                &format!("logical size fixture {index} {}", "x".repeat(200)),
+            );
+        }
+        let grown = store.logical_size_bytes().unwrap();
+        assert!(
+            grown > empty,
+            "inserted rows must allocate more pages: {empty} -> {grown}"
+        );
+        assert_eq!(grown % page_size, 0);
+    }
+
+    #[test]
     fn corpus_snapshot_pins_namespace_state_and_moves_on_every_write() {
         // Vikunja #62: the fingerprint must (a) stay namespace-scoped,
         // (b) move on insert (generation), and (c) move on a same-count

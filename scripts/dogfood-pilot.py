@@ -16,7 +16,7 @@ import re
 import statistics
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -240,7 +240,13 @@ def evidence_reference(value: Any, where: str) -> str:
 def validate_manifest(manifest: Any, *, candidate: bool = False) -> dict[str, Any]:
     manifest = exact_keys(manifest, MANIFEST_KEYS, "manifest")
     if integer(manifest["schema_version"], "manifest.schema_version", 1) != SCHEMA_VERSION:
-        fail("unsupported manifest schema_version")
+        # v1 predates pinned execution (model/version/prompt budget) and the
+        # 2-3 repository rule; no v1 pilot was ever admitted, so v1 input is
+        # rejected rather than migrated with guessed execution metadata.
+        fail(
+            f"unsupported manifest schema_version {manifest['schema_version']}; "
+            f"expected {SCHEMA_VERSION} — regenerate the manifest, do not migrate v1"
+        )
 
     admission = exact_keys(manifest["admission"], ADMISSION_KEYS, "manifest.admission")
     task_56 = exact_keys(admission["task_56"], TASK_56_KEYS, "manifest.admission.task_56")
@@ -591,8 +597,20 @@ def correctness_rate(pairs: list[dict[str, Any]], arm: str, prefix: str) -> floa
     return ratio(correct, opportunities)
 
 
-def aggregate(manifest: dict[str, Any], pairs: list[dict[str, Any]], final: bool) -> dict[str, Any]:
+def aggregate(
+    manifest: dict[str, Any],
+    pairs: list[dict[str, Any]],
+    final: bool,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     manifest = validate_manifest(manifest)
+    if final:
+        # A complete set of pairs can land before the declared period ends; a
+        # final verdict then would silently shorten the preregistered window.
+        end = timestamp(manifest["period"]["end_utc"], "manifest.period.end_utc")
+        if (now or datetime.now(timezone.utc)) < end:
+            fail("final aggregation is not allowed before manifest.period.end_utc; use --interim")
     validated: list[dict[str, Any]] = []
     seen: set[str] = set()
     for pair in pairs:
@@ -1092,6 +1110,37 @@ def self_test() -> None:
     check(
         aggregate(manifest, pairs[:1], final=False)["verdict"] == "CONTINUE",
         "safe interim observation did not continue",
+    )
+    legacy_manifest = copy.deepcopy(manifest)
+    legacy_manifest["schema_version"] = 1
+    try:
+        validate_manifest(legacy_manifest)
+    except PilotError as error:
+        check("regenerate the manifest" in str(error), f"v1 rejection message drifted: {error}")
+    else:
+        raise AssertionError("schema_version 1 manifest was accepted")
+    legacy_pair = copy.deepcopy(pairs[0])
+    legacy_pair["schema_version"] = 1
+    try:
+        validate_pair(legacy_pair, validate_manifest(manifest))
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("schema_version 1 observation was accepted")
+    period_end = timestamp(end, "end")
+    try:
+        aggregate(manifest, pairs, final=True, now=period_end - timedelta(seconds=1))
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("final verdict was issued before the pilot period ended")
+    check(
+        aggregate(manifest, pairs, final=True, now=period_end)["verdict"] == "GO",
+        "final verdict at the period end was rejected",
+    )
+    check(
+        aggregate(manifest, mie_pairs, final=False, now=period_end - timedelta(days=2))["verdict"] == "STOP",
+        "interim stop rules were unavailable during the pilot period",
     )
     blocked_manifest = copy.deepcopy(manifest)
     blocked_manifest["admission"]["task_56"]["state"] = "no-go"

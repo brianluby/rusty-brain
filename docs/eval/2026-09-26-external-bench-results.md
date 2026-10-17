@@ -241,11 +241,10 @@ categories, plus all other benchmarks' category breakdowns. Original files
 are at `~/.cache/rusty-brain-bench/runs/` with the names in that inventory;
 they are local reproducibility artifacts, not remotely hosted downloads.
 
-The four native summary links are
-[`longmemeval-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/longmemeval-native.summary.json),
-[`locomo-top10-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/locomo-top10-native.summary.json),
-[`convomem-top10-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/convomem-top10-native.summary.json), and
-[`membench-movie-top5-native.summary.json`](file:///Users/bluby/.cache/rusty-brain-bench/runs/membench-movie-top5-native.summary.json).
+The four native summaries, in that local cache directory
+(`~/.cache/rusty-brain-bench/runs/`), are `longmemeval-native.summary.json`,
+`locomo-top10-native.summary.json`, `convomem-top10-native.summary.json`, and
+`membench-movie-top5-native.summary.json`.
 The ingest and p95 columns above were already recorded there; they are not
 new performance measurements.
 

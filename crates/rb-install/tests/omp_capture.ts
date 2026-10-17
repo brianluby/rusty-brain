@@ -132,9 +132,16 @@ try {
   };
   const deliveryHandlers = new Map<string, Handler>();
   let deliverySession = "omp-stable-first";
-  let deliveryBranch: unknown[] = [];
+  let deliveryBranch: unknown[] | null = [];
   const deliveryContext = {
-    cwd: root, sessionManager: { getSessionId: () => deliverySession, getBranch: () => deliveryBranch },
+    cwd: root,
+    sessionManager: {
+      getSessionId: () => deliverySession,
+      getBranch: () => {
+        if (deliveryBranch === null) throw new Error("session history disposed");
+        return deliveryBranch;
+      },
+    },
   };
   extension({ on: (name: string, handler: Handler) => deliveryHandlers.set(name, handler) } as unknown as Parameters<typeof extension>[0]);
   const deliver = async (name: string, payload = {}) => {
@@ -184,6 +191,24 @@ try {
   const resumedDelivery = body(await deliver("before_agent_start", { prompt: callbackObservation }));
   assert.ok(!resumedDelivery.includes("# Rusty Brain — Stable project context"), "cold resume with retained context cannot re-inject startup text");
   assert.ok(resumedDelivery.includes(dynamicNote.id), "cold resume keeps current query recall available");
+  // Each retained-history shape, and unreadable history, classifies session_start as a resume;
+  // history without retained conversation still receives startup context.
+  const coldStarts: [string, unknown[] | null, boolean][] = [
+    ["compaction", [{ type: "compaction", summary: "earlier work" }], false],
+    ["user-message", [{ type: "message", message: { role: "user", content: "earlier prompt" } }], false],
+    ["assistant-message", [{ type: "message", message: { role: "assistant", content: "earlier reply" } }], false],
+    ["unreadable-history", null, false],
+    ["other-custom-message", [{ type: "custom_message", customType: "other.extension", content: "x" }], true],
+    ["tool-message", [{ type: "message", message: { role: "toolResult", content: "x" } }], true],
+  ];
+  for (const [label, branch, startup] of coldStarts) {
+    deliverySession = `omp-cold-${label}`;
+    deliveryBranch = branch;
+    await deliver("session_start");
+    const delivered = body(await deliver("before_agent_start", { prompt: callbackObservation }));
+    assert.equal(delivered.includes("# Rusty Brain — Stable project context"), startup,
+      `${label} history must ${startup ? "receive" : "suppress"} startup context`);
+  }
   deliveryBranch = [];
   for (const transition of ["session_switch", "session_branch", "session_tree"]) {
     deliverySession = `omp-resumed-${transition}`;

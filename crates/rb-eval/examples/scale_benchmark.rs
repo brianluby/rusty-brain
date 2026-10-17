@@ -1751,7 +1751,9 @@ fn execute_fault_tests(
             .args(arguments)
             .output()
             .with_context(|| format!("execute required fault test {test}"))?;
-        let stdout = String::from_utf8(result.stdout).context("fault-test stdout is not UTF-8")?;
+        // Lossy decode: undecodable bytes must not abort the run before the
+        // evidence record is written; the pass check below still fails closed.
+        let stdout = String::from_utf8_lossy(&result.stdout).into_owned();
         complete &= result.status.success() && fault_test_output_passed(&stdout, test);
         let record = FaultArtifactRecord {
             schema: "rusty-brain-scale-fault-evidence-v2".into(),

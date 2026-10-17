@@ -39,9 +39,13 @@ fn failure(record: &Value, benchmark: &str) -> Result<&'static str> {
 
 /// Read-only inputs; create-new outputs prevent overwriting frozen evidence.
 /// Native channel scores/DB bytes/hardware were not captured and stay unavailable.
+///
+/// All twelve inputs are parsed, classified and count-checked in memory before
+/// any output is created, so a malformed input leaves no partial artifact under
+/// the official completed name and a corrected rerun is not blocked.
 pub fn complete_frozen(runs: &Path, out: &Path) -> Result<()> {
-    std::fs::create_dir_all(out)?;
     let mut entries = Vec::new();
+    let mut outputs: Vec<(String, Vec<u8>)> = Vec::new();
     for stem in [
         "longmemeval",
         "locomo-top10",
@@ -61,26 +65,21 @@ pub fn complete_frozen(runs: &Path, out: &Path) -> Result<()> {
             let text = std::str::from_utf8(&bytes)?;
             let benchmark = summary["benchmark"].as_str().context("benchmark")?;
             let mut failures: BTreeMap<String, usize> = BTreeMap::new();
-            let mut output = std::io::BufWriter::new(
-                std::fs::OpenOptions::new()
-                    .write(true)
-                    .create_new(true)
-                    .open(out.join(&records_name))?,
-            );
+            let mut completed = Vec::with_capacity(bytes.len());
             let mut count = 0usize;
             for line in text.lines() {
-                let mut record: Value = serde_json::from_str(line)?;
+                let mut record: Value = serde_json::from_str(line)
+                    .with_context(|| format!("{records_name} record {}", count + 1))?;
                 if record.get("failure").is_none() {
                     record["failure"] = json!(failure(&record, benchmark)?);
                 }
                 *failures
                     .entry(record["failure"].as_str().context("failure")?.into())
                     .or_default() += 1;
-                serde_json::to_writer(&mut output, &record)?;
-                output.write_all(b"\n")?;
+                serde_json::to_writer(&mut completed, &record)?;
+                completed.push(b'\n');
                 count += 1;
             }
-            output.flush()?;
             if summary["overall"]["n"].as_u64() != Some(count as u64) {
                 bail!("{records_name} count differs from summary");
             }
@@ -88,10 +87,11 @@ pub fn complete_frozen(runs: &Path, out: &Path) -> Result<()> {
                 "summary_file": summary_name, "records_file": records_name,
                 "summary_sha256": format!("{:x}", Sha256::digest(&summary_bytes)),
                 "frozen_records_sha256": format!("{:x}", Sha256::digest(&bytes)),
-                "completed_records_sha256": format!("{:x}", Sha256::digest(std::fs::read(out.join(&records_name))?)),
+                "completed_records_sha256": format!("{:x}", Sha256::digest(&completed)),
                 "records": count, "failures": failures,
                 "metadata": summary,
             }));
+            outputs.push((records_name, completed));
         }
     }
     let manifest = json!({
@@ -101,13 +101,41 @@ pub fn complete_frozen(runs: &Path, out: &Path) -> Result<()> {
         "unrecoverable_historical_fields": ["native numeric channel scores", "logical/physical DB bytes", "CPU model, RAM and full historical OS version"],
         "entries": entries,
     });
-    let mut file = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(out.join("frozen-artifact-completion.json"))?;
-    serde_json::to_writer_pretty(&mut file, &manifest)?;
-    file.write_all(b"\n")?;
-    Ok(())
+    let mut manifest_bytes = serde_json::to_vec_pretty(&manifest)?;
+    manifest_bytes.push(b'\n');
+    outputs.push(("frozen-artifact-completion.json".into(), manifest_bytes));
+    write_all_new(out, &outputs)
+}
+
+/// Refuse up front if any output already exists, then create each with
+/// `create_new`; on a write failure, remove the files this call created.
+fn write_all_new(out: &Path, outputs: &[(String, Vec<u8>)]) -> Result<()> {
+    std::fs::create_dir_all(out)?;
+    if let Some((name, _)) = outputs.iter().find(|(name, _)| out.join(name).exists()) {
+        bail!(
+            "{} already exists; refusing to overwrite frozen evidence",
+            out.join(name).display()
+        );
+    }
+    let mut created = Vec::with_capacity(outputs.len());
+    let result = outputs.iter().try_for_each(|(name, bytes)| -> Result<()> {
+        let path = out.join(name);
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .with_context(|| format!("create {}", path.display()))?;
+        created.push(path);
+        file.write_all(bytes)?;
+        file.sync_all()?;
+        Ok(())
+    });
+    if result.is_err() {
+        for path in &created {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -136,5 +164,68 @@ mod tests {
             "abstained"
         );
         assert!(failure(&json!({}), "convomem").is_err());
+    }
+
+    fn write_frozen_runs(runs: &Path, last_records: &str) {
+        let stems = [
+            "longmemeval",
+            "locomo-top10",
+            "convomem-top10",
+            "membench-movie-top5",
+        ];
+        for stem in stems {
+            for suffix in ["native", "parity", "parity-tok256"] {
+                let tag = format!("{stem}-{suffix}");
+                let summary =
+                    json!({"complete": true, "benchmark": "membench", "overall": {"n": 1}});
+                std::fs::write(
+                    runs.join(format!("{tag}.summary.json")),
+                    summary.to_string(),
+                )
+                .unwrap();
+                let records = if tag == "membench-movie-top5-parity-tok256" {
+                    last_records
+                } else {
+                    "{\"targets\": [\"t\"], \"hit\": true}\n"
+                };
+                std::fs::write(runs.join(format!("{tag}.jsonl")), records).unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn invalid_input_creates_no_outputs_and_rerun_succeeds() {
+        let runs = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write_frozen_runs(runs.path(), "not json\n");
+        assert!(complete_frozen(runs.path(), out.path()).is_err());
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
+
+        write_frozen_runs(runs.path(), "{\"targets\": [], \"hit\": false}\n");
+        complete_frozen(runs.path(), out.path()).unwrap();
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 13);
+        let completed =
+            std::fs::read_to_string(out.path().join("membench-movie-top5-parity-tok256.jsonl"))
+                .unwrap();
+        assert!(completed.contains("unscorable_empty_gold"));
+
+        let manifest = out.path().join("frozen-artifact-completion.json");
+        let before = std::fs::read(&manifest).unwrap();
+        let error = complete_frozen(runs.path(), out.path()).unwrap_err();
+        assert!(error.to_string().contains("already exists"), "{error:#}");
+        assert_eq!(std::fs::read(&manifest).unwrap(), before);
+    }
+
+    #[test]
+    fn summary_count_mismatch_creates_no_outputs() {
+        let runs = tempfile::tempdir().unwrap();
+        let out = tempfile::tempdir().unwrap();
+        write_frozen_runs(
+            runs.path(),
+            "{\"targets\": [\"t\"], \"hit\": true}\n{\"targets\": [\"t\"], \"hit\": false}\n",
+        );
+        let error = complete_frozen(runs.path(), out.path()).unwrap_err();
+        assert!(error.to_string().contains("count differs"), "{error:#}");
+        assert_eq!(std::fs::read_dir(out.path()).unwrap().count(), 0);
     }
 }
