@@ -1507,7 +1507,17 @@ mod tests {
         }
         collector.set_modified(UNIX_EPOCH).unwrap();
         drop(attempts);
-        prune_startup_logs(directory.path()).unwrap();
+        // Another test in this process can fork a child between our drop and
+        // its exec; the child briefly shares these descriptors and therefore
+        // the flocks, so pruning correctly skips those logs as still active.
+        // Retry until the inherited copies close at exec.
+        for _ in 0..100 {
+            prune_startup_logs(directory.path()).unwrap();
+            if !completed.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
         assert!(!completed.exists());
         assert_eq!(
             fs::read_dir(directory.path()).unwrap().count(),

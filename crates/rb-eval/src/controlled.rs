@@ -17,6 +17,8 @@ pub const PROMPT_ROW_BUDGET: usize = 5;
 pub const ADMISSION_ROW_BUDGET: usize = 128;
 pub const ADMISSION_BYTE_BUDGET: usize = 32_768;
 pub const STREAM_SEEDS: [u64; 5] = [20_260_101, 20_260_201, 20_260_301, 20_260_401, 20_260_501];
+/// Preregistered (#86) MMR trade-off; not tuned.
+pub const MMR_LAMBDA: f64 = 0.7;
 
 const STOPWORDS: &[&str] = &[
     "a", "an", "and", "are", "as", "at", "be", "by", "do", "does", "for", "from", "how", "i", "in",
@@ -32,6 +34,8 @@ pub enum RetrievalArm {
     ExactEvidence,
     RecencyOnly,
     ImportanceOnly,
+    /// #86 shadow arm: Linear's own candidates reselected by MMR.
+    Mmr,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -273,6 +277,152 @@ pub fn exact_evidence_rankings(corpus: &Corpus, linear: &DetailedRun) -> Vec<Vec
             budget_ranking(corpus, &selected)
         })
         .collect()
+}
+
+/// #86: reselect each query's Linear candidates by Maximal Marginal Relevance,
+/// then apply the shared prompt budget. Relevance is Linear's rank,
+/// `(n - r) / n`, so fusion order stays the relevance signal; redundancy is
+/// the max cosine to already-selected rows over stored document vectors.
+/// Ties break by Linear rank. A candidate without a vector is an error.
+pub fn mmr_rankings(
+    corpus: &Corpus,
+    linear: &DetailedRun,
+    vectors: &HashMap<String, Vec<f32>>,
+    lambda: f64,
+) -> Result<Vec<Vec<String>>, String> {
+    linear
+        .per_query
+        .iter()
+        .map(|detail| {
+            let candidates = &detail.ranked_keys;
+            let vectors_for: Vec<&[f32]> = candidates
+                .iter()
+                .map(|key| {
+                    vectors
+                        .get(key)
+                        .map(Vec::as_slice)
+                        .ok_or_else(|| format!("no document vector for candidate {key}"))
+                })
+                .collect::<Result<_, _>>()?;
+            let selected = mmr_order(&vectors_for, lambda);
+            let reranked: Vec<String> = selected
+                .into_iter()
+                .map(|rank| candidates[rank].clone())
+                .collect();
+            Ok(budget_ranking(corpus, &reranked))
+        })
+        .collect()
+}
+
+/// Greedy MMR over candidates given in relevance (rank) order; returns the
+/// selection order as candidate indices.
+fn mmr_order(vectors: &[&[f32]], lambda: f64) -> Vec<usize> {
+    let n = vectors.len() as f64;
+    let mut remaining: Vec<usize> = (0..vectors.len()).collect();
+    let mut selected: Vec<usize> = Vec::with_capacity(vectors.len());
+    while !remaining.is_empty() {
+        let (position, _) = remaining
+            .iter()
+            .enumerate()
+            .map(|(position, &rank)| {
+                let relevance = (n - rank as f64) / n;
+                // Preregistered: the max over an empty selection is 0;
+                // otherwise it is the true max, which may be negative.
+                let redundancy = if selected.is_empty() {
+                    0.0
+                } else {
+                    selected
+                        .iter()
+                        .map(|&chosen| cosine(vectors[rank], vectors[chosen]))
+                        .fold(f64::NEG_INFINITY, f64::max)
+                };
+                (position, lambda * relevance - (1.0 - lambda) * redundancy)
+            })
+            // `remaining` stays in rank order, so keeping the first maximum
+            // breaks ties by Linear rank.
+            .fold((0, f64::NEG_INFINITY), |best, item| {
+                if item.1 > best.1 {
+                    item
+                } else {
+                    best
+                }
+            });
+        selected.push(remaining.remove(position));
+    }
+    selected
+}
+
+fn cosine(left: &[f32], right: &[f32]) -> f64 {
+    let (mut dot, mut left_norm, mut right_norm) = (0.0_f64, 0.0_f64, 0.0_f64);
+    for (a, b) in left.iter().zip(right) {
+        dot += f64::from(*a) * f64::from(*b);
+        left_norm += f64::from(*a) * f64::from(*a);
+        right_norm += f64::from(*b) * f64::from(*b);
+    }
+    if left_norm == 0.0 || right_norm == 0.0 {
+        0.0
+    } else {
+        dot / (left_norm.sqrt() * right_norm.sqrt())
+    }
+}
+
+/// Silent losses of an arm relative to a baseline over the same queries.
+#[derive(Debug, Clone, Default, Serialize, PartialEq, Eq)]
+pub struct SilentLosses {
+    /// Expected keys in the baseline's budgeted rows but absent from the arm's.
+    pub relevant_drops: usize,
+    /// Queries where the baseline held both sides of an authored
+    /// contradiction pair and the arm holds exactly one.
+    pub contradiction_drops: usize,
+}
+
+/// Authored `contradicts` pairs, as `(memory, target)`.
+pub fn contradiction_pairs(corpus: &Corpus) -> Vec<(String, String)> {
+    let known: HashSet<&str> = corpus
+        .memories
+        .iter()
+        .map(|memory| memory.key.as_str())
+        .collect();
+    let mut pairs: Vec<(String, String)> = corpus
+        .memories
+        .iter()
+        .filter_map(|memory| {
+            relation_target(&memory.context.to_lowercase(), "contradicts", &known)
+                .map(|target| (memory.key.clone(), target))
+        })
+        .collect();
+    pairs.sort();
+    pairs.dedup();
+    pairs
+}
+
+pub fn silent_losses(
+    corpus: &Corpus,
+    baseline: &[Vec<String>],
+    arm: &[Vec<String>],
+) -> Result<SilentLosses, String> {
+    if baseline.len() != corpus.golden_queries.len() || arm.len() != baseline.len() {
+        return Err("ranking/query count mismatch".into());
+    }
+    let pairs = contradiction_pairs(corpus);
+    let mut losses = SilentLosses::default();
+    for ((query, base), shadow) in corpus.golden_queries.iter().zip(baseline).zip(arm) {
+        let base: HashSet<&str> = base.iter().map(String::as_str).collect();
+        let shadow: HashSet<&str> = shadow.iter().map(String::as_str).collect();
+        losses.relevant_drops += query
+            .expected
+            .iter()
+            .filter(|key| base.contains(key.as_str()) && !shadow.contains(key.as_str()))
+            .count();
+        if pairs.iter().any(|(left, right)| {
+            base.contains(left.as_str())
+                && base.contains(right.as_str())
+                && (shadow.contains(left.as_str()) != shadow.contains(right.as_str()))
+        }) {
+            losses.contradiction_drops += 1;
+        }
+    }
+    Ok(losses)
 }
 
 /// Newest-first shadow baseline for a fixed chronological stream order.
@@ -773,5 +923,82 @@ mod tests {
                 assert!(report.retained_bytes <= ADMISSION_BYTE_BUDGET);
             }
         }
+    }
+
+    #[test]
+    fn mmr_demotes_a_near_duplicate_below_a_distinct_lower_ranked_row() {
+        let a = [1.0_f32, 0.0, 0.0];
+        let a_copy = [0.99_f32, 0.01, 0.0];
+        let distinct = [0.0_f32, 1.0, 0.0];
+        let order = mmr_order(&[&a, &a_copy, &distinct], MMR_LAMBDA);
+        assert_eq!(order, vec![0, 2, 1]);
+    }
+
+    #[test]
+    fn mmr_keeps_negative_redundancy_instead_of_clamping_to_zero() {
+        // After `first`, both remaining rows have negative similarity to it.
+        // The true max rewards `opposite` (cos = -1) over `slightly` (cos ~ -0.1);
+        // clamping both to 0 would keep rank order and pick `slightly` first.
+        let first = [1.0_f32, 0.0];
+        let slightly = [-0.1_f32, 1.0];
+        let opposite = [-1.0_f32, 0.0];
+        assert_eq!(
+            mmr_order(&[&first, &slightly, &opposite], 0.5),
+            vec![0, 2, 1]
+        );
+    }
+
+    #[test]
+    fn mmr_with_lambda_one_is_linear_order_and_ties_keep_rank() {
+        let v = [1.0_f32, 0.0];
+        let w = [0.0_f32, 1.0];
+        assert_eq!(mmr_order(&[&v, &v, &w, &w], 1.0), vec![0, 1, 2, 3]);
+        assert_eq!(mmr_order(&[], MMR_LAMBDA), Vec::<usize>::new());
+        assert_eq!(cosine(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+    }
+
+    #[tokio::test]
+    async fn mmr_rankings_fail_closed_on_a_missing_vector() {
+        let corpus = crate::load_committed_corpus().unwrap();
+        let run = crate::run_corpus_detailed(&corpus).await.unwrap();
+        let first = run
+            .per_query
+            .iter()
+            .find_map(|detail| detail.ranked_keys.first())
+            .unwrap()
+            .clone();
+        let error = mmr_rankings(&corpus, &run, &HashMap::new(), MMR_LAMBDA).unwrap_err();
+        assert!(error.contains(&first), "{error}");
+    }
+
+    #[test]
+    fn silent_losses_count_dropped_relevant_rows_and_split_contradictions() {
+        let corpus = crate::load_committed_corpus().unwrap();
+        let pairs = contradiction_pairs(&corpus);
+        assert_eq!(pairs.len(), 6, "README documents six contradiction pairs");
+        let (left, right) = pairs[0].clone();
+        let query = &corpus.golden_queries[0];
+        let expected = query
+            .expected
+            .iter()
+            .find(|key| **key != left && **key != right)
+            .unwrap()
+            .clone();
+        let mut baseline = vec![Vec::new(); corpus.golden_queries.len()];
+        let mut arm = baseline.clone();
+        baseline[0] = vec![left.clone(), right.clone(), expected];
+        arm[0] = vec![left];
+        let losses = silent_losses(&corpus, &baseline, &arm).unwrap();
+        assert_eq!(
+            losses,
+            SilentLosses {
+                relevant_drops: 1 + usize::from(query.expected.contains(&right)),
+                contradiction_drops: 1,
+            }
+        );
+        assert_eq!(
+            silent_losses(&corpus, &baseline, &baseline).unwrap(),
+            SilentLosses::default()
+        );
     }
 }
