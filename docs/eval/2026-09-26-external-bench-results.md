@@ -326,7 +326,8 @@ The full all-four diagnostic matrix above was executed once: 12 runs
 `main` `a1ec930`, from a detached worktree, with the commands exactly as
 written. This is a **current diagnostic**, not a replacement quality run: the
 September headline above stays the frozen result. Hardware: Apple M4 Pro,
-12 logical CPUs, Darwin 27.0.0. No model calls; $0 external API cost.
+12 logical CPUs, Darwin 27.0.0. Only the pinned local embedding model runs;
+there are no external API calls and $0 external API cost.
 
 The summary, hashes and audit counts are committed as
 [`artifacts/2026-10-17-external-bench-diagnostic-replay.json`](artifacts/2026-10-17-external-bench-diagnostic-replay.json).
@@ -396,5 +397,5 @@ kanban #100. Nothing was tuned or changed in response.
 - Native numeric channel scores and DB sizes for the **September** runs:
   unrecoverable, as stated above. The new values describe current code only.
 - September CPU model, RAM and full OS version: unavailable.
-- A reproducible 512-token configuration: not available until #100 pins a
+- A reproducible 512-token configuration: not available until kanban #100 pins a
   model revision that allows it.
