@@ -5,6 +5,18 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — External benchmark diagnostic replay (kanban 60)
+
+- Execute the full all-four per-question diagnostic matrix (12 runs) on clean
+  `a1ec930`: every record now has a failure class, numeric per-channel scores
+  and logical DB bytes. Summary, hashes and audit counts are in
+  `docs/eval/artifacts/2026-10-17-external-bench-diagnostic-replay.json`; the
+  frozen September headline is unchanged.
+- Finding: the current model snapshot caps embedding input at 256 tokens even
+  when 512 is requested, so September's 512-token columns cannot be
+  reproduced (LoCoMo native 0.917 → 0.900). Pinning and effective-length
+  recording are tracked in kanban 100.
+
 ### Added — Bounded diversity-selection experiment (kanban 86)
 
 - Add an eval-only MMR arm that reselects Linear's own top-10 candidates over

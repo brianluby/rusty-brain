@@ -1,0 +1,496 @@
+{
+  "artifact_role": "current_diagnostic_not_frozen_quality",
+  "effective_max_tokens_finding": "requested 512 is capped at 256: parity (512 requested) equals parity-tok256 on every benchmark; see kanban #100",
+  "embedding_model": "all-MiniLM-L6-v2",
+  "embedding_snapshot": "Qdrant/all-MiniLM-L6-v2-onnx@d13954661f83248295ba75c1ed411eef3b7b936e (tokenizer_config model_max_length 256)",
+  "external_api_cost_usd": 0.0,
+  "hardware": {
+    "cpu_model": "Apple M4 Pro",
+    "kernel": "Darwin 27.0.0",
+    "logical_cpus": 12,
+    "note": "captured on this execution only; null means unavailable; no historical hardware inference",
+    "physical_memory_bytes": "25769803776"
+  },
+  "parity_512_equals_parity_256": {
+    "convomem-top10": true,
+    "locomo-top10": true,
+    "longmemeval": true,
+    "membench-movie-top5": true
+  },
+  "runs": [
+    {
+      "complete": true,
+      "headline_current": {
+        "mrr": 0.9211248196248195,
+        "ndcg@10": 0.9237765515149817,
+        "recall_any@1": 0.876,
+        "recall_any@10": 0.99,
+        "recall_any@5": 0.978
+      },
+      "headline_delta": {
+        "mrr": -0.00076,
+        "ndcg@10": 4e-05,
+        "recall_any@1": 0.0,
+        "recall_any@10": 0.0,
+        "recall_any@5": -0.002
+      },
+      "headline_frozen_2026_09_26": {
+        "mrr": 0.9218850649350647,
+        "ndcg@10": 0.9237368068656923,
+        "recall_any@1": 0.876,
+        "recall_any@10": 0.99,
+        "recall_any@5": 0.98
+      },
+      "n": 500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit_at_10_only": 6,
+          "hit_at_5": 489,
+          "hit_below_10": 3,
+          "miss": 2
+        },
+        "hits_with_numeric_channel_scores": 8333,
+        "logical_db_bytes_max": 2043904,
+        "logical_db_bytes_median": 1916928,
+        "records_with_failure_class": 500,
+        "records_with_logical_db_bytes": 500,
+        "returned_hits": 8333
+      },
+      "records": 500,
+      "records_sha256": "3c68134ec45f4107a41b3454be65a761692827367795406aa0bde51b45f52525",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "longmemeval-native",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "a32fb571bf34950cb054695fc5c934228a09d74e9e4095e3aafc07468d450fd9"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "mrr": 0.874202317127317,
+        "ndcg@10": 0.8784525252706545,
+        "recall_any@1": 0.806,
+        "recall_any@10": 0.982,
+        "recall_any@5": 0.966
+      },
+      "headline_delta": {
+        "mrr": -0.00013,
+        "ndcg@10": -8.1e-05,
+        "recall_any@1": 0.0,
+        "recall_any@10": -0.002,
+        "recall_any@5": 0.006
+      },
+      "headline_frozen_2026_09_26": {
+        "mrr": 0.8743320207570207,
+        "ndcg@10": 0.8785332599012492,
+        "recall_any@1": 0.806,
+        "recall_any@10": 0.984,
+        "recall_any@5": 0.96
+      },
+      "n": 500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit_at_10_only": 8,
+          "hit_at_5": 483,
+          "hit_below_10": 9
+        },
+        "hits_with_numeric_channel_scores": 23551,
+        "logical_db_bytes_max": 1982464,
+        "logical_db_bytes_median": 1896448,
+        "records_with_failure_class": 500,
+        "records_with_logical_db_bytes": 500,
+        "returned_hits": 23551
+      },
+      "records": 500,
+      "records_sha256": "76df74b8e44584d13cf51aaff1fb258d4d4b7fa3489068f3e81f580abe659ea1",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "longmemeval-parity",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "f17f9635a8b2fefbc3f47b4273fc874adf0d65725bb2540dcffd699f56e2b31d"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "mrr": 0.874202317127317,
+        "ndcg@10": 0.8784525252706545,
+        "recall_any@1": 0.806,
+        "recall_any@10": 0.982,
+        "recall_any@5": 0.966
+      },
+      "headline_delta": {
+        "mrr": 0.0,
+        "ndcg@10": 0.0,
+        "recall_any@1": 0.0,
+        "recall_any@10": 0.0,
+        "recall_any@5": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "mrr": 0.874202317127317,
+        "ndcg@10": 0.8784525252706545,
+        "recall_any@1": 0.806,
+        "recall_any@10": 0.982,
+        "recall_any@5": 0.966
+      },
+      "n": 500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit_at_10_only": 8,
+          "hit_at_5": 483,
+          "hit_below_10": 9
+        },
+        "hits_with_numeric_channel_scores": 23551,
+        "logical_db_bytes_max": 1982464,
+        "logical_db_bytes_median": 1896448,
+        "records_with_failure_class": 500,
+        "records_with_logical_db_bytes": 500,
+        "returned_hits": 23551
+      },
+      "records": 500,
+      "records_sha256": "2a548372d26e11c23e081e855f3ef6dc13d027c7a0681cbe98aee5557ccc6b6d",
+      "requested_max_tokens": 256,
+      "run": "longmemeval-parity-tok256",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "87cd0f6889d77b6e8d2cd7b1182f92bdc66e9de144f5e93af78f23f1cf41c144"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "evidence_recall_excl_empty": 0.899937733250044,
+        "evidence_recall_mempalace": 0.9001392685305072,
+        "mrr_excl_empty": 0.7294820047090472,
+        "recall_any@10_excl_empty": 0.9359233097880928
+      },
+      "headline_delta": {
+        "evidence_recall_excl_empty": -0.016839,
+        "evidence_recall_mempalace": -0.016805,
+        "mrr_excl_empty": -0.002324,
+        "recall_any@10_excl_empty": -0.017154
+      },
+      "headline_frozen_2026_09_26": {
+        "evidence_recall_excl_empty": 0.9167767847132127,
+        "evidence_recall_mempalace": 0.916944404482169,
+        "mrr_excl_empty": 0.7318064965643164,
+        "recall_any@10_excl_empty": 0.9530776992936428
+      },
+      "n": 1986,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 1707,
+          "miss": 127,
+          "partial_hit": 148,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 19855,
+        "logical_db_bytes_max": 2007040,
+        "logical_db_bytes_median": 1961984,
+        "records_with_failure_class": 1986,
+        "records_with_logical_db_bytes": 1986,
+        "returned_hits": 19855
+      },
+      "records": 1986,
+      "records_sha256": "a0a17c61f3d4a82613fb8ebf32eb78b4c1a69d199783401625877bf351c1b876",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "locomo-top10-native",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "d88e12ab2aa7439decfa4c6ee3fdac9db0d2349b26027b4f5ab77b4559db497b"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "evidence_recall_excl_empty": 0.602073022279884,
+        "evidence_recall_mempalace": 0.6028744864847583,
+        "mrr_excl_empty": 0.36720864767030303,
+        "recall_any@10_excl_empty": 0.6493440968718466
+      },
+      "headline_delta": {
+        "evidence_recall_excl_empty": -0.123293,
+        "evidence_recall_mempalace": -0.123045,
+        "mrr_excl_empty": -0.08281,
+        "recall_any@10_excl_empty": -0.120585
+      },
+      "headline_frozen_2026_09_26": {
+        "evidence_recall_excl_empty": 0.7253659923437927,
+        "evidence_recall_mempalace": 0.7259191323390721,
+        "mrr_excl_empty": 0.45001841974596823,
+        "recall_any@10_excl_empty": 0.7699293642785066
+      },
+      "n": 1986,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 1095,
+          "miss": 695,
+          "partial_hit": 192,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 19860,
+        "logical_db_bytes_max": 1990656,
+        "logical_db_bytes_median": 1941504,
+        "records_with_failure_class": 1986,
+        "records_with_logical_db_bytes": 1986,
+        "returned_hits": 19860
+      },
+      "records": 1986,
+      "records_sha256": "e2b9116fd7a2a872afc920a5c6ddbf58555ab3af1363d3c4e54b66cce6aff09f",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "locomo-top10-parity",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "9dc96502b2d5e26e2fde0c1f8c3cb40805c97becb8c5fd9fe53e8fa06a06d043"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "evidence_recall_excl_empty": 0.602073022279884,
+        "evidence_recall_mempalace": 0.6028744864847583,
+        "mrr_excl_empty": 0.36720864767030303,
+        "recall_any@10_excl_empty": 0.6493440968718466
+      },
+      "headline_delta": {
+        "evidence_recall_excl_empty": 0.0,
+        "evidence_recall_mempalace": 0.0,
+        "mrr_excl_empty": 0.0,
+        "recall_any@10_excl_empty": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "evidence_recall_excl_empty": 0.602073022279884,
+        "evidence_recall_mempalace": 0.6028744864847583,
+        "mrr_excl_empty": 0.36720864767030303,
+        "recall_any@10_excl_empty": 0.6493440968718466
+      },
+      "n": 1986,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 1095,
+          "miss": 695,
+          "partial_hit": 192,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 19860,
+        "logical_db_bytes_max": 1990656,
+        "logical_db_bytes_median": 1941504,
+        "records_with_failure_class": 1986,
+        "records_with_logical_db_bytes": 1986,
+        "returned_hits": 19860
+      },
+      "records": 1986,
+      "records_sha256": "6cf5e139610b13597fecda116e31698917c23663cfd3af21b72cc3afaf0ee16f",
+      "requested_max_tokens": 256,
+      "run": "locomo-top10-parity-tok256",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "1d18da44a0bb35e6c635de554d6c3fe8925fa709ebd4f019a854677bcfcaf157"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "recall_mempalace": 0.9126666666666666
+      },
+      "headline_delta": {
+        "recall_mempalace": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "recall_mempalace": 0.9126666666666666
+      },
+      "n": 250,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 226,
+          "miss": 20,
+          "partial_hit": 4
+        },
+        "hits_with_numeric_channel_scores": 2464,
+        "logical_db_bytes_max": 1830912,
+        "logical_db_bytes_median": 1789952,
+        "records_with_failure_class": 250,
+        "records_with_logical_db_bytes": 250,
+        "returned_hits": 2464
+      },
+      "records": 250,
+      "records_sha256": "4ed1187ea071dc563ffd17159394dc4df8f364f86aceb5f75885d284940a0046",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "convomem-top10-native",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "9e87239a9830346547fd3300f744b084f9cb6689651ff798eb897c63e542c278"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "recall_mempalace": 0.9286666666666666
+      },
+      "headline_delta": {
+        "recall_mempalace": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "recall_mempalace": 0.9286666666666666
+      },
+      "n": 250,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 230,
+          "miss": 16,
+          "partial_hit": 4
+        },
+        "hits_with_numeric_channel_scores": 2487,
+        "logical_db_bytes_max": 1814528,
+        "logical_db_bytes_median": 1781760,
+        "records_with_failure_class": 250,
+        "records_with_logical_db_bytes": 250,
+        "returned_hits": 2487
+      },
+      "records": 250,
+      "records_sha256": "63bf752eab154fb834ddfbb9ca8497988af1ab286711f7f643647d6b259e0229",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "convomem-top10-parity",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "db0ee5cb90234f187048d8df0317faf2c0601e68365af195a8a6ea837735e740"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "recall_mempalace": 0.9286666666666666
+      },
+      "headline_delta": {
+        "recall_mempalace": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "recall_mempalace": 0.9286666666666666
+      },
+      "n": 250,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 230,
+          "miss": 16,
+          "partial_hit": 4
+        },
+        "hits_with_numeric_channel_scores": 2487,
+        "logical_db_bytes_max": 1814528,
+        "logical_db_bytes_median": 1781760,
+        "records_with_failure_class": 250,
+        "records_with_logical_db_bytes": 250,
+        "returned_hits": 2487
+      },
+      "records": 250,
+      "records_sha256": "984f6d24bbf02a11a3f89786c01d4712c053564530ba1fa0f27766eec610605a",
+      "requested_max_tokens": 256,
+      "run": "convomem-top10-parity-tok256",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "9128871852b05ac1c45a93e77a6d761421f613687fbba1ef16c0a35ebe9782d0"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "hit_at_k_mempalace": 0.8762352941176471,
+        "hit_at_k_sid_only": 0.8758823529411764
+      },
+      "headline_delta": {
+        "hit_at_k_mempalace": 0.0,
+        "hit_at_k_sid_only": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "hit_at_k_mempalace": 0.8762352941176471,
+        "hit_at_k_sid_only": 0.8758823529411764
+      },
+      "n": 8500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 7448,
+          "miss": 1048,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 42500,
+        "logical_db_bytes_max": 2080768,
+        "logical_db_bytes_median": 1966080,
+        "records_with_failure_class": 8500,
+        "records_with_logical_db_bytes": 8500,
+        "returned_hits": 42500
+      },
+      "records": 8500,
+      "records_sha256": "679fda3d8792a628157c0d69090faff87a27ab0dda6cd6d9d0efb88bc3aa4b92",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "membench-movie-top5-native",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "cadb67c134485a44bfd3d21f41cc61d6223c736671daf9323a93f256b350c879"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "hit_at_k_mempalace": 0.7865882352941177,
+        "hit_at_k_sid_only": 0.786
+      },
+      "headline_delta": {
+        "hit_at_k_mempalace": 0.0,
+        "hit_at_k_sid_only": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "hit_at_k_mempalace": 0.7865882352941177,
+        "hit_at_k_sid_only": 0.786
+      },
+      "n": 8500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 6686,
+          "miss": 1810,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 42500,
+        "logical_db_bytes_max": 1945600,
+        "logical_db_bytes_median": 1859584,
+        "records_with_failure_class": 8500,
+        "records_with_logical_db_bytes": 8500,
+        "returned_hits": 42500
+      },
+      "records": 8500,
+      "records_sha256": "094e6a1094afe9749246d83515e9f39b59616842a40b0c10db2fc98f4c7ca67c",
+      "requested_max_tokens": "512 (fastembed default, production)",
+      "run": "membench-movie-top5-parity",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "9ec73be481fc6941914ee03b893492b1e289cfe181d3016f7d883b86a22a4169"
+    },
+    {
+      "complete": true,
+      "headline_current": {
+        "hit_at_k_mempalace": 0.7865882352941177,
+        "hit_at_k_sid_only": 0.786
+      },
+      "headline_delta": {
+        "hit_at_k_mempalace": 0.0,
+        "hit_at_k_sid_only": 0.0
+      },
+      "headline_frozen_2026_09_26": {
+        "hit_at_k_mempalace": 0.7865882352941177,
+        "hit_at_k_sid_only": 0.786
+      },
+      "n": 8500,
+      "per_question_audit": {
+        "failure_classes": {
+          "hit": 6686,
+          "miss": 1810,
+          "unscorable_empty_gold": 4
+        },
+        "hits_with_numeric_channel_scores": 42500,
+        "logical_db_bytes_max": 1945600,
+        "logical_db_bytes_median": 1859584,
+        "records_with_failure_class": 8500,
+        "records_with_logical_db_bytes": 8500,
+        "returned_hits": 42500
+      },
+      "records": 8500,
+      "records_sha256": "b1ea06e6e78b3a3097f63725cbc2bb95f450b3a06af4e7fc420674b98bdf3243",
+      "requested_max_tokens": 256,
+      "run": "membench-movie-top5-parity-tok256",
+      "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+      "rusty_brain_dirty": false,
+      "summary_sha256": "0c689cadca34a92c2ee6852aef3fec3a905cacf03014c341a7f80d89fdd18b47"
+    }
+  ],
+  "rusty_brain_commit": "a1ec930c9c0469a465a71eaa023f56f05748483a",
+  "schema": "rusty-brain-external-bench-diagnostic-replay-v1"
+}
