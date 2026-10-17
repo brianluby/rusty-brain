@@ -3,7 +3,7 @@
 - **Date:** 2026-10-17
 - **Protocol:** [`2026-10-17-diversity-selection-preregistration.md`](2026-10-17-diversity-selection-preregistration.md),
   committed (`b0a7885`) before the arm was measured.
-- **Code:** clean commit `52a841b`, release build. The artifact is
+- **Code:** clean commit `049412b`, release build (first measured at `52a841b`; the review fixes changed no quality metric). The artifact is
   [`2026-10-17-diversity-selection-results.json`](2026-10-17-diversity-selection-results.json).
 - **Inputs:** committed corpus (72 golden and 20 held-out queries, 8
   near-duplicate clusters, 6 contradiction pairs) and the strict committed
@@ -31,7 +31,7 @@ production changes.
 | Injected tokens (sum over queries) | 5,272 | 5,230 | −42 | reported | — |
 | Relevant drops (5 seeds) | — | 0 | — | = 0 | yes |
 | Contradiction drops (5 seeds) | — | 0 | — | = 0 | yes |
-| MMR step p99 (worst seed) | — | 60 µs | — | ≤ 1 ms | yes |
+| MMR step p99 (worst seed) | — | 57 µs | — | ≤ 1 ms | yes |
 
 ## Golden set (72 queries, reported, not the decision set)
 
@@ -73,8 +73,12 @@ choosing it after seeing these results would be tuning on the held-out set.
 ## Caveats
 
 - Latency is in-process on one shared machine (Apple M4 Pro) while the #60
-  benchmark replay was running; the MMR-arm latency is reported as recall plus
-  step at the same percentile, an upper bound.
+  benchmark replay was running. MMR-arm p50/p99 are percentiles of each
+  query's own recall time plus its MMR step (nearest-rank, as for Linear).
+- PR review found two implementation issues, fixed before this artifact: the
+  redundancy max clamped all-negative similarities to 0 instead of using the
+  preregistered true max, and arm latency summed independent percentiles.
+  Neither changed any quality metric or loss count.
 - Relevance inside MMR is Linear's rank, not its fused score, because fused
   scores are not exposed per key. That proxy was declared in advance.
 - The corpus is small (205 memories). The result says MMR does not pay off at

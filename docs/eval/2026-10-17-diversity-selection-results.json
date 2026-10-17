@@ -2,15 +2,15 @@
   "budget": "5 rows / 800 tokens, whole rows",
   "build_profile": "release",
   "candidate_pool": "Linear top-10 (RECALL_LIMIT) per query",
-  "captured_at": "2026-10-17T20:14:47Z",
+  "captured_at": "2026-10-17T20:35:51Z",
   "concurrent_load": "kanban #60 external-bench replay running on the same machine",
   "decision": "defer",
   "decision_rule_set": "holdout",
   "lambda": 0.7,
-  "latency_note": "in-process, shared machine; MMR arm latency = recall + step at the same percentile (upper bound)",
+  "latency_note": "in-process, shared machine; MMR arm latency = percentiles of per-query (recall + MMR step)",
   "preregistration": "docs/eval/2026-10-17-diversity-selection-preregistration.md",
   "relevance": "(n - rank) / n over Linear order",
-  "rusty_brain_commit": "52a841bfa69da209138a1a9008097ece7207d747",
+  "rusty_brain_commit": "049412b026e345a0f23b589bd69d9274e6ddfb23",
   "rusty_brain_dirty": false,
   "schema": "rusty-brain-diversity-selection-v1",
   "sets": {
@@ -37,8 +37,8 @@
         "injected_tokens": 19684.0,
         "mrr": 0.9837962962962964,
         "ndcg_at_5": 0.9537339465324524,
-        "p50_latency_us": 1706.8,
-        "p99_latency_us": 1950.6,
+        "p50_latency_us": 1696.6,
+        "p99_latency_us": 1943.6,
         "recall_at_5": 0.962962962962963
       },
       "mmr": {
@@ -48,13 +48,13 @@
         "injected_tokens": 19639.0,
         "mrr": 0.982638888888889,
         "ndcg_at_5": 0.9404374217870621,
-        "p50_latency_us": 1755.4,
-        "p99_latency_us": 2006.4,
+        "p50_latency_us": 1742.8,
+        "p99_latency_us": 1990.0,
         "recall_at_5": 0.9560185185185185
       },
       "mmr_step_us_worst_seed": {
         "p50": 49,
-        "p99": 60
+        "p99": 71
       },
       "queries": 72,
       "seeds": 5,
@@ -86,8 +86,8 @@
         "injected_tokens": 5272.0,
         "mrr": 0.95,
         "ndcg_at_5": 0.9497530390648865,
-        "p50_latency_us": 1752.4,
-        "p99_latency_us": 2101.6,
+        "p50_latency_us": 1770.8,
+        "p99_latency_us": 2091.4,
         "recall_at_5": 0.975
       },
       "mmr": {
@@ -97,13 +97,13 @@
         "injected_tokens": 5230.0,
         "mrr": 0.95,
         "ndcg_at_5": 0.9348308995071394,
-        "p50_latency_us": 1802.8,
-        "p99_latency_us": 2157.8,
+        "p50_latency_us": 1819.6,
+        "p99_latency_us": 2140.8,
         "recall_at_5": 0.975
       },
       "mmr_step_us_worst_seed": {
-        "p50": 52,
-        "p99": 60
+        "p50": 51,
+        "p99": 57
       },
       "queries": 20,
       "seeds": 5,
