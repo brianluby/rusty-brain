@@ -24,6 +24,21 @@ You can run the deterministic checks before tagging:
 scripts/release-preflight.sh --tag vX.Y.Z --commit HEAD --main-ref origin/main
 ```
 
+Before creating a tag, run the same three-target build and packaged-smoke matrix
+without publishing:
+
+```bash
+gh workflow run release.yml --ref <verification-branch>
+```
+
+Manual runs name artifacts by the full source SHA, exercise the deterministic
+preflight self-tests, and build, attest, checksum and smoke each native package.
+They never create a release and do not certify tag/version/changelog/ancestry
+alignment; actual tag publication still requires those checks. The first complete
+manual matrix passed on ARM macOS, Intel macOS and Linux at `2cb6acf` over the
+merged `a33ea3b` product source:
+[native verification run](https://github.com/brianluby/rusty-brain/actions/runs/38924475235).
+
 ## Check a local packaged artifact
 
 The tarball must contain one top-level directory with executable

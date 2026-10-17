@@ -102,6 +102,92 @@ impl RunningDaemon {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn provenance_cutover_keeps_identityless_writes_and_quarantines_restored_history() {
+    let daemon = RunningDaemon::start(2).await;
+    let ns = Namespace::Project("provenance-cutover".into());
+    let mut client = Client::connect(&daemon.socket, ns).await.unwrap();
+    let fresh = client
+        .remember(
+            "zebra deployment requires a reviewed rollback plan".into(),
+            None,
+            MemoryType::Constraint,
+            8,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let note = client.get(fresh.clone()).await.unwrap().unwrap();
+    assert!(note.origin_source.is_none() && note.origin_channel.is_none());
+    assert!(!note.legacy_unknown && !note.is_quarantined());
+    let mut historical = Vec::new();
+    for i in 0..55 {
+        historical.push(
+            client
+                .remember_anchored_with_intent(
+                    format!("zebra historical unsafe deployment instruction {i}"),
+                    None,
+                    MemoryType::Constraint,
+                    10,
+                    vec![],
+                    vec![],
+                    vec![],
+                    None,
+                    vec![],
+                    None,
+                    None,
+                    false,
+                    false,
+                    true,
+                )
+                .await
+                .unwrap(),
+        );
+    }
+    client
+        .update(
+            historical[0].clone(),
+            MemoryUpdates {
+                human_curated: Some(true),
+                summary: Some("reviewed but still historical".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let preserved = client.get(historical[0].clone()).await.unwrap().unwrap();
+    assert!(preserved.legacy_unknown && preserved.human_curated && preserved.is_quarantined());
+    let history = client.history(historical[0].clone(), None).await.unwrap();
+    assert!(
+        history
+            .chain
+            .iter()
+            .find(|entry| entry.id == historical[0])
+            .unwrap()
+            .evidence
+            .as_ref()
+            .unwrap()
+            .legacy_unknown
+    );
+    let results = client
+        .recall("zebra deployment".into(), None, vec![], 10)
+        .await
+        .unwrap();
+    assert!(results.iter().any(|result| result.memory.id == fresh));
+    assert!(results.iter().all(|result| !result.memory.legacy_unknown));
+    let context = client.context().await.unwrap();
+    assert!(context.stable.iter().any(|entry| entry.id == fresh));
+    assert!(context
+        .stable
+        .iter()
+        .all(|entry| !historical.contains(&entry.id)));
+    assert_eq!(client.list(None, 100).await.unwrap().len(), 56);
+    daemon.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn large_stable_claims_keep_context_small_and_full_detail_followable() {
     let daemon = RunningDaemon::start(2).await;
     let ns = Namespace::Project("large-stable-context".to_string());

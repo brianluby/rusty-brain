@@ -793,7 +793,7 @@ capture_memory_diagnostics() { # home project query diagnostics_dir planted_json
   (
     export HOME="$home" PATH="$BIN_DIR:$PATH"
     # These read-only probes never call a model or expose provider credentials.
-    unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY
+    unset ANTHROPIC_API_KEY OPENAI_API_KEY GEMINI_API_KEY LITELLM_API_KEY
     # Probe startup before any query path can refresh a target's access time.
     rusty-brain --json context > "$dir/context.json"
     local sid="scorecard-diagnostic"
@@ -954,6 +954,17 @@ resolve_log_dir() { # log_dir_flag keep_logs_env out
 # Create an isolated profile and optional empty work project for one arm.
 seed_home() { # home [project]
   mkdir -p "$1"
+  if [ -n "${LITELLM_MODEL_JSON:-}" ]; then
+    mkdir -p "$1/.omp/agent"
+    # Only catalog metadata and an environment-variable name enter the profile.
+    # DeepSeek needs real reasoning replay; agent tool turns must bypass response caches.
+    jq -n --arg url "$LITELLM_BASE_URL" --argjson model "$LITELLM_MODEL_JSON" \
+      '{providers:{litellm:{baseUrl:$url,api:"openai-completions",
+        apiKey:"LITELLM_API_KEY",models:[($model + {compat:{
+          replayReasoningContent:true,
+          extraBody:{cache:{"no-cache":true,"no-store":true},thinking:{type:"disabled"}}
+        }})]}}}' > "$1/.omp/agent/models.yml"
+  fi
   [ -z "${2:-}" ] || mkdir -p "$2"
 }
 
@@ -1997,6 +2008,19 @@ command -v omp     >/dev/null 2>&1 || { echo "omp not on PATH" >&2; exit 1; }
 command -v jq      >/dev/null 2>&1 || { echo "jq not on PATH" >&2; exit 1; }
 command -v python3 >/dev/null 2>&1 || { echo "python3 not on PATH" >&2; exit 1; }
 [ -f "$SCENARIOS_FILE" ] || { echo "scenarios file not found: $SCENARIOS_FILE" >&2; exit 1; }
+LITELLM_MODEL_JSON=""
+if [ "$MODEL" = "litellm/deepseek-v4.1-flash" ] || \
+   { [ "$MODEL" = "@slow" ] && [ "${PI_SLOW_MODEL:-}" = "litellm/deepseek-v4.1-flash" ]; }; then
+  [ -n "${LITELLM_API_KEY:-}" ] && [ -n "${LITELLM_BASE_URL:-}" ] \
+    || { echo "LiteLLM scorecard requires LITELLM_API_KEY and LITELLM_BASE_URL" >&2; exit 1; }
+  # Prices are the installed catalog's estimates, not an asserted proxy charge.
+  # Unknown pricing cannot silently turn the cost comparison into zero-vs-zero.
+  LITELLM_MODEL_JSON="$(omp models find deepseek-v4.1-flash --json | jq -ce '
+    .models[] | select(.selector == "litellm/deepseek-v4.1-flash") |
+    select(.pricingStatus == "fixed" and .cost.input > 0 and .cost.output > 0) |
+    {id,name,contextWindow,maxTokens,reasoning,input,cost}')" \
+    || { echo "exact LiteLLM model with known catalog pricing is unavailable" >&2; exit 1; }
+fi
 [ -n "$RUNS" ] || RUNS="$(jq -r '.config.runs_per_scenario // 5' "$SCENARIOS_FILE")"
 [ -n "$MIN_RUNS" ] || MIN_RUNS="$(jq -r '.config.min_runs // 5' "$SCENARIOS_FILE")"
 if [ -z "${RB_SCORECARD_TIE_MARGIN+x}" ]; then
@@ -2203,7 +2227,7 @@ run_scenario() { # row
       derr="$mb/daemon.log"
       # The daemon receives no model credential. OMP resolves the selected
       # provider from its isolated profile environment.
-      env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY rusty-brain serve >"$derr" 2>&1 &
+      env -u ANTHROPIC_API_KEY -u OPENAI_API_KEY -u GEMINI_API_KEY -u LITELLM_API_KEY rusty-brain serve >"$derr" 2>&1 &
       dpid=$!
       # shellcheck disable=SC2329 # Invoked by the EXIT trap below.
       cleanup_memory_on() {

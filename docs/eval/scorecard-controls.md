@@ -13,8 +13,33 @@ omp --no-extensions \
 Pass `--model <OMP_MODEL>` (or set `RB_SCORECARD_OMP_MODEL`) to select a model.
 Each arm has a fresh home and OMP agent directory: supply provider credentials
 through environment variables or `OMP_AUTH_BROKER_*`; the runner does not copy
-local credential stores or model aliases. `@slow` needs `PI_SLOW_MODEL` in this
-environment. Run separately per selector; do not pool different models.
+local credential stores. `@slow` needs `PI_SLOW_MODEL` in this environment. Run
+separately per selector; do not pool different models.
+
+### DeepSeek Flash v4.1 verification
+
+The selected local verification route is `litellm/deepseek-v4.1-flash` with
+`LITELLM_API_KEY` and a credential-free HTTPS `LITELLM_BASE_URL` supplied privately
+through the process environment. Never paste credentials into logs or command
+arguments. The runner copies only this exact model's public catalog metadata and
+fixed pricing into each isolated profile, with the credential environment-variable
+name rather than its value. Build `assertion-precision` alongside the runtime
+binaries before invoking the complete `--runs 5` scorecard.
+
+Use the existing Chat Completions adapter with `replayReasoningContent=true` and
+request-body `cache={"no-cache":true,"no-store":true}`. The native Claude smoke
+uses the same model through the existing Anthropic Messages endpoint and scoped
+`CLAUDE_CODE_EXTRA_BODY`. These controls prevent whole-response cache replay after
+tool results; HTTP cache headers alone did not prevent the observed replay.
+Reasoning is the provider's real content, never a fabricated placeholder.
+Responses transport tool continuation was not established for this route.
+
+Keep catalog-priced usage estimates separate from authoritative proxy billing;
+cache bypass does not establish prompt/KV cache economics. Credentials remain
+local by user choice: scheduled GitHub jobs require separately provisioned
+`LITELLM_API_KEY` and `LITELLM_BASE_URL`, have no Anthropic fallback, and are not
+recovered merely by a successful local run. Manual runs leave alert issues
+unchanged unless `manage_issue=true` is explicitly selected.
 
 The scorecard entry point re-exports the canonical installed runtime from
 `crates/rb-install/assets/omp-extension.ts`. For persistent project installation,

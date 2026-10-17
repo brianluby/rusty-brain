@@ -215,6 +215,7 @@ fn recall_request(query: &str) -> Request {
 
 fn remember_request(content: &str) -> Request {
     Request::Remember {
+        legacy_unknown: None,
         content: content.to_string(),
         context: None,
         memory_type: MemoryType::Insight,

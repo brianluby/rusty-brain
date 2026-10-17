@@ -2,7 +2,7 @@
 
 ## Status
 
-Draft, implementation-ready. Class R is stretch/report-only and must not become a hard release gate beyond the existing zero memory-induced-errors safety gate.
+Delivered (Vikunja #383), report-only. The [N=5 measured artifact](../eval/2026-07-12-w35-scorecard-n5-run.md#class-r--reachteam-proxy-vikunja-383) records two-identity shared-store reach on one machine: memory-on 33% versus realistic 0% and steelman 20%. This is a simulation, not two-user/two-machine adoption or Phase 5 pilot proof. Class R does not add a hard gate beyond zero memory-induced errors; the artifact's historical Class A retrieval-at-scale interpretation remains withdrawn.
 
 ## Owner Area
 
@@ -149,16 +149,8 @@ Then run a reach-only smoke if a dimension filter exists. If no filter exists, r
 
 ## Implementation Checklist
 
-- [ ] Add reach scenarios.
-- [ ] Add reach branch in `run_scenario`.
-- [ ] Create separate A/B homes and projects.
-- [ ] Share one DB, socket, and namespace.
-- [ ] Plant facts from A.
-- [ ] Score B only.
-- [ ] Ensure B memory-on has no target-bearing docs.
-- [ ] Ensure realistic B omits target.
-- [ ] Ensure steelman B includes target.
-- [ ] Extend `--self-test`.
-- [ ] Run live `runs=1`.
-- [ ] Run measured `runs>=5`.
-- [ ] Publish measured reach result as report-only.
+- [x] Reach scenarios and runner branch landed with separate A/B homes and projects, one shared store/namespace, A planting, and B-only scoring.
+- [x] Scenario self-tests guard realistic-baseline target omission and steelman target inclusion; memory-on B has no target-bearing project docs.
+- [x] Publish measured `runs>=5` reach artifact as report-only (linked above, with raw TSV and live run URL).
+
+The original staged `runs=1` smoke checklist is superseded by the retained complete N=5 artifact; no separate smoke execution is asserted by this reconciliation.

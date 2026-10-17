@@ -9,18 +9,19 @@ from __future__ import annotations
 
 import argparse
 import copy
+import hashlib
 import json
 import math
 import re
 import statistics
 import sys
 import tempfile
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 CANDIDATE_REPOSITORIES = {"rusty-brain", "threatmitigator", "vikunja-rust-mcp"}
 SURFACES = {"claude_native", "http", "mcp"}
 ARM_ORDERS = {"baseline_first", "treatment_first"}
@@ -57,9 +58,11 @@ MANIFEST_KEYS = {
     "admission",
     "thresholds",
     "repositories",
+    "execution",
 }
 PERIOD_KEYS = {"duration_days", "start_utc", "end_utc"}
 ADMISSION_KEYS = {"frozen_at_utc", "task_56", "task_57"}
+EXECUTION_KEYS = {"model_id", "model_version", "prompt_budget_tokens"}
 TASK_56_KEYS = {
     "state",
     "evidence",
@@ -97,6 +100,9 @@ COMMON_ARM_KEYS = {
     "store_id",
     "namespace",
     "agent",
+    "model_id",
+    "model_version",
+    "prompt_budget_tokens",
     "task_success",
     "turns",
     "active_seconds",
@@ -231,25 +237,35 @@ def evidence_reference(value: Any, where: str) -> str:
     return value
 
 
-def validate_manifest(manifest: Any) -> dict[str, Any]:
+def validate_manifest(manifest: Any, *, candidate: bool = False) -> dict[str, Any]:
     manifest = exact_keys(manifest, MANIFEST_KEYS, "manifest")
     if integer(manifest["schema_version"], "manifest.schema_version", 1) != SCHEMA_VERSION:
-        fail("unsupported manifest schema_version")
+        # v1 predates pinned execution (model/version/prompt budget) and the
+        # 2-3 repository rule; no v1 pilot was ever admitted, so v1 input is
+        # rejected rather than migrated with guessed execution metadata.
+        fail(
+            f"unsupported manifest schema_version {manifest['schema_version']}; "
+            f"expected {SCHEMA_VERSION} — regenerate the manifest, do not migrate v1"
+        )
 
     admission = exact_keys(manifest["admission"], ADMISSION_KEYS, "manifest.admission")
     task_56 = exact_keys(admission["task_56"], TASK_56_KEYS, "manifest.admission.task_56")
-    if task_56["state"] != "go" or task_56["overall_pilot_go"] is not True:
+    if not candidate and (task_56["state"] != "go" or task_56["overall_pilot_go"] is not True):
         fail(
             "task #56 blocks treatment: reviewed production evidence must record "
             "state='go' and overall_pilot_go=true"
         )
     task_57 = exact_keys(admission["task_57"], TASK_57_KEYS, "manifest.admission.task_57")
-    if task_57["state"] != "go" or task_57["complete"] is not True:
+    if not candidate and (task_57["state"] != "go" or task_57["complete"] is not True):
         fail("task #57 blocks treatment: reviewed evidence must record state='go' and complete=true")
 
-    if manifest["status"] != "admitted":
-        fail("manifest.status must be admitted before any treatment observation")
+    if manifest["status"] != ("candidate" if candidate else "admitted"):
+        fail("manifest.status must be candidate for preparation or admitted before observations")
     identifier(manifest["pilot_id"], "manifest.pilot_id")
+    execution = exact_keys(manifest["execution"], EXECUTION_KEYS, "manifest.execution")
+    nonempty_string(execution["model_id"], "execution.model_id")
+    nonempty_string(execution["model_version"], "execution.model_version")
+    integer(execution["prompt_budget_tokens"], "execution.prompt_budget_tokens", 1)
 
     period = exact_keys(manifest["period"], PERIOD_KEYS, "manifest.period")
     if integer(period["duration_days"], "manifest.period.duration_days", 1) != 14:
@@ -260,9 +276,10 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
         fail("pilot start/end must span exactly 14 days")
 
     runs = integer(manifest["paired_runs_per_repository"], "paired_runs_per_repository", 5)
-    frozen = timestamp(admission["frozen_at_utc"], "manifest.admission.frozen_at_utc")
-    if frozen >= start:
-        fail("admission must be frozen before the pilot starts")
+    if admission["frozen_at_utc"] is not None or not candidate:
+        frozen = timestamp(admission["frozen_at_utc"], "manifest.admission.frozen_at_utc")
+        if frozen >= start:
+            fail("admission must be frozen before the pilot starts")
 
     evidence_reference(task_56["evidence"], "task_56.evidence")
     if task_56["blocker"] is not None:
@@ -271,7 +288,10 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     if task_56["unqualified_behavior_allowed"] is not False:
         fail("unqualified experimental behavior must remain disallowed")
 
-    evidence_reference(task_57["evidence"], "task_57.evidence")
+    if not candidate or task_57["complete"] is True:
+        evidence_reference(task_57["evidence"], "task_57.evidence")
+    else:
+        nonempty_string(task_57["evidence"], "task_57.evidence")
     integer(task_57["max_active_memories"], "task_57.max_active_memories", 1)
 
     frozen_thresholds = json.dumps(THRESHOLDS, sort_keys=True, separators=(",", ":"))
@@ -279,12 +299,14 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     if supplied_thresholds != frozen_thresholds:
         fail("pilot thresholds differ from the preregistered constants")
     repositories = manifest["repositories"]
-    if not isinstance(repositories, list) or not repositories:
-        fail("at least one repository must be confirmed before admission")
+    if not isinstance(repositories, list) or not 2 <= len(repositories) <= 3:
+        fail("exactly two or three real repositories must be confirmed before admission")
 
     seen_repositories: set[str] = set()
     seen_pairs: set[str] = set()
-    seen_storage: set[tuple[str, str]] = set()
+    seen_scenarios: set[str] = set()
+    seen_stores: set[str] = set()
+    seen_namespaces: set[str] = set()
     for index, repository in enumerate(repositories):
         where = f"manifest.repositories[{index}]"
         repository = exact_keys(repository, REPOSITORY_KEYS, where)
@@ -301,13 +323,12 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
         if repository["baseline_namespace"] == repository["treatment_namespace"]:
             fail(f"{where} baseline and treatment namespaces must be isolated")
         for arm in ("baseline", "treatment"):
-            storage = (
-                repository[f"{arm}_store_id"],
-                repository[f"{arm}_namespace"],
-            )
-            if storage in seen_storage:
-                fail(f"{where} reuses a store/namespace tuple from another pilot arm")
-            seen_storage.add(storage)
+            store_id = repository[f"{arm}_store_id"]
+            namespace = repository[f"{arm}_namespace"]
+            if store_id in seen_stores or namespace in seen_namespaces:
+                fail(f"{where} reuses a store or namespace from another pilot arm")
+            seen_stores.add(store_id)
+            seen_namespaces.add(namespace)
         plan = repository["pair_plan"]
         if not isinstance(plan, list) or len(plan) != runs:
             fail(f"{where}.pair_plan must contain exactly {runs} pairs")
@@ -315,7 +336,10 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
             pair_where = f"{where}.pair_plan[{pair_index}]"
             pair = exact_keys(pair, PLAN_KEYS, pair_where)
             pair_id = identifier(pair["pair_id"], f"{pair_where}.pair_id")
-            identifier(pair["scenario_id"], f"{pair_where}.scenario_id")
+            scenario_id = identifier(pair["scenario_id"], f"{pair_where}.scenario_id")
+            if scenario_id in seen_scenarios:
+                fail(f"duplicate scenario_id {scenario_id}")
+            seen_scenarios.add(scenario_id)
             if not isinstance(pair["snapshot_sha256"], str) or not SHA256.fullmatch(
                 pair["snapshot_sha256"]
             ):
@@ -332,10 +356,79 @@ def validate_manifest(manifest: Any) -> dict[str, Any]:
     return manifest
 
 
+def validate_snapshots(manifest: dict[str, Any], snapshots: Any) -> None:
+    """Verify the hash-bound sanitized tasks, not only caller-typed digests."""
+    if not isinstance(snapshots, list):
+        fail("scenario snapshots must be an array")
+    planned = {}
+    for repo in manifest["repositories"]:
+        for pair in repo["pair_plan"]:
+            scenario = pair["scenario_id"]
+            if scenario in planned:
+                fail(f"duplicate scenario_id {scenario}")
+            planned[scenario] = (repo, pair)
+    if len(snapshots) != len(planned):
+        fail("scenario snapshots must cover every planned pair exactly once")
+    seen = set()
+    for snapshot in snapshots:
+        snapshot = exact_keys(snapshot, {"scenario_id", "repository", "commit_sha", "source_paths", "scheduled_utc", "delivery_surface", "task", "seed_memories", "rubric", "contested_opportunities", "multi_answer_opportunities"}, "snapshot")
+        scenario = snapshot["scenario_id"]
+        if scenario not in planned or scenario in seen:
+            fail("unknown or duplicate scenario snapshot")
+        seen.add(scenario)
+        repo, pair = planned[scenario]
+        if snapshot["repository"] != repo["name"] or snapshot["commit_sha"] != repo["commit_sha"]:
+            fail(f"snapshot {scenario} repository revision differs from manifest")
+        digest = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+        if digest != pair["snapshot_sha256"]:
+            fail(f"snapshot {scenario} content hash differs from manifest")
+        scheduled = timestamp(snapshot["scheduled_utc"], "snapshot.scheduled_utc")
+        if not timestamp(manifest["period"]["start_utc"], "start") <= scheduled < timestamp(manifest["period"]["end_utc"], "end"):
+            fail(f"snapshot {scenario} schedule is outside the pilot period")
+        if snapshot["delivery_surface"] not in SURFACES:
+            fail(f"snapshot {scenario} delivery surface is invalid")
+        nonempty_string(snapshot["task"], "snapshot.task")
+        for field in ("source_paths", "seed_memories", "rubric"):
+            if not isinstance(snapshot[field], list) or not snapshot[field]:
+                fail(f"snapshot.{field} must be a nonempty array")
+            for value in snapshot[field]:
+                nonempty_string(value, f"snapshot.{field} item")
+        for field in ("contested_opportunities", "multi_answer_opportunities"):
+            integer(snapshot[field], f"snapshot.{field}")
+    for repo in manifest["repositories"]:
+        selected = [item for item in snapshots if item["repository"] == repo["name"]]
+        for field in ("contested_opportunities", "multi_answer_opportunities"):
+            if not sum(item[field] for item in selected):
+                fail(f"{repo['name']} must predeclare contested and multi-answer coverage")
+
+
+def validate_scheduled_pairs(manifest: dict[str, Any], pairs: list[dict[str, Any]], snapshots: list[dict[str, Any]]) -> None:
+    by_scenario = {snapshot["scenario_id"]: snapshot for snapshot in snapshots}
+    end = timestamp(manifest["period"]["end_utc"], "end")
+    for pair in pairs:
+        snapshot = by_scenario[pair["scenario_id"]]
+        scheduled = timestamp(snapshot["scheduled_utc"], "snapshot.scheduled_utc")
+        next_slot = min([end] + [timestamp(item["scheduled_utc"], "snapshot.scheduled_utc")
+            for item in snapshots if item["repository"] == pair["repository"]
+            and timestamp(item["scheduled_utc"], "snapshot.scheduled_utc") > scheduled])
+        observed = timestamp(pair["observed_at_utc"], "pair.observed_at_utc")
+        if not scheduled <= observed < next_slot:
+            fail(f"pair {pair['pair_id']} observation is outside its scheduled completion window")
+        if pair["treatment"]["delivery_surface"] != snapshot["delivery_surface"]:
+            fail(f"pair {pair['pair_id']} delivery surface differs from the snapshot")
+        for arm in ("baseline", "treatment"):
+            for field in ("contested_opportunities", "multi_answer_opportunities"):
+                if pair[arm][field] != snapshot[field]:
+                    fail(f"pair {pair['pair_id']} safety opportunities differ from the snapshot")
+
+
 def validate_common_arm(arm: Any, where: str) -> dict[str, Any]:
     arm = exact_keys(arm, COMMON_ARM_KEYS, where)
     for field in ("environment_id", "store_id", "namespace", "agent"):
         identifier(arm[field], f"{where}.{field}")
+    for field in ("model_id", "model_version"):
+        nonempty_string(arm[field], f"{where}.{field}")
+    integer(arm["prompt_budget_tokens"], f"{where}.prompt_budget_tokens", 1)
     if not isinstance(arm["task_success"], bool):
         fail(f"{where}.task_success must be boolean")
     for field in ("turns", "corrections", "contested_opportunities", "contested_correct", "multi_answer_opportunities", "multi_answer_correct"):
@@ -461,6 +554,9 @@ def validate_pair(pair: Any, manifest: dict[str, Any]) -> dict[str, Any]:
         fail(f"pair {pair_id} store/namespace isolation differs from the manifest")
     if baseline["agent"] != treatment["agent"]:
         fail(f"pair {pair_id} must use the same agent in both arms")
+    for arm in (baseline, treatment):
+        if any(arm[field] != manifest["execution"][field] for field in EXECUTION_KEYS):
+            fail(f"pair {pair_id} model/version/prompt budget differs from the frozen execution")
     for prefix in ("contested", "multi_answer"):
         if baseline[f"{prefix}_opportunities"] != treatment[f"{prefix}_opportunities"]:
             fail(f"pair {pair_id} must use identical {prefix} opportunities in both arms")
@@ -501,8 +597,20 @@ def correctness_rate(pairs: list[dict[str, Any]], arm: str, prefix: str) -> floa
     return ratio(correct, opportunities)
 
 
-def aggregate(manifest: dict[str, Any], pairs: list[dict[str, Any]], final: bool) -> dict[str, Any]:
+def aggregate(
+    manifest: dict[str, Any],
+    pairs: list[dict[str, Any]],
+    final: bool,
+    *,
+    now: datetime | None = None,
+) -> dict[str, Any]:
     manifest = validate_manifest(manifest)
+    if final:
+        # A complete set of pairs can land before the declared period ends; a
+        # final verdict then would silently shorten the preregistered window.
+        end = timestamp(manifest["period"]["end_utc"], "manifest.period.end_utc")
+        if (now or datetime.now(timezone.utc)) < end:
+            fail("final aggregation is not allowed before manifest.period.end_utc; use --interim")
     validated: list[dict[str, Any]] = []
     seen: set[str] = set()
     for pair in pairs:
@@ -814,9 +922,10 @@ def self_test() -> None:
     start = "2026-08-01T00:00:00Z"
     end = "2026-08-15T00:00:00Z"
     manifest = {
-        "schema_version": 1,
+        "schema_version": SCHEMA_VERSION,
         "pilot_id": "self-test",
         "status": "admitted",
+        "execution": {"model_id": "fixture-model", "model_version": "fixture-v1", "prompt_budget_tokens": 8000},
         "period": {"duration_days": 14, "start_utc": start, "end_utc": end},
         "paired_runs_per_repository": 5,
         "admission": {
@@ -855,12 +964,21 @@ def self_test() -> None:
             ],
         }],
     }
+    second = copy.deepcopy(manifest["repositories"][0])
+    second["name"] = "threatmitigator"
+    for field in ("baseline_store_id", "treatment_store_id", "baseline_namespace", "treatment_namespace"):
+        second[field] = "second-" + second[field]
+    for plan in second["pair_plan"]:
+        plan["pair_id"] = "second-" + plan["pair_id"]
+        plan["scenario_id"] = "second-" + plan["scenario_id"]
+    manifest["repositories"].append(second)
 
     def make_pair(index: int) -> dict[str, Any]:
         common = {
             "store_id": "baseline-store",
             "namespace": "baseline-ns",
             "agent": "claude-code",
+            **manifest["execution"],
             "task_success": True,
             "turns": 5,
             "active_seconds": 300.0,
@@ -905,7 +1023,7 @@ def self_test() -> None:
             "backup_active_seconds": 2.0,
         }
         return {
-            "schema_version": 1,
+            "schema_version": SCHEMA_VERSION,
             "pair_id": f"pair-{index}",
             "scenario_id": f"scenario-{index}",
             "repository": "rusty-brain",
@@ -925,9 +1043,18 @@ def self_test() -> None:
         }
 
     pairs = [make_pair(index) for index in range(1, 6)]
+    for original in list(pairs):
+        pair = copy.deepcopy(original)
+        pair["repository"] = "threatmitigator"
+        pair["pair_id"] = "second-" + pair["pair_id"]
+        pair["scenario_id"] = "second-" + pair["scenario_id"]
+        for arm in ("baseline", "treatment"):
+            for field in ("environment_id", "store_id", "namespace"):
+                pair[arm][field] = "second-" + pair[arm][field]
+        pairs.append(pair)
     report = aggregate(manifest, pairs, final=True)
     check(report["verdict"] == "GO", f"expected GO, got {report}")
-    check(report["metrics"]["injected_tokens"] == 250, "token aggregation drifted")
+    check(report["metrics"]["injected_tokens"] == 500, "token aggregation drifted")
     check(report["unmeasured"] == ["injected_cost_usd"], "unmeasured fields drifted")
 
     mie_pairs = copy.deepcopy(pairs)
@@ -983,6 +1110,37 @@ def self_test() -> None:
     check(
         aggregate(manifest, pairs[:1], final=False)["verdict"] == "CONTINUE",
         "safe interim observation did not continue",
+    )
+    legacy_manifest = copy.deepcopy(manifest)
+    legacy_manifest["schema_version"] = 1
+    try:
+        validate_manifest(legacy_manifest)
+    except PilotError as error:
+        check("regenerate the manifest" in str(error), f"v1 rejection message drifted: {error}")
+    else:
+        raise AssertionError("schema_version 1 manifest was accepted")
+    legacy_pair = copy.deepcopy(pairs[0])
+    legacy_pair["schema_version"] = 1
+    try:
+        validate_pair(legacy_pair, validate_manifest(manifest))
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("schema_version 1 observation was accepted")
+    period_end = timestamp(end, "end")
+    try:
+        aggregate(manifest, pairs, final=True, now=period_end - timedelta(seconds=1))
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("final verdict was issued before the pilot period ended")
+    check(
+        aggregate(manifest, pairs, final=True, now=period_end)["verdict"] == "GO",
+        "final verdict at the period end was rejected",
+    )
+    check(
+        aggregate(manifest, mie_pairs, final=False, now=period_end - timedelta(days=2))["verdict"] == "STOP",
+        "interim stop rules were unavailable during the pilot period",
     )
     blocked_manifest = copy.deepcopy(manifest)
     blocked_manifest["admission"]["task_56"]["state"] = "no-go"
@@ -1044,23 +1202,21 @@ def self_test() -> None:
     else:
         raise AssertionError("secret-shaped pilot identifier passed sanitization")
     cross_repository_reuse = copy.deepcopy(manifest)
-    second = copy.deepcopy(cross_repository_reuse["repositories"][0])
-    second["name"] = "threatmitigator"
-    second["commit_sha"] = "f" * 40
-    second["baseline_store_id"] = "treatment-store"
-    second["baseline_namespace"] = "treatment-ns"
-    second["treatment_store_id"] = "second-treatment-store"
-    second["treatment_namespace"] = "second-treatment-ns"
-    for index, plan in enumerate(second["pair_plan"], 1):
-        plan["pair_id"] = f"second-pair-{index}"
-        plan["scenario_id"] = f"second-scenario-{index}"
-    cross_repository_reuse["repositories"].append(second)
+    cross_repository_reuse["repositories"][1]["baseline_store_id"] = "treatment-store"
     try:
         validate_manifest(cross_repository_reuse)
     except PilotError:
         pass
     else:
         raise AssertionError("cross-repository store/namespace reuse passed isolation")
+    changed_model = copy.deepcopy(pairs[:1])
+    changed_model[0]["treatment"]["model_version"] = "different-version"
+    try:
+        aggregate(manifest, changed_model, final=False)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("different paired model versions were accepted")
     unmeasured_pairs = copy.deepcopy(pairs[:1])
     for arm in ("baseline", "treatment"):
         unmeasured_pairs[0][arm]["contested_opportunities"] = 0
@@ -1080,9 +1236,77 @@ def self_test() -> None:
             "".join(json.dumps(pair, sort_keys=True) + "\n" for pair in pairs),
             encoding="utf-8",
         )
-        check(len(read_jsonl(events)) == 5, "JSONL round-trip failed")
+        check(len(read_jsonl(events)) == 10, "JSONL round-trip failed")
         write_json(output, report)
         check(read_json(output)["verdict"] == "GO", "report round-trip failed")
+    single = copy.deepcopy(manifest)
+    single["repositories"] = single["repositories"][:1]
+    try:
+        validate_manifest(single)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("one-repository pilot was admitted")
+    candidate = copy.deepcopy(manifest)
+    candidate["status"] = "candidate"
+    candidate["admission"]["frozen_at_utc"] = None
+    candidate["admission"]["task_57"]["complete"] = False
+    candidate["admission"]["task_57"]["state"] = "evidence-unavailable"
+    validate_manifest(candidate, candidate=True)
+    try:
+        aggregate(candidate, [], final=False)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("candidate preparation admitted treatment")
+    snapshot_manifest = copy.deepcopy(manifest)
+    snapshots = []
+    for repo in snapshot_manifest["repositories"]:
+        for plan in repo["pair_plan"]:
+            snapshot = dict(scenario_id=plan["scenario_id"], repository=repo["name"], commit_sha=repo["commit_sha"], source_paths=["src/lib.rs"], scheduled_utc=start, delivery_surface="mcp", task="Synthetic self-test task", seed_memories=["Synthetic self-test fact"], rubric=["Verify against source"], contested_opportunities=1, multi_answer_opportunities=1)
+            plan["snapshot_sha256"] = hashlib.sha256(json.dumps(snapshot, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode()).hexdigest()
+            snapshots.append(snapshot)
+    validate_snapshots(snapshot_manifest, snapshots)
+    aliased = copy.deepcopy(snapshot_manifest)
+    plans = aliased["repositories"][0]["pair_plan"]
+    plans[0]["scenario_id"] = plans[1]["scenario_id"]
+    plans[0]["snapshot_sha256"] = "f" * 64
+    for validate in (lambda: validate_manifest(aliased), lambda: validate_snapshots(aliased, snapshots[1:])):
+        try:
+            validate()
+        except PilotError:
+            pass
+        else:
+            raise AssertionError("different-hash pairs sharing a scenario ID were accepted")
+    timing_manifest = copy.deepcopy(manifest)
+    timing_manifest["period"] = {"duration_days": 14, "start_utc": "2026-10-19T16:00:00Z", "end_utc": "2026-11-02T16:00:00Z"}
+    timing_pair = copy.deepcopy(pairs[0])
+    timing_snapshot = copy.deepcopy(snapshots[0])
+    timing_snapshot["scheduled_utc"] = "2026-10-31T16:00:00Z"
+    timing_snapshot["delivery_surface"] = timing_pair["treatment"]["delivery_surface"]
+    for observed, allowed in [("2026-10-19T16:00:00Z", False), ("2026-10-31T16:00:00Z", True), ("2026-11-02T16:00:00Z", False)]:
+        timing_pair["observed_at_utc"] = observed
+        try:
+            validate_scheduled_pairs(timing_manifest, [timing_pair], [timing_snapshot])
+        except PilotError:
+            check(not allowed, "scheduled observation was rejected")
+        else:
+            check(allowed, "early/late observation passed the frozen completion window")
+    later_snapshot = {**timing_snapshot, "scenario_id": "next-slot", "scheduled_utc": "2026-11-01T16:00:00Z"}
+    timing_pair["observed_at_utc"] = "2026-11-01T16:00:00Z"
+    try:
+        validate_scheduled_pairs(timing_manifest, [timing_pair], [timing_snapshot, later_snapshot])
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("observation at the next same-repository slot was accepted")
+    snapshots[0]["task"] = "Changed task"
+    try:
+        validate_snapshots(snapshot_manifest, snapshots)
+    except PilotError:
+        pass
+    else:
+        raise AssertionError("changed scenario content passed its frozen hash")
     print("dogfood-pilot self-test PASS")
 
 
@@ -1092,11 +1316,14 @@ def main(argv: list[str]) -> int:
     subparsers = parser.add_subparsers(dest="command")
     validate_parser = subparsers.add_parser("validate", help="validate a frozen manifest")
     validate_parser.add_argument("--manifest", required=True, type=Path)
+    validate_parser.add_argument("--candidate", action="store_true", help="check preparation only; never admit treatment")
+    validate_parser.add_argument("--snapshots", required=True, type=Path)
     aggregate_parser = subparsers.add_parser("aggregate", help="aggregate sanitized JSONL observations")
     aggregate_parser.add_argument("--manifest", required=True, type=Path)
     aggregate_parser.add_argument("--events", required=True, type=Path)
     aggregate_parser.add_argument("--output", required=True, type=Path)
     aggregate_parser.add_argument("--interim", action="store_true", help="evaluate stop rules before all pairs finish")
+    aggregate_parser.add_argument("--snapshots", required=True, type=Path)
     args = parser.parse_args(argv)
 
     if args.self_test:
@@ -1105,11 +1332,17 @@ def main(argv: list[str]) -> int:
         self_test()
         return 0
     if args.command == "validate":
-        validate_manifest(read_json(args.manifest))
-        print("dogfood-pilot manifest valid and admitted")
+        manifest = validate_manifest(read_json(args.manifest), candidate=args.candidate)
+        validate_snapshots(manifest, read_json(args.snapshots))
+        print("dogfood-pilot candidate complete; admission still blocked" if args.candidate else "dogfood-pilot manifest valid and admitted")
         return 0
     if args.command == "aggregate":
-        report = aggregate(read_json(args.manifest), read_jsonl(args.events), final=not args.interim)
+        manifest = validate_manifest(read_json(args.manifest))
+        snapshots = read_json(args.snapshots)
+        validate_snapshots(manifest, snapshots)
+        pairs = [validate_pair(pair, manifest) for pair in read_jsonl(args.events)]
+        validate_scheduled_pairs(manifest, pairs, snapshots)
+        report = aggregate(manifest, pairs, final=not args.interim)
         write_json(args.output, report)
         print(f"dogfood-pilot verdict: {report['verdict']}")
         if report["verdict"] == "STOP":

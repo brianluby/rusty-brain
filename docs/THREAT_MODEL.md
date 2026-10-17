@@ -120,6 +120,22 @@ layers, all enforced server-side:
    digest, but stay listed (visibly marked `[quarantined]`) — demotion,
    never silent deletion.
 
+   Migration 015 separately records `legacy_unknown=true` only for historical
+   rows whose source and channel are both NULL. It does not invent provenance,
+   reclassify sourced internal jobs, or apply a blanket NULL rule to new writes.
+   New identity-less UDS writes remain accepted and explicitly unverified under
+   the existing same-OS-user boundary; acceptance does not authenticate their
+   provenance or promote their trust class. Historical quarantine is applied before
+   recall/context cutoffs and survives
+   edits, curation, restart and portable export/restore. Old exports without the
+   field conservatively classify unsourced rows; new exports preserve explicit
+   false as well as true. Inspect exact get/history evidence, deliberately
+   re-author a verified replacement, then archive or forget the old entry to
+   recover useful knowledge; no ordinary update silently clears the marker.
+   Restore requires the daemon's `legacy_quarantine` capability for historical
+   intent and its bounded exact-content probe; unsupported daemons fail before
+   that request is sent. Upgrade/restart the daemon before relying on this policy.
+
 3. **Compaction source filtering.** The hook fold is a compaction-driven
    write (MPBench V-P2/V-S3): scratch observations, transcript "decisions",
    and `/compact` custom instructions all become durable memory at the

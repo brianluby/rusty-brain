@@ -927,12 +927,14 @@ fn stocked_corpus() -> MockCorpus {
                 memory: tip,
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: false,
             },
             rb_types::SearchResult {
                 memory: disputed,
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: false,
             },
         ],
@@ -1041,6 +1043,7 @@ fn omp_supported_preparation_shares_one_token_budget_for_stable_and_five_hits() 
                     score: 0.9,
                     channels: Default::default(),
                     stale: true,
+                    channel_scores: None,
                 }
             })
             .collect(),

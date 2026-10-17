@@ -158,6 +158,10 @@ fn format_markdown(memories: &[MemoryNote]) -> String {
         if m.contested {
             out.push_str("- **Contested:** yes\n");
         }
+        out.push_str(&format!(
+            "- **Legacy unknown origin:** {}\n",
+            m.legacy_unknown
+        ));
         if !m.anchors.is_empty() {
             let labels: Vec<String> = m.anchors.iter().map(ToString::to_string).collect();
             out.push_str(&format!("- **Anchors:** {}\n", labels.join(", ")));
@@ -184,14 +188,14 @@ fn format_markdown(memories: &[MemoryNote]) -> String {
 
 fn format_csv(memories: &[MemoryNote]) -> String {
     let mut out = String::from(
-        "id,type,importance,confidence,tags,summary,context,created,updated,contested\n",
+        "id,type,importance,confidence,tags,summary,context,created,updated,contested,legacy_unknown\n",
     );
     for m in memories {
         let tags = csv_escape(&m.tags.join(";"));
         let summary = csv_escape(&m.summary);
         let context = csv_escape(&m.context);
         out.push_str(&format!(
-            "{},{},{},{:.2},{},{},{},{},{},{}\n",
+            "{},{},{},{:.2},{},{},{},{},{},{},{}\n",
             m.id,
             m.memory_type.as_str(),
             m.importance,
@@ -202,6 +206,7 @@ fn format_csv(memories: &[MemoryNote]) -> String {
             m.created_at,
             m.updated_at,
             m.contested,
+            m.legacy_unknown,
         ));
     }
     out.trim_end().to_string()
@@ -313,8 +318,30 @@ fn is_backup_file(path: &Path) -> bool {
 /// Content and source are extracted from each memory note. Only active,
 /// non-superseded memories are restored.
 pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
-    let envelope: ExportEnvelope = serde_json::from_str(text)
+    let mut value: serde_json::Value = serde_json::from_str(text)
         .context("parsing export JSON (expected a rusty-brain export)")?;
+    let memories = value
+        .get_mut("memories")
+        .and_then(serde_json::Value::as_array_mut)
+        .context("export memories must be an array")?;
+    for memory in memories {
+        let fields = memory
+            .as_object_mut()
+            .context("export memory must be an object")?;
+        if !fields.contains_key("legacy_unknown") {
+            // Only old exports need classification; explicit false on new
+            // identity-less writes must survive backup/restore unchanged.
+            let unknown = fields
+                .get("origin_channel")
+                .is_none_or(serde_json::Value::is_null)
+                && fields
+                    .get("origin_source")
+                    .is_none_or(serde_json::Value::is_null);
+            fields.insert("legacy_unknown".into(), serde_json::Value::Bool(unknown));
+        }
+    }
+    let envelope: ExportEnvelope =
+        serde_json::from_value(value).context("parsing export memories")?;
     if envelope.version != 1 {
         anyhow::bail!("unsupported export version {}", envelope.version);
     }
@@ -327,6 +354,7 @@ pub fn parse_restore(text: &str) -> anyhow::Result<Vec<ImportItem>> {
             continue;
         }
         items.push(ImportItem {
+            legacy_unknown: m.legacy_unknown,
             summary: m.summary,
             content: m.content,
             memory_type: m.memory_type,
@@ -370,6 +398,7 @@ mod tests {
 
     fn sample_note(summary: &str, content: &str, mt: MemoryType, imp: u8) -> MemoryNote {
         MemoryNote {
+            legacy_unknown: false,
             id: MemoryId::new(),
             namespace: Namespace::Project("test".into()),
             created_at: chrono::Utc::now(),
@@ -445,6 +474,33 @@ mod tests {
             .remove("human_curated");
         let restored = parse_restore(&serde_json::to_string(&legacy).unwrap()).unwrap();
         assert!(!restored[1].human_curated);
+    }
+
+    #[test]
+    fn restore_preserves_explicit_classification_and_conservatively_reads_old_exports() {
+        let mut fresh = sample_note("fresh", "fresh unverified write", MemoryType::Insight, 5);
+        fresh.origin_source = None;
+        fresh.origin_channel = None;
+        let mut historical = fresh.clone();
+        historical.legacy_unknown = true;
+        historical.human_curated = true;
+        let mut job = fresh.clone();
+        job.origin_source = Some("job".into());
+        let json = format_json(&[fresh, historical, job], "project:test").unwrap();
+        let restored = parse_restore(&json).unwrap();
+        assert!(!restored[0].legacy_unknown);
+        assert!(restored[1].legacy_unknown && restored[1].human_curated);
+        assert!(!restored[2].legacy_unknown);
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        for memory in old["memories"].as_array_mut().unwrap() {
+            memory.as_object_mut().unwrap().remove("legacy_unknown");
+        }
+        let restored = parse_restore(&serde_json::to_string(&old).unwrap()).unwrap();
+        assert!(restored[0].legacy_unknown && restored[1].legacy_unknown);
+        assert!(
+            !restored[2].legacy_unknown,
+            "legacy internal jobs are exempt"
+        );
     }
 
     #[test]

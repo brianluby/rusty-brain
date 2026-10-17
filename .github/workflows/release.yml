@@ -3,9 +3,11 @@ name: Release
 on:
   push:
     tags: ["v*"]
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
+  ARTIFACT_VERSION: ${{ github.event_name == 'workflow_dispatch' && github.sha || github.ref_name }}
 
 # Jobs opt in to the permissions they need; everything else is denied.
 permissions: {}
@@ -35,7 +37,11 @@ jobs:
       - name: Fetch main branch
         run: git fetch --no-tags origin main:refs/remotes/origin/main
       - name: Verify tag, version, changelog, and ancestry
+        if: github.event_name == 'push'
         run: scripts/release-preflight.sh --tag "$GITHUB_REF_NAME" --commit "$GITHUB_SHA"
+      - name: Exercise preflight checks without publishing
+        if: github.event_name == 'workflow_dispatch'
+        run: bash scripts/release-preflight.test.sh
 
   build:
     name: build (${{ matrix.target }})
@@ -65,7 +71,7 @@ jobs:
       - name: Package tarball
         run: |
           set -euo pipefail
-          archive="rusty-brain-${GITHUB_REF_NAME}-${TARGET}"
+          archive="rusty-brain-${ARTIFACT_VERSION}-${TARGET}"
           mkdir -p "dist/${archive}"
           for bin in rusty-brain rusty-brain-hooks rusty-brain-install; do
             cp "target/${TARGET}/release/${bin}" "dist/${archive}/"
@@ -100,13 +106,17 @@ jobs:
         with:
           name: tarball-${{ matrix.target }}
           path: dist
+      - name: Checksum downloaded artifacts
+        working-directory: dist
+        run: shasum -a 256 -- *.tar.gz > SHA256SUMS
       - name: Verify packaged artifact on its native runner
-        run: scripts/verify-fresh-install.sh --tarball "dist/rusty-brain-${GITHUB_REF_NAME}-${TARGET}.tar.gz"
+        run: scripts/verify-fresh-install.sh --tarball "dist/rusty-brain-${ARTIFACT_VERSION}-${TARGET}.tar.gz"
         env:
           TARGET: ${{ matrix.target }}
 
   release:
     name: publish release
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
     needs: [preflight, build, smoke]
     runs-on: ubuntu-latest
     permissions:

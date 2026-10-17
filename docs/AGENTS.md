@@ -203,7 +203,7 @@ installers and skip OMP.
 
 **Lifecycle:**
 
-- `session_start` only marks startup preparation as pending; it starts no hook
+- A fresh `session_start` marks startup preparation as pending; it starts no hook
   process. The first `before_agent_start` connects, auto-starts the daemon if
   needed, and performs deferred preparation of stable context and prompt-relevant
   memory in one hidden, agent-attributed message under one 600-token budget,
@@ -214,6 +214,10 @@ installers and skip OMP.
   current. Prepared output is not a host-delivery acknowledgement.
 - Failed startup preparation retries on the next prompt. Successful empty
   preparation does not keep retrying startup.
+- Cold `--resume` also emits `session_start`. Retained conversation, compaction
+  or Rusty Brain custom-message entries select resume semantics rather than
+  re-injecting a startup block. Missing branch history is treated conservatively
+  as resumed/unknown; current query recall remains available.
 - `tool_result` records native `write.path`, hashline `edit.input`/`patch` paths
   (including moves/removals), and shell commands in redacted per-session scratch.
 - Before switching or branching, a checkpoint folds the old session without
@@ -246,11 +250,18 @@ processes, a disposable daemon/store, prompt injection and recall (no live model
 bun crates/rb-install/tests/omp_capture.ts target/debug/rusty-brain target/debug/rusty-brain-hooks
 ```
 
-The compact-context tranche also exercised installed native callbacks with real
-hook processes and disposable data, including combined preparation, repeated
-prompts, capture, failure recovery and independent sessions. An isolated OMP
-18.8.6 launch with `openai-codex/gpt-6-luna` stopped because no provider credential
-was available; it does not renew the historical model-backed verification.
+The compact-context tranche exercised installed native callbacks with real hook
+processes and disposable data. On 2026-10-16, authenticated OMP 18.8.6 with
+`litellm/deepseek-v4.1-flash` also passed startup, UUID-followed exact late-detail
+recovery, unchanged-preview suppression, supersession correction, namespace and
+zero-confidence poison exclusion, MCP get/history, and actual persisted-session
+resume. The cold-resume check found and fixed duplicate startup preparation.
+Returned text estimates were 201/265/203 tokens across the recorded preparations;
+the unchanged prompt emitted no duplicate stable preview and resume emitted only
+query-specific text. These include framing/handles, not full host envelopes or
+provider billing. See [dated verification evidence](eval/2026-10-16-closeout-verification.json).
+This is lifecycle/detail-access evidence, not universal model-level poisoning
+resistance, generated-answer quality, or a completed N=5 efficacy scorecard.
 
 **Troubleshooting:** run `rusty-brain-install status --agents omp` and
 `rusty-brain doctor` first. Verify the OMP working directory and binary locations.

@@ -1,0 +1,60 @@
+{
+  "schema": "rusty-brain-pilot-store-preparation-v1",
+  "status": "prepared_not_admitted",
+  "study_root": "${HOME}/.local/share/rusty-brain-pilots/phase5-20261019",
+  "runtime_root": "/tmp/rbp5-20261019-i1ol1j_3",
+  "runtime_root_ephemeral_recreate_before_admission": true,
+  "credentials_stored": false,
+  "operator_assigned": false,
+  "treatment_started": false,
+  "sqlite_databases_initialized": false,
+  "stores": [
+    {
+      "repository": "rusty-brain",
+      "arm": "baseline",
+      "store_id": "phase5-20261019-rusty-brain-baseline",
+      "namespace": "phase5-20261019-rusty-brain-baseline",
+      "path_relative_to_study_root": "rb-baseline",
+      "db_relative_to_study_root": "rb-baseline/data/memory.db",
+      "socket": "/tmp/rbp5-20261019-i1ol1j_3/rb-baseline.sock",
+      "config_sha256": "21fd5fbbae0cee1b3f7ca36ed56e5d7cf02539dcfbc96fe177351ee7fe249638",
+      "state": "reserved_empty_directories_no_database_or_observation"
+    },
+    {
+      "repository": "rusty-brain",
+      "arm": "treatment",
+      "store_id": "phase5-20261019-rusty-brain-treatment",
+      "namespace": "phase5-20261019-rusty-brain-treatment",
+      "path_relative_to_study_root": "rb-treatment",
+      "db_relative_to_study_root": "rb-treatment/data/memory.db",
+      "socket": "/tmp/rbp5-20261019-i1ol1j_3/rb-treatment.sock",
+      "config_sha256": "d1e08e9e974acf69efdb2d928c3de9fc6e0d2a73fc5d468a6520f106dca0b6fa",
+      "state": "reserved_empty_directories_no_database_or_observation"
+    },
+    {
+      "repository": "threatmitigator",
+      "arm": "baseline",
+      "store_id": "phase5-20261019-threatmitigator-baseline",
+      "namespace": "phase5-20261019-threatmitigator-baseline",
+      "path_relative_to_study_root": "tm-baseline",
+      "db_relative_to_study_root": "tm-baseline/data/memory.db",
+      "socket": "/tmp/rbp5-20261019-i1ol1j_3/tm-baseline.sock",
+      "config_sha256": "2d94b10debe69e68bc23f82aee24a2a488e41fb6da30f017b1149dde2676a075",
+      "state": "reserved_empty_directories_no_database_or_observation"
+    },
+    {
+      "repository": "threatmitigator",
+      "arm": "treatment",
+      "store_id": "phase5-20261019-threatmitigator-treatment",
+      "namespace": "phase5-20261019-threatmitigator-treatment",
+      "path_relative_to_study_root": "tm-treatment",
+      "db_relative_to_study_root": "tm-treatment/data/memory.db",
+      "socket": "/tmp/rbp5-20261019-i1ol1j_3/tm-treatment.sock",
+      "config_sha256": "3473c51c6fedc1ffa2b394f3c1e8d261babc5732227764f16fe99749a32682d2",
+      "state": "reserved_empty_directories_no_database_or_observation"
+    }
+  ],
+  "scenario_inputs_file_sha256": "bfb56c397492280ccdd3f765e5054cdabe5895a40c699c531131610f7e59820a",
+  "scenario_inputs_location": "scenario-inputs.json under the private study root; not stored in Git",
+  "privacy": "Contains private-project source paths/tasks; only opaque IDs and SHA-256 commitments are public."
+}

@@ -91,6 +91,8 @@ pub struct QaRecord {
     pub metrics: QuestionMetrics,
     pub ingest_ms: u128,
     pub query_us: u128,
+    pub logical_db_bytes: u64,
+    pub failure: &'static str,
 }
 
 pub async fn run_sample<P: EmbeddingProvider>(
@@ -112,6 +114,8 @@ pub async fn run_sample<P: EmbeddingProvider>(
         let r = retrieve(provider, &docs, &qa.question, profile, top_k).await?;
         let ids: Vec<String> = r.ranked.iter().map(|h| h.session_id.clone()).collect();
         let evidence = evidence_sessions(&qa.evidence);
+        let found = evidence.iter().filter(|id| ids.contains(id)).count();
+        let failure = super::core::classify_failure(evidence.len(), found, r.abstained.is_some());
         out.push(QaRecord {
             sample_id: sample.sample_id.clone(),
             qa_index,
@@ -126,6 +130,8 @@ pub async fn run_sample<P: EmbeddingProvider>(
             abstained: r.abstained,
             ingest_ms: r.ingest_ms,
             query_us: r.query_us,
+            logical_db_bytes: r.logical_db_bytes,
+            failure,
         });
     }
     Ok(out)

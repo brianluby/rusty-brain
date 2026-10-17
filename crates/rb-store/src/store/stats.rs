@@ -6,6 +6,7 @@
 
 use super::internal::*;
 use super::*;
+use crate::error::storage_err;
 use rb_types::{FeedbackTotals, GrowthBucket, MemoryStats, TopRecalled};
 
 /// Read `meta.embedding_model` from `db_path` over a plain READ-ONLY SQLite
@@ -41,6 +42,18 @@ fn count_query(
 }
 
 impl SqliteStore {
+    /// Logical SQLite main-database allocation, including free pages and indexes.
+    /// Works in memory; excludes WAL, process RSS and physical filesystem usage.
+    pub fn logical_size_bytes(&self) -> Result<u64> {
+        self.conn
+            .query_row(
+                "SELECT page_count * page_size FROM pragma_page_count(), pragma_page_size()",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(storage_err)
+    }
+
     /// Compute the namespace-scoped value/health aggregate for `ns`
     /// (doctor/stats PRD). Pure reads — safe on a read-pool connection; the
     /// caller supplies the bounded `window_days`, the CURRENT
@@ -324,6 +337,37 @@ mod tests {
         let id = note.id.clone();
         store.insert_memory(&note, Some(&[0.1f32; DIM])).unwrap();
         id
+    }
+
+    #[test]
+    fn logical_size_bytes_counts_whole_pages_and_grows_with_writes() {
+        let store = SqliteStore::open_in_memory(DIM).unwrap();
+        let page_size: u64 = store
+            .conn
+            .query_row("PRAGMA page_size", [], |row| row.get(0))
+            .unwrap();
+        let empty = store.logical_size_bytes().unwrap();
+        assert!(empty > 0, "schema pages are allocated even in memory");
+        assert_eq!(
+            empty % page_size,
+            0,
+            "allocation is reported in whole pages"
+        );
+
+        let ns = Namespace::Project("size".to_string());
+        for index in 0..200 {
+            seed(
+                &store,
+                &ns,
+                &format!("logical size fixture {index} {}", "x".repeat(200)),
+            );
+        }
+        let grown = store.logical_size_bytes().unwrap();
+        assert!(
+            grown > empty,
+            "inserted rows must allocate more pages: {empty} -> {grown}"
+        );
+        assert_eq!(grown % page_size, 0);
     }
 
     #[test]

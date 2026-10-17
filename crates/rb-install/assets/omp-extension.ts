@@ -305,7 +305,21 @@ export default function rustyBrainOmpExtension(pi: ExtensionAPI): void {
     }
   }
 
-  pi.on("session_start", async (_event, context) => start(context, "startup", true));
+  pi.on("session_start", async (_event, context) => {
+    // Cold --resume emits session_start too; retained conversation is not a fresh startup.
+    let source = "resume";
+    try {
+      const retained = context.sessionManager.getBranch().some((entry) => {
+        const value = objectValue(entry);
+        const role = objectValue(value?.message)?.role;
+        return value?.type === "compaction"
+          || (value?.type === "custom_message" && value.customType === "dev.rusty-brain.recall")
+          || (value?.type === "message" && (role === "user" || role === "assistant"));
+      });
+      source = retained ? "resume" : "startup";
+    } catch { /* Missing history cannot establish a fresh startup. */ }
+    return start(context, source, true);
+  });
   pi.on("session_switch", async (_event, context) => start(context, "resume", true));
   pi.on("session_branch", async (_event, context) => start(context, "resume", true));
   pi.on("session_tree", async (_event, context) => start(context, "resume", false));

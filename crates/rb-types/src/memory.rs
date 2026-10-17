@@ -74,6 +74,11 @@ pub struct MemoryNote {
     /// surface. See `write_gate` module docs and docs/THREAT_MODEL.md.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub origin_channel: Option<crate::write_gate::WriteChannel>,
+    /// Pre-cutover row with no recorded source or channel. Quarantined until
+    /// deliberately re-authored; edits and human curation never clear it.
+    /// New identity-less writes are unverified, not historical, and use false.
+    #[serde(default)]
+    pub legacy_unknown: bool,
     #[serde(default)]
     pub session_id: Option<String>,
     /// Typed code anchors (PRD 2026-07-02): structured file/commit/symbol
@@ -133,6 +138,7 @@ impl MemoryNote {
             origin_agent: None,
             origin_source: None,
             origin_channel: None,
+            legacy_unknown: false,
             session_id: None,
             anchors: Vec::new(),
             // The conservative pre-evidence default; the daemon's derivation
@@ -141,16 +147,15 @@ impl MemoryNote {
         }
     }
 
-    /// Retrieval-side quarantine decision (Vikunja #69), derived exactly like
-    /// `contested` (never persisted): a row is quarantined when its stamped
-    /// channel is the unauthenticated HTTP surface, or — for rows written
-    /// before the channel column existed — when its daemon-stamped
-    /// `origin_source` says `http` (the HTTP listener set that field itself,
-    /// so it is as unforgeable as the column). Quarantined rows are EXCLUDED
-    /// from recall/injection and surfaced with an explicit marker on
-    /// list/get surfaces (never silently hidden).
+    /// Historical unknown provenance and HTTP-origin rows are excluded from
+    /// recall/injection, but remain available on audit/detail/export surfaces.
+    /// New identity-less writes stay eligible and explicitly unverified; NULL
+    /// provenance alone must never classify a row as historical at read time.
     #[must_use]
     pub fn is_quarantined(&self) -> bool {
+        if self.legacy_unknown {
+            return true;
+        }
         match self.origin_channel {
             Some(crate::write_gate::WriteChannel::Http) => true,
             Some(_) => false,
@@ -347,11 +352,27 @@ mod tests {
         m.origin_source = Some("http".to_string());
         assert!(m.is_quarantined());
 
-        // Legacy/NULL rows with any other origin -> trusted (today's behavior).
+        // Sourced legacy rows remain eligible; new identity-less rows are
+        // explicitly unverified, not inferred historical from NULL provenance.
         let mut m = sample();
         m.origin_source = Some("hook".to_string());
         assert!(!m.is_quarantined());
-        assert!(!sample().is_quarantined());
+        let unverified = sample();
+        assert!(!unverified.legacy_unknown && !unverified.is_quarantined());
+        assert_eq!(
+            serde_json::to_value(&unverified).unwrap()["legacy_unknown"],
+            false
+        );
+        let mut job = sample();
+        job.origin_source = Some("job".into());
+        assert!(!job.is_quarantined());
+        m.legacy_unknown = true;
+        m.origin_channel = Some(WriteChannel::Cli);
+        m.human_curated = true;
+        assert!(
+            m.is_quarantined(),
+            "restoring or curating must never upgrade history"
+        );
     }
 
     #[test]

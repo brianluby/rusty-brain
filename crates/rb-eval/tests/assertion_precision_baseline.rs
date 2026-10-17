@@ -33,6 +33,7 @@ async fn assert_class(class: &str) {
         for row in case["memories"].as_array().unwrap() {
             let (mut note, vector) = engine
                 .compose_note(RememberInput {
+                    legacy_unknown: false,
                     content: row["content"].as_str().unwrap().to_string(),
                     context: None,
                     memory_type: MemoryType::Insight,

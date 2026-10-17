@@ -240,6 +240,35 @@ impl SqliteStore {
         Ok(out)
     }
 
+    /// Exact, namespace-scoped restore probe, independent of recall eligibility
+    /// and list limits. Stream candidate text only; never hydrate an audit corpus.
+    /// SQLite trim is ASCII-only; final borrowed-text comparison uses Rust trim.
+    pub fn has_historical_duplicate(&self, ns: &Namespace, content: &str) -> Result<bool> {
+        let content = content.trim();
+        if content.is_empty() {
+            return Ok(false);
+        }
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT content FROM memories WHERE namespace = ?1
+             AND archived_at IS NULL AND superseded_by IS NULL AND legacy_unknown = 1
+             AND instr(content, ?2) > 0",
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let mut rows = stmt
+            .query(rusqlite::params![ns.as_db_string(), content])
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+            let value = row.get_ref(0).map_err(|e| Error::Storage(e.to_string()))?;
+            let candidate = value.as_str().map_err(|e| Error::Storage(e.to_string()))?;
+            if candidate.trim() == content {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Semantic neighbors proven equivalent by the conservative automatic rule.
     /// Human review still receives all neighbors via `near_duplicates`.
     pub fn equivalent_duplicates(
@@ -333,6 +362,7 @@ impl SqliteStore {
             || a.trust_class != b.trust_class
             || a.origin_source != b.origin_source
             || a.origin_channel != b.origin_channel
+            || a.legacy_unknown != b.legacy_unknown
             || a.origin_user != b.origin_user
             || a.origin_host != b.origin_host
             || a.origin_agent != b.origin_agent
@@ -550,11 +580,11 @@ impl SqliteStore {
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, origin_channel,
                         session_id,
-                        base_importance, trust_class, human_curated
+                        base_importance, trust_class, human_curated, legacy_unknown
                      ) VALUES (
                         ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12,
                         ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25,
-                        ?26, ?27, ?28
+                        ?26, ?27, ?28, ?29
                      )",
                 rusqlite::params![
                     note.id.to_string(),
@@ -593,6 +623,7 @@ impl SqliteStore {
                     // tier; the SQL CHECK is the storage backstop.
                     note.trust_class.as_str(),
                     i64::from(u8::from(note.human_curated)),
+                    note.legacy_unknown,
                 ],
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -928,6 +959,9 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
             .map(|s| rb_types::WriteChannel::parse(&s))
             .transpose()
             .map_err(|e| Error::Storage(e.to_string()))?,
+        legacy_unknown: row
+            .get("legacy_unknown")
+            .map_err(|e| Error::Storage(e.to_string()))?,
         session_id: go("session_id")?,
         anchors,
         // Trust-class ladder (Vikunja #63): NOT NULL since migration 012;
@@ -1227,7 +1261,7 @@ fn build_list_filtered_query(
                 related_files, access_count, last_accessed_at, archived_at,
                 superseded_by, embedding_model, embedding_input_version,
                 origin_user, origin_host, origin_agent, origin_source, session_id,
-                origin_channel, trust_class, human_curated
+                origin_channel, trust_class, human_curated, legacy_unknown
          FROM memories m WHERE {predicate}"
     );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
@@ -1289,7 +1323,8 @@ fn build_active_contradicts_query(
     (sql, params)
 }
 
-const RECALL_NOT_QUARANTINED_SQL: &str = "m.origin_channel IS NOT 'http' AND
+const RECALL_NOT_QUARANTINED_SQL: &str =
+    "m.legacy_unknown = 0 AND m.origin_channel IS NOT 'http' AND
      (m.origin_channel IS NOT NULL OR m.origin_source IS NOT 'http')";
 
 #[allow(clippy::vec_box)]
@@ -1386,7 +1421,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel, trust_class, human_curated
+                        origin_channel, trust_class, human_curated, legacy_unknown
                  FROM memories WHERE memory_id = ?1",
             )
             .map_err(|e| Error::Storage(e.to_string()))?;
@@ -1513,6 +1548,7 @@ impl Store for SqliteStore {
         let mut out = Vec::new();
         let eligibility_sql = "SELECT 1 FROM memories m WHERE m.memory_id = ?1
              AND m.namespace = ?2 AND m.archived_at IS NULL
+             AND m.legacy_unknown = 0
              AND m.origin_channel IS NOT 'http'
              AND (m.origin_channel IS NOT NULL OR m.origin_source IS NOT 'http')
              AND m.confidence >= ?3";
@@ -1982,7 +2018,7 @@ impl Store for SqliteStore {
                     related_files, access_count, last_accessed_at, archived_at,
                     superseded_by, embedding_model, embedding_input_version,
                     origin_user, origin_host, origin_agent, origin_source, session_id,
-                    origin_channel, trust_class, human_curated
+                    origin_channel, trust_class, human_curated, legacy_unknown
              FROM memories
              WHERE namespace = ?1 AND memory_id IN ({})",
             placeholders.join(", ")
@@ -2077,7 +2113,7 @@ impl Store for SqliteStore {
                         related_files, access_count, last_accessed_at, archived_at,
                         superseded_by, embedding_model, embedding_input_version,
                         origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel, trust_class, human_curated
+                        origin_channel, trust_class, human_curated, legacy_unknown
                  FROM memories
                  WHERE archived_at IS NULL
                    AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
@@ -6365,6 +6401,83 @@ mod vector_write_hygiene_tests {
         assert_ne!(
             note.embedding_model, "det",
             "the embedding stamp must not be updated on an archived row"
+        );
+    }
+
+    #[test]
+    fn sqlite_full_rolls_back_and_recovers_after_reopen() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = dir.path().join("full.db");
+        let ns = Namespace::Project("sqlite-full".into());
+        let store = SqliteStore::open(&db, DIM).unwrap();
+        let baseline =
+            MemoryNote::new(ns.clone(), "durablebaseline".into(), MemoryType::Insight, 5);
+        store.insert_memory(&baseline, Some(&[0.1; DIM])).unwrap();
+        store.checkpoint_truncate().unwrap();
+        let before = store.last_oplog_seq().unwrap();
+        let pages: i64 = store
+            .conn
+            .query_row("PRAGMA page_count", [], |row| row.get(0))
+            .unwrap();
+        store
+            .conn
+            .pragma_update(None, "max_page_count", pages)
+            .unwrap();
+        let refused = MemoryNote::new(
+            ns.clone(),
+            format!("refusedpressure {}", "x".repeat(1024 * 1024)),
+            MemoryType::Insight,
+            5,
+        );
+        let error = store
+            .insert_memory(&refused, Some(&[0.2; DIM]))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("database or disk is full"),
+            "{error}"
+        );
+        assert!(store.is_autocommit());
+        assert!(store.get_memory(&refused.id).unwrap().is_none());
+        assert_eq!(store.last_oplog_seq().unwrap(), before);
+        assert_eq!(vector_row_count(&store, &refused.id), 0);
+        assert!(store
+            .keyword_search(&ns, "refusedpressure", 10)
+            .unwrap()
+            .is_empty());
+        store
+            .conn
+            .pragma_update(None, "max_page_count", pages + 4096)
+            .unwrap();
+        let recovered = MemoryNote::new(
+            ns.clone(),
+            "recoveredpressure".into(),
+            MemoryType::Insight,
+            5,
+        );
+        store.insert_memory(&recovered, Some(&[0.3; DIM])).unwrap();
+        store.checkpoint_truncate().unwrap();
+        drop(store);
+
+        let reopened = SqliteStore::open(&db, DIM).unwrap();
+        assert!(reopened.get_memory(&baseline.id).unwrap().is_some());
+        assert!(reopened.get_memory(&recovered.id).unwrap().is_some());
+        assert!(reopened.get_memory(&refused.id).unwrap().is_none());
+        assert_eq!(reopened.list(&ns, None, 10).unwrap().len(), 2);
+        assert_eq!(vector_row_count(&reopened, &baseline.id), 1);
+        assert_eq!(vector_row_count(&reopened, &recovered.id), 1);
+        assert_eq!(
+            reopened
+                .keyword_search(&ns, "recoveredpressure", 10)
+                .unwrap(),
+            vec![recovered.id]
+        );
+        assert_eq!(reopened.last_oplog_seq().unwrap(), before + 1);
+        assert_eq!(
+            reopened
+                .conn
+                .query_row("PRAGMA integrity_check", [], |row| row.get::<_, String>(0))
+                .unwrap(),
+            "ok"
         );
     }
 

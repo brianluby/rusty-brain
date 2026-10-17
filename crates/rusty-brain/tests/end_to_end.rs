@@ -1177,3 +1177,190 @@ fn authored_procedures_preserve_outcomes_and_sources_through_recall_and_detail()
         assert!(!String::from_utf8_lossy(&foreign_history.stdout).contains(exception));
     }
 }
+
+#[test]
+fn provenance_export_restore_preserves_classification_and_deduplicates_after_restart() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let daemon = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+    let remembered = cli(&exe, &socket, &db, dir.path(), "provenance-source")
+        .args([
+            "remember",
+            "zebra source template",
+            "--type",
+            "constraint",
+            "--importance",
+            "9",
+        ])
+        .output()
+        .unwrap();
+    assert!(remembered.status.success());
+    let exported = cli(&exe, &socket, &db, dir.path(), "provenance-source")
+        .args(["--json", "export", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(exported.status.success());
+    let mut envelope: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let template = envelope["memories"][0].clone();
+    let mut memories = Vec::new();
+    for (content, classification, source) in [
+        ("zebra fresh unverified", Some(false), None),
+        ("zebra classified history", Some(true), None),
+        ("zebra old missing classification", None, None),
+        ("zebra old internal job", None, Some("job")),
+    ] {
+        let mut memory = template.clone();
+        memory["content"] = content.into();
+        memory["summary"] = content.into();
+        memory["origin_channel"] = serde_json::Value::Null;
+        memory["origin_source"] = source.map_or(serde_json::Value::Null, Into::into);
+        if let Some(classification) = classification {
+            memory["legacy_unknown"] = classification.into();
+        } else {
+            memory.as_object_mut().unwrap().remove("legacy_unknown");
+        }
+        memories.push(memory);
+    }
+    envelope["memories"] = memories.into();
+    envelope["count"] = 4.into();
+    let input = dir.path().join("provenance-export.json");
+    std::fs::write(&input, serde_json::to_vec(&envelope).unwrap()).unwrap();
+    let restored = cli(&exe, &socket, &db, dir.path(), "provenance-restored")
+        .args(["--json", "restore"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(
+        restored.status.success(),
+        "{}",
+        String::from_utf8_lossy(&restored.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+    assert_eq!(report["new"], 4);
+    drop(daemon);
+    let _daemon = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+    let exported = cli(&exe, &socket, &db, dir.path(), "provenance-restored")
+        .args(["--json", "export", "--format", "json"])
+        .output()
+        .unwrap();
+    assert!(exported.status.success());
+    let restored: serde_json::Value = serde_json::from_slice(&exported.stdout).unwrap();
+    let memories = restored["memories"].as_array().unwrap();
+    assert_eq!(memories.len(), 4);
+    for memory in memories {
+        let historical = matches!(
+            memory["content"].as_str().unwrap(),
+            "zebra classified history" | "zebra old missing classification"
+        );
+        assert_eq!(memory["legacy_unknown"], historical);
+        if historical {
+            let detail = cli(&exe, &socket, &db, dir.path(), "provenance-restored")
+                .args(["get", memory["id"].as_str().unwrap()])
+                .output()
+                .unwrap();
+            assert!(detail.status.success());
+            assert!(String::from_utf8_lossy(&detail.stdout).contains("legacy unknown origin"));
+        }
+    }
+    let repeated = cli(&exe, &socket, &db, dir.path(), "provenance-restored")
+        .args(["--json", "restore"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(repeated.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&repeated.stdout).unwrap();
+    assert_eq!(report["new"], 0);
+    assert_eq!(report["skipped_duplicate"], 4);
+}
+
+#[test]
+fn historical_restore_dedup_crosses_list_limit_without_materializing_oversized_corpus() {
+    use rb_store::Store;
+    use rb_types::{MemoryNote, MemoryType, Namespace};
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let ns = Namespace::Project("bounded-historical-restore".into());
+    let mut target = MemoryNote::new(
+        ns.clone(),
+        "older exact historical target".into(),
+        MemoryType::Insight,
+        7,
+    );
+    target.legacy_unknown = true;
+    target.embedding_model = "deterministic".into();
+    target.created_at -= chrono::Duration::days(2);
+    {
+        // Match serve's offline provider dimension. Fixtures have no vectors;
+        // this regression exercises the real CLI/wire/store restore probe.
+        let store = rb_store::SqliteStore::open(&db, 512).unwrap();
+        store.insert_memory(&target, None).unwrap();
+        for index in 0..1_012 {
+            let content = if index >= 1_001 {
+                format!(
+                    "large destination row {index} {}",
+                    "background archival evidence ".repeat(3_800)
+                )
+            } else {
+                format!("newer unrelated destination row {index}")
+            };
+            let mut note = MemoryNote::new(ns.clone(), content, MemoryType::Insight, 7);
+            note.legacy_unknown = true;
+            note.embedding_model = "deterministic".into();
+            store.insert_memory(&note, None).unwrap();
+        }
+    }
+    let mut fresh = target.clone();
+    fresh.content = "new exact historical target".into();
+    let input = dir.path().join("historical-restore.json");
+    std::fs::write(
+        &input,
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1, "exported_at": chrono::Utc::now(), "namespace": ns.as_db_string(),
+            "count": 3, "memories": [target, fresh.clone(), fresh]
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+    let _daemon = spawn_daemon(&exe, &socket, &db, dir.path());
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+    for (new, skipped) in [(1, 2), (0, 3)] {
+        let output = cli(&exe, &socket, &db, dir.path(), "bounded-historical-restore")
+            .args(["--json", "restore"])
+            .arg(&input)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["new"], new);
+        assert_eq!(report["skipped_duplicate"], skipped);
+        assert_eq!(report["failed"], 0);
+    }
+    // The same text in another namespace is not a duplicate.
+    let foreign = cli(&exe, &socket, &db, dir.path(), "foreign-historical-restore")
+        .args(["--json", "restore"])
+        .arg(&input)
+        .output()
+        .unwrap();
+    assert!(foreign.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&foreign.stdout).unwrap();
+    assert_eq!(report["new"], 2);
+    assert_eq!(report["skipped_duplicate"], 1);
+    let ping = cli(&exe, &socket, &db, dir.path(), "bounded-historical-restore")
+        .arg("status")
+        .output()
+        .unwrap();
+    assert!(
+        ping.status.success(),
+        "bounded restore must leave the daemon usable"
+    );
+}

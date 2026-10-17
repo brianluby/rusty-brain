@@ -563,6 +563,7 @@ mod tests {
         }
         for req in [
             Request::Remember {
+                legacy_unknown: None,
                 anchors: vec![],
                 content: "c".into(),
                 context: None,

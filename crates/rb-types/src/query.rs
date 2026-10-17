@@ -33,6 +33,19 @@ pub struct ChannelHits {
     pub graph: bool,
 }
 
+/// Unweighted Linear channel scores before priors, confidence and source adjustment.
+/// `None` means the channel did not surface the candidate; these are not final
+/// score contributions (and are not RRF scores).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+pub struct ChannelScores {
+    /// Reciprocal FTS rank: 1 / (1 + zero-based rank), not raw BM25.
+    pub fts: Option<f32>,
+    /// Cosine similarity: max(0, 1 - cosine distance), bounded to [0, 1].
+    pub vector: Option<f32>,
+    /// Reciprocal minimum graph hop count: 1 / max(1, hops).
+    pub graph: Option<f32>,
+}
+
 /// A single ranked search hit.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -40,6 +53,8 @@ pub struct SearchResult {
     pub score: f32,
     #[serde(default)]
     pub channels: ChannelHits,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub channel_scores: Option<ChannelScores>,
     /// State-bound staleness (Vikunja #63): `true` when this memory is
     /// commit-bound and the repository state at query time has moved past
     /// the anchored commit (HEAD differs, or the worktree is dirty). A
@@ -117,6 +132,7 @@ impl ContextEntry {
         hash.update([
             u8::from(memory.human_curated),
             u8::from(memory.contested),
+            u8::from(memory.legacy_unknown),
             u8::from(stale),
         ]);
         for field in [
@@ -579,9 +595,9 @@ mod tests {
     #[test]
     fn context_fingerprint_has_a_portable_serialized_fixture() {
         let mut note = context_fingerprint_note();
-        // Independently framed with Python hashlib.sha256: 24f59a62214df278
-        // efc9e46e9a2f1a4e55a721b2f58468aadd0e1639a394e45b; first 8 bytes LE.
-        let expected = 8_715_113_034_698_913_060;
+        // Independently framed with Python hashlib.sha256: 30c4c9831380d233
+        // 57525d424ee2cb3e881b389b467fd852b190195638d333f9; first 8 bytes LE.
+        let expected = 3_734_187_862_347_334_704;
         let entry = ContextEntry::from_memory(note.clone(), true, None);
         assert_eq!(entry.fingerprint, expected);
         let serialized = serde_json::to_string(&entry).unwrap();
@@ -599,7 +615,7 @@ mod tests {
     fn context_fingerprint_retains_full_evidence_and_qualifications() {
         let note = context_fingerprint_note();
         let expected = ContextEntry::fingerprint_for(&note, true, None);
-        let mutations: [fn(&mut MemoryNote); 22] = [
+        let mutations: [fn(&mut MemoryNote); 23] = [
             |n| n.content.push_str(" Exception: read-only."),
             |n| n.context.push_str(" Outcome unknown."),
             |n| n.summary.push_str(" (proposal)"),
@@ -612,6 +628,7 @@ mod tests {
             |n| n.trust_class = TrustClass::AgentAttested,
             |n| n.human_curated = false,
             |n| n.contested = false,
+            |n| n.legacy_unknown = true,
             |n| n.origin_user = Some("Grace".into()),
             |n| n.origin_host = Some("titan".into()),
             |n| n.origin_agent = Some("other".into()),
@@ -713,6 +730,7 @@ mod tests {
                 graph: false,
             },
             stale: false,
+            channel_scores: None,
         };
         let json = serde_json::to_string(&result).unwrap();
         let back: SearchResult = serde_json::from_str(&json).unwrap();
@@ -738,11 +756,14 @@ mod tests {
             score: 0.5,
             channels: ChannelHits::default(),
             stale: false,
+            channel_scores: None,
         })
         .unwrap();
         value.as_object_mut().unwrap().remove("channels").unwrap();
+        value.as_object_mut().unwrap().remove("channel_scores");
         let back: SearchResult = serde_json::from_value(value).unwrap();
         assert_eq!(back.channels, ChannelHits::default());
+        assert_eq!(back.channel_scores, None);
         assert!(!back.channels.fts && !back.channels.vector && !back.channels.graph);
     }
 

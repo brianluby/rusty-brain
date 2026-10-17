@@ -125,8 +125,12 @@ pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
         let contested = if n.contested { " [contested]" } else { "" };
         // Vikunja #69: quarantined rows stay listed but visibly demoted —
         // quarantine is never silent deletion.
-        let quarantined = if n.is_quarantined() {
+        let quarantined = if n.legacy_unknown {
+            " [quarantined] [legacy unknown origin]"
+        } else if n.is_quarantined() {
             " [quarantined]"
+        } else if n.origin_channel.is_none() && n.origin_source.is_none() {
+            " [unverified origin]"
         } else {
             ""
         };
@@ -158,8 +162,12 @@ pub fn render_get(memory: &Option<MemoryNote>, json: bool) -> String {
             // every human surface (recall/list/context/get) marks a contradicted note.
             let contested = if n.contested { " [contested]" } else { "" };
             // Vikunja #69: quarantine is visible on every human surface.
-            let quarantined = if n.is_quarantined() {
+            let quarantined = if n.legacy_unknown {
+                " [quarantined] [legacy unknown origin]"
+            } else if n.is_quarantined() {
                 " [quarantined]"
+            } else if n.origin_channel.is_none() && n.origin_source.is_none() {
+                " [unverified origin]"
             } else {
                 ""
             };
@@ -357,6 +365,7 @@ pub fn render_restore_plan(items: &[ImportItem], json: bool) -> String {
                     "type": item.memory_type.as_str(),
                     "importance": item.importance,
                     "source": redact(&item.source),
+                    "legacy_unknown": item.legacy_unknown,
                 })
             })
             .collect();
@@ -367,11 +376,16 @@ pub fn render_restore_plan(items: &[ImportItem], json: bool) -> String {
         let mut out = format!("Restore plan: {} memories\n", items.len());
         for item in items {
             out.push_str(&format!(
-                "- [{} imp {}] {} ({})\n",
+                "- [{} imp {}] {} ({}){}\n",
                 item.memory_type.as_str(),
                 item.importance,
                 redact(&item.summary),
-                redact(&item.source)
+                redact(&item.source),
+                if item.legacy_unknown {
+                    " [quarantined: legacy unknown origin]"
+                } else {
+                    ""
+                }
             ));
         }
         out.trim_end().to_string()
@@ -736,6 +750,11 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
                     evidence.trust_class.as_str(),
                     if evidence.human_curated { "yes" } else { "no" }
                 ));
+                if evidence.legacy_unknown {
+                    out.push_str("         provenance: [quarantined: legacy unknown origin]\n");
+                } else if evidence.origin_channel.is_none() && entry.origin_source.is_none() {
+                    out.push_str("         provenance: unverified origin (new identity-less write; not historical quarantine)\n");
+                }
                 out.push_str(&format!(
                     "         created: {}; updated: {}; last accessed: {}\n",
                     entry.created_at.to_rfc3339(),
@@ -1249,6 +1268,7 @@ mod tests {
             memory: n.clone(),
             score: 0.91,
             channels: rb_types::ChannelHits::default(),
+            channel_scores: None,
             stale: false,
         }];
         let out = render_recall(&results, false);
@@ -1268,6 +1288,7 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            channel_scores: None,
             stale: false,
         }];
         let out = render_recall(&results, false);
@@ -1284,12 +1305,14 @@ mod tests {
                 memory: note("current fact", 5),
                 score: 0.9,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: false,
             },
             SearchResult {
                 memory: note("anchored fact from an older head", 5),
                 score: 0.8,
                 channels: rb_types::ChannelHits::default(),
+                channel_scores: None,
                 stale: true,
             },
         ];
@@ -1308,6 +1331,7 @@ mod tests {
             memory: n,
             score: 0.8,
             channels: rb_types::ChannelHits::default(),
+            channel_scores: None,
             stale: false,
         }];
         let out = render_recall(&results, true);
@@ -1337,6 +1361,17 @@ mod tests {
         // And the JSON surfaces the channel itself for machine consumers.
         let out = render_notes(std::slice::from_ref(&n), true);
         assert!(out.contains("\"origin_channel\""), "json channel: {out}");
+        n.origin_channel = None;
+        n.legacy_unknown = true;
+        for out in [
+            render_notes(std::slice::from_ref(&n), false),
+            render_get(&Some(n.clone()), false),
+        ] {
+            assert!(out.contains("[quarantined]") && out.contains("legacy unknown origin"));
+        }
+        n.legacy_unknown = false;
+        let out = render_get(&Some(n), false);
+        assert!(out.contains("unverified origin") && !out.contains("quarantined"));
     }
 
     #[test]
@@ -1365,6 +1400,7 @@ mod tests {
             memory: n,
             score: 0.5,
             channels: rb_types::ChannelHits::default(),
+            channel_scores: None,
             stale: false,
         }];
         let out = render_recall(&results, true);
@@ -1416,6 +1452,7 @@ mod tests {
     #[test]
     fn import_plan_renders_items_in_both_modes() {
         let items = vec![ImportItem {
+            legacy_unknown: false,
             summary: "Use SQLite".to_string(),
             content: "Use SQLite for local-first storage".to_string(),
             memory_type: MemoryType::ArchitectureDecision,
@@ -1442,6 +1479,7 @@ mod tests {
     fn import_plan_redacts_preview_metadata() {
         let token = format!("sk-proj-{}", "A".repeat(40));
         let items = vec![ImportItem {
+            legacy_unknown: false,
             summary: format!("token {token}"),
             content: "not rendered".to_string(),
             memory_type: MemoryType::Insight,
@@ -2002,6 +2040,7 @@ mod tests {
                         }],
                         trust_class: rb_types::TrustClass::HumanConfirmed,
                         human_curated: true,
+                        legacy_unknown: false,
                         source_status: rb_types::HistorySourceStatus::RecordedUnverified,
                     }),
                     origin_user: Some("bob".to_string()),
@@ -2105,6 +2144,23 @@ mod tests {
         assert!(out.contains("created:"));
         assert!(out.contains("updated:"));
         assert!(out.contains("last accessed:"));
+    }
+
+    #[test]
+    fn human_history_distinguishes_quarantined_history_from_new_unverified_origin() {
+        let mut history = sample_history();
+        history.chain[1].origin_source = None;
+        let evidence = history.chain[1].evidence.as_mut().unwrap();
+        evidence.origin_channel = None;
+        evidence.human_curated = true;
+        evidence.legacy_unknown = true;
+        let historical = render_history(&history, false);
+        assert!(historical.contains("[quarantined: legacy unknown origin]"));
+        assert!(historical.contains("human-curated: yes"));
+        history.chain[1].evidence.as_mut().unwrap().legacy_unknown = false;
+        let unverified = render_history(&history, false);
+        assert!(unverified.contains("unverified origin (new identity-less write"));
+        assert!(!unverified.contains("[quarantined: legacy unknown origin]"));
     }
 
     #[test]
@@ -2331,5 +2387,25 @@ mod tests {
         let parsed: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(parsed["lagged"], true);
         assert_eq!(parsed["dropped"], 4);
+    }
+    #[test]
+    fn restore_preview_exposes_historical_quarantine_in_both_formats() {
+        let item = ImportItem {
+            summary: "inspect before recovery".into(),
+            content: "historic claim".into(),
+            memory_type: rb_types::MemoryType::Insight,
+            importance: 5,
+            source: "restore:test".into(),
+            tags: vec![],
+            anchors: vec![],
+            human_curated: false,
+            legacy_unknown: true,
+        };
+        let human = render_restore_plan(std::slice::from_ref(&item), false);
+        assert!(human.contains("quarantined: legacy unknown origin"));
+        let json = render_restore_plan(&[item], true);
+        let parsed: serde_json::Value =
+            serde_json::from_str(&json).expect("valid restore preview JSON");
+        assert_eq!(parsed["items"][0]["legacy_unknown"], true);
     }
 }

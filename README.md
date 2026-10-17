@@ -147,6 +147,14 @@ Implemented and test-covered (correctness is the primary coverage; see [Testing]
   becomes a durable memory, and commit-anchored memories report **STALE**
   (never silently reused) once the repo moves past their anchor.
 
+On upgrade, migration 015 marks historical rows with neither source nor channel
+as `legacy_unknown`. They remain inspectable/exportable but leave recall and
+startup context; edits or human curation do not clear this classification.
+New identity-less writes remain accepted and explicitly unverified, not trusted;
+internal `origin_source=job` writes keep their existing behavior. Restart the
+daemon with the upgraded binaries before relying on the cutover. See the
+[provenance recovery policy](docs/THREAT_MODEL.md).
+
 Planned / deferred (designed but not built): LLM-assisted memory evolution
 (reconciliation, reflection), a networked multi-host surface with real auth, and an
 ANN vector index for larger corpora. See [Roadmap](#roadmap).
@@ -568,6 +576,13 @@ Install the local supply-chain gate with `brew install cargo-deny` on macOS
 including its all-features graph, for the same advisory, license, ban, and source
 policy enforced by CI. An installed tool is not a clean verdict: investigate
 any findings instead of adding blanket exceptions.
+
+When changing the MCP registry, review overview tool counts manually: the runtime
+tests `exposes_exactly_the_twelve_tools` and
+`advertised_default_set_is_the_token_economy_subset` guard the exact routable and
+default-advertised sets, not documentation wording. The current surface is 12
+routable tools, six advertised by default. Workspace/PRD prose is reviewed against
+the manifest and delivery evidence rather than pinned by source-text assertions.
 
 Optional local compiler caching: `brew install sccache`, then merge the following
 into **your user** `~/.cargo/config.toml` (not the repository):

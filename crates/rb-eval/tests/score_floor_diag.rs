@@ -34,6 +34,7 @@ async fn ingest<P: EmbeddingProvider>(
         };
         let id = engine
             .remember(RememberInput {
+                legacy_unknown: false,
                 content: m.content.clone(),
                 context,
                 memory_type: m.memory_type,
