@@ -315,8 +315,87 @@ retrieval, not the historical run's missing channel values. A limited smoke
 is instrumentation validation only, never the all-question audit.
 
 **Closeout boundary:** instrumentation and reconstructable frozen metadata
-are supplied here; new runtime diagnostics have not been executed in this
-addendum. Until their full outputs are attached by the integration owner,
-the numeric-channel and DB audit clauses remain pending. Even after that,
-missing historical hardware and native channel values remain explicitly
-unavailable, not implicitly waived or retrospectively invented.
+are supplied here. The full diagnostic execution follows below. Missing
+historical hardware and native channel values remain explicitly unavailable,
+not implicitly waived or retrospectively invented.
+
+## Diagnostic replay execution (2026-10-17)
+
+The full all-four diagnostic matrix above was executed once: 12 runs
+(native-512, parity-512 and parity-256 for each benchmark) on clean merged
+`main` `a1ec930`, from a detached worktree, with the commands exactly as
+written. This is a **current diagnostic**, not a replacement quality run: the
+September headline above stays the frozen result. Hardware: Apple M4 Pro,
+12 logical CPUs, Darwin 27.0.0. Only the pinned local embedding model runs;
+there are no external API calls and $0 external API cost.
+
+The summary, hashes and audit counts are committed as
+[`artifacts/2026-10-17-external-bench-diagnostic-replay.json`](artifacts/2026-10-17-external-bench-diagnostic-replay.json).
+The per-question JSONL stays outside git (LoCoMo and ConvoMem are
+CC BY-NC) in the local cache as `diagnostics-20261017-a1ec930.*`, and the
+artifact records each file's SHA-256.
+
+### Per-question audit: complete
+
+| Run | Questions | Failure class on every record | Returned hits with numeric channel scores | Records with `logical_db_bytes` | Max DB bytes |
+|---|---:|:---:|---:|:---:|---:|
+| LongMemEval native | 500 | yes | 8,333 / 8,333 | 500 | 2,043,904 |
+| LongMemEval parity | 500 | yes | 23,551 / 23,551 | 500 | 1,982,464 |
+| LoCoMo native | 1,986 | yes | 19,855 / 19,855 | 1,986 | 2,007,040 |
+| LoCoMo parity | 1,986 | yes | 19,860 / 19,860 | 1,986 | 1,990,656 |
+| ConvoMem native | 250 | yes | 2,464 / 2,464 | 250 | 1,830,912 |
+| ConvoMem parity | 250 | yes | 2,487 / 2,487 | 250 | 1,814,528 |
+| MemBench native | 8,500 | yes | 42,500 / 42,500 | 8,500 | 2,080,768 |
+| MemBench parity | 8,500 | yes | 42,500 / 42,500 | 8,500 | 1,945,600 |
+
+Parity-256 rows are identical to parity rows (see the next section). Channel
+scores keep the semantics stated above: unweighted, pre-prior, `null` for an
+absent channel. DB bytes are logical SQLite allocation per fresh in-memory
+store, not disk, WAL or RSS.
+
+### Finding: the effective embedding length is now 256 tokens
+
+Today the "512-token" profiles are not 512 tokens. On every benchmark,
+parity with the default (512 requested) produces exactly the same results as
+parity-256. The only model snapshot available
+(`Qdrant/all-MiniLM-L6-v2-onnx@d13954661f83`, downloaded 2026-10-16)
+declares `model_max_length: 256` and tokenizer truncation 256, and fastembed
+5.15 appears to cap the requested length at that value. Rebuilding the
+September code (`a17c72c`) gives the same LoCoMo parity result today, both by
+default and with an explicit `--embed-max-tokens 512`, so the change is in
+the model files, not in rusty-brain. The September snapshot evidently allowed
+512 tokens and no longer exists, so **the September 512-token columns cannot
+be reproduced today**. The run metadata label
+`512 (fastembed default, production)` overstates the effective length; that,
+model-revision pinning and the production 256-vs-512 choice are tracked in
+kanban #100. Nothing was tuned or changed in response.
+
+### Current versus frozen headline
+
+| Benchmark (metric) | Frozen parity-256 | Current parity (effective 256) | Frozen parity-512 | Frozen native | **Current native** |
+|---|---:|---:|---:|---:|---:|
+| LongMemEval-S (R@5) | 0.966 | 0.966 | 0.960 | 0.980 | **0.978** |
+| LongMemEval-S (R@1) | 0.806 | 0.806 | 0.806 | 0.876 | **0.876** |
+| LoCoMo (evidence recall@10) | 0.603 | 0.603 | 0.726 | 0.917 | **0.900** |
+| ConvoMem (recall@10) | 0.929 | 0.929 | 0.929 | 0.913 | **0.913** |
+| MemBench (hit@5) | 0.787 | 0.787 | 0.787 | 0.876 | **0.876** |
+
+1. Current parity reproduces the frozen **256-token** parity column exactly,
+   and so still reproduces MemPalace raw. The adapter-equivalence result holds.
+2. ConvoMem and MemBench, whose messages are short, are unchanged in every
+   column, as truncation predicts.
+3. Current native is lower only where long inputs matter: LoCoMo −1.7 pp
+   (0.917 → 0.900) and LongMemEval R@5 −0.2 pp. It still leads MemPalace raw
+   on LongMemEval, LoCoMo and MemBench, and still trails slightly on
+   ConvoMem.
+4. The frozen September headline is not rewritten. It remains the record of
+   what that configuration measured; this section is the record of what the
+   current configuration measures.
+
+### Remaining unavailable, not waived
+
+- Native numeric channel scores and DB sizes for the **September** runs:
+  unrecoverable, as stated above. The new values describe current code only.
+- September CPU model, RAM and full OS version: unavailable.
+- A reproducible 512-token configuration: not available until kanban #100 pins a
+  model revision that allows it.
