@@ -5,6 +5,15 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Bounded diversity-selection experiment (kanban 86)
+
+- Add an eval-only MMR arm that reselects Linear's own top-10 candidates over
+  stored composite document vectors, plus silent-loss counts for dropped
+  relevant rows and split contradiction pairs. Preregistered before measuring.
+- Decision: defer. On the held-out set MMR gave no duplicate-coverage gain and
+  lowered NDCG@5 by 0.015; production ranking is unchanged. See
+  `docs/eval/2026-10-17-diversity-selection-results.md`.
+
 ### Added — Provenance and verification closeout (kanban 55, 58, 59, 60, 93)
 
 - Classify historical NULL-source/NULL-channel rows once in migration 015 as

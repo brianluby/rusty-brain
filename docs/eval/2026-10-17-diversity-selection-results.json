@@ -1,0 +1,117 @@
+{
+  "budget": "5 rows / 800 tokens, whole rows",
+  "build_profile": "release",
+  "candidate_pool": "Linear top-10 (RECALL_LIMIT) per query",
+  "captured_at": "2026-10-17T20:14:47Z",
+  "concurrent_load": "kanban #60 external-bench replay running on the same machine",
+  "decision": "defer",
+  "decision_rule_set": "holdout",
+  "lambda": 0.7,
+  "latency_note": "in-process, shared machine; MMR arm latency = recall + step at the same percentile (upper bound)",
+  "preregistration": "docs/eval/2026-10-17-diversity-selection-preregistration.md",
+  "relevance": "(n - rank) / n over Linear order",
+  "rusty_brain_commit": "52a841bfa69da209138a1a9008097ece7207d747",
+  "rusty_brain_dirty": false,
+  "schema": "rusty-brain-diversity-selection-v1",
+  "sets": {
+    "golden": {
+      "decision_checks": {
+        "dedup_precision_gain_ge_0_02": false,
+        "ndcg_drop_le_0_01": false,
+        "no_contradiction_drops": true,
+        "no_relevant_drops": false,
+        "recall_drop_le_0_01": true,
+        "step_p99_le_1ms": true
+      },
+      "delta": {
+        "dedup_precision_at_5": 0.013888888888888729,
+        "injected_tokens": -45.0,
+        "mrr": -0.0011574074074074403,
+        "ndcg_at_5": -0.013296524745390226,
+        "recall_at_5": -0.006944444444444531
+      },
+      "linear": {
+        "dedup_precision_at_5": 0.9472222222222222,
+        "injected_bytes": 78209.0,
+        "injected_rows": 360.0,
+        "injected_tokens": 19684.0,
+        "mrr": 0.9837962962962964,
+        "ndcg_at_5": 0.9537339465324524,
+        "p50_latency_us": 1706.8,
+        "p99_latency_us": 1950.6,
+        "recall_at_5": 0.962962962962963
+      },
+      "mmr": {
+        "dedup_precision_at_5": 0.9611111111111109,
+        "injected_bytes": 78028.0,
+        "injected_rows": 360.0,
+        "injected_tokens": 19639.0,
+        "mrr": 0.982638888888889,
+        "ndcg_at_5": 0.9404374217870621,
+        "p50_latency_us": 1755.4,
+        "p99_latency_us": 2006.4,
+        "recall_at_5": 0.9560185185185185
+      },
+      "mmr_step_us_worst_seed": {
+        "p50": 49,
+        "p99": 60
+      },
+      "queries": 72,
+      "seeds": 5,
+      "silent_losses_summed_over_seeds": {
+        "contradiction_drops": 0,
+        "relevant_drops": 5
+      }
+    },
+    "holdout": {
+      "decision_checks": {
+        "dedup_precision_gain_ge_0_02": false,
+        "ndcg_drop_le_0_01": false,
+        "no_contradiction_drops": true,
+        "no_relevant_drops": true,
+        "recall_drop_le_0_01": true,
+        "step_p99_le_1ms": true
+      },
+      "delta": {
+        "dedup_precision_at_5": 0.0,
+        "injected_tokens": -42.0,
+        "mrr": 0.0,
+        "ndcg_at_5": -0.014922139557747127,
+        "recall_at_5": 0.0
+      },
+      "linear": {
+        "dedup_precision_at_5": 0.9700000000000001,
+        "injected_bytes": 20945.0,
+        "injected_rows": 100.0,
+        "injected_tokens": 5272.0,
+        "mrr": 0.95,
+        "ndcg_at_5": 0.9497530390648865,
+        "p50_latency_us": 1752.4,
+        "p99_latency_us": 2101.6,
+        "recall_at_5": 0.975
+      },
+      "mmr": {
+        "dedup_precision_at_5": 0.9700000000000001,
+        "injected_bytes": 20774.0,
+        "injected_rows": 100.0,
+        "injected_tokens": 5230.0,
+        "mrr": 0.95,
+        "ndcg_at_5": 0.9348308995071394,
+        "p50_latency_us": 1802.8,
+        "p99_latency_us": 2157.8,
+        "recall_at_5": 0.975
+      },
+      "mmr_step_us_worst_seed": {
+        "p50": 52,
+        "p99": 60
+      },
+      "queries": 20,
+      "seeds": 5,
+      "silent_losses_summed_over_seeds": {
+        "contradiction_drops": 0,
+        "relevant_drops": 0
+      }
+    }
+  },
+  "similarity": "cosine over stored composite document vectors (strict replay)"
+}
