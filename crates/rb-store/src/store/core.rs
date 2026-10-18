@@ -3,6 +3,7 @@
 use super::internal::*;
 use super::*;
 use crate::error::storage_err;
+use std::collections::HashMap;
 
 impl SqliteStore {
     /// Insert benchmark fixtures in one transaction per caller-provided batch.
@@ -790,89 +791,184 @@ fn parse_json_array(s: &str) -> Result<Vec<String>> {
 fn from_opt_ts(secs: Option<i64>) -> Result<Option<chrono::DateTime<chrono::Utc>>> {
     secs.map(from_ts).transpose()
 }
-fn load_links(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<MemoryLink>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT source_id, target_id, link_type, strength, reason, created_at
-             FROM memory_links WHERE source_id = ?1",
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-    let rows = stmt
-        .query_map(rusqlite::params![id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, f64>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+/// Upper bound on ids bound into one batched `IN (...)` list. SQLite builds
+/// before 3.32 cap bound parameters at 999 (32766 since); staying well under
+/// the older cap keeps every chunked query portable and leaves room for a
+/// leading non-id parameter (`get_many`'s namespace).
+const IN_LIST_CHUNK: usize = 500;
 
-    let mut links = Vec::new();
-    for r in rows {
-        let (src, tgt, lt, strength, reason, created) =
-            r.map_err(|e| Error::Storage(e.to_string()))?;
-        links.push(MemoryLink {
-            source_id: parse_id(&src)?,
-            target_id: parse_id(&tgt)?,
-            link_type: rb_types::LinkType::parse(&lt)?,
-            // `strength` is stored as SQLite REAL (f64) and narrowed to f32 here.
-            strength: strength as f32,
-            reason,
-            created_at: from_ts(created)?,
-        });
-    }
-    Ok(links)
+/// `"?{start}, ?{start+1}, ..."` — `n` explicitly numbered placeholders.
+fn numbered_placeholders(start: usize, n: usize) -> String {
+    (start..start + n)
+        .map(|i| format!("?{i}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
-/// Load a memory's typed code anchors (PRD 2026-07-02), decoded from the
-/// kind-split columns: `path` carries a file anchor's value, `ref` a
+
+/// Load the outgoing links of every id in `ids` with one IN-list query per
+/// `IN_LIST_CHUNK` ids, grouped by source id. Each group is ordered by
+/// `(target_id, link_type)` — the primary-key order a single-source lookup
+/// walks — so batching never reorders a note's links.
+fn load_links_batch(
+    conn: &rusqlite::Connection,
+    ids: &[&MemoryId],
+) -> Result<HashMap<MemoryId, Vec<MemoryLink>>> {
+    let mut out: HashMap<MemoryId, Vec<MemoryLink>> = HashMap::new();
+    for chunk in ids.chunks(IN_LIST_CHUNK) {
+        let sql = format!(
+            "SELECT source_id, target_id, link_type, strength, reason, created_at
+             FROM memory_links WHERE source_id IN ({})
+             ORDER BY source_id, target_id, link_type",
+            numbered_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|id| id.to_string())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, f64>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
+
+        for r in rows {
+            let (src, tgt, lt, strength, reason, created) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
+            let source_id = parse_id(&src)?;
+            out.entry(source_id.clone()).or_default().push(MemoryLink {
+                source_id,
+                target_id: parse_id(&tgt)?,
+                link_type: rb_types::LinkType::parse(&lt)?,
+                // `strength` is stored as SQLite REAL (f64) and narrowed to f32 here.
+                strength: strength as f32,
+                reason,
+                created_at: from_ts(created)?,
+            });
+        }
+    }
+    Ok(out)
+}
+/// Load the typed code anchors (PRD 2026-07-02) of every id in `ids` with one
+/// IN-list query per `IN_LIST_CHUNK` ids, grouped by memory id and decoded
+/// from the kind-split columns: `path` carries a file anchor's value, `ref` a
 /// commit/symbol's. Ordered by insertion (rowid) so round-trips preserve the
 /// caller's anchor order.
-fn load_anchors(conn: &rusqlite::Connection, id: &MemoryId) -> Result<Vec<rb_types::MemoryAnchor>> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT kind, path, start_line, end_line, ref
-             FROM memory_anchors WHERE memory_id = ?1 ORDER BY id",
-        )
-        .map_err(|e| Error::Storage(e.to_string()))?;
-    let rows = stmt
-        .query_map(rusqlite::params![id.to_string()], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-                row.get::<_, Option<String>>(4)?,
-            ))
-        })
-        .map_err(|e| Error::Storage(e.to_string()))?;
+fn load_anchors_batch(
+    conn: &rusqlite::Connection,
+    ids: &[&MemoryId],
+) -> Result<HashMap<MemoryId, Vec<rb_types::MemoryAnchor>>> {
+    let mut out: HashMap<MemoryId, Vec<rb_types::MemoryAnchor>> = HashMap::new();
+    for chunk in ids.chunks(IN_LIST_CHUNK) {
+        let sql = format!(
+            "SELECT memory_id, kind, path, start_line, end_line, ref
+             FROM memory_anchors WHERE memory_id IN ({}) ORDER BY id",
+            numbered_placeholders(1, chunk.len())
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| Error::Storage(e.to_string()))?;
+        let rows = stmt
+            .query_map(
+                rusqlite::params_from_iter(chunk.iter().map(|id| id.to_string())),
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<i64>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .map_err(|e| Error::Storage(e.to_string()))?;
 
-    let mut anchors = Vec::new();
-    for r in rows {
-        let (kind, path, start, end, reference) = r.map_err(|e| Error::Storage(e.to_string()))?;
-        let kind = rb_types::parse_anchor_kind(&kind)?;
-        let value = path.or(reference).ok_or_else(|| {
-            Error::Storage("memory_anchors row carries neither path nor ref".to_string())
-        })?;
-        let to_line = |v: Option<i64>| -> Result<Option<u32>> {
-            v.map(|n| {
-                u32::try_from(n)
-                    .map_err(|_| Error::Storage("anchor line out of range in DB".to_string()))
-            })
-            .transpose()
-        };
-        anchors.push(rb_types::MemoryAnchor {
-            kind,
-            value,
-            start_line: to_line(start)?,
-            end_line: to_line(end)?,
-        });
+        for r in rows {
+            let (memory_id, kind, path, start, end, reference) =
+                r.map_err(|e| Error::Storage(e.to_string()))?;
+            out.entry(parse_id(&memory_id)?)
+                .or_default()
+                .push(decode_anchor(&kind, path, start, end, reference)?);
+        }
     }
-    Ok(anchors)
+    Ok(out)
 }
+fn decode_anchor(
+    kind: &str,
+    path: Option<String>,
+    start: Option<i64>,
+    end: Option<i64>,
+    reference: Option<String>,
+) -> Result<rb_types::MemoryAnchor> {
+    let kind = rb_types::parse_anchor_kind(kind)?;
+    let value = path.or(reference).ok_or_else(|| {
+        Error::Storage("memory_anchors row carries neither path nor ref".to_string())
+    })?;
+    let to_line = |v: Option<i64>| -> Result<Option<u32>> {
+        v.map(|n| {
+            u32::try_from(n)
+                .map_err(|_| Error::Storage("anchor line out of range in DB".to_string()))
+        })
+        .transpose()
+    };
+    Ok(rb_types::MemoryAnchor {
+        kind,
+        value,
+        start_line: to_line(start)?,
+        end_line: to_line(end)?,
+    })
+}
+/// Run a multi-statement read inside ONE read snapshot. In WAL mode each
+/// autocommit statement takes its own snapshot, so reading rows and then their
+/// links and anchors in later statements could return a note assembled from
+/// two database states. A deferred transaction pins the snapshot at the first
+/// read; inside an enclosing transaction the reads already share one.
+fn in_read_snapshot<T>(conn: &rusqlite::Connection, read: impl FnOnce() -> Result<T>) -> Result<T> {
+    if !conn.is_autocommit() {
+        return read();
+    }
+    let tx = conn
+        .unchecked_transaction()
+        .map_err(|e| Error::Storage(e.to_string()))?;
+    let out = read()?;
+    tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+    Ok(out)
+}
+/// Fill `links` and `anchors` for every note in `notes` with two batched
+/// IN-list fetches (per `IN_LIST_CHUNK` ids) instead of two queries per note.
+/// `notes` must carry distinct ids: each id's relations are moved into the
+/// first note that claims them.
+fn attach_relations(conn: &rusqlite::Connection, notes: &mut [MemoryNote]) -> Result<()> {
+    if notes.is_empty() {
+        return Ok(());
+    }
+    let ids: Vec<&MemoryId> = notes.iter().map(|n| &n.id).collect();
+    let mut links = load_links_batch(conn, &ids)?;
+    let mut anchors = load_anchors_batch(conn, &ids)?;
+    for note in notes {
+        note.links = links.remove(&note.id).unwrap_or_default();
+        note.anchors = anchors.remove(&note.id).unwrap_or_default();
+    }
+    Ok(())
+}
+/// Decode one `memories` row and load its relations (single-row path).
 fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<MemoryNote> {
+    let mut note = row_to_bare_note(row)?;
+    attach_relations(conn, std::slice::from_mut(&mut note))?;
+    Ok(note)
+}
+/// Decode one `memories` row with empty `links`/`anchors`; multi-row callers
+/// fill those for the whole page at once via [`attach_relations`].
+fn row_to_bare_note(row: &rusqlite::Row<'_>) -> Result<MemoryNote> {
     let id = parse_id(
         &row.get::<_, String>("memory_id")
             .map_err(|e| Error::Storage(e.to_string()))?,
@@ -897,11 +993,6 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
         row.get::<_, Option<String>>(c)
             .map_err(|e| Error::Storage(e.to_string()))
     };
-    // TODO(P1): batch relation loading — BOTH load_links and load_anchors are
-    // per-row queries (N+1 in list/get_many paths) and candidates for a single
-    // batched IN-list fetch per page of rows.
-    let links = load_links(conn, &id)?;
-    let anchors = load_anchors(conn, &id)?;
     Ok(MemoryNote {
         id,
         namespace,
@@ -941,7 +1032,7 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
             .transpose()?,
         embedding_model: g("embedding_model")?,
         embedding_input_version: g("embedding_input_version")?,
-        links,
+        links: Vec::new(),
         // `contested` (Feature C) is a read-side annotation computed by the engine
         // from `memory_links` after ranking; it is never stored, so loads default
         // it to false.
@@ -963,7 +1054,7 @@ fn row_to_note(conn: &rusqlite::Connection, row: &rusqlite::Row<'_>) -> Result<M
             .get("legacy_unknown")
             .map_err(|e| Error::Storage(e.to_string()))?,
         session_id: go("session_id")?,
-        anchors,
+        anchors: Vec::new(),
         // Trust-class ladder (Vikunja #63): NOT NULL since migration 012;
         // pre-ladder rows read their backfilled `agent_attested`.
         trust_class: rb_types::TrustClass::parse(&g("trust_class")?)?,
@@ -1687,21 +1778,24 @@ impl Store for SqliteStore {
         filter: &rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        let (sql, params) = build_list_filtered_query(ns, filter, limit)?;
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt
-            .query(refs.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        in_read_snapshot(&self.conn, || {
+            let (sql, params) = build_list_filtered_query(ns, filter, limit)?;
+            let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+            let mut stmt = self
+                .conn
+                .prepare(&sql)
+                .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query(refs.as_slice())
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
-            out.push(row_to_note(&self.conn, row)?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+                out.push(row_to_bare_note(row)?);
+            }
+            attach_relations(&self.conn, &mut out)?;
+            Ok(out)
+        })
     }
 
     fn update_memory(&self, id: &MemoryId, updates: &MemoryUpdates) -> Result<()> {
@@ -1882,24 +1976,36 @@ impl Store for SqliteStore {
             .filter(|id| seen.insert(id.to_string()))
             .collect();
 
-        // Build "?2, ?3, ..." placeholders; ?1 is the timestamp.
-        let placeholders: Vec<String> = (0..unique.len()).map(|i| format!("?{}", i + 2)).collect();
-        let sql = format!(
-            "UPDATE memories
-             SET access_count = access_count + 1, last_accessed_at = ?1
-             WHERE memory_id IN ({})",
-            placeholders.join(", ")
-        );
-
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(unique.len() + 1);
-        params.push(Box::new(chrono::Utc::now().timestamp()));
-        for id in &unique {
-            params.push(Box::new(id.to_string()));
+        // One timestamp and one transaction for every chunk, so any number of
+        // ids stays under SQLite's bound-parameter limit and the bump is still
+        // all-or-nothing.
+        let now = chrono::Utc::now().timestamp();
+        let tx = if self.conn.is_autocommit() {
+            Some(
+                self.conn
+                    .unchecked_transaction()
+                    .map_err(|e| Error::Storage(e.to_string()))?,
+            )
+        } else {
+            None
+        };
+        for chunk in unique.chunks(IN_LIST_CHUNK) {
+            // ?1 is the timestamp; the chunk's ids are ?2, ?3, ...
+            let sql = format!(
+                "UPDATE memories
+                 SET access_count = access_count + 1, last_accessed_at = ?1
+                 WHERE memory_id IN ({})",
+                numbered_placeholders(2, chunk.len())
+            );
+            let params = std::iter::once(rusqlite::types::Value::from(now))
+                .chain(chunk.iter().map(|id| id.to_string().into()));
+            self.conn
+                .execute(&sql, rusqlite::params_from_iter(params))
+                .map_err(|e| Error::Storage(e.to_string()))?;
         }
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
-        self.conn
-            .execute(&sql, refs.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        if let Some(tx) = tx {
+            tx.commit().map_err(|e| Error::Storage(e.to_string()))?;
+        }
         Ok(())
     }
 
@@ -2010,42 +2116,48 @@ impl Store for SqliteStore {
             return Ok(Vec::new());
         }
 
-        // Build "?2, ?3, ..." placeholders; ?1 is reserved for the namespace.
-        let placeholders: Vec<String> = (0..ids.len()).map(|i| format!("?{}", i + 2)).collect();
-        let sql = format!(
-            "SELECT memory_id, namespace, created_at, updated_at, content, summary,
-                    keywords, tags, context, memory_type, importance, confidence,
-                    related_files, access_count, last_accessed_at, archived_at,
-                    superseded_by, embedding_model, embedding_input_version,
-                    origin_user, origin_host, origin_agent, origin_source, session_id,
-                    origin_channel, trust_class, human_curated, legacy_unknown
-             FROM memories
-             WHERE namespace = ?1 AND memory_id IN ({})",
-            placeholders.join(", ")
-        );
+        // Fetch each distinct id once, in IN-list chunks so any number of ids
+        // stays under SQLite's bound-parameter limit.
+        // Rows (across chunks) and their relations share one read snapshot.
+        let found = in_read_snapshot(&self.conn, || {
+            let mut seen = std::collections::HashSet::new();
+            let distinct: Vec<&MemoryId> = ids.iter().filter(|id| seen.insert(*id)).collect();
+            let ns_db = ns.as_db_string();
+            let mut found = Vec::new();
+            for chunk in distinct.chunks(IN_LIST_CHUNK) {
+                // ?1 is reserved for the namespace; the chunk's ids are ?2, ?3, ...
+                let sql = format!(
+                    "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                            keywords, tags, context, memory_type, importance, confidence,
+                            related_files, access_count, last_accessed_at, archived_at,
+                            superseded_by, embedding_model, embedding_input_version,
+                            origin_user, origin_host, origin_agent, origin_source, session_id,
+                            origin_channel, trust_class, human_curated, legacy_unknown
+                     FROM memories
+                     WHERE namespace = ?1 AND memory_id IN ({})",
+                    numbered_placeholders(2, chunk.len())
+                );
+                let params =
+                    std::iter::once(ns_db.clone()).chain(chunk.iter().map(|id| id.to_string()));
 
-        let mut params: Vec<Box<dyn rusqlite::ToSql>> = Vec::with_capacity(ids.len() + 1);
-        params.push(Box::new(ns.as_db_string()));
-        for id in ids {
-            params.push(Box::new(id.to_string()));
-        }
-        let refs: Vec<&dyn rusqlite::ToSql> = params.iter().map(|b| b.as_ref()).collect();
+                let mut stmt = self
+                    .conn
+                    .prepare(&sql)
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                let mut rows = stmt
+                    .query(rusqlite::params_from_iter(params))
+                    .map_err(|e| Error::Storage(e.to_string()))?;
+                while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+                    found.push(row_to_bare_note(row)?);
+                }
+            }
+            attach_relations(&self.conn, &mut found)?;
+            Ok(found)
+        })?;
 
-        let mut stmt = self
-            .conn
-            .prepare(&sql)
-            .map_err(|e| Error::Storage(e.to_string()))?;
-        let mut rows = stmt
-            .query(refs.as_slice())
-            .map_err(|e| Error::Storage(e.to_string()))?;
-
-        // Decode into an id-keyed map, then re-emit in request order.
-        let mut by_id: std::collections::HashMap<MemoryId, MemoryNote> =
-            std::collections::HashMap::new();
-        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
-            let note = row_to_note(&self.conn, row)?;
-            by_id.insert(note.id.clone(), note);
-        }
+        // Key by id, then re-emit in request order.
+        let by_id: HashMap<MemoryId, MemoryNote> =
+            found.into_iter().map(|n| (n.id.clone(), n)).collect();
 
         // Use `get` (not `remove`) so duplicate ids are preserved positionally,
         // honouring the "same order as `ids`" contract.
@@ -2103,38 +2215,41 @@ impl Store for SqliteStore {
         input_version: &str,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
-        // Bounded, deterministic scan (oldest first then by id, mirroring the
-        // consolidation candidate order) of active rows whose stamp is stale.
-        let mut stmt = self
-            .conn
-            .prepare(
-                "SELECT memory_id, namespace, created_at, updated_at, content, summary,
-                        keywords, tags, context, memory_type, importance, confidence,
-                        related_files, access_count, last_accessed_at, archived_at,
-                        superseded_by, embedding_model, embedding_input_version,
-                        origin_user, origin_host, origin_agent, origin_source, session_id,
-                        origin_channel, trust_class, human_curated, legacy_unknown
-                 FROM memories
-                 WHERE archived_at IS NULL
-                   AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
-                 ORDER BY created_at ASC, memory_id ASC
-                 LIMIT ?3",
-            )
-            .map_err(|e| Error::Storage(e.to_string()))?;
+        in_read_snapshot(&self.conn, || {
+            // Bounded, deterministic scan (oldest first then by id, mirroring the
+            // consolidation candidate order) of active rows whose stamp is stale.
+            let mut stmt = self
+                .conn
+                .prepare(
+                    "SELECT memory_id, namespace, created_at, updated_at, content, summary,
+                            keywords, tags, context, memory_type, importance, confidence,
+                            related_files, access_count, last_accessed_at, archived_at,
+                            superseded_by, embedding_model, embedding_input_version,
+                            origin_user, origin_host, origin_agent, origin_source, session_id,
+                            origin_channel, trust_class, human_curated, legacy_unknown
+                     FROM memories
+                     WHERE archived_at IS NULL
+                       AND (embedding_model <> ?1 OR embedding_input_version <> ?2)
+                     ORDER BY created_at ASC, memory_id ASC
+                     LIMIT ?3",
+                )
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let mut rows = stmt
-            .query(rusqlite::params![
-                model,
-                input_version,
-                i64::try_from(limit).unwrap_or(i64::MAX)
-            ])
-            .map_err(|e| Error::Storage(e.to_string()))?;
+            let mut rows = stmt
+                .query(rusqlite::params![
+                    model,
+                    input_version,
+                    i64::try_from(limit).unwrap_or(i64::MAX)
+                ])
+                .map_err(|e| Error::Storage(e.to_string()))?;
 
-        let mut out = Vec::new();
-        while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
-            out.push(row_to_note(&self.conn, row)?);
-        }
-        Ok(out)
+            let mut out = Vec::new();
+            while let Some(row) = rows.next().map_err(|e| Error::Storage(e.to_string()))? {
+                out.push(row_to_bare_note(row)?);
+            }
+            attach_relations(&self.conn, &mut out)?;
+            Ok(out)
+        })
     }
 
     fn update_vector(
@@ -5140,6 +5255,161 @@ mod get_many_tests {
             vec![a.clone(), a, b],
             "duplicate id must appear twice in output"
         );
+    }
+
+    #[test]
+    fn read_snapshot_pins_one_state_across_statements() {
+        // Two connections to one WAL file: a commit from `writer` between two
+        // reads on `reader` must stay invisible inside one snapshot. This is
+        // what keeps batched rows and their relations consistent.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("snapshot.db");
+        let reader = SqliteStore::open(&path, 8).unwrap();
+        let writer = SqliteStore::open(&path, 8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        node(&writer, &proj, "first");
+        let count = |s: &SqliteStore| -> i64 {
+            s.conn
+                .query_row("SELECT COUNT(*) FROM memories", [], |r| r.get(0))
+                .unwrap()
+        };
+
+        let (before, after) = in_read_snapshot(&reader.conn, || {
+            let before = count(&reader);
+            node(&writer, &proj, "second");
+            Ok((before, count(&reader)))
+        })
+        .unwrap();
+        assert_eq!((before, after), (1, 1), "one snapshot for the whole read");
+        // Outside the snapshot the commit is visible, so the check is meaningful.
+        assert_eq!(count(&reader), 2);
+    }
+
+    #[test]
+    fn record_accesses_accepts_more_ids_than_sqlite_param_limit() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let a = node(&store, &proj, "alpha");
+        let mut ids: Vec<MemoryId> = (0..40_000).map(|_| MemoryId::new()).collect();
+        ids[33_000] = a.clone();
+        ids[39_999] = a.clone();
+        store.record_accesses(&ids).unwrap();
+        let note = store.get_memory(&a).unwrap().unwrap();
+        assert_eq!(note.access_count, 1, "deduplicated across chunks");
+        assert!(note.last_accessed_at.is_some());
+    }
+
+    #[test]
+    fn get_many_accepts_more_ids_than_sqlite_param_limit() {
+        // 40k ids exceeds even SQLite's post-3.32 cap of 32766 bound
+        // parameters; a single IN-list would fail to prepare.
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let proj = Namespace::Project("rb".into());
+        let other = Namespace::Project("other".into());
+        let a = node(&store, &proj, "alpha");
+        let b = node(&store, &proj, "bravo");
+        let foreign = node(&store, &other, "foreign");
+
+        let mut ids: Vec<MemoryId> = (0..40_000).map(|_| MemoryId::new()).collect();
+        ids[3] = b.clone();
+        ids[IN_LIST_CHUNK + 7] = foreign;
+        ids[25_000] = a.clone();
+        ids[39_999] = b.clone();
+
+        let got: Vec<MemoryId> = store
+            .get_many(&proj, &ids)
+            .unwrap()
+            .into_iter()
+            .map(|n| n.id)
+            .collect();
+        assert_eq!(got, vec![b.clone(), a, b]);
+    }
+
+    fn link(source: &MemoryId, target: &MemoryId, lt: rb_types::LinkType) -> rb_types::MemoryLink {
+        rb_types::MemoryLink {
+            source_id: source.clone(),
+            target_id: target.clone(),
+            link_type: lt,
+            strength: 0.5,
+            reason: String::new(),
+            created_at: chrono::Utc::now(),
+        }
+    }
+
+    #[test]
+    fn batched_relations_keep_per_note_order_across_chunks() {
+        use rb_types::LinkType;
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let ns = Namespace::Project("rb".into());
+        // One more than a chunk so relations land in two IN-list batches.
+        let ids: Vec<MemoryId> = (0..=IN_LIST_CHUNK)
+            .map(|i| node(&store, &ns, &format!("note {i}")))
+            .collect();
+        let first = &ids[0];
+        let last = &ids[IN_LIST_CHUNK];
+
+        // Links inserted out of (target_id, link_type) order.
+        let mut targets = vec![ids[3].clone(), ids[1].clone(), ids[2].clone()];
+        for t in &targets {
+            store
+                .add_link(&link(first, t, LinkType::References))
+                .unwrap();
+            store.add_link(&link(first, t, LinkType::Extends)).unwrap();
+        }
+        store
+            .add_link(&link(last, first, LinkType::Implements))
+            .unwrap();
+
+        let anchors = vec![
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Symbol, "Zeta").unwrap(),
+            rb_types::MemoryAnchor::parse_file_spec("src/a.rs:1-2").unwrap(),
+            rb_types::MemoryAnchor::new(rb_types::AnchorKind::Commit, "abc").unwrap(),
+        ];
+        let mut anchored = MemoryNote::new(ns.clone(), "anchored".into(), MemoryType::Insight, 5);
+        anchored.anchors = anchors.clone();
+        store.insert_memory(&anchored, None).unwrap();
+
+        let many = store.get_many(&ns, &ids).unwrap();
+        let listed = store
+            .list_filtered(&ns, &rb_types::RecallFilter::default(), 10_000)
+            .unwrap();
+        let reembed = store
+            .memories_for_reembed("other-model", "other-version", 10_000)
+            .unwrap();
+        assert_eq!(listed.len(), ids.len() + 1);
+        assert_eq!(reembed.len(), ids.len() + 1);
+
+        // Every batched load matches the single-row path.
+        for note in many.iter().chain(&listed).chain(&reembed) {
+            let single = store.get_memory(&note.id).unwrap().unwrap();
+            assert_eq!(note, &single, "batched load diverged for {}", note.id);
+        }
+
+        // Explicit order checks: links by (target_id, link_type), anchors by insertion.
+        let got_first = many.iter().find(|n| &n.id == first).unwrap();
+        targets.sort_by_key(|t| t.to_string());
+        let want: Vec<(String, &str)> = targets
+            .iter()
+            .flat_map(|t| {
+                [LinkType::Extends, LinkType::References].map(|lt| (t.to_string(), lt.as_str()))
+            })
+            .collect();
+        let got: Vec<(String, &str)> = got_first
+            .links
+            .iter()
+            .map(|l| (l.target_id.to_string(), l.link_type.as_str()))
+            .collect();
+        assert_eq!(got, want);
+        assert!(got_first.links.iter().all(|l| &l.source_id == first));
+
+        let got_last = many.iter().find(|n| &n.id == last).unwrap();
+        assert_eq!(got_last.links.len(), 1);
+        assert_eq!(&got_last.links[0].target_id, first);
+        assert!(many[1].links.is_empty() && many[1].anchors.is_empty());
+
+        let got_anchored = listed.iter().find(|n| n.id == anchored.id).unwrap();
+        assert_eq!(got_anchored.anchors, anchors);
+        assert!(got_anchored.links.is_empty());
     }
 }
 #[cfg(test)]

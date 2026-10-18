@@ -5,6 +5,16 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Batched store reads past the SQLite parameter limit (kanban 101)
+
+- `get_many` and `record_accesses` bound one SQL parameter per id, so more
+  than about 32,765 ids failed. Both now chunk their IN-lists; the access bump
+  stays one transaction.
+- `get_many`, `list_filtered` and `memories_for_reembed` load links and
+  anchors with batched queries instead of two per row (the N+1 `TODO(P1)`),
+  with identical ordering. Each multi-query read runs in one read snapshot,
+  so a concurrent write can never yield a note that mixes two states.
+
 ### Added — Implementer/reviewer pair experiment (kanban 83)
 
 - Run three budget-capped `claude -p` implementations, each reviewed once by
