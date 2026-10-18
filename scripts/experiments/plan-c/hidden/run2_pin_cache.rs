@@ -72,7 +72,8 @@ fn symlinked_snapshot_files_are_followed_like_hf_hub_writes_them() {
 #[test]
 fn correct_small_files_leave_only_the_missing_onnx() {
     // Real pinned JSON files downloaded for the oracle (PLANC_PIN_JSON_DIR).
-    let Ok(src) = std::env::var("PLANC_PIN_JSON_DIR") else { return };
+    let src = std::env::var("PLANC_PIN_JSON_DIR")
+        .expect("set PLANC_PIN_JSON_DIR to the pinned JSON files; this oracle never skips");
     let dir = tempfile::tempdir().unwrap();
     let snap = snapshot(dir.path());
     std::fs::create_dir_all(&snap).unwrap();
@@ -85,7 +86,8 @@ fn correct_small_files_leave_only_the_missing_onnx() {
 
 #[test]
 fn a_real_populated_cache_is_complete() {
-    let Ok(root) = std::env::var("PLANC_REAL_CACHE") else { return };
+    let root = std::env::var("PLANC_REAL_CACHE")
+        .expect("set PLANC_REAL_CACHE to a populated model cache; this oracle never skips");
     let status = cached_pin_status(Path::new(&root), &PIN).unwrap();
     assert_eq!(status, PinCacheStatus::Complete);
 }

@@ -13,12 +13,19 @@ set -uo pipefail
 N=$1; GATE=$2; HCRATE=$3; HARGS=$4
 P=$(cd "$(dirname "$0")" && pwd)
 WT=${PLANC_WORKTREE:-$HOME/repos/rusty-brain/.worktrees/plan-c}
-OUT=${PLANC_OUT:-$P/runs}/run$N; mkdir -p "$OUT"
+OUT=${PLANC_OUT:-$P/runs}/run$N; mkdir -p "$OUT" && OUT=$(cd "$OUT" && pwd) || exit 2
 BUDGET=${BUDGET:-5}
 log(){ printf '%s %s\n' "$(date -u +%H:%M:%S)" "$*" | tee -a "$OUT/log.txt"; }
 
 cd "$WT" || exit 2
-git reset -q --hard origin/main && git clean -qfd
+# Refuse anything but the root of a linked worktree: a stale or mistyped path
+# would otherwise let `reset --hard` discard work in the main checkout.
+top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git worktree: $WT" >&2; exit 2; }
+[ "$top" = "$(pwd -P)" ] || { echo "$WT is not a worktree root (resolves to $top)" >&2; exit 2; }
+[ "$(git rev-parse --absolute-git-dir)" != "$(cd "$(git rev-parse --git-common-dir)" && pwd -P)" ] \
+  || { echo "$WT is the main checkout, not a linked worktree" >&2; exit 2; }
+git reset -q --hard origin/main && git clean -qfd || exit 2
+FAILED=0
 log "base $(git rev-parse --short HEAD)"
 
 # 1. Implement (hard dollar cap; hooks and MCP off so nothing leaks into user stores).
@@ -49,15 +56,16 @@ rmdir "$EMPTY" 2>/dev/null
 
 # 4. Gate: the implementer's own tests and clippy, then the hidden oracle.
 log "gate: cargo nextest run $GATE"
-cargo nextest run $GATE > "$OUT/gate-test.txt" 2>&1; log "gate test exit $?"
-cargo clippy $GATE --all-targets -- -D warnings > "$OUT/gate-clippy.txt" 2>&1; log "gate clippy exit $?"
+cargo nextest run $GATE > "$OUT/gate-test.txt" 2>&1; rc=$?; log "gate test exit $rc"; [ $rc -eq 0 ] || FAILED=1
+cargo clippy $GATE --all-targets -- -D warnings > "$OUT/gate-clippy.txt" 2>&1; rc=$?; log "gate clippy exit $rc"; [ $rc -eq 0 ] || FAILED=1
 cp "$P/hidden/"run${N}_*.rs "crates/$HCRATE/tests/"
 if [ "$HCRATE" = rb-embed ] && ! grep -q '^tempfile' crates/rb-embed/Cargo.toml; then
   printf '\n[dev-dependencies.tempfile]\nworkspace = true\n' >> crates/rb-embed/Cargo.toml
 fi
-# Run 2 optionally reads PLANC_PIN_JSON_DIR (the pinned JSON files) and
-# PLANC_REAL_CACHE (a populated model cache) from the environment.
+# Run 2's hidden tests REQUIRE PLANC_PIN_JSON_DIR (the four pinned JSON files)
+# and PLANC_REAL_CACHE (a populated model cache); they fail when unset.
 cargo test -p "$HCRATE" $HARGS --test "$(basename "$P"/hidden/run${N}_*.rs .rs)" > "$OUT/hidden.txt" 2>&1
-log "hidden oracle exit $?"
+rc=$?; log "hidden oracle exit $rc"; [ $rc -eq 0 ] || FAILED=1
 grep -E '^test |test result' "$OUT/hidden.txt" | tee -a "$OUT/log.txt"
-log done
+log "done (gates $([ $FAILED -eq 0 ] && echo passed || echo FAILED))"
+exit $FAILED
