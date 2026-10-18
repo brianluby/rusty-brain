@@ -422,6 +422,13 @@ The 256-token finding above has a confirmed cause and a fix.
   replay fixture with the pin gives all 297 vectors byte-identical to the
   committed fixture at both 512 and 256: every corpus text fits in 256
   tokens. Only long-input benchmarks tell the settings apart.
+- **Existing stores.** The stored model id stays `all-MiniLM-L6-v2`. A local
+  store first filled between 2026-09-27 and this change may hold rows over 256
+  tokens embedded from their first 256 tokens. The weights are identical, so
+  those vectors share the vector space with new ones (as every row longer than
+  the limit always has); they are a truncated representation, not a different
+  model. Changing the id would key away the committed replay fixtures and make
+  every local store refuse to start until re-embedded, so it was not done.
 
 ### Pinned rerun against the frozen September runs
 

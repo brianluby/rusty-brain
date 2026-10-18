@@ -157,15 +157,24 @@ fn resolve_max_tokens(
 }
 
 /// Fetch and hash-check every pinned file, using the same cache and endpoint
-/// resolution as fastembed's own download path. Cached files are reused, so
-/// this is offline after the first load.
+/// resolution as fastembed 5.15's own download path (`HF_HOME` is the cache
+/// root itself, not `$HF_HOME/hub`), so files an older install already cached
+/// at this revision are reused. Offline after the first load.
 fn fetch_pinned(pin: &PinnedModel) -> rb_types::Result<PinnedBytes> {
     let cache_dir = std::env::var("HF_HOME")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from(fastembed::get_cache_dir()));
     let endpoint =
         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
-    let api = ApiBuilder::new()
+    // hf-hub reads only its token file; also honor HF_TOKEN for gated mirrors.
+    let mut builder = ApiBuilder::new();
+    if let Some(token) = std::env::var("HF_TOKEN")
+        .ok()
+        .filter(|t| !t.trim().is_empty())
+    {
+        builder = builder.with_token(Some(token));
+    }
+    let api = builder
         .with_cache_dir(cache_dir)
         .with_endpoint(endpoint)
         .with_progress(false)

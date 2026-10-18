@@ -19,6 +19,10 @@ All notable changes to rusty-brain are documented here. The format is based on
 - The default stays 512 tokens, the documented setting behind every committed
   baseline. With the pin, LoCoMo reproduces the frozen September runs exactly;
   the committed replay fixture is byte-identical at 512 and at 256.
+- Local stores first filled between 2026-09-27 and this change may hold rows
+  over 256 tokens embedded from their first 256 tokens. The weights are the
+  same, so those vectors stay comparable; the model id is deliberately
+  unchanged, so they are not re-embedded automatically.
 
 ### Added — External benchmark diagnostic replay (kanban 60)
 
