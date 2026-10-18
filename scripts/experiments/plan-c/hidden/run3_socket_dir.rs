@@ -3,7 +3,10 @@
 
 use rb_daemon::prepare_socket_dir;
 use std::os::unix::fs::PermissionsExt;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
+
+// Not covered here: refusing a directory owned by another user needs a second
+// uid (root to chown), so that clause of the spec is judged by review only.
 
 fn mode(p: &std::path::Path) -> u32 {
     std::fs::metadata(p).unwrap().permissions().mode() & 0o777
@@ -54,7 +57,8 @@ fn dangling_symlink_is_refused_and_not_created_through() {
     let target = tmp.path().join("nowhere");
     let link = tmp.path().join("run");
     std::os::unix::fs::symlink(&target, &link).unwrap();
-    assert!(prepare_socket_dir(&link.join("d.sock")).is_err());
+    let err = prepare_socket_dir(&link.join("d.sock")).unwrap_err();
+    assert!(err.to_string().to_lowercase().contains("symlink"), "{err}");
     assert!(!target.exists(), "must not create the symlink target");
 }
 
@@ -71,10 +75,16 @@ fn concurrent_first_starts_all_succeed() {
     for round in 0..20 {
         let tmp = Arc::new(tempfile::tempdir().unwrap());
         let sock = tmp.path().join(format!("r{round}/run/d.sock"));
+        // Release all 16 together so the creation race is actually exercised.
+        let start = Arc::new(Barrier::new(16));
         let handles: Vec<_> = (0..16)
             .map(|_| {
                 let sock = sock.clone();
-                std::thread::spawn(move || prepare_socket_dir(&sock))
+                let start = Arc::clone(&start);
+                std::thread::spawn(move || {
+                    start.wait();
+                    prepare_socket_dir(&sock)
+                })
             })
             .collect();
         for h in handles {
