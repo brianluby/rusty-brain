@@ -1,0 +1,24 @@
+{
+ "total_cost_usd": 0.9928768000000002,
+ "num_turns": 21,
+ "duration_ms": 237973,
+ "subtype": "success",
+ "is_error": false,
+ "modelUsage": {
+  "claude-opus-5-5": {
+   "inputTokens": 28,
+   "outputTokens": 13381,
+   "cacheReadInputTokens": 1003364,
+   "cacheCreationInputTokens": 65559,
+   "webSearchRequests": 0,
+   "costUSD": 0.9928768000000002,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 128000,
+   "thinkingTokens": 3258,
+   "canonicalModel": "claude-opus-5-5",
+   "provider": "firstParty",
+   "costBasis": "list"
+  }
+ },
+ "result": "The offline cache check is in place, and `rusty-brain doctor` now reports it as `local-model-cache` when built with `local` and the local backend is selected. Tests and clippy pass both with and without `local`.\n\n**rb-embed** (`crates/rb-embed/src/local.rs`, re-exported from `lib.rs`)\n- `PinCacheStatus` and `cached_pin_status(cache_root, pin)` work as specified. The check looks in `<root>/models--<org>--<name>/snapshots/<revision>/` and follows hf-hub's symlinks into `blobs/`. It hashes each file by streaming it through the hasher, so the ~90 MB onnx is never read into memory.\n- A symlink whose blob is gone counts as missing. Any other open or read error returns `Error::Embedding`.\n- The check only opens and reads files. It never creates the cache root or anything else.\n- `pub fn model_cache_root()` holds the cache-root rule (`HF_HOME`, else `FASTEMBED_CACHE_DIR` / `.fastembed_cache`). `fetch_pinned` now calls it, so loading and the check can't drift apart.\n- Three additions beyond the brief:\n  - I also re-exported the existing `pinned_model`, because doctor needs it to turn the configured model name into a pin.\n  - I added `tempfile` (already a workspace dependency) as a dev-dependency of rb-embed.\n  - `cargo fmt` reformatted my edits.\n\n**doctor** (`crates/rusty-brain/src/doctor.rs`)\n- `check_local_model_cache` returns Ok when Complete. It returns Warn when files are missing, with the hint that the first daemon start downloads it. It returns Fail when a file is corrupt, and the hint names the `models--\u2026` directory to delete so the model is downloaded again.\n- It also returns Fail for an unknown model name or a cache it can't read. The brief didn't cover these cases; both would also stop the daemon from loading the model.\n- `run_doctor` adds the check only when built with `local` and `serve::local_requested(...)` is true. Without the feature, nothing is added.\n\n**Tests**\n- rb-embed tests use a fake pin over small files laid out like hf-hub (blobs plus symlinks). They cover:\n  - all files present (Complete)\n  - an absent root, which reports all five files in order and creates nothing\n  - missing files and a broken symlink, reported in pin order\n  - the first corrupt file winning even when another file is missing\n  - a different revision not finding the files\n- Doctor tests cover Warn (and that no cache is created), Fail when corrupt, Fail for an unknown model, and Ok when complete. The Ok case runs through the status-mapping helper, because building a complete cache would need the real model files.\n- Commands run:\n  - `cargo clippy -p rb-embed -p rusty-brain --all-targets [--features rb-embed/local,rusty-brain/local] -- -D warnings`: clean both ways.\n  - `cargo nextest run` on both crates: 282 passed with the feature, 265 passed without."
+}

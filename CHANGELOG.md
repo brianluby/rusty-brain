@@ -5,6 +5,17 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — Implementer/reviewer pair experiment (kanban 83)
+
+- Run three budget-capped `claude -p` implementations, each reviewed once by
+  `codex exec` from the diff alone, gated by tests plus a hidden acceptance
+  test. Claude spent $3.45 of a $20 cap.
+- Decision: do not graduate. The reviewer found genuine defects the tests
+  missed in two of three runs (a read-snapshot split and a symlink-swap
+  race), short of the preregistered three of three. The wrapper stays in
+  `scripts/experiments/plan-c/`; results are in
+  `docs/eval/2026-10-17-plan-c-pair-results.md`.
+
 ### Fixed — Pinned local embedding model (kanban 100)
 
 - The local provider now loads `Qdrant/all-MiniLM-L6-v2-onnx` at a pinned

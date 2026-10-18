@@ -1,0 +1,360 @@
+diff --git a/crates/rb-daemon/src/lib.rs b/crates/rb-daemon/src/lib.rs
+index 4a1ebba..713f30b 100644
+--- a/crates/rb-daemon/src/lib.rs
++++ b/crates/rb-daemon/src/lib.rs
+@@ -26,7 +26,7 @@ pub use rb_config::{default_db_path, default_socket_path};
+ // without a direct rb-engine dependency (W2.2).
+ pub use http::HttpListenerConfig;
+ pub use rb_engine::FusionMode;
+-pub use server::{Daemon, DaemonConfig, EnrichEndpoint};
++pub use server::{prepare_socket_dir, Daemon, DaemonConfig, EnrichEndpoint};
+ pub use shared_embedder::SharedEmbedder;
+ pub use store_handle::{
+     accept_model_change, dropped_broadcast_count, ReadPoolMetrics, StoreHandle, WriterQueueMetrics,
+diff --git a/crates/rb-daemon/src/server.rs b/crates/rb-daemon/src/server.rs
+index 0186c5f..6facfc2 100644
+--- a/crates/rb-daemon/src/server.rs
++++ b/crates/rb-daemon/src/server.rs
+@@ -552,34 +552,162 @@ fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+         .create(dir)
+ }
+ 
+-fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
++/// Prepare the socket's parent directory, fail-closed (W0.5).
++///
++/// A missing dir (and any missing ancestors) is created as exactly 0700 and
++/// published atomically, so concurrent first starts all succeed and none ever
++/// observes it with another mode. An existing dir is accepted only when it is
++/// a real directory owned by the effective user with mode exactly 0700;
++/// anything else (another mode or owner, a non-directory, or a symlink, even a
++/// dangling one) is refused and never repaired or followed.
++pub fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
+     let socket_dir = socket_path
+         .parent()
+         .ok_or_else(|| Error::Io("socket path has no parent dir".to_string()))?;
+ 
+-    if socket_dir.exists() {
+-        let metadata = fs::metadata(socket_dir)
+-            .map_err(|e| Error::Io(format!("stat socket dir {}: {e}", socket_dir.display())))?;
+-        if !metadata.is_dir() {
++    match fs::symlink_metadata(socket_dir) {
++        Ok(metadata) => return check_socket_dir(socket_dir, &metadata),
++        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
++        Err(e) => {
+             return Err(Error::Io(format!(
+-                "socket parent {} is not a directory",
++                "stat socket dir {}: {e}",
+                 socket_dir.display()
+-            )));
++            )))
+         }
+-        let mode = metadata.permissions().mode() & 0o777;
+-        if mode != 0o700 {
+-            return Err(Error::Io(format!(
+-                "socket dir {} must already be private (0700), got {mode:03o}",
+-                socket_dir.display()
+-            )));
++    }
++    match create_private_dir_atomically(socket_dir) {
++        Ok(()) => Ok(()),
++        // Lost the race to a concurrent starter (or something else appeared):
++        // validate whatever is there now, exactly like a pre-existing dir.
++        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
++            let metadata = fs::symlink_metadata(socket_dir).map_err(|e| {
++                Error::Io(format!("stat socket dir {}: {e}", socket_dir.display()))
++            })?;
++            check_socket_dir(socket_dir, &metadata)
+         }
+-        return Ok(());
++        Err(e) => Err(Error::Io(format!(
++            "create socket dir {}: {e}",
++            socket_dir.display()
++        ))),
+     }
++}
+ 
+-    create_private_dir(socket_dir)
+-        .map_err(|e| Error::Io(format!("create socket dir {}: {e}", socket_dir.display())))?;
+-    fs::set_permissions(socket_dir, fs::Permissions::from_mode(0o700))
+-        .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))
++/// Validate an existing socket dir from its `lstat` metadata, never repairing.
++fn check_socket_dir(dir: &Path, metadata: &fs::Metadata) -> Result<()> {
++    use std::os::unix::fs::MetadataExt;
++
++    if metadata.file_type().is_symlink() {
++        return Err(Error::Io(format!(
++            "socket parent {} is a symlink; refusing to follow it",
++            dir.display()
++        )));
++    }
++    if !metadata.is_dir() {
++        return Err(Error::Io(format!(
++            "socket parent {} is not a directory",
++            dir.display()
++        )));
++    }
++    let euid = process_euid();
++    if metadata.uid() != euid {
++        return Err(Error::Io(format!(
++            "socket dir {} is owned by uid {}, not the current user (uid {euid})",
++            dir.display(),
++            metadata.uid()
++        )));
++    }
++    let mode = metadata.permissions().mode() & 0o7777;
++    if mode != 0o700 {
++        return Err(Error::Io(format!(
++            "socket dir {} must already be private (0700), got {mode:03o}",
++            dir.display()
++        )));
++    }
++    Ok(())
++}
++
++/// Create `dir` and any missing ancestors as exactly 0700. Each new component
++/// is built as a private staging dir, chmodded past the umask, then published
++/// with a no-replace rename, so no observer sees it with any other mode. Fails
++/// with `AlreadyExists` when `dir` itself appeared concurrently.
++fn create_private_dir_atomically(dir: &Path) -> std::io::Result<()> {
++    use std::io::ErrorKind;
++    use std::os::unix::fs::DirBuilderExt as _;
++    use std::sync::atomic::{AtomicU64, Ordering};
++
++    static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
++
++    let parent = match dir.parent() {
++        Some(parent) if !parent.as_os_str().is_empty() => parent,
++        Some(_) => Path::new("."),
++        None => return Err(ErrorKind::AlreadyExists.into()),
++    };
++    match fs::symlink_metadata(parent) {
++        Ok(_) => {}
++        Err(e) if e.kind() == ErrorKind::NotFound => match create_private_dir_atomically(parent) {
++            Ok(()) => {}
++            Err(e) if e.kind() == ErrorKind::AlreadyExists => {}
++            Err(e) => return Err(e),
++        },
++        Err(e) => return Err(e),
++    }
++
++    let nanos = std::time::SystemTime::now()
++        .duration_since(std::time::UNIX_EPOCH)
++        .map_or(0, |d| d.subsec_nanos());
++    for _ in 0..16 {
++        let staging = parent.join(format!(
++            ".rb-private-dir-{}-{}-{nanos}",
++            std::process::id(),
++            STAGING_SEQ.fetch_add(1, Ordering::Relaxed)
++        ));
++        match fs::DirBuilder::new().mode(0o700).create(&staging) {
++            Ok(()) => {}
++            // A stale or planted staging name: try the next one.
++            Err(e) if e.kind() == ErrorKind::AlreadyExists => continue,
++            Err(e) => return Err(e),
++        }
++        let published = fs::set_permissions(&staging, fs::Permissions::from_mode(0o700))
++            .and_then(|()| rename_noreplace(&staging, dir));
++        if published.is_err() {
++            let _ = fs::remove_dir(&staging);
++        }
++        return published;
++    }
++    Err(std::io::Error::other(format!(
++        "no free staging dir name in {}",
++        parent.display()
++    )))
++}
++
++/// `rename(2)` that fails with `AlreadyExists` instead of replacing `to`.
++#[allow(unsafe_code)]
++fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
++    use std::ffi::CString;
++    use std::os::unix::ffi::OsStrExt;
++
++    let from = CString::new(from.as_os_str().as_bytes())?;
++    let to = CString::new(to.as_os_str().as_bytes())?;
++    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
++    #[cfg(target_os = "linux")]
++    let rc = unsafe {
++        libc::syscall(
++            libc::SYS_renameat2,
++            libc::AT_FDCWD,
++            from.as_ptr(),
++            libc::AT_FDCWD,
++            to.as_ptr(),
++            libc::RENAME_NOREPLACE,
++        )
++    };
++    // SAFETY: both pointers are NUL-terminated strings that outlive the call.
++    #[cfg(target_vendor = "apple")]
++    let rc = unsafe { libc::renamex_np(from.as_ptr(), to.as_ptr(), libc::RENAME_EXCL) };
++    if rc == 0 {
++        Ok(())
++    } else {
++        Err(std::io::Error::last_os_error())
++    }
+ }
+ 
+ /// Nonblocking database-inode admission lock. Its Arc is retained by daemon and
+@@ -2962,6 +3090,161 @@ mod tests {
+         assert_eq!(mode, 0o700);
+     }
+ 
++    fn mode_of(path: &Path) -> u32 {
++        fs::symlink_metadata(path).unwrap().permissions().mode() & 0o7777
++    }
++
++    fn assert_no_staging_leftovers(dir: &Path) {
++        let leftovers: Vec<_> = fs::read_dir(dir)
++            .unwrap()
++            .map(|entry| entry.unwrap().file_name())
++            .filter(|name| name.to_string_lossy().starts_with(".rb-private-dir-"))
++            .collect();
++        assert!(leftovers.is_empty(), "staging dirs left: {leftovers:?}");
++    }
++
++    #[test]
++    fn prepare_socket_dir_creates_missing_ancestors_private_and_accepts_them_after() {
++        let dir = tempfile::tempdir().unwrap();
++        let socket = dir.path().join("a").join("b").join("c").join("sock");
++
++        prepare_socket_dir(&socket).unwrap();
++
++        for ancestor in ["a", "a/b", "a/b/c"] {
++            assert_eq!(mode_of(&dir.path().join(ancestor)), 0o700, "{ancestor}");
++        }
++        assert_no_staging_leftovers(dir.path());
++        // A second start accepts the dir it created.
++        prepare_socket_dir(&socket).unwrap();
++    }
++
++    #[test]
++    fn prepare_socket_dir_concurrent_first_starts_all_succeed() {
++        let dir = tempfile::tempdir().unwrap();
++        let socket = dir.path().join("x").join("y").join("sock");
++        let barrier = std::sync::Barrier::new(16);
++
++        std::thread::scope(|scope| {
++            let handles: Vec<_> = (0..16)
++                .map(|_| {
++                    scope.spawn(|| {
++                        barrier.wait();
++                        prepare_socket_dir(&socket)
++                    })
++                })
++                .collect();
++            for handle in handles {
++                handle.join().unwrap().unwrap();
++            }
++        });
++
++        assert_eq!(mode_of(&dir.path().join("x")), 0o700);
++        assert_eq!(mode_of(&dir.path().join("x/y")), 0o700);
++        assert_no_staging_leftovers(dir.path());
++        assert_no_staging_leftovers(&dir.path().join("x"));
++    }
++
++    #[test]
++    fn prepare_socket_dir_creates_exactly_0700_despite_owner_stripping_umask() {
++        // umask is process-wide: only run where each test is its own process.
++        if std::env::var_os("NEXTEST_EXECUTION_MODE").is_none_or(|m| m != "process-per-test") {
++            return;
++        }
++        let dir = tempfile::tempdir().unwrap();
++        let socket = dir.path().join("masked").join("sock");
++
++        // SAFETY: umask only swaps the process file-mode mask.
++        #[allow(unsafe_code)]
++        let previous = unsafe { libc::umask(0o277) };
++        let result = prepare_socket_dir(&socket);
++        #[allow(unsafe_code)]
++        // SAFETY: as above, restoring the previous mask.
++        unsafe {
++            libc::umask(previous);
++        }
++
++        result.unwrap();
++        assert_eq!(mode_of(&dir.path().join("masked")), 0o700);
++    }
++
++    #[test]
++    fn prepare_socket_dir_accepts_existing_private_dir() {
++        let dir = tempfile::tempdir().unwrap();
++        let socket_dir = dir.path().join("private");
++        fs::create_dir(&socket_dir).unwrap();
++        fs::set_permissions(&socket_dir, fs::Permissions::from_mode(0o700)).unwrap();
++
++        prepare_socket_dir(&socket_dir.join("sock")).unwrap();
++    }
++
++    #[test]
++    fn prepare_socket_dir_rejects_any_mode_other_than_0700_without_chmod() {
++        let dir = tempfile::tempdir().unwrap();
++        for mode in [0o750, 0o701, 0o711, 0o500, 0o1700, 0o2700] {
++            let socket_dir = dir.path().join(format!("m{mode:o}"));
++            fs::create_dir(&socket_dir).unwrap();
++            fs::set_permissions(&socket_dir, fs::Permissions::from_mode(mode)).unwrap();
++            // Some platforms refuse setgid on dirs for non-members; test what stuck.
++            let actual = mode_of(&socket_dir);
++            if actual == 0o700 {
++                continue;
++            }
++
++            let err = prepare_socket_dir(&socket_dir.join("sock")).unwrap_err();
++            assert!(
++                err.to_string().contains("must already be private"),
++                "{mode:o}: unexpected error: {err}"
++            );
++            assert_eq!(mode_of(&socket_dir), actual, "{mode:o}: must not chmod");
++        }
++    }
++
++    #[test]
++    fn prepare_socket_dir_rejects_dir_owned_by_another_user() {
++        if process_euid() == 0 {
++            return;
++        }
++        // `/` is root-owned on every Unix this runs on.
++        let err = prepare_socket_dir(Path::new("/sock")).unwrap_err();
++        assert!(err.to_string().contains("owned by uid 0"), "{err}");
++    }
++
++    #[test]
++    fn prepare_socket_dir_rejects_non_directory_parent() {
++        let dir = tempfile::tempdir().unwrap();
++        let file = dir.path().join("file");
++        fs::write(&file, b"x").unwrap();
++
++        let err = prepare_socket_dir(&file.join("sock")).unwrap_err();
++        assert!(err.to_string().contains("is not a directory"), "{err}");
++    }
++
++    #[test]
++    fn prepare_socket_dir_rejects_symlink_to_private_dir() {
++        let dir = tempfile::tempdir().unwrap();
++        let target = dir.path().join("target");
++        fs::create_dir(&target).unwrap();
++        fs::set_permissions(&target, fs::Permissions::from_mode(0o700)).unwrap();
++        let link = dir.path().join("link");
++        std::os::unix::fs::symlink(&target, &link).unwrap();
++
++        let err = prepare_socket_dir(&link.join("sock")).unwrap_err();
++        assert!(err.to_string().contains("symlink"), "{err}");
++    }
++
++    #[test]
++    fn prepare_socket_dir_rejects_dangling_symlink_without_creating_through_it() {
++        let dir = tempfile::tempdir().unwrap();
++        let target = dir.path().join("nowhere");
++        let link = dir.path().join("link");
++        std::os::unix::fs::symlink(&target, &link).unwrap();
++
++        let err = prepare_socket_dir(&link.join("sock")).unwrap_err();
++        assert!(err.to_string().contains("symlink"), "{err}");
++        assert!(!target.exists(), "must not create through a dangling symlink");
++        assert!(fs::symlink_metadata(&link).unwrap().file_type().is_symlink());
++    }
++
+     #[test]
+     fn prepare_db_dir_creates_missing_dir_private_and_leaves_existing_alone() {
+         let dir = tempfile::tempdir().unwrap();
