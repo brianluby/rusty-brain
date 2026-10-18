@@ -118,8 +118,11 @@ already accept.
 1. **`HistoryEntry.archived_at: Option<DateTime>`.** An additive serde field,
    following the `contested` precedent, so no contract-version bump. The
    human timeline renders "current until <time>".
-2. **`RecallFilter.as_of: Option<DateTime>`**, for `list` (and `history`), but
-   **not** ranked `recall`:
+2. **`RecallFilter.as_of: Option<DateTime>`**, for `list` only, not ranked
+   `recall` and not `history`. `RecallFilter` rides only on `Request::List`
+   and `Request::Recall`, and `Request::History` takes just an id and depth.
+   An as-of history would need its own `History` field, and that is not part
+   of step 1.
    - Membership is `created_at ≤ T AND (archived_at IS NULL OR archived_at > T)`.
    - Archived rows have no vectors, so a ranked as-of recall would silently
      lose its vector channel. A filtered list is honest.
@@ -136,7 +139,17 @@ already accept.
      That is not part of step 1.
    - Every response carries `"temporal_basis": "recorded"` and a note that
      metadata values are current, not as of T.
-3. **Limitations stated in the output and the docs:** purged rows never
+3. **Capability gate (fail closed).** `RecallFilter` fields are additive: an
+   older daemon decodes the frame, drops the unknown `as_of`, and answers an
+   ordinary active-only list, which would be a silently wrong audit result.
+   Follow the typed-anchors precedent: the daemon advertises a new `as_of`
+   capability in its handshake ack, and the client refuses to send `as_of`
+   to a daemon without it (`InvalidArgument` naming the missing capability,
+   like `CAP_ANCHORS`). As a second guard, the client errors if an `as_of`
+   response lacks `temporal_basis`. `HistoryEntry.archived_at` needs no gate:
+   from an older daemon it decodes as `None`, and the timeline omits the end
+   time rather than claiming one.
+4. **Limitations stated in the output and the docs:** purged rows never
    appear; metadata is as of now; this is not validity time.
 
 ### Test cases
@@ -154,6 +167,8 @@ already accept.
 | 8 | Active recall regression | The committed semantic gate and recall goldens are unchanged, with no `as_of` set |
 | 9 | Namespace isolation | `as_of` never returns rows from another namespace |
 | 10 | Metadata | The returned importance and confidence are current values, and the response says so |
+| 11 | Client against a daemon without the `as_of` capability | The client fails before sending, naming the capability; no active-only result is returned |
+| 12 | A response to an `as_of` request without `temporal_basis` | The client errors instead of returning the rows |
 
 ## Deferred: validity time (step 2)
 
