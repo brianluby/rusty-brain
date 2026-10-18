@@ -67,9 +67,14 @@ benchmarks and interactive commands.
 ## Reproduce
 
 ```bash
+cargo llvm-cov clean --workspace   # --no-report skips the automatic cleanup
 cargo llvm-cov --workspace --no-report --no-fail-fast
-cargo llvm-cov report --summary-only
+cargo llvm-cov report --summary-only                  # per-file text table and TOTAL
+cargo llvm-cov report --json --summary-only --output-path coverage.json
 ```
+
+The per-crate table sums each file's covered and total counts from
+`coverage.json` by `crates/<name>/`.
 
 `cargo-llvm-cov` needs `llvm-cov` and `llvm-profdata` built from the same LLVM
 major version as the active `rustc`. On this machine Homebrew's Rust comes
