@@ -16,6 +16,13 @@ All notable changes to rusty-brain are documented here. The format is based on
   `scripts/experiments/plan-c/`; results are in
   `docs/eval/2026-10-17-plan-c-pair-results.md`.
 
+### Added — Coverage baseline (kanban 82)
+
+- Record per-crate `cargo llvm-cov` coverage at `cfc9b23`: 93.2% of lines
+  workspace-wide, lowest `rusty-brain` at 84.9%. Decision: no CI coverage gate,
+  report-only or blocking; coverage stays an on-demand reference before large
+  refactors. See `docs/eval/2026-10-18-coverage-baseline.md`.
+
 ### Fixed — Pinned local embedding model (kanban 100)
 
 - The local provider now loads `Qdrant/all-MiniLM-L6-v2-onnx` at a pinned
