@@ -536,10 +536,20 @@ fn prepare_db_dir(dir: &Path) -> Result<()> {
         }
         return Ok(());
     }
-    fs::create_dir_all(dir)
+    // Create private in one step: a concurrent starter must never observe the
+    // umask default (0755) between creation and chmod.
+    create_private_dir(dir)
         .map_err(|e| Error::Io(format!("create db dir {}: {e}", dir.display())))?;
     fs::set_permissions(dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", dir.display())))
+}
+
+fn create_private_dir(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
 }
 
 fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
@@ -566,7 +576,7 @@ fn prepare_socket_dir(socket_path: &Path) -> Result<()> {
         return Ok(());
     }
 
-    fs::create_dir_all(socket_dir)
+    create_private_dir(socket_dir)
         .map_err(|e| Error::Io(format!("create socket dir {}: {e}", socket_dir.display())))?;
     fs::set_permissions(socket_dir, fs::Permissions::from_mode(0o700))
         .map_err(|e| Error::Io(format!("chmod 0700 {}: {e}", socket_dir.display())))
