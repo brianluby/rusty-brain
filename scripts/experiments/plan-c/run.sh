@@ -26,6 +26,11 @@ top=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "not a git worktree: 
   || { echo "$WT is the main checkout, not a linked worktree" >&2; exit 2; }
 git reset -q --hard origin/main && git clean -qfd || exit 2
 FAILED=0
+# The worktree is reset at the start of every run, so an interrupted run needs
+# no repair; only the reviewer's scratch dir must not leak.
+EMPTY=$(mktemp -d)
+trap 'rm -rf "$EMPTY"' EXIT
+trap 'log "interrupted"; exit 130' INT TERM
 log "base $(git rev-parse --short HEAD)"
 
 # 1. Implement (hard dollar cap; hooks and MCP off so nothing leaks into user stores).
@@ -38,21 +43,26 @@ claude -p "$(cat "$OUT/prompt.md")" \
   --allowedTools "Read Edit Write Glob Grep Bash(cargo:*) Bash(git diff:*) Bash(git status:*) Bash(ls:*)" \
   --settings '{"disableAllHooks":true}' --strict-mcp-config --no-session-persistence \
   > "$OUT/claude.json" 2> "$OUT/claude.stderr"
-log "implement exit $? in $(( $(date +%s) - start ))s"
-python3 -I -c 'import json,sys; d=json.load(open(sys.argv[1])); print("claude cost_usd", d.get("total_cost_usd"), "turns", d.get("num_turns"), "subtype", d.get("subtype"), "is_error", d.get("is_error"))' "$OUT/claude.json" | tee -a "$OUT/log.txt"
+rc=$?; log "implement exit $rc in $(( $(date +%s) - start ))s"
+# A failed or over-budget implementation is a failed run, never retried.
+[ $rc -eq 0 ] || FAILED=1
+# claude -p can exit 0 yet report an error or the budget cap in its JSON.
+summary=$(python3 -I -c 'import json,sys
+d=json.load(open(sys.argv[1]))
+print("claude cost_usd", d.get("total_cost_usd"), "turns", d.get("num_turns"), "subtype", d.get("subtype"), "is_error", d.get("is_error"))
+sys.exit(1 if d.get("is_error") or d.get("subtype") != "success" else 0)' "$OUT/claude.json" 2>&1)
+rc=$?; log "$summary"; [ $rc -eq 0 ] || FAILED=1
 
 # 2. Capture the diff (untracked files included).
 git add -N . && git diff > "$OUT/diff.patch"
 log "diff $(wc -l < "$OUT/diff.patch") lines, files: $(git diff --name-only | tr '\n' ' ')"
 
 # 3. Adversarial review: one call, diff-only, read-only, 10-minute timeout, no retry.
-EMPTY=$(mktemp -d)
 { cat "$P/tasks/review.md"; echo; echo "## Task"; cat "$P/tasks/run$N.md"; echo; echo "## Diff"; echo '```diff'; cat "$OUT/diff.patch"; echo '```'; } > "$OUT/review-prompt.md"
 start=$(date +%s)
 timeout 600 codex exec --json -s read-only --skip-git-repo-check --ephemeral -C "$EMPTY" \
   -o "$OUT/review.json" - < "$OUT/review-prompt.md" > "$OUT/codex.jsonl" 2> "$OUT/codex.stderr"
-log "review exit $? in $(( $(date +%s) - start ))s"
-rmdir "$EMPTY" 2>/dev/null
+rc=$?; log "review exit $rc in $(( $(date +%s) - start ))s$([ $rc -eq 124 ] && echo ' (timed out; no retry)')"
 
 # 4. Gate: the implementer's own tests and clippy, then the hidden oracle.
 log "gate: cargo nextest run $GATE"
