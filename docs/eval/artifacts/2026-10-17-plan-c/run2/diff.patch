@@ -1,0 +1,410 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index f2d5387..d407bf4 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -2687,6 +2687,7 @@ dependencies = [
+  "serde",
+  "serde_json",
+  "sha2",
++ "tempfile",
+  "tokio",
+  "wiremock",
+ ]
+diff --git a/crates/rb-embed/Cargo.toml b/crates/rb-embed/Cargo.toml
+index 6ffdeb2..877c8de 100644
+--- a/crates/rb-embed/Cargo.toml
++++ b/crates/rb-embed/Cargo.toml
+@@ -35,6 +35,7 @@ hf-hub = { version = "0.5", optional = true, default-features = false, features
+ tokio = { workspace = true, optional = true }
+ 
+ [dev-dependencies]
++tempfile = { workspace = true }
+ tokio = { workspace = true }
+ wiremock = { workspace = true }
+ 
+diff --git a/crates/rb-embed/src/lib.rs b/crates/rb-embed/src/lib.rs
+index d9bab91..c39b1c5 100644
+--- a/crates/rb-embed/src/lib.rs
++++ b/crates/rb-embed/src/lib.rs
+@@ -14,7 +14,10 @@ mod voyage;
+ 
+ pub use deterministic::DeterministicProvider;
+ #[cfg(feature = "local")]
+-pub use local::{LocalProvider, PinnedFile, PinnedModel, ALL_MINILM_L6_V2};
++pub use local::{
++    cached_pin_status, model_cache_root, pinned_model, LocalProvider, PinCacheStatus, PinnedFile,
++    PinnedModel, ALL_MINILM_L6_V2,
++};
+ pub use provider::{EmbedKind, EmbeddingProvider};
+ pub use voyage::VoyageProvider;
+ 
+diff --git a/crates/rb-embed/src/local.rs b/crates/rb-embed/src/local.rs
+index e1f3471..e4cd88c 100644
+--- a/crates/rb-embed/src/local.rs
++++ b/crates/rb-embed/src/local.rs
+@@ -17,7 +17,7 @@ use hf_hub::api::sync::ApiBuilder;
+ use hf_hub::{Repo, RepoType};
+ use rb_types::Error;
+ use sha2::{Digest, Sha256};
+-use std::path::PathBuf;
++use std::path::{Path, PathBuf};
+ use std::sync::{Arc, Mutex};
+ 
+ /// Default model when none is specified. 384-dimensional.
+@@ -156,14 +156,79 @@ fn resolve_max_tokens(
+     Ok(n)
+ }
+ 
+-/// Fetch and hash-check every pinned file, using the same cache and endpoint
+-/// resolution as fastembed 5.15's own download path (`HF_HOME` is the cache
+-/// root itself, not `$HF_HOME/hub`), so files an older install already cached
+-/// at this revision are reused. Offline after the first load.
+-fn fetch_pinned(pin: &PinnedModel) -> rb_types::Result<PinnedBytes> {
+-    let cache_dir = std::env::var("HF_HOME")
++/// The model cache root loading uses, resolved like fastembed 5.15's own
++/// download path: `HF_HOME` is the cache root itself (not `$HF_HOME/hub`),
++/// else fastembed's `FASTEMBED_CACHE_DIR` or `.fastembed_cache`.
++pub fn model_cache_root() -> PathBuf {
++    std::env::var("HF_HOME")
+         .map(PathBuf::from)
+-        .unwrap_or_else(|_| PathBuf::from(fastembed::get_cache_dir()));
++        .unwrap_or_else(|_| PathBuf::from(fastembed::get_cache_dir()))
++}
++
++/// What the local cache holds of a pinned revision, per [`cached_pin_status`].
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub enum PinCacheStatus {
++    /// Every pinned file is cached with the expected hash.
++    Complete,
++    /// These files are absent (in pin order); loading would download them.
++    Missing(Vec<&'static str>),
++    /// This cached file's SHA-256 differs from the pin; loading would refuse it.
++    Corrupt { file: &'static str },
++}
++
++/// Check, fully offline, whether `cache_root` holds every file of `pin` at its
++/// revision in hf-hub's layout. Never downloads, creates or modifies anything.
++/// A hash mismatch wins over missing files, so a corrupt cache is never
++/// reported as merely incomplete.
++pub fn cached_pin_status(cache_root: &Path, pin: &PinnedModel) -> rb_types::Result<PinCacheStatus> {
++    let snapshot = cache_root
++        .join(format!("models--{}", pin.repo.replace('/', "--")))
++        .join("snapshots")
++        .join(pin.revision);
++    let mut missing = Vec::new();
++    for file in [
++        &pin.onnx,
++        &pin.tokenizer,
++        &pin.config,
++        &pin.special_tokens_map,
++        &pin.tokenizer_config,
++    ] {
++        let path = snapshot.join(file.name);
++        // Follows hf-hub's symlinks into `blobs/`; a dangling one is missing.
++        let mut reader = match std::fs::File::open(&path) {
++            Ok(f) => f,
++            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
++                missing.push(file.name);
++                continue;
++            }
++            Err(e) => {
++                return Err(Error::Embedding(format!(
++                    "failed to open {}: {e}",
++                    path.display()
++                )))
++            }
++        };
++        // Stream: model.onnx is ~90 MB.
++        let mut hasher = Sha256::new();
++        std::io::copy(&mut reader, &mut hasher)
++            .map_err(|e| Error::Embedding(format!("failed to read {}: {e}", path.display())))?;
++        if format!("{:x}", hasher.finalize()) != file.sha256 {
++            return Ok(PinCacheStatus::Corrupt { file: file.name });
++        }
++    }
++    Ok(if missing.is_empty() {
++        PinCacheStatus::Complete
++    } else {
++        PinCacheStatus::Missing(missing)
++    })
++}
++
++/// Fetch and hash-check every pinned file under [`model_cache_root`], with
++/// the same endpoint resolution as fastembed 5.15's own download path, so
++/// files an older install already cached at this revision are reused.
++/// Offline after the first load.
++fn fetch_pinned(pin: &PinnedModel) -> rb_types::Result<PinnedBytes> {
++    let cache_dir = model_cache_root();
+     let endpoint =
+         std::env::var("HF_ENDPOINT").unwrap_or_else(|_| "https://huggingface.co".to_string());
+     // hf-hub reads only its token file; also honor HF_TOKEN for gated mirrors.
+@@ -482,6 +547,116 @@ mod tests {
+         assert!(resolve_max_tokens(Some(0), 512, 512).is_err());
+     }
+ 
++    const FAKE_FILES: [(&str, &[u8]); 5] = [
++        ("model.onnx", b"onnx"),
++        ("tokenizer.json", b"tokenizer"),
++        ("config.json", b"config"),
++        ("special_tokens_map.json", b"special"),
++        ("tokenizer_config.json", b"tokenizer_config"),
++    ];
++
++    /// A pin over `FAKE_FILES`, so cache checks run without real weights.
++    fn fake_pin() -> PinnedModel {
++        let pinned = |(name, bytes): (&'static str, &[u8])| PinnedFile {
++            name,
++            sha256: Box::leak(format!("{:x}", Sha256::digest(bytes)).into_boxed_str()),
++        };
++        PinnedModel {
++            repo: "Org/fake-model",
++            revision: "0123456789abcdef0123456789abcdef01234567",
++            onnx: pinned(FAKE_FILES[0]),
++            tokenizer: pinned(FAKE_FILES[1]),
++            config: pinned(FAKE_FILES[2]),
++            special_tokens_map: pinned(FAKE_FILES[3]),
++            tokenizer_config: pinned(FAKE_FILES[4]),
++            pooling: Pooling::Mean,
++            default_max_tokens: 512,
++        }
++    }
++
++    fn snapshot_dir(root: &Path, pin: &PinnedModel) -> PathBuf {
++        root.join("models--Org--fake-model")
++            .join("snapshots")
++            .join(pin.revision)
++    }
++
++    /// Cache `FAKE_FILES` like hf-hub: blobs plus snapshot symlinks.
++    fn populate(root: &Path, pin: &PinnedModel) {
++        let blobs = root.join("models--Org--fake-model").join("blobs");
++        let snapshot = snapshot_dir(root, pin);
++        std::fs::create_dir_all(&blobs).unwrap();
++        std::fs::create_dir_all(&snapshot).unwrap();
++        for (name, bytes) in FAKE_FILES {
++            std::fs::write(blobs.join(name), bytes).unwrap();
++            std::os::unix::fs::symlink(Path::new("../../blobs").join(name), snapshot.join(name))
++                .unwrap();
++        }
++    }
++
++    #[test]
++    fn fully_cached_pin_is_complete() {
++        let dir = tempfile::tempdir().unwrap();
++        let pin = fake_pin();
++        populate(dir.path(), &pin);
++        assert_eq!(
++            cached_pin_status(dir.path(), &pin).unwrap(),
++            PinCacheStatus::Complete
++        );
++    }
++
++    #[test]
++    fn absent_cache_lists_every_file_in_order_and_creates_nothing() {
++        let dir = tempfile::tempdir().unwrap();
++        let root = dir.path().join("never-created");
++        let status = cached_pin_status(&root, &fake_pin()).unwrap();
++        assert_eq!(
++            status,
++            PinCacheStatus::Missing(FAKE_FILES.iter().map(|(name, _)| *name).collect())
++        );
++        assert!(!root.exists(), "the check must not create the cache root");
++    }
++
++    #[test]
++    fn missing_and_dangling_files_are_reported_in_pin_order() {
++        let dir = tempfile::tempdir().unwrap();
++        let pin = fake_pin();
++        populate(dir.path(), &pin);
++        let snapshot = snapshot_dir(dir.path(), &pin);
++        std::fs::remove_file(snapshot.join("tokenizer_config.json")).unwrap();
++        // An interrupted download can leave the link without its blob.
++        std::fs::remove_file(dir.path().join("models--Org--fake-model/blobs/model.onnx")).unwrap();
++        assert_eq!(
++            cached_pin_status(dir.path(), &pin).unwrap(),
++            PinCacheStatus::Missing(vec!["model.onnx", "tokenizer_config.json"])
++        );
++    }
++
++    #[test]
++    fn first_hash_mismatch_is_corrupt_even_with_files_missing() {
++        let dir = tempfile::tempdir().unwrap();
++        let pin = fake_pin();
++        populate(dir.path(), &pin);
++        let snapshot = snapshot_dir(dir.path(), &pin);
++        let blobs = dir.path().join("models--Org--fake-model").join("blobs");
++        std::fs::remove_file(snapshot.join("model.onnx")).unwrap();
++        std::fs::write(blobs.join("config.json"), b"tampered").unwrap();
++        std::fs::write(blobs.join("tokenizer_config.json"), b"tampered").unwrap();
++        assert_eq!(
++            cached_pin_status(dir.path(), &pin).unwrap(),
++            PinCacheStatus::Corrupt {
++                file: "config.json"
++            }
++        );
++        let other_revision = PinnedModel {
++            revision: "fedcba9876543210fedcba9876543210fedcba98",
++            ..fake_pin()
++        };
++        assert!(matches!(
++            cached_pin_status(dir.path(), &other_revision).unwrap(),
++            PinCacheStatus::Missing(files) if files.len() == 5
++        ));
++    }
++
+     #[test]
+     fn metadata_only_provider_has_no_pin_or_truncation() {
+         let p = LocalProvider::without_model("all-MiniLM-L6-v2", 384);
+diff --git a/crates/rusty-brain/src/doctor.rs b/crates/rusty-brain/src/doctor.rs
+index 342b73c..53f756d 100644
+--- a/crates/rusty-brain/src/doctor.rs
++++ b/crates/rusty-brain/src/doctor.rs
+@@ -452,6 +452,84 @@ fn check_embedding_identity(
+     }
+ }
+ 
++/// Local backend only: is the pinned model fully and intactly cached? Purely
++/// offline — inspects `cache_root` without downloading or writing, so a
++/// corrupt cache is caught before the daemon refuses to load it.
++#[cfg(feature = "local")]
++pub fn check_local_model_cache(cache_root: &Path, local_model: Option<&str>) -> DoctorCheck {
++    let name = "local-model-cache";
++    let pin = match rb_embed::pinned_model(local_model.unwrap_or_default()) {
++        Ok(pin) => pin,
++        Err(e) => {
++            return DoctorCheck {
++                name,
++                status: CheckStatus::Fail,
++                detail: e.to_string(),
++                hint: None,
++            }
++        }
++    };
++    local_model_cache_check(
++        cache_root,
++        pin,
++        rb_embed::cached_pin_status(cache_root, pin),
++    )
++}
++
++/// Map a cache inspection result to the `local-model-cache` check.
++#[cfg(feature = "local")]
++fn local_model_cache_check(
++    cache_root: &Path,
++    pin: &rb_embed::PinnedModel,
++    status: rb_types::Result<rb_embed::PinCacheStatus>,
++) -> DoctorCheck {
++    let name = "local-model-cache";
++    let model = format!("{}@{}", pin.repo, pin.revision);
++    match status {
++        Ok(rb_embed::PinCacheStatus::Complete) => DoctorCheck {
++            name,
++            status: CheckStatus::Ok,
++            detail: format!("{model} cached in {}", cache_root.display()),
++            hint: None,
++        },
++        Ok(rb_embed::PinCacheStatus::Missing(files)) => DoctorCheck {
++            name,
++            status: CheckStatus::Warn,
++            detail: format!(
++                "{model} is not fully cached in {} (missing {})",
++                cache_root.display(),
++                files.join(", ")
++            ),
++            hint: Some(
++                "the first daemon start downloads it (needs network access to \
++                 the Hugging Face endpoint)"
++                    .to_string(),
++            ),
++        },
++        Ok(rb_embed::PinCacheStatus::Corrupt { file }) => DoctorCheck {
++            name,
++            status: CheckStatus::Fail,
++            detail: format!(
++                "cached {file} of {model} in {} does not match its pinned SHA-256; \
++                 the daemon will refuse to load it",
++                cache_root.display()
++            ),
++            hint: Some(format!(
++                "delete {} so the next daemon start re-downloads it",
++                cache_root
++                    .join(format!("models--{}", pin.repo.replace('/', "--")))
++                    .display()
++            )),
++        },
++        Err(e) => DoctorCheck {
++            name,
++            status: CheckStatus::Fail,
++            detail: format!("cannot inspect {model} in {}: {e}", cache_root.display()),
++            hint: None,
++        },
++    }
++}
++
+ /// Run the full doctor flow and print the report; `Err` (non-zero exit) when
+ /// any check FAILS. Never auto-starts the daemon and never writes.
+ /// Retention-policy lint (retention PRD RET-4): purely static — no daemon,
+@@ -540,6 +618,13 @@ pub async fn run_doctor(
+         local_model.as_deref(),
+         &mut checks,
+     );
++    #[cfg(feature = "local")]
++    if crate::serve::local_requested(embed_backend.as_deref(), local_model.as_deref()) {
++        checks.push(check_local_model_cache(
++            &rb_embed::model_cache_root(),
++            local_model.as_deref(),
++        ));
++    }
+     checks.push(check_retention(retention.as_ref()));
+ 
+     let report = DoctorReport { checks };
+@@ -814,6 +899,49 @@ mod tests {
+         );
+     }
+ 
++    #[cfg(feature = "local")]
++    #[test]
++    fn local_model_cache_check_warns_when_missing_and_fails_when_corrupt() {
++        let dir = tempfile::tempdir().unwrap();
++        let root = dir.path().join("cache");
++
++        let missing = check_local_model_cache(&root, None);
++        assert_eq!(missing.status, CheckStatus::Warn, "{missing:?}");
++        assert_eq!(missing.name, "local-model-cache");
++        assert!(missing.detail.contains("model.onnx"), "{missing:?}");
++        let hint = missing.hint.expect("a missing model carries guidance");
++        assert!(hint.contains("first daemon start downloads"), "{hint}");
++        assert!(!root.exists(), "doctor must not create the cache");
++
++        let pin = &rb_embed::ALL_MINILM_L6_V2;
++        let snapshot = root
++            .join("models--Qdrant--all-MiniLM-L6-v2-onnx")
++            .join("snapshots")
++            .join(pin.revision);
++        std::fs::create_dir_all(&snapshot).unwrap();
++        std::fs::write(snapshot.join("config.json"), b"{}").unwrap();
++        let corrupt = check_local_model_cache(&root, Some("all-MiniLM-L6-v2"));
++        assert_eq!(corrupt.status, CheckStatus::Fail, "{corrupt:?}");
++        assert!(corrupt.detail.contains("config.json"), "{corrupt:?}");
++        assert!(corrupt.hint.is_some(), "{corrupt:?}");
++
++        let unknown = check_local_model_cache(&root, Some("not-a-real-model"));
++        assert_eq!(unknown.status, CheckStatus::Fail, "{unknown:?}");
++    }
++
++    #[cfg(feature = "local")]
++    #[test]
++    fn local_model_cache_check_is_ok_when_complete() {
++        let pin = &rb_embed::ALL_MINILM_L6_V2;
++        let ok = local_model_cache_check(
++            Path::new("/cache"),
++            pin,
++            Ok(rb_embed::PinCacheStatus::Complete),
++        );
++        assert_eq!(ok.status, CheckStatus::Ok, "{ok:?}");
++        assert!(ok.detail.contains(pin.revision), "{ok:?}");
++    }
++
+     #[test]
+     fn report_counts_failures_for_the_exit_code() {
+         let report = DoctorReport {

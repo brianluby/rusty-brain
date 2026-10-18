@@ -1,0 +1,17 @@
+03:20:50 base 593be2a
+03:20:50 implement: claude -p --max-budget-usd 5
+03:24:49 implement exit 0 in 239s
+claude cost_usd 0.9928768000000002 turns 21 subtype success is_error False
+03:24:49 diff      410 lines, files: Cargo.lock crates/rb-embed/Cargo.toml crates/rb-embed/src/lib.rs crates/rb-embed/src/local.rs crates/rusty-brain/src/doctor.rs 
+03:25:06 review exit 0 in 17s
+03:25:06 gate: cargo nextest run -p rb-embed -p rusty-brain --features local
+03:25:18 gate test exit 0
+03:25:18 gate clippy exit 0
+03:25:46 hidden oracle exit 0
+test empty_cache_reports_every_file_missing_and_creates_nothing ... ok
+test a_wrong_file_is_corrupt_even_when_others_are_missing ... ok
+test symlinked_snapshot_files_are_followed_like_hf_hub_writes_them ... ok
+test correct_small_files_leave_only_the_missing_onnx ... ok
+test a_real_populated_cache_is_complete ... ok
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+03:25:46 done

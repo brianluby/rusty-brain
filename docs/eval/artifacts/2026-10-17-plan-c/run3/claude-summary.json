@@ -1,0 +1,24 @@
+{
+ "total_cost_usd": 1.0563342,
+ "num_turns": 23,
+ "duration_ms": 221193,
+ "subtype": "success",
+ "is_error": false,
+ "modelUsage": {
+  "claude-opus-5-5": {
+   "inputTokens": 32,
+   "outputTokens": 20280,
+   "cacheReadInputTokens": 1010751,
+   "cacheCreationInputTokens": 56057,
+   "webSearchRequests": 0,
+   "costUSD": 1.0563342,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 128000,
+   "thinkingTokens": 9442,
+   "canonicalModel": "claude-opus-5-5",
+   "provider": "firstParty",
+   "costBasis": "list"
+  }
+ },
+ "result": "`prepare_socket_dir` is now hardened and public, and re-exported at the crate root as `rb_daemon::prepare_socket_dir(socket_path: &Path) -> rb_types::Result<()>`. Clippy (`-D warnings`) is clean and `cargo nextest run -p rb-daemon` passes all 214 tests. Only `rb-daemon` was touched.\n\n**What it does now**\n- **Existing directory:** it's checked with `lstat`, so a link is never followed. It's accepted only if it's a real directory, owned by the current user, with mode exactly `0700`. The setuid, setgid and sticky bits must also be clear, so `01700` and `02700` are refused. Everything else is refused and nothing is chmodded: a symlink (the error contains \"symlink\"), a non-directory, another owner's directory, or any other mode.\n- **Missing directory:** the socket's parent and any missing parents are each first made as a hidden temporary directory next to the final spot. Each is set to `0700` and then renamed into place with a rename that refuses to overwrite (`renameat2(RENAME_NOREPLACE)` on Linux, `renamex_np(RENAME_EXCL)` on macOS). So no other process can see it with a different mode, even under a umask that strips owner bits.\n- **Concurrent first starts:** if another start creates the directory first, this call checks the existing directory like any other, so a directory created by another start is accepted. The temporary directory is removed when the rename fails.\n- **Existing callers:** `Daemon::bind` still calls it unchanged. A path without a parent and a parent that is a plain file are still refused.\n\n**Tests added** (in `server.rs`):\n- Missing parents are all created `0700`, no temporary directories are left behind, and a second call accepts the result.\n- 16 threads released together on the same missing nested path all succeed, and nothing is left behind.\n- Creation still yields exactly `0700` under umask `0277`. This test only runs under nextest's process-per-test mode, because umask applies to the whole process. I temporarily made it fail if it skipped to confirm it really runs under nextest, then reverted that.\n- An existing `0700` directory is accepted.\n- Six other modes are rejected, and each one's mode is left untouched afterwards.\n- A directory owned by another user is rejected. This uses `/` and is skipped when running as root.\n- A non-directory parent is rejected.\n- A symlink to a private directory is rejected.\n- A dangling symlink is rejected, nothing is created at its target, and the link is left as it was.\n\n**Decision for you:** the no-overwrite rename is only written for Linux and Apple targets, so `rb-daemon` will no longer compile on other Unix systems such as FreeBSD. If those matter, the fix would be a fallback there that creates the directory and then sets its mode. It would lose the guarantee only under a umask that strips owner bits."
+}

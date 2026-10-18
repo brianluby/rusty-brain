@@ -1,0 +1,24 @@
+{
+ "total_cost_usd": 1.4041627999999997,
+ "num_turns": 37,
+ "duration_ms": 181792,
+ "subtype": "success",
+ "is_error": false,
+ "modelUsage": {
+  "claude-opus-5-5": {
+   "inputTokens": 44,
+   "outputTokens": 19600,
+   "cacheReadInputTokens": 1481294,
+   "cacheCreationInputTokens": 89466,
+   "webSearchRequests": 0,
+   "costUSD": 1.4041627999999997,
+   "contextWindow": 1000000,
+   "maxOutputTokens": 128000,
+   "thinkingTokens": 5180,
+   "canonicalModel": "claude-opus-5-5",
+   "provider": "firstParty",
+   "costBasis": "list"
+  }
+ },
+ "result": "I removed the `TODO(P1)`: `get_many`, `list_filtered` and `memories_for_reembed` now load links and anchors with batched IN-list queries instead of two queries per row. Clippy passes with `-D warnings` and all 293 `rb-store` tests pass (2 skipped). The only file changed is `crates/rb-store/src/store/core.rs`.\n\n**How it works**\n- **Row decoding:** `row_to_note` is split. `row_to_bare_note` decodes a row with empty `links` and `anchors`, and `attach_relations` fills both for a whole set of notes in one pass.\n- **Batching:** `load_links_batch` and `load_anchors_batch` run one IN-list query per 500 ids (`IN_LIST_CHUNK`) and group the results by memory id. 500 stays under the 999-parameter cap of SQLite builds before 3.32, with room left for `get_many`'s namespace parameter.\n- **Ordering:** links now have an explicit `ORDER BY source_id, target_id, link_type`, which matches the primary-key order the old per-row query got without asking for it. Anchors keep `ORDER BY id`. Each memory's rows always land in a single chunk, so grouping can't reorder them.\n- **`get_many`:** it removes duplicate ids, fetches rows in chunks of 500 with `namespace = ?1` on every chunk, attaches relations once, then rebuilds the output in request order. Duplicate ids still repeat in place, and missing or other-namespace ids are still skipped.\n- **`get_memory`:** it still has its own single-row path, which now goes through the same `attach_relations` instead of the two old loaders. Those loaders are gone.\n\n**New tests** (in `get_many_tests`)\n- `get_many_accepts_more_ids_than_sqlite_param_limit`: 40,000 ids, more than SQLite's 32,766-parameter cap, with real, duplicate, missing and other-namespace ids scattered through. The result keeps request order and duplicates and drops the foreign id.\n- `batched_relations_keep_per_note_order_across_chunks`: 501 notes so relations span two batches. It checks that every note from `get_many`, `list_filtered` and `memories_for_reembed` equals what `get_memory` returns. It also checks link order directly, using links inserted out of order across two link types, and that anchors keep their insertion order.\n\nOne leftover: comments in `migrations/009_memory_anchors.sql` still mention the old per-memory anchor load and `load_links`. I didn't touch them because changing migration files was out of scope."
+}
