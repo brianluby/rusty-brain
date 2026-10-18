@@ -63,6 +63,8 @@ start=$(date +%s)
 timeout 600 codex exec --json -s read-only --skip-git-repo-check --ephemeral -C "$EMPTY" \
   -o "$OUT/review.json" - < "$OUT/review-prompt.md" > "$OUT/codex.jsonl" 2> "$OUT/codex.stderr"
 rc=$?; log "review exit $rc in $(( $(date +%s) - start ))s$([ $rc -eq 124 ] && echo ' (timed out; no retry)')"
+# No reviewer verdict means the run did not test the pair.
+[ $rc -eq 0 ] && [ -s "$OUT/review.json" ] || FAILED=1
 
 # 4. Gate: the implementer's own tests and clippy, then the hidden oracle.
 log "gate: cargo nextest run $GATE"
