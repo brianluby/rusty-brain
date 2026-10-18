@@ -655,6 +655,10 @@ portable performance**:
   **`ANTHROPIC_API_KEY`** repository secret (small spend: the session runs
   `--model haiku --max-budget-usd 1`). Run it locally with
   `scripts/nightly-claude-smoke.sh --bin-dir target/release`.
+- **Coverage** is measured on demand, not gated in CI: 93.2% of lines across
+  the workspace at `cfc9b23`, with per-crate numbers, the reproduce commands and
+  the no-gate rationale in
+  [`docs/eval/2026-10-18-coverage-baseline.md`](docs/eval/2026-10-18-coverage-baseline.md).
 
 **Not yet measured:** portable performance and latency; large-corpus scale;
 sustained concurrency; resource exhaustion and partial outages; Voyage quality;
