@@ -139,6 +139,15 @@ already accept.
      That is not part of step 1.
    - Every response carries `"temporal_basis": "recorded"` and a note that
      metadata values are current, not as of T.
+   - **Completeness.** `list` is clamped to 1,000 rows by the daemon
+     (`MAX_LIMIT`; the CLI defaults to 20), and `Response::Listed` has no
+     cursor or truncation signal. An audit must never look complete when it
+     is not. An `as_of` response therefore orders by `(created_at,
+     memory_id)`, carries `truncated: bool` (computed by fetching one row past
+     the effective limit), and, when truncated, a `next_after` keyset cursor
+     (the last row's `created_at` and `memory_id`) that a follow-up `as_of`
+     request accepts. The CLI prints a warning and the cursor whenever
+     `truncated` is true.
 3. **Capability gate (fail closed).** `RecallFilter` fields are additive: an
    older daemon decodes the frame, drops the unknown `as_of`, and answers an
    ordinary active-only list, which would be a silently wrong audit result.
@@ -169,6 +178,7 @@ already accept.
 | 10 | Metadata | The returned importance and confidence are current values, and the response says so |
 | 11 | Client against a daemon without the `as_of` capability | The client fails before sending, naming the capability; no active-only result is returned |
 | 12 | A response to an `as_of` request without `temporal_basis` | The client errors instead of returning the rows |
+| 13 | More matching rows than the effective limit (a limit of 20, and also more than 1,000) | `truncated: true` with a `next_after` cursor; following the cursor returns every remaining row exactly once, in order, with no duplicates or gaps at equal `created_at` |
 
 ## Deferred: validity time (step 2)
 
