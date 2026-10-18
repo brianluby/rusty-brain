@@ -4,7 +4,7 @@
 
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use rb_embed::LocalProvider;
+use rb_embed::{LocalProvider, PinnedModel};
 use rb_eval::external::core::Memo;
 use rb_eval::external::locomo::{run_sample, QaRecord, Sample};
 use rb_eval::external::longmemeval::{aggregate, run_question, Entry, Profile, TOP_N};
@@ -145,6 +145,19 @@ fn load_embedder(
         .context("manifest embedding_model")?;
     let provider = LocalProvider::load_with_max_tokens(model, embed_max_tokens)?;
     let pin = provider.pin().context("loaded provider has a pin")?;
+    let effective = provider
+        .max_tokens()
+        .context("loaded provider reports its truncation")?;
+    let meta = embedding_meta(manifest, pin, embed_max_tokens, effective);
+    Ok((provider, meta))
+}
+
+fn embedding_meta(
+    manifest: &serde_json::Value,
+    pin: &PinnedModel,
+    requested_max_tokens: Option<usize>,
+    effective_max_tokens: usize,
+) -> serde_json::Value {
     let files: BTreeMap<&str, &str> = [
         pin.onnx,
         pin.tokenizer,
@@ -155,18 +168,17 @@ fn load_embedder(
     .iter()
     .map(|f| (f.name, f.sha256))
     .collect();
-    let meta = json!({
+    json!({
         "model": manifest["rusty_brain"]["embedding_model"],
         "dim": manifest["rusty_brain"]["embedding_dim"],
         "input_kind": "document/query (symmetric model; kind ignored)",
         "hf_repo": pin.repo,
         "hf_revision": pin.revision,
         "file_sha256": files,
-        "requested_max_tokens": embed_max_tokens,
-        "max_tokens": provider.max_tokens(),
+        "requested_max_tokens": requested_max_tokens,
+        "max_tokens": effective_max_tokens,
         "max_tokens_semantics": "effective truncation read back from the loaded tokenizer; requested_max_tokens null means the pin default",
-    });
-    Ok((provider, meta))
+    })
 }
 
 fn run_meta(
@@ -782,4 +794,30 @@ async fn longmemeval(
     println!("{}", serde_json::to_string_pretty(&summary["overall"])?);
     eprintln!("wrote {}", path.display());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rb_embed::ALL_MINILM_L6_V2;
+
+    #[test]
+    fn embedding_meta_records_pin_and_effective_not_requested_tokens() {
+        let manifest: serde_json::Value = serde_json::from_str(MANIFEST).unwrap_or_default();
+        let meta = embedding_meta(&manifest, &ALL_MINILM_L6_V2, None, 512);
+        assert_eq!(meta["model"], "all-MiniLM-L6-v2");
+        assert_eq!(meta["hf_revision"], ALL_MINILM_L6_V2.revision);
+        assert_eq!(meta["requested_max_tokens"], serde_json::Value::Null);
+        assert_eq!(meta["max_tokens"], 512);
+        let files = meta["file_sha256"].as_object().map(|m| m.len());
+        assert_eq!(files, Some(5));
+        assert_eq!(
+            meta["file_sha256"]["tokenizer_config.json"],
+            ALL_MINILM_L6_V2.tokenizer_config.sha256
+        );
+
+        let explicit = embedding_meta(&manifest, &ALL_MINILM_L6_V2, Some(256), 256);
+        assert_eq!(explicit["requested_max_tokens"], 256);
+        assert_eq!(explicit["max_tokens"], 256);
+    }
 }

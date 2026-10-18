@@ -14,7 +14,7 @@ mod voyage;
 
 pub use deterministic::DeterministicProvider;
 #[cfg(feature = "local")]
-pub use local::LocalProvider;
+pub use local::{LocalProvider, PinnedFile, PinnedModel, ALL_MINILM_L6_V2};
 pub use provider::{EmbedKind, EmbeddingProvider};
 pub use voyage::VoyageProvider;
 
