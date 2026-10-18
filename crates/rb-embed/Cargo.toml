@@ -16,7 +16,7 @@ path = "src/lib.rs"
 # OFF by default: the default build closure MUST NOT compile or link
 # fastembed/ort/onnxruntime. Enabled in CI only by the `build-local` job
 # and at runtime via `--features local`.
-local = ["dep:fastembed", "dep:tokio"]
+local = ["dep:fastembed", "dep:hf-hub", "dep:tokio"]
 
 [dependencies]
 rb-types = { path = "../rb-types" }
@@ -28,6 +28,9 @@ secrecy = { workspace = true }
 sha2 = { workspace = true }
 # Optional: only compiled when the `local` feature is enabled.
 fastembed = { version = "5.15", optional = true }
+# Optional: fetch the local model at a pinned Hugging Face revision. Same
+# version and features fastembed already enables, so no new crates.
+hf-hub = { version = "0.5", optional = true, default-features = false, features = ["ureq", "native-tls"] }
 # Optional: the local provider runs ONNX inference via spawn_blocking.
 tokio = { workspace = true, optional = true }
 
