@@ -172,6 +172,13 @@ async fn run_with_kind(
                     }
                 );
                 let embedder = rb_embed::LocalProvider::load(&model_name)?;
+                if let (Some(pin), Some(max_tokens)) = (embedder.pin(), embedder.max_tokens()) {
+                    tracing::info!(
+                        "local model pinned to {}@{}; inputs truncate at {max_tokens} tokens",
+                        pin.repo,
+                        pin.revision
+                    );
+                }
                 run_with_embedder(config, embedder, accept_model_change, shutdown).await
             }
             #[cfg(not(feature = "local"))]

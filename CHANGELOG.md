@@ -5,6 +5,21 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Fixed — Pinned local embedding model (kanban 100)
+
+- The local provider now loads `Qdrant/all-MiniLM-L6-v2-onnx` at a pinned
+  revision (`5f1b8cd`) and checks the SHA-256 of every file, failing closed on
+  a mismatch. On 2026-09-27 upstream lowered `model_max_length` from 512 to
+  256 without changing the weights, and fastembed silently clamps to it, so
+  fresh installs had quietly switched to 256 tokens.
+- A token limit above the tokenizer's cap is now an error, not a silent
+  clamp. Benchmark metadata records the pinned revision, file hashes, and the
+  requested and effective token limits (read back from the loaded tokenizer).
+  The daemon logs the revision and limit at startup.
+- The default stays 512 tokens, the documented setting behind every committed
+  baseline. With the pin, LoCoMo reproduces the frozen September runs exactly;
+  the committed replay fixture is byte-identical at 512 and at 256.
+
 ### Added — External benchmark diagnostic replay (kanban 60)
 
 - Execute the full all-four per-question diagnostic matrix (12 runs) on clean

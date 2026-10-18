@@ -54,7 +54,7 @@ enum Command {
         /// First N questions only (smoke runs). A limited run is never a result.
         #[arg(long)]
         limit: Option<usize>,
-        /// Embedding truncation in tokens (default: production, fastembed 512).
+        /// Embedding truncation in tokens (default: the pinned model's 512).
         #[arg(long)]
         embed_max_tokens: Option<usize>,
     },
@@ -103,7 +103,7 @@ enum Command {
         /// First N conversations only (smoke runs). A limited run is never a result.
         #[arg(long)]
         limit: Option<usize>,
-        /// Embedding truncation in tokens (default: production, fastembed 512).
+        /// Embedding truncation in tokens (default: the pinned model's 512).
         #[arg(long)]
         embed_max_tokens: Option<usize>,
     },
@@ -133,17 +133,46 @@ fn token_suffix(max_tokens: Option<usize>) -> String {
     max_tokens.map(|n| format!("-tok{n}")).unwrap_or_default()
 }
 
-fn max_tokens_json(max_tokens: Option<usize>) -> serde_json::Value {
-    max_tokens.map_or_else(
-        || json!("512 (fastembed default, production)"),
-        |n| json!(n),
-    )
+/// Load the pinned local model and describe what was actually loaded: the
+/// exact revision and file hashes, and the truncation read back from the
+/// tokenizer rather than the requested or assumed value (Vikunja #100).
+fn load_embedder(
+    manifest: &serde_json::Value,
+    embed_max_tokens: Option<usize>,
+) -> Result<(LocalProvider, serde_json::Value)> {
+    let model = manifest["rusty_brain"]["embedding_model"]
+        .as_str()
+        .context("manifest embedding_model")?;
+    let provider = LocalProvider::load_with_max_tokens(model, embed_max_tokens)?;
+    let pin = provider.pin().context("loaded provider has a pin")?;
+    let files: BTreeMap<&str, &str> = [
+        pin.onnx,
+        pin.tokenizer,
+        pin.config,
+        pin.special_tokens_map,
+        pin.tokenizer_config,
+    ]
+    .iter()
+    .map(|f| (f.name, f.sha256))
+    .collect();
+    let meta = json!({
+        "model": manifest["rusty_brain"]["embedding_model"],
+        "dim": manifest["rusty_brain"]["embedding_dim"],
+        "input_kind": "document/query (symmetric model; kind ignored)",
+        "hf_repo": pin.repo,
+        "hf_revision": pin.revision,
+        "file_sha256": files,
+        "requested_max_tokens": embed_max_tokens,
+        "max_tokens": provider.max_tokens(),
+        "max_tokens_semantics": "effective truncation read back from the loaded tokenizer; requested_max_tokens null means the pin default",
+    });
+    Ok((provider, meta))
 }
 
 fn run_meta(
     manifest: &serde_json::Value,
     profile: Profile,
-    embed_max_tokens: Option<usize>,
+    embedding: &serde_json::Value,
     diagnostic: bool,
 ) -> serde_json::Value {
     let w = rb_search::Weights::default();
@@ -161,7 +190,7 @@ fn run_meta(
         "rusty_brain_commit": git(&["rev-parse", "HEAD"]),
         "rusty_brain_dirty": git(&["status", "--porcelain"]).map(|s| !s.is_empty()),
         "mempalace_commit": manifest["mempalace"]["commit"],
-        "embedding": {"model": manifest["rusty_brain"]["embedding_model"], "dim": manifest["rusty_brain"]["embedding_dim"], "input_kind": "document/query (symmetric model; kind ignored)", "max_tokens": max_tokens_json(embed_max_tokens)},
+        "embedding": embedding,
         "fusion": if profile == Profile::Native { "production default (Linear) + heuristic enrichment" } else { "none (vector index only)" },
         "os": format!("{} {}", std::env::consts::OS, std::env::consts::ARCH),
         "db": "in-memory fresh per question; logical_db_bytes = SQLite main page_count * page_size after recall (includes free pages/indexes; excludes WAL, RSS, physical filesystem bytes)",
@@ -417,13 +446,8 @@ async fn convomem_cmd(
     if pinned != pins {
         bail!("ConvoMem selection differs from {CONVOMEM_SELECTION}");
     }
-    let model = manifest["rusty_brain"]["embedding_model"]
-        .as_str()
-        .context("embedding_model")?;
-    let provider = Arc::new(LocalProvider::load_with_max_tokens(
-        model,
-        embed_max_tokens,
-    )?);
+    let (local, embedding) = load_embedder(manifest, embed_max_tokens)?;
+    let provider = Arc::new(local);
     std::fs::create_dir_all(&out)?;
     let wall = Instant::now();
     let mut records = Vec::with_capacity(selected.len());
@@ -446,7 +470,7 @@ async fn convomem_cmd(
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
     let summary = merge(
-        run_meta(manifest, profile, embed_max_tokens, diagnostic),
+        run_meta(manifest, profile, &embedding, diagnostic),
         json!({
             "benchmark": "convomem",
             "complete": true,
@@ -505,13 +529,8 @@ async fn membench_cmd(
         }
     }
     let items = membench::load(&data, &topic)?;
-    let model = manifest["rusty_brain"]["embedding_model"]
-        .as_str()
-        .context("embedding_model")?;
-    let provider = Arc::new(LocalProvider::load_with_max_tokens(
-        model,
-        embed_max_tokens,
-    )?);
+    let (local, embedding) = load_embedder(manifest, embed_max_tokens)?;
+    let provider = Arc::new(local);
     std::fs::create_dir_all(&out)?;
     let wall = Instant::now();
     let mut records = Vec::with_capacity(items.len());
@@ -543,7 +562,7 @@ async fn membench_cmd(
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
     let summary = merge(
-        run_meta(manifest, profile, embed_max_tokens, diagnostic),
+        run_meta(manifest, profile, &embedding, diagnostic),
         json!({
             "benchmark": "membench",
             "complete": true,
@@ -592,13 +611,8 @@ async fn locomo(
     if let Some(n) = limit {
         samples.truncate(n);
     }
-    let model = manifest["rusty_brain"]["embedding_model"]
-        .as_str()
-        .context("embedding_model")?;
-    let provider = Arc::new(Memo::new(LocalProvider::load_with_max_tokens(
-        model,
-        embed_max_tokens,
-    )?));
+    let (local, embedding) = load_embedder(manifest, embed_max_tokens)?;
+    let provider = Arc::new(Memo::new(local));
     std::fs::create_dir_all(&out)?;
     let tag = format!(
         "{}locomo-top{top_k}-{}{}",
@@ -639,7 +653,7 @@ async fn locomo(
         .collect();
     let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
     query_us.sort_unstable();
-    let mut summary = run_meta(manifest, profile, embed_max_tokens, diagnostic);
+    let mut summary = run_meta(manifest, profile, &embedding, diagnostic);
     let extra = json!({
         "benchmark": "locomo10",
         "complete": limit.is_none(),
@@ -699,13 +713,8 @@ async fn longmemeval(
         entries.truncate(n);
     }
 
-    let model = manifest["rusty_brain"]["embedding_model"]
-        .as_str()
-        .context("manifest embedding_model")?;
-    let provider = Arc::new(LocalProvider::load_with_max_tokens(
-        model,
-        embed_max_tokens,
-    )?);
+    let (local, embedding) = load_embedder(manifest, embed_max_tokens)?;
+    let provider = Arc::new(local);
     std::fs::create_dir_all(&out)?;
     let tag = format!(
         "{}longmemeval-{}{}",
@@ -750,7 +759,7 @@ async fn longmemeval(
     query_us.sort_unstable();
 
     let summary = merge(
-        run_meta(manifest, profile, embed_max_tokens, diagnostic),
+        run_meta(manifest, profile, &embedding, diagnostic),
         json!({
             "benchmark": "longmemeval_s_cleaned",
             "complete": limit.is_none(),

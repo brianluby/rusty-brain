@@ -398,4 +398,57 @@ kanban #100. Nothing was tuned or changed in response.
   unrecoverable, as stated above. The new values describe current code only.
 - September CPU model, RAM and full OS version: unavailable.
 - A reproducible 512-token configuration: not available until kanban #100 pins a
-  model revision that allows it.
+  model revision that allows it. (Resolved the same day; see the next section.)
+
+## Embedding model pin (2026-10-17, kanban #100)
+
+The 256-token finding above has a confirmed cause and a fix.
+
+- **Cause.** Upstream commit `944c7f6` of `Qdrant/all-MiniLM-L6-v2-onnx`
+  (2026-09-27) changed `tokenizer_config.json` `model_max_length` from 512
+  to 256. `model.onnx` is byte-identical across revisions. fastembed 5.15
+  truncates at `min(requested, model_max_length)` without any warning, and
+  hf-hub reuses whatever revision is cached. So older installs kept 512 and
+  fresh installs silently got 256. The September runs (2026-09-26) used
+  revision `5f1b8cd`, the last one allowing 512.
+- **Fix.** The local provider now loads revision
+  `5f1b8cd78bc4fb444dd171e59b18f3a3af89a079` only, checks the SHA-256 of all
+  five files, and fails closed on a mismatch. A token request above the
+  tokenizer's cap is an error instead of a silent clamp. Run metadata records
+  the revision, the file hashes, and the requested and effective token limits
+  (read back from the loaded tokenizer). The default stays 512, the
+  documented setting.
+- **Committed fixtures are unaffected.** Re-recording the semantic-gate
+  replay fixture with the pin gives all 297 vectors byte-identical to the
+  committed fixture at both 512 and 256: every corpus text fits in 256
+  tokens. Only long-input benchmarks tell the settings apart.
+
+### Pinned rerun against the frozen September runs
+
+Diagnostic reruns on the pin branch. "Exact" means per-question ranking order,
+scores and evidence recall match the frozen September JSONL on every question;
+the only added field is `channel_scores`.
+
+| Benchmark (metric) | Run | Frozen (Sept) | Pinned rerun | Per-question |
+|---|---|---:|---:|---|
+| LoCoMo (evidence recall@10) | parity, 512 | 0.726 | 0.726 | exact, 1,986/1,986 |
+| LoCoMo (evidence recall@10) | parity, 256 | 0.603 | 0.603 | exact, 1,986/1,986 |
+| LoCoMo (evidence recall@10) | native, 512 | 0.917 | 0.917 | exact, 1,986/1,986 |
+| LongMemEval-S (R@5) | parity, 512 | 0.960 | 0.960 | exact, 500/500 |
+| LongMemEval-S (R@5) | native, 512 | 0.980 | 0.980 | exact, 500/500 |
+| ConvoMem (recall@10) | parity, 512 | 0.929 | 0.929 | exact, 250/250 |
+| ConvoMem (recall@10) | native, 512 | 0.913 | 0.913 | exact, 250/250 |
+
+MemBench was not rerun (about an hour per run); its messages are short, and it
+was unchanged across every column above.
+
+### Production setting: keep 512
+
+The measured evidence favors keeping 512 tokens. It is the documented default
+behind every committed baseline. It is better wherever inputs are long
+(LoCoMo native 0.917 versus 0.900 at 256, parity 0.726 versus 0.603;
+LongMemEval native R@5 0.980 versus 0.978), and
+equal wherever they are short (ConvoMem, MemBench, and the semantic-gate
+corpus). 256 remains available explicitly (`--embed-max-tokens 256`) as the
+MemPalace-parity setting. Nothing was tuned; the frozen September artifacts
+are unchanged.

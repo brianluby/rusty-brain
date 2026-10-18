@@ -318,7 +318,7 @@ good real-world recall. For meaningful semantic recall, configure a real provide
 |---|---|---|
 | Deterministic (default) | (none) | Offline, non-semantic. Fallback when nothing else is configured. |
 | Voyage API | set `VOYAGE_API_KEY` | Remote HTTP embeddings (`voyage-3-lite`, dim 512). |
-| Local ONNX | build `--features local`, then set `RB_EMBED_BACKEND=local` | Downloads `all-MiniLM-L6-v2` (dim 384) on first use via `fastembed`. |
+| Local ONNX | build `--features local`, then set `RB_EMBED_BACKEND=local` | Downloads `all-MiniLM-L6-v2` (dim 384) on first use via `fastembed`, at a pinned Hugging Face revision with SHA-256-checked files; inputs truncate at 512 tokens. Loading fails closed on a hash mismatch. |
 
 The embedding dimension AND model identity are fixed at first daemon init and checked
 fail-closed on every startup (vector reads are length-checked too); switching
