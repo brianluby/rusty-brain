@@ -1680,7 +1680,7 @@ async fn recall_and_list_filters_flow_over_the_wire() {
     .unwrap();
     let resp: rb_proto::Response = rb_proto::read_frame(&mut framed).await.unwrap();
     match resp {
-        rb_proto::Response::Listed { memories } => {
+        rb_proto::Response::Listed { memories, .. } => {
             let got: std::collections::HashSet<_> = memories.iter().map(|n| n.id.clone()).collect();
             assert_eq!(
                 got,

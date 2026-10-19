@@ -6,8 +6,8 @@
 use crate::codec::bounded_framed;
 use crate::frame::{read_frame, write_frame};
 use crate::messages::{
-    request_uses_human_curation, Handshake, HandshakeAck, Request, Response, ScrubResult,
-    CONTRACT_VERSION,
+    request_uses_as_of, request_uses_human_curation, Handshake, HandshakeAck, Request, Response,
+    ScrubResult, CONTRACT_VERSION,
 };
 use crate::{response_error_to_error, Response as Resp};
 use futures::SinkExt;
@@ -38,12 +38,20 @@ pub struct Client<S = UnixStream> {
     /// Whether the daemon accepts durable curation intent on write requests.
     supports_human_curation: bool,
     supports_legacy_quarantine: bool,
+    /// Whether the daemon advertised [`crate::CAP_AS_OF`]: it honors
+    /// `RecallFilter.as_of` instead of dropping it (Vikunja #102).
+    supports_as_of: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
 enum ConnectionState {
     Idle,
-    AwaitingResponse { subscribe: bool },
+    /// `as_of`: the pending request asked for a point-in-time list, so its
+    /// `Listed` answer must carry the as-of envelope (Vikunja #102).
+    AwaitingResponse {
+        subscribe: bool,
+        as_of: bool,
+    },
     Streaming,
     Poisoned,
 }
@@ -133,6 +141,7 @@ where
                 .capabilities
                 .iter()
                 .any(|c| c == crate::CAP_LEGACY_QUARANTINE),
+            supports_as_of: ack.capabilities.iter().any(|c| c == crate::CAP_AS_OF),
         })
     }
 
@@ -143,6 +152,12 @@ where
     #[must_use]
     pub fn supports_anchors(&self) -> bool {
         self.supports_anchors
+    }
+
+    /// Whether the daemon advertised [`crate::CAP_AS_OF`] (Vikunja #102).
+    #[must_use]
+    pub fn supports_as_of(&self) -> bool {
+        self.supports_as_of
     }
 
     /// Whether the daemon advertised support for persistent human curation.
@@ -181,6 +196,16 @@ where
                 "daemon does not advertise human curation support".to_string(),
             ));
         }
+        let as_of = request_uses_as_of(req);
+        if as_of && !self.supports_as_of {
+            // Fail closed (Vikunja #102, the CAP_ANCHORS precedent): an older
+            // daemon would drop `as_of` and answer an active-only list.
+            return Err(Error::InvalidArgument(
+                "this daemon does not support point-in-time lists (no `as_of` capability \
+                 in its handshake); upgrade and restart the daemon to use --as-of"
+                    .to_string(),
+            ));
+        }
         let bytes = serde_json::to_vec(req).map_err(|e| Error::Serialization(e.to_string()))?;
         if bytes.len() > self.framed.codec().max_frame_length() {
             return Err(Error::InvalidArgument(
@@ -195,6 +220,7 @@ where
             .map_err(|e| Error::Io(e.to_string()))?;
         self.state = ConnectionState::AwaitingResponse {
             subscribe: matches!(req, Request::Subscribe { .. }),
+            as_of,
         };
         Ok(())
     }
@@ -204,7 +230,7 @@ where
     /// Cancellation or a malformed/lost response permanently breaks the
     /// connection rather than letting a later request consume its response.
     pub async fn recv_response(&mut self) -> Result<Response> {
-        let ConnectionState::AwaitingResponse { subscribe } = self.state else {
+        let ConnectionState::AwaitingResponse { subscribe, as_of } = self.state else {
             return Err(Error::Io(
                 "connection has no readable pending response or is broken".into(),
             ));
@@ -220,6 +246,15 @@ where
         } else {
             ConnectionState::Idle
         };
+        if as_of && matches!(response, Response::Listed { as_of: None, .. }) {
+            // Second guard (Vikunja #102): rows without `temporal_basis` were
+            // not produced by the as-of predicate, so never return them.
+            return Err(Error::Storage(
+                "daemon answered a point-in-time list without temporal_basis; refusing \
+                 rows that may be an ordinary active-only list"
+                    .to_string(),
+            ));
+        }
         Ok(response)
     }
 
@@ -662,6 +697,14 @@ where
         filter: rb_types::RecallFilter,
         limit: usize,
     ) -> Result<Vec<MemoryNote>> {
+        if filter.as_of.is_some() || filter.as_of_after.is_some() {
+            // Dropping the envelope would hide `truncated` from the caller.
+            return Err(Error::InvalidArgument(
+                "an as_of filter goes through Client::list_as_of, which returns its \
+                 truncation envelope"
+                    .to_string(),
+            ));
+        }
         self.ensure_filter_sendable(&filter)?;
         let (min_importance, filter) = filter.split_list_legacy();
         let resp = self
@@ -672,7 +715,42 @@ where
             })
             .await?;
         match resp {
-            Resp::Listed { memories } => Ok(memories),
+            Resp::Listed { memories, .. } => Ok(memories),
+            other => Err(self.unexpected(other)),
+        }
+    }
+
+    /// One page of a recording-time point-in-time list (Vikunja #102):
+    /// `filter.as_of` must be set (and `filter.as_of_after` to continue from
+    /// a previous page's `next_after`). Fails before sending unless the
+    /// daemon advertised [`crate::CAP_AS_OF`], and fails if the answer lacks
+    /// the as-of envelope (`temporal_basis`) — never an active-only result.
+    pub async fn list_as_of(
+        &mut self,
+        filter: rb_types::RecallFilter,
+        limit: usize,
+    ) -> Result<(Vec<MemoryNote>, rb_types::AsOfPage)> {
+        if filter.as_of.is_none() {
+            return Err(Error::InvalidArgument(
+                "list_as_of requires filter.as_of".to_string(),
+            ));
+        }
+        filter.validate()?;
+        self.ensure_filter_sendable(&filter)?;
+        // Every dimension rides the filter (no legacy split): a daemon that
+        // reaches this point advertised as_of, so it reads the whole filter.
+        let resp = self
+            .request(Request::List {
+                min_importance: None,
+                limit,
+                filter,
+            })
+            .await?;
+        match resp {
+            Resp::Listed {
+                memories,
+                as_of: Some(page),
+            } => Ok((memories, page)),
             other => Err(self.unexpected(other)),
         }
     }
@@ -1351,7 +1429,15 @@ mod wrapper_tests {
                     } else {
                         vec![note()]
                     };
-                    Response::Listed { memories }
+                    // As-of probe (keyed on limit=77): a well-behaved as-of
+                    // daemon answers with the envelope; every other list —
+                    // including an as-of one — gets none, which is what a
+                    // daemon that dropped `as_of` would send (Vikunja #102).
+                    let as_of = match filter.as_of {
+                        Some(t) if limit == 77 => Some(rb_types::AsOfPage::recorded(t, None)),
+                        _ => None,
+                    };
+                    Response::Listed { memories, as_of }
                 }
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],
@@ -1479,6 +1565,7 @@ mod wrapper_tests {
                             confidence: 1.0,
                             created_at: chrono::Utc::now(),
                             archived: false,
+                            archived_at: None,
                             contested: false,
                             current: true,
                             is_target: true,
@@ -1855,6 +1942,109 @@ mod wrapper_tests {
             .unwrap();
         assert_eq!(id.to_string().len(), 36);
 
+        drop(c);
+        server.await.unwrap();
+    }
+
+    fn as_of_filter() -> rb_types::RecallFilter {
+        rb_types::RecallFilter {
+            as_of: Some(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            ..Default::default()
+        }
+    }
+
+    /// #88 test 11: a daemon without the `as_of` capability would drop the
+    /// field and answer an active-only list, so the client fails BEFORE
+    /// sending, naming the capability — through the typed wrapper and the
+    /// raw request path alike — and the connection stays usable.
+    #[tokio::test]
+    async fn as_of_is_rejected_against_a_daemon_without_the_capability() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        // The fake server answers ANY list with rows, so an Err proves the
+        // request never round-tripped.
+        let server = tokio::spawn(serve(listener, MemoryId::new()));
+        let mut c = connect(&path).await;
+        assert!(!c.supports_as_of());
+
+        let err = c.list_as_of(as_of_filter(), 5).await.unwrap_err();
+        match &err {
+            rb_types::Error::InvalidArgument(msg) => {
+                assert!(
+                    msg.contains("`as_of` capability"),
+                    "names the capability: {msg}"
+                );
+            }
+            other => panic!("expected InvalidArgument, got {other:?}"),
+        }
+        let raw = c
+            .request(Request::List {
+                min_importance: None,
+                limit: 5,
+                filter: as_of_filter(),
+            })
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(raw, rb_types::Error::InvalidArgument(_)),
+            "{raw:?}"
+        );
+        let recall = c
+            .recall_filtered_with_status("q".into(), as_of_filter(), 5)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(recall, rb_types::Error::InvalidArgument(_)),
+            "{recall:?}"
+        );
+        // An as-of filter never leaks through the envelope-dropping wrapper.
+        assert!(c.list_filtered(as_of_filter(), 5).await.is_err());
+
+        // Non-as-of lists still work against the old daemon.
+        let listed = c
+            .list_filtered(rb_types::RecallFilter::default(), 5)
+            .await
+            .unwrap();
+        assert_eq!(listed.len(), 1);
+        drop(c);
+        server.await.unwrap();
+    }
+
+    /// #88 test 12: an as-of request answered WITHOUT `temporal_basis` (no
+    /// as-of envelope) is an error, never rows — on the typed and raw paths.
+    #[tokio::test]
+    async fn as_of_response_without_temporal_basis_is_an_error() {
+        let (_dir, path) = socket_path();
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = tokio::spawn(serve_with_capabilities(
+            listener,
+            MemoryId::new(),
+            vec![crate::CAP_AS_OF.to_string()],
+        ));
+        let mut c = connect(&path).await;
+        assert!(c.supports_as_of());
+
+        let err = c.list_as_of(as_of_filter(), 5).await.unwrap_err();
+        match &err {
+            rb_types::Error::Storage(msg) => assert!(msg.contains("temporal_basis"), "{msg}"),
+            other => panic!("expected a temporal_basis error, got {other:?}"),
+        }
+        let raw = c
+            .request(Request::List {
+                min_importance: None,
+                limit: 5,
+                filter: as_of_filter(),
+            })
+            .await
+            .unwrap_err();
+        assert!(matches!(raw, rb_types::Error::Storage(_)), "{raw:?}");
+
+        // The well-formed answer (limit 77 probe) returns rows + envelope.
+        let (rows, page) = c.list_as_of(as_of_filter(), 77).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(page.temporal_basis, rb_types::TemporalBasis::Recorded);
+        assert_eq!(page.precision, rb_types::TimePrecision::Second);
+        assert!(!page.truncated);
         drop(c);
         server.await.unwrap();
     }

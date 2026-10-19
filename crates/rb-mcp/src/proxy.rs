@@ -623,7 +623,7 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
         // `get` returns full content (the model fetched it deliberately), so it
         // keeps the full JSON as text rather than a truncated projection.
         Response::Got { memory } => ToolContent::json(json!({ "memory": memory }), false),
-        Response::Listed { memories } => {
+        Response::Listed { memories, .. } => {
             let text = if memories.is_empty() {
                 "no stored memories".to_string()
             } else {
@@ -1158,6 +1158,7 @@ mod tests {
                             confidence: 0.9,
                             created_at: now - chrono::Duration::days(1),
                             archived: true,
+                            archived_at: None,
                             contested: false,
                             current: false,
                             is_target: false,
@@ -1176,6 +1177,7 @@ mod tests {
                             confidence: 0.95,
                             created_at: now,
                             archived: false,
+                            archived_at: None,
                             contested: true,
                             current: true,
                             is_target: true,

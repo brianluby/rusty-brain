@@ -360,6 +360,20 @@ pub struct RecallFilter {
     /// Audit list/get deliberately retain quarantined and exhausted rows.
     #[serde(skip)]
     pub recall_eligible: bool,
+    /// Recording-time point-in-time view (Vikunja #102), honored by `list`
+    /// ONLY: membership becomes
+    /// `created_at <= T AND (archived_at IS NULL OR archived_at > T)` and
+    /// REPLACES the `state` predicate (so `state` must stay `Active`).
+    /// Whole seconds only; ranked recall rejects it (archived rows have no
+    /// vectors). Results order by `(created_at, memory_id)` ascending. A
+    /// pre-`as_of` daemon would drop this field and answer an active-only
+    /// list, so clients gate it on the `as_of` handshake capability.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of: Option<chrono::DateTime<chrono::Utc>>,
+    /// Keyset cursor continuing an `as_of` list: only rows strictly after
+    /// this `(created_at, memory_id)` pair. Requires `as_of`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub as_of_after: Option<crate::AsOfCursor>,
 }
 
 impl RecallFilter {
@@ -411,6 +425,44 @@ impl RecallFilter {
         }
         for anchor in &self.anchors {
             anchor.validate()?;
+        }
+        self.validate_as_of()
+    }
+
+    /// The `as_of` rules (Vikunja #102): `as_of` replaces the state predicate,
+    /// and because `state` has no presence bit on the wire it must be the
+    /// default `Active` (which is then ignored); `Archived`/`All` are
+    /// errors. Instants are whole seconds — a sub-second value is rejected
+    /// rather than silently truncated. A cursor needs an `as_of`.
+    fn validate_as_of(&self) -> crate::error::Result<()> {
+        let whole_second = |what: &str, t: chrono::DateTime<chrono::Utc>| {
+            if t.timestamp_subsec_nanos() == 0 {
+                Ok(())
+            } else {
+                Err(crate::error::Error::InvalidArgument(format!(
+                    "{what} {t} has sub-second precision; as_of is exact to whole \
+                     seconds (precision: second)"
+                )))
+            }
+        };
+        let Some(as_of) = self.as_of else {
+            if self.as_of_after.is_some() {
+                return Err(crate::error::Error::InvalidArgument(
+                    "as_of_after is a cursor for an as_of list and requires as_of".to_string(),
+                ));
+            }
+            return Ok(());
+        };
+        if !self.state.is_active() {
+            return Err(crate::error::Error::InvalidArgument(
+                "as_of replaces the archived-state filter: it cannot be combined with \
+                 state archived/all (or --archived)"
+                    .to_string(),
+            ));
+        }
+        whole_second("as_of", as_of)?;
+        if let Some(cursor) = &self.as_of_after {
+            whole_second("as_of_after.created_at", cursor.created_at)?;
         }
         Ok(())
     }
@@ -474,6 +526,14 @@ impl RecallFilter {
             .all(|af| note.anchors.iter().any(|a| af.matches_anchor(a)))
         {
             return false;
+        }
+        if let Some(as_of) = self.as_of {
+            // `as_of` REPLACES the state predicate (Vikunja #102).
+            return crate::as_of::member_as_of(note.created_at, note.archived_at, as_of)
+                && self
+                    .as_of_after
+                    .as_ref()
+                    .is_none_or(|c| c.admits(note.created_at, &note.id));
         }
         self.state.admits_archived(note.archived_at.is_some())
     }
@@ -858,6 +918,11 @@ mod tests {
                 value: "src/server.rs".to_string(),
             }],
             recall_eligible: false,
+            as_of: Some(chrono::DateTime::from_timestamp(1_700_000_000, 0).unwrap()),
+            as_of_after: Some(crate::AsOfCursor {
+                created_at: chrono::DateTime::from_timestamp(1_600_000_000, 0).unwrap(),
+                memory_id: crate::MemoryId::new(),
+            }),
         };
         let json = serde_json::to_string(&filter).unwrap();
         let back: RecallFilter = serde_json::from_str(&json).unwrap();

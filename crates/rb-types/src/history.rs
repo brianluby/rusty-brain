@@ -70,6 +70,13 @@ pub struct HistoryEntry {
     /// `archived_at IS NOT NULL` — a superseded/deleted chain member.
     #[serde(default)]
     pub archived: bool,
+    /// When this member left the active set (archive, supersede or
+    /// retention), Vikunja #102. Write-once, whole-second recording time.
+    /// `None` for an active member — or from a daemon that predates the
+    /// field, in which case the timeline omits the end time rather than
+    /// claiming one. Additive, no CONTRACT_VERSION bump (`contested`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
     /// At least one ACTIVE in-namespace `contradicts` edge touches this member
     /// (the same predicate as the `MemoryNote.contested` read flag).
     #[serde(default)]
@@ -195,6 +202,7 @@ mod tests {
             confidence: 0.8,
             created_at: chrono::Utc::now(),
             archived: false,
+            archived_at: None,
             contested: true,
             current: true,
             is_target: true,

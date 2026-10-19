@@ -324,6 +324,7 @@ mod tests {
                 },
                 Request::List { .. } => Response::Listed {
                     memories: vec![note()],
+                    as_of: None,
                 },
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],
@@ -411,6 +412,7 @@ mod tests {
                             confidence: 1.0,
                             created_at: chrono::Utc::now(),
                             archived: false,
+                            archived_at: None,
                             contested: false,
                             current: true,
                             is_target: true,
@@ -1353,6 +1355,7 @@ mod tests {
                 confidence: memory.confidence,
                 created_at: memory.created_at,
                 archived: false,
+                archived_at: None,
                 contested: false,
                 current: true,
                 is_target: true,

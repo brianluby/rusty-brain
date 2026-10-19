@@ -540,7 +540,12 @@ fn decode_chain_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
     })?;
     let confidence = row.get::<_, f64>(4).map_err(storage)? as f32;
     let created_at = from_ts(row.get::<_, i64>(5).map_err(storage)?)?;
-    let archived = row.get::<_, Option<i64>>(6).map_err(storage)?.is_some();
+    let archived_at = row
+        .get::<_, Option<i64>>(6)
+        .map_err(storage)?
+        .map(from_ts)
+        .transpose()?;
+    let archived = archived_at.is_some();
     let superseded_by = row
         .get::<_, Option<String>>(7)
         .map_err(storage)?
@@ -554,6 +559,7 @@ fn decode_chain_row(row: &rusqlite::Row<'_>) -> Result<ChainRow> {
             confidence,
             created_at,
             archived,
+            archived_at,
             contested: false,
             current: false,
             is_target: false,

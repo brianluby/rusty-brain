@@ -1364,3 +1364,125 @@ fn historical_restore_dedup_crosses_list_limit_without_materializing_oversized_c
         "bounded restore must leave the daemon usable"
     );
 }
+
+/// Vikunja #102 through the binary: `list --as-of` returns what the store
+/// held at T (including a row deleted since), labels the basis, warns and
+/// prints a cursor when truncated, `--after` continues it, `--as-of
+/// --archived` is rejected, and `history` renders "current until".
+#[test]
+fn list_as_of_flows_through_the_binary() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("runtime").join("rb.sock");
+    let db = dir.path().join("rb.db");
+    let exe = cargo_bin("rusty-brain");
+    let config_home = dir.path();
+    let _reap = spawn_daemon(&exe, &socket, &db, config_home);
+    assert!(wait_for_socket(&socket, Duration::from_secs(10)));
+
+    let output = |args: &[&str]| {
+        cli(&exe, &socket, &db, config_home, "as-of-e2e")
+            .args(args)
+            .output()
+            .expect("run cli")
+    };
+    let run = |args: &[&str]| {
+        let out = output(args);
+        assert!(
+            out.status.success(),
+            "{args:?} failed: stderr={:?}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (
+            String::from_utf8_lossy(&out.stdout).into_owned(),
+            String::from_utf8_lossy(&out.stderr).into_owned(),
+        )
+    };
+    let remember = |content: &str| {
+        let (out, _) = run(&["--json", "remember", content]);
+        serde_json::from_str::<serde_json::Value>(out.trim()).unwrap()["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    };
+    let kept = remember("the kept fusion decision");
+    let gone = remember("the retired fusion decision");
+    let (got, _) = run(&["--json", "get", &gone]);
+    let created = serde_json::from_str::<serde_json::Value>(got.trim()).unwrap()["created_at"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let created = chrono::DateTime::parse_from_rfc3339(&created).unwrap();
+    // Both rows exist by the later of the two creation seconds; archive at
+    // least one second after it so the delete is not a member boundary.
+    let t = created.timestamp() + 1;
+    std::thread::sleep(Duration::from_millis(2_100));
+    run(&["delete", &gone]);
+    let as_of = chrono::DateTime::from_timestamp(t, 0)
+        .unwrap()
+        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+
+    // The deleted row was a member at T; the active-only default drops it.
+    let (stdout, stderr) = run(&["list", "--as-of", &as_of]);
+    assert!(stdout.contains("temporal basis: recorded"), "{stdout}");
+    assert!(
+        stdout.contains("retired fusion") && stdout.contains("kept fusion"),
+        "{stdout}"
+    );
+    assert!(!stderr.contains("warning"), "{stderr}");
+    let (stdout, _) = run(&["list"]);
+    assert!(!stdout.contains("retired fusion"), "{stdout}");
+
+    // JSON carries the envelope.
+    let (stdout, _) = run(&["--json", "list", "--as-of", &as_of]);
+    let v: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(v["temporal_basis"], "recorded");
+    assert_eq!(v["precision"], "second");
+    assert_eq!(v["metadata"], "current");
+    assert_eq!(v["truncated"], false);
+    assert_eq!(v["memories"].as_array().unwrap().len(), 2);
+
+    // Truncation: a warning with the cursor; --after continues exactly once.
+    let (first, stderr) = run(&["--json", "list", "--as-of", &as_of, "--limit", "1"]);
+    assert!(
+        stderr.contains("warning") && stderr.contains("--after"),
+        "{stderr}"
+    );
+    let first: serde_json::Value = serde_json::from_str(first.trim()).unwrap();
+    assert_eq!(first["truncated"], true);
+    let cursor = format!(
+        "{}/{}",
+        first["next_after"]["created_at"].as_str().unwrap(),
+        first["next_after"]["memory_id"].as_str().unwrap()
+    );
+    // The printed cursor is exactly the JSON `next_after`, pasteable.
+    assert!(stderr.contains(&format!("--after {cursor}")), "{stderr}");
+    let token = cursor;
+    let (second, stderr) = run(&[
+        "--json", "list", "--as-of", &as_of, "--limit", "1", "--after", &token,
+    ]);
+    let second: serde_json::Value = serde_json::from_str(second.trim()).unwrap();
+    assert_eq!(second["truncated"], false, "{stderr}");
+    let mut ids = vec![
+        first["memories"][0]["id"].as_str().unwrap().to_string(),
+        second["memories"][0]["id"].as_str().unwrap().to_string(),
+    ];
+    ids.sort();
+    let mut want = vec![kept.clone(), gone.clone()];
+    want.sort();
+    assert_eq!(ids, want, "both members exactly once");
+
+    // State conflict and precision are rejected before any request.
+    assert!(!output(&["list", "--as-of", &as_of, "--archived"])
+        .status
+        .success());
+    assert!(!output(&["list", "--as-of", "2026-08-15T00:00:00.5Z"])
+        .status
+        .success());
+    assert!(!output(&["list", "--after", &token]).status.success());
+
+    // History renders when the deleted version stopped being current.
+    let (stdout, _) = run(&["history", &gone]);
+    assert!(stdout.contains("current until"), "{stdout}");
+    let (stdout, _) = run(&["history", &kept]);
+    assert!(!stdout.contains("current until"), "{stdout}");
+}

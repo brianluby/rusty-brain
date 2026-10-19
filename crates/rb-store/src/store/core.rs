@@ -1135,10 +1135,34 @@ fn build_filter_predicate(
         sql.push_str(&format!("?{}", params.len()));
     }
 
-    match filter.state {
-        rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
-        rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
-        rb_types::MemoryState::All => {}
+    if let Some(as_of) = filter.as_of {
+        // Recording-time membership at whole-second T (Vikunja #102). It
+        // REPLACES the state predicate: `archived_at` is write-once, so a row
+        // archived after T was still a member at T. Validation already
+        // rejected sub-second instants and a non-Active state. Kept in
+        // lockstep with `RecallFilter::matches` by the
+        // `as_of_filter_agrees_with_recall_filter_matches` drift test.
+        params.push(Box::new(as_of.timestamp()));
+        let t = params.len();
+        sql.push_str(&format!(
+            " AND m.created_at <= ?{t} AND (m.archived_at IS NULL OR m.archived_at > ?{t})"
+        ));
+        if let Some(cursor) = &filter.as_of_after {
+            // Keyset continuation over the (created_at, memory_id) order.
+            params.push(Box::new(cursor.created_at.timestamp()));
+            let c = params.len();
+            params.push(Box::new(cursor.memory_id.to_string()));
+            let id = params.len();
+            sql.push_str(&format!(
+                " AND (m.created_at > ?{c} OR (m.created_at = ?{c} AND m.memory_id > ?{id}))"
+            ));
+        }
+    } else {
+        match filter.state {
+            rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
+            rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
+            rb_types::MemoryState::All => {}
+        }
     }
     if let Some(min) = filter.min_importance {
         push(
@@ -1356,7 +1380,10 @@ fn build_list_filtered_query(
          FROM memories m WHERE {predicate}"
     );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-    let order = if filter.recall_eligible {
+    let order = if filter.as_of.is_some() {
+        // The keyset order `as_of_after` continues (Vikunja #102).
+        "m.created_at ASC, m.memory_id ASC"
+    } else if filter.recall_eligible {
         "m.importance DESC, m.created_at DESC, m.memory_id ASC"
     } else {
         "m.created_at DESC, m.memory_id ASC"
@@ -1423,6 +1450,13 @@ fn build_recall_predicate(
     ns: &Namespace,
     filter: &rb_types::RecallFilter,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    if filter.as_of.is_some() {
+        // Defense in depth behind the engine check: archived rows have no
+        // vectors, so an as-of ranked recall would silently lose a channel.
+        return Err(Error::InvalidArgument(
+            "as_of applies to list only, not ranked recall".to_string(),
+        ));
+    }
     let (mut sql, mut params) = build_filter_predicate(ns, filter)?;
     params.push(Box::new(f64::from(
         rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE,

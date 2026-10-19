@@ -237,6 +237,12 @@ rusty-brain link <from-id> <to-id> --type contradicts --reason "policy reversed"
 rusty-brain history <id>
 rusty-brain history <id> --depth 3 --json
 
+# what did the store hold as active at an instant? RECORDING time, whole
+# seconds, oldest first; metadata shown is current, purged rows never appear,
+# and it is not validity time. A truncated page warns and prints a cursor.
+rusty-brain list --as-of 2026-08-15T00:00:00Z
+rusty-brain list --as-of 2026-08-15T00:00:00Z --after <created_at>/<id>
+
 # retroactively redact secrets from every stored memory, then re-embed
 rusty-brain scrub
 rusty-brain reembed

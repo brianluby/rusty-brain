@@ -68,6 +68,28 @@ fn parse_review_threshold(s: &str) -> Result<f32, String> {
     Ok(v)
 }
 
+/// Parse an `--as-of` instant (Vikunja #102): RFC 3339 only (no dates or
+/// relative ages), whole seconds only — timestamps are stored as whole Unix
+/// seconds, so a sub-second instant is rejected rather than truncated.
+fn parse_as_of(s: &str) -> Result<chrono::DateTime<chrono::Utc>, String> {
+    let ts = chrono::DateTime::parse_from_rfc3339(s)
+        .map_err(|_| {
+            format!("invalid --as-of '{s}': expected an RFC 3339 instant (2026-08-15T00:00:00Z)")
+        })?
+        .with_timezone(&chrono::Utc);
+    if ts.timestamp_subsec_nanos() != 0 {
+        return Err(format!(
+            "--as-of '{s}' has sub-second precision; as-of is exact to whole seconds"
+        ));
+    }
+    Ok(ts)
+}
+
+/// Parse an `--after` cursor as printed by a truncated `--as-of` list.
+fn parse_as_of_cursor(s: &str) -> Result<rb_types::AsOfCursor, String> {
+    rb_types::AsOfCursor::parse_token(s).map_err(|e| e.to_string())
+}
+
 /// Parse a `--since`/`--until` bound: an RFC 3339 timestamp
 /// (`2026-07-10T12:00:00Z`), a date (`2026-07-01`, midnight UTC), or a
 /// now-relative age (`7d`, `36h`, `45m`, `10s`).
@@ -501,6 +523,16 @@ pub enum Command {
         /// Only memories anchored to this symbol (repeatable).
         #[arg(long = "symbol", value_parser = parse_symbol_filter)]
         symbol: Vec<rb_types::AnchorFilter>,
+        /// Point-in-time view: the memories the store held as active at this
+        /// RFC 3339 instant (whole seconds), as RECORDED — not when facts
+        /// were true. Metadata shown is current; purged rows never appear.
+        /// Ordered oldest first. Cannot be combined with --archived.
+        #[arg(long = "as-of", value_parser = parse_as_of, conflicts_with = "archived")]
+        as_of: Option<chrono::DateTime<chrono::Utc>>,
+        /// Continue a truncated --as-of list from the cursor it printed
+        /// (`<created_at>/<memory id>`).
+        #[arg(long, value_parser = parse_as_of_cursor, requires = "as_of")]
+        after: Option<rb_types::AsOfCursor>,
     },
 
     /// Show memories connected to an id by graph links.
@@ -908,6 +940,55 @@ mod tests {
                 assert!(!archived);
             }
             other => panic!("expected List, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn as_of_flags_parse_and_conflict_with_archived() {
+        // Vikunja #102 / #88 test 7: --as-of --archived is a usage error.
+        let cli = Cli::parse_from(["rusty-brain", "list", "--as-of", "2026-08-15T00:00:00Z"]);
+        match cli.command {
+            Command::List { as_of, after, .. } => {
+                assert_eq!(as_of.unwrap().timestamp(), 1_786_752_000);
+                assert!(after.is_none());
+            }
+            other => panic!("expected List, got {other:?}"),
+        }
+        let id = rb_types::MemoryId::new();
+        let token = format!("2026-08-01T00:00:00Z/{id}");
+        let cli = Cli::parse_from([
+            "rusty-brain",
+            "list",
+            "--as-of",
+            "2026-08-15T00:00:00Z",
+            "--after",
+            &token,
+        ]);
+        match cli.command {
+            Command::List { after, .. } => assert_eq!(after.unwrap().memory_id, id),
+            other => panic!("expected List, got {other:?}"),
+        }
+        for bad in [
+            vec!["list", "--as-of", "2026-08-15T00:00:00Z", "--archived"],
+            // Whole seconds only, RFC 3339 only (no dates or relative ages).
+            vec!["list", "--as-of", "2026-08-15T00:00:00.250Z"],
+            vec!["list", "--as-of", "2026-08-15"],
+            vec!["list", "--as-of", "7d"],
+            // A cursor needs an --as-of.
+            vec!["list", "--after", &token],
+            vec![
+                "list",
+                "--as-of",
+                "2026-08-15T00:00:00Z",
+                "--after",
+                "garbage",
+            ],
+        ] {
+            let argv: Vec<&str> = std::iter::once("rusty-brain").chain(bad.clone()).collect();
+            assert!(
+                Cli::try_parse_from(argv).is_err(),
+                "{bad:?} must be rejected"
+            );
         }
     }
 

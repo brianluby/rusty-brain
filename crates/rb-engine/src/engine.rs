@@ -574,6 +574,16 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         use std::collections::HashMap;
 
         Self::ensure_filter_supported(filter)?;
+        if filter.as_of.is_some() {
+            // Vikunja #102: as_of is a list-only view. Archived rows have no
+            // vectors, so a ranked as-of recall would silently lose its
+            // vector channel; a filtered list is the honest surface.
+            return Err(rb_types::Error::InvalidArgument(
+                "as_of applies to list only, not ranked recall (archived rows have no \
+                 vectors); use list --as-of"
+                    .to_string(),
+            ));
+        }
 
         // Retain ranking headroom among eligible candidates, not post-filter headroom.
         let candidate_limit = limit.saturating_mul(4).max(limit);
@@ -1169,6 +1179,42 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         Ok(notes)
     }
 
+    /// One page of a recording-time point-in-time list (Vikunja #102):
+    /// the rows whose membership predicate holds at `filter.as_of`, ordered
+    /// by `(created_at, memory_id)` ascending, after `filter.as_of_after`
+    /// when set. Fetches one row past `limit` so the returned [`AsOfPage`]
+    /// can say `truncated` honestly and carry the `next_after` cursor — an
+    /// audit must never look complete when it is not.
+    ///
+    /// [`AsOfPage`]: rb_types::AsOfPage
+    pub async fn list_as_of(
+        &self,
+        filter: &rb_types::RecallFilter,
+        limit: usize,
+    ) -> rb_types::Result<(Vec<MemoryNote>, rb_types::AsOfPage)> {
+        let Some(as_of) = filter.as_of else {
+            return Err(rb_types::Error::InvalidArgument(
+                "list_as_of requires filter.as_of".to_string(),
+            ));
+        };
+        if limit == 0 {
+            return Err(rb_types::Error::InvalidArgument(
+                "an as_of list needs a limit of at least 1 so its cursor can advance".to_string(),
+            ));
+        }
+        let mut notes = self.list(filter, limit.saturating_add(1)).await?;
+        let next_after = if notes.len() > limit {
+            notes.truncate(limit);
+            notes.last().map(|last| rb_types::AsOfCursor {
+                created_at: last.created_at,
+                memory_id: last.id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok((notes, rb_types::AsOfPage::recorded(as_of, next_after)))
+    }
+
     /// Expand the graph around `id` to `depth` hops and fetch the connected notes.
     pub async fn graph(&self, id: MemoryId, depth: u8) -> rb_types::Result<Vec<MemoryNote>> {
         let Some(anchor) = self.get_scoped(id.clone()).await? else {
@@ -1430,6 +1476,80 @@ mod tests {
             // applies the channel's context default (agent_attested).
             trust_class: None,
         }
+    }
+
+    /// Vikunja #102 (#88 test 13, engine half): `list_as_of` fetches one row
+    /// past the limit, so a full page says `truncated` with a cursor at its
+    /// last row, the final page does not, and every member is seen once.
+    #[tokio::test]
+    async fn list_as_of_reports_truncation_and_pages_with_its_cursor() {
+        let eng = engine();
+        let base = 1_782_864_000;
+        let ids = seed_notes(&eng, 25, |i, note| {
+            note.created_at = chrono::DateTime::from_timestamp(base + (i as i64 % 4), 0).unwrap();
+            // Archived after T: still a member as of T.
+            if i == 3 {
+                note.archived_at = chrono::DateTime::from_timestamp(base + 100, 0);
+            }
+        })
+        .await;
+        let mut filter = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(base + 50, 0),
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let mut truncated_pages = 0;
+        loop {
+            let (rows, page) = eng.list_as_of(&filter, 10).await.unwrap();
+            assert_eq!(page.temporal_basis, rb_types::TemporalBasis::Recorded);
+            seen.extend(rows.iter().map(|n| n.id.clone()));
+            let Some(cursor) = page.next_after else {
+                assert!(!page.truncated);
+                break;
+            };
+            truncated_pages += 1;
+            assert!(page.truncated);
+            assert_eq!(rows.len(), 10);
+            assert_eq!(cursor.memory_id, rows.last().unwrap().id);
+            filter.as_of_after = Some(cursor);
+        }
+        assert_eq!(truncated_pages, 2);
+        let mut want = ids;
+        want.sort_by_key(ToString::to_string);
+        let mut got = seen.clone();
+        got.sort_by_key(ToString::to_string);
+        got.dedup();
+        assert_eq!(got.len(), seen.len(), "no duplicates");
+        assert_eq!(got, want, "every member exactly once");
+
+        // An exactly-full last page is not truncated (the +1 probe is empty).
+        let exact = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(base + 50, 0),
+            ..Default::default()
+        };
+        let (_, page) = eng.list_as_of(&exact, 25).await.unwrap();
+        assert!(!page.truncated && page.next_after.is_none());
+        assert!(eng.list_as_of(&exact, 0).await.is_err());
+        assert!(eng
+            .list_as_of(&rb_types::RecallFilter::default(), 5)
+            .await
+            .is_err());
+    }
+
+    /// #88 test 8, engine half: ranked recall refuses `as_of` (archived rows
+    /// have no vectors) rather than silently dropping a channel.
+    #[tokio::test]
+    async fn recall_rejects_as_of() {
+        let eng = engine();
+        let filter = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(1_782_864_000, 0),
+            ..Default::default()
+        };
+        let err = eng.recall_with_status("q", 5, &filter).await.unwrap_err();
+        assert!(
+            matches!(&err, rb_types::Error::InvalidArgument(m) if m.contains("list only")),
+            "{err:?}"
+        );
     }
 
     /// Store `n` notes shaped by `shape(i, note)` through the backend directly

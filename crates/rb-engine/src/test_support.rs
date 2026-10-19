@@ -276,6 +276,17 @@ impl MemoryBackend for MockBackend {
             let contested = self.active_contradicts(ns, ids).await?;
             v.retain(|n| contested.contains(&n.id) == want);
         }
+        if filter.as_of.is_some() {
+            // Mirror the store's as-of keyset order (Vikunja #102).
+            v.sort_by(|a, b| {
+                a.created_at
+                    .timestamp()
+                    .cmp(&b.created_at.timestamp())
+                    .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+            });
+            v.truncate(limit);
+            return Ok(v);
+        }
         v.sort_by(|a, b| {
             let importance = if filter.recall_eligible {
                 b.importance.cmp(&a.importance)

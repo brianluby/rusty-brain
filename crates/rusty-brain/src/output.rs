@@ -103,6 +103,42 @@ fn anchors_suffix(n: &MemoryNote) -> String {
     format!(" [anchors: {}]", anchor_labels(n))
 }
 
+/// Render one page of a recording-time point-in-time list (Vikunja #102).
+/// JSON: the as-of envelope (`temporal_basis`, `precision`, `metadata`,
+/// `truncated`, `next_after`, `notes`) with the rows under `memories`.
+/// Human: a header stating the basis and limits, then the rows oldest first.
+pub fn render_as_of_list(notes: &[MemoryNote], page: &rb_types::AsOfPage, json: bool) -> String {
+    if json {
+        let mut value = serde_json::to_value(page).unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "failed to render as-of JSON");
+            serde_json::json!({})
+        });
+        if let Some(map) = value.as_object_mut() {
+            map.insert(
+                "memories".to_string(),
+                serde_json::to_value(notes).unwrap_or_default(),
+            );
+        }
+        return serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string());
+    }
+    let mut out = format!(
+        "As recorded at {} (temporal basis: recorded; precision: second)\n",
+        page.as_of
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    );
+    for note in &page.notes {
+        out.push_str(&format!("  note: {note}\n"));
+    }
+    out.push_str(&render_notes(notes, false));
+    if let Some(cursor) = page.next_after.as_ref().filter(|_| page.truncated) {
+        out.push_str(&format!(
+            "\n(truncated: more memories match; continue with --after {})",
+            cursor.to_token()
+        ));
+    }
+    out
+}
+
 /// Render a list of notes (used by `list` and `graph`).
 pub fn render_notes(notes: &[MemoryNote], json: bool) -> String {
     if json {
@@ -666,6 +702,15 @@ pub fn render_history(history: &rb_types::MemoryHistory, json: bool) -> String {
             flags,
             terminal_text(&entry.summary),
         ));
+        if let Some(archived_at) = entry.archived_at {
+            // Vikunja #102: when this version stopped being current, as
+            // recorded. An older daemon sends no archived_at, so nothing is
+            // claimed for it.
+            out.push_str(&format!(
+                "       current until {}\n",
+                archived_at.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+            ));
+        }
         let predecessors = if entry.predecessors.is_empty() {
             "none in bounded result".to_string()
         } else {
@@ -1998,6 +2043,7 @@ mod tests {
                     confidence: 1.0,
                     created_at: now - chrono::Duration::days(3),
                     archived: true,
+                    archived_at: None,
                     contested: false,
                     current: false,
                     is_target: false,
@@ -2016,6 +2062,7 @@ mod tests {
                     confidence: 0.9,
                     created_at: now,
                     archived: false,
+                    archived_at: None,
                     contested: true,
                     current: true,
                     is_target: true,
@@ -2193,6 +2240,59 @@ mod tests {
         let out = render_history(&history, false);
         assert!(out.contains("target detail/provenance unavailable"));
         assert!(out.contains("source status unavailable"));
+    }
+
+    #[test]
+    fn human_history_renders_current_until_only_when_archived_at_is_known() {
+        // Vikunja #102: an older daemon sends no archived_at — claim nothing.
+        let mut history = sample_history();
+        assert!(!render_history(&history, false).contains("current until"));
+        history.chain[0].archived_at = chrono::DateTime::from_timestamp(1_785_542_400, 0);
+        let out = render_history(&history, false);
+        assert!(out.contains("current until 2026-08-01T00:00:00Z"), "{out}");
+        let json: serde_json::Value =
+            serde_json::from_str(&render_history(&history, true)).unwrap();
+        assert_eq!(json["chain"][0]["archived_at"], "2026-08-01T00:00:00Z");
+        assert!(json["chain"][1].get("archived_at").is_none());
+    }
+
+    #[test]
+    fn as_of_list_states_its_basis_and_cursor() {
+        let t = chrono::DateTime::from_timestamp(1_786_752_000, 0).unwrap();
+        let cursor = rb_types::AsOfCursor {
+            created_at: chrono::DateTime::from_timestamp(1_785_542_400, 0).unwrap(),
+            memory_id: rb_types::MemoryId::new(),
+        };
+        let page = rb_types::AsOfPage::recorded(t, Some(cursor.clone()));
+        let notes = vec![MemoryNote::new(
+            rb_types::Namespace::Global,
+            "Use Linear fusion".into(),
+            rb_types::MemoryType::ArchitectureDecision,
+            6,
+        )];
+        let human = render_as_of_list(&notes, &page, false);
+        assert!(
+            human.contains("As recorded at 2026-08-15T00:00:00Z"),
+            "{human}"
+        );
+        assert!(human.contains("temporal basis: recorded; precision: second"));
+        assert!(
+            human.contains("metadata (summary, tags, importance, confidence) is the current value")
+        );
+        assert!(human.contains("purged rows never appear"));
+        assert!(human.contains("Use Linear fusion"));
+        assert!(
+            human.contains(&format!("--after {}", cursor.to_token())),
+            "{human}"
+        );
+
+        let json: serde_json::Value =
+            serde_json::from_str(&render_as_of_list(&notes, &page, true)).unwrap();
+        assert_eq!(json["temporal_basis"], "recorded");
+        assert_eq!(json["precision"], "second");
+        assert_eq!(json["metadata"], "current");
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["memories"].as_array().unwrap().len(), 1);
     }
 
     #[test]

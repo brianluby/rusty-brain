@@ -485,6 +485,25 @@ A single SQLite file holds everything, opened in WAL mode:
   identity, the current embedding composition version, and the `site_id` (uuid v4)
   stamped onto oplog rows.
 
+**Point-in-time lists (recording time).** Every timestamp is recording
+(transaction) time stored as whole Unix seconds, and `archived_at` is write-once,
+so `list --as-of T` (`RecallFilter.as_of`, list only) answers "what did the store
+hold as active at T?" with `created_at <= T AND (archived_at IS NULL OR
+archived_at > T)`. It replaces the archived-state predicate (`--archived`, or a
+wire `state` other than the default, is a validation error), rejects sub-second
+instants, orders by `(created_at, memory_id)` and pages with a `next_after`
+keyset cursor (`truncated` is computed by fetching one row past the daemon's
+1,000-row clamp or the requested limit). Its limits are stated in every
+response (`temporal_basis: "recorded"`, `precision: "second"`, `metadata:
+"current"`): it is not validity time, a row created and archived in the same
+second is never a member, summary/tags/importance/confidence are the current
+values, and purged rows never appear. Ranked recall refuses `as_of` because
+archived rows have no vectors. The daemon advertises an `as_of` handshake
+capability and clients refuse to send `as_of` without it, because an older
+daemon would drop the field and answer an ordinary active-only list. `history`
+entries carry each version's `archived_at` ("current until"). See
+`docs/eval/2026-10-18-point-in-time-recall-assessment.md` (Vikunja #88/#102).
+
 Migrations are individual `NNN_*.sql` files discovered at build time, checksummed, and
 applied transactionally. A CI test builds a brand-new database from the committed SQL
 and runs every query path against it, so the schema the code expects and the schema the
