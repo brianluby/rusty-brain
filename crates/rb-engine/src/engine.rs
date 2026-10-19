@@ -320,12 +320,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let (note, embedding) = self.compose_note(input).await?;
         let id = note.id.clone();
         let embedding_for_links = embedding.clone();
-        if let Some((old, allow_curated_supersede)) = supersedes {
-            self.backend
-                .write_superseding(note, embedding, old, allow_curated_supersede)
-                .await?;
-        } else {
-            self.backend.write(note, embedding).await?;
+        // Recording time (Vikunja #102): a fresh write is stamped at the
+        // backend's write transaction, not at compose time. A pinned clock
+        // (eval determinism) keeps the composed, pinned stamps.
+        match (supersedes, self.fixed_now.is_some()) {
+            (Some((old, allow)), false) => {
+                self.backend
+                    .write_superseding_recorded_now(note, embedding, old, allow)
+                    .await?;
+            }
+            (Some((old, allow)), true) => {
+                self.backend
+                    .write_superseding(note, embedding, old, allow)
+                    .await?;
+            }
+            (None, false) => self.backend.write_recorded_now(note, embedding).await?,
+            (None, true) => self.backend.write(note, embedding).await?,
         }
 
         // Best-effort link generation: never fails the remember.

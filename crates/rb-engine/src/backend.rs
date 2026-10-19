@@ -15,6 +15,33 @@ pub trait MemoryBackend: Send + Sync {
         old: MemoryId,
         allow_curated_supersede: bool,
     ) -> rb_types::Result<()>;
+    /// [`MemoryBackend::write`] for a FRESH memory (Vikunja #102): the
+    /// backend re-stamps `created_at`/`updated_at` at its write transaction,
+    /// because the engine composed the note (and its times) before
+    /// enrichment, embedding and the writer queue. Recording-time `as_of`
+    /// must never show a memory before it was stored. `write` keeps the
+    /// caller's times (fixtures, imports). The default delegates to `write`.
+    async fn write_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+    ) -> rb_types::Result<()> {
+        self.write(note, embedding).await
+    }
+    /// [`MemoryBackend::write_superseding`] for a FRESH replacement: one
+    /// in-transaction instant stamps the replacement's `created_at` and the
+    /// old row's `archived_at`, so as of any second exactly one version is a
+    /// member. The default delegates to `write_superseding`.
+    async fn write_superseding_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        self.write_superseding(note, embedding, old, allow_curated_supersede)
+            .await
+    }
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
     /// Candidates must satisfy the COMPLETE filter (including contested),
     /// namespace, quarantine and recall-confidence eligibility BEFORE the
