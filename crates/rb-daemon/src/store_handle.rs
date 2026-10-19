@@ -134,6 +134,8 @@ enum WriteCommand {
     Insert {
         note: Box<MemoryNote>,
         embedding: Option<Vec<f32>>,
+        /// Re-stamp the write times at the transaction (Vikunja #102).
+        recorded_now: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     InsertSuperseding {
@@ -141,6 +143,8 @@ enum WriteCommand {
         embedding: Option<Vec<f32>>,
         old: MemoryId,
         allow_curated_supersede: bool,
+        /// Re-stamp the write times at the transaction (Vikunja #102).
+        recorded_now: bool,
         reply: oneshot::Sender<Result<()>>,
     },
     Update {
@@ -896,6 +900,42 @@ impl StoreHandle {
                 read_pool_metrics_snapshot(&read_metrics, read_pool_capacity),
             )
         })
+    }
+
+    async fn insert(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        recorded_now: bool,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::Insert {
+            note: Box::new(note),
+            embedding,
+            recorded_now,
+            reply,
+        };
+        self.send_write(cmd, rx).await
+    }
+
+    async fn insert_superseding(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+        recorded_now: bool,
+    ) -> Result<()> {
+        let (reply, rx) = oneshot::channel();
+        let cmd = WriteCommand::InsertSuperseding {
+            note: Box::new(note),
+            embedding,
+            old,
+            allow_curated_supersede,
+            recorded_now,
+            reply,
+        };
+        self.send_write(cmd, rx).await
     }
 
     async fn send_write<T>(
@@ -1670,6 +1710,7 @@ fn writer_loop(
             WriteCommand::Insert {
                 note,
                 embedding,
+                recorded_now,
                 reply,
             } => {
                 let namespace = note.namespace.clone();
@@ -1679,7 +1720,14 @@ fn writer_loop(
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    |s| s.insert_memory(&note, embedding.as_deref()),
+                    |s| {
+                        if recorded_now {
+                            // Recording time is the write transaction's (#102).
+                            s.insert_memory_recorded_now(&note, embedding.as_deref())
+                        } else {
+                            s.insert_memory(&note, embedding.as_deref())
+                        }
+                    },
                 );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
@@ -1702,6 +1750,7 @@ fn writer_loop(
                 embedding,
                 old,
                 allow_curated_supersede,
+                recorded_now,
                 reply,
             } => {
                 let namespace = note.namespace.clone();
@@ -1713,12 +1762,21 @@ fn writer_loop(
                     embedding_dim,
                     embedding_model.as_deref(),
                     |s| {
-                        seqs = Some(s.insert_superseding_memory(
-                            &note,
-                            embedding.as_deref(),
-                            &old,
-                            allow_curated_supersede,
-                        )?);
+                        seqs = Some(if recorded_now {
+                            s.insert_superseding_memory_recorded_now(
+                                &note,
+                                embedding.as_deref(),
+                                &old,
+                                allow_curated_supersede,
+                            )?
+                        } else {
+                            s.insert_superseding_memory(
+                                &note,
+                                embedding.as_deref(),
+                                &old,
+                                allow_curated_supersede,
+                            )?
+                        });
                         Ok(())
                     },
                 );
@@ -2479,13 +2537,15 @@ impl MemoryBackend for StoreHandle {
     }
 
     async fn write(&self, note: MemoryNote, embedding: Option<Vec<f32>>) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::Insert {
-            note: Box::new(note),
-            embedding,
-            reply,
-        };
-        self.send_write(cmd, rx).await
+        self.insert(note, embedding, false).await
+    }
+
+    async fn write_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+    ) -> Result<()> {
+        self.insert(note, embedding, true).await
     }
 
     async fn write_superseding(
@@ -2495,15 +2555,19 @@ impl MemoryBackend for StoreHandle {
         old: MemoryId,
         allow_curated_supersede: bool,
     ) -> Result<()> {
-        let (reply, rx) = oneshot::channel();
-        let cmd = WriteCommand::InsertSuperseding {
-            note: Box::new(note),
-            embedding,
-            old,
-            allow_curated_supersede,
-            reply,
-        };
-        self.send_write(cmd, rx).await
+        self.insert_superseding(note, embedding, old, allow_curated_supersede, false)
+            .await
+    }
+
+    async fn write_superseding_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> Result<()> {
+        self.insert_superseding(note, embedding, old, allow_curated_supersede, true)
+            .await
     }
 
     async fn get(&self, ns: Namespace, id: MemoryId) -> Result<Option<MemoryNote>> {

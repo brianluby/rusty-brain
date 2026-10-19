@@ -15,6 +15,33 @@ pub trait MemoryBackend: Send + Sync {
         old: MemoryId,
         allow_curated_supersede: bool,
     ) -> rb_types::Result<()>;
+    /// [`MemoryBackend::write`] for a FRESH memory (Vikunja #102): the
+    /// backend re-stamps `created_at`/`updated_at` at its write transaction,
+    /// because the engine composed the note (and its times) before
+    /// enrichment, embedding and the writer queue. Recording-time `as_of`
+    /// must never show a memory before it was stored. `write` keeps the
+    /// caller's times (fixtures, imports). The default delegates to `write`.
+    async fn write_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+    ) -> rb_types::Result<()> {
+        self.write(note, embedding).await
+    }
+    /// [`MemoryBackend::write_superseding`] for a FRESH replacement: one
+    /// in-transaction instant stamps the replacement's `created_at` and the
+    /// old row's `archived_at`, so as of any second exactly one version is a
+    /// member. The default delegates to `write_superseding`.
+    async fn write_superseding_recorded_now(
+        &self,
+        note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        self.write_superseding(note, embedding, old, allow_curated_supersede)
+            .await
+    }
     async fn get(&self, ns: Namespace, id: MemoryId) -> rb_types::Result<Option<MemoryNote>>;
     /// Candidates must satisfy the COMPLETE filter (including contested),
     /// namespace, quarantine and recall-confidence eligibility BEFORE the
@@ -456,6 +483,50 @@ mod tests {
             note.embedding_input_version = input_version;
             Ok(())
         }
+    }
+
+    /// Vikunja #102: the default `*_recorded_now` methods forward to `write`
+    /// / `write_superseding` unchanged, so a backend without a transaction
+    /// clock (in-memory test doubles) keeps the composed note as given.
+    #[tokio::test]
+    async fn recorded_now_defaults_forward_to_the_plain_writes() {
+        let backend = MockBackend::default();
+        let mut old = MemoryNote::new(Namespace::Global, "old".into(), MemoryType::Insight, 5);
+        old.created_at = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let old_id = old.id.clone();
+        backend
+            .write_recorded_now(old.clone(), Some(vec![0.1]))
+            .await
+            .unwrap();
+        let stored = backend
+            .get(Namespace::Global, old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.created_at, old.created_at, "forwarded unchanged");
+        assert_eq!(backend.embeddings.lock().unwrap()[&old_id], vec![0.1]);
+
+        let new = MemoryNote::new(Namespace::Global, "new".into(), MemoryType::Insight, 5);
+        let new_id = new.id.clone();
+        backend
+            .write_superseding_recorded_now(new, None, old_id.clone(), false)
+            .await
+            .unwrap();
+        let old_now = backend
+            .get(Namespace::Global, old_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old_now.superseded_by,
+            Some(new_id.clone()),
+            "supersede forwarded"
+        );
+        assert!(backend
+            .get(Namespace::Global, new_id)
+            .await
+            .unwrap()
+            .is_some());
     }
 
     #[tokio::test]

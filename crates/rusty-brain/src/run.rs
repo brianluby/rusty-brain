@@ -68,6 +68,8 @@ fn build_recall_filter(
         },
         anchors,
         recall_eligible: false,
+        as_of: None,
+        as_of_after: None,
     }
 }
 
@@ -543,8 +545,10 @@ async fn run_client(
             file,
             commit,
             symbol,
+            as_of,
+            after,
         } => {
-            let filter = build_recall_filter(
+            let mut filter = build_recall_filter(
                 memory_type,
                 tags,
                 min_importance,
@@ -558,11 +562,38 @@ async fn run_client(
                 archived,
                 collect_anchor_filters(file, commit, symbol),
             );
-            let notes = client
-                .list_filtered(filter, limit)
-                .await
-                .context("list failed")?;
-            println!("{}", output::render_notes(&notes, json));
+            if let Some(as_of) = as_of {
+                // Recording-time point-in-time page (Vikunja #102).
+                filter.as_of = Some(as_of);
+                filter.as_of_after = after;
+                let (notes, page) = client
+                    .list_as_of(filter, limit)
+                    .await
+                    .context("list --as-of failed")?;
+                if page.truncated {
+                    // stderr so `--json` stdout stays machine-parseable; an
+                    // audit must never look complete when it is not.
+                    let cursor = page
+                        .next_after
+                        .as_ref()
+                        .map(rb_types::AsOfCursor::to_token)
+                        .unwrap_or_default();
+                    eprintln!(
+                        "warning: more memories match as of {} than this page holds \
+                         ({} shown); continue with --after {cursor}",
+                        page.as_of
+                            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        notes.len()
+                    );
+                }
+                println!("{}", output::render_as_of_list(&notes, &page, json));
+            } else {
+                let notes = client
+                    .list_filtered(filter, limit)
+                    .await
+                    .context("list failed")?;
+                println!("{}", output::render_notes(&notes, json));
+            }
         }
         Command::Graph { id, depth } => {
             let id = parse_id(&id).context("invalid memory id")?;

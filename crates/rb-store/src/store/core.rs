@@ -394,6 +394,56 @@ impl SqliteStore {
         old: &MemoryId,
         allow_curated_supersede: bool,
     ) -> Result<(u64, Option<u64>)> {
+        self.insert_superseding_inner(note, embedding, old, allow_curated_supersede, false)
+    }
+
+    /// [`Store::insert_memory`] for a FRESH write, with `created_at`/
+    /// `updated_at` re-stamped at the instant the IMMEDIATE transaction holds
+    /// the write lock (Vikunja #102). The engine composes a note — and stamps
+    /// its times — before enrichment, embedding and the writer queue; those
+    /// awaits can cross a second, so the composed `created_at` would claim the
+    /// row was recorded before it was. Recording-time `as_of` needs the
+    /// transaction time. Imports and fixtures that carry historical times
+    /// keep using [`Store::insert_memory`].
+    pub fn insert_memory_recorded_now(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        rb_types::validate_importance(note.importance)?;
+        rb_types::validate_confidence(note.confidence)?;
+        for anchor in &note.anchors {
+            anchor.validate()?;
+        }
+        immediate_tx(&self.conn, || {
+            let note = recorded_at(note, chrono::Utc::now());
+            self.insert_memory_tx_body(&note, embedding)
+        })
+    }
+
+    /// [`SqliteStore::insert_superseding_memory`] for a fresh write: ONE
+    /// instant, taken inside the transaction, stamps both the replacement's
+    /// `created_at` and the superseded row's `archived_at`, so as of any
+    /// second exactly one of them is a member — never both, never neither
+    /// (Vikunja #102).
+    pub fn insert_superseding_memory_recorded_now(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        old: &MemoryId,
+        allow_curated_supersede: bool,
+    ) -> Result<(u64, Option<u64>)> {
+        self.insert_superseding_inner(note, embedding, old, allow_curated_supersede, true)
+    }
+
+    fn insert_superseding_inner(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        old: &MemoryId,
+        allow_curated_supersede: bool,
+        recorded_now: bool,
+    ) -> Result<(u64, Option<u64>)> {
         if note.id == *old {
             return Err(Error::InvalidArgument(
                 "a memory cannot supersede itself".to_string(),
@@ -405,6 +455,14 @@ impl SqliteStore {
             anchor.validate()?;
         }
         immediate_tx(&self.conn, || {
+            let now = chrono::Utc::now();
+            let stamped;
+            let note = if recorded_now {
+                stamped = recorded_at(note, now);
+                &stamped
+            } else {
+                note
+            };
             let old_note = self.get_memory(old)?;
             if let Some(old_note) = &old_note {
                 if old_note.namespace != note.namespace {
@@ -423,7 +481,7 @@ impl SqliteStore {
             if old_note.is_none_or(|old| old.archived_at.is_some() || old.superseded_by.is_some()) {
                 return Ok((created_seq, None));
             }
-            self.supersede_in_tx(old, &note.id)?;
+            self.supersede_in_tx_at(old, &note.id, now.timestamp())?;
             let archived_seq = self
                 .latest_oplog_seq_for(old)?
                 .ok_or_else(|| Error::Storage("supersede oplog row is missing".to_string()))?;
@@ -434,7 +492,11 @@ impl SqliteStore {
     /// General supersede error mapping shared by explicit and automatic writes.
     /// The caller owns the transaction; the structural guard stays unchanged.
     fn supersede_in_tx(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
-        match self.supersede_guarded_in_tx(old, new, chrono::Utc::now().timestamp())? {
+        self.supersede_in_tx_at(old, new, chrono::Utc::now().timestamp())
+    }
+
+    fn supersede_in_tx_at(&self, old: &MemoryId, new: &MemoryId, now_ts: i64) -> Result<()> {
+        match self.supersede_guarded_in_tx(old, new, now_ts)? {
             SupersedeGuard::Applied => Ok(()),
             SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
                 "a memory cannot supersede itself: {old}"
@@ -1135,10 +1197,34 @@ fn build_filter_predicate(
         sql.push_str(&format!("?{}", params.len()));
     }
 
-    match filter.state {
-        rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
-        rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
-        rb_types::MemoryState::All => {}
+    if let Some(as_of) = filter.as_of {
+        // Recording-time membership at whole-second T (Vikunja #102). It
+        // REPLACES the state predicate: `archived_at` is write-once, so a row
+        // archived after T was still a member at T. Validation already
+        // rejected sub-second instants and a non-Active state. Kept in
+        // lockstep with `RecallFilter::matches` by the
+        // `as_of_filter_agrees_with_recall_filter_matches` drift test.
+        params.push(Box::new(as_of.timestamp()));
+        let t = params.len();
+        sql.push_str(&format!(
+            " AND m.created_at <= ?{t} AND (m.archived_at IS NULL OR m.archived_at > ?{t})"
+        ));
+        if let Some(cursor) = &filter.as_of_after {
+            // Keyset continuation over the (created_at, memory_id) order.
+            params.push(Box::new(cursor.created_at.timestamp()));
+            let c = params.len();
+            params.push(Box::new(cursor.memory_id.to_string()));
+            let id = params.len();
+            sql.push_str(&format!(
+                " AND (m.created_at > ?{c} OR (m.created_at = ?{c} AND m.memory_id > ?{id}))"
+            ));
+        }
+    } else {
+        match filter.state {
+            rb_types::MemoryState::Active => sql.push_str(" AND m.archived_at IS NULL"),
+            rb_types::MemoryState::Archived => sql.push_str(" AND m.archived_at IS NOT NULL"),
+            rb_types::MemoryState::All => {}
+        }
     }
     if let Some(min) = filter.min_importance {
         push(
@@ -1328,6 +1414,14 @@ fn build_filter_predicate(
     Ok((sql, params))
 }
 
+/// `note` with its write stamps set to the recording instant `now`.
+pub(crate) fn recorded_at(note: &MemoryNote, now: chrono::DateTime<chrono::Utc>) -> MemoryNote {
+    let mut note = note.clone();
+    note.created_at = now;
+    note.updated_at = now;
+    note
+}
+
 #[allow(clippy::vec_box)]
 fn build_list_filtered_query(
     ns: &Namespace,
@@ -1356,7 +1450,10 @@ fn build_list_filtered_query(
          FROM memories m WHERE {predicate}"
     );
     params.push(Box::new(i64::try_from(limit).unwrap_or(i64::MAX)));
-    let order = if filter.recall_eligible {
+    let order = if filter.as_of.is_some() {
+        // The keyset order `as_of_after` continues (Vikunja #102).
+        "m.created_at ASC, m.memory_id ASC"
+    } else if filter.recall_eligible {
         "m.importance DESC, m.created_at DESC, m.memory_id ASC"
     } else {
         "m.created_at DESC, m.memory_id ASC"
@@ -1423,6 +1520,13 @@ fn build_recall_predicate(
     ns: &Namespace,
     filter: &rb_types::RecallFilter,
 ) -> Result<(String, Vec<Box<dyn rusqlite::ToSql>>)> {
+    if filter.as_of.is_some() {
+        // Defense in depth behind the engine check: archived rows have no
+        // vectors, so an as-of ranked recall would silently lose a channel.
+        return Err(Error::InvalidArgument(
+            "as_of applies to list only, not ranked recall".to_string(),
+        ));
+    }
     let (mut sql, mut params) = build_filter_predicate(ns, filter)?;
     params.push(Box::new(f64::from(
         rb_types::RECALL_MIN_ELIGIBLE_CONFIDENCE,

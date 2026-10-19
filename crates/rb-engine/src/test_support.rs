@@ -27,6 +27,8 @@ pub(crate) struct MockBackend {
     fail_snapshot: std::sync::atomic::AtomicBool,
     changing_snapshot: std::sync::atomic::AtomicBool,
     snapshot_reads: std::sync::atomic::AtomicU64,
+    /// Calls to the `*_recorded_now` write methods (Vikunja #102).
+    pub recorded_now_writes: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBackend {
@@ -125,6 +127,37 @@ impl MemoryBackend for MockBackend {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
         Ok(())
     }
+    /// Like the daemon's store: count the call and stamp the write times at
+    /// "transaction" time, then store as `write` does.
+    async fn write_recorded_now(
+        &self,
+        mut note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+    ) -> rb_types::Result<()> {
+        self.recorded_now_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = chrono::Utc::now();
+        note.created_at = now;
+        note.updated_at = now;
+        self.write(note, embedding).await
+    }
+
+    async fn write_superseding_recorded_now(
+        &self,
+        mut note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        self.recorded_now_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = chrono::Utc::now();
+        note.created_at = now;
+        note.updated_at = now;
+        self.write_superseding(note, embedding, old, allow_curated_supersede)
+            .await
+    }
+
     async fn write_superseding(
         &self,
         note: MemoryNote,
@@ -275,6 +308,17 @@ impl MemoryBackend for MockBackend {
             let ids: Vec<MemoryId> = v.iter().map(|n| n.id.clone()).collect();
             let contested = self.active_contradicts(ns, ids).await?;
             v.retain(|n| contested.contains(&n.id) == want);
+        }
+        if filter.as_of.is_some() {
+            // Mirror the store's as-of keyset order (Vikunja #102).
+            v.sort_by(|a, b| {
+                a.created_at
+                    .timestamp()
+                    .cmp(&b.created_at.timestamp())
+                    .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+            });
+            v.truncate(limit);
+            return Ok(v);
         }
         v.sort_by(|a, b| {
             let importance = if filter.recall_eligible {

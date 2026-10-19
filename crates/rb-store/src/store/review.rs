@@ -594,6 +594,10 @@ impl SqliteStore {
             for anchor in &note.anchors {
                 anchor.validate()?;
             }
+            // Recording time (Vikunja #102): the combined memory is recorded
+            // at the same instant the originals are archived below, not at
+            // its earlier compose time, so `as_of` never shows both.
+            let note = &super::core::recorded_at(note, now);
             self.insert_memory_tx_body(note, embedding)?;
 
             // 4. Copy the originals' external edges onto the combined memory
@@ -1446,6 +1450,40 @@ mod review_tests {
 
     fn merge_key(a: &MemoryId, b: &MemoryId) -> String {
         review_item_key(ReviewReason::NearDuplicate, &[a.clone(), b.clone()])
+    }
+
+    /// Vikunja #102 (PR #109 review): the combined memory is recorded at the
+    /// SAME instant the originals are archived, not at its earlier compose
+    /// time, so an as-of list never shows the merge and its originals at once.
+    #[test]
+    fn review_merge_records_the_combined_memory_at_the_archive_instant() {
+        let store = SqliteStore::open_in_memory(8).unwrap();
+        let a = insert_vec(&store, &ns(), "twin a", v_unit());
+        let b = insert_vec(&store, &ns(), "twin b", v_unit());
+        let mut note = combined_note(&ns(), "combined twin");
+        // Composed an hour before the merge transaction runs.
+        note.created_at -= chrono::Duration::hours(1);
+        note.updated_at = note.created_at;
+        let now = chrono::Utc::now();
+        store
+            .review_merge(
+                &ns(),
+                &a,
+                &b,
+                0.95,
+                &note,
+                Some(&v_unit()),
+                "{}",
+                false,
+                now,
+            )
+            .unwrap();
+        let merged = store.get_memory(&note.id).unwrap().unwrap();
+        assert_eq!(merged.created_at.timestamp(), now.timestamp());
+        for old in [&a, &b] {
+            let m = store.get_memory(old).unwrap().unwrap();
+            assert_eq!(m.archived_at.map(|t| t.timestamp()), Some(now.timestamp()));
+        }
     }
 
     #[test]

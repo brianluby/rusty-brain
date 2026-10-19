@@ -635,6 +635,11 @@ pub fn response_to_content(resp: Response, now: DateTime<Utc>) -> ToolContent {
                 is_error: false,
             }
         }
+        // The MCP tools never set `as_of`, but render the envelope with the
+        // rows if a raw caller does, so the basis is never dropped (#102).
+        Response::ListedAsOf { memories, as_of } => {
+            ToolContent::json(json!({ "memories": memories, "as_of": as_of }), false)
+        }
         Response::GraphResult { memories } => {
             ToolContent::json(json!({ "memories": memories }), false)
         }
@@ -1158,6 +1163,7 @@ mod tests {
                             confidence: 0.9,
                             created_at: now - chrono::Duration::days(1),
                             archived: true,
+                            archived_at: None,
                             contested: false,
                             current: false,
                             is_target: false,
@@ -1176,6 +1182,7 @@ mod tests {
                             confidence: 0.95,
                             created_at: now,
                             archived: false,
+                            archived_at: None,
                             contested: true,
                             current: true,
                             is_target: true,
@@ -1575,6 +1582,22 @@ mod tests {
     fn unknown_tool_is_method_not_found() {
         let err = build_request("frobnicate", &json!({})).unwrap_err();
         assert_eq!(err.code, crate::jsonrpc::METHOD_NOT_FOUND);
+    }
+
+    #[test]
+    fn listed_as_of_keeps_its_envelope_in_tool_content() {
+        // Vikunja #102: a raw as-of answer never loses its temporal basis.
+        let t = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let content = response_to_content(
+            rb_proto::Response::ListedAsOf {
+                memories: vec![note()],
+                as_of: rb_types::AsOfPage::recorded(t, None),
+            },
+            Utc::now(),
+        );
+        assert!(!content.is_error);
+        assert_eq!(content.structured["as_of"]["temporal_basis"], "recorded");
+        assert_eq!(content.structured["memories"].as_array().unwrap().len(), 1);
     }
 
     #[test]

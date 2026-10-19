@@ -7,6 +7,7 @@
 
 mod abstention;
 mod anchor;
+mod as_of;
 mod change;
 mod embedding;
 mod error;
@@ -32,6 +33,9 @@ pub use abstention::{AbstainReason, CorpusSnapshot};
 pub use anchor::{
     kind_str as anchor_kind_str, normalize_anchor_value, parse_file_filter,
     parse_kind as parse_anchor_kind, MemoryAnchor,
+};
+pub use as_of::{
+    member_as_of, AsOfCursor, AsOfPage, MetadataBasis, TemporalBasis, TimePrecision, AS_OF_NOTES,
 };
 pub use change::{ChangeKind, MemoryChanged};
 pub use embedding::EmbeddingInputFingerprint;

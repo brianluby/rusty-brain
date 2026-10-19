@@ -1168,6 +1168,9 @@ async fn handle_connection(
             rb_proto::CAP_ANCHORS.to_string(),
             CAP_HUMAN_CURATION.to_string(),
             rb_proto::CAP_LEGACY_QUARANTINE.to_string(),
+            // Recording-time `as_of` lists (Vikunja #102): clients refuse to
+            // send `as_of` to a daemon that does not advertise this.
+            rb_proto::CAP_AS_OF.to_string(),
         ],
     };
     write_frame(&mut framed, &ack).await?;
@@ -2032,6 +2035,26 @@ where
         }
         Request::Get { id } => match engine.get(id).await {
             Ok(memory) => Response::Got { memory },
+            Err(e) => error_to_response(e),
+        },
+        Request::List {
+            min_importance,
+            limit,
+            filter,
+        } if filter.as_of.is_some() => match engine
+            // Point-in-time page (Vikunja #102): the same MAX_LIMIT clamp,
+            // plus the truncation envelope so an audit never looks complete
+            // when it is not.
+            .list_as_of(
+                &filter.fold_list_legacy(min_importance),
+                limit.min(MAX_LIMIT),
+            )
+            .await
+        {
+            Ok((memories, page)) => Response::ListedAsOf {
+                memories,
+                as_of: page,
+            },
             Err(e) => error_to_response(e),
         },
         Request::List {

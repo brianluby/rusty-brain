@@ -320,12 +320,22 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         let (note, embedding) = self.compose_note(input).await?;
         let id = note.id.clone();
         let embedding_for_links = embedding.clone();
-        if let Some((old, allow_curated_supersede)) = supersedes {
-            self.backend
-                .write_superseding(note, embedding, old, allow_curated_supersede)
-                .await?;
-        } else {
-            self.backend.write(note, embedding).await?;
+        // Recording time (Vikunja #102): a fresh write is stamped at the
+        // backend's write transaction, not at compose time. A pinned clock
+        // (eval determinism) keeps the composed, pinned stamps.
+        match (supersedes, self.fixed_now.is_some()) {
+            (Some((old, allow)), false) => {
+                self.backend
+                    .write_superseding_recorded_now(note, embedding, old, allow)
+                    .await?;
+            }
+            (Some((old, allow)), true) => {
+                self.backend
+                    .write_superseding(note, embedding, old, allow)
+                    .await?;
+            }
+            (None, false) => self.backend.write_recorded_now(note, embedding).await?,
+            (None, true) => self.backend.write(note, embedding).await?,
         }
 
         // Best-effort link generation: never fails the remember.
@@ -574,6 +584,16 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         use std::collections::HashMap;
 
         Self::ensure_filter_supported(filter)?;
+        if filter.as_of.is_some() {
+            // Vikunja #102: as_of is a list-only view. Archived rows have no
+            // vectors, so a ranked as-of recall would silently lose its
+            // vector channel; a filtered list is the honest surface.
+            return Err(rb_types::Error::InvalidArgument(
+                "as_of applies to list only, not ranked recall (archived rows have no \
+                 vectors); use list --as-of"
+                    .to_string(),
+            ));
+        }
 
         // Retain ranking headroom among eligible candidates, not post-filter headroom.
         let candidate_limit = limit.saturating_mul(4).max(limit);
@@ -1169,6 +1189,42 @@ impl<B: MemoryBackend, P: EmbeddingProvider> MemoryEngine<B, P> {
         Ok(notes)
     }
 
+    /// One page of a recording-time point-in-time list (Vikunja #102):
+    /// the rows whose membership predicate holds at `filter.as_of`, ordered
+    /// by `(created_at, memory_id)` ascending, after `filter.as_of_after`
+    /// when set. Fetches one row past `limit` so the returned [`AsOfPage`]
+    /// can say `truncated` honestly and carry the `next_after` cursor — an
+    /// audit must never look complete when it is not.
+    ///
+    /// [`AsOfPage`]: rb_types::AsOfPage
+    pub async fn list_as_of(
+        &self,
+        filter: &rb_types::RecallFilter,
+        limit: usize,
+    ) -> rb_types::Result<(Vec<MemoryNote>, rb_types::AsOfPage)> {
+        let Some(as_of) = filter.as_of else {
+            return Err(rb_types::Error::InvalidArgument(
+                "list_as_of requires filter.as_of".to_string(),
+            ));
+        };
+        if limit == 0 {
+            return Err(rb_types::Error::InvalidArgument(
+                "an as_of list needs a limit of at least 1 so its cursor can advance".to_string(),
+            ));
+        }
+        let mut notes = self.list(filter, limit.saturating_add(1)).await?;
+        let next_after = if notes.len() > limit {
+            notes.truncate(limit);
+            notes.last().map(|last| rb_types::AsOfCursor {
+                created_at: last.created_at,
+                memory_id: last.id.clone(),
+            })
+        } else {
+            None
+        };
+        Ok((notes, rb_types::AsOfPage::recorded(as_of, next_after)))
+    }
+
     /// Expand the graph around `id` to `depth` hops and fetch the connected notes.
     pub async fn graph(&self, id: MemoryId, depth: u8) -> rb_types::Result<Vec<MemoryNote>> {
         let Some(anchor) = self.get_scoped(id.clone()).await? else {
@@ -1430,6 +1486,129 @@ mod tests {
             // applies the channel's context default (agent_attested).
             trust_class: None,
         }
+    }
+
+    /// Vikunja #102 (#88 test 13, engine half): `list_as_of` fetches one row
+    /// past the limit, so a full page says `truncated` with a cursor at its
+    /// last row, the final page does not, and every member is seen once.
+    #[tokio::test]
+    async fn list_as_of_reports_truncation_and_pages_with_its_cursor() {
+        let eng = engine();
+        let base = 1_782_864_000;
+        let ids = seed_notes(&eng, 25, |i, note| {
+            note.created_at = chrono::DateTime::from_timestamp(base + (i as i64 % 4), 0).unwrap();
+            // Archived after T: still a member as of T.
+            if i == 3 {
+                note.archived_at = chrono::DateTime::from_timestamp(base + 100, 0);
+            }
+        })
+        .await;
+        let mut filter = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(base + 50, 0),
+            ..Default::default()
+        };
+        let mut seen = Vec::new();
+        let mut truncated_pages = 0;
+        loop {
+            let (rows, page) = eng.list_as_of(&filter, 10).await.unwrap();
+            assert_eq!(page.temporal_basis, rb_types::TemporalBasis::Recorded);
+            seen.extend(rows.iter().map(|n| n.id.clone()));
+            let Some(cursor) = page.next_after else {
+                assert!(!page.truncated);
+                break;
+            };
+            truncated_pages += 1;
+            assert!(page.truncated);
+            assert_eq!(rows.len(), 10);
+            assert_eq!(cursor.memory_id, rows.last().unwrap().id);
+            filter.as_of_after = Some(cursor);
+        }
+        assert_eq!(truncated_pages, 2);
+        // The MockBackend mirrors the store's keyset order exactly: pages
+        // concatenate to one ascending (created_at, id) sequence.
+        let order: Vec<_> = seen
+            .iter()
+            .map(|id| {
+                let note = eng.backend().notes.lock().unwrap()[id].clone();
+                (note.created_at.timestamp(), id.to_string())
+            })
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "ascending (created_at, memory_id)");
+        let mut want = ids;
+        want.sort_by_key(ToString::to_string);
+        let mut got = seen.clone();
+        got.sort_by_key(ToString::to_string);
+        got.dedup();
+        assert_eq!(got.len(), seen.len(), "no duplicates");
+        assert_eq!(got, want, "every member exactly once");
+
+        // An exactly-full last page is not truncated (the +1 probe is empty).
+        let exact = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(base + 50, 0),
+            ..Default::default()
+        };
+        let (_, page) = eng.list_as_of(&exact, 25).await.unwrap();
+        assert!(!page.truncated && page.next_after.is_none());
+        assert!(eng.list_as_of(&exact, 0).await.is_err());
+        assert!(eng
+            .list_as_of(&rb_types::RecallFilter::default(), 5)
+            .await
+            .is_err());
+    }
+
+    /// Vikunja #102 (PR #109 review): an unpinned `remember` and
+    /// `remember_superseding` route through the backend's `*_recorded_now`
+    /// writes, so the backend stamps recording time at its transaction.
+    #[tokio::test]
+    async fn remember_routes_fresh_writes_through_recorded_now() {
+        let eng = engine();
+        let old = eng.remember(input("the decision is RRF", 6)).await.unwrap();
+        eng.remember_superseding(input("the decision is Linear", 6), old, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            eng.backend().recorded_now_writes.load(Ordering::SeqCst),
+            2,
+            "both fresh writes take the recorded-now path"
+        );
+    }
+
+    /// A pinned clock (eval determinism) keeps the composed, pinned stamps:
+    /// the plain writes, never the recorded-now ones.
+    #[tokio::test]
+    async fn pinned_clock_remember_keeps_the_pinned_stamps() {
+        let pinned = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let eng = engine().with_fixed_now(pinned);
+        let old = eng.remember(input("the decision is RRF", 6)).await.unwrap();
+        let new = eng
+            .remember_superseding(input("the decision is Linear", 6), old.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(eng.backend().recorded_now_writes.load(Ordering::SeqCst), 0);
+        for id in [&old, &new] {
+            assert_eq!(eng.backend().note_of(id).unwrap().created_at, pinned);
+        }
+        // The supersede itself bumps the OLD row's updated_at; the new row
+        // keeps both pinned write stamps.
+        assert_eq!(eng.backend().note_of(&new).unwrap().updated_at, pinned);
+    }
+
+    /// #88 test 8, engine half: ranked recall refuses `as_of` (archived rows
+    /// have no vectors) rather than silently dropping a channel.
+    #[tokio::test]
+    async fn recall_rejects_as_of() {
+        let eng = engine();
+        let filter = rb_types::RecallFilter {
+            as_of: chrono::DateTime::from_timestamp(1_782_864_000, 0),
+            ..Default::default()
+        };
+        let err = eng.recall_with_status("q", 5, &filter).await.unwrap_err();
+        assert!(
+            matches!(&err, rb_types::Error::InvalidArgument(m) if m.contains("list only")),
+            "{err:?}"
+        );
     }
 
     /// Store `n` notes shaped by `shape(i, note)` through the backend directly

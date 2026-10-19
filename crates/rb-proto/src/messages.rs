@@ -61,6 +61,13 @@ pub const CAP_HUMAN_CURATION: &str = "human_curation";
 /// Capability required to preserve historical quarantine during portable restore.
 pub const CAP_LEGACY_QUARANTINE: &str = "legacy_quarantine";
 
+/// Capability a daemon advertises when it honors `RecallFilter.as_of` on
+/// `List` (Vikunja #102). A pre-`as_of` daemon decodes the frame, DROPS the
+/// unknown field and answers an ordinary active-only list — a silently wrong
+/// audit — so clients refuse to send `as_of` without it (the [`CAP_ANCHORS`]
+/// precedent).
+pub const CAP_AS_OF: &str = "as_of";
+
 /// Daemon reply to a `Handshake`.
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct HandshakeAck {
@@ -390,6 +397,20 @@ pub fn request_uses_anchors(req: &Request) -> bool {
     }
 }
 
+/// True when `req` asks for a recording-time point-in-time view
+/// (`filter.as_of` or its cursor) that a pre-`as_of` daemon would silently
+/// drop. `Recall` is included so the capability gate fails before the wire
+/// even though the daemon rejects as-of recall itself.
+#[must_use]
+pub fn request_uses_as_of(req: &Request) -> bool {
+    match req {
+        Request::Recall { filter, .. } | Request::List { filter, .. } => {
+            filter.as_of.is_some() || filter.as_of_after.is_some()
+        }
+        _ => false,
+    }
+}
+
 /// True when `req` asks to mark/unmark curation or override a curation guard.
 /// Typed clients gate these requests on the daemon's advertised capability.
 #[must_use]
@@ -494,6 +515,17 @@ pub enum Response {
     },
     Listed {
         memories: Vec<MemoryNote>,
+    },
+    /// The answer to a `List` whose filter set `as_of` (Vikunja #102): the
+    /// page plus its as-of envelope (`temporal_basis: "recorded"`,
+    /// `precision: "second"`, `metadata: "current"`, `truncated`,
+    /// `next_after`). A separate variant so `Listed` keeps its exact Rust and
+    /// wire shape; only a client that sent `as_of` (which requires the
+    /// [`CAP_AS_OF`] capability) ever receives it, and such a client treats
+    /// a plain `Listed` answer as an error. No CONTRACT_VERSION bump.
+    ListedAsOf {
+        memories: Vec<MemoryNote>,
+        as_of: rb_types::AsOfPage,
     },
     GraphResult {
         memories: Vec<MemoryNote>,
@@ -638,6 +670,68 @@ mod tests {
             MemoryType::ArchitectureDecision,
             8,
         )
+    }
+
+    /// Vikunja #102: `Listed` keeps its exact pre-#102 wire shape, and the
+    /// as-of answer is its own additive `ListedAsOf` variant whose envelope
+    /// round-trips; `request_uses_as_of` sees the filter field or its cursor.
+    #[test]
+    fn listed_as_of_envelope_is_additive_and_requests_are_detected() {
+        let plain = serde_json::to_value(Response::Listed {
+            memories: Vec::new(),
+        })
+        .unwrap();
+        assert_eq!(
+            plain,
+            serde_json::json!({"result": "Listed", "memories": []})
+        );
+        let t0 = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let page = serde_json::to_value(Response::ListedAsOf {
+            memories: Vec::new(),
+            as_of: rb_types::AsOfPage::recorded(t0, None),
+        })
+        .unwrap();
+        assert_eq!(page["result"], "ListedAsOf");
+        assert_eq!(page["as_of"]["temporal_basis"], "recorded");
+        assert_eq!(page["as_of"]["precision"], "second");
+        assert_eq!(page["as_of"]["metadata"], "current");
+        assert!(matches!(
+            serde_json::from_value::<Response>(page).unwrap(),
+            Response::ListedAsOf { .. }
+        ));
+        assert_eq!(CAP_AS_OF, "as_of");
+
+        let t = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let with_as_of = rb_types::RecallFilter {
+            as_of: Some(t),
+            ..Default::default()
+        };
+        let cursor_only = rb_types::RecallFilter {
+            as_of_after: Some(rb_types::AsOfCursor {
+                created_at: t,
+                memory_id: MemoryId::new(),
+            }),
+            ..Default::default()
+        };
+        for filter in [with_as_of, cursor_only] {
+            assert!(request_uses_as_of(&Request::List {
+                min_importance: None,
+                limit: 5,
+                filter: filter.clone(),
+            }));
+            assert!(request_uses_as_of(&Request::Recall {
+                query: "q".into(),
+                memory_type: None,
+                tags: Vec::new(),
+                limit: 5,
+                filter,
+            }));
+        }
+        assert!(!request_uses_as_of(&Request::List {
+            min_importance: None,
+            limit: 5,
+            filter: rb_types::RecallFilter::default(),
+        }));
     }
 
     #[test]
@@ -1302,6 +1396,7 @@ mod tests {
                         confidence: 0.9,
                         created_at: chrono::Utc::now(),
                         archived: false,
+                        archived_at: None,
                         contested: true,
                         current: true,
                         is_target: true,
@@ -1884,6 +1979,7 @@ mod tests {
                     confidence: 0.9,
                     created_at: now,
                     archived: false,
+                    archived_at: None,
                     contested: true,
                     current: true,
                     is_target: true,

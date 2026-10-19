@@ -70,6 +70,13 @@ pub struct HistoryEntry {
     /// `archived_at IS NOT NULL` — a superseded/deleted chain member.
     #[serde(default)]
     pub archived: bool,
+    /// When this member left the active set (archive, supersede or
+    /// retention), Vikunja #102. Write-once, whole-second recording time.
+    /// `None` for an active member — or from a daemon that predates the
+    /// field, in which case the timeline omits the end time rather than
+    /// claiming one. Additive, no CONTRACT_VERSION bump (`contested`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archived_at: Option<chrono::DateTime<chrono::Utc>>,
     /// At least one ACTIVE in-namespace `contradicts` edge touches this member
     /// (the same predicate as the `MemoryNote.contested` read flag).
     #[serde(default)]
@@ -187,6 +194,24 @@ mod tests {
         AnchorKind, LinkType, MemoryAnchor, MemoryId, MemoryType, TrustClass, WriteChannel,
     };
 
+    /// Vikunja #102: `archived_at` is additive — an active entry serializes
+    /// without the key (byte-identical to the pre-#102 frame), and a
+    /// pre-#102 frame decodes it as `None`.
+    #[test]
+    fn archived_at_is_additive_on_the_wire() {
+        let active = entry("active");
+        let v = serde_json::to_value(&active).unwrap();
+        assert!(v.get("archived_at").is_none(), "{v}");
+        let back: HistoryEntry = serde_json::from_value(v).unwrap();
+        assert_eq!(back.archived_at, None);
+        let mut archived = entry("archived");
+        archived.archived = true;
+        archived.archived_at = chrono::DateTime::from_timestamp(1_785_542_400, 0);
+        let v = serde_json::to_value(&archived).unwrap();
+        assert_eq!(v["archived_at"], "2026-08-01T00:00:00Z");
+        assert_eq!(serde_json::from_value::<HistoryEntry>(v).unwrap(), archived);
+    }
+
     fn entry(summary: &str) -> HistoryEntry {
         HistoryEntry {
             id: MemoryId::new(),
@@ -195,6 +220,7 @@ mod tests {
             confidence: 0.8,
             created_at: chrono::Utc::now(),
             archived: false,
+            archived_at: None,
             contested: true,
             current: true,
             is_target: true,

@@ -1,5 +1,7 @@
 //! `SqliteStore`: the concrete `Store` backed by SQLite + sqlite-vec.
 
+#[cfg(test)]
+mod as_of_tests;
 mod core;
 mod history;
 mod internal;
