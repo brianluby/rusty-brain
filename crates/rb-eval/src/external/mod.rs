@@ -7,5 +7,6 @@ pub mod convomem;
 pub mod core;
 pub mod locomo;
 pub mod longmemeval;
+pub mod longmemeval_turn;
 pub mod membench;
 pub mod metrics;

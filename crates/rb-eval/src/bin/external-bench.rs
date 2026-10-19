@@ -8,10 +8,11 @@ use rb_embed::{LocalProvider, PinnedModel};
 use rb_eval::external::core::Memo;
 use rb_eval::external::locomo::{run_sample, QaRecord, Sample};
 use rb_eval::external::longmemeval::{aggregate, run_question, Entry, Profile, TOP_N};
+use rb_eval::external::longmemeval_turn::{self, OracleEntry, RecordFormat};
 use rb_eval::external::{convomem, membench};
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -55,6 +56,25 @@ enum Command {
         #[arg(long)]
         limit: Option<usize>,
         /// Embedding truncation in tokens (default: the pinned model's 512).
+        #[arg(long)]
+        embed_max_tokens: Option<usize>,
+    },
+    /// LongMemEval oracle at turn granularity, replicating the `mind`
+    /// harness (evidence@1, evidence@k, answer-string@k; abstention excluded).
+    LongmemevalTurn {
+        #[arg(long)]
+        data: PathBuf,
+        #[arg(long, value_enum)]
+        profile: Profile,
+        #[arg(long, value_enum, default_value = "mind")]
+        format: RecordFormat,
+        /// JSON file: an array of question ids, or a mind report whose
+        /// `evaluated_question_ids` fixes the subset. Default: every
+        /// non-abstention question.
+        #[arg(long)]
+        question_ids: Option<PathBuf>,
+        #[arg(long)]
+        out: PathBuf,
         #[arg(long)]
         embed_max_tokens: Option<usize>,
     },
@@ -286,6 +306,28 @@ async fn main() -> Result<()> {
                 &manifest,
                 data,
                 limit,
+                RunOptions {
+                    profile,
+                    out,
+                    embed_max_tokens,
+                    diagnostic,
+                },
+            )
+            .await
+        }
+        Command::LongmemevalTurn {
+            data,
+            profile,
+            format,
+            question_ids,
+            out,
+            embed_max_tokens,
+        } => {
+            longmemeval_turn(
+                &manifest,
+                data,
+                format,
+                question_ids,
                 RunOptions {
                     profile,
                     out,
@@ -794,6 +836,140 @@ async fn longmemeval(
     println!("{}", serde_json::to_string_pretty(&summary["overall"])?);
     eprintln!("wrote {}", path.display());
     Ok(())
+}
+
+/// Question ids from a JSON array, or from a mind report's
+/// `evaluated_question_ids`.
+fn read_question_ids(path: &PathBuf) -> Result<Vec<String>> {
+    let value: serde_json::Value = serde_json::from_slice(&std::fs::read(path)?)?;
+    let list = value
+        .get("evaluated_question_ids")
+        .unwrap_or(&value)
+        .as_array()
+        .context("question ids must be a JSON array or a report with evaluated_question_ids")?;
+    list.iter()
+        .map(|v| {
+            v.as_str()
+                .map(str::to_string)
+                .context("question id must be a string")
+        })
+        .collect()
+}
+
+async fn longmemeval_turn(
+    manifest: &serde_json::Value,
+    data: PathBuf,
+    format: RecordFormat,
+    question_ids: Option<PathBuf>,
+    options: RunOptions,
+) -> Result<()> {
+    let RunOptions {
+        profile,
+        out,
+        embed_max_tokens,
+        diagnostic,
+    } = options;
+    let (bytes, sha) = read_pinned(manifest, "longmemeval_oracle", &data)?;
+    let entries: Vec<OracleEntry> = serde_json::from_slice(&bytes)?;
+    drop(bytes);
+    let dataset_questions = entries.len();
+    let abstentions = entries.iter().filter(|e| e.is_abstention()).count();
+    let by_id: HashMap<&str, &OracleEntry> = entries
+        .iter()
+        .map(|e| (e.question_id.as_str(), e))
+        .collect();
+    let (selected, subset): (Vec<&OracleEntry>, serde_json::Value) = match &question_ids {
+        Some(path) => {
+            let ids = read_question_ids(path)?;
+            let picked = ids
+                .iter()
+                .map(|id| {
+                    by_id
+                        .get(id.as_str())
+                        .copied()
+                        .with_context(|| format!("question id {id} is not in the dataset"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            if picked.iter().any(|e| e.is_abstention()) {
+                bail!("the subset includes abstention questions, which mind excludes");
+            }
+            (
+                picked,
+                json!({"source": path.display().to_string(), "ids": ids}),
+            )
+        }
+        None => (
+            entries.iter().filter(|e| !e.is_abstention()).collect(),
+            json!("all non-abstention questions"),
+        ),
+    };
+
+    let (local, embedding) = load_embedder(manifest, embed_max_tokens)?;
+    let provider = Arc::new(Memo::new(local));
+    std::fs::create_dir_all(&out)?;
+    let format_name = match format {
+        RecordFormat::Mind => "mindfmt",
+        RecordFormat::Clean => "clean",
+    };
+    let tag = format!(
+        "{}longmemeval-turn-oracle-{}-{format_name}{}-n{}",
+        if diagnostic { "diagnostic-" } else { "" },
+        profile_name(profile),
+        token_suffix(embed_max_tokens),
+        selected.len()
+    );
+    let wall = Instant::now();
+    let mut records = Vec::with_capacity(selected.len());
+    let mut skipped_no_evidence = 0usize;
+    for entry in &selected {
+        match longmemeval_turn::run_question(&provider, entry, profile, format).await? {
+            Some(record) => records.push(record),
+            None => skipped_no_evidence += 1,
+        }
+    }
+    let n = records.len();
+    let rate = |count: usize| if n == 0 { 0.0 } else { count as f64 / n as f64 };
+    let count =
+        |f: fn(&longmemeval_turn::TurnRecord) -> bool| records.iter().filter(|r| f(r)).count();
+    let (e1, ek, ak) = (
+        count(|r| r.evidence_at_1),
+        count(|r| r.evidence_at_k),
+        count(|r| r.answer_string_at_k),
+    );
+    let mut query_us: Vec<u128> = records.iter().map(|r| r.query_us).collect();
+    query_us.sort_unstable();
+    let summary = merge(
+        run_meta(manifest, profile, &embedding, diagnostic),
+        json!({
+            "benchmark": "longmemeval_oracle_turn",
+            "replicates": "mind bench/longmemeval.py @ 91cbbf0 (sha256 6f105c6ae3438d3ab91cb0102e7635daa634f616194605307bca3900659d0fac)",
+            "dataset_sha256": sha,
+            "dataset_hf_revision": manifest["datasets"]["longmemeval_oracle"]["hf_revision"],
+            "dataset_questions": dataset_questions,
+            "skipped_abstention": abstentions,
+            "subset": subset,
+            "record_format": format,
+            "granularity": "turn (user and assistant; identical texts collapsed)",
+            "top_k": longmemeval_turn::TOP_K,
+            "top_n": longmemeval_turn::TOP_N,
+            "wall_clock_s": wall.elapsed().as_secs_f64(),
+            "query_us": {"p50": percentile(&query_us, 50.0), "p95": percentile(&query_us, 95.0)},
+            "overall": {
+                "selected": selected.len(),
+                "evaluated": n,
+                "skipped_no_evidence": skipped_no_evidence,
+                "abstained": records.iter().filter(|r| r.abstained.is_some()).count(),
+                "evidence_at_1": e1,
+                "evidence_at_1_rate": rate(e1),
+                "evidence_at_k": ek,
+                "evidence_at_k_rate": rate(ek),
+                "answer_string_at_k": ak,
+                "answer_string_at_k_rate": rate(ak),
+                "avg_records": if n == 0 { 0.0 } else { records.iter().map(|r| r.records).sum::<usize>() as f64 / n as f64 },
+            },
+        }),
+    );
+    write_outputs(&out, &tag, &records, &summary)
 }
 
 #[cfg(test)]

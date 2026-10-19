@@ -5,6 +5,18 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — LongMemEval oracle turn-level comparison with mind (kanban 103)
+
+- Add `external-bench longmemeval-turn`, which replicates the mind project's
+  harness: the oracle dataset (now pinned in the manifest), turn-level records,
+  and evidence@1, evidence@5 and answer-string@5. Add an independent,
+  validated replica of mind's BM25 baseline (`scripts/external/mind_bm25_replica.py`).
+- On mind's 50 questions, rusty-brain native scores 0.64 / 0.92 / 0.58,
+  matching or beating both published mind variants and tying mind's own BM25.
+  On all 470, native ties BM25 at rank 1 and beats it on evidence in the top 5
+  (0.928 vs 0.881, paired p = 0.004). See
+  `docs/eval/2026-10-18-mind-longmemeval-comparison.md`.
+
 ### Fixed — Batched store reads past the SQLite parameter limit (kanban 101)
 
 - `get_many` and `record_accesses` bound one SQL parameter per id, so more
