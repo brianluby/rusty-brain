@@ -113,18 +113,27 @@ Paired exact McNemar tests against BM25 (wins / losses):
 1. **mind's 50 are easier than average.** BM25 scores 0.66 at rank 1 on them
    but 0.543 on all 470. Any conclusion from those 50 alone carries about ±13
    points of noise and a selection bias.
-2. **Fusion is what helps.** rusty-brain native gets an evidence turn into the
-   top 5 for 4.7 more questions per hundred than BM25. On which turn ranks
-   first it only ties BM25. The vector-only profile is worse than BM25 at
-   rank 1, as expected for exact-turn questions with lexical overlap. So the
-   gain comes from combining channels, not from the embedding model.
+2. **The full native pipeline helps; the runs do not isolate why.**
+   rusty-brain native gets an evidence turn into the top 5 for 4.7 more
+   questions per hundred than BM25, and ties BM25 on which turn ranks first.
+   The vector-only profile is worse than BM25 at rank 1, as expected for
+   exact-turn questions with lexical overlap. Native differs from parity in
+   both channel fusion and heuristic enrichment, though, so these runs do not
+   say which of the two (or their combination) produces the gain. That would
+   take an ablation that changes fusion alone, which was not run.
 3. **On mind's own setup, rusty-brain is at least as good as mind's best
    reported variant.** mind's published variants are below its own BM25
    baseline on evidence@1 and evidence@5. rusty-brain native ties that
    baseline at rank 1 and beats it at depth 5 on the full set.
-4. **The record format barely matters.** Removing the date, question id and
-   session id moves native by at most 1.4 points (evidence@1 0.543 → 0.557).
-   The `answer_*` session-id leak does not drive these results.
+4. **The record format matters little for native, more for vector-only.**
+   On the 470-question runs, removing the date, question id and session id
+   moves native by at most 1.5 points (evidence@1 255 → 262 of 470, +1.49;
+   evidence@5 +1.06; answer@5 −0.85), and BM25 by at most 2.1. Vector-only
+   parity drops by up to 3.6 (evidence@1 233 → 216). On the 50-question runs,
+   single questions dominate: native moves +2, +4 and −2 points (evidence@5
+   0.92 → 0.96 is 2 questions). Native's gains do not depend on the
+   `answer_*` session-id leak, since the clean format scores at least as high
+   on evidence.
 
 ## Caveats
 
