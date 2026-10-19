@@ -911,12 +911,23 @@ async fn longmemeval_turn(
         RecordFormat::Mind => "mindfmt",
         RecordFormat::Clean => "clean",
     };
+    // The subset's identity (not just its size) is in the tag, so two
+    // same-sized `--question-ids` runs can never overwrite each other.
+    let subset_digest = {
+        let mut h = Sha256::new();
+        for e in &selected {
+            h.update(e.question_id.as_bytes());
+            h.update(b"\n");
+        }
+        format!("{:x}", h.finalize())
+    };
     let tag = format!(
-        "{}longmemeval-turn-oracle-{}-{format_name}{}-n{}",
+        "{}longmemeval-turn-oracle-{}-{format_name}{}-n{}-{}",
         if diagnostic { "diagnostic-" } else { "" },
         profile_name(profile),
         token_suffix(embed_max_tokens),
-        selected.len()
+        selected.len(),
+        &subset_digest[..8]
     );
     let wall = Instant::now();
     let mut records = Vec::with_capacity(selected.len());
@@ -948,6 +959,7 @@ async fn longmemeval_turn(
             "dataset_questions": dataset_questions,
             "skipped_abstention": abstentions,
             "subset": subset,
+            "subset_sha256": subset_digest,
             "record_format": format,
             "granularity": "turn (user and assistant; identical texts collapsed)",
             "top_k": longmemeval_turn::TOP_K,
