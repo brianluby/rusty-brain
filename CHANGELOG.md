@@ -17,6 +17,19 @@ All notable changes to rusty-brain are documented here. The format is based on
   On all 470, native ties BM25 at rank 1 and beats it on evidence in the top 5
   (0.928 vs 0.881, paired p = 0.004).
 
+### Added — Point-in-time recall assessment (kanban 88)
+
+- Assess whether history and supersession data can answer what was known or
+  valid at an earlier time. All timestamps are recording time. Because
+  `archived_at` is write-once, the active set *as recorded* at any instant is
+  derivable, but no command exposes it: `--until` filters only on
+  `created_at`, and `history` shows no end time. Validity or event time is not
+  stored at all.
+- Recommendation: implement a small read-only `as_of` view (`archived_at` in
+  history, and an `as_of` list filter labeled `temporal_basis: recorded`).
+  Defer validity time until a real failure is observed. See
+  `docs/eval/2026-10-18-point-in-time-recall-assessment.md`.
+
 ### Fixed — Batched store reads past the SQLite parameter limit (kanban 101)
 
 - `get_many` and `record_accesses` bound one SQL parameter per id, so more
