@@ -472,3 +472,69 @@ fn as_of_filter_agrees_with_recall_filter_matches() {
         }
     }
 }
+
+/// PR #109 review (Codex P1): the engine stamps `created_at` when it
+/// composes a note, before enrichment, embedding and the writer queue. A
+/// fresh write is re-stamped at its transaction, so `as_of` never reports a
+/// memory as present before it was written.
+#[test]
+fn fresh_insert_is_recorded_at_transaction_time() {
+    let store = SqliteStore::open_in_memory(8).unwrap();
+    let mut note = MemoryNote::new(ns(), "composed early".into(), MemoryType::Insight, 5);
+    let composed = chrono::Utc::now().timestamp() - 3_600;
+    note.created_at = at(composed);
+    note.updated_at = at(composed);
+    let before = chrono::Utc::now().timestamp();
+    store.insert_memory_recorded_now(&note, None).unwrap();
+    let after = chrono::Utc::now().timestamp();
+    let stored = store.get_memory(&note.id).unwrap().unwrap();
+    let recorded = stored.created_at.timestamp();
+    assert!(
+        (before..=after).contains(&recorded),
+        "{recorded} not in {before}..={after}"
+    );
+    assert_eq!(stored.updated_at.timestamp(), recorded);
+    assert!(list(&store, &ns(), &as_of(composed)).is_empty());
+    assert!(list(&store, &ns(), &as_of(recorded - 1)).is_empty());
+    assert_eq!(list(&store, &ns(), &as_of(recorded)), vec![note.id]);
+}
+
+/// PR #109 review (Codex P1): a superseding write stamps the replacement's
+/// `created_at` and the old row's `archived_at` with ONE in-transaction
+/// instant, so as of every second exactly one version is a member.
+#[test]
+fn superseding_write_hands_off_at_one_instant() {
+    let store = SqliteStore::open_in_memory(8).unwrap();
+    let old = plant(
+        &store,
+        &ns(),
+        "old",
+        chrono::Utc::now().timestamp() - 7_200,
+        None,
+        None,
+    );
+    let mut note = MemoryNote::new(ns(), "replacement".into(), MemoryType::Insight, 5);
+    let composed = chrono::Utc::now().timestamp() - 3_600;
+    note.created_at = at(composed);
+    note.updated_at = at(composed);
+    let (_, archived_seq) = store
+        .insert_superseding_memory_recorded_now(&note, None, &old, false)
+        .unwrap();
+    assert!(archived_seq.is_some(), "the old row was superseded");
+    let new_row = store.get_memory(&note.id).unwrap().unwrap();
+    let old_row = store.get_memory(&old).unwrap().unwrap();
+    let handoff = new_row.created_at.timestamp();
+    assert_eq!(old_row.archived_at.map(|t| t.timestamp()), Some(handoff));
+    for t in [composed, handoff - 1] {
+        assert_eq!(list(&store, &ns(), &as_of(t)), vec![old.clone()], "at {t}");
+    }
+    assert_eq!(list(&store, &ns(), &as_of(handoff)), vec![note.id]);
+    // The historical-time insert path is unchanged (imports, fixtures).
+    let mut kept = MemoryNote::new(ns(), "imported".into(), MemoryType::Insight, 5);
+    kept.created_at = at(JUL_1);
+    store.insert_memory(&kept, None).unwrap();
+    assert_eq!(
+        store.get_memory(&kept.id).unwrap().unwrap().created_at,
+        at(JUL_1)
+    );
+}

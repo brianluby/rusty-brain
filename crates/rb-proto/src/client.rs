@@ -246,7 +246,12 @@ where
         } else {
             ConnectionState::Idle
         };
-        if as_of && matches!(response, Response::Listed { as_of: None, .. }) {
+        if as_of
+            && !matches!(
+                response,
+                Response::ListedAsOf { .. } | Response::Error { .. }
+            )
+        {
             // Second guard (Vikunja #102): rows without `temporal_basis` were
             // not produced by the as-of predicate, so never return them.
             return Err(Error::Storage(
@@ -715,7 +720,7 @@ where
             })
             .await?;
         match resp {
-            Resp::Listed { memories, .. } => Ok(memories),
+            Resp::Listed { memories } => Ok(memories),
             other => Err(self.unexpected(other)),
         }
     }
@@ -747,9 +752,9 @@ where
             })
             .await?;
         match resp {
-            Resp::Listed {
+            Resp::ListedAsOf {
                 memories,
-                as_of: Some(page),
+                as_of: page,
             } => Ok((memories, page)),
             other => Err(self.unexpected(other)),
         }
@@ -1433,11 +1438,13 @@ mod wrapper_tests {
                     // daemon answers with the envelope; every other list —
                     // including an as-of one — gets none, which is what a
                     // daemon that dropped `as_of` would send (Vikunja #102).
-                    let as_of = match filter.as_of {
-                        Some(t) if limit == 77 => Some(rb_types::AsOfPage::recorded(t, None)),
-                        _ => None,
-                    };
-                    Response::Listed { memories, as_of }
+                    match filter.as_of {
+                        Some(t) if limit == 77 => Response::ListedAsOf {
+                            memories,
+                            as_of: rb_types::AsOfPage::recorded(t, None),
+                        },
+                        _ => Response::Listed { memories },
+                    }
                 }
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],

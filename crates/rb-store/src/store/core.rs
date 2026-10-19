@@ -394,6 +394,56 @@ impl SqliteStore {
         old: &MemoryId,
         allow_curated_supersede: bool,
     ) -> Result<(u64, Option<u64>)> {
+        self.insert_superseding_inner(note, embedding, old, allow_curated_supersede, false)
+    }
+
+    /// [`Store::insert_memory`] for a FRESH write, with `created_at`/
+    /// `updated_at` re-stamped at the instant the IMMEDIATE transaction holds
+    /// the write lock (Vikunja #102). The engine composes a note — and stamps
+    /// its times — before enrichment, embedding and the writer queue; those
+    /// awaits can cross a second, so the composed `created_at` would claim the
+    /// row was recorded before it was. Recording-time `as_of` needs the
+    /// transaction time. Imports and fixtures that carry historical times
+    /// keep using [`Store::insert_memory`].
+    pub fn insert_memory_recorded_now(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+    ) -> Result<()> {
+        rb_types::validate_importance(note.importance)?;
+        rb_types::validate_confidence(note.confidence)?;
+        for anchor in &note.anchors {
+            anchor.validate()?;
+        }
+        immediate_tx(&self.conn, || {
+            let note = recorded_at(note, chrono::Utc::now());
+            self.insert_memory_tx_body(&note, embedding)
+        })
+    }
+
+    /// [`SqliteStore::insert_superseding_memory`] for a fresh write: ONE
+    /// instant, taken inside the transaction, stamps both the replacement's
+    /// `created_at` and the superseded row's `archived_at`, so as of any
+    /// second exactly one of them is a member — never both, never neither
+    /// (Vikunja #102).
+    pub fn insert_superseding_memory_recorded_now(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        old: &MemoryId,
+        allow_curated_supersede: bool,
+    ) -> Result<(u64, Option<u64>)> {
+        self.insert_superseding_inner(note, embedding, old, allow_curated_supersede, true)
+    }
+
+    fn insert_superseding_inner(
+        &self,
+        note: &MemoryNote,
+        embedding: Option<&[f32]>,
+        old: &MemoryId,
+        allow_curated_supersede: bool,
+        recorded_now: bool,
+    ) -> Result<(u64, Option<u64>)> {
         if note.id == *old {
             return Err(Error::InvalidArgument(
                 "a memory cannot supersede itself".to_string(),
@@ -405,6 +455,14 @@ impl SqliteStore {
             anchor.validate()?;
         }
         immediate_tx(&self.conn, || {
+            let now = chrono::Utc::now();
+            let stamped;
+            let note = if recorded_now {
+                stamped = recorded_at(note, now);
+                &stamped
+            } else {
+                note
+            };
             let old_note = self.get_memory(old)?;
             if let Some(old_note) = &old_note {
                 if old_note.namespace != note.namespace {
@@ -423,7 +481,7 @@ impl SqliteStore {
             if old_note.is_none_or(|old| old.archived_at.is_some() || old.superseded_by.is_some()) {
                 return Ok((created_seq, None));
             }
-            self.supersede_in_tx(old, &note.id)?;
+            self.supersede_in_tx_at(old, &note.id, now.timestamp())?;
             let archived_seq = self
                 .latest_oplog_seq_for(old)?
                 .ok_or_else(|| Error::Storage("supersede oplog row is missing".to_string()))?;
@@ -434,7 +492,11 @@ impl SqliteStore {
     /// General supersede error mapping shared by explicit and automatic writes.
     /// The caller owns the transaction; the structural guard stays unchanged.
     fn supersede_in_tx(&self, old: &MemoryId, new: &MemoryId) -> Result<()> {
-        match self.supersede_guarded_in_tx(old, new, chrono::Utc::now().timestamp())? {
+        self.supersede_in_tx_at(old, new, chrono::Utc::now().timestamp())
+    }
+
+    fn supersede_in_tx_at(&self, old: &MemoryId, new: &MemoryId, now_ts: i64) -> Result<()> {
+        match self.supersede_guarded_in_tx(old, new, now_ts)? {
             SupersedeGuard::Applied => Ok(()),
             SupersedeGuard::SelfSupersede => Err(Error::InvalidArgument(format!(
                 "a memory cannot supersede itself: {old}"
@@ -1350,6 +1412,14 @@ fn build_filter_predicate(
     }
 
     Ok((sql, params))
+}
+
+/// `note` with its write stamps set to the recording instant `now`.
+pub(crate) fn recorded_at(note: &MemoryNote, now: chrono::DateTime<chrono::Utc>) -> MemoryNote {
+    let mut note = note.clone();
+    note.created_at = now;
+    note.updated_at = now;
+    note
 }
 
 #[allow(clippy::vec_box)]

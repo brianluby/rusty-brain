@@ -1480,6 +1480,22 @@ fn list_as_of_flows_through_the_binary() {
         .success());
     assert!(!output(&["list", "--after", &token]).status.success());
 
+    // The as-of error branch: a request the client refuses (an inverted
+    // created-at window) surfaces as a failed `list --as-of`, never rows.
+    let refused = output(&[
+        "list",
+        "--as-of",
+        &as_of,
+        "--since",
+        "2026-09-01T00:00:00Z",
+        "--until",
+        "2026-08-01T00:00:00Z",
+    ]);
+    assert!(!refused.status.success());
+    let stderr = String::from_utf8_lossy(&refused.stderr);
+    assert!(stderr.contains("list --as-of failed"), "{stderr}");
+    assert!(refused.stdout.is_empty(), "no rows on the error path");
+
     // History renders when the deleted version stopped being current.
     let (stdout, _) = run(&["history", &gone]);
     assert!(stdout.contains("current until"), "{stdout}");

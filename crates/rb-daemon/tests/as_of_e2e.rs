@@ -42,6 +42,13 @@ impl RunningDaemon {
     /// Seed the database with controlled recording times BEFORE the daemon
     /// opens it, then start the daemon on it.
     async fn start_seeded(seed: impl FnOnce(&SqliteStore)) -> RunningDaemon {
+        Self::start_seeded_with(seed, SharedEmbedder::new(DeterministicProvider::new(DIM))).await
+    }
+
+    async fn start_seeded_with(
+        seed: impl FnOnce(&SqliteStore),
+        embedder: SharedEmbedder,
+    ) -> RunningDaemon {
         let dir = tempfile::tempdir_in(std::env::temp_dir()).unwrap();
         let socket = dir.path().join("runtime").join("sock");
         let db = dir.path().join("memory.db");
@@ -62,9 +69,7 @@ impl RunningDaemon {
             write_gate: rb_types::WriteGateConfig::default(),
             http: None,
         };
-        let daemon = Daemon::bind(cfg, SharedEmbedder::new(DeterministicProvider::new(DIM)))
-            .await
-            .unwrap();
+        let daemon = Daemon::bind(cfg, embedder).await.unwrap();
         let (tx, rx) = oneshot::channel::<()>();
         let task = tokio::spawn(async move {
             daemon
@@ -217,7 +222,7 @@ async fn late_recorded_event_is_labelled_as_recorded_with_current_metadata() {
         })
         .await
         .unwrap();
-    assert!(matches!(plain, Response::Listed { as_of: None, .. }));
+    assert!(matches!(plain, Response::Listed { .. }));
     drop(client);
     daemon.stop().await;
 }
@@ -338,6 +343,101 @@ async fn as_of_validation_errors_and_recall_is_unchanged() {
         .await
         .unwrap();
     assert_eq!(results.len(), 1, "active recall unchanged without as_of");
+    drop(client);
+    daemon.stop().await;
+}
+
+/// An embedder that takes longer than a second, so a write composed before
+/// embedding would carry a `created_at` from a second it was not yet stored.
+struct SlowEmbedder(DeterministicProvider);
+
+#[async_trait::async_trait]
+impl rb_embed::EmbeddingProvider for SlowEmbedder {
+    fn model_id(&self) -> &str {
+        self.0.model_id()
+    }
+
+    fn dim(&self) -> usize {
+        self.0.dim()
+    }
+
+    async fn embed(
+        &self,
+        texts: &[String],
+        kind: rb_embed::EmbedKind,
+    ) -> rb_types::Result<Vec<Vec<f32>>> {
+        if kind == rb_embed::EmbedKind::Document {
+            tokio::time::sleep(Duration::from_millis(1_200)).await;
+        }
+        self.0.embed(texts, kind).await
+    }
+}
+
+/// PR #109 review (Codex P1) over the wire: `remember` composes (and used
+/// to stamp) a note before embedding, so a slow embedding made `as_of`
+/// report it as present before it was stored, and a superseding write showed
+/// both versions. Recording time is now the write transaction's: nothing is
+/// a member before its write, and the supersede hands off in one instant.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn remember_is_recorded_at_write_time_not_compose_time() {
+    let daemon = RunningDaemon::start_seeded_with(
+        |_| {},
+        SharedEmbedder::new(SlowEmbedder(DeterministicProvider::new(DIM))),
+    )
+    .await;
+    let mut client = Client::connect(&daemon.socket, ns()).await.unwrap();
+
+    let composed = chrono::Utc::now().timestamp();
+    let old = client
+        .remember(
+            "the fusion decision is RRF".into(),
+            None,
+            MemoryType::ArchitectureDecision,
+            6,
+            vec![],
+            vec![],
+            vec![],
+            None,
+        )
+        .await
+        .unwrap();
+    let old_row = client.get(old.clone()).await.unwrap().unwrap();
+    assert!(
+        old_row.created_at.timestamp() > composed,
+        "stamped after the 1.2s embedding, not at compose time"
+    );
+    let (rows, _) = client.list_as_of(as_of(composed), 20).await.unwrap();
+    assert!(rows.is_empty(), "not a member before it was written");
+
+    let new = client
+        .remember_superseding(
+            "the fusion decision is Linear".into(),
+            None,
+            MemoryType::ArchitectureDecision,
+            6,
+            vec![],
+            vec![],
+            vec![],
+            None,
+            old.clone(),
+        )
+        .await
+        .unwrap();
+    let new_row = client.get(new.clone()).await.unwrap().unwrap();
+    let old_row = client.get(old.clone()).await.unwrap().unwrap();
+    let handoff = new_row.created_at.timestamp();
+    assert_eq!(old_row.archived_at.map(|t| t.timestamp()), Some(handoff));
+    for t in [
+        old_row.created_at.timestamp(),
+        handoff - 1,
+        handoff,
+        handoff + 1,
+    ] {
+        let (rows, _) = client.list_as_of(as_of(t), 20).await.unwrap();
+        let ids: Vec<_> = rows.into_iter().map(|n| n.id).collect();
+        let want = if t < handoff { &old } else { &new };
+        assert_eq!(ids, vec![want.clone()], "exactly one version at {t}");
+    }
     drop(client);
     daemon.stop().await;
 }

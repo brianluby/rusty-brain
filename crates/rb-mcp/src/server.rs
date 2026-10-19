@@ -324,7 +324,6 @@ mod tests {
                 },
                 Request::List { .. } => Response::Listed {
                     memories: vec![note()],
-                    as_of: None,
                 },
                 Request::Graph { .. } => Response::GraphResult {
                     memories: vec![note()],

@@ -1514,6 +1514,18 @@ mod tests {
             filter.as_of_after = Some(cursor);
         }
         assert_eq!(truncated_pages, 2);
+        // The MockBackend mirrors the store's keyset order exactly: pages
+        // concatenate to one ascending (created_at, id) sequence.
+        let order: Vec<_> = seen
+            .iter()
+            .map(|id| {
+                let note = eng.backend().notes.lock().unwrap()[id].clone();
+                (note.created_at.timestamp(), id.to_string())
+            })
+            .collect();
+        let mut sorted = order.clone();
+        sorted.sort();
+        assert_eq!(order, sorted, "ascending (created_at, memory_id)");
         let mut want = ids;
         want.sort_by_key(ToString::to_string);
         let mut got = seen.clone();

@@ -239,9 +239,11 @@ rusty-brain history <id> --depth 3 --json
 
 # what did the store hold as active at an instant? RECORDING time, whole
 # seconds, oldest first; metadata shown is current, purged rows never appear,
-# and it is not validity time. A truncated page warns and prints a cursor.
+# and it is not validity time. A truncated page warns on stderr with
+# "continue with --after <cursor>": set CURSOR to that printed token.
 rusty-brain list --as-of 2026-08-15T00:00:00Z
-rusty-brain list --as-of 2026-08-15T00:00:00Z --after <created_at>/<id>
+CURSOR='2026-08-01T09:30:00Z/0b1f6c1e-6f2a-4c3e-9d1a-5e7f8a9b0c1d'
+rusty-brain list --as-of 2026-08-15T00:00:00Z --after "$CURSOR"
 
 # retroactively redact secrets from every stored memory, then re-embed
 rusty-brain scrub

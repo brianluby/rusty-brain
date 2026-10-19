@@ -2051,9 +2051,9 @@ where
             )
             .await
         {
-            Ok((memories, page)) => Response::Listed {
+            Ok((memories, page)) => Response::ListedAsOf {
                 memories,
-                as_of: Some(page),
+                as_of: page,
             },
             Err(e) => error_to_response(e),
         },
@@ -2070,10 +2070,7 @@ where
             )
             .await
         {
-            Ok(memories) => Response::Listed {
-                memories,
-                as_of: None,
-            },
+            Ok(memories) => Response::Listed { memories },
             Err(e) => error_to_response(e),
         },
         Request::Graph { id, depth } => match engine.graph(id, depth.min(MAX_DEPTH)).await {

@@ -515,14 +515,17 @@ pub enum Response {
     },
     Listed {
         memories: Vec<MemoryNote>,
-        /// The as-of envelope (Vikunja #102): present iff the request set
-        /// `filter.as_of`. Carries `temporal_basis: "recorded"`,
-        /// `precision: "second"`, `metadata: "current"`, `truncated` and the
-        /// `next_after` keyset cursor. Clients treat an as-of request
-        /// answered WITHOUT it as an error. Additive + skipped when absent:
-        /// byte-identical for every non-as-of list, no CONTRACT_VERSION bump.
-        #[serde(default, skip_serializing_if = "Option::is_none")]
-        as_of: Option<rb_types::AsOfPage>,
+    },
+    /// The answer to a `List` whose filter set `as_of` (Vikunja #102): the
+    /// page plus its as-of envelope (`temporal_basis: "recorded"`,
+    /// `precision: "second"`, `metadata: "current"`, `truncated`,
+    /// `next_after`). A separate variant so `Listed` keeps its exact Rust and
+    /// wire shape; only a client that sent `as_of` (which requires the
+    /// [`CAP_AS_OF`] capability) ever receives it, and such a client treats
+    /// a plain `Listed` answer as an error. No CONTRACT_VERSION bump.
+    ListedAsOf {
+        memories: Vec<MemoryNote>,
+        as_of: rb_types::AsOfPage,
     },
     GraphResult {
         memories: Vec<MemoryNote>,
@@ -669,25 +672,33 @@ mod tests {
         )
     }
 
-    /// Vikunja #102: a non-as-of `Listed` frame carries no `as_of` key
-    /// (byte-identical for old peers), an old frame decodes to `None`, and
-    /// `request_uses_as_of` sees the filter field or its cursor.
+    /// Vikunja #102: `Listed` keeps its exact pre-#102 wire shape, and the
+    /// as-of answer is its own additive `ListedAsOf` variant whose envelope
+    /// round-trips; `request_uses_as_of` sees the filter field or its cursor.
     #[test]
     fn listed_as_of_envelope_is_additive_and_requests_are_detected() {
         let plain = serde_json::to_value(Response::Listed {
             memories: Vec::new(),
-            as_of: None,
         })
         .unwrap();
-        assert!(plain.get("as_of").is_none(), "{plain}");
         assert_eq!(
             plain,
             serde_json::json!({"result": "Listed", "memories": []})
         );
-        let old: Response =
-            serde_json::from_value(serde_json::json!({"result": "Listed", "memories": []}))
-                .unwrap();
-        assert!(matches!(old, Response::Listed { as_of: None, .. }));
+        let t0 = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let page = serde_json::to_value(Response::ListedAsOf {
+            memories: Vec::new(),
+            as_of: rb_types::AsOfPage::recorded(t0, None),
+        })
+        .unwrap();
+        assert_eq!(page["result"], "ListedAsOf");
+        assert_eq!(page["as_of"]["temporal_basis"], "recorded");
+        assert_eq!(page["as_of"]["precision"], "second");
+        assert_eq!(page["as_of"]["metadata"], "current");
+        assert!(matches!(
+            serde_json::from_value::<Response>(page).unwrap(),
+            Response::ListedAsOf { .. }
+        ));
         assert_eq!(CAP_AS_OF, "as_of");
 
         let t = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
@@ -1294,7 +1305,6 @@ mod tests {
             Response::Got { memory: None },
             Response::Listed {
                 memories: vec![note()],
-                as_of: None,
             },
             Response::GraphResult {
                 memories: vec![note()],

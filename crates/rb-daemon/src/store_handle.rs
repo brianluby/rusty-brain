@@ -1679,7 +1679,8 @@ fn writer_loop(
                     &db_path,
                     embedding_dim,
                     embedding_model.as_deref(),
-                    |s| s.insert_memory(&note, embedding.as_deref()),
+                    // Recording time is the write transaction's (#102).
+                    |s| s.insert_memory_recorded_now(&note, embedding.as_deref()),
                 );
                 let changed = report.result.is_ok();
                 let writer_usable = report.writer_usable;
@@ -1713,7 +1714,7 @@ fn writer_loop(
                     embedding_dim,
                     embedding_model.as_deref(),
                     |s| {
-                        seqs = Some(s.insert_superseding_memory(
+                        seqs = Some(s.insert_superseding_memory_recorded_now(
                             &note,
                             embedding.as_deref(),
                             &old,
