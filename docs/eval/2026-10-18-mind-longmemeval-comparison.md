@@ -4,14 +4,9 @@
 - **Report only.** The harness code used here is not kept in the tree. It is
   in this repository's history at commit `b160870` (the turn-level mode and
   the BM25 replica) and `11b1c7c` (the last revision with it), where the
-  commands below can be rerun.
-- **Question:** how does rusty-brain compare with the
-  [`mind`](https://github.com/Da7-Tech/mind) project on the one benchmark both
-  report, under mind's own setup?
-- **Artifact:**
-  [`artifacts/2026-10-18-mind-longmemeval-comparison.json`](artifacts/2026-10-18-mind-longmemeval-comparison.json)
-  holds per-question outcomes for every run, file hashes and the validation
-  numbers.
+  commands below can be rerun. Both are ancestors of the commit that added
+  this report, so they stay reachable from `main` as long as the PR is merged
+  with a merge commit, not squashed.
 
 ## Short answer
 
@@ -169,8 +164,10 @@ cargo build --release -p rb-eval --features record-local --bin external-bench
 ./target/release/external-bench --diagnostic longmemeval-turn \
   --data DATA/longmemeval_oracle.json --profile native --format mind \
   --question-ids mind/bench/results/longmemeval-bm25-v7-dev.json --out RUNS
-python3 -I scripts/external/mind_bm25_replica.py DATA/longmemeval_oracle.json all mind
+python3 -I scripts/external/mind_bm25_replica.py DATA/longmemeval_oracle.json \
+  mind/bench/results/longmemeval-bm25-v7-dev.json mind
 ```
 
-Omit `--question-ids` (and pass `all` to the replica) for all 470 questions.
+For all 470 questions, omit `--question-ids` and pass `all` as the replica's
+second argument instead of the report path.
 Use `--profile parity` and `--format clean` for the other runs.
