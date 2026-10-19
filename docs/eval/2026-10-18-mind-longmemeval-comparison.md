@@ -1,6 +1,10 @@
 # rusty-brain vs `mind` on LongMemEval (oracle, turn level)
 
 - **Date:** 2026-10-18. Local only, $0 API cost.
+- **Report only.** The harness code used here is not kept in the tree. It is
+  in this repository's history at commit `b160870` (the turn-level mode and
+  the BM25 replica) and `11b1c7c` (the last revision with it), where the
+  commands below can be rerun.
 - **Question:** how does rusty-brain compare with the
   [`mind`](https://github.com/Da7-Tech/mind) project on the one benchmark both
   report, under mind's own setup?
@@ -49,15 +53,16 @@ The replication follows `bench/longmemeval.py` and `mind.py` at commit
 `91cbbf0`. Both match the SHA-256 recorded in mind's reports.
 
 - **rusty-brain:**
-  - Command: `external-bench longmemeval-turn` (new, `rb-eval`).
-  - Module: `crates/rb-eval/src/external/longmemeval_turn.rs`.
-  - Embedding model: pinned local `all-MiniLM-L6-v2` at 512 tokens (#100).
+  - Command: `external-bench longmemeval-turn` (`rb-eval`, at `b160870`).
+  - Module: `crates/rb-eval/src/external/longmemeval_turn.rs` (at `b160870`).
+  - Embedding model: pinned local `all-MiniLM-L6-v2` at 512 tokens (kanban
+    #100).
   - Native profile: the production pipeline (heuristic enrichment plus Linear
     fusion of FTS, vector and graph).
   - Parity profile: vector index only.
-- **BM25 reference:** `scripts/external/mind_bm25_replica.py`, an independent
-  reimplementation of mind's `BM25Baseline` and tokenizer. It does not run
-  mind's code.
+- **BM25 reference:** `scripts/external/mind_bm25_replica.py` (at
+  `b160870`), an independent reimplementation of mind's `BM25Baseline` and
+  tokenizer. It does not run mind's code.
 - **Record formats:**
   - `mind`: mind's exact text, used for the comparison.
   - `clean`: `role: content` only. mind's format embeds the session id, and
@@ -141,7 +146,23 @@ Paired exact McNemar tests against BM25 (wins / losses):
 - **Latency is not compared.** mind reports recall latency only, while our
   wall times include ingest and embedding, on different hardware.
 
+## Provenance
+
+- **What the runs were built from:** the reported runs were built from an
+  uncommitted working tree on `1694a38`, so their summaries record that
+  commit with `dirty: true`. Those Rust changes were then committed with no
+  further edits as `b160870`.
+- **Check from a clean tree:** three of the eight rusty-brain runs (the
+  parity profile: n = 50 in both formats, and n = 470 in mind format) were
+  rerun from the clean, committed `11b1c7c`. Per-question outcomes and top-5
+  rankings were identical to the reported runs.
+- **Not repeated:** the native-profile runs.
+- **BM25 replica:** its later edits (no MD5, ties ordered by text) left
+  per-question outcomes identical on all four runs.
+
 ## Reproduce
+
+From a checkout of `b160870`:
 
 ```bash
 cargo build --release -p rb-eval --features record-local --bin external-bench

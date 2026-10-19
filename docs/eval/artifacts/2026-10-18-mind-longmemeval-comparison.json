@@ -15828,5 +15828,20 @@
     ]
    }
   }
+ },
+ "provenance": {
+  "code_commit": "b160870522b7df422f143cd5606c62f7bf7d0947",
+  "runs_built_from": "uncommitted working tree on 1694a38, whose Rust changes were committed without further edits as b160870",
+  "clean_rerun_check": {
+   "commit": "11b1c7c",
+   "dirty": false,
+   "runs": [
+    "n50-clean-rusty_brain_parity",
+    "n50-mind-rusty_brain_parity",
+    "n470-mind-rusty_brain_parity"
+   ],
+   "result": "per-question outcomes and top-5 rankings identical"
+  },
+  "code_kept_in_tree": false
  }
 }
