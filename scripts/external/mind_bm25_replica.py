@@ -3,8 +3,10 @@
 the same LongMemEval oracle turn records. Usage: bm25_replica.py DATA IDS_JSON|all FORMAT(mind|clean)"""
 import hashlib, json, math, re, sys
 
-WORD_RUN = re.compile(r"[\w؀-ۿ]+", re.UNICODE)
-NOSPACE = re.compile("[⺀-鿿㐀-䶿豈-﫿぀-ヿ가-힯฀-๿]")
+WORD_RUN = re.compile(r"[\w\u0600-\u06ff]+", re.UNICODE)
+# mind also lists CJK ext A (\u3400-\u4dbf) and kana (\u3040-\u30ff); both lie
+# inside \u2e80-\u9fff already, so dropping them leaves the set unchanged.
+NOSPACE = re.compile("[\u2e80-\u9fff\uf900-\ufaff\uac00-\ud7af\u0e00-\u0e7f]")
 
 def bigrams(chars):
     return ["".join(chars)] if len(chars) < 2 else ["".join(chars[i:i+2]) for i in range(len(chars)-1)]
@@ -27,7 +29,10 @@ def tokenize(text):
         if nospace: out.extend(bigrams(nospace))
     return out
 
-def node_id(text): return hashlib.md5(text.encode("utf-8")).hexdigest()[:12]
+def tie_key(text):
+    """mind's content address (md5[:12]), used only to order equal BM25
+    scores exactly as mind does. Not a security use."""
+    return hashlib.md5(text.encode("utf-8"), usedforsecurity=False).hexdigest()[:12]
 def terms(text): return [t.lower() for t in tokenize(text)]
 def norm(v):
     if v is None: return ""
@@ -48,7 +53,7 @@ def records(q, fmt):
             role = t.get("role") or "unknown-role"
             text = ("[%s] question %s session %s %s: %s" % (date or "unknown-date", q["question_id"], sid, role, t.get("content", ""))
                     if fmt == "mind" else "%s: %s" % (role, t.get("content", "")))
-            nid = node_id(text); docs[nid] = text
+            nid = tie_key(text); docs[nid] = text
             if t.get("has_answer") or (se and not marked): ev.add(nid)
     return docs, ev
 
