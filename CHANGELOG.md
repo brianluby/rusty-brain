@@ -5,6 +5,18 @@ All notable changes to rusty-brain are documented here. The format is based on
 
 ## [Unreleased]
 
+### Added — LongMemEval oracle turn-level comparison with mind (kanban 103)
+
+- Report only: `docs/eval/2026-10-18-mind-longmemeval-comparison.md` compares
+  rusty-brain with the mind project under mind's own setup (the LongMemEval
+  oracle at turn level; evidence@1, evidence@5 and answer-string@5). The
+  harness and the BM25 replica are not kept in the tree; they are in history
+  at `b160870`.
+- On mind's 50 questions, rusty-brain native scores 0.64 / 0.92 / 0.58,
+  matching or beating both published mind variants and tying mind's own BM25.
+  On all 470, native ties BM25 at rank 1 and beats it on evidence in the top 5
+  (0.928 vs 0.881, paired p = 0.004).
+
 ### Added — Point-in-time recall assessment (kanban 88)
 
 - Assess whether history and supersession data can answer what was known or
