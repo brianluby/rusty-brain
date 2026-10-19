@@ -12,7 +12,7 @@ contract_version = 3
 "crates/rb-proto/src/messages.rs::HandshakeAck" = "50a6688e1f1471bb61e82460a1c3b8a6d82a27b3e8e8866933a2ab8b00a0ebd4"
 "crates/rb-proto/src/messages.rs::RecallChannelTotals" = "2aac88f5866b68f3291c4f3c1d5b922eec1c691533b5a3d9008598547e226f78"
 "crates/rb-proto/src/messages.rs::Request" = "5ac2ca8bc9dda62a337477926571fbe894cd395fea736c106eb7bf0abcd42b1c"
-"crates/rb-proto/src/messages.rs::Response" = "b01245343792456a8de493191e3e30d749619c81be03348948e9296c82e8e0fc"
+"crates/rb-proto/src/messages.rs::Response" = "10a44caf72718efe1ffbea04f6a4478e53c205cc6dcdd7a1f462c2917477a2cb"
 "crates/rb-proto/src/messages.rs::ScrubCheckpoint" = "dfe99a03b49da585b2e26b8825493a07cb95b11c615bf1ed4b48a339ea6976cc"
 "crates/rb-proto/src/messages.rs::ScrubResult" = "89eb31711254dae32468bce07ea31c707f4fa0a6d32dfe9ca33dc4707f922918"
 "crates/rb-types/src/abstention.rs::AbstainReason" = "4bc07498ec9861b37f02e12677cfee436787b3ece8e6817566e036afce48b282"
@@ -199,4 +199,4 @@ note = "Historical provenance quarantine and capability-gated restore probe; num
 [[log]]
 contract_version = 3
 intent = "additive"
-note = "Vikunja #102: RecallFilter.as_of/as_of_after (list-only recording-time point-in-time view, gated by the as_of handshake capability), Response::Listed.as_of envelope (AsOfPage/AsOfCursor/TemporalBasis/TimePrecision/MetadataBasis), HistoryEntry.archived_at; all serde-default + skip-serializing, no CONTRACT_VERSION bump"
+note = "Vikunja #102: RecallFilter.as_of/as_of_after (list-only recording-time point-in-time view, gated by the as_of handshake capability), new Response::ListedAsOf variant carrying the AsOfPage envelope (AsOfCursor/TemporalBasis/TimePrecision/MetadataBasis); Response::Listed unchanged; HistoryEntry.archived_at; all serde-default + skip-serializing, no CONTRACT_VERSION bump"
