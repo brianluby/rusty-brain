@@ -27,6 +27,8 @@ pub(crate) struct MockBackend {
     fail_snapshot: std::sync::atomic::AtomicBool,
     changing_snapshot: std::sync::atomic::AtomicBool,
     snapshot_reads: std::sync::atomic::AtomicU64,
+    /// Calls to the `*_recorded_now` write methods (Vikunja #102).
+    pub recorded_now_writes: std::sync::atomic::AtomicUsize,
 }
 
 impl MockBackend {
@@ -125,6 +127,37 @@ impl MemoryBackend for MockBackend {
         self.notes.lock().unwrap().insert(note.id.clone(), note);
         Ok(())
     }
+    /// Like the daemon's store: count the call and stamp the write times at
+    /// "transaction" time, then store as `write` does.
+    async fn write_recorded_now(
+        &self,
+        mut note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+    ) -> rb_types::Result<()> {
+        self.recorded_now_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = chrono::Utc::now();
+        note.created_at = now;
+        note.updated_at = now;
+        self.write(note, embedding).await
+    }
+
+    async fn write_superseding_recorded_now(
+        &self,
+        mut note: MemoryNote,
+        embedding: Option<Vec<f32>>,
+        old: MemoryId,
+        allow_curated_supersede: bool,
+    ) -> rb_types::Result<()> {
+        self.recorded_now_writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let now = chrono::Utc::now();
+        note.created_at = now;
+        note.updated_at = now;
+        self.write_superseding(note, embedding, old, allow_curated_supersede)
+            .await
+    }
+
     async fn write_superseding(
         &self,
         note: MemoryNote,

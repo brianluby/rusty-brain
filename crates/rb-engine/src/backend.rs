@@ -485,6 +485,50 @@ mod tests {
         }
     }
 
+    /// Vikunja #102: the default `*_recorded_now` methods forward to `write`
+    /// / `write_superseding` unchanged, so a backend without a transaction
+    /// clock (in-memory test doubles) keeps the composed note as given.
+    #[tokio::test]
+    async fn recorded_now_defaults_forward_to_the_plain_writes() {
+        let backend = MockBackend::default();
+        let mut old = MemoryNote::new(Namespace::Global, "old".into(), MemoryType::Insight, 5);
+        old.created_at = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let old_id = old.id.clone();
+        backend
+            .write_recorded_now(old.clone(), Some(vec![0.1]))
+            .await
+            .unwrap();
+        let stored = backend
+            .get(Namespace::Global, old_id.clone())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(stored.created_at, old.created_at, "forwarded unchanged");
+        assert_eq!(backend.embeddings.lock().unwrap()[&old_id], vec![0.1]);
+
+        let new = MemoryNote::new(Namespace::Global, "new".into(), MemoryType::Insight, 5);
+        let new_id = new.id.clone();
+        backend
+            .write_superseding_recorded_now(new, None, old_id.clone(), false)
+            .await
+            .unwrap();
+        let old_now = backend
+            .get(Namespace::Global, old_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            old_now.superseded_by,
+            Some(new_id.clone()),
+            "supersede forwarded"
+        );
+        assert!(backend
+            .get(Namespace::Global, new_id)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
     #[tokio::test]
     async fn mock_backend_round_trips_write_and_get() {
         let backend = MockBackend::default();

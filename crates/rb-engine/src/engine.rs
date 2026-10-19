@@ -1558,6 +1558,43 @@ mod tests {
             .is_err());
     }
 
+    /// Vikunja #102 (PR #109 review): an unpinned `remember` and
+    /// `remember_superseding` route through the backend's `*_recorded_now`
+    /// writes, so the backend stamps recording time at its transaction.
+    #[tokio::test]
+    async fn remember_routes_fresh_writes_through_recorded_now() {
+        let eng = engine();
+        let old = eng.remember(input("the decision is RRF", 6)).await.unwrap();
+        eng.remember_superseding(input("the decision is Linear", 6), old, false)
+            .await
+            .unwrap();
+        assert_eq!(
+            eng.backend().recorded_now_writes.load(Ordering::SeqCst),
+            2,
+            "both fresh writes take the recorded-now path"
+        );
+    }
+
+    /// A pinned clock (eval determinism) keeps the composed, pinned stamps:
+    /// the plain writes, never the recorded-now ones.
+    #[tokio::test]
+    async fn pinned_clock_remember_keeps_the_pinned_stamps() {
+        let pinned = chrono::DateTime::from_timestamp(1_782_864_000, 0).unwrap();
+        let eng = engine().with_fixed_now(pinned);
+        let old = eng.remember(input("the decision is RRF", 6)).await.unwrap();
+        let new = eng
+            .remember_superseding(input("the decision is Linear", 6), old.clone(), false)
+            .await
+            .unwrap();
+        assert_eq!(eng.backend().recorded_now_writes.load(Ordering::SeqCst), 0);
+        for id in [&old, &new] {
+            assert_eq!(eng.backend().note_of(id).unwrap().created_at, pinned);
+        }
+        // The supersede itself bumps the OLD row's updated_at; the new row
+        // keeps both pinned write stamps.
+        assert_eq!(eng.backend().note_of(&new).unwrap().updated_at, pinned);
+    }
+
     /// #88 test 8, engine half: ranked recall refuses `as_of` (archived rows
     /// have no vectors) rather than silently dropping a channel.
     #[tokio::test]
