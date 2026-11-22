@@ -1,0 +1,57 @@
+# Owner-approved pilot adoption 2026-11-21 (Veans #13). ci-policy-v1 for brianluby/rusty-brain,
+# reconciled from the repo's existing deny.toml (read in full 2026-11-12).
+# Owner must approve every section; nothing here is applied.
+#
+# Mapping from deny.toml -> ci-policy-v1:
+#   [licenses].allow            -> licenses.allow (all 12 tokens carried over)
+#   [[licenses.exceptions]]     -> NOT REPRESENTABLE: ci-policy-v1 Licenses has
+#     (option-ext =0.2.0 MPL-2.0)  only `allow` (additionalProperties=false).
+#                                  deny.toml + its crate-scoped exception MUST
+#                                  stay enforced by existing cargo-deny CI.
+#                                  Owner decision R4.
+#   [advisories].ignore         -> advisories.exceptions (structured, expiring)
+#     RUSTSEC-2024-0436
+#   [bans] multiple-versions=warn -> bans.multiple_versions = "warn"
+#   [bans] deny=[]              -> bans.deny = []
+#   [sources] unknown-git=deny, -> sources.allow_git = [] (crates.io only;
+#     allow-registry=crates.io     no git deps in Cargo.lock, verified)
+#   [bans] wildcards=warn,      -> NOT REPRESENTABLE in ci-policy-v1; remain
+#     highlight=all, skip=[]       enforced by existing deny.toml CI.
+#   [graph] all-features=true   -> no ci-policy-v1 field; existing cargo-deny
+#                                  job keeps all-features graph coverage.
+schema_version = 1
+
+[licenses]
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Unicode-3.0",
+    "Unicode-DFS-2016",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "Zlib",
+    "NCSA",
+]
+
+[advisories]
+# deny.toml ignores RUSTSEC-2024-0436 (paste unmaintained; build-time proc-macro,
+# only via optional local feature: tokenizers/rav1e -> fastembed; no safe upgrade).
+# ci-policy-v1 requires owner + reason + expiry within 90 days.
+# PROPOSED expiry = today (2026-11-12) + 90 days; owner decision R5: approve
+# this time-boxed exception or upgrade fastembed off paste first.
+[[advisories.exceptions]]
+id = "RUSTSEC-2024-0436"
+owner = "PROPOSED: rusty-brain owner (brianluby) — unapproved"
+reason = "paste unmaintained; build-time proc-macro only via optional local feature (fastembed closure); no safe upgrade; default closure unaffected (carried from deny.toml)"
+expires = "2027-02-10"
+
+[sources]
+allow_git = []
+
+[bans]
+multiple_versions = "warn"
+deny = []
