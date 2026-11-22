@@ -1,0 +1,69 @@
+# Owner-approved pilot adoption 2026-11-21 (Veans #13). R1 pin 1.100.0;
+# R2(a) three supported targets, Intel-mac path stays unowned; R3 local excluded;
+# R6 arm64-linux included per draft; R8 shipped deliverables only.
+schema_version = 1
+repository = "brianluby/rusty-brain"
+# PROPOSED EXACT PIN — owner decision R1. Repo currently uses channel = "stable"
+# (mutable). 1.100.0 is the current published stable (rustup check 2026-11-12:
+# 1.100.0 (0ef1bc386 2026-11-09)); installed locally and used for discovery.
+# Owner must approve replacing mutable stable with this pin.
+toolchain = "1.100.0"
+manifest = "Cargo.toml"
+
+# Ticket #13 deliverables: rusty-brain / rb-hooks / rb-install. These are
+# exactly the packages the existing release.yml builds and packages:
+#   cargo build --release --locked --target <t> -p rusty-brain -p rb-hooks -p rb-install
+# Binary target names differ from package names (verified via cargo metadata).
+#
+# Targets: the existing release matrix ALSO ships x86_64-apple-darwin
+# (macos-15-intel), which Armorer v0.1 does NOT support (src/config.rs TARGETS).
+# This draft adopts the three supported targets only — owner decision R2,
+# option (a): preserve the Intel-mac release path unowned. Option (b) is
+# deferring adoption pending a reviewed target-enum contract extension.
+[[deliverables]]
+id = "rusty-brain"
+profile = "service" # daemon + CLI; `rusty-brain serve` runs the memory daemon in foreground
+package = "rusty-brain"
+binary = "rusty-brain"
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+feature_set = "default"
+
+# Second feature case: local ONNX backend (fastembed/ort). Existing CI builds
+# it (ci.yml build-local, ubuntu-latest only) but release.yml ships DEFAULT
+# features only. Selecting it as a deliverable is owner decision R3; the local
+# closure downloads native ONNX Runtime + HF model bytes (see report).
+[[deliverables]]
+id = "rusty-brain-local"
+profile = "service"
+package = "rusty-brain"
+binary = "rusty-brain"
+targets = ["x86_64-unknown-linux-gnu"]
+feature_set = "local"
+
+[[deliverables]]
+id = "rb-hooks"
+profile = "cli" # per-event capture hook, fail-open, invoked by agent CLIs
+package = "rb-hooks"
+binary = "rusty-brain-hooks"
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+feature_set = "default"
+
+[[deliverables]]
+id = "rb-install"
+profile = "cli" # merge/uninstall/status engine wiring agent CLIs to the hook
+package = "rb-install"
+binary = "rusty-brain-install"
+targets = ["aarch64-apple-darwin", "aarch64-unknown-linux-gnu", "x86_64-unknown-linux-gnu"]
+feature_set = "default"
+
+[feature_sets.default]
+default_features = true
+features = [] # none of the three deliverable packages declare default features
+
+[feature_sets.local]
+default_features = true
+features = ["local"] # rusty-brain: local = ["rb-embed/local"] -> dep:fastembed, dep:hf-hub, dep:tokio
+
+[policy]
+license_file = "LICENSE"
+attestations = "required"
